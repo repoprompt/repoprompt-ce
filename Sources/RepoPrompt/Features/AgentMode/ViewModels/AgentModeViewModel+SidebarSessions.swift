@@ -25,6 +25,7 @@ extension AgentModeViewModel {
         let filteredTabs: [StashedTab]
         let sortedTabs: [StashedTab]
         let dateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
+        let sessionIDByStashedTabID: [UUID: UUID]
     }
 
     struct ArchivedHUDSessionDescriptor {
@@ -32,6 +33,11 @@ extension AgentModeViewModel {
         let entry: AgentSessionIndexEntry?
         let dateInfo: SidebarSessionDateInfo
         let searchFields: AgentSessionSearchFields
+    }
+
+    private struct ArchivedSidebarSessionMetadata {
+        let dateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
+        let sessionIDByStashedTabID: [UUID: UUID]
     }
 
     private struct ArchivedSidebarSessionLookup {
@@ -172,12 +178,40 @@ extension AgentModeViewModel {
         for stashedTab: StashedTab,
         lookup: ArchivedSidebarSessionLookup
     ) -> SidebarSessionDateInfo {
-        let entry = lookup.explicitEntry(for: stashedTab.tab.activeAgentSessionID)
-            ?? preferredArchivedSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, lookup: lookup)
+        archivedSessionDateInfo(
+            for: stashedTab,
+            entry: archivedSidebarEntry(for: stashedTab, lookup: lookup)
+        )
+    }
 
-        return SidebarSessionDateInfo(
+    private func archivedSessionDateInfo(
+        for stashedTab: StashedTab,
+        entry: AgentSessionIndexEntry?
+    ) -> SidebarSessionDateInfo {
+        SidebarSessionDateInfo(
             lastEngagementAt: entry?.lastUserMessageAt,
             activityDate: entry.map(AgentSessionRestoreSupport.sidebarActivityDate(for:)) ?? stashedTab.tab.lastModified
+        )
+    }
+
+    private func archivedSidebarSessionMetadata(
+        for stashedTabs: [StashedTab],
+        lookup: ArchivedSidebarSessionLookup
+    ) -> ArchivedSidebarSessionMetadata {
+        var dateInfoByStashedTabID: [UUID: SidebarSessionDateInfo] = [:]
+        var sessionIDByStashedTabID: [UUID: UUID] = [:]
+        dateInfoByStashedTabID.reserveCapacity(stashedTabs.count)
+        sessionIDByStashedTabID.reserveCapacity(stashedTabs.count)
+
+        for stashedTab in stashedTabs {
+            let entry = archivedSidebarEntry(for: stashedTab, lookup: lookup)
+            dateInfoByStashedTabID[stashedTab.id] = archivedSessionDateInfo(for: stashedTab, entry: entry)
+            sessionIDByStashedTabID[stashedTab.id] = stashedTab.tab.activeAgentSessionID ?? entry?.id
+        }
+
+        return ArchivedSidebarSessionMetadata(
+            dateInfoByStashedTabID: dateInfoByStashedTabID,
+            sessionIDByStashedTabID: sessionIDByStashedTabID
         )
     }
 
@@ -197,20 +231,22 @@ extension AgentModeViewModel {
             return ArchivedSidebarSessionTabsSnapshot(
                 filteredTabs: filteredTabs,
                 sortedTabs: [],
-                dateInfoByStashedTabID: [:]
+                dateInfoByStashedTabID: [:],
+                sessionIDByStashedTabID: [:]
             )
         }
-        let dateInfoByID = archivedSessionDateInfoByID(for: filteredTabs, lookup: lookup)
+        let metadata = archivedSidebarSessionMetadata(for: filteredTabs, lookup: lookup)
         let sortedTabs = sortedFilteredArchivedSessionTabs(
             filteredTabs,
             diagnosticInputStashedCount: stashedTabs.count,
             diagnosticSearchActive: !trimmedSearch.isEmpty,
-            dateInfoByID: dateInfoByID
+            dateInfoByID: metadata.dateInfoByStashedTabID
         )
         return ArchivedSidebarSessionTabsSnapshot(
             filteredTabs: filteredTabs,
             sortedTabs: sortedTabs,
-            dateInfoByStashedTabID: dateInfoByID
+            dateInfoByStashedTabID: metadata.dateInfoByStashedTabID,
+            sessionIDByStashedTabID: metadata.sessionIDByStashedTabID
         )
     }
 
@@ -599,6 +635,7 @@ extension AgentModeViewModel {
             archivedSessionTabsForHeader: archivedSessionTabs.filteredTabs,
             pagedArchivedSessionTabsForRows: pagedArchivedTabs,
             archivedDateInfoByStashedTabID: archivedSessionTabs.dateInfoByStashedTabID,
+            archivedSessionIDByStashedTabID: archivedSessionTabs.sessionIDByStashedTabID,
             defaultCollapseSeedKeys: defaultCollapsedSidebarThreadKeys(
                 in: canonicalRows,
                 searchText: sidebarSnapshot.searchText

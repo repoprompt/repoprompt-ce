@@ -224,6 +224,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             case question
             case userInput = "user_input"
             case approval
+            case hookApproval = "hook_approval"
             case mcpElicitation = "mcp_elicitation"
         }
 
@@ -394,6 +395,39 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         }
     }
 
+    package struct HookGate: Equatable, Sendable {
+        package enum Status: String, Equatable, Sendable {
+            case approvedAll = "approved_all"
+            case approvedSelected = "approved_selected"
+            case continuedWithoutHooks = "continued_without_hooks"
+            case resolvedExternally = "resolved_externally"
+        }
+
+        package let status: Status
+        package let approvedHookCount: Int
+        package let skippedHookCount: Int?
+        package let resolvedAt: Date
+
+        package init(status: Status, approvedHookCount: Int, skippedHookCount: Int?, resolvedAt: Date) {
+            self.status = status
+            self.approvedHookCount = approvedHookCount
+            self.skippedHookCount = skippedHookCount
+            self.resolvedAt = resolvedAt
+        }
+
+        package func asObject() -> [String: Value] {
+            var object: [String: Value] = [
+                "status": .string(status.rawValue),
+                "approved_hook_count": .int(approvedHookCount),
+                "resolved_at": .string(DomainAgentRunSnapshot.timestamp(resolvedAt))
+            ]
+            if let skippedHookCount {
+                object["skipped_hook_count"] = .int(skippedHookCount)
+            }
+            return object
+        }
+    }
+
     package enum FailureReason: String, Equatable, Sendable {
         case processCrash = "process_crash"
         case timeout
@@ -437,6 +471,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
     package let statusText: String?
     package let latestAssistantPreview: String?
     package let interaction: Interaction?
+    package let hookGate: HookGate?
     package let transcriptItemCount: Int
     package let updatedAt: Date
     package let parentSessionID: UUID?
@@ -457,6 +492,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         statusText: String?,
         latestAssistantPreview: String?,
         interaction: Interaction?,
+        hookGate: HookGate? = nil,
         transcriptItemCount: Int,
         updatedAt: Date,
         parentSessionID: UUID?,
@@ -476,6 +512,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         self.statusText = statusText
         self.latestAssistantPreview = latestAssistantPreview
         self.interaction = interaction
+        self.hookGate = hookGate
         self.transcriptItemCount = transcriptItemCount
         self.updatedAt = updatedAt
         self.parentSessionID = parentSessionID
@@ -511,6 +548,9 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         if let interaction {
             object["interaction"] = .object(interaction.asObject())
             object["interaction_id"] = .string(interaction.id.uuidString)
+        }
+        if let hookGate {
+            object["hook_gate"] = .object(hookGate.asObject())
         }
         if let failureReason {
             object["failure_reason"] = .string(failureReason.rawValue)

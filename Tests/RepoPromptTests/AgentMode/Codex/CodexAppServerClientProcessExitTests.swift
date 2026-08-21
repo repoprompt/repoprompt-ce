@@ -439,6 +439,252 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         await client.stop()
     }
 
+    func testStoppedControllerPreflightReleasesGlobalTrustMutexAndRetrySucceeds() async throws {
+        let directory = try makeTemporaryDirectory()
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executable = try makeHookTrustServer(in: directory, recordURL: recordURL)
+        let firstClient = try await makeClient(executable: executable, launchDirectory: directory, timeout: 5)
+        let secondClient = try await makeClient(executable: executable, launchDirectory: directory, timeout: 5)
+        addTeardownBlock {
+            await firstClient.stop()
+            await secondClient.stop()
+        }
+        try await firstClient.startIfNeeded()
+        try await secondClient.startIfNeeded()
+
+        var options = CodexNativeSessionController.Options.agentModeDefault()
+        options.requestTimeout = 0.1
+        let firstController = CodexNativeSessionController(
+            client: firstClient,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePaths: .uniform(directory.path),
+            options: options
+        )
+        let secondController = CodexNativeSessionController(
+            client: secondClient,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePaths: .uniform(directory.path),
+            options: options
+        )
+        addTeardownBlock {
+            await firstController.shutdown()
+            await secondController.shutdown()
+        }
+        try await firstController.test_beginBindingSession()
+        try await secondController.test_beginBindingSession()
+        await firstController.test_ensureInboundStreamsStarted()
+        await secondController.test_ensureInboundStreamsStarted()
+        let firstDisplayed = try await firstController.listHooksForCurrentWorkspace()
+        let secondDisplayed = try await secondController.listHooksForCurrentWorkspace()
+        let candidate = CodexHookTrustCandidate(key: "hook-key", currentHash: "hook-hash")
+
+        let firstProcessIDValue = await firstClient.debugProcessID()
+        let firstProcessID = try XCTUnwrap(firstProcessIDValue)
+        XCTAssertEqual(Darwin.kill(firstProcessID, SIGSTOP), 0)
+        addTeardownBlock { _ = Darwin.kill(firstProcessID, SIGCONT) }
+
+        let startedAt = ContinuousClock.now
+        do {
+            _ = try await firstController.trustHooksForCurrentWorkspace(
+                expectedCandidates: [candidate],
+                expectedInventoryFingerprint: firstDisplayed.fingerprint
+            )
+            XCTFail("Hook trust must fail closed when preflight cannot settle")
+        } catch CodexHookTrustError.malformedListResponse {
+            // Expected: the explicit preflight deadline fired while the child was stopped.
+        } catch {
+            XCTFail("Stopped-process hook preflight was relabeled as \(error)")
+        }
+        XCTAssertLessThan(startedAt.duration(to: .now), .seconds(2))
+
+        let secondVerified = try await secondController.trustHooksForCurrentWorkspace(
+            expectedCandidates: [candidate],
+            expectedInventoryFingerprint: secondDisplayed.fingerprint
+        )
+        XCTAssertTrue(secondVerified.verifies([candidate]))
+
+        XCTAssertEqual(Darwin.kill(firstProcessID, SIGCONT), 0)
+        let firstVerified = try await firstController.trustHooksForCurrentWorkspace(
+            expectedCandidates: [candidate],
+            expectedInventoryFingerprint: firstDisplayed.fingerprint
+        )
+        XCTAssertTrue(firstVerified.verifies([candidate]))
+    }
+
+    func testSettlementDeadlineRetiresOwningGenerationBeforeFreshReconnect() async throws {
+        let directory = try makeTemporaryDirectory()
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executable = try makePersistentServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoredMethods: ["config/batchWrite"]
+        )
+        let client = try await makeClient(executable: executable, launchDirectory: directory, timeout: 5)
+        addTeardownBlock { await client.stop() }
+        try await client.startIfNeeded()
+        let retiredGeneration = await client.debugTransportGeneration()
+        let retiredPIDValue = await client.debugProcessID()
+        let retiredPID = try XCTUnwrap(retiredPIDValue)
+        let deadlineGeneration = SettlementDeadlineGenerationRecorder()
+
+        do {
+            _ = try await client.requestWithSettlementDeadline(
+                method: "config/batchWrite",
+                params: ["edits": []],
+                deadline: 0.05,
+                onUnsettled: { generation in deadlineGeneration.record(generation) }
+            )
+            XCTFail("The ignored mutation must reach its settlement deadline")
+        } catch let CodexAppServerClient.ClientError.requestFailed(failure) {
+            XCTAssertTrue(failure.message.contains("timed out"))
+        } catch {
+            XCTFail("Settlement deadline was relabeled as \(error)")
+        }
+
+        XCTAssertEqual(deadlineGeneration.value, retiredGeneration)
+        let processIsRunning = await client.debugIsProcessRunning()
+        let processIDAfterSettlement = await client.debugProcessID()
+        let terminationReason = await client.debugLastTransportTerminationReason()
+        XCTAssertFalse(processIsRunning)
+        XCTAssertNil(processIDAfterSettlement)
+        XCTAssertEqual(
+            terminationReason,
+            .settlementDeadline(method: "config/batchWrite", generation: retiredGeneration)
+        )
+        var status: Int32 = 0
+        errno = 0
+        XCTAssertEqual(waitpid(retiredPID, &status, WNOHANG), -1)
+        XCTAssertEqual(errno, ECHILD)
+
+        try await client.startIfNeeded()
+        let replacementGeneration = await client.debugTransportGeneration()
+        XCTAssertGreaterThan(replacementGeneration, retiredGeneration)
+        _ = try await client.request(method: "hooks/list", params: ["cwds": [directory.path]], timeout: 1)
+        try await waitForRecordedMethod("hooks/list", at: recordURL)
+    }
+
+    func testSettlementDeadlineReportsCapturedGenerationAfterConcurrentTerminationClaim() async throws {
+        let timeoutDeliveryGate = OneShotAsyncHookGate()
+        let deadlineGeneration = SettlementDeadlineGenerationRecorder()
+        let client = CodexAppServerClient(
+            writeFrameHandler: { _, _ in },
+            livenessProbe: { _ in true },
+            faultInjection: .init(
+                requestTimeoutDelivery: { _, _ in
+                    await timeoutDeliveryGate.holdFirstInvocation()
+                }
+            )
+        )
+        addTeardownBlock { await client.stop() }
+        await client.debugInstallTestTransport()
+        let capturedGeneration = await client.debugTransportGeneration()
+
+        let requestTask = Task {
+            try await client.requestWithSettlementDeadline(
+                method: "config/batchWrite",
+                params: ["edits": []],
+                deadline: 0.01,
+                onUnsettled: { generation in deadlineGeneration.record(generation) }
+            )
+        }
+        try await waitUntil("timeout request removal", timeout: 2) {
+            await timeoutDeliveryGate.hasEntered
+        }
+
+        await client.debugBeginTransportFailure()
+        try await waitUntil("concurrent transport termination", timeout: 2) {
+            await !(client.debugIsProcessRunning())
+        }
+        await timeoutDeliveryGate.release()
+
+        do {
+            _ = try await requestTask.value
+            XCTFail("The mutation must preserve its timeout failure")
+        } catch let CodexAppServerClient.ClientError.requestFailed(failure) {
+            XCTAssertTrue(failure.message.contains("timed out"))
+        } catch {
+            XCTFail("Timeout was relabeled as \(error)")
+        }
+        XCTAssertEqual(deadlineGeneration.value, capturedGeneration)
+    }
+
+    func testSubscriptionCreationRejectsTransportDeathAfterStartupCompletion() async throws {
+        let subscriptionGate = OneShotAsyncHookGate()
+        let client = CodexAppServerClient(
+            livenessProbe: { _ in true },
+            faultInjection: .init(
+                subscriptionPreparation: {
+                    await subscriptionGate.holdFirstInvocation()
+                }
+            )
+        )
+        addTeardownBlock { await client.stop() }
+        await client.debugInstallTestTransport()
+        let retiredGeneration = await client.debugTransportGeneration()
+
+        let subscriptionTask = Task {
+            try await client.subscribeNotificationsWithTransportGeneration()
+        }
+        try await waitUntil("subscription preparation", timeout: 2) {
+            await subscriptionGate.hasEntered
+        }
+        await client.debugBeginTransportFailure()
+        try await waitUntil("transport death before subscription installation", timeout: 2) {
+            await !(client.debugIsProcessRunning())
+        }
+        await subscriptionGate.release()
+
+        do {
+            _ = try await subscriptionTask.value
+            XCTFail("A subscription must not be created without a healthy transport")
+        } catch CodexAppServerClient.ClientError.processNotRunning {
+            // Expected: the retired generation cannot acquire a subscription slot.
+        } catch {
+            XCTFail("Unexpected subscription error: \(error)")
+        }
+
+        await client.debugInstallTestTransport()
+        let replacementGeneration = await client.debugTransportGeneration()
+        let replacement = try await client.subscribeNotificationsWithTransportGeneration()
+        XCTAssertGreaterThan(replacementGeneration, retiredGeneration)
+        XCTAssertEqual(replacement.transportGeneration, replacementGeneration)
+    }
+
+    func testRecoveryInitializationUsesExplicitDeadlineAndReapsTimedOutGeneration() async throws {
+        let directory = try makeTemporaryDirectory()
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let executable = try makePersistentServer(
+            in: directory,
+            recordURL: recordURL,
+            ignoredMethods: ["initialize"]
+        )
+        let client = try await makeClient(
+            executable: executable,
+            launchDirectory: directory,
+            timeout: 60
+        )
+        addTeardownBlock { await client.stop() }
+
+        do {
+            try await client.startIfNeeded(initializationTimeout: 0.05)
+            XCTFail("Ignored recovery initialize must reach its explicit deadline")
+        } catch let CodexAppServerClient.ClientError.requestFailed(failure) {
+            XCTAssertTrue(failure.message.contains("timed out"))
+        } catch {
+            XCTFail("Recovery initialize timeout was relabeled as \(error)")
+        }
+
+        await client.stop()
+        let processIsRunning = await client.debugIsProcessRunning()
+        let processID = await client.debugProcessID()
+        XCTAssertFalse(processIsRunning)
+        XCTAssertNil(processID)
+    }
+
     func testStaleObservedExitCannotMutateReplacementGeneration() async throws {
         let directory = try makeTemporaryDirectory()
         let recordURL = directory.appendingPathComponent("requests.jsonl")
@@ -821,6 +1067,46 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         return try writeExecutable(script, to: executable)
     }
 
+    private func makeHookTrustServer(in directory: URL, recordURL: URL) throws -> URL {
+        let executable = directory.appendingPathComponent("hook-trust-codex")
+        let script = """
+        #!/usr/bin/env python3
+        import json
+        import sys
+
+        record_path = \(String(reflecting: recordURL.path))
+        cwd = \(String(reflecting: directory.path))
+        trusted = False
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            with open(record_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"method": method}) + "\\n")
+                handle.flush()
+            if "id" not in request:
+                continue
+            if method == "hooks/list":
+                hook = {
+                    "eventName": "preToolUse",
+                    "source": "project",
+                    "sourcePath": cwd + "/.codex/config.toml",
+                    "key": "hook-key",
+                    "currentHash": "hook-hash",
+                    "enabled": True,
+                    "trustStatus": "trusted" if trusted else "untrusted",
+                    "handlerType": "command",
+                }
+                result = {"data": [{"cwd": cwd, "hooks": [hook], "errors": [], "warnings": []}]}
+            elif method == "config/batchWrite":
+                trusted = True
+                result = {"status": "ok"}
+            else:
+                result = {}
+            print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+        """
+        return try writeExecutable(script, to: executable)
+    }
+
     private func makePersistentServer(
         in directory: URL,
         recordURL: URL,
@@ -1028,6 +1314,46 @@ private actor CompletionFlag {
 
     func markComplete() {
         isComplete = true
+    }
+}
+
+private final class SettlementDeadlineGenerationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64?
+
+    func record(_ generation: UInt64) {
+        lock.lock()
+        self.generation = generation
+        lock.unlock()
+    }
+
+    var value: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation
+    }
+}
+
+private actor OneShotAsyncHookGate {
+    private var didEnter = false
+    private var isReleased = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    var hasEntered: Bool {
+        didEnter
+    }
+
+    func holdFirstInvocation() async {
+        guard !didEnter else { return }
+        didEnter = true
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        isReleased = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

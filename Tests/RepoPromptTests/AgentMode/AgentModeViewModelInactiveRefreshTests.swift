@@ -821,6 +821,72 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(searched.renderedSelectionOrder.count, 25)
     }
 
+    func testArchivedCopyUsesIndexSessionIDWhenStoredBindingIsMissing() {
+        let viewModel = makeViewModel()
+        let activeTab = ComposeTabState(id: UUID(), name: "Active")
+        let archivedTabID = UUID()
+        let stashedTab = StashedTab(
+            tab: ComposeTabState(
+                id: archivedTabID,
+                name: "Archived",
+                activeAgentSessionID: nil
+            )
+        )
+        var workspace = makeWorkspace(name: "Archived copy", tabs: [activeTab], activeTabID: activeTab.id)
+        workspace.stashedTabs = [stashedTab]
+        let manager = makeWorkspaceManager(workspaces: [workspace])
+        manager.activeWorkspace = workspace
+        viewModel.workspaceManager = manager
+
+        let indexSessionID = UUID()
+        let entry = makeIndexEntry(
+            id: indexSessionID,
+            tabID: archivedTabID,
+            lastUserMessageAt: Date(timeIntervalSince1970: 1)
+        )
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        viewModel.test_installSessionIndexSnapshot(
+            [entry.id: entry],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+
+        let collapsedProjection = viewModel.sidebarListProjection(
+            workspaceID: workspace.id,
+            composeTabs: [activeTab],
+            stashedTabs: [stashedTab],
+            currentTabID: activeTab.id,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: false,
+            showComposeTabsWithoutAgentSessions: false
+        )
+        XCTAssertTrue(collapsedProjection.pagedArchivedSessionTabsForRows.isEmpty)
+        XCTAssertTrue(collapsedProjection.archivedSessionIDByStashedTabID.isEmpty)
+
+        let projection = viewModel.sidebarListProjection(
+            workspaceID: workspace.id,
+            composeTabs: [activeTab],
+            stashedTabs: [stashedTab],
+            currentTabID: activeTab.id,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
+        )
+        var writtenValues: [String] = []
+        let action = AgentSidebarSessionIDCopyAction(
+            sessionID: projection.archivedSessionIDByStashedTabID[stashedTab.id],
+            clipboardWriter: { writtenValues.append($0) }
+        )
+
+        XCTAssertEqual(projection.pagedArchivedSessionTabsForRows.map(\.id), [stashedTab.id])
+        XCTAssertTrue(action.isEnabled)
+
+        action.perform()
+
+        XCTAssertEqual(writtenValues, [indexSessionID.uuidString])
+    }
+
     func testSidebarListProjectionMemoizesWithinExplicitRenderGeneration() throws {
         let viewModel = makeViewModel()
         let composeTabs = (0 ..< 400).map { index in

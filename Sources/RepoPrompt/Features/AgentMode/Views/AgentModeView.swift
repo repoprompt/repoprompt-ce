@@ -1852,6 +1852,10 @@ struct AgentModeChatDetailView: View {
         runInteractionSnapshot.pendingApproval?.id
     }
 
+    private var pendingCodexHookReviewID: UUID? {
+        runInteractionSnapshot.pendingCodexHookReview?.id
+    }
+
     private var pendingMCPElicitationID: UUID? {
         runInteractionSnapshot.pendingMCPElicitationRequest?.id
     }
@@ -1861,7 +1865,10 @@ struct AgentModeChatDetailView: View {
     }
 
     private var isInteractionBlockerVisible: Bool {
-        pendingApprovalID != nil || pendingMCPElicitationID != nil || pendingApplyEditsReviewID != nil
+        pendingCodexHookReviewID != nil
+            || pendingApprovalID != nil
+            || pendingMCPElicitationID != nil
+            || pendingApplyEditsReviewID != nil
     }
 
     var body: some View {
@@ -2399,7 +2406,24 @@ struct AgentModeChatDetailView: View {
             transcriptBlockRows(blocks: visibleTranscriptBlocks)
         }
         runningIndicatorSlot
-        if let review = runInteractionSnapshot.pendingApplyEditsReview {
+        if let request = runInteractionSnapshot.pendingCodexHookReview {
+            CodexHookReviewCard(
+                request: request,
+                isStrictModeEnabled: {
+                    agentModeVM.isCodexHookApprovalStrictModeEnabled()
+                },
+                onDecision: { decision in
+                    guard let tabID = currentTabID else { return }
+                    try await agentModeVM.submitCodexHookReviewDecision(
+                        tabID: tabID,
+                        requestID: request.id,
+                        decision: decision
+                    )
+                }
+            )
+            .id("pendingCodexHookReview")
+            .transition(.opacity)
+        } else if let review = runInteractionSnapshot.pendingApplyEditsReview {
             AgentApplyEditsReviewCard(
                 review: review,
                 onAccept: {

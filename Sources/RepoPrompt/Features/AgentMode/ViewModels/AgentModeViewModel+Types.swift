@@ -207,6 +207,7 @@ extension AgentModeViewModel {
         let archivedSessionTabsForHeader: [StashedTab]
         let pagedArchivedSessionTabsForRows: [StashedTab]
         let archivedDateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
+        let archivedSessionIDByStashedTabID: [UUID: UUID]
         let defaultCollapseSeedKeys: [AgentSidebarThreadKey]
         let renderedSelectionOrder: [AgentSidebarSelectionIdentity]
 
@@ -413,12 +414,20 @@ extension AgentModeViewModel {
             case nonScalar
         }
 
+        enum AnswerValueShape: Equatable {
+            case scalarString
+            case stringArray
+            case structuredObject
+        }
+
+        let suppliedArgumentNames: Set<String>
         let text: String?
         let skip: Bool
         let explicitSkip: Bool
         let responseArgument: ResponseArgument
-        let containsDecisionArgument: Bool
         let amendment: String?
+        let answerValueShapesByQuestionID: [String: AnswerValueShape]
+        let hasNormalizedAnswerFieldNames: Bool
         let answersByQuestionID: [String: [String]]
         let askUserAnswersByQuestionID: [String: AgentAskUserAnswer]
         let hasStructuredAnswerObjects: Bool
@@ -427,12 +436,14 @@ extension AgentModeViewModel {
         let elicitationMeta: [String: AgentJSONValue]
 
         init(
+            suppliedArgumentNames: Set<String> = [],
             text: String?,
             skip: Bool,
             explicitSkip: Bool = false,
             responseArgument: ResponseArgument,
-            containsDecisionArgument: Bool,
             amendment: String?,
+            answerValueShapesByQuestionID: [String: AnswerValueShape] = [:],
+            hasNormalizedAnswerFieldNames: Bool = false,
             answersByQuestionID: [String: [String]],
             askUserAnswersByQuestionID: [String: AgentAskUserAnswer] = [:],
             hasStructuredAnswerObjects: Bool = false,
@@ -440,18 +451,24 @@ extension AgentModeViewModel {
             elicitationContent: [String: AgentJSONValue] = [:],
             elicitationMeta: [String: AgentJSONValue] = [:]
         ) {
+            self.suppliedArgumentNames = suppliedArgumentNames
             self.text = text
             self.skip = skip
             self.explicitSkip = explicitSkip
             self.responseArgument = responseArgument
-            self.containsDecisionArgument = containsDecisionArgument
             self.amendment = amendment
+            self.answerValueShapesByQuestionID = answerValueShapesByQuestionID
+            self.hasNormalizedAnswerFieldNames = hasNormalizedAnswerFieldNames
             self.answersByQuestionID = answersByQuestionID
             self.askUserAnswersByQuestionID = askUserAnswersByQuestionID
             self.hasStructuredAnswerObjects = hasStructuredAnswerObjects
             self.elicitationActionRaw = elicitationActionRaw
             self.elicitationContent = elicitationContent
             self.elicitationMeta = elicitationMeta
+        }
+
+        func containsArgument(_ name: String) -> Bool {
+            suppliedArgumentNames.contains(name)
         }
     }
 

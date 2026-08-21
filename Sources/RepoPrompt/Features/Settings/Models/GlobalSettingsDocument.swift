@@ -593,6 +593,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var codexGoalSupportEnabled: Bool?
         var codexReasoningSummariesEnabled: Bool?
         var codexMemoriesEnabled: Bool?
+        var codexHookApprovalStrictModeEnabled: Bool?
+        var codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]?
         var providerConversationCleanupAction: String?
         var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         var agentSessionHandoffInstructions: String?
@@ -608,6 +610,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
             codexGoalSupportEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
             codexMemoriesEnabled: Bool? = nil,
+            codexHookApprovalStrictModeEnabled: Bool? = nil,
+            codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]? = nil,
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil
@@ -622,6 +626,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
             self.codexMemoriesEnabled = codexMemoriesEnabled
+            self.codexHookApprovalStrictModeEnabled = codexHookApprovalStrictModeEnabled
+            self.codexHookApprovalStrictModeWorkspaceOverrides = codexHookApprovalStrictModeWorkspaceOverrides
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions

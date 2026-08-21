@@ -124,6 +124,16 @@ final class AgentTabSession: ObservableObject {
     @Published var pendingAskUser: AgentAskUserPendingState? = nil
     @Published var pendingUserInputRequest: AgentRequestUserInputRequest? = nil
     @Published var pendingApproval: AgentApprovalRequest? = nil
+    @Published var pendingCodexHookReview: AgentCodexHookReviewRequest? = nil
+    var codexHookReviewContinuation: CheckedContinuation<Void, Error>?
+    var codexHookGateCoalescedContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
+    var codexHookGateGeneration: UInt64 = 0
+    var codexHookGateAttemptToken: UUID?
+    var codexHookGateDispatchOwnerToken: UUID?
+    var codexHookGateInventoryFingerprint: String?
+    @Published var codexHookGateAudit: AgentCodexHookGateAudit?
+    var codexHookGateBindingMemo: CodexHookGateBindingIdentity?
+    var codexHookGateActiveBinding: CodexHookGateBindingIdentity?
     @Published var pendingPermissionsRequest: AgentPermissionsRequest? = nil
     @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil
     @Published var pendingApplyEditsReview: PendingApplyEditsReview? = nil
@@ -250,6 +260,11 @@ final class AgentTabSession: ObservableObject {
         case compact
         case review
         case unknown
+    }
+
+    struct CodexHookGateBindingIdentity: Equatable {
+        let controllerInstanceID: ObjectIdentifier
+        let controllerGeneration: UUID
     }
 
     struct CodexAuthoritativeTurnIdentity: Equatable {
@@ -413,6 +428,12 @@ final class AgentTabSession: ObservableObject {
     var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
     var codexFallbackQueue: [CodexFallbackQueueEntry] = []
     var codexFallbackDispatchInFlight: CodexFallbackQueueEntry?
+    /// Bridges queued follow-ups to a hook-gate owner's turn for as long as that turn has no
+    /// settled identity of its own. Whichever of the accepted `turn/start` receipt or the
+    /// lifecycle start arrives first supplies the value — they race, and the queue has to be
+    /// bound by then either way. It is transient by design: the turn's terminal event either
+    /// upgrades it to the identity-derived blocker or resolves the queue outright.
+    var codexFallbackHookGateOwnerBlocker: CodexFallbackBlockingTurn?
     var codexFallbackPumpTask: Task<Void, Never>?
     var codexFallbackSuccessorRetryTask: Task<Void, Never>?
     let codexDispatchSerialGate = CodexDispatchSerialGate()
@@ -515,10 +536,16 @@ final class AgentTabSession: ObservableObject {
             let oldIdentity = oldValue.map { ObjectIdentifier($0) }
             let newIdentity = codexController.map { ObjectIdentifier($0) }
             guard oldIdentity != newIdentity else { return }
+            resetCodexHookGateBinding()
             codexControllerGeneration = UUID()
             codexAuthoritativeActiveTurn = nil
             codexAnonymousActiveTurn = nil
             codexRoutingObservedTurnID = nil
+            // A replaced controller can never deliver the lifecycle of a turn the previous
+            // one accepted, so a surviving blocker would gate the fallback pump on an event
+            // that is never coming. Disposition of the entries themselves belongs to the
+            // coordinator, which retires the queue with the controller.
+            codexFallbackHookGateOwnerBlocker = nil
         }
     }
 
@@ -681,12 +708,78 @@ final class AgentTabSession: ObservableObject {
         pendingAssistantDelta = ""
         agentTask?.cancel()
         agentTask = nil
+        if hasActiveCodexHookGateOperation {
+            resetCodexHookGateBinding()
+        }
         codexEventTask?.cancel()
         codexEventTask = nil
         codexEventTaskRunID = nil
         applyEditsApprovalSubscriptionTask?.cancel()
         applyEditsApprovalSubscriptionTask = nil
         applyEditsApprovalSubscriptionID = nil
+    }
+
+    var hasPendingCodexHookReviewRequest: Bool {
+        pendingCodexHookReview != nil
+    }
+
+    var hasPendingCodexHookReviewWait: Bool {
+        hasPendingCodexHookReviewRequest || codexHookReviewContinuation != nil
+    }
+
+    var hasActiveCodexHookGateOperation: Bool {
+        hasPendingCodexHookReviewWait
+            || codexHookGateAttemptToken != nil
+            || codexHookGateDispatchOwnerToken != nil
+            || !codexHookGateCoalescedContinuations.isEmpty
+    }
+
+    func finishCodexHookGateOwnerDispatch(
+        token: UUID,
+        succeeded: Bool
+    ) {
+        guard codexHookGateDispatchOwnerToken == token else { return }
+        codexHookGateDispatchOwnerToken = nil
+        codexHookGateActiveBinding = nil
+        let continuations = Array(codexHookGateCoalescedContinuations.values)
+        codexHookGateCoalescedContinuations.removeAll()
+        for continuation in continuations {
+            if succeeded {
+                continuation.resume()
+            } else {
+                continuation.resume(throwing: CancellationError())
+            }
+        }
+    }
+
+    func cancelCodexHookGateCoalescedWaiter(_ waiterID: UUID) {
+        codexHookGateCoalescedContinuations.removeValue(forKey: waiterID)?
+            .resume(throwing: CancellationError())
+    }
+
+    @discardableResult
+    func cancelCodexHookReview() -> Bool {
+        let continuation = codexHookReviewContinuation
+        let coalescedContinuations = Array(codexHookGateCoalescedContinuations.values)
+        guard hasActiveCodexHookGateOperation else { return false }
+        codexHookReviewContinuation = nil
+        codexHookGateCoalescedContinuations.removeAll()
+        pendingCodexHookReview = nil
+        codexHookGateAttemptToken = nil
+        codexHookGateDispatchOwnerToken = nil
+        continuation?.resume(throwing: CancellationError())
+        for continuation in coalescedContinuations {
+            continuation.resume(throwing: CancellationError())
+        }
+        return true
+    }
+
+    func resetCodexHookGateBinding() {
+        _ = cancelCodexHookReview()
+        codexHookGateInventoryFingerprint = nil
+        codexHookGateActiveBinding = nil
+        codexHookGateBindingMemo = nil
+        codexHookGateAudit = nil
     }
 
     @discardableResult
@@ -730,6 +823,7 @@ final class AgentTabSession: ObservableObject {
             || pendingAskUser != nil
             || pendingUserInputRequest != nil
             || pendingApproval != nil
+            || hasActiveCodexHookGateOperation
             || pendingPermissionsRequest != nil
             || pendingMCPElicitationRequest != nil
             || pendingApplyEditsReview != nil
@@ -957,6 +1051,10 @@ final class AgentTabSession: ObservableObject {
 
     var uiPendingApproval: AgentApprovalRequest? {
         shouldSurfaceInteractionsInUI ? pendingApproval : nil
+    }
+
+    var uiPendingCodexHookReview: AgentCodexHookReviewRequest? {
+        shouldSurfaceInteractionsInUI ? pendingCodexHookReview : nil
     }
 
     var uiPendingPermissionsRequest: AgentPermissionsRequest? {

@@ -290,7 +290,7 @@ private final class PersistedCleanupRecorder: @unchecked Sendable {
     }
 }
 
-private final class CleanupRecordingCodexController: CodexSessionControlling, @unchecked Sendable {
+private final class CleanupRecordingCodexController: CodexSessionControllerTurnDispatchTestDefaults, @unchecked Sendable {
     struct CleanupCall {
         let handle: ProviderConversationCleanupHandle
         let action: ProviderConversationCleanupAction

@@ -15,17 +15,12 @@ import XCTest
     final class ContextBuilderWorktreeInheritanceTests: XCTestCase {
         func testExplicitInactiveWorkspaceContextBuilderUsesTargetAuthorityWithoutVisibleProjection() async throws {
             try await runInactiveWorkspaceAuthorityScenario(
-                bindTargetFirst: false,
                 validationStartsIncomplete: true
             )
         }
 
-        func testBoundInactiveWorkspaceContextBuilderUsesTargetAuthorityWithoutVisibleProjection() async throws {
-            try await runInactiveWorkspaceAuthorityScenario(bindTargetFirst: true)
-        }
-
         func testInactiveWorkspaceContextBuilderSurvivesVisibleTabSwitchAndCancelsWithoutLateProjection() async throws {
-            try await runInactiveWorkspaceAuthorityScenario(bindTargetFirst: false, cancelDuringRun: true)
+            try await runInactiveWorkspaceAuthorityScenario(cancelDuringRun: true)
         }
 
         func testInactiveWorkspaceContextBuilderFailsClosedWhenTargetProjectionIsUnavailable() async throws {
@@ -1873,7 +1868,6 @@ import XCTest
         }
 
         private func runInactiveWorkspaceAuthorityScenario(
-            bindTargetFirst: Bool,
             cancelDuringRun: Bool = false,
             validationStartsIncomplete: Bool = false
         ) async throws {
@@ -2074,20 +2068,12 @@ import XCTest
                     )
 
                     let endpoint = try fixture.endpointA()
-                    if bindTargetFirst {
-                        _ = try await endpoint.callTool(
-                            name: "bind_context",
-                            arguments: ["op": "bind", "context_id": fixture.contextB.tabID.uuidString]
-                        )
-                    }
-                    var arguments: [String: Any] = [
+                    let arguments: [String: Any] = [
                         "instructions": "Inspect workspace B only.",
                         "response_type": "plan",
-                        "_rawJSON": true
+                        "_rawJSON": true,
+                        "context_id": fixture.contextB.tabID.uuidString
                     ]
-                    if !bindTargetFirst {
-                        arguments["context_id"] = fixture.contextB.tabID.uuidString
-                    }
                     var removedTargetSnapshot: ComposeTabState?
                     if let gate {
                         let request = Task {

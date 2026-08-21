@@ -95,6 +95,7 @@
             session.codexFallbackPumpTask = nil
             session.codexFallbackQueue = []
             session.codexFallbackDispatchInFlight = nil
+            session.codexFallbackHookGateOwnerBlocker = nil
             session.codexPendingTurnKind = nil
             session.codexAuthoritativeActiveTurn = nil
             session.codexAnonymousActiveTurn = nil

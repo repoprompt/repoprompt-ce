@@ -589,7 +589,7 @@ extension OracleViewModel {
             return loaded
         }
         guard let tabID,
-              let candidate = workspaceManager.bindingCandidate(forContextID: tabID),
+              let candidate = workspaceManager.storedBindingCandidate(forContextID: tabID),
               let workspace = workspaceManager.workspaces.first(where: { $0.id == candidate.workspaceID }),
               let persisted = try await chatData.findSession(for: workspace, id: rawID, composeTabID: tabID)
         else {

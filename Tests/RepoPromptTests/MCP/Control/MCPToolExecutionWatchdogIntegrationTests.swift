@@ -1478,6 +1478,7 @@ import XCTest
                 }
                 do {
                     let endpoint = try fixture.endpointA()
+                    try await Self.activateWorkspace(for: fixture.contextA)
                     _ = try await endpoint.callTool(
                         name: "bind_context",
                         arguments: [
@@ -1645,6 +1646,7 @@ import XCTest
 
                 do {
                     let endpoint = try fixture.endpointA()
+                    try await Self.activateWorkspace(for: fixture.contextA)
                     _ = try await endpoint.callTool(
                         name: "bind_context",
                         arguments: [
@@ -1785,6 +1787,7 @@ import XCTest
                 }
                 do {
                     let endpoint = try fixture.endpointA()
+                    try await Self.activateWorkspace(for: fixture.contextA)
                     _ = try await endpoint.callTool(
                         name: "bind_context",
                         arguments: [
@@ -1913,6 +1916,7 @@ import XCTest
                     )
                     endpoint = createdEndpoint
                     try await fixture.registerDomainWorkspace(fixture.contextA)
+                    try await Self.activateWorkspace(for: fixture.contextA)
                     let bindResponse = try await createdEndpoint.callTool(
                         name: "bind_context",
                         arguments: ["op": "bind", "context_id": fixture.contextA.tabID.uuidString]
@@ -2920,6 +2924,21 @@ import XCTest
                     throw error
                 }
             }
+        }
+
+        private static func activateWorkspace(for context: PersistentMCPTestContext) async throws {
+            let workspace = try XCTUnwrap(
+                context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
+            )
+            await context.window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "MCPToolExecutionWatchdogIntegrationTests"
+            )
+            context.window.promptManager.loadComposeTabsFromWorkspace(
+                workspace,
+                syncPromptText: true
+            )
         }
 
         private static func waitUntil(

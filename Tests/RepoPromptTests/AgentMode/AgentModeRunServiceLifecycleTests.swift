@@ -2578,7 +2578,7 @@ private final class LifecycleNoopHeadlessProvider: HeadlessAgentProvider {
     func dispose() async {}
 }
 
-final class LifecycleNoopCodexController: CodexSessionControlling {
+final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     enum SendBehavior: CustomStringConvertible {
         case success
         case failure
@@ -2673,6 +2673,7 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     }
 
     func compactThread() async throws {}
+
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil
     }

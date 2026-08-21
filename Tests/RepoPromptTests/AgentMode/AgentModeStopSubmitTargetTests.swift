@@ -996,7 +996,7 @@ private final class StopSubmitSendRecorder: @unchecked Sendable {
     }
 }
 
-private final class StopSubmitNoopCodexController: CodexSessionControlling {
+private final class StopSubmitNoopCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     private let recorder: StopSubmitSendRecorder?
     private let activeThread: Bool
     private let eventStream: AsyncStream<CodexNativeSessionController.Event>

@@ -314,6 +314,13 @@ struct GlobalSettingsWriteDiagnostic: Equatable {
     let caller: String
 }
 
+// MARK: - Codex Hook Approval Settings
+
+@MainActor
+protocol CodexHookApprovalSettingsProviding {
+    func codexHookApprovalStrictModeEnabled(workspaceID: UUID?) -> Bool
+}
+
 // MARK: - Global Settings Store (Persistent)
 
 /// This is the single source of truth for workspace default settings.
@@ -321,7 +328,7 @@ struct GlobalSettingsWriteDiagnostic: Equatable {
 /// `~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json`.
 /// Windows use WindowSettingsManager to maintain local overlays.
 @MainActor
-class GlobalSettingsStore: ObservableObject {
+class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding {
     static let shared = GlobalSettingsStore()
 
     private let defaults: UserDefaults
@@ -1320,6 +1327,55 @@ class GlobalSettingsStore: ObservableObject {
     func setCodexMemoriesEnabled(_ enabled: Bool, commit: Bool = true) {
         updateAgentModeScalar(commit: commit) { settings in
             settings.codexMemoriesEnabled = enabled
+        }
+    }
+
+    func globalCodexHookApprovalStrictModeEnabled() -> Bool {
+        scalarPreferences.agentMode?.codexHookApprovalStrictModeEnabled ?? false
+    }
+
+    func codexHookApprovalStrictModeWorkspaceOverride(workspaceID: UUID) -> Bool? {
+        scalarPreferences.agentMode?.codexHookApprovalStrictModeWorkspaceOverrides?[workspaceID.uuidString]
+    }
+
+    func codexHookApprovalStrictModeEnabled(workspaceID: UUID?) -> Bool {
+        if let workspaceID,
+           let workspaceOverride = codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID)
+        {
+            return workspaceOverride
+        }
+        return globalCodexHookApprovalStrictModeEnabled()
+    }
+
+    func setGlobalCodexHookApprovalStrictModeEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexHookApprovalStrictModeEnabled = enabled
+        }
+    }
+
+    func setCodexHookApprovalStrictModeEnabled(
+        _ enabled: Bool,
+        workspaceID: UUID?,
+        commit: Bool = true
+    ) {
+        if let workspaceID,
+           codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID) != nil
+        {
+            setCodexHookApprovalStrictModeOverride(enabled, for: workspaceID, commit: commit)
+        } else {
+            setGlobalCodexHookApprovalStrictModeEnabled(enabled, commit: commit)
+        }
+    }
+
+    func setCodexHookApprovalStrictModeOverride(
+        _ override: Bool?,
+        for workspaceID: UUID,
+        commit: Bool = true
+    ) {
+        updateAgentModeScalar(commit: commit) { settings in
+            var overrides = settings.codexHookApprovalStrictModeWorkspaceOverrides ?? [:]
+            overrides[workspaceID.uuidString] = override
+            settings.codexHookApprovalStrictModeWorkspaceOverrides = overrides.isEmpty ? nil : overrides
         }
     }
 
