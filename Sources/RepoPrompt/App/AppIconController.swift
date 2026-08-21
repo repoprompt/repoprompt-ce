@@ -35,7 +35,9 @@ final class AppIconController {
     private init(application: NSApplication = .shared) {
         self.application = application
         appearanceObservation = application.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
-            self?.applyFromGlobalSettings()
+            Task { @MainActor in
+                self?.applyFromGlobalSettings()
+            }
         }
     }
 
