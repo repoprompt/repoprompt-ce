@@ -389,6 +389,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
 
     struct UISettings: Codable, Equatable {
         var appearanceMode: String?
+        var appIconMode: String?
         var useTransparency: Bool?
         var collapseLatestFileChanges: Bool?
         var showTooltips: Bool?
@@ -400,6 +401,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
 
         init(
             appearanceMode: String? = nil,
+            appIconMode: String? = nil,
             useTransparency: Bool? = nil,
             collapseLatestFileChanges: Bool? = nil,
             showTooltips: Bool? = nil,
@@ -410,6 +412,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             showDatesInMessageTimestamps: Bool? = nil
         ) {
             self.appearanceMode = appearanceMode
+            self.appIconMode = appIconMode
             self.useTransparency = useTransparency
             self.collapseLatestFileChanges = collapseLatestFileChanges
             self.showTooltips = showTooltips

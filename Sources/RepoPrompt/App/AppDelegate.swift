@@ -136,6 +136,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         signal(SIGPIPE, SIG_IGN)
 
         AppearanceController.shared.applyFromGlobalSettings()
+        AppIconController.shared.applyFromGlobalSettings()
 
         // ───────────────────────────────────────────────────
         // Start the runtime and publish both application-scoped MCP services before
