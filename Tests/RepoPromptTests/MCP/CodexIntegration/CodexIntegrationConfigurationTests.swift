@@ -514,6 +514,57 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertFalse(execArguments.contains { $0.contains("features.parallel_tool_calls") })
     }
 
+    func testRuntimePoliciesScopeCodexAppAndPluginDefaultsToInteractiveAgentMode() {
+        let policy = CodexOverrides.ToolPolicy(
+            toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,
+            shellToolEnabled: false,
+            webSearchRequestEnabled: false,
+            multiAgentEnabled: false
+        )
+
+        let cliOverrides = CodexOverrides.cliConfigArgs(toolPolicy: policy)
+        let appServerOverrides = CodexOverrides.appServerConfigMap(toolPolicy: policy)
+        let upstreamOwnedFeatures = [
+            "features.apps",
+            "features.plugins",
+            "features.tool_call_mcp_elicitation",
+            "features.tool_suggest"
+        ]
+        for key in upstreamOwnedFeatures {
+            XCTAssertTrue(cliOverrides.contains("\(key)=false"), key)
+            XCTAssertEqual(appServerOverrides[key] as? Bool, false, key)
+        }
+
+        let nativeAgentOverrides = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            shellToolEnabled: false,
+            computerUseEnabled: true
+        )
+        for key in upstreamOwnedFeatures {
+            XCTAssertNil(nativeAgentOverrides[key], key)
+        }
+
+        let interactiveChatOverrides = CodexCLIProvider().interactiveConfigOverrides(
+            excludeServers: []
+        )
+        for key in upstreamOwnedFeatures {
+            XCTAssertEqual(interactiveChatOverrides[key] as? Bool, false, key)
+        }
+
+        let headlessOverrides = CodexIntegrationConfiguration.configOverrides(for: .agentRun)
+        for key in upstreamOwnedFeatures {
+            XCTAssertTrue(headlessOverrides.contains("\(key)=false"), key)
+        }
+
+        let execArguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: []
+        ).args
+        for key in upstreamOwnedFeatures {
+            XCTAssertTrue(execArguments.contains("\(key)=false"), key)
+        }
+    }
+
     func testOwnedCodeModePolicyIsExactIdempotentAndPreservesUnrelatedSettings() {
         let input = """
         model = "user-model"
@@ -612,7 +663,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
 
         XCTAssertFalse(result.changed)
         XCTAssertEqual(result.content, input)
-        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.147.0") == true)
+        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.149.0") == true)
         XCTAssertFalse(result.content.contains("direct_only_tool_namespaces"))
     }
 

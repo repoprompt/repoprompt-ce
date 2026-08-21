@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "minimumCodexVersion": "0.147.0",
+  "minimumCodexVersion": "0.149.0",
   "experimental": true,
   "methodChecks": [
     {
@@ -191,8 +191,8 @@
         },
         {
           "path": "data[].hooks[].command",
-          "presence": "optional",
-          "nullable": true
+          "presence": "conditional",
+          "nullable": false
         },
         {
           "path": "data[].hooks[].sourcePath",

@@ -284,7 +284,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
             if version_probe_path is not None:
                 with open(version_probe_path, "a", encoding="utf-8") as handle:
                     handle.write("probe\\n")
-            print("codex 0.147.0")
+            print("codex 0.149.0")
             raise SystemExit(0)
         environment_path = \(environmentPath)
         if environment_path is not None:

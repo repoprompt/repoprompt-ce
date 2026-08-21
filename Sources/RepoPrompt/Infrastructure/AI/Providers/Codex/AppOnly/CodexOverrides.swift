@@ -1,16 +1,19 @@
 import Foundation
 
 enum CodexOverrides {
+    private static let upstreamOwnedAppConfigKeys = [
+        "features.apps",
+        "features.plugins",
+        "features.tool_call_mcp_elicitation",
+        "features.tool_suggest"
+    ]
+
     private static let forcedDisabledConfig: [String: Bool] = [
         "features.apps": false,
         "features.memories": false,
         "features.goals": false,
         "features.computer_use": false,
         "features.plugins": false,
-        // Disable MCP elicitation until RepoPrompt supports the mcpServer/elicitation/request
-        // server request and its {action, content, _meta} response contract. Without this,
-        // Codex routes MCP tool approvals through elicitation by default (ToolCallMcpElicitation
-        // is stable + enabled), which RepoPrompt treats as unsupported and fails the run.
         "features.tool_call_mcp_elicitation": false,
         "features.tool_suggest": false,
         "memories.generate_memories": false,
@@ -18,10 +21,7 @@ enum CodexOverrides {
     ]
 
     private static let computerUseEnabledConfig: [String: Bool] = [
-        "features.computer_use": true,
-        "features.plugins": true,
-        "features.tool_call_mcp_elicitation": true,
-        "features.tool_suggest": true
+        "features.computer_use": true
     ]
 
     enum ReasoningSummary: String {
@@ -35,16 +35,21 @@ enum CodexOverrides {
         var goalsEnabled: Bool
         var memoriesEnabled: Bool
         var computerUseEnabled: Bool
+        var preserveUpstreamAppDefaults = false
 
         static let defaultDisabled = FeaturePolicy(goalsEnabled: false, memoriesEnabled: false, computerUseEnabled: false)
         static let enabledForGoals = FeaturePolicy(goalsEnabled: true, memoriesEnabled: false, computerUseEnabled: false)
-        static let enabledForComputerUse = FeaturePolicy(goalsEnabled: false, memoriesEnabled: false, computerUseEnabled: true)
-
-        static func resolved(goalsEnabled: Bool, memoriesEnabled: Bool, computerUseEnabled: Bool) -> FeaturePolicy {
+        static func resolved(
+            goalsEnabled: Bool,
+            memoriesEnabled: Bool,
+            computerUseEnabled: Bool,
+            preserveUpstreamAppDefaults: Bool
+        ) -> FeaturePolicy {
             FeaturePolicy(
                 goalsEnabled: goalsEnabled,
                 memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled
+                computerUseEnabled: computerUseEnabled,
+                preserveUpstreamAppDefaults: preserveUpstreamAppDefaults
             )
         }
     }
@@ -166,6 +171,11 @@ enum CodexOverrides {
 
     private static func forcedConfig(featurePolicy: FeaturePolicy) -> [String: Bool] {
         var config = forcedDisabledConfig
+        if featurePolicy.preserveUpstreamAppDefaults {
+            for key in upstreamOwnedAppConfigKeys {
+                config[key] = nil
+            }
+        }
         if featurePolicy.goalsEnabled {
             config["features.goals"] = true
         }

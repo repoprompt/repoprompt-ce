@@ -24,7 +24,7 @@ import test_codex_runtime_artifact as artifact_fixtures
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "Scripts" / "codex_update_candidate.py"
 BASELINE = ROOT / "Vendor" / "Codex" / "manifest.json"
-VERSION = "0.148.0"
+VERSION = "0.150.0"
 TAG = f"rust-v{VERSION}"
 TARGETS = (
     ("aarch64-apple-darwin", "arm64"),
@@ -256,7 +256,7 @@ EOF
             "minimumExternalVersion",
             "License and NOTICE review",
             "Manual approval and soak",
-            "0.147.0",
+            "0.149.0",
             str(self.lipo),
             str(self.codesign),
         ):
@@ -410,14 +410,14 @@ EOF
     def test_selector_and_output_safety_fail_closed(self) -> None:
         malformed = self._run(
             self.temp / "malformed",
-            selector=("--version", "0.147.0-rc.1"),
+            selector=("--version", "0.149.0-rc.1"),
             expected=1,
         )
         self.assertIn("stable numeric triplet", malformed.stderr)
 
         not_newer = self._run(
             self.temp / "not-newer",
-            selector=("--version", "0.147.0"),
+            selector=("--version", "0.149.0"),
             expected=1,
         )
         self.assertIn("must be newer", not_newer.stderr)
