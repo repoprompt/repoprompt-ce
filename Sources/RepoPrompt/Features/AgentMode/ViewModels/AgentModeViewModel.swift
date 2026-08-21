@@ -576,6 +576,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
     private let workspacePathProvider: () -> String?
+    private let workspaceRootPathsProvider: () -> [String]
     private let skillCatalog: AgentSkillCatalog
     private let headlessProviderFactory: HeadlessProviderFactory
     private let acpProviderFactory: ACPProviderFactory
@@ -1637,12 +1638,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
-        let codexWorkspacePathProvider = { [weak workspaceManager] in
-            workspaceManager?.activeWorkspace?.repoPaths.first
+        let codexWorkspaceRootPathsProvider = { [weak workspaceManager] in
+            workspaceManager?.activeWorkspace?.repoPaths ?? []
         }
+        let codexWorkspacePathProvider = { codexWorkspaceRootPathsProvider().first }
         let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
-            Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
+            Self.makeSessionWorkspaceProviders(workspaceRootPaths: codexWorkspaceRootPathsProvider)
         workspacePathProvider = codexWorkspacePathProvider
+        workspaceRootPathsProvider = codexWorkspaceRootPathsProvider
         attachmentWorkspaceDirectoryProvider = { [weak workspaceManager] in
             guard let workspaceManager, workspaceManager.activeWorkspace != nil else {
                 return nil
@@ -1809,6 +1812,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         init(
             testWindowID: Int = 1,
             testWorkspacePath: String? = nil,
+            testWorkspacePaths: [String]? = nil,
             testWorkspaceDirectory: URL? = nil,
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
             clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
@@ -1882,10 +1886,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 return FileManager.default.temporaryDirectory
             }
-            let codexWorkspacePathProvider = { testWorkspacePath }
+            let codexWorkspaceRootPathsProvider = {
+                testWorkspacePaths ?? testWorkspacePath.map { [$0] } ?? []
+            }
+            let codexWorkspacePathProvider = { codexWorkspaceRootPathsProvider().first }
             let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
-                Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
+                Self.makeSessionWorkspaceProviders(workspaceRootPaths: codexWorkspaceRootPathsProvider)
             workspacePathProvider = codexWorkspacePathProvider
+            workspaceRootPathsProvider = codexWorkspaceRootPathsProvider
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
                 ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
@@ -2084,19 +2092,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func effectiveWorkspacePath(for session: TabSession) throws -> String? {
         try Self.effectiveWorkspacePath(
             for: session,
-            fallbackWorkspacePath: workspacePathProvider()
+            workspaceRootPaths: workspaceRootPathsProvider()
         )
     }
 
     func codexRuntimeWorkspacePaths(for session: TabSession) throws -> CodexRuntimeWorkspacePaths {
         try Self.codexRuntimeWorkspacePaths(
             for: session,
-            fallbackWorkspacePath: workspacePathProvider()
+            workspaceRootPaths: workspaceRootPathsProvider()
         )
     }
 
     func primaryExecutionBinding(for session: TabSession) -> AgentSessionWorktreeBinding? {
-        Self.primaryExecutionBinding(in: session.worktreeBindings, fallbackWorkspacePath: workspacePathProvider())
+        do {
+            return try Self.primaryExecutionBinding(
+                in: session.worktreeBindings,
+                workspaceRootPaths: workspaceRootPathsProvider()
+            )
+        } catch {
+            // Indicators are presentation-only. Execution transitions resolve the same binding
+            // through the throwing path and preserve invalid state as a distinct destination.
+            return nil
+        }
     }
 
     func primaryExecutionWorktreeIndicator(forTabID tabID: UUID) -> AgentWorktreeIndicator? {
@@ -2112,29 +2129,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private static func primaryExecutionBinding(
         in bindings: [AgentSessionWorktreeBinding],
-        fallbackWorkspacePath: String?
-    ) -> AgentSessionWorktreeBinding? {
-        AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+        workspaceRootPaths: [String]
+    ) throws -> AgentSessionWorktreeBinding? {
+        try AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
             in: bindings,
-            fallbackWorkspacePath: fallbackWorkspacePath
+            workspaceRootPaths: workspaceRootPaths
         )
     }
 
     private static func effectiveWorkspacePath(
         for session: TabSession,
-        fallbackWorkspacePath: String?
+        workspaceRootPaths: [String]
     ) throws -> String? {
         try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
             bindings: session.worktreeBindings,
-            fallbackWorkspacePath: fallbackWorkspacePath
+            workspaceRootPaths: workspaceRootPaths
         )
     }
 
     /// One projection contract for both initializers: session-scoped scalar
     /// workspace path and Codex launch/execution path pair, derived from the
-    /// same fallback workspace provider.
+    /// complete active workspace root provider.
     private static func makeSessionWorkspaceProviders(
-        fallbackWorkspacePath: @escaping () -> String?
+        workspaceRootPaths: @escaping () -> [String]
     ) -> (
         sessionWorkspacePath: (TabSession) throws -> String?,
         codexRuntimeWorkspacePaths: (TabSession) throws -> CodexRuntimeWorkspacePaths
@@ -2143,13 +2160,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessionWorkspacePath: { session in
                 try Self.effectiveWorkspacePath(
                     for: session,
-                    fallbackWorkspacePath: fallbackWorkspacePath()
+                    workspaceRootPaths: workspaceRootPaths()
                 )
             },
             codexRuntimeWorkspacePaths: { session in
                 try Self.codexRuntimeWorkspacePaths(
                     for: session,
-                    fallbackWorkspacePath: fallbackWorkspacePath()
+                    workspaceRootPaths: workspaceRootPaths()
                 )
             }
         )
@@ -2157,11 +2174,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private static func codexRuntimeWorkspacePaths(
         for session: TabSession,
-        fallbackWorkspacePath: String?
+        workspaceRootPaths: [String]
     ) throws -> CodexRuntimeWorkspacePaths {
         try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
             bindings: session.worktreeBindings,
-            fallbackWorkspacePath: fallbackWorkspacePath
+            workspaceRootPaths: workspaceRootPaths
         )
     }
 
@@ -6738,11 +6755,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             return .blocked("This thread cannot change execution location right now.")
         }
-        let previousPrimary = primaryExecutionBinding(for: session)
+        let previousPrimary: AgentSessionWorktreeBinding?
+        let previousBindingsAreInvalid: Bool
+        do {
+            previousPrimary = try Self.primaryExecutionBinding(
+                in: session.worktreeBindings,
+                workspaceRootPaths: workspaceRootPathsProvider()
+            )
+            previousBindingsAreInvalid = false
+        } catch {
+            previousPrimary = nil
+            previousBindingsAreInvalid = true
+        }
         switch choice {
-        case .local where previousPrimary == nil:
+        case .local where previousPrimary == nil && !previousBindingsAreInvalid:
             return .unchanged
-        case let .existingWorktree(selection) where previousPrimary?.worktreeID == selection.worktreeID:
+        case let .existingWorktree(selection)
+            where !previousBindingsAreInvalid && previousPrimary?.worktreeID == selection.worktreeID:
             return .unchanged
         default:
             break
@@ -6767,7 +6796,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         do {
             let desiredBindings: [AgentSessionWorktreeBinding] = switch choice {
             case .local:
-                session.worktreeBindings.filter { $0.id != previousPrimary?.id }
+                previousBindingsAreInvalid
+                    ? []
+                    : session.worktreeBindings.filter { $0.id != previousPrimary?.id }
             case .newWorktree, .existingWorktree:
                 try await prepareStartedExecutionLocationBinding(
                     choice,
@@ -6918,20 +6949,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private struct ExecutionDestinationIdentity: Equatable {
-        let repositoryID: String?
-        let worktreeID: String?
-        let path: String?
+    private enum ExecutionDestinationIdentity: Equatable {
+        case local(path: String?)
+        case worktree(repositoryID: String?, worktreeID: String?, path: String?)
+        case invalid(bindings: [AgentSessionWorktreeBinding])
     }
 
     private func executionDestinationIdentity(in bindings: [AgentSessionWorktreeBinding]) -> ExecutionDestinationIdentity {
-        let binding = Self.primaryExecutionBinding(in: bindings, fallbackWorkspacePath: workspacePathProvider())
-        return ExecutionDestinationIdentity(
-            repositoryID: binding?.repositoryID,
-            worktreeID: binding?.worktreeID,
-            path: Self.standardizedWorkspacePath(binding?.worktreeRootPath)
-                ?? Self.standardizedWorkspacePath(workspacePathProvider())
-        )
+        do {
+            guard let binding = try Self.primaryExecutionBinding(
+                in: bindings,
+                workspaceRootPaths: workspaceRootPathsProvider()
+            ) else {
+                return .local(path: Self.standardizedWorkspacePath(workspacePathProvider()))
+            }
+            return .worktree(
+                repositoryID: binding.repositoryID,
+                worktreeID: binding.worktreeID,
+                path: Self.standardizedWorkspacePath(binding.worktreeRootPath)
+            )
+        } catch {
+            return .invalid(bindings: bindings)
+        }
     }
 
     private func executionLocationContext() async throws -> ExecutionLocationContext {
