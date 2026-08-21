@@ -117,6 +117,8 @@ class WindowState: ObservableObject {
 
     // MARK: - Window identification
 
+    private static let mainWindowTabbingIdentifier: NSWindow.TabbingIdentifier = "com.repoprompt.main"
+
     private(set) static var windowCounter = 0
 
     private static func allocateWindowID() -> Int {
@@ -563,6 +565,11 @@ class WindowState: ObservableObject {
     }
 
     private func configureWindowChrome(for window: NSWindow) {
+        // Give independently created SwiftUI scenes one explicit main-window tabbing group so
+        // AppKit keeps Merge All Windows available from whichever main window is active.
+        window.tabbingIdentifier = Self.mainWindowTabbingIdentifier
+        window.tabbingMode = .automatic
+
         // Keep titlebar visually continuous with content (no horizontal separator).
         window.toolbar?.showsBaselineSeparator = false
         if #unavailable(macOS 15.0) {
