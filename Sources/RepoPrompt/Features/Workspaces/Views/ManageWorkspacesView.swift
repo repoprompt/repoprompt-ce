@@ -370,9 +370,7 @@ struct ManageWorkspacesView: View {
                         .font(fontPreset.subheadlineFont)
                         .fontWeight(.medium)
                 }
-                ForEach(group.duplicateWorkspaceIDs.indices, id: \.self) { index in
-                    let workspaceID = group.duplicateWorkspaceIDs[index]
-                    let name = group.duplicateWorkspaceNames[index]
+                ForEach(Array(zip(group.duplicateWorkspaceIDs, group.duplicateWorkspaceNames)), id: \.0) { workspaceID, name in
                     let windowIDs = group.windowIDsByWorkspaceID[workspaceID] ?? []
                     HStack(spacing: 0) {
                         Text("  • \(name)")
