@@ -138,6 +138,9 @@ enum CodexDynamicModelMapper {
         }
 
         return options.sorted { lhs, rhs in
+            if lhs.isDefault != rhs.isDefault {
+                return lhs.isDefault && !rhs.isDefault
+            }
             let leftBase = lhs.baseID.lowercased()
             let rightBase = rhs.baseID.lowercased()
             if leftBase == rightBase {
@@ -147,9 +150,6 @@ enum CodexDynamicModelMapper {
                     return leftRank < rightRank
                 }
                 return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
-            }
-            if lhs.isDefault != rhs.isDefault {
-                return lhs.isDefault && !rhs.isDefault
             }
             if AIModel.codexBaseModelPrecedes(leftBase, rightBase) { return true }
             if AIModel.codexBaseModelPrecedes(rightBase, leftBase) { return false }
