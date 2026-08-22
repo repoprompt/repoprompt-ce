@@ -209,6 +209,82 @@ final class WorkingDirsBindRootProjectionTests: XCTestCase {
     }
 
     @MainActor
+    func testWorkingDirsBindPreservesPreviousBindingWhenActiveTabChangesAfterRootValidation() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+        }
+
+        let rootURL = try makeTemporaryDirectory(named: "working-dirs-commit-target")
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: rootURL.deletingLastPathComponent())
+        }
+
+        let previousTabID = UUID()
+        let prospectiveTabID = UUID()
+        let replacementTabID = UUID()
+        let workspace = WorkspaceModel(
+            name: "Working Dirs Commit Target",
+            repoPaths: [rootURL.path],
+            customStoragePath: rootURL.appendingPathComponent("workspace.json"),
+            composeTabs: [
+                ComposeTabState(id: previousTabID, name: "Previous"),
+                ComposeTabState(id: prospectiveTabID, name: "Prospective"),
+                ComposeTabState(id: replacementTabID, name: "Replacement")
+            ],
+            activeComposeTabID: prospectiveTabID
+        )
+        try await install(workspace: workspace, in: window, reason: "workingDirsCommitTargetTest")
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: rootURL.path
+        )
+
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "working-dirs-commit-target-test",
+            tabID: previousTabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting {
+            window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
+            guard let workspaceIndex = window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) else {
+                XCTFail("Workspace disappeared before the commit-time target change")
+                return
+            }
+            window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = replacementTabID
+        }
+        addTeardownBlock { @MainActor in
+            window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
+        }
+
+        let (service, bindContext) = try await bindContextTool(for: window)
+        defer { withExtendedLifetime(service) {} }
+        do {
+            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await bindContext([
+                    "op": .string("bind"),
+                    "working_dirs": .string(rootURL.path),
+                    "create_if_missing": .bool(false)
+                ])
+            }
+            XCTFail("Expected the commit-time target change to reject the stale working_dirs bind")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("changed while its root projection was being resolved"), message)
+            XCTAssertTrue(message.contains("existing MCP binding was not changed"), message)
+        }
+        XCTAssertEqual(window.mcpServer.tabContextByConnectionID[connectionID]?.tabID, previousTabID)
+    }
+
+    @MainActor
     func testWorkingDirsBindPreservesPreviousBindingWhenSessionRootLifetimeChangesAfterPreflight() async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

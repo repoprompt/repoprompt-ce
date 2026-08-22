@@ -1848,6 +1848,15 @@ final class WindowRoutingService: Service {
                 tabID: target.tabID,
                 workspaceID: target.workspaceID
             ) {
+                let commitTarget = try? resolveActiveTabBindTarget(
+                    windowID: target.windowID,
+                    expectedWorkspaceID: target.workspaceID,
+                    matchedBy: target.matchedBy,
+                    normalizedWorkingDirs: target.normalizedWorkingDirs
+                )
+                guard commitTarget?.tabID == target.tabID else {
+                    throw staleWorkingDirsTargetError()
+                }
                 guard !bindingAlreadyMatches else { return }
                 try targetWindow.mcpServer.bindTabForConnection(
                     connectionID: connectionID,
