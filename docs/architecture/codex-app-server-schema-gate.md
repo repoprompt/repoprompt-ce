@@ -146,19 +146,17 @@ The bounded comparison also recorded these explicit gaps rather than hiding them
 
 The repository candidate flow verified both official `rust-v0.149.0` macOS packages, including
 their complete layouts, architectures, OpenAI signing identities, and trusted timestamps. The
-pinned CLI passes the bounded app-server projection after recording that a hook `command` is now
-conditionally present and non-null. RepoPrompt's decoder already accepts the conditional shape.
+pinned CLI passes the bounded app-server projection. Upstream changed a hook `command` from
+optional and nullable to conditionally present but non-null when present; RepoPrompt's decoder
+already accepts that bounded shape.
 
-Codex 0.149.0 [removes the ChatGPT workspace-settings gate from app and plugin
-availability](https://github.com/openai/codex/pull/38994). A live
-probe using RepoPrompt's existing isolated `CODEX_HOME` confirmed that enabling the upstream
-features makes already connected apps installed, enabled, and callable without sharing the Codex
-Desktop home or adding a RepoPrompt-specific authentication path. Native Agent Mode therefore
-stops forcing `features.apps`, `features.plugins`, `features.tool_call_mcp_elicitation`, and
-`features.tool_suggest` off and leaves those defaults to the pinned Codex runtime. RepoPrompt's
-existing MCP elicitation handler remains the client-side approval boundary. Non-Agent chat and
-headless `codex exec` continue to disable those features because they cannot present or resolve an
-MCP elicitation request.
+Codex 0.149.0 also changes upstream app and plugin availability. RepoPrompt does not inherit those
+runtime defaults: `features.apps`, `features.plugins`, `features.tool_call_mcp_elicitation`, and
+`features.tool_suggest` are explicitly false on every Codex launch/config surface by default. The
+human-only **Connected Apps** setting enables all four together only for supported direct native
+Agent Mode app-server sessions. The setting is absent from the MCP `app_settings` catalog, defaults
+to false for absent or legacy persistence, and cannot enable standard chat, headless exec, or
+MCP-started Agent Mode sessions.
 
 ## Files and tests
 

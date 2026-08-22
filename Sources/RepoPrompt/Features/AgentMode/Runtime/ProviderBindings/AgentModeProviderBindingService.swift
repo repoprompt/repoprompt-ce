@@ -39,6 +39,16 @@ final class AgentModeProviderBindingService {
         preferences.runtimePermission(for: agent, profile: profile)
     }
 
+    /// Captures the human-owned Connected Apps preference for a direct Agent Mode launch.
+    /// MCP-controlled sessions remain unsupported even when the persisted preference is on.
+    func codexConnectedAppsEnabledForLaunch(isMCPControlled: Bool) -> Bool {
+        guard !isMCPControlled else { return false }
+        return preferences
+            .topLevelSettingsControlsBinding(providerID: .codex)
+            .codexTools?
+            .connectedAppsEnabled == true
+    }
+
     func permissionProfileForMCPActivation(isSubagent: Bool) -> AgentProviderPermissionProfile {
         permissionProfileForMCPActivation(isSubagent: isSubagent, provider: nil)
     }

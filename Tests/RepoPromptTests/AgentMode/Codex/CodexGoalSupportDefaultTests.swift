@@ -73,6 +73,13 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         XCTAssertTrue(CodexAgentModeBooleanPreference.memories.isEnabled(defaults: defaults))
     }
 
+    func testMissingUserDefaultsConnectedAppsKeyDefaultsDisabled() throws {
+        let defaults = try makeIsolatedDefaults()
+
+        XCTAssertNil(defaults.object(forKey: CodexConnectedApps.defaultsKey))
+        XCTAssertFalse(CodexAgentModeBooleanPreference.connectedApps.isEnabled(defaults: defaults))
+    }
+
     func testMissingGlobalSettingsGoalScalarDefaultsEnabled() throws {
         let store = try makeStore(document: GlobalSettingsDocument(
             scalarPreferences: GlobalScalarPreferences(agentMode: .init())
@@ -149,6 +156,35 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
         XCTAssertTrue(reloaded.codexMemoriesEnabled())
         XCTAssertEqual(try fileStore.load().scalarPreferences?.agentMode?.codexMemoriesEnabled, true)
+    }
+
+    func testMissingGlobalSettingsConnectedAppsScalarDefaultsDisabled() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+
+        XCTAssertFalse(store.codexConnectedAppsEnabled())
+    }
+
+    func testGlobalSettingsConnectedAppsOptInPersistsAcrossReload() throws {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexConnectedAppsPersistenceTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: temp)
+        }
+        let fileStore = GlobalSettingsFileStore(fileURL: temp.appendingPathComponent("Settings/globalSettings.json"))
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+        let defaults = try makeIsolatedDefaults()
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        store.setCodexConnectedAppsEnabled(true)
+
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertTrue(reloaded.codexConnectedAppsEnabled())
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.agentMode?.codexConnectedAppsEnabled, true)
     }
 
     func testProviderConversationCleanupActionDefaultsArchiveAndPersistsDelete() throws {

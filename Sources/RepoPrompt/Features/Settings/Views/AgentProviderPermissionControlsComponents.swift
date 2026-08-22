@@ -226,6 +226,18 @@ struct CodexProviderToolsRuntimeSection: View {
             .hoverTooltip("Controls Codex memory generation and use for app-server launch and thread start/resume. Off by default.")
 
             ProviderRuntimeSubsection(
+                title: "Connected Apps",
+                subtitle: "Optional Codex integrations for direct Agent Mode sessions only."
+            ) {
+                ProviderRuntimeToggleRow(
+                    title: "Enable Connected Apps",
+                    description: "Enable Codex apps, plugins, MCP elicitation, and tool suggestions together. Off by default. Chat, headless, and MCP-started agents remain disabled.",
+                    isOn: tools.connectedAppsEnabled,
+                    onChange: { onApplyMutation(.connectedApps(enabled: $0)) }
+                )
+            }
+
+            ProviderRuntimeSubsection(
                 title: "MCP servers",
                 subtitle: "Choose which configured MCP servers Codex can use. RepoPrompt is required for app integration."
             ) {

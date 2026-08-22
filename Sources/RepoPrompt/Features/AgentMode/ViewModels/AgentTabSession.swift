@@ -565,6 +565,7 @@ final class AgentTabSession: ObservableObject {
         var goalSupportEnabled: Bool
         var reasoningSummariesEnabled: Bool
         var memoriesEnabled: Bool
+        var connectedAppsEnabled = false
     }
 
     var pendingCodexComputerUseActivation: AgentModeViewModel.CodexComputerUseActivation?

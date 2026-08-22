@@ -667,8 +667,7 @@ final class CodexNativeSessionController {
         /// Nil preserves Codex process defaults; non-nil values are explicit process overrides.
         /// Agent Mode omits this so thread start/resume config is authoritative.
         var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
-        /// Preserve Codex's stable app defaults only when this surface can resolve MCP elicitation.
-        var preserveUpstreamAppDefaults = false
+        var connectedAppsEnabledProvider: @MainActor () -> Bool = { false }
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
@@ -700,6 +699,7 @@ final class CodexNativeSessionController {
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
             shellToolEnabled: Bool? = nil,
             suppressThirdPartyMCPServers: Bool = false,
+            connectedAppsEnabledProvider: @escaping @MainActor () -> Bool = { false },
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
@@ -710,6 +710,7 @@ final class CodexNativeSessionController {
                 configOverridesProvider: {
                     let featurePolicy = await MainActor.run {
                         (
+                            connectedAppsEnabled: connectedAppsEnabledProvider(),
                             goalSupportEnabled: goalSupportEnabledProvider(),
                             reasoningSummariesEnabled: reasoningSummariesEnabledProvider(),
                             memoriesEnabled: memoriesEnabledProvider(),
@@ -719,6 +720,7 @@ final class CodexNativeSessionController {
                     return CodexNativeSessionController.defaultAppServerConfigOverrides(
                         shellToolEnabled: shellToolEnabled,
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
+                        connectedAppsEnabled: featurePolicy.connectedAppsEnabled,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
                         memoriesEnabled: featurePolicy.memoriesEnabled,
@@ -730,7 +732,7 @@ final class CodexNativeSessionController {
                 approvalReviewerProvider: approvalReviewerProvider,
                 authTokensRefreshHandler: nil,
                 processModelReasoningSummary: nil,
-                preserveUpstreamAppDefaults: true,
+                connectedAppsEnabledProvider: connectedAppsEnabledProvider,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
@@ -2783,7 +2785,7 @@ final class CodexNativeSessionController {
                 goalsEnabled: options.goalSupportEnabledProvider(),
                 memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
                 computerUseEnabled: options.computerUseEnabledProvider(),
-                preserveUpstreamAppDefaults: options.preserveUpstreamAppDefaults
+                connectedAppsEnabled: options.connectedAppsEnabledProvider()
             )
         }
     }
@@ -9114,6 +9116,7 @@ final class CodexNativeSessionController {
     static func defaultAppServerConfigOverrides(
         shellToolEnabled: Bool? = nil,
         suppressThirdPartyMCPServers: Bool = false,
+        connectedAppsEnabled: Bool = false,
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
         memoriesEnabled: Bool = false,
@@ -9135,7 +9138,7 @@ final class CodexNativeSessionController {
                 goalsEnabled: goalSupportEnabled,
                 memoriesEnabled: memoriesEnabled,
                 computerUseEnabled: computerUseEnabled,
-                preserveUpstreamAppDefaults: true
+                connectedAppsEnabled: connectedAppsEnabled
             )
         )
         let mcpOverrides = appServerMCPServerOverrides(

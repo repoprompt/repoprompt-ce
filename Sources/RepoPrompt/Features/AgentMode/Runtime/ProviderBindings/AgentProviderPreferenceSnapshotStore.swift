@@ -177,6 +177,8 @@ final class AgentProviderPreferenceSnapshotStore {
             CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
         case let .memories(enabled):
             CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
+        case let .connectedApps(enabled):
+            CodexAgentModeBooleanPreference.connectedApps.setEnabled(enabled, defaults: defaults)
         case let .mcpServer(normalizedName, enabled):
             CodexAgentToolPreferences.setMCPServerEnabled(
                 normalizedName: normalizedName,
@@ -207,6 +209,10 @@ final class AgentProviderPreferenceSnapshotStore {
 
     func setCodexMemoriesEnabled(_ enabled: Bool) {
         applyCodexToolSettingMutation(.memories(enabled: enabled))
+    }
+
+    func setCodexConnectedAppsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.connectedApps(enabled: enabled))
     }
 
     func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
@@ -408,6 +414,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
+                connectedAppsEnabled: codexConnectedAppsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -424,6 +431,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
+                connectedAppsEnabled: codexConnectedAppsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -473,6 +481,10 @@ final class AgentProviderPreferenceSnapshotStore {
 
     private func codexMemoriesEnabled() -> Bool {
         CodexAgentModeBooleanPreference.memories.isEnabled(defaults: defaults)
+    }
+
+    private func codexConnectedAppsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.connectedApps.isEnabled(defaults: defaults)
     }
 
     private func claudeEffortLevel(

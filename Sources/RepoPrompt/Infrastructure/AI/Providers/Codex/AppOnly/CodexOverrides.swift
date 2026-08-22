@@ -1,7 +1,7 @@
 import Foundation
 
 enum CodexOverrides {
-    private static let upstreamOwnedAppConfigKeys = [
+    private static let connectedAppsConfigKeys = [
         "features.apps",
         "features.plugins",
         "features.tool_call_mcp_elicitation",
@@ -35,21 +35,31 @@ enum CodexOverrides {
         var goalsEnabled: Bool
         var memoriesEnabled: Bool
         var computerUseEnabled: Bool
-        var preserveUpstreamAppDefaults = false
+        var connectedAppsEnabled: Bool
 
-        static let defaultDisabled = FeaturePolicy(goalsEnabled: false, memoriesEnabled: false, computerUseEnabled: false)
-        static let enabledForGoals = FeaturePolicy(goalsEnabled: true, memoriesEnabled: false, computerUseEnabled: false)
+        static let defaultDisabled = FeaturePolicy(
+            goalsEnabled: false,
+            memoriesEnabled: false,
+            computerUseEnabled: false,
+            connectedAppsEnabled: false
+        )
+        static let enabledForGoals = FeaturePolicy(
+            goalsEnabled: true,
+            memoriesEnabled: false,
+            computerUseEnabled: false,
+            connectedAppsEnabled: false
+        )
         static func resolved(
             goalsEnabled: Bool,
             memoriesEnabled: Bool,
             computerUseEnabled: Bool,
-            preserveUpstreamAppDefaults: Bool
+            connectedAppsEnabled: Bool = false
         ) -> FeaturePolicy {
             FeaturePolicy(
                 goalsEnabled: goalsEnabled,
                 memoriesEnabled: memoriesEnabled,
                 computerUseEnabled: computerUseEnabled,
-                preserveUpstreamAppDefaults: preserveUpstreamAppDefaults
+                connectedAppsEnabled: connectedAppsEnabled
             )
         }
     }
@@ -171,10 +181,8 @@ enum CodexOverrides {
 
     private static func forcedConfig(featurePolicy: FeaturePolicy) -> [String: Bool] {
         var config = forcedDisabledConfig
-        if featurePolicy.preserveUpstreamAppDefaults {
-            for key in upstreamOwnedAppConfigKeys {
-                config[key] = nil
-            }
+        for key in connectedAppsConfigKeys {
+            config[key] = featurePolicy.connectedAppsEnabled
         }
         if featurePolicy.goalsEnabled {
             config["features.goals"] = true

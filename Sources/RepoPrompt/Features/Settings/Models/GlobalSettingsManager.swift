@@ -1330,6 +1330,16 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         }
     }
 
+    func codexConnectedAppsEnabled() -> Bool {
+        CodexConnectedApps.isEnabled(persistedValue: scalarPreferences.agentMode?.codexConnectedAppsEnabled)
+    }
+
+    func setCodexConnectedAppsEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexConnectedAppsEnabled = enabled
+        }
+    }
+
     func globalCodexHookApprovalStrictModeEnabled() -> Bool {
         scalarPreferences.agentMode?.codexHookApprovalStrictModeEnabled ?? false
     }
