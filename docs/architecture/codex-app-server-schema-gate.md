@@ -156,7 +156,7 @@ runtime defaults: `features.apps`, `features.plugins`, `features.tool_call_mcp_e
 human-only **Connected Apps** setting enables all four together only for supported direct native
 Agent Mode app-server sessions. The setting is absent from the MCP `app_settings` catalog, defaults
 to false for absent or legacy persistence, and cannot enable standard chat, headless exec, or
-MCP-started Agent Mode sessions.
+MCP-related Agent Mode sessions at any point in their lifetime, including after live control ends.
 
 ## Files and tests
 

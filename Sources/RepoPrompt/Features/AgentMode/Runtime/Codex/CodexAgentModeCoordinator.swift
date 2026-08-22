@@ -258,7 +258,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let windowID: Int
     private let runtimeWorkspacePathsProvider: (AgentTabSession) throws -> CodexRuntimeWorkspacePaths
     private let codexControllerFactory: CodexControllerFactory
-    private let codexConnectedAppsEnabledForLaunch: (_ isMCPControlled: Bool) -> Bool
+    private let codexConnectedAppsEnabledForLaunch: (_ isMCPRelated: Bool) -> Bool
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
     private let shouldManageCodexTooling: Bool
     private let activeToolQuery: ActiveToolQuery
@@ -374,7 +374,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         codexControllerFactory: @escaping CodexControllerFactory,
         connectionPolicyInstaller: @escaping ConnectionPolicyInstaller,
         shouldManageCodexTooling: Bool,
-        codexConnectedAppsEnabledForLaunch: @escaping (_ isMCPControlled: Bool) -> Bool = { _ in false },
+        codexConnectedAppsEnabledForLaunch: @escaping (_ isMCPRelated: Bool) -> Bool = { _ in false },
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
         codexHookApprovalSettings: any CodexHookApprovalSettingsProviding,
         activeToolQuery: @escaping ActiveToolQuery = { _ in false },
@@ -5775,7 +5775,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let wantsGoalSupport = CodexGoalSupport.isEnabled
         let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
         let wantsMemories = CodexMemories.isEnabled
-        let wantsConnectedApps = codexConnectedAppsEnabledForLaunch(session.mcpControlContext != nil)
+        let wantsConnectedApps = codexConnectedAppsEnabledForLaunch(session.isMCPRelated)
         let codexComputerUseFeatureEnabled = CodexComputerUseWorkflow.isEnabled
         if !codexComputerUseFeatureEnabled {
             session.pendingCodexComputerUseActivation = nil
@@ -5876,7 +5876,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 goalSupportEnabled: CodexGoalSupport.isEnabled,
                 reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
                 memoriesEnabled: CodexMemories.isEnabled,
-                connectedAppsEnabled: codexConnectedAppsEnabledForLaunch(session.mcpControlContext != nil)
+                connectedAppsEnabled: codexConnectedAppsEnabledForLaunch(session.isMCPRelated)
             )
 
             if let existingController = session.codexController,

@@ -1722,8 +1722,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexControllerFactory: codexControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
             shouldManageCodexTooling: true,
-            codexConnectedAppsEnabledForLaunch: { isMCPControlled in
-                providerBindingService.codexConnectedAppsEnabledForLaunch(isMCPControlled: isMCPControlled)
+            codexConnectedAppsEnabledForLaunch: { isMCPRelated in
+                providerBindingService.codexConnectedAppsEnabledForLaunch(isMCPRelated: isMCPRelated)
             },
             codexHookApprovalSettings: GlobalSettingsStore.shared,
             activeToolQuery: { [weak mcpServer] runID in
@@ -1863,6 +1863,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
+            testCodexConnectedAppsEnabledForLaunch: @escaping (_ isMCPRelated: Bool) -> Bool = { _ in false },
             testCodexActiveAgentRunWaitQuery: CodexAgentRunWaitQuery? = nil,
             testCodexActiveAgentRunWaitDrain: CodexAgentRunWaitDrain? = nil,
             testCodexLeaseRoutingTimeoutMs: Int? = nil,
@@ -1923,6 +1924,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 codexControllerFactory: codexControllerFactory,
                 connectionPolicyInstaller: connectionPolicyInstaller,
                 shouldManageCodexTooling: shouldManageCodexTooling,
+                codexConnectedAppsEnabledForLaunch: testCodexConnectedAppsEnabledForLaunch,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
                 codexHookApprovalSettings: testCodexHookApprovalSettingsProvider ?? GlobalSettingsStore.shared,
                 activeToolQuery: testCodexActiveToolQuery
