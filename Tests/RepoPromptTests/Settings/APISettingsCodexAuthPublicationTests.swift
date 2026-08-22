@@ -195,6 +195,12 @@ private actor ControlledCodexAuthRecovery: CodexManagedAuthRecovering {
         return .recovered(account: account)
     }
 
+    func checkManagedAccount() async -> CodexManagedAuthRefreshResult {
+        refreshCallCount += 1
+        await refreshGate?.wait()
+        return .recovered(account: account)
+    }
+
     func managedAccountSnapshot() async -> CodexManagedAccount? {
         snapshotCallCount += 1
         await snapshotGate?.wait()

@@ -648,6 +648,32 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         XCTAssertNil(clearedSnapshot)
     }
 
+    func testPassiveAccountCheckDoesNotRefreshToken() async {
+        let accountPayload: [String: Any] = [
+            "account": ["type": "chatgpt", "email": "passive@example.com", "planType": "plus"],
+            "requiresOpenaiAuth": true
+        ]
+        let client = MockCodexManagedAuthClient(
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [Self.signedOutAccount],
+            unrefreshedAccountReadResponse: accountPayload
+        )
+        let service = makeService(client: client, clock: TestClock(), validationTimeout: 1)
+
+        let result = await service.checkManagedAccount()
+
+        XCTAssertEqual(
+            result,
+            .recovered(account: CodexManagedAccount(
+                email: "passive@example.com",
+                planType: "plus",
+                accountType: "chatgpt"
+            ))
+        )
+        XCTAssertEqual(client.accountReadRefreshFlags(), [false])
+        XCTAssertEqual(await service.managedAccountSnapshot()?.email, "passive@example.com")
+    }
+
     func testLoginReturnsFreshManagedAccountSnapshot() async {
         let accountPayload: [String: Any] = [
             "account": ["type": "chatgpt", "email": "fresh@example.com", "planType": "plus"],
