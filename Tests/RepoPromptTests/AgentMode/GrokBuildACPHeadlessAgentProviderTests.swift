@@ -53,13 +53,88 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertTrue(requestConfig.alwaysApproveTools)
     }
 
+    func testStatusRemainsDistinctFromValidShortAssistantContent() async throws {
+        let harness = try makeHarness()
+        let provider = harness.makeHeadlessProvider(modelString: nil, scenario: .statusAndShortContent)
+
+        let results = try await collect(provider, message: "hi")
+
+        XCTAssertEqual(results.filter { $0.type == "status" }.compactMap(\.text), ["RepoPrompt Agent File Tools Plan"])
+        XCTAssertEqual(results.filter { $0.type == "content" }.compactMap(\.text), ["No."])
+        XCTAssertEqual(results.last?.type, "message_stop")
+    }
+
+    func testCleanPreTerminalFragmentsRemainComplete() async throws {
+        let harness = try makeHarness()
+        let provider = harness.makeHeadlessProvider(modelString: nil, scenario: .preTerminalFragments)
+
+        let results = try await collect(provider, message: "hi")
+
+        XCTAssertEqual(results.filter { $0.type == "content" }.compactMap(\.text).joined(), "Clean answer.")
+        XCTAssertEqual(results.last?.type, "message_stop")
+    }
+
+    func testPostResponseContentIsDrainedBeforeTerminal() async throws {
+        let harness = try makeHarness()
+        let provider = harness.makeHeadlessProvider(modelString: nil, scenario: .postResponseContent)
+
+        let results = try await collect(provider, message: "hi")
+
+        XCTAssertEqual(results.filter { $0.type == "content" }.compactMap(\.text).joined(), "Full response.")
+        XCTAssertEqual(results.map(\.type), ["content", "content", "message_stop"])
+    }
+
+    func testDescendantLateContentHoldingInheritedPipesIsBounded() async throws {
+        let harness = try makeHarness()
+        let provider = harness.makeHeadlessProvider(
+            modelString: nil,
+            scenario: .descendantLateContentHoldingInheritedPipes
+        )
+        let startedAt = ProcessInfo.processInfo.systemUptime
+
+        let results = try await collect(provider, message: "hi")
+
+        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+        XCTAssertEqual(results.filter { $0.type == "content" }.compactMap(\.text).joined(), "Full response.")
+        let terminals = results.filter { $0.type == "message_stop" || $0.type == AIStreamResult.incompleteType }
+        XCTAssertEqual(terminals.count, 1)
+        let terminal = try XCTUnwrap(terminals.first)
+        XCTAssertEqual(terminal.type, AIStreamResult.incompleteType)
+        XCTAssertEqual(terminal.stopReason, "transport_did_not_settle_before_shutdown")
+        XCTAssertFalse(results.contains { $0.type == "message_stop" })
+        XCTAssertLessThan(elapsed, 15)
+    }
+
+    func testForcedShutdownMarksPartialContentIncomplete() async throws {
+        let harness = try makeHarness()
+        let provider = harness.makeHeadlessProvider(modelString: nil, scenario: .unsettledTransport)
+
+        let results = try await collect(provider, message: "hi")
+
+        XCTAssertEqual(results.filter { $0.type == "content" }.compactMap(\.text), ["No."])
+        XCTAssertEqual(results.last?.type, AIStreamResult.incompleteType)
+        XCTAssertEqual(results.last?.stopReason, "transport_did_not_settle_before_shutdown")
+    }
+
     // MARK: - Harness
+
+    private enum Scenario: String {
+        case standard
+        case statusAndShortContent = "status_and_short_content"
+        case preTerminalFragments = "pre_terminal_fragments"
+        case postResponseContent = "post_response_content"
+        case unsettledTransport = "unsettled_transport"
+        case descendantLateContentHoldingInheritedPipes = "descendant_late_content_holding_pipes"
+    }
 
     private struct Harness {
         let workspace: URL
         let recordURL: URL
 
-        func makeHeadlessProvider(modelString: String?) -> GrokBuildACPHeadlessAgentProvider {
+        func makeHeadlessProvider(
+            modelString: String?,
+            scenario: Scenario = .standard
+        ) -> GrokBuildACPHeadlessAgentProvider {
             let recordPath = recordURL.path
             return GrokBuildACPHeadlessAgentProvider(
                 config: GrokBuildAgentConfig(
@@ -72,7 +147,10 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                 providerFactory: { config in
                     EnvForwardingGrokProvider(
                         config: config,
-                        extraEnvironment: ["ACP_RECORD_PATH": recordPath]
+                        extraEnvironment: [
+                            "ACP_RECORD_PATH": recordPath,
+                            "ACP_SCENARIO": scenario.rawValue
+                        ]
                     )
                 }
             )
@@ -115,9 +193,20 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 
     private func drain(_ provider: GrokBuildACPHeadlessAgentProvider, message: String) async throws {
+        _ = try await collect(provider, message: message)
+    }
+
+    private func collect(
+        _ provider: GrokBuildACPHeadlessAgentProvider,
+        message: String
+    ) async throws -> [AIStreamResult] {
         let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: message))
-        for try await _ in stream {}
+        var results: [AIStreamResult] = []
+        for try await result in stream {
+            results.append(result)
+        }
         await provider.dispose()
+        return results
     }
 
     private func makeHarness() throws -> Harness {
@@ -128,8 +217,10 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         import json
         import os
         import sys
+        import time
 
         record_path = os.environ.get("ACP_RECORD_PATH")
+        scenario = os.environ.get("ACP_SCENARIO", "standard")
         session_id = "grok-headless-session"
 
         if "--help" in sys.argv:
@@ -144,6 +235,18 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
 
         def respond(request_id, result=None):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result or {}}), flush=True)
+
+        def emit_update(update):
+            print(json.dumps({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": session_id, "update": update}
+            }), flush=True)
+
+        def emit_content(text):
+            emit_update({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text}
+            })
 
         for line in sys.stdin:
             line = line.strip()
@@ -176,13 +279,43 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             elif method == "session/set_model":
                 respond(request_id, {"_meta": {"model": {"Ok": params.get("modelId")}}})
             elif method == "session/prompt":
-                print(json.dumps({
-                    "jsonrpc": "2.0", "method": "session/update",
-                    "params": {"sessionId": session_id, "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": "pong"}}}
-                }), flush=True)
-                respond(request_id, {"stopReason": "end_turn"})
+                if scenario == "status_and_short_content":
+                    emit_update({
+                        "sessionUpdate": "session_info_update",
+                        "title": "RepoPrompt Agent File Tools Plan"
+                    })
+                    emit_content("No.")
+                    respond(request_id, {"stopReason": "end_turn"})
+                elif scenario == "pre_terminal_fragments":
+                    emit_content("Clean ")
+                    emit_content("answer.")
+                    respond(request_id, {"stopReason": "end_turn"})
+                    sys.exit(0)
+                elif scenario == "post_response_content":
+                    emit_content("Full ")
+                    respond(request_id, {"stopReason": "end_turn"})
+                    for _ in sys.stdin:
+                        pass
+                    emit_content("response.")
+                    sys.exit(0)
+                elif scenario == "descendant_late_content_holding_pipes":
+                    emit_content("Full ")
+                    respond(request_id, {"stopReason": "end_turn"})
+                    child_pid = os.fork()
+                    if child_pid == 0:
+                        time.sleep(0.2)
+                        emit_content("response.")
+                        time.sleep(30)
+                        os._exit(0)
+                    os._exit(0)
+                elif scenario == "unsettled_transport":
+                    emit_content("No.")
+                    respond(request_id, {"stopReason": "end_turn"})
+                    while True:
+                        time.sleep(1)
+                else:
+                    emit_content("pong")
+                    respond(request_id, {"stopReason": "end_turn"})
             elif request_id is not None:
                 respond(request_id, {})
         """# + "\n"
