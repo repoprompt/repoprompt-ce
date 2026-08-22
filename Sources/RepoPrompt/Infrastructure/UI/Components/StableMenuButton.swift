@@ -15,19 +15,29 @@ struct StableMenuButton<Label: View>: View {
 
     let items: () -> [StableMenuItem]
     let triggerStyle: TriggerStyle
+    let openRequestCount: Int
+    let programmaticPresentationID: AnyHashable?
+    let isProgrammaticPresentationAllowed: Bool
     let onOpen: @MainActor () -> Void
     @ViewBuilder let label: () -> Label
 
+    @Environment(\.isEnabled) private var isEnabled
     @StateObject private var presenter = StableMenuPresenter()
 
     init(
         items: @escaping () -> [StableMenuItem],
         triggerStyle: TriggerStyle = .automatic,
+        openRequestCount: Int = 0,
+        programmaticPresentationID: AnyHashable? = nil,
+        isProgrammaticPresentationAllowed: Bool = true,
         onOpen: @escaping @MainActor () -> Void = {},
         @ViewBuilder label: @escaping () -> Label
     ) {
         self.items = items
         self.triggerStyle = triggerStyle
+        self.openRequestCount = openRequestCount
+        self.programmaticPresentationID = programmaticPresentationID
+        self.isProgrammaticPresentationAllowed = isProgrammaticPresentationAllowed
         self.onOpen = onOpen
         self.label = label
     }
@@ -45,14 +55,35 @@ struct StableMenuButton<Label: View>: View {
 
     private var button: some View {
         Button {
-            onOpen()
-            presenter.present(items())
+            presentMenu(expectedProgrammaticPresentationID: nil, requiresProgrammaticPermission: false)
         } label: {
             label()
         }
         .background(
-            StableMenuAnchorView(presenter: presenter)
-                .allowsHitTesting(false)
+            StableMenuAnchorView(
+                presenter: presenter,
+                isEnabled: isEnabled,
+                programmaticPresentationID: programmaticPresentationID,
+                isProgrammaticPresentationAllowed: isProgrammaticPresentationAllowed,
+                onOpen: onOpen,
+                items: items
+            )
+            .allowsHitTesting(false)
+        )
+        .onChange(of: openRequestCount) {
+            presenter.enqueueProgrammaticPresentation(expectedPresentationID: programmaticPresentationID)
+        }
+    }
+
+    private func presentMenu(
+        expectedProgrammaticPresentationID: AnyHashable?,
+        requiresProgrammaticPermission: Bool
+    ) {
+        presenter.present(
+            expectedProgrammaticPresentationID: expectedProgrammaticPresentationID,
+            requiresProgrammaticPermission: requiresProgrammaticPermission,
+            onOpen: onOpen,
+            items: items
         )
     }
 }
@@ -203,21 +234,76 @@ private extension NSMenu {
 }
 
 @MainActor
-private final class StableMenuPresenter: NSObject, ObservableObject, NSMenuDelegate {
-    weak var anchorView: NSView?
-    private var retainedMenu: NSMenu?
+final class StableMenuPresenter: NSObject, ObservableObject, NSMenuDelegate {
+    typealias PopUpMenu = (NSMenu, NSPoint, NSView) -> Void
 
-    func present(_ items: [StableMenuItem]) {
-        guard !items.isEmpty else { return }
-        guard let anchorView else { return }
+    weak var anchorView: NSView?
+    private var isEnabled = true
+    private var programmaticPresentationID: AnyHashable?
+    private var isProgrammaticPresentationAllowed = true
+    private var currentOnOpen: (() -> Void)?
+    private var currentItems: (() -> [StableMenuItem])?
+    private var retainedMenu: NSMenu?
+    private let popUpMenu: PopUpMenu
+
+    init(popUpMenu: @escaping PopUpMenu = { menu, point, anchorView in
+        menu.popUp(positioning: nil, at: point, in: anchorView)
+    }) {
+        self.popUpMenu = popUpMenu
+    }
+
+    func update(
+        anchorView: NSView,
+        isEnabled: Bool,
+        programmaticPresentationID: AnyHashable?,
+        isProgrammaticPresentationAllowed: Bool,
+        onOpen: @escaping () -> Void,
+        items: @escaping () -> [StableMenuItem]
+    ) {
+        self.anchorView = anchorView
+        self.isEnabled = isEnabled
+        self.programmaticPresentationID = programmaticPresentationID
+        self.isProgrammaticPresentationAllowed = isProgrammaticPresentationAllowed
+        currentOnOpen = onOpen
+        currentItems = items
+    }
+
+    func enqueueProgrammaticPresentation(expectedPresentationID: AnyHashable?) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let currentOnOpen, let currentItems else { return }
+            present(
+                expectedProgrammaticPresentationID: expectedPresentationID,
+                requiresProgrammaticPermission: true,
+                onOpen: currentOnOpen,
+                items: currentItems
+            )
+        }
+    }
+
+    func present(
+        expectedProgrammaticPresentationID: AnyHashable?,
+        requiresProgrammaticPermission: Bool,
+        onOpen: () -> Void,
+        items: () -> [StableMenuItem]
+    ) {
+        guard isEnabled else { return }
+        guard let anchorView, anchorView.window != nil else { return }
+        if requiresProgrammaticPermission {
+            guard isProgrammaticPresentationAllowed else { return }
+            guard expectedProgrammaticPresentationID == programmaticPresentationID else { return }
+        }
+
+        onOpen()
+        let menuItems = items()
+        guard !menuItems.isEmpty else { return }
 
         retainedMenu?.cancelTracking()
-        let menu = NSMenu.stableMenu(from: items, fontPreset: FontScalePreset.current)
+        let menu = NSMenu.stableMenu(from: menuItems, fontPreset: FontScalePreset.current)
         menu.delegate = self
         retainedMenu = menu
 
         let popupPoint = NSPoint(x: 0, y: anchorView.bounds.height + 2)
-        menu.popUp(positioning: nil, at: popupPoint, in: anchorView)
+        popUpMenu(menu, popupPoint, anchorView)
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -241,19 +327,35 @@ private final class StableMenuActionBox: NSObject {
 @MainActor
 private struct StableMenuAnchorView: NSViewRepresentable {
     @ObservedObject var presenter: StableMenuPresenter
+    let isEnabled: Bool
+    let programmaticPresentationID: AnyHashable?
+    let isProgrammaticPresentationAllowed: Bool
+    let onOpen: () -> Void
+    let items: () -> [StableMenuItem]
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
-        presenter.anchorView = view
+        updatePresenter(anchorView: view)
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        presenter.anchorView = nsView
+        updatePresenter(anchorView: nsView)
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: ()) {
         // Do not cancel tracking here. SwiftUI may rebuild the trigger while the AppKit
         // menu is open; retaining the menu through `StableMenuPresenter` is the point.
+    }
+
+    private func updatePresenter(anchorView: NSView) {
+        presenter.update(
+            anchorView: anchorView,
+            isEnabled: isEnabled,
+            programmaticPresentationID: programmaticPresentationID,
+            isProgrammaticPresentationAllowed: isProgrammaticPresentationAllowed,
+            onOpen: onOpen,
+            items: items
+        )
     }
 }
