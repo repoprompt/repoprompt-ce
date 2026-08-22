@@ -172,13 +172,16 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
             tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
             agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
-            tabName: "Line 1\n\"quoted\" \\ path"
+            tabName: "Line 1\n\"quoted\" \\ path — 日本語 👨‍👩‍👧‍👦 \u{85}\u{2028}\u{2029}"
         )
 
         let prompt = AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli-debug")
         let lines = prompt.split(separator: "\n", omittingEmptySubsequences: false)
 
-        XCTAssertEqual(lines[2], #"Session title: "Line 1\n\"quoted\" \\ path""#)
+        XCTAssertEqual(
+            lines[2],
+            #"Session title: "Line 1\n\"quoted\" \\ path — 日本語 👨‍👩‍👧‍👦 \u{85}\u{2028}\u{2029}""#
+        )
         XCTAssertEqual(prompt.components(separatedBy: "Agent session ID:").count, 2)
         XCTAssertTrue(prompt.contains("Agent session ID: 33333333-3333-3333-3333-333333333333"))
     }
