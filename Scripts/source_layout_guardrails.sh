@@ -771,6 +771,7 @@ print_matches \
 allowed_tracked_docs=(
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/context-composer.md"
+  "docs/architecture/desktop-agent-authority.md"
   "docs/architecture/headless-mcp-runtime.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
