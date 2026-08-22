@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 
 @MainActor
-final class CodexConnectedAppsProviderBindingTests: XCTestCase {
+final class CodexCapabilityProviderBindingTests: XCTestCase {
     private var suiteNames: [String] = []
 
     override func tearDown() {
@@ -14,79 +14,119 @@ final class CodexConnectedAppsProviderBindingTests: XCTestCase {
         super.tearDown()
     }
 
-    func testProviderSnapshotDefaultsOffAndHumanMutationRoundTrips() throws {
+    func testProviderSnapshotDefaultsOffAndMutationsRemainIndependent() throws {
         let defaults = try makeIsolatedDefaults()
         let snapshots = AgentProviderPreferenceSnapshotStore(
             defaults: defaults,
             codexMCPServerEntries: { [] }
         )
 
-        XCTAssertFalse(try XCTUnwrap(
+        var tools = try XCTUnwrap(
             snapshots.topLevelSettingsControlsBinding(providerID: .codex).codexTools
-        ).connectedAppsEnabled)
+        )
+        XCTAssertFalse(tools.appsEnabled)
+        XCTAssertFalse(tools.pluginsEnabled)
+        XCTAssertFalse(tools.mcpElicitationEnabled)
+        XCTAssertFalse(tools.toolSuggestionsEnabled)
 
-        snapshots.applyCodexToolSettingMutation(.connectedApps(enabled: true))
+        snapshots.applyCodexToolSettingMutation(.apps(enabled: true))
+        tools = try XCTUnwrap(snapshots.topLevelSettingsControlsBinding(providerID: .codex).codexTools)
+        XCTAssertTrue(tools.appsEnabled)
+        XCTAssertFalse(tools.pluginsEnabled)
+        XCTAssertFalse(tools.mcpElicitationEnabled)
+        XCTAssertFalse(tools.toolSuggestionsEnabled)
 
-        XCTAssertTrue(try XCTUnwrap(
-            snapshots.topLevelSettingsControlsBinding(providerID: .codex).codexTools
-        ).connectedAppsEnabled)
-        XCTAssertEqual(defaults.object(forKey: CodexConnectedApps.defaultsKey) as? Bool, true)
+        snapshots.applyCodexToolSettingMutation(.plugins(enabled: true))
+        snapshots.applyCodexToolSettingMutation(.mcpElicitation(enabled: true))
+        snapshots.applyCodexToolSettingMutation(.toolSuggestions(enabled: true))
+        tools = try XCTUnwrap(snapshots.topLevelSettingsControlsBinding(providerID: .codex).codexTools)
+        XCTAssertTrue(tools.appsEnabled)
+        XCTAssertTrue(tools.pluginsEnabled)
+        XCTAssertTrue(tools.mcpElicitationEnabled)
+        XCTAssertTrue(tools.toolSuggestionsEnabled)
+        for preference in CodexCapabilityPreference.allCases {
+            XCTAssertEqual(defaults.object(forKey: preference.defaultsKey) as? Bool, true)
+        }
     }
 
-    func testLaunchSnapshotAllowsDirectSessionAndRejectsMCPRelatedSession() throws {
+    func testLaunchSnapshotProjectsMixedDirectChoicesAndDisablesMCPRelatedSessions() throws {
         let defaults = try makeIsolatedDefaults()
-        defaults.set(true, forKey: CodexConnectedApps.defaultsKey)
+        CodexCapabilityPreference.apps.setEnabled(true, defaults: defaults)
+        CodexCapabilityPreference.plugins.setEnabled(false, defaults: defaults)
+        CodexCapabilityPreference.mcpElicitation.setEnabled(true, defaults: defaults)
+        CodexCapabilityPreference.toolSuggestions.setEnabled(false, defaults: defaults)
         let service = AgentModeProviderBindingService(preferences: AgentProviderPreferenceSnapshotStore(
             defaults: defaults,
             codexMCPServerEntries: { [] }
         ))
 
-        XCTAssertTrue(service.codexConnectedAppsEnabledForLaunch(isMCPRelated: false))
-        XCTAssertFalse(service.codexConnectedAppsEnabledForLaunch(isMCPRelated: true))
+        XCTAssertEqual(
+            service.codexCapabilitiesForLaunch(isMCPRelated: false),
+            CodexCapabilitySettings(
+                appsEnabled: true,
+                pluginsEnabled: false,
+                mcpElicitationEnabled: true,
+                toolSuggestionsEnabled: false
+            )
+        )
+        XCTAssertEqual(service.codexCapabilitiesForLaunch(isMCPRelated: true), .disabled)
     }
 
     func testCoordinatorLaunchSnapshotKeepsMCPRelatedSessionsDisabledForLifetime() async {
         await assertCoordinatorLaunch(
             label: "direct human",
-            expectedConnectedAppsEnabled: true
+            expectedCapabilities: Self.allEnabled
         ) { _ in }
         await assertCoordinatorLaunch(
             label: "live MCP control",
-            expectedConnectedAppsEnabled: false
+            expectedCapabilities: .disabled
         ) { session in
             session.mcpControlContext = makeLiveMCPControlContext()
         }
         await assertCoordinatorLaunch(
             label: "released MCP-originated session",
-            expectedConnectedAppsEnabled: false
+            expectedCapabilities: .disabled
         ) { session in
             session.isMCPOriginated = true
         }
         await assertCoordinatorLaunch(
             label: "released temporary MCP control",
-            expectedConnectedAppsEnabled: false
+            expectedCapabilities: .disabled
         ) { session in
             session.mcpControlActivationGeneration = 2
         }
+        await assertCoordinatorLaunch(
+            label: "MCP-parented session",
+            expectedCapabilities: .disabled
+        ) { session in
+            session.parentSessionID = UUID()
+        }
     }
+
+    private static let allEnabled = CodexCapabilitySettings(
+        appsEnabled: true,
+        pluginsEnabled: true,
+        mcpElicitationEnabled: true,
+        toolSuggestionsEnabled: true
+    )
 
     private func assertCoordinatorLaunch(
         label: String,
-        expectedConnectedAppsEnabled: Bool,
+        expectedCapabilities: CodexCapabilitySettings,
         configure: (AgentModeViewModel.TabSession) -> Void
     ) async {
-        let controller = ConnectedAppsLaunchFakeCodexController()
-        var capturedConnectedAppsEnabled: Bool?
+        let controller = CapabilityLaunchFakeCodexController()
+        var capturedCapabilities: CodexCapabilitySettings?
         let viewModel = AgentModeViewModel(
             testWorkspacePath: "/repo",
             codexControllerFactory: { _, _, _, _, _, _ in controller },
-            codexControllerFactoryWithComputerUse: { _, _, _, _, _, _, _, connectedAppsEnabled in
-                capturedConnectedAppsEnabled = connectedAppsEnabled
+            codexControllerFactoryWithComputerUse: { _, _, _, _, _, _, _, capabilities in
+                capturedCapabilities = capabilities
                 return controller
             },
-            testCodexHookApprovalSettingsProvider: ConnectedAppsHookApprovalSettings(),
-            testCodexConnectedAppsEnabledForLaunch: { isMCPRelated in
-                !isMCPRelated
+            testCodexHookApprovalSettingsProvider: CapabilityHookApprovalSettings(),
+            testCodexCapabilitiesForLaunch: { isMCPRelated in
+                isMCPRelated ? .disabled : Self.allEnabled
             }
         )
         viewModel.test_initializeRunService()
@@ -97,7 +137,7 @@ final class CodexConnectedAppsProviderBindingTests: XCTestCase {
 
         await viewModel.test_codexCoordinator.ensureCodexNativeSession(session: session)
 
-        XCTAssertEqual(capturedConnectedAppsEnabled, expectedConnectedAppsEnabled, label)
+        XCTAssertEqual(capturedCapabilities, expectedCapabilities, label)
         await viewModel.test_codexCoordinator.shutdownCodexSession(session)
     }
 
@@ -125,7 +165,7 @@ final class CodexConnectedAppsProviderBindingTests: XCTestCase {
     }
 
     private func makeIsolatedDefaults() throws -> UserDefaults {
-        let suiteName = "CodexConnectedAppsProviderBindingTests.\(UUID().uuidString)"
+        let suiteName = "CodexCapabilityProviderBindingTests.\(UUID().uuidString)"
         suiteNames.append(suiteName)
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
@@ -134,13 +174,13 @@ final class CodexConnectedAppsProviderBindingTests: XCTestCase {
 }
 
 @MainActor
-private final class ConnectedAppsHookApprovalSettings: CodexHookApprovalSettingsProviding {
+private final class CapabilityHookApprovalSettings: CodexHookApprovalSettingsProviding {
     func codexHookApprovalStrictModeEnabled(workspaceID _: UUID?) -> Bool {
         false
     }
 }
 
-private final class ConnectedAppsLaunchFakeCodexController: CodexSessionControllerPassiveStubDefaults {
+private final class CapabilityLaunchFakeCodexController: CodexSessionControllerPassiveStubDefaults {
     let events: AsyncStream<CodexNativeSessionController.Event>
     private var eventsContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
 

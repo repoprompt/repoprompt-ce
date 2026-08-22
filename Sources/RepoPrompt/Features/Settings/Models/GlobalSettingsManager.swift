@@ -1330,13 +1330,43 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         }
     }
 
-    func codexConnectedAppsEnabled() -> Bool {
-        CodexConnectedApps.isEnabled(persistedValue: scalarPreferences.agentMode?.codexConnectedAppsEnabled)
+    func codexAppsEnabled() -> Bool {
+        CodexCapabilityPreference.isEnabled(persistedValue: scalarPreferences.agentMode?.codexAppsEnabled)
     }
 
-    func setCodexConnectedAppsEnabled(_ enabled: Bool, commit: Bool = true) {
+    func setCodexAppsEnabled(_ enabled: Bool, commit: Bool = true) {
         updateAgentModeScalar(commit: commit) { settings in
-            settings.codexConnectedAppsEnabled = enabled
+            settings.codexAppsEnabled = enabled
+        }
+    }
+
+    func codexPluginsEnabled() -> Bool {
+        CodexCapabilityPreference.isEnabled(persistedValue: scalarPreferences.agentMode?.codexPluginsEnabled)
+    }
+
+    func setCodexPluginsEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexPluginsEnabled = enabled
+        }
+    }
+
+    func codexMCPElicitationEnabled() -> Bool {
+        CodexCapabilityPreference.isEnabled(persistedValue: scalarPreferences.agentMode?.codexMCPElicitationEnabled)
+    }
+
+    func setCodexMCPElicitationEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexMCPElicitationEnabled = enabled
+        }
+    }
+
+    func codexToolSuggestionsEnabled() -> Bool {
+        CodexCapabilityPreference.isEnabled(persistedValue: scalarPreferences.agentMode?.codexToolSuggestionsEnabled)
+    }
+
+    func setCodexToolSuggestionsEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexToolSuggestionsEnabled = enabled
         }
     }
 

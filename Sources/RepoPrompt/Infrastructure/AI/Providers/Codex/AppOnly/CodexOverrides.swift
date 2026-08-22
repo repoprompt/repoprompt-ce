@@ -1,13 +1,6 @@
 import Foundation
 
 enum CodexOverrides {
-    private static let connectedAppsConfigKeys = [
-        "features.apps",
-        "features.plugins",
-        "features.tool_call_mcp_elicitation",
-        "features.tool_suggest"
-    ]
-
     private static let forcedDisabledConfig: [String: Bool] = [
         "features.apps": false,
         "features.memories": false,
@@ -35,31 +28,31 @@ enum CodexOverrides {
         var goalsEnabled: Bool
         var memoriesEnabled: Bool
         var computerUseEnabled: Bool
-        var connectedAppsEnabled: Bool
+        var capabilities: CodexCapabilitySettings
 
         static let defaultDisabled = FeaturePolicy(
             goalsEnabled: false,
             memoriesEnabled: false,
             computerUseEnabled: false,
-            connectedAppsEnabled: false
+            capabilities: .disabled
         )
         static let enabledForGoals = FeaturePolicy(
             goalsEnabled: true,
             memoriesEnabled: false,
             computerUseEnabled: false,
-            connectedAppsEnabled: false
+            capabilities: .disabled
         )
         static func resolved(
             goalsEnabled: Bool,
             memoriesEnabled: Bool,
             computerUseEnabled: Bool,
-            connectedAppsEnabled: Bool = false
+            capabilities: CodexCapabilitySettings = .disabled
         ) -> FeaturePolicy {
             FeaturePolicy(
                 goalsEnabled: goalsEnabled,
                 memoriesEnabled: memoriesEnabled,
                 computerUseEnabled: computerUseEnabled,
-                connectedAppsEnabled: connectedAppsEnabled
+                capabilities: capabilities
             )
         }
     }
@@ -181,9 +174,10 @@ enum CodexOverrides {
 
     private static func forcedConfig(featurePolicy: FeaturePolicy) -> [String: Bool] {
         var config = forcedDisabledConfig
-        for key in connectedAppsConfigKeys {
-            config[key] = featurePolicy.connectedAppsEnabled
-        }
+        config["features.apps"] = featurePolicy.capabilities.appsEnabled
+        config["features.plugins"] = featurePolicy.capabilities.pluginsEnabled
+        config["features.tool_call_mcp_elicitation"] = featurePolicy.capabilities.mcpElicitationEnabled
+        config["features.tool_suggest"] = featurePolicy.capabilities.toolSuggestionsEnabled
         if featurePolicy.goalsEnabled {
             config["features.goals"] = true
         }

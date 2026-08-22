@@ -177,8 +177,14 @@ final class AgentProviderPreferenceSnapshotStore {
             CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
         case let .memories(enabled):
             CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
-        case let .connectedApps(enabled):
-            CodexAgentModeBooleanPreference.connectedApps.setEnabled(enabled, defaults: defaults)
+        case let .apps(enabled):
+            CodexAgentModeBooleanPreference.apps.setEnabled(enabled, defaults: defaults)
+        case let .plugins(enabled):
+            CodexAgentModeBooleanPreference.plugins.setEnabled(enabled, defaults: defaults)
+        case let .mcpElicitation(enabled):
+            CodexAgentModeBooleanPreference.mcpElicitation.setEnabled(enabled, defaults: defaults)
+        case let .toolSuggestions(enabled):
+            CodexAgentModeBooleanPreference.toolSuggestions.setEnabled(enabled, defaults: defaults)
         case let .mcpServer(normalizedName, enabled):
             CodexAgentToolPreferences.setMCPServerEnabled(
                 normalizedName: normalizedName,
@@ -211,8 +217,20 @@ final class AgentProviderPreferenceSnapshotStore {
         applyCodexToolSettingMutation(.memories(enabled: enabled))
     }
 
-    func setCodexConnectedAppsEnabled(_ enabled: Bool) {
-        applyCodexToolSettingMutation(.connectedApps(enabled: enabled))
+    func setCodexAppsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.apps(enabled: enabled))
+    }
+
+    func setCodexPluginsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.plugins(enabled: enabled))
+    }
+
+    func setCodexMCPElicitationEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.mcpElicitation(enabled: enabled))
+    }
+
+    func setCodexToolSuggestionsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.toolSuggestions(enabled: enabled))
     }
 
     func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
@@ -414,7 +432,10 @@ final class AgentProviderPreferenceSnapshotStore {
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
-                connectedAppsEnabled: codexConnectedAppsEnabled(),
+                appsEnabled: codexAppsEnabled(),
+                pluginsEnabled: codexPluginsEnabled(),
+                mcpElicitationEnabled: codexMCPElicitationEnabled(),
+                toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -431,7 +452,10 @@ final class AgentProviderPreferenceSnapshotStore {
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
-                connectedAppsEnabled: codexConnectedAppsEnabled(),
+                appsEnabled: codexAppsEnabled(),
+                pluginsEnabled: codexPluginsEnabled(),
+                mcpElicitationEnabled: codexMCPElicitationEnabled(),
+                toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -483,8 +507,20 @@ final class AgentProviderPreferenceSnapshotStore {
         CodexAgentModeBooleanPreference.memories.isEnabled(defaults: defaults)
     }
 
-    private func codexConnectedAppsEnabled() -> Bool {
-        CodexAgentModeBooleanPreference.connectedApps.isEnabled(defaults: defaults)
+    private func codexAppsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.apps.isEnabled(defaults: defaults)
+    }
+
+    private func codexPluginsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.plugins.isEnabled(defaults: defaults)
+    }
+
+    private func codexMCPElicitationEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.mcpElicitation.isEnabled(defaults: defaults)
+    }
+
+    private func codexToolSuggestionsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.toolSuggestions.isEnabled(defaults: defaults)
     }
 
     private func claudeEffortLevel(

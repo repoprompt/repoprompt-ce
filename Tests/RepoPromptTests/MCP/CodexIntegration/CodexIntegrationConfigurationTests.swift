@@ -514,23 +514,23 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertFalse(execArguments.contains { $0.contains("features.parallel_tool_calls") })
     }
 
-    func testRuntimePoliciesForceConnectedAppsOffExceptExplicitNativeAgentModeOptIn() {
+    func testRuntimePoliciesForceOptionalCapabilitiesOffExceptDirectNativeAgentModeChoices() {
         let policy = CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,
             shellToolEnabled: false,
             webSearchRequestEnabled: false,
             multiAgentEnabled: false
         )
-
-        let cliOverrides = CodexOverrides.cliConfigArgs(toolPolicy: policy)
-        let appServerOverrides = CodexOverrides.appServerConfigMap(toolPolicy: policy)
-        let connectedAppsFeatures = [
+        let capabilityKeys = [
             "features.apps",
             "features.plugins",
             "features.tool_call_mcp_elicitation",
             "features.tool_suggest"
         ]
-        for key in connectedAppsFeatures {
+
+        let cliOverrides = CodexOverrides.cliConfigArgs(toolPolicy: policy)
+        let appServerOverrides = CodexOverrides.appServerConfigMap(toolPolicy: policy)
+        for key in capabilityKeys {
             XCTAssertTrue(cliOverrides.contains("\(key)=false"), key)
             XCTAssertEqual(appServerOverrides[key] as? Bool, false, key)
         }
@@ -539,28 +539,34 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
             shellToolEnabled: false,
             computerUseEnabled: true
         )
-        for key in connectedAppsFeatures {
+        for key in capabilityKeys {
             XCTAssertEqual(nativeAgentDefaults[key] as? Bool, false, key)
         }
 
-        let nativeAgentOptIn = CodexNativeSessionController.defaultAppServerConfigOverrides(
+        let nativeAgentChoices = CodexNativeSessionController.defaultAppServerConfigOverrides(
             shellToolEnabled: false,
-            connectedAppsEnabled: true,
+            capabilities: CodexCapabilitySettings(
+                appsEnabled: true,
+                pluginsEnabled: false,
+                mcpElicitationEnabled: true,
+                toolSuggestionsEnabled: false
+            ),
             computerUseEnabled: false
         )
-        for key in connectedAppsFeatures {
-            XCTAssertEqual(nativeAgentOptIn[key] as? Bool, true, key)
-        }
+        XCTAssertEqual(nativeAgentChoices["features.apps"] as? Bool, true)
+        XCTAssertEqual(nativeAgentChoices["features.plugins"] as? Bool, false)
+        XCTAssertEqual(nativeAgentChoices["features.tool_call_mcp_elicitation"] as? Bool, true)
+        XCTAssertEqual(nativeAgentChoices["features.tool_suggest"] as? Bool, false)
 
         let interactiveChatOverrides = CodexCLIProvider().interactiveConfigOverrides(
             excludeServers: []
         )
-        for key in connectedAppsFeatures {
+        for key in capabilityKeys {
             XCTAssertEqual(interactiveChatOverrides[key] as? Bool, false, key)
         }
 
         let headlessOverrides = CodexIntegrationConfiguration.configOverrides(for: .agentRun)
-        for key in connectedAppsFeatures {
+        for key in capabilityKeys {
             XCTAssertTrue(headlessOverrides.contains("\(key)=false"), key)
         }
 
@@ -569,7 +575,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
             serverEntries: [],
             brokenServers: []
         ).args
-        for key in connectedAppsFeatures {
+        for key in capabilityKeys {
             XCTAssertTrue(execArguments.contains("\(key)=false"), key)
         }
     }

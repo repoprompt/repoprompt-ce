@@ -39,14 +39,20 @@ final class AgentModeProviderBindingService {
         preferences.runtimePermission(for: agent, profile: profile)
     }
 
-    /// Captures the human-owned Connected Apps preference for a direct Agent Mode launch.
-    /// MCP-related sessions remain unsupported for their lifetime even when the preference is on.
-    func codexConnectedAppsEnabledForLaunch(isMCPRelated: Bool) -> Bool {
-        guard !isMCPRelated else { return false }
-        return preferences
-            .topLevelSettingsControlsBinding(providerID: .codex)
-            .codexTools?
-            .connectedAppsEnabled == true
+    /// Snapshots human-owned Codex capability preferences for a direct Agent Mode launch.
+    /// MCP-related sessions remain restricted for their lifetime regardless of preference state.
+    func codexCapabilitiesForLaunch(isMCPRelated: Bool) -> CodexCapabilitySettings {
+        guard !isMCPRelated,
+              let tools = preferences
+              .topLevelSettingsControlsBinding(providerID: .codex)
+              .codexTools
+        else { return .disabled }
+        return CodexCapabilitySettings(
+            appsEnabled: tools.appsEnabled,
+            pluginsEnabled: tools.pluginsEnabled,
+            mcpElicitationEnabled: tools.mcpElicitationEnabled,
+            toolSuggestionsEnabled: tools.toolSuggestionsEnabled
+        )
     }
 
     func permissionProfileForMCPActivation(isSubagent: Bool) -> AgentProviderPermissionProfile {

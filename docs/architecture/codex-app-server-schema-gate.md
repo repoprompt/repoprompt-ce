@@ -152,11 +152,11 @@ already accepts that bounded shape.
 
 Codex 0.149.0 also changes upstream app and plugin availability. RepoPrompt does not inherit those
 runtime defaults: `features.apps`, `features.plugins`, `features.tool_call_mcp_elicitation`, and
-`features.tool_suggest` are explicitly false on every Codex launch/config surface by default. The
-human-only **Connected Apps** setting enables all four together only for supported direct native
-Agent Mode app-server sessions. The setting is absent from the MCP `app_settings` catalog, defaults
-to false for absent or legacy persistence, and cannot enable standard chat, headless exec, or
-MCP-related Agent Mode sessions at any point in their lifetime, including after live control ends.
+`features.tool_suggest` are explicitly false on every Codex launch/config surface by default. Four
+independent, human-owned settings can enable these capabilities separately for directly started
+native Agent Mode app-server sessions. Each setting is absent/default false and is intentionally
+absent from the MCP `app_settings` catalog. Standard chat, headless exec, and every MCP-related
+Agent Mode session force all four false for the session lifetime, including after live control ends.
 
 ## Files and tests
 

@@ -1650,7 +1650,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return FileManager.default.temporaryDirectory
         }
         let providerBindingService = AgentModeProviderBindingService()
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, connectedAppsEnabled in
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities in
             let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false)
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
@@ -1658,7 +1658,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
                 shellToolEnabled: permissionProfile.codexBashToolEnabled(),
                 suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
-                connectedAppsEnabledProvider: { connectedAppsEnabled },
+                capabilitiesProvider: { capabilities },
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
                 memoriesEnabledProvider: { CodexMemories.isEnabled },
@@ -1722,8 +1722,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexControllerFactory: codexControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
             shouldManageCodexTooling: true,
-            codexConnectedAppsEnabledForLaunch: { isMCPRelated in
-                providerBindingService.codexConnectedAppsEnabledForLaunch(isMCPRelated: isMCPRelated)
+            codexCapabilitiesForLaunch: { isMCPRelated in
+                providerBindingService.codexCapabilitiesForLaunch(isMCPRelated: isMCPRelated)
             },
             codexHookApprovalSettings: GlobalSettingsStore.shared,
             activeToolQuery: { [weak mcpServer] runID in
@@ -1863,7 +1863,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
-            testCodexConnectedAppsEnabledForLaunch: @escaping (_ isMCPRelated: Bool) -> Bool = { _ in false },
+            testCodexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
             testCodexActiveAgentRunWaitQuery: CodexAgentRunWaitQuery? = nil,
             testCodexActiveAgentRunWaitDrain: CodexAgentRunWaitDrain? = nil,
             testCodexLeaseRoutingTimeoutMs: Int? = nil,
@@ -1924,7 +1924,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 codexControllerFactory: codexControllerFactory,
                 connectionPolicyInstaller: connectionPolicyInstaller,
                 shouldManageCodexTooling: shouldManageCodexTooling,
-                codexConnectedAppsEnabledForLaunch: testCodexConnectedAppsEnabledForLaunch,
+                codexCapabilitiesForLaunch: testCodexCapabilitiesForLaunch,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
                 codexHookApprovalSettings: testCodexHookApprovalSettingsProvider ?? GlobalSettingsStore.shared,
                 activeToolQuery: testCodexActiveToolQuery
