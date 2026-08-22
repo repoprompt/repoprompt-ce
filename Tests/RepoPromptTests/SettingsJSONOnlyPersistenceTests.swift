@@ -1757,6 +1757,25 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fileURL), original)
     }
 
+    func testAppIconModeDefaultsToSystemAndPersists() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        XCTAssertEqual(store.appIconModeRaw(), "System")
+        store.setAppIconModeRaw("Light")
+
+        let reloaded = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertEqual(reloaded.appIconModeRaw(), "Light")
+    }
+
     func testFalseV4AtomicWriteFailurePreservesOriginalAfterExactBackup() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
