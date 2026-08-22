@@ -1706,26 +1706,40 @@ class WorkspaceFilesViewModel: ObservableObject {
         // Slice presence and relative-path eligibility are independent of binding
         // authority. Apply them first so the expensive global binding snapshot is
         // requested only for tabs that can target at least one modified file.
-        let candidateTabs = workspace.composeTabs.compactMap { tab -> (
-            tab: ComposeTabState,
-            sessionID: UUID,
-            slices: [String: [LineRange]],
-            candidateFileIDs: Set<UUID>
-        )? in
+        //
+        // The O(M×N) hasSuffix matching loop is CPU-intensive on large workspaces.
+        // Snapshot the needed value-types from @MainActor state, then offload the
+        // matching work to a background thread to avoid blocking the main thread.
+        struct TabSnapshot {
+            let tab: ComposeTabState
+            let sessionID: UUID
+            let slices: [String: [LineRange]]
+            let slicePaths: [String]
+        }
+        let tabSnapshots: [TabSnapshot] = workspace.composeTabs.compactMap { tab in
             guard let sessionID = tab.activeAgentSessionID else { return nil }
             let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
             guard !slices.isEmpty else { return nil }
-            let slicePaths = Array(slices.keys)
-            let candidateFileIDs = Set(modifiedFilesByID.compactMap { fileID, file -> UUID? in
-                let relativePath = file.standardizedRelativePath
-                guard slicePaths.contains(where: {
-                    $0 == relativePath || $0.hasSuffix("/\(relativePath)")
-                }) else { return nil }
-                return fileID
-            })
-            guard !candidateFileIDs.isEmpty else { return nil }
-            return (tab, sessionID, slices, candidateFileIDs)
+            return TabSnapshot(tab: tab, sessionID: sessionID, slices: slices, slicePaths: Array(slices.keys))
         }
+        guard !tabSnapshots.isEmpty else { return [:] }
+
+        // Copy value types needed by the background task.
+        let fileRelativePaths: [UUID: String] = Dictionary(uniqueKeysWithValues: modifiedFilesByID.map { ($0.key, $0.value.standardizedRelativePath) })
+
+        let candidateTabs: [(tab: ComposeTabState, sessionID: UUID, slices: [String: [LineRange]], candidateFileIDs: Set<UUID>)] =
+            await Task.detached(priority: .userInitiated) {
+                tabSnapshots.compactMap { snapshot in
+                    let candidateFileIDs = Set(fileRelativePaths.compactMap { fileID, relativePath -> UUID? in
+                        guard snapshot.slicePaths.contains(where: {
+                            $0 == relativePath || $0.hasSuffix("/\(relativePath)")
+                        }) else { return nil }
+                        return fileID
+                    })
+                    guard !candidateFileIDs.isEmpty else { return nil }
+                    return (snapshot.tab, snapshot.sessionID, snapshot.slices, candidateFileIDs)
+                }
+            }.value
         guard !candidateTabs.isEmpty else { return [:] }
 
         let bindingStates = provider(Set(candidateTabs.map(\.sessionID)))
