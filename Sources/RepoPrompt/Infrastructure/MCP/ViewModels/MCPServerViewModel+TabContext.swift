@@ -1136,13 +1136,8 @@ extension MCPServerViewModel {
             throw TabBindError.tabNotFound(tabID)
         }
 
-        // Tear down any previous binding for this connection
-        if tabContextByConnectionID[connectionID] != nil {
-            releaseBinding(connectionID: connectionID)
-        }
-
-        // Explicit tab-context bindings preserve the tab's stored state unless a caller opts into
-        // active selection flushing through the snapshot helper.
+        // Build the replacement before releasing a usable binding. A stale or otherwise invalid
+        // target must not turn a failed rebind into an unbound connection.
         var context = try makeTabContextSnapshot(
             tabID: tab.id,
             workspaceID: ws.id,
@@ -1152,6 +1147,10 @@ extension MCPServerViewModel {
             captureActiveUIState: false,
             flushActiveSelection: false
         )
+
+        if tabContextByConnectionID[connectionID] != nil {
+            releaseBinding(connectionID: connectionID)
+        }
 
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
@@ -2033,6 +2032,8 @@ extension MCPServerViewModel {
     struct ProspectiveFileToolLookupResolution {
         let lookupContext: WorkspaceLookupContext
         let sourceIdentity: AgentWorkspaceLookupContextIdentity
+        fileprivate let visibleRootFingerprint: String
+        fileprivate let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot?
     }
 
     @MainActor
@@ -2040,6 +2041,7 @@ extension MCPServerViewModel {
         tabID: UUID,
         workspaceID: UUID?
     ) async throws -> ProspectiveFileToolLookupResolution {
+        let visibleRootFingerprint = await fileToolVisibleRootFingerprint()
         var snapshot = try makeTabContextSnapshot(
             tabID: tabID,
             workspaceID: workspaceID,
@@ -2056,7 +2058,9 @@ extension MCPServerViewModel {
             )
             return ProspectiveFileToolLookupResolution(
                 lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
-                sourceIdentity: source.identity
+                sourceIdentity: source.identity,
+                visibleRootFingerprint: visibleRootFingerprint,
+                sessionRootLifetimeSnapshot: nil
             )
         }
 
@@ -2068,7 +2072,18 @@ extension MCPServerViewModel {
             source: source,
             store: promptVM.workspaceFileContextStore
         )
-        guard fileToolLookupSnapshotIsCurrent(snapshot, connectionID: nil),
+        let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot? = if let bindingProjection = lookupContext.bindingProjection {
+            await promptVM.workspaceFileContextStore.sessionBoundRootScopeValidationSnapshot(
+                lookupContext.rootScope,
+                expectedPhysicalRoots: bindingProjection.physicalRootRefs
+            )
+        } else {
+            nil
+        }
+        let currentVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard currentVisibleRootFingerprint == visibleRootFingerprint,
+              lookupContext.bindingProjection == nil || sessionRootLifetimeSnapshot != nil,
+              fileToolLookupSnapshotIsCurrent(snapshot, connectionID: nil),
               fileToolBindingSourceIsCurrent(source, for: snapshot)
         else {
             #if DEBUG
@@ -2076,12 +2091,29 @@ extension MCPServerViewModel {
             #endif
             return ProspectiveFileToolLookupResolution(
                 lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
-                sourceIdentity: source.identity
+                sourceIdentity: source.identity,
+                visibleRootFingerprint: visibleRootFingerprint,
+                sessionRootLifetimeSnapshot: nil
             )
+        }
+        if let sessionRootLifetimeSnapshot {
+            guard await sessionRootLifetimeSnapshot.isCurrent() else {
+                #if DEBUG
+                    fileToolLookupContextStaleCompletionCount += 1
+                #endif
+                return ProspectiveFileToolLookupResolution(
+                    lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
+                    sourceIdentity: source.identity,
+                    visibleRootFingerprint: visibleRootFingerprint,
+                    sessionRootLifetimeSnapshot: nil
+                )
+            }
         }
         return ProspectiveFileToolLookupResolution(
             lookupContext: lookupContext,
-            sourceIdentity: source.identity
+            sourceIdentity: source.identity,
+            visibleRootFingerprint: visibleRootFingerprint,
+            sessionRootLifetimeSnapshot: sessionRootLifetimeSnapshot
         )
     }
 
@@ -2112,6 +2144,59 @@ extension MCPServerViewModel {
         )
         return fileToolLookupSnapshotIsCurrent(snapshot, connectionID: nil)
             && source.identity == expectedSourceIdentity
+    }
+
+    @MainActor
+    func performIfProspectiveFileToolLookupResolutionIsCurrent(
+        _ resolution: ProspectiveFileToolLookupResolution,
+        tabID: UUID,
+        workspaceID: UUID,
+        operation: @MainActor () throws -> Void
+    ) async throws -> Bool {
+        guard prospectiveFileToolLookupSourceIsCurrent(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            expectedSourceIdentity: resolution.sourceIdentity
+        ) else { return false }
+
+        let currentVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard currentVisibleRootFingerprint == resolution.visibleRootFingerprint else { return false }
+        if let sessionRootLifetimeSnapshot = resolution.sessionRootLifetimeSnapshot {
+            guard await sessionRootLifetimeSnapshot.isCurrent() else { return false }
+        }
+
+        #if DEBUG
+            if let debugAfterFileToolLookupContextRootValidationForTesting {
+                await debugAfterFileToolLookupContextRootValidationForTesting()
+            }
+        #endif
+
+        let finalVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard finalVisibleRootFingerprint == resolution.visibleRootFingerprint,
+              prospectiveFileToolLookupSourceIsCurrent(
+                  tabID: tabID,
+                  workspaceID: workspaceID,
+                  expectedSourceIdentity: resolution.sourceIdentity
+              )
+        else { return false }
+
+        if let sessionRootLifetimeSnapshot = resolution.sessionRootLifetimeSnapshot {
+            var operationError: Error?
+            let didPerform = sessionRootLifetimeSnapshot.performIfGenerationCurrent {
+                do {
+                    try operation()
+                } catch {
+                    operationError = error
+                }
+            }
+            if let operationError {
+                throw operationError
+            }
+            return didPerform
+        }
+
+        try operation()
+        return true
     }
 
     @MainActor

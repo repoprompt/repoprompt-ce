@@ -4,6 +4,19 @@ import MCP
 import XCTest
 
 final class WorkingDirsBindRootProjectionTests: XCTestCase {
+    func testWorkingDirsLoadedRootValidationAcceptsDifferentlyCasedEquivalentPath() {
+        let loadedRoot = "/private/tmp/RepoPrompt/WorkingRoot"
+        let differentlyCasedRequest = "/PRIVATE/TMP/repoprompt/workingroot"
+
+        XCTAssertEqual(
+            WindowRoutingService.missingWorkingDirsRootProjectionPaths(
+                requestedRoots: [differentlyCasedRequest],
+                loadedRoots: [loadedRoot]
+            ),
+            []
+        )
+    }
+
     @MainActor
     func testWorkingDirsBindHydratesAgentProjectionBeforeBinding() async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
@@ -187,6 +200,100 @@ final class WorkingDirsBindRootProjectionTests: XCTestCase {
         do {
             _ = try await bindTask.value
             XCTFail("Expected the stale working_dirs target to be rejected")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("changed while its root projection was being resolved"), message)
+            XCTAssertTrue(message.contains("existing MCP binding was not changed"), message)
+        }
+        XCTAssertEqual(window.mcpServer.tabContextByConnectionID[connectionID]?.tabID, previousTabID)
+    }
+
+    @MainActor
+    func testWorkingDirsBindPreservesPreviousBindingWhenSessionRootLifetimeChangesAfterPreflight() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+        }
+
+        let logicalRootURL = try makeTemporaryDirectory(named: "working-dirs-lifetime-logical")
+        let physicalRootURL = try makeTemporaryDirectory(named: "working-dirs-lifetime-physical")
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: logicalRootURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: physicalRootURL.deletingLastPathComponent())
+        }
+
+        let previousTabID = UUID()
+        let agentTabID = UUID()
+        let agentSessionID = UUID()
+        let workspace = WorkspaceModel(
+            name: "Working Dirs Lifetime Fence",
+            repoPaths: [logicalRootURL.path],
+            customStoragePath: logicalRootURL.appendingPathComponent("workspace.json"),
+            composeTabs: [
+                ComposeTabState(id: previousTabID, name: "Previous"),
+                ComposeTabState(
+                    id: agentTabID,
+                    name: "Prospective Agent",
+                    activeAgentSessionID: agentSessionID
+                )
+            ],
+            activeComposeTabID: agentTabID
+        )
+        try await install(workspace: workspace, in: window, reason: "workingDirsLifetimeFenceTest")
+        let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: logicalRootURL.path
+        )
+        let physicalRoot = try await window.workspaceFileContextStore.loadRoot(
+            path: physicalRootURL.path,
+            kind: .sessionWorktree
+        )
+        let binding = makeWorktreeBinding(logicalRoot: logicalRoot, physicalRoot: physicalRoot)
+        window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
+            sessionID == agentSessionID && tabID == agentTabID ? .hydrated([binding]) : .unavailable
+        }
+
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "working-dirs-lifetime-fence-test",
+            tabID: previousTabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting {
+            window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
+            await window.workspaceFileContextStore.unloadRoot(id: physicalRoot.id)
+            do {
+                let replacementRoot = try await window.workspaceFileContextStore.loadRoot(
+                    path: physicalRootURL.path,
+                    kind: .sessionWorktree
+                )
+                XCTAssertNotEqual(replacementRoot.id, physicalRoot.id)
+            } catch {
+                XCTFail("Failed to reload the session root during the deterministic race: \(error)")
+            }
+        }
+        addTeardownBlock { @MainActor in
+            window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
+        }
+
+        let (service, bindContext) = try await bindContextTool(for: window)
+        defer { withExtendedLifetime(service) {} }
+        do {
+            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await bindContext([
+                    "op": .string("bind"),
+                    "working_dirs": .string(logicalRootURL.path),
+                    "create_if_missing": .bool(false)
+                ])
+            }
+            XCTFail("Expected session-root lifetime churn to reject the stale working_dirs bind")
         } catch {
             let message = String(describing: error)
             XCTAssertTrue(message.contains("changed while its root projection was being resolved"), message)

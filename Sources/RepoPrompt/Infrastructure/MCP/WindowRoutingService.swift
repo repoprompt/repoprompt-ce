@@ -1814,8 +1814,11 @@ final class WindowRoutingService: Service {
         throw MCPError.invalidParams("Ambiguous window choice for bind_context tab creation. Supply window_id. Available windows: \(available)")
     }
 
-    private func clearNonRunScopedBindingsAcrossWindows(for connectionID: UUID) {
-        for window in windowStates.allWindows {
+    private func clearNonRunScopedBindingsAcrossWindows(
+        for connectionID: UUID,
+        excludingWindowID: Int? = nil
+    ) {
+        for window in windowStates.allWindows where window.windowID != excludingWindowID {
             _ = window.mcpServer.clearNonRunScopedBinding(forConnection: connectionID)
         }
     }
@@ -1824,34 +1827,44 @@ final class WindowRoutingService: Service {
         _ target: ResolvedBindTarget,
         connectionID: UUID,
         clientName: String?,
-        expectedWorkingDirsSourceIdentity: AgentWorkspaceLookupContextIdentity? = nil,
+        expectedWorkingDirsResolution: MCPServerViewModel.ProspectiveFileToolLookupResolution? = nil,
         bindingAlreadyMatches: Bool = false
     ) async throws {
         guard let targetWindow = windowStates.allWindows.first(where: { $0.windowID == target.windowID }) else {
             throw MCPError.invalidParams("Window \(target.windowID) not found")
         }
-        if let expectedWorkingDirsSourceIdentity {
+        if let expectedWorkingDirsResolution {
             let currentTarget = try? resolveActiveTabBindTarget(
                 windowID: target.windowID,
                 expectedWorkspaceID: target.workspaceID,
                 matchedBy: target.matchedBy,
                 normalizedWorkingDirs: target.normalizedWorkingDirs
             )
-            guard currentTarget?.tabID == target.tabID,
-                  targetWindow.mcpServer.prospectiveFileToolLookupSourceIsCurrent(
-                      tabID: target.tabID,
-                      workspaceID: target.workspaceID,
-                      expectedSourceIdentity: expectedWorkingDirsSourceIdentity
-                  )
-            else {
-                throw MCPError.invalidRequest(
-                    "The working_dirs target changed while its root projection was being resolved. " +
-                        "The existing MCP binding was not changed. Bind again with the same working_dirs."
+            guard currentTarget?.tabID == target.tabID else {
+                throw staleWorkingDirsTargetError()
+            }
+            let didBind = try await targetWindow.mcpServer.performIfProspectiveFileToolLookupResolutionIsCurrent(
+                expectedWorkingDirsResolution,
+                tabID: target.tabID,
+                workspaceID: target.workspaceID
+            ) {
+                guard !bindingAlreadyMatches else { return }
+                try targetWindow.mcpServer.bindTabForConnection(
+                    connectionID: connectionID,
+                    clientName: clientName,
+                    tabID: target.tabID,
+                    workspaceID: target.workspaceID,
+                    windowID: target.windowID
+                )
+                clearNonRunScopedBindingsAcrossWindows(
+                    for: connectionID,
+                    excludingWindowID: target.windowID
                 )
             }
-        }
-        if !bindingAlreadyMatches {
-            clearNonRunScopedBindingsAcrossWindows(for: connectionID)
+            guard didBind else {
+                throw staleWorkingDirsTargetError()
+            }
+        } else if !bindingAlreadyMatches {
             try targetWindow.mcpServer.bindTabForConnection(
                 connectionID: connectionID,
                 clientName: clientName,
@@ -1859,8 +1872,19 @@ final class WindowRoutingService: Service {
                 workspaceID: target.workspaceID,
                 windowID: target.windowID
             )
+            clearNonRunScopedBindingsAcrossWindows(
+                for: connectionID,
+                excludingWindowID: target.windowID
+            )
         }
         try await networkMgr.setActiveWindowForCurrentConnection(target.windowID)
+    }
+
+    private func staleWorkingDirsTargetError() -> MCPError {
+        MCPError.invalidRequest(
+            "The working_dirs target changed while its root projection was being resolved. " +
+                "The existing MCP binding was not changed. Bind again with the same working_dirs."
+        )
     }
 
     private func resolveActiveTabBindTarget(
@@ -1892,10 +1916,19 @@ final class WindowRoutingService: Service {
         )
     }
 
+    nonisolated static func missingWorkingDirsRootProjectionPaths(
+        requestedRoots: [String],
+        loadedRoots: [String]
+    ) -> [String] {
+        let loadedRootKeys = Set(WorkspaceRootSetKey(paths: loadedRoots).normalizedPaths.map { $0.lowercased() })
+        return WorkspaceRootSetKey(paths: requestedRoots).normalizedPaths
+            .filter { !loadedRootKeys.contains($0.lowercased()) }
+    }
+
     private func ensureWorkingDirsRootProjectionIsLoaded(
         _ target: ResolvedBindTarget,
         requestedRoots: [String]
-    ) async throws -> AgentWorkspaceLookupContextIdentity {
+    ) async throws -> MCPServerViewModel.ProspectiveFileToolLookupResolution {
         let window = try resolveWindowForBinding(windowID: target.windowID)
         let resolution = try await window.mcpServer.resolveProspectiveFileToolLookupContext(
             tabID: target.tabID,
@@ -1904,9 +1937,10 @@ final class WindowRoutingService: Service {
         let scopedRoots = await window.promptManager.workspaceFileContextStore
             .rootRefs(scope: resolution.lookupContext.rootScope)
         let loadedRoots = resolution.lookupContext.bindingProjection?.visibleLogicalRootRefs ?? scopedRoots
-        let loadedRootPaths = Set(loadedRoots.map(\.standardizedFullPath))
-        let missingRoots = WorkspaceManagerViewModel.normalizedExactWorkspaceDirectorySet(requestedRoots)
-            .filter { !loadedRootPaths.contains($0) }
+        let missingRoots = Self.missingWorkingDirsRootProjectionPaths(
+            requestedRoots: requestedRoots,
+            loadedRoots: loadedRoots.map(\.standardizedFullPath)
+        )
         guard missingRoots.isEmpty else {
             throw MCPError.invalidRequest(
                 "working_dirs matched workspace '\(target.workspaceName)', but its active tab '\(target.tabName)' " +
@@ -1916,7 +1950,7 @@ final class WindowRoutingService: Service {
                     "then bind again with the same working_dirs."
             )
         }
-        return resolution.sourceIdentity
+        return resolution
     }
 
     private func listBindContextWindows(
@@ -2097,7 +2131,7 @@ final class WindowRoutingService: Service {
                                 normalizedWorkingDirs: target.normalizedWorkingDirs
                             )
                         }
-                        let sourceIdentity = try await ensureWorkingDirsRootProjectionIsLoaded(
+                        let prospectiveLookupResolution = try await ensureWorkingDirsRootProjectionIsLoaded(
                             tabTarget,
                             requestedRoots: target.normalizedWorkingDirs
                         )
@@ -2110,7 +2144,7 @@ final class WindowRoutingService: Service {
                             tabTarget,
                             connectionID: connectionID,
                             clientName: clientName,
-                            expectedWorkingDirsSourceIdentity: sourceIdentity,
+                            expectedWorkingDirsResolution: prospectiveLookupResolution,
                             bindingAlreadyMatches: unchanged
                         )
 
