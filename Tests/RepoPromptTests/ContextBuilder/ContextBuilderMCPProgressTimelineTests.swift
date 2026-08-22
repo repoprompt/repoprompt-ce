@@ -3,6 +3,26 @@ import Foundation
 import XCTest
 
 final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
+    private var previousAdditionalOracleModels: [String] = []
+
+    override func setUp() async throws {
+        previousAdditionalOracleModels = await MainActor.run {
+            GlobalSettingsStore.shared.additionalOracleModelRaws()
+        }
+        try await MainActor.run {
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws([], commit: false)
+        }
+        try await super.setUp()
+    }
+
+    override func tearDown() async throws {
+        let previousAdditionalOracleModels = previousAdditionalOracleModels
+        try await MainActor.run {
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(previousAdditionalOracleModels, commit: false)
+        }
+        try await super.tearDown()
+    }
+
     func testPhaseCatalogCoversExpectedDiscoveryAndGenerationSequence() {
         XCTAssertEqual(ContextBuilderMCPProgressPhase.allCases, [
             .providerProcessStarting,
@@ -1168,6 +1188,53 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         }
         XCTAssertEqual(mode, .plan)
         XCTAssertEqual(prompt, "<task>Shared caller task</task>")
+    }
+
+    func testGeneratedResponseFollowUpHintPreservesLegacyHintForNilOrSingleOracle() {
+        let expected = "Continue this plan conversation with ask_oracle(chat_id: \"chat-123\", new_chat: false)"
+        let noGroup = MCPContextBuilderToolProvider.generatedResponseFollowUpHint(
+            modeLabel: "plan",
+            chatID: "chat-123",
+            oracleCount: nil
+        )
+        let singleOracle = MCPContextBuilderToolProvider.generatedResponseFollowUpHint(
+            modeLabel: "plan",
+            chatID: "chat-123",
+            oracleCount: 1
+        )
+
+        XCTAssertEqual(noGroup, expected)
+        XCTAssertEqual(singleOracle, expected)
+        XCTAssertFalse(noGroup.contains("ordered, independent lane results"))
+        XCTAssertFalse(singleOracle.contains("ordered, independent lane results"))
+    }
+
+    func testGeneratedResponseFollowUpHintKeepsMultiOracleResultsIndependent() {
+        let continuation = "Continue this review conversation with ask_oracle(chat_id: \"chat-456\", new_chat: false)"
+        let groupGuidance = "The Oracle group returned ordered, independent lane results. Check each result against the task and report unresolved disagreements."
+        let expected = groupGuidance + "\n\nOptional later follow-up: " + continuation
+        let twoOracles = MCPContextBuilderToolProvider.generatedResponseFollowUpHint(
+            modeLabel: "review",
+            chatID: "chat-456",
+            oracleCount: 2
+        )
+        let fiveOracles = MCPContextBuilderToolProvider.generatedResponseFollowUpHint(
+            modeLabel: "review",
+            chatID: "chat-456",
+            oracleCount: 5
+        )
+
+        XCTAssertEqual(twoOracles, expected)
+        XCTAssertEqual(fiveOracles, expected)
+        for requiredText in [
+            "ordered, independent lane results",
+            "Check each result against the task",
+            "unresolved disagreements",
+            "Optional later follow-up:"
+        ] {
+            XCTAssertTrue(twoOracles.contains(requiredText), requiredText)
+        }
+        XCTAssertTrue(twoOracles.hasSuffix(continuation))
     }
 
     func testResponseDispositionRoutesRequestedModesAndFailsClosedOnMissingFollowUpState() {

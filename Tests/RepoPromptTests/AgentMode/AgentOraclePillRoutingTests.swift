@@ -1,5 +1,7 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -398,6 +400,242 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertNil(wrongWorkspace)
     }
 
+    func testAggregateOraclePillCountAndLabelsUseConfiguredOrLatestProjectedGroup() {
+        let historical = ChatSession(
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 5,
+            name: "Historical",
+            savedAt: Date(timeIntervalSince1970: 100)
+        )
+        let latestSingle = ChatSession(
+            name: "Latest Single",
+            savedAt: Date(timeIntervalSince1970: 200)
+        )
+        let latestGroupID = UUID()
+        let latestProjected = ChatSession(
+            oracleGroupID: latestGroupID,
+            oracleLaneIndex: 0,
+            oracleGroupSize: 4,
+            name: "Latest Group",
+            savedAt: Date(timeIntervalSince1970: 300)
+        )
+        let invalidProjected = ChatSession(
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 99,
+            name: "Invalid Projection",
+            savedAt: Date(timeIntervalSince1970: 400)
+        )
+
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(
+                configuredAdditionalCount: 0,
+                sessions: [historical, latestSingle]
+            ),
+            1
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(
+                configuredAdditionalCount: 0,
+                sessions: [historical, latestProjected]
+            ),
+            4
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 2, sessions: []),
+            3
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 0, sessions: [invalidProjected]),
+            5
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 99, sessions: []),
+            5
+        )
+        XCTAssertEqual(
+            (0 ... 4).map(OracleViewModel.oracleLabel(laneIndex:)),
+            ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(isStreaming: true, lastAssistantContent: "Error: stale"),
+            .streaming
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "partial answer\n\n--\nError:\nstatus code 502"
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "Error: status code 502 Gemini response stalled"
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "Review looks correct. Mention error handling."
+            ),
+            .completed
+        )
+    }
+
+    func testGroupedDeleteFallsBackToProjectionCleanupWhenCanonicalDocumentIsMissing() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        var projection = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 2,
+            name: "Missing Canonical Group",
+            messages: [StoredMessage(isUser: false, rawText: "preserve me", sequenceIndex: 0)]
+        )
+        projection.fileURL = try await fixture.oracleViewModel.chatData.saveChatSession(
+            projection,
+            for: fixture.workspace
+        )
+        fixture.oracleViewModel.sessions = [projection]
+
+        let handledAsGroup = try await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: projection)
+        XCTAssertFalse(handledAsGroup)
+        await fixture.oracleViewModel.deleteSession(projection)
+        XCTAssertTrue(fixture.oracleViewModel.sessions.isEmpty)
+        XCTAssertFalse(try FileManager.default.fileExists(atPath: XCTUnwrap(projection.fileURL).path))
+    }
+
+    func testEmptyRosterConfiguredEntryPointUsesLegacyValidationBeforeGroupPersistence() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let settings = GlobalSettingsStore.shared
+        let previousRoster = settings.additionalOracleModelRaws()
+        try settings.setAdditionalOracleModelRaws([], commit: false)
+        defer { try? settings.setAdditionalOracleModelRaws(previousRoster, commit: false) }
+        let workspaceID = UUID()
+        let packaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: fixture.tabID,
+            sourceWorkspaceID: workspaceID,
+            sourceSelectionRevision: 0,
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            promptText: "",
+            selection: StoredSelection(),
+            lookupContext: nil,
+            reviewGitContext: .automaticOnly(),
+            provenance: .direct
+        )
+        let context = OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: workspaceID,
+            activationPolicy: .background,
+            packaging: packaging
+        )
+
+        do {
+            _ = try await fixture.oracleViewModel.tool_chatSendWithConfiguredRoster(
+                args: [
+                    "message": .string("must not dispatch"),
+                    "model": .string("model-a"),
+                    "selected_paths": .array([])
+                ],
+                promptVM: fixture.composition.promptManager,
+                tabContext: context
+            )
+            XCTFail("Expected the legacy removed-argument validation to reject the call")
+        } catch let error as ChatToolError {
+            XCTAssertEqual(error.code, .invalidParams)
+            XCTAssertTrue(error.message.contains("selected_paths"), error.message)
+        }
+
+        let owner = try OracleConversationOwner(
+            kind: "app-tab",
+            identifier: "workspace:\(workspaceID.uuidString):tab:\(fixture.tabID.uuidString)"
+        )
+        let conversation = try await AppDomainRuntimeComposition.shared.oracleConversationStore
+            .loadMostRecentConversation(owner: owner)
+        if case let .group(group)? = conversation {
+            try? await AppDomainRuntimeComposition.shared.oracleConversationStore.delete(
+                groupID: group.group.id,
+                owner: owner,
+                expectedRevision: group.revision
+            )
+        }
+        XCTAssertNil(conversation)
+    }
+
+    func testGroupedDeleteRejectsProjectionThatIsNotACanonicalMember() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let owner = try OracleConversationOwner(
+            kind: "app-tab",
+            identifier: "workspace:\(fixture.workspace.id.uuidString):tab:\(fixture.tabID.uuidString)"
+        )
+        let models = try ["model-a", "model-b"].map {
+            try OracleModelReference(providerID: "fixture", modelID: $0)
+        }
+        let descriptor = try OracleGroupDescriptor(size: models.count)
+        let members = try models.enumerated().map { index, model in
+            try OracleGroupMember(
+                laneID: OracleLaneID(index: index),
+                publicChatID: "canonical-\(index)",
+                model: model
+            )
+        }
+        let timestamp = Date(timeIntervalSince1970: 1000)
+        let group = try OracleGroupDocument(
+            group: descriptor,
+            owner: owner,
+            name: "Canonical Group",
+            revision: 1,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            roster: OracleRoster(primary: models[0], additional: Array(models.dropFirst())),
+            members: members,
+            turns: [OracleTurnRecord(
+                input: OracleInput(mode: .chat, userMessage: "test"),
+                state: .prepared,
+                startedAt: timestamp
+            )]
+        )
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        try await store.create(group)
+        var mismatchedProjection = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            oracleGroupID: descriptor.id.rawValue,
+            oracleLaneIndex: 0,
+            oracleGroupSize: 2,
+            name: "Forged Projection",
+            messages: [StoredMessage(isUser: false, rawText: "preserve me", sequenceIndex: 0)]
+        )
+        mismatchedProjection.fileURL = try await fixture.oracleViewModel.chatData.saveChatSession(
+            mismatchedProjection,
+            for: fixture.workspace
+        )
+        fixture.oracleViewModel.sessions = [mismatchedProjection]
+
+        let handledAsGroup = try await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: mismatchedProjection)
+        let retained = try await store.load(groupID: descriptor.id, owner: owner)
+        if let retained {
+            try await store.delete(
+                groupID: retained.group.id,
+                owner: owner,
+                expectedRevision: retained.revision
+            )
+        }
+
+        XCTAssertFalse(handledAsGroup)
+        XCTAssertNotNil(retained)
+        XCTAssertEqual(fixture.oracleViewModel.sessions.map(\.id), [mismatchedProjection.id])
+        XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(mismatchedProjection.fileURL).path))
+    }
+
     private static var nextFixtureWindowID = -1200
 
     private static func allocateFixtureWindowID() -> Int {
@@ -411,7 +649,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
         let composition = WindowStateCompositionFactory.make(
             windowID: Self.allocateFixtureWindowID(),
-            deferredInitialAgentSystemWorkspaceRefresh: true,
+            deferredInitialAgentSystemWorkspaceRefresh: false,
             sharedMCPService: MCPService()
         )
         await composition.workspaceManager.awaitInitialized()

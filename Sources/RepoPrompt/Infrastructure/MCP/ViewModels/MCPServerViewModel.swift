@@ -570,7 +570,7 @@ final class MCPServerViewModel: ObservableObject {
                         return try await override(args, promptVM, tabContext)
                     }
                 #endif
-                return try await oracleVM.tool_chatSend(
+                return try await oracleVM.tool_chatSendWithConfiguredRoster(
                     args: args,
                     promptVM: promptVM,
                     tabContext: tabContext

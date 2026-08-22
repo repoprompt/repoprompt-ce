@@ -24,8 +24,16 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
     private let codexClientName = AgentProviderKind.codexExec.mcpClientNameHint ?? "RepoPromptCE"
     private var trackedRuns: [(runID: UUID, windowID: Int)] = []
     private var retainedHosts: [AgentModeViewModel] = []
+    private var previousAdditionalOracleModels: [String] = []
+
+    override func setUp() async throws {
+        previousAdditionalOracleModels = GlobalSettingsStore.shared.additionalOracleModelRaws()
+        try GlobalSettingsStore.shared.setAdditionalOracleModelRaws([], commit: false)
+        try await super.setUp()
+    }
 
     override func tearDown() async throws {
+        try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(previousAdditionalOracleModels, commit: false)
         for host in retainedHosts {
             await host.prepareForWindowClose()
         }

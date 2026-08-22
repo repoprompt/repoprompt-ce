@@ -173,7 +173,7 @@ final class MCPDomainToolCatalogTests: XCTestCase {
             Set(MCPClientToolPolicyProfile.allCases)
         )
         let expected: [MCPClientToolPolicyProfile: [String]] = [
-            .direct: ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "oracle_utils", "oracle_send", "git", "manage_worktree", "context_builder", "agent_run", "agent_manage", "history"],
+            .direct: ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "oracle_utils", "ask_oracle", "oracle_send", "git", "manage_worktree", "context_builder", "agent_run", "agent_manage", "history"],
             .discovery: ["manage_selection", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "git", "ask_user", "history"],
             .agentModeGenericExplore: ["app_settings", "get_code_structure", "get_file_tree", "read_file", "file_search", "git", "ask_user", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
             .agentModeGenericEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],

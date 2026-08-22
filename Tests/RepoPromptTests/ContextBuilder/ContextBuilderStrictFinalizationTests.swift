@@ -4,6 +4,26 @@ import MCP
 import XCTest
 
 final class ContextBuilderStrictFinalizationTests: XCTestCase {
+    private var previousAdditionalOracleModels: [String] = []
+
+    override func setUp() async throws {
+        previousAdditionalOracleModels = await MainActor.run {
+            GlobalSettingsStore.shared.additionalOracleModelRaws()
+        }
+        try await MainActor.run {
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws([], commit: false)
+        }
+        try await super.setUp()
+    }
+
+    override func tearDown() async throws {
+        let previousAdditionalOracleModels = previousAdditionalOracleModels
+        try await MainActor.run {
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(previousAdditionalOracleModels, commit: false)
+        }
+        try await super.tearDown()
+    }
+
     @MainActor
     func testActiveContextBuilderIncompleteTerminationFailsAndPreservesOracleChat() async throws {
         #if DEBUG
@@ -393,11 +413,254 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
         #endif
     }
 
+    @MainActor
+    func testGroupPrimaryFailureReturnsStructuredReplyWithoutAuxiliarySubstitution() async throws {
+        #if DEBUG
+            let primaryModel = AIModel.customProviderUser(name: "oracle-group-primary-failure-test")
+            let auxiliaryModel = AIModel.customProviderUser(name: "oracle-group-auxiliary-success-test")
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(
+                [auxiliaryModel.rawValue],
+                commit: false
+            )
+            let composition = makeComposition(
+                windowID: -184,
+                streamOutputProvider: { model in
+                    if model.rawValue == primaryModel.rawValue {
+                        return (
+                            text: "primary partial",
+                            terminalOutcome: .incomplete(reason: "max_tokens")
+                        )
+                    }
+                    return (text: "auxiliary answer", terminalOutcome: .completed)
+                }
+            )
+            await composition.workspaceManager.awaitInitialized()
+            let previousCustomProviderValidity = composition.apiSettingsViewModel.isCustomProviderValid
+            composition.apiSettingsViewModel.isCustomProviderValid = true
+            defer { composition.apiSettingsViewModel.isCustomProviderValid = previousCustomProviderValidity }
+
+            let root = makeTemporaryRoot(label: "group-incomplete")
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let workspace = composition.workspaceManager.createWorkspace(
+                name: "Context Builder grouped incomplete test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await composition.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderStrictFinalizationTests.group-incomplete"
+            )
+            let activeWorkspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+            let tabID = try XCTUnwrap(
+                activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+            )
+            let viewModel = composition.contextBuilderAgentViewModel
+            viewModel.installRunTestHooks(
+                ContextBuilderAgentViewModel.RunTestHooks(
+                    beforeProcessingProviderEvent: nil,
+                    providerEventDisposition: nil,
+                    teardownCompleted: nil,
+                    resolveMCPFollowUpModel: { _ in
+                        (model: primaryModel, chatPresetID: nil, mcpControlInfo: nil)
+                    }
+                )
+            )
+            defer { viewModel.installRunTestHooks(nil) }
+
+            let phaseRecorder = ContextBuilderStrictFinalizationPhaseRecorder()
+            let reply = try await viewModel.runMCPPlanOrQuestion(
+                for: tabID,
+                oracleViewModel: composition.oracleViewModel,
+                mode: .plan,
+                prompt: "Produce a grouped plan.",
+                selection: StoredSelection(),
+                reviewGitContext: .automaticOnly(),
+                progressReporter: { phase in
+                    await phaseRecorder.record(phase)
+                }
+            )
+            XCTAssertEqual(reply.oracleGroup?.result.status, .failed)
+            XCTAssertEqual(reply.response, "primary partial")
+            XCTAssertEqual(reply.oracleGroup?.orderedResults.map(\.laneIndex), [0, 1])
+            XCTAssertEqual(reply.oracleGroup?.orderedResults.map(\.status), [.failed, .completed])
+            XCTAssertEqual(
+                reply.oracleGroup?.orderedResults.map(\.response),
+                [nil, "auxiliary answer"]
+            )
+            XCTAssertEqual(
+                reply.oracleGroup?.orderedResults.map { $0.error?.partialResponse },
+                ["primary partial", nil]
+            )
+            XCTAssertEqual(reply.errors, [
+                "Oracle failed: The provider ended the response before successful completion (reason: max_tokens)."
+            ])
+            let owner = try OracleViewModel.oracleGroupOwner(
+                workspaceID: workspace.id,
+                tabID: tabID
+            )
+            let loadedGroup = try await AppDomainRuntimeComposition.shared
+                .oracleConversationStore.load(
+                    member: OracleMemberLookup(publicChatID: reply.shortId),
+                    owner: owner
+                )
+            let group = try XCTUnwrap(loadedGroup)
+            XCTAssertEqual(group.turns.last?.status, .failed)
+            XCTAssertEqual(group.turns.last?.results.map(\.status), [.failed, .completed])
+            XCTAssertEqual(
+                group.turns.last?.results.map { $0.error?.partialResponse },
+                ["primary partial", nil]
+            )
+
+            XCTAssertEqual(viewModel.generatedPlanResponseText(for: tabID), "primary partial")
+            XCTAssertNotNil(viewModel.currentFollowUpOracleChatID(for: tabID))
+            guard case let .ready(_, previewText) = viewModel.planStatus(for: tabID) else {
+                return XCTFail("Expected Context Builder ready state with retained Primary partial response")
+            }
+            XCTAssertEqual(previewText, "primary partial")
+            let phases = await phaseRecorder.snapshot()
+            XCTAssertEqual(phases, [
+                .modelResolution,
+                .payloadPackaging,
+                .sessionCreationAndPersist,
+                .streaming,
+                .messageFinalization
+            ])
+        #else
+            throw XCTSkip("Strict finalization injection is DEBUG-only.")
+        #endif
+    }
+
+    @MainActor
+    func testReplacementOracleRunOwnsStateWhilePredecessorResumesAfterReservationRelease() async throws {
+        #if DEBUG
+            let testModel = AIModel.customProviderUser(name: "oracle-group-replacement-test")
+            try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(
+                [testModel.rawValue],
+                commit: false
+            )
+            let responseCounter = ContextBuilderStrictFinalizationResponseCounter()
+            let composition = makeComposition(
+                windowID: -183,
+                terminalOutcome: .completed,
+                responseTextProvider: {
+                    let index = await responseCounter.next()
+                    return "response-\(index)"
+                }
+            )
+            await composition.workspaceManager.awaitInitialized()
+            let previousCustomProviderValidity = composition.apiSettingsViewModel.isCustomProviderValid
+            composition.apiSettingsViewModel.isCustomProviderValid = true
+            defer { composition.apiSettingsViewModel.isCustomProviderValid = previousCustomProviderValidity }
+
+            let root = makeTemporaryRoot(label: "replacement-after-reservation-release")
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let workspace = composition.workspaceManager.createWorkspace(
+                name: "Context Builder replacement ownership test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await composition.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderStrictFinalizationTests.replacement-after-reservation-release"
+            )
+            let activeWorkspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+            let tabID = try XCTUnwrap(
+                activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+            )
+            let viewModel = composition.contextBuilderAgentViewModel
+            let firstReleaseGate = ContextBuilderStrictFinalizationGate()
+            let secondReleaseGate = ContextBuilderStrictFinalizationGate()
+            var releaseCount = 0
+            viewModel.installRunTestHooks(
+                ContextBuilderAgentViewModel.RunTestHooks(
+                    beforeProcessingProviderEvent: nil,
+                    providerEventDisposition: nil,
+                    teardownCompleted: nil,
+                    resolveMCPFollowUpModel: { _ in
+                        (
+                            model: testModel,
+                            chatPresetID: nil,
+                            mcpControlInfo: nil
+                        )
+                    },
+                    afterOracleArtifactReservationReleased: { _ in
+                        releaseCount += 1
+                        if releaseCount == 1 {
+                            await firstReleaseGate.arriveAndWait()
+                        } else if releaseCount == 2 {
+                            await secondReleaseGate.arriveAndWait()
+                        }
+                    }
+                )
+            )
+            defer { viewModel.installRunTestHooks(nil) }
+
+            let firstRun = Task { @MainActor in
+                try await viewModel.runMCPPlanOrQuestion(
+                    for: tabID,
+                    oracleViewModel: composition.oracleViewModel,
+                    mode: .plan,
+                    prompt: "First plan.",
+                    selection: StoredSelection(),
+                    reviewGitContext: .automaticOnly()
+                )
+            }
+            await firstReleaseGate.waitUntilArrived()
+
+            let secondRun = Task { @MainActor in
+                try await viewModel.runMCPPlanOrQuestion(
+                    for: tabID,
+                    oracleViewModel: composition.oracleViewModel,
+                    mode: .plan,
+                    prompt: "Second plan.",
+                    selection: StoredSelection(),
+                    reviewGitContext: .automaticOnly()
+                )
+            }
+            await secondReleaseGate.waitUntilArrived()
+
+            XCTAssertEqual(viewModel.planStatus(for: tabID), .generating)
+            XCTAssertTrue(viewModel.hasFollowUpOracleGroupTaskForTesting(tabID: tabID))
+            let replacementProgress = try XCTUnwrap(viewModel.generatedPlanResponseText(for: tabID))
+            XCTAssertTrue(replacementProgress.hasPrefix("response-"))
+
+            await firstReleaseGate.release()
+            do {
+                _ = try await firstRun.value
+                XCTFail("Expected the replaced Oracle run to cancel")
+            } catch {
+                XCTAssertTrue(error is CancellationError)
+            }
+
+            XCTAssertEqual(viewModel.planStatus(for: tabID), .generating)
+            XCTAssertTrue(viewModel.hasFollowUpOracleGroupTaskForTesting(tabID: tabID))
+            XCTAssertEqual(viewModel.generatedPlanResponseText(for: tabID), replacementProgress)
+
+            await secondReleaseGate.release()
+            let reply = try await secondRun.value
+            let response = try XCTUnwrap(reply.response)
+            XCTAssertTrue(response.hasPrefix("response-"))
+            XCTAssertEqual(viewModel.generatedPlanResponseText(for: tabID), response)
+            XCTAssertFalse(viewModel.hasFollowUpOracleGroupTaskForTesting(tabID: tabID))
+        #else
+            throw XCTSkip("Oracle replacement ownership injection is DEBUG-only.")
+        #endif
+    }
+
     #if DEBUG
         @MainActor
         private func makeComposition(
             windowID: Int,
-            terminalOutcome: ChatStreamTerminalOutcome? = nil
+            terminalOutcome: ChatStreamTerminalOutcome? = nil,
+            responseTextProvider: (@Sendable () async -> String)? = nil,
+            streamOutputProvider: (@Sendable (AIModel) async -> (
+                text: String,
+                terminalOutcome: ChatStreamTerminalOutcome?
+            ))? = nil
         ) -> WindowStateComposition {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -408,14 +671,21 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
                 aiQueriesServiceFactory: { keyManager in
                     AIQueriesService(
                         keyManager: keyManager,
-                        sendPromptOverride: { _, _ in
+                        sendPromptOverride: { _, model in
+                            let output = await streamOutputProvider?(model)
+                            let responseText: String = if let output {
+                                output.text
+                            } else {
+                                await responseTextProvider?() ?? "partial response"
+                            }
+                            let selectedTerminalOutcome = output?.terminalOutcome ?? terminalOutcome
                             let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
                                 continuation.yield(
                                     ChatStreamOutput(
-                                        text: "partial response",
+                                        text: responseText,
                                         reasoning: nil,
                                         tokens: ChatTokenInfo(),
-                                        terminalOutcome: terminalOutcome
+                                        terminalOutcome: selectedTerminalOutcome
                                     )
                                 )
                                 continuation.finish()
@@ -458,4 +728,62 @@ final class ContextBuilderStrictFinalizationTests: XCTestCase {
             return root
         }
     #endif
+}
+
+private actor ContextBuilderStrictFinalizationResponseCounter {
+    private var value = 0
+
+    func next() -> Int {
+        value += 1
+        return value
+    }
+}
+
+private actor ContextBuilderStrictFinalizationPhaseRecorder {
+    private var phases: [ContextBuilderMCPProgressPhase] = []
+
+    func record(_ phase: ContextBuilderMCPProgressPhase) {
+        phases.append(phase)
+    }
+
+    func snapshot() -> [ContextBuilderMCPProgressPhase] {
+        phases
+    }
+}
+
+private actor ContextBuilderStrictFinalizationGate {
+    private var arrived = false
+    private var released = false
+    private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func arriveAndWait() async {
+        arrived = true
+        let waiters = arrivalWaiters
+        arrivalWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilArrived() async {
+        guard !arrived else { return }
+        await withCheckedContinuation { continuation in
+            arrivalWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        guard !released else { return }
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
 }

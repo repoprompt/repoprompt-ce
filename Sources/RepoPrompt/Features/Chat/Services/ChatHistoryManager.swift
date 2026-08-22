@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import SwiftUI
 
 /// Error definitions analogous to ChatSessionError:
@@ -94,6 +95,10 @@ actor ChatDataService {
         let composeTabID: UUID?
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
+        let oracleGroupID: UUID?
+        let oracleLaneIndex: Int?
+        let oracleGroupSize: Int?
+        let oracleModelRaw: String?
         let name: String
         let savedAt: Date
         let shortID: String?
@@ -264,6 +269,10 @@ actor ChatDataService {
                 composeTabID: header.composeTabID,
                 agentModeSessionID: header.agentModeSessionID,
                 agentModeRunID: header.agentModeRunID,
+                oracleGroupID: header.oracleGroupID,
+                oracleLaneIndex: header.oracleLaneIndex,
+                oracleGroupSize: header.oracleGroupSize,
+                oracleModelRaw: header.oracleModelRaw,
                 name: header.name,
                 savedAt: header.savedAt,
                 fileURL: fileURL,
@@ -300,19 +309,69 @@ actor ChatDataService {
             return lhsDate > rhsDate
         }
 
-        // Apply chat history limit based on user setting
+        // Apply the limit to logical conversations, not projection files. If any
+        // header is unreadable, retain everything: an unreadable projection may
+        // belong to a canonical group and must never be deleted independently.
         let limit = chatHistoryLimit
-        if limit != .unlimited, sortedFiles.count > limit.rawValue {
-            let filesToDelete = sortedFiles.dropFirst(limit.rawValue)
-            for url in filesToDelete {
-                // Best-effort delete; ignore individual failures
-                try? FileManager.default.removeItem(at: url)
+        guard limit != .unlimited else { return sortedFiles }
+        var sessionsByURL: [URL: ChatSession] = [:]
+        for url in sortedFiles {
+            guard let session = try? Self.loadChatSessionStubFromDisk(from: url) else {
+                return sortedFiles
             }
-            return Array(sortedFiles.prefix(limit.rawValue))
+            sessionsByURL[url] = session
         }
-
-        // If unlimited or under limit, return all files
-        return sortedFiles
+        enum ConversationKey: Hashable {
+            case group(UUID)
+            case single(UUID)
+        }
+        var orderedKeys: [ConversationKey] = []
+        for url in sortedFiles {
+            guard let session = sessionsByURL[url] else { continue }
+            let key = session.oracleGroupID.map(ConversationKey.group) ?? .single(session.id)
+            if !orderedKeys.contains(key) { orderedKeys.append(key) }
+        }
+        guard orderedKeys.count > limit.rawValue else { return sortedFiles }
+        let staleKeys = Set(orderedKeys.dropFirst(limit.rawValue))
+        var deletedURLs = Set<URL>()
+        for key in staleKeys {
+            let urls = sortedFiles.filter { url in
+                guard let session = sessionsByURL[url] else { return false }
+                return (session.oracleGroupID.map(ConversationKey.group) ?? .single(session.id)) == key
+            }
+            switch key {
+            case .single:
+                for url in urls where (try? FileManager.default.removeItem(at: url)) != nil {
+                    deletedURLs.insert(url)
+                }
+            case let .group(rawGroupID):
+                guard let seed = urls.compactMap({ sessionsByURL[$0] }).first,
+                      let tabID = seed.composeTabID,
+                      let owner = try? OracleConversationOwner(
+                          kind: "app-tab",
+                          identifier: "workspace:\(seed.workspaceID?.uuidString ?? "none"):tab:\(tabID.uuidString)"
+                      )
+                else { continue }
+                let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+                do {
+                    guard let group = try await store.load(
+                        groupID: OracleGroupID(rawValue: rawGroupID),
+                        owner: owner
+                    ) else { continue }
+                    try await store.delete(
+                        groupID: group.group.id,
+                        owner: owner,
+                        expectedRevision: group.revision
+                    )
+                    for url in urls where (try? FileManager.default.removeItem(at: url)) != nil {
+                        deletedURLs.insert(url)
+                    }
+                } catch {
+                    continue
+                }
+            }
+        }
+        return sortedFiles.filter { !deletedURLs.contains($0) }
     }
 
     /// Get metadata for recent chat sessions without loading full content

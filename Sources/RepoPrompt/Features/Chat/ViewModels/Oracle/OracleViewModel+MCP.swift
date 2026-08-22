@@ -20,6 +20,11 @@ extension OracleViewModel {
         let chatPresetID: UUID? // The chat preset to use for this mode (always resolved now)
     }
 
+    enum OracleSendActivationPolicy: Equatable {
+        case foregroundWhenActive
+        case background
+    }
+
     enum OracleSendPackagingProvenance: Equatable {
         case direct
         case delegated(delegationID: UUID)
@@ -37,6 +42,7 @@ extension OracleViewModel {
         let selection: StoredSelection
         let lookupContext: WorkspaceLookupContext?
         let reviewGitContext: FrozenPromptGitReviewContext
+        let prebuiltAIMessage: AIMessage?
         let provenance: OracleSendPackagingProvenance
 
         init(
@@ -49,6 +55,7 @@ extension OracleViewModel {
             selection: StoredSelection,
             lookupContext: WorkspaceLookupContext?,
             reviewGitContext: FrozenPromptGitReviewContext,
+            prebuiltAIMessage: AIMessage? = nil,
             provenance: OracleSendPackagingProvenance
         ) {
             self.sourceTabID = sourceTabID
@@ -60,6 +67,7 @@ extension OracleViewModel {
             self.selection = selection
             self.lookupContext = lookupContext
             self.reviewGitContext = reviewGitContext
+            self.prebuiltAIMessage = prebuiltAIMessage
             self.provenance = provenance
         }
 
@@ -119,6 +127,7 @@ extension OracleViewModel {
         let origin: OracleSendOrigin
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
+        let activationPolicy: OracleSendActivationPolicy
         let packaging: OracleSendPackagingContext
 
         init(
@@ -127,6 +136,7 @@ extension OracleViewModel {
             origin: OracleSendOrigin = .compatibility,
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil,
+            activationPolicy: OracleSendActivationPolicy = .foregroundWhenActive,
             packaging: OracleSendPackagingContext
         ) {
             self.tabID = tabID
@@ -134,6 +144,7 @@ extension OracleViewModel {
             self.origin = origin
             self.agentModeSessionID = agentModeSessionID
             self.agentModeRunID = agentModeRunID
+            self.activationPolicy = activationPolicy
             self.packaging = packaging
         }
     }
@@ -1055,7 +1066,9 @@ extension OracleViewModel {
     func tool_chatSend(
         args: [String: Value],
         promptVM: PromptViewModel,
-        tabContext: OracleSendTabContext? = nil
+        tabContext: OracleSendTabContext? = nil,
+        resolvedModel: AIModel? = nil,
+        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws
         -> [String: Value]
     {
@@ -1103,12 +1116,21 @@ extension OracleViewModel {
         let presetsManager = ModelPresetsManager.shared
         let allPresets = presetsManager.allPresets()
 
-        let modelSelection = try await selectModel(
-            modelParam: modelParam,
-            mode: mode,
-            allPresets: allPresets,
-            promptVM: promptVM
-        )
+        let modelSelection: ModelSelectionResult = if let resolvedModel {
+            ModelSelectionResult(
+                model: resolvedModel,
+                mcpControlInfo: "Oracle group • \(resolvedModel.displayName)",
+                isAutoSelected: false,
+                chatPresetID: findBuiltInPreset(for: mode)?.id
+            )
+        } else {
+            try await selectModel(
+                modelParam: modelParam,
+                mode: mode,
+                allPresets: allPresets,
+                promptVM: promptVM
+            )
+        }
 
         let selectedModel = modelSelection.model
         let mcpControlledModel = modelSelection.mcpControlInfo
@@ -1130,7 +1152,8 @@ extension OracleViewModel {
         let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
         let shouldActivate: Bool
         if let tabContext {
-            let isFocusedTab = (promptVM.activeComposeTabID == tabContext.tabID)
+            let isFocusedTab = (promptVM.activeComposeTabID == tabContext.tabID) &&
+                tabContext.activationPolicy == .foregroundWhenActive
             let activeSessionID = workspaceManager.activeChatSessionID(forTabID: tabContext.tabID)
                 ?? currentSessionID.flatMap { currentID in
                     sessions.first(where: { $0.id == currentID && $0.composeTabID == tabContext.tabID })?.id
@@ -1182,7 +1205,9 @@ extension OracleViewModel {
                 gitBaseOverride: nil,
                 selectionOverride: selectionOverride,
                 lookupContextOverride: lookupContextOverride,
-                reviewGitContextOverride: reviewGitContextOverride
+                reviewGitContextOverride: reviewGitContextOverride,
+                overrideAIMessage: tabContext?.packaging.prebuiltAIMessage,
+                onProgress: onProgress
             )
         }
         let queryId: UUID?

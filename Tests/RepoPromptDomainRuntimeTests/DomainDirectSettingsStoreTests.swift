@@ -3,6 +3,65 @@ import Foundation
 import XCTest
 
 final class DomainDirectSettingsStoreTests: XCTestCase {
+    func testOrderedOracleRosterStringArrayPersistsAndReloads() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DomainDirectSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "oracle-roster"
+        let persistence = makePersistence(root: root, profile: profile)
+        let writer = DomainDirectSettingsStore(persistence: persistence, profileIdentifier: profile)
+        await writer.bootstrap()
+        _ = try await writer.set(
+            key: OracleRosterContract.additionalSettingKey,
+            value: .stringArray([" model-a ", "model-a", "model-b"])
+        )
+
+        let reader = DomainDirectSettingsStore(persistence: persistence, profileIdentifier: profile)
+        await reader.bootstrap()
+        let value = try await reader.effectiveValue(for: OracleRosterContract.additionalSettingKey)
+        XCTAssertEqual(value, .stringArray(["model-a", "model-a", "model-b"]))
+    }
+
+    func testMalformedPersistedOracleRosterIsSanitizedWithoutBlockingRepairs() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DomainDirectSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "oracle-roster-recovery"
+        let persistence = makePersistence(root: root, profile: profile)
+        let writer = DomainDirectSettingsStore(persistence: persistence, profileIdentifier: profile)
+        await writer.bootstrap()
+        _ = try await writer.set(
+            key: OracleRosterContract.additionalSettingKey,
+            value: .stringArray(["model-a"])
+        )
+        let snapshot = try await persistence.loadDirectSettingsData()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(snapshot.data)) as? [String: Any]
+        )
+        var values = try XCTUnwrap(object["values"] as? [String: Any])
+        values[OracleRosterContract.additionalSettingKey] = [
+            "stringArray": ["_0": [" ", "model-b", "model-c", "model-d", "model-e", "model-f"]]
+        ]
+        object["values"] = values
+        let malformed = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try await persistence.compareAndSwapDirectSettingsData(
+            expectedDigest: snapshot.digest,
+            data: malformed
+        )
+
+        let reader = DomainDirectSettingsStore(persistence: persistence, profileIdentifier: profile)
+        await reader.bootstrap()
+        let recovered = try await reader.effectiveValue(for: OracleRosterContract.additionalSettingKey)
+        XCTAssertEqual(
+            recovered,
+            .stringArray(["model-b", "model-c", "model-d", "model-e"])
+        )
+        _ = try await reader.set(
+            key: OracleRosterContract.additionalSettingKey,
+            value: .stringArray(["repaired"])
+        )
+    }
+
     func testConcurrentColdStartBootstrapWaitsForPersistedSettingsLoad() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("DomainDirectSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -130,7 +189,6 @@ final class DomainDirectSettingsStoreTests: XCTestCase {
         let second = Task {
             let result: TestTaskResult<UInt64>
             do {
-                await store.bootstrap()
                 result = try await .success(store.set(
                     key: "agent_mode.show_built_in_workflow_cleanup_guidance",
                     value: .bool(true)

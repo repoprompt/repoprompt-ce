@@ -19,6 +19,7 @@
 
 import Combine
 import Foundation
+import RepoPromptDomainRuntime
 import SwiftUI
 
 @MainActor
@@ -180,6 +181,33 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         displayName(forChatModelRaw: profileSnapshot.planningModelRaw, fallback: "Select an Oracle model")
     }
 
+    var additionalOracleModelRaws: [String] {
+        profileSnapshot.additionalOracleModelRaws
+    }
+
+    var oracleCount: Int {
+        1 + additionalOracleModelRaws.count
+    }
+
+    var canAddOracle: Bool {
+        let primary = profileSnapshot.planningModelRaw?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return primary?.isEmpty == false && oracleCount < OracleRosterContract.maximumCount
+    }
+
+    func oracleLabel(at index: Int) -> String {
+        OracleRosterContract.displayLabel(laneIndex: index)
+    }
+
+    func oracleModelName(at index: Int) -> String {
+        let raw = index == 0
+            ? profileSnapshot.planningModelRaw
+            : additionalOracleModelRaws.indices.contains(index - 1)
+            ? additionalOracleModelRaws[index - 1]
+            : nil
+        return displayName(forChatModelRaw: raw, fallback: "Select an Oracle model")
+    }
+
     var currentBuiltinChatModelName: String {
         let raw = profileSnapshot.syncChatModelWithOracle
             ? profileSnapshot.planningModelRaw
@@ -309,6 +337,19 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         )
     }
 
+    func additionalOracleModelDestination(at index: Int) -> ModelDestination {
+        ModelDestination(
+            id: "agentModels.oracle.additional.\(index)",
+            getter: { [weak self] in
+                guard let self, additionalOracleModelRaws.indices.contains(index) else { return "" }
+                return additionalOracleModelRaws[index]
+            },
+            applier: { [weak self] rawValue in
+                self?.setAdditionalOracleModel(raw: rawValue, at: index)
+            }
+        )
+    }
+
     /// Destination for the Built-in Chat model. Writes `preferredComposeModel`
     /// and, when the sync toggle is on, mirrors to `planningModel` in the
     /// selected global/workspace Agent Models profile.
@@ -335,6 +376,27 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             } else {
                 profile.preferredComposeModelRaw = raw
             }
+        }
+    }
+
+    func addOracle() {
+        guard canAddOracle, let primary = profileSnapshot.planningModelRaw else { return }
+        updateSelectedProfile(reason: "agent_models.oracle_add") { profile in
+            profile.additionalOracleModelRaws.append(primary)
+        }
+    }
+
+    func removeOracle(at index: Int) {
+        guard additionalOracleModelRaws.indices.contains(index) else { return }
+        updateSelectedProfile(reason: "agent_models.oracle_remove") { profile in
+            profile.additionalOracleModelRaws.remove(at: index)
+        }
+    }
+
+    func setAdditionalOracleModel(raw: String, at index: Int) {
+        guard additionalOracleModelRaws.indices.contains(index) else { return }
+        updateSelectedProfile(reason: "agent_models.oracle_model") { profile in
+            profile.additionalOracleModelRaws[index] = raw
         }
     }
 

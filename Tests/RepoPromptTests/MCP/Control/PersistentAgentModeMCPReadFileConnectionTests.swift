@@ -7,6 +7,19 @@ import XCTest
 
 @MainActor
 final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
+    private var previousAdditionalOracleModels: [String] = []
+
+    override func setUp() async throws {
+        previousAdditionalOracleModels = GlobalSettingsStore.shared.additionalOracleModelRaws()
+        try GlobalSettingsStore.shared.setAdditionalOracleModelRaws([], commit: false)
+        try await super.setUp()
+    }
+
+    override func tearDown() async throws {
+        try GlobalSettingsStore.shared.setAdditionalOracleModelRaws(previousAdditionalOracleModels, commit: false)
+        try await super.tearDown()
+    }
+
     func testWorktreeReadCoverageCertificateHitsExactFullAndSliceRepeatsButNotExpansion() async throws {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
