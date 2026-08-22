@@ -1,5 +1,6 @@
 import Cuchardet
 import Foundation
+import RepoPromptDomainRuntime
 import UniversalCharsetDetection
 
 private extension String.Encoding {
@@ -211,6 +212,7 @@ actor ContentReadAsyncLimiter {
 
     init(
         capacity: Int,
+        bulkPermitLimit: Int,
         maxQueuedWaiterCount: Int = 512,
         retryAfterMilliseconds: Int = 1000,
         agePromotionNanoseconds: UInt64 = 1_000_000_000,
@@ -218,6 +220,7 @@ actor ContentReadAsyncLimiter {
         nowUptimeNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) {
         precondition(capacity > 0, "Content read limiter must have at least one permit")
+        precondition(bulkPermitLimit > 0 && bulkPermitLimit <= capacity)
         precondition(maxQueuedWaiterCount >= 0)
         precondition(retryAfterMilliseconds >= 0)
         precondition(maxConsecutiveInteractiveGrants > 0)
@@ -226,14 +229,9 @@ actor ContentReadAsyncLimiter {
         self.retryAfterMilliseconds = retryAfterMilliseconds
         self.agePromotionNanoseconds = agePromotionNanoseconds
         self.maxConsecutiveInteractiveGrants = maxConsecutiveInteractiveGrants
-        backgroundPermitLimit = Self.bulkPermitLimit(forCapacity: capacity)
+        backgroundPermitLimit = bulkPermitLimit
         self.nowUptimeNanoseconds = nowUptimeNanoseconds
         availablePermits = capacity
-    }
-
-    static func bulkPermitLimit(forCapacity capacity: Int) -> Int {
-        precondition(capacity > 0)
-        return capacity > 1 ? capacity - 1 : 1
     }
 
     func beginForegroundActivity(
@@ -779,16 +777,16 @@ actor ContentReadAsyncLimiter {
 extension FileSystemService {
     private static let defaultContentReadChunkSize = 1_048_576
     private static let defaultContentReadFileSizeLimit: Int64 = 10_000_000
-    private static let contentReadWorkerLimit = max(2, min(4, ProcessInfo.processInfo.activeProcessorCount))
     private static let contentReadWorkerLimiter = ContentReadAsyncLimiter(
-        capacity: contentReadWorkerLimit,
+        capacity: ContentReadConcurrencyCapacity.maximumConcurrentReads,
+        bulkPermitLimit: ContentReadConcurrencyCapacity.maximumConcurrentBulkReads,
         maxQueuedWaiterCount: 512
     )
 
     /// Maximum CodeMap bulk permits when no foreground activity is registered.
     /// Foreground activity temporarily suppresses all CodeMap permit grants.
     nonisolated static var codeMapArtifactBuildBulkPermitLimit: Int {
-        ContentReadAsyncLimiter.bulkPermitLimit(forCapacity: contentReadWorkerLimit)
+        ContentReadConcurrencyCapacity.maximumConcurrentBulkReads
     }
 
     nonisolated static func withContentReadForegroundActivity<T>(
@@ -848,7 +846,11 @@ extension FileSystemService {
 
     #if DEBUG
         nonisolated static var contentReadWorkerLimitForTesting: Int {
-            contentReadWorkerLimit
+            ContentReadConcurrencyCapacity.maximumConcurrentReads
+        }
+
+        nonisolated static var contentReadBulkPermitLimitForTesting: Int {
+            ContentReadConcurrencyCapacity.maximumConcurrentBulkReads
         }
 
         nonisolated static func contentReadWorkerLimiterSnapshotForTesting() async -> ContentReadAsyncLimiter.Snapshot {

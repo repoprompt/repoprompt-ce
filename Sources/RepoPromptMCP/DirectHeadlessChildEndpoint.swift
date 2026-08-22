@@ -273,7 +273,11 @@ actor DirectHeadlessChildLaunchCoordinator {
         let provider = arguments["provider"]?.stringValue
             ?? arguments["model_id"]?.stringValue
             ?? "headless"
-        let runID = arguments["run_id"]?.stringValue.flatMap(UUID.init(uuidString:)) ?? UUID()
+        let runID = Self.resolvedRunID(
+            toolName: toolName,
+            arguments: arguments,
+            securityContext: securityContext
+        )
         let request = DomainRunLaunchReservationRequest(
             runID: runID,
             context: handle.context,
@@ -287,5 +291,19 @@ actor DirectHeadlessChildLaunchCoordinator {
             lifetime: .seconds(60)
         )
         return try await harness.prepare(request: request)
+    }
+
+    nonisolated static func resolvedRunID(
+        toolName: String,
+        arguments: [String: MCP.Value],
+        securityContext: DomainToolInvocationSecurityContext
+    ) -> UUID {
+        let operation = arguments["op"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let createsSession = (toolName == "agent_run" && (operation ?? "start") == "start")
+            || (toolName == "agent_explore" && operation == "start")
+        if createsSession { return UUID() }
+        return securityContext.principal.runID ?? UUID()
     }
 }

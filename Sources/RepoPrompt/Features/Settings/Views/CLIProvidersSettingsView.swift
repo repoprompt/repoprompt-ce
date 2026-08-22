@@ -46,11 +46,13 @@ struct CLIProvidersSettingsView: View {
     @State private var showCodexSignOutConfirmation = false
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
+    @State private var isLoadingGrokBuild = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
     @State private var showOpenCodeTraceDump = false
     @State private var showCursorTraceDump = false
+    @State private var showGrokBuildTraceDump = false
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
 
@@ -63,6 +65,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCodexExpanded: Bool = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
+    @State private var isGrokBuildExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -81,6 +84,7 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isCodexConnected
             || viewModel.isOpenCodeConnected
             || viewModel.isCursorConnected
+            || viewModel.isGrokBuildConnected
     }
 
     private var codexStatusText: String? {
@@ -140,6 +144,7 @@ struct CLIProvidersSettingsView: View {
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
+                grokBuildCard
             }
             .padding(16)
         }
@@ -1822,6 +1827,85 @@ struct CLIProvidersSettingsView: View {
 
     // MARK: - Cursor Card
 
+    private var grokBuildCard: some View {
+        providerCard(
+            title: "Grok Build",
+            subtitle: "Uses xAI's Grok Build ACP runtime (`grok agent stdio`) for Agent Mode and headless tasks. RepoPrompt MCP tools are added through the ACP session.",
+            infoURL: "https://docs.x.ai/build/overview",
+            isConnected: viewModel.isGrokBuildConnected,
+            isExpanded: $isGrokBuildExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isGrokBuildConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testGrokBuildConnection() }) {
+                            if isLoadingGrokBuild {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingGrokBuild)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromGrokBuild() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text(grokBuildModelSummary)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    directProviderInlineControls(for: .grokBuild)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testGrokBuildConnection() }) {
+                            if isLoadingGrokBuild {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingGrokBuild)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.grokBuildError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Install with `npm i -g @xai-official/grok` or the xAI installer. Authenticate with `grok login` or a Grok API key (stored under API Keys).")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var grokBuildModelSummary: String {
+        let options = viewModel.availableGrokBuildModelOptions
+        let count = options.count
+        if count <= 1 {
+            return "Using Grok's configured default model; dynamic model discovery will refresh in the background."
+        }
+        return count == 1 ? "1 model available." : "\(count) models available (including Default)."
+    }
+
+    // MARK: - Cursor CLI / ACP card
+
     private var cursorCard: some View {
         providerCard(
             title: "Cursor CLI",
@@ -2362,6 +2446,39 @@ struct CLIProvidersSettingsView: View {
         viewModel.disconnectCursor()
         alertMessage = "Signed out from Cursor CLI"
         showCursorTraceDump = false
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testGrokBuildConnection() {
+        isLoadingGrokBuild = true
+        Task {
+            do {
+                let ok = try await viewModel.testGrokBuildConnection()
+                await MainActor.run {
+                    isLoadingGrokBuild = false
+                    if ok {
+                        alertMessage = "Grok Build connected. \(grokBuildModelSummary.lowercased())"
+                        showGrokBuildTraceDump = false
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingGrokBuild = false
+                    alertMessage = viewModel.grokBuildError ?? error.asFriendlyString()
+                    showGrokBuildTraceDump = viewModel.hasGrokBuildTrace()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func signOutFromGrokBuild() {
+        viewModel.disconnectGrokBuild()
+        alertMessage = "Signed out from Grok Build"
+        showGrokBuildTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
     }

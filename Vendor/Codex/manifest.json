@@ -1,18 +1,18 @@
 {
   "schemaVersion": 2,
-  "version": "0.145.0",
-  "tag": "rust-v0.145.0",
-  "releaseURL": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
+  "version": "0.149.0",
+  "tag": "rust-v0.149.0",
+  "releaseURL": "https://github.com/openai/codex/releases/tag/rust-v0.149.0",
   "checksums": {
     "asset": "codex-package_SHA256SUMS",
-    "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-package_SHA256SUMS",
-    "sha256": "2692d126c2fc9bfe35041f28c771c4296dda43704fad6b4a1c8752987aaee806"
+    "url": "https://github.com/openai/codex/releases/download/rust-v0.149.0/codex-package_SHA256SUMS",
+    "sha256": "27dfdc7cf0bbb17bcefe11eb76751f6d7fffd322d79d7f25c2dfe88067744cc0"
   },
   "packages": {
     "aarch64-apple-darwin": {
       "archive": "codex-package-aarch64-apple-darwin.tar.gz",
-      "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-package-aarch64-apple-darwin.tar.gz",
-      "sha256": "ece937169d4c9e910d60826a6ea4ae7848a16c089403d122e70e7da4ac41ba34",
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.149.0/codex-package-aarch64-apple-darwin.tar.gz",
+      "sha256": "6c7589a52fe90e3742e35662115a4c55c39715601df0d41345ba8ec8f4221d4e",
       "architecture": "arm64",
       "tree": [
         {
@@ -22,21 +22,21 @@
         {
           "path": "bin/codex",
           "kind": "file",
-          "sha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+          "sha256": "f4a74117b8142cda581c95ff753abf4508b5636d89682c1ed77e4a9249af8963",
           "executable": true,
-          "normalizedSha256": "9d5063b15eef5355edebd2bcb85f782cfcb4d0730dc876305dffb2877016b64a"
+          "normalizedSha256": "97aca6cd97bc77f911c6303f2656c3745c8153d409b01e2557292cd2d0c5321a"
         },
         {
           "path": "bin/codex-code-mode-host",
           "kind": "file",
-          "sha256": "c75e27ea296ede4025959e4f66772c283261f28d95b1f27be4d8ef07aabe9bce",
+          "sha256": "3eca39bb7f93315fab6b0dec2334381c0f50a2ccda113ec482fb815f16072a5c",
           "executable": true,
-          "normalizedSha256": "dcab13acb27395da4debde1996ab2e2fda238444d61ab513c6985b783bbbff71"
+          "normalizedSha256": "d70b3aaeeaf119ac2c07649c25fedd6060a0d1f60bd3d4dcd6d155ab06b065d9"
         },
         {
           "path": "codex-package.json",
           "kind": "file",
-          "sha256": "547b024068df54e735ba27886edb2f2e403e656f100d9e5c8d300cc36d236108",
+          "sha256": "46abc0b34dcee2500c44000187869375c4bc21b7752bb9d04ce50ebef62a5d7e",
           "executable": false
         },
         {
@@ -46,7 +46,7 @@
         {
           "path": "codex-path/rg",
           "kind": "file",
-          "sha256": "a326a1fb48074202e9ad41e4cd1e389eeea372c8c6f7d7e80da81176d5d9430e",
+          "sha256": "b4a0ff402c26bf623ce5ddc8a806c65a29397ecca0d7210147b0f9224c70558c",
           "executable": true,
           "normalizedSha256": "0bb5ee787d769df26f96e176b74139c3da0c4fb0ded311e96c5970a9ce7b0330"
         },
@@ -65,7 +65,7 @@
         {
           "path": "codex-resources/zsh/bin/zsh",
           "kind": "file",
-          "sha256": "b69893d9da08786211bac0862212e26a8a31af24eb77da21692671c58d388b8d",
+          "sha256": "4707e28b5f2fc75ce07c5fa3ff32d76a0fc43812c7880f9a98005dbc65a77e32",
           "executable": true,
           "normalizedSha256": "5cc9238f3e211be71cd25cde1bbe4319849951d4b1fdf942d925091388bd95fd"
         }
@@ -73,8 +73,8 @@
     },
     "x86_64-apple-darwin": {
       "archive": "codex-package-x86_64-apple-darwin.tar.gz",
-      "url": "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-package-x86_64-apple-darwin.tar.gz",
-      "sha256": "9d402c9ca814655fddc07b548d7086491c0afcebe1f746cdeba1045fd6f62646",
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.149.0/codex-package-x86_64-apple-darwin.tar.gz",
+      "sha256": "ba332e647cc898e3b4e86a3bc6e8db414a124eb88d8480f4707bbc66b0432f9d",
       "architecture": "x86_64",
       "tree": [
         {
@@ -84,21 +84,21 @@
         {
           "path": "bin/codex",
           "kind": "file",
-          "sha256": "6db9193ce2c9a8cef2b5482612cde24202a4329dfc34f4687a036d5d7da619af",
+          "sha256": "c646bd178240bb50efd81c2f9919dd9124b126c815911f6c1b6db400786c5ccd",
           "executable": true,
-          "normalizedSha256": "3fe2099550d6d2d3e3d652798f17ae40802f7fabf7dbef29316b6d07328859fd"
+          "normalizedSha256": "aa3f2567430329d603e7514c98ca8c8d4730ae81b141a283ee2fa3650839c216"
         },
         {
           "path": "bin/codex-code-mode-host",
           "kind": "file",
-          "sha256": "d80a29354a989060c974c4f5280815df07d602e4c1ae38106b9a97f58c63eb83",
+          "sha256": "61550b069ff415a6d0e7d78ad490a798f7cda9aabf2f7b6a668719255c5b6fbd",
           "executable": true,
-          "normalizedSha256": "0598a563e61b8df1e6492af0befb7971bbe47f6b945f39cf124ba46fba46273c"
+          "normalizedSha256": "e9ee0a93266544a687d3b89a894f966da728cbb00b4bcb6dba8a7428e0abf602"
         },
         {
           "path": "codex-package.json",
           "kind": "file",
-          "sha256": "c8072bf3f7352998626ba7384023be130c691167e258d4e97a6848c1f2b4ae2b",
+          "sha256": "59d70443b27d1d93f198cee8b1816b89d61469a8d3f2a7220fc83333d814a16b",
           "executable": false
         },
         {
@@ -108,7 +108,7 @@
         {
           "path": "codex-path/rg",
           "kind": "file",
-          "sha256": "0c9a0066db0d26b640777db88045b0ccdd58509a746700e43e1c4ff8707a5ed0",
+          "sha256": "6e003d63beaf1aa8b479b216e08caf150c9434035685f689940407ef42d00806",
           "executable": true,
           "normalizedSha256": "817d5e12aaa1d12716865d4fa2d7fb5847000d722a9c601e6ea0bd7ea9003c1a"
         },
@@ -127,7 +127,7 @@
         {
           "path": "codex-resources/zsh/bin/zsh",
           "kind": "file",
-          "sha256": "901782b34a9742b9962199332934ac77229073760bf837bc86b156ce4b86b9fa",
+          "sha256": "0e5d4221569debf1e35bba124c78bf104756693b3f04be4772ecbec7293c8930",
           "executable": true,
           "normalizedSha256": "901782b34a9742b9962199332934ac77229073760bf837bc86b156ce4b86b9fa"
         }

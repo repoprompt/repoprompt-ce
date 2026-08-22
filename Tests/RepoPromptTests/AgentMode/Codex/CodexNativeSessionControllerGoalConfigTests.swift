@@ -30,6 +30,27 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
     }
 
+    func testAgentModeCapabilityChoicesProjectIndependentlyToProcessStartAndThreadStartResume() async throws {
+        let capabilities = CodexCapabilitySettings(
+            appsEnabled: true,
+            pluginsEnabled: false,
+            mcpElicitationEnabled: true,
+            toolSuggestionsEnabled: false
+        )
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            capabilitiesProvider: { capabilities }
+        )
+
+        try await assertStartAndResumeGoalConfig(
+            options: options,
+            expectedGoalSupportEnabled: true,
+            expectedCapabilities: capabilities
+        )
+    }
+
     func testAgentModeDefaultCarriesExplicitGoalOptOutToStartAndResume() async throws {
         let options = CodexNativeSessionController.Options.agentModeDefault(
             approvalPolicyProvider: { .never },
@@ -776,6 +797,28 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         }
     }
 
+    func testStandardCodexProviderDoesNotRegisterAgentModeSkillRoots() async throws {
+        let provider = CodexCLIProvider(
+            defaultRequestTimeout: 5,
+            testRequestTimeout: 5,
+            maxRetries: 0,
+            appServerReadyHook: {}
+        )
+        let options = provider.interactiveSessionOptions(excludeServers: [], requestTimeout: 5)
+        let (controller, recordURL) = try await makeController(options: options)
+
+        _ = try await controller.startOrResume(existing: nil, baseInstructions: "Chat")
+        await controller.shutdown()
+
+        XCTAssertEqual(try recordedRequests(for: "skills/extraRoots/set", at: recordURL).count, 0)
+        XCTAssertEqual(try recordedRequests(for: "thread/start", at: recordURL).count, 1)
+        try assertProcessCapabilityConfig(
+            at: recordURL,
+            expectedCapabilities: .disabled,
+            label: "standard provider process"
+        )
+    }
+
     func testSchemaAlignedThreadRequestsOmitUndeclaredFieldsAndAcceptMissingGoal() async throws {
         let (startController, startRecordURL) = try await makeController(options: makeOptions())
         _ = try await startController.startOrResume(
@@ -956,6 +999,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         expectedGoalSupportEnabled: Bool,
         expectedReasoningSummary: String = "none",
         expectedMemoriesEnabled: Bool = false,
+        expectedCapabilities: CodexCapabilitySettings = .disabled,
         expectedApprovalReviewer: String = "user"
     ) async throws {
         let (startController, startRecordURL) = try await makeController(options: options)
@@ -967,6 +1011,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             expectedGoalSupportEnabled: expectedGoalSupportEnabled,
             expectedReasoningSummary: expectedReasoningSummary,
             expectedMemoriesEnabled: expectedMemoriesEnabled,
+            expectedCapabilities: expectedCapabilities,
             expectedApprovalReviewer: expectedApprovalReviewer,
             label: "thread/start"
         )
@@ -977,6 +1022,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             label: "thread/start process"
         )
         try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: startRecordURL, label: "thread/start process")
+        try assertProcessCapabilityConfig(
+            at: startRecordURL,
+            expectedCapabilities: expectedCapabilities,
+            label: "thread/start process"
+        )
         XCTAssertEqual(
             try recordedRequests(for: "thread/memoryMode/set", at: startRecordURL).count,
             0,
@@ -998,6 +1048,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             expectedGoalSupportEnabled: expectedGoalSupportEnabled,
             expectedReasoningSummary: expectedReasoningSummary,
             expectedMemoriesEnabled: expectedMemoriesEnabled,
+            expectedCapabilities: expectedCapabilities,
             expectedApprovalReviewer: expectedApprovalReviewer,
             label: "thread/resume"
         )
@@ -1008,6 +1059,11 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             label: "thread/resume process"
         )
         try assertProcessLaunchOmitsDirectOnlyNamespaceOverride(at: resumeRecordURL, label: "thread/resume process")
+        try assertProcessCapabilityConfig(
+            at: resumeRecordURL,
+            expectedCapabilities: expectedCapabilities,
+            label: "thread/resume process"
+        )
         try assertMemoryModeRequest(
             at: resumeRecordURL,
             expectedThreadID: "existing-thread",
@@ -1136,7 +1192,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         import sys
 
         if sys.argv[1:] == ["--version"]:
-            print("codex 0.145.0")
+            print("codex 0.149.0")
             raise SystemExit(0)
 
         record_path = \(String(reflecting: recordURL.path))
@@ -1309,6 +1365,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         expectedGoalSupportEnabled: Bool,
         expectedReasoningSummary: String,
         expectedMemoriesEnabled: Bool,
+        expectedCapabilities: CodexCapabilitySettings,
         expectedApprovalReviewer: String,
         label: String
     ) throws {
@@ -1321,6 +1378,14 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         XCTAssertEqual(config["memories.generate_memories"] as? Bool, expectedMemoriesEnabled, label)
         XCTAssertEqual(config["memories.use_memories"] as? Bool, expectedMemoriesEnabled, label)
         XCTAssertEqual(config["features.computer_use"] as? Bool, false, label)
+        XCTAssertEqual(config["features.apps"] as? Bool, expectedCapabilities.appsEnabled, label)
+        XCTAssertEqual(config["features.plugins"] as? Bool, expectedCapabilities.pluginsEnabled, label)
+        XCTAssertEqual(
+            config["features.tool_call_mcp_elicitation"] as? Bool,
+            expectedCapabilities.mcpElicitationEnabled,
+            label
+        )
+        XCTAssertEqual(config["features.tool_suggest"] as? Bool, expectedCapabilities.toolSuggestionsEnabled, label)
         XCTAssertEqual(
             config["features.code_mode.direct_only_tool_namespaces"] as? [String],
             ["mcp__RepoPromptCE"],
@@ -1382,5 +1447,22 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             arguments.contains { $0.hasPrefix("features.code_mode.direct_only_tool_namespaces=") },
             label
         )
+    }
+
+    private func assertProcessCapabilityConfig(
+        at recordURL: URL,
+        expectedCapabilities: CodexCapabilitySettings,
+        label: String
+    ) throws {
+        let arguments = try recordedProcessArguments(at: recordURL)
+        let expectedValues = [
+            "features.apps=\(expectedCapabilities.appsEnabled)",
+            "features.plugins=\(expectedCapabilities.pluginsEnabled)",
+            "features.tool_call_mcp_elicitation=\(expectedCapabilities.mcpElicitationEnabled)",
+            "features.tool_suggest=\(expectedCapabilities.toolSuggestionsEnabled)"
+        ]
+        for value in expectedValues {
+            XCTAssertTrue(arguments.contains(value), "\(label): \(value)")
+        }
     }
 }

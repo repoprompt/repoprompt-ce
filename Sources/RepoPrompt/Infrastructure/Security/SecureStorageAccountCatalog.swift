@@ -32,6 +32,7 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     case agentPermissionClaudeDocument
     case agentPermissionOpenCodeDocument
     case agentPermissionCursorDocument
+    case agentPermissionGrokBuildDocument
 
     var identifier: String {
         switch self {
@@ -96,6 +97,11 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
                 40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
                 51, 53, 52, 41, 116, 57, 47, 40, 41, 53, 40, 116, 44, 107
             ])
+        case .agentPermissionGrokBuildDocument:
+            Self.decode([
+                40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
+                51, 53, 52, 41, 116, 61, 40, 53, 49, 24, 47, 51, 54, 62, 116, 44, 107
+            ])
         }
     }
 
@@ -128,6 +134,7 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
         case .agentPermissionClaudeDocument: "Claude permissions"
         case .agentPermissionOpenCodeDocument: "OpenCode permissions"
         case .agentPermissionCursorDocument: "Cursor permissions"
+        case .agentPermissionGrokBuildDocument: "Grok Build permissions"
         }
     }
 
@@ -167,7 +174,8 @@ enum SecureStorageAccountCatalog {
         .agentPermissionCodexDocument,
         .agentPermissionClaudeDocument,
         .agentPermissionOpenCodeDocument,
-        .agentPermissionCursorDocument
+        .agentPermissionCursorDocument,
+        .agentPermissionGrokBuildDocument
     ]
 
     static let allAccounts = SecureStorageAccount.allCases

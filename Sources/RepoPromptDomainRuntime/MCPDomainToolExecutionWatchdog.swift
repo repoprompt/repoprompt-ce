@@ -410,7 +410,7 @@ package enum MCPToolExecutionWatchdog {
                     guard deadlineDidExpire else { continue }
 
                     if let settlementSlot {
-                        switch settlementSlot.resolveGraceExpiry() {
+                        switch settlementSlot.resolveGraceExpiry(now: environment.now()) {
                         case .settled:
                             continue
 
@@ -493,7 +493,7 @@ package enum MCPToolExecutionWatchdog {
                 await onEvent(.cancellationRequested(origin: .requestCancellation))
             }
             if let settlementSlot {
-                switch settlementSlot.cancel() {
+                switch settlementSlot.cancel(now: environment.now()) {
                 case let .abandoned(completedSettlement):
                     if let completedSettlement {
                         Task { await onAbandonedSettlement(completedSettlement) }

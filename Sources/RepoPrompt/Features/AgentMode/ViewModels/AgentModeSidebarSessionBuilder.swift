@@ -283,6 +283,9 @@ struct AgentModeSidebarSessionBuilder {
         let isMCPControlled = mcpControlledTabIDs.contains(tab.id)
         let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
         let mergeAttention = sidebarRowWorktreeMergeAttention(liveSession: metadataLiveSession, entry: entry)
+        let canStash = boundLiveSession?.items.isEmpty == false
+            || boundLiveSession?.transcript.turns.isEmpty == false
+            || entry.map(Self.sessionIndexEntryHasConversationContent) == true
         let searchFields = Self.searchFields(
             title: title,
             entry: entry,
@@ -302,6 +305,7 @@ struct AgentModeSidebarSessionBuilder {
             activityDate: activityDate,
             isPinned: tab.isPinned,
             sessionID: resolvedSessionID,
+            canStash: canStash,
             parentSessionID: resolvedParentSessionID,
             depth: 0,
             isMCPControlled: isMCPControlled,
@@ -734,6 +738,7 @@ struct AgentModeSidebarSessionBuilder {
             activityDate: session.activityDate,
             isPinned: session.isPinned,
             sessionID: session.sessionID,
+            canStash: session.canStash,
             parentSessionID: session.parentSessionID,
             depth: depth,
             isMCPControlled: session.isMCPControlled,

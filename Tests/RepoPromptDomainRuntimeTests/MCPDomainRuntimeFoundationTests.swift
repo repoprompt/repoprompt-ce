@@ -22,11 +22,149 @@ final class MCPDomainToolCatalogTests: XCTestCase {
             !MCPDomainToolCatalog.toolNames(for: [$0]).isEmpty
         })
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "read_file"), [.fileRead])
+        XCTAssertEqual(MCPDomainToolCatalog.admissionClass(for: "read_file"), .fileRead)
+        XCTAssertEqual(MCPDomainToolCatalog.admissionClass(for: "get_code_structure"), .smallRead)
+        XCTAssertEqual(MCPDomainToolCatalog.admissionClass(for: "get_file_tree"), .smallRead)
+        XCTAssertEqual(MCPDomainToolCatalog.admissionClass(for: "oracle_chat_log"), .smallRead)
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "file_search"), [.fileSearch])
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "history"), [.historyRead])
         XCTAssertEqual(MCPToolCapability.statusPublication.externalName, "agent_session_control")
         XCTAssertNil(MCPDomainToolCatalog.admissionClass(for: "unknown"))
         XCTAssertTrue(MCPDomainToolCatalog.capabilities(for: "unknown").isEmpty)
+    }
+
+    func testOperationIdentityMirrorsCatalogSelectorsNormalizationAndHandlerDefaults() {
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.manageSelection, input: .missing),
+            MCPDomainToolOperationIdentity(canonicalTool: MCPWindowToolName.manageSelection, normalizedOperation: "get")
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.workspaceContext, input: .missing).normalizedOperation,
+            "snapshot"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.prompt, input: .missing).normalizedOperation,
+            "get"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.agentRun, input: .missing).normalizedOperation,
+            "wait"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.git, input: .missing).normalizedOperation,
+            "status"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.agentManage, input: .missing).normalizedOperation,
+            "list_sessions"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.workspaceContext, input: .value("  EXPORT ")).normalizedOperation,
+            "export"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.manageSelection, input: .value("SET")).normalizedOperation,
+            "set"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.agentManage, input: .value("handoff")).normalizedOperation,
+            "extract_handoff"
+        )
+        XCTAssertEqual(MCPDomainToolCatalog.operationArgumentKey(for: MCPGlobalToolName.manageWorkspaces), "action")
+        XCTAssertEqual(MCPDomainToolCatalog.operationArgumentKey(for: MCPWindowToolName.fileActions), "action")
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.fileActions, input: .value("CREATE")).normalizedOperation,
+            "create"
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.fileActions, input: .value("rename")).normalizedOperation,
+            "move"
+        )
+        XCTAssertNil(MCPDomainToolCatalog.operationArgumentKey(for: MCPWindowToolName.readFile))
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.readFile, input: .malformed).normalizedOperation,
+            MCPDomainToolOperationIdentity.callOperation
+        )
+    }
+
+    func testOperationIdentityBoundsUnknownAndMalformedValuesWithoutRetainingInput() {
+        let privateValue = "private/path/session/prompt/" + String(repeating: "x", count: 10000)
+        let unknownOperation = MCPDomainToolCatalog.operationIdentity(
+            for: MCPWindowToolName.manageSelection,
+            input: .value(privateValue)
+        )
+        XCTAssertEqual(unknownOperation.canonicalTool, MCPWindowToolName.manageSelection)
+        XCTAssertEqual(unknownOperation.normalizedOperation, MCPDomainToolOperationIdentity.unknownOperation)
+        XCTAssertFalse(unknownOperation.normalizedOperation.contains("private"))
+
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.manageSelection, input: .malformed).normalizedOperation,
+            MCPDomainToolOperationIdentity.unknownOperation
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPGlobalToolName.appSettings, input: .missing).normalizedOperation,
+            MCPDomainToolOperationIdentity.unknownOperation
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: "future_private_tool_\(privateValue)", input: .value(privateValue)),
+            .unknown
+        )
+        XCTAssertEqual(
+            MCPDomainToolCatalog.operationIdentity(for: MCPWindowToolName.history, input: .value("SEARCH")).normalizedOperation,
+            MCPDomainToolOperationIdentity.unknownOperation
+        )
+    }
+
+    func testConfiguredLimitsReportCurrentConnectionAndResourceScopes() throws {
+        let appMutation = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPGlobalToolName.appSettings))
+        XCTAssertEqual(appMutation.connectionLane, MCPDomainToolAdmissionLimits.exclusiveConnection)
+        XCTAssertEqual(appMutation.resourceLease, MCPDomainToolAdmissionLimits.exclusiveConnection)
+        XCTAssertEqual(appMutation.resourceScope, .application)
+
+        let fileRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.readFile))
+        XCTAssertEqual(fileRead.connectionLane, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        XCTAssertEqual(fileRead.resourceLease, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        XCTAssertEqual(fileRead.resourceScope, .window)
+
+        for toolName in [
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.getFileTree,
+            MCPWindowToolName.oracleChatLog
+        ] {
+            let smallRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: toolName))
+            XCTAssertEqual(smallRead.connectionLane, 2, toolName)
+            XCTAssertEqual(smallRead.resourceLease, 2, toolName)
+            XCTAssertEqual(smallRead.resourceScope, .window, toolName)
+        }
+
+        let gitRead = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.git))
+        XCTAssertEqual(gitRead.connectionLane, MCPDomainToolAdmissionLimits.gitReadConnection)
+        XCTAssertEqual(gitRead.resourceLease, MCPDomainToolAdmissionLimits.gitReadPerRepository)
+        XCTAssertEqual(gitRead.resourceScope, .repository)
+
+        let control = try XCTUnwrap(MCPDomainToolCatalog.configuredLimits(for: MCPWindowToolName.agentRun))
+        XCTAssertEqual(control.connectionLane, MCPDomainToolAdmissionLimits.controlConnection)
+        XCTAssertNil(control.resourceLease)
+        XCTAssertNil(control.resourceScope)
+        XCTAssertNil(MCPDomainToolCatalog.configuredLimits(for: "unknown"))
+    }
+
+    func testContentReadCapacityScalesWithoutCapWhileBulkCapacityPreservesReserveAndCeiling() {
+        XCTAssertEqual(
+            ContentReadConcurrencyCapacity.maximumConcurrentReads,
+            max(2, ProcessInfo.processInfo.activeProcessorCount)
+        )
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 1), 1)
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 2), 1)
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 3), 2)
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 4), 3)
+        XCTAssertEqual(ContentReadConcurrencyCapacity.bulkReadLimit(forReadCapacity: 64), 3)
+        XCTAssertEqual(
+            ContentReadConcurrencyCapacity.maximumConcurrentBulkReads,
+            ContentReadConcurrencyCapacity.bulkReadLimit(
+                forReadCapacity: ContentReadConcurrencyCapacity.maximumConcurrentReads
+            )
+        )
     }
 
     func testEveryClientProfileHasExplicitPolicyAndPreservesFrozenVisibility() {
@@ -43,7 +181,8 @@ final class MCPDomainToolCatalogTests: XCTestCase {
             .agentModeClaudeEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
             .agentModeCodexEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
             .agentModeOpenCodeEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
-            .agentModeCursorEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"]
+            .agentModeCursorEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
+            .agentModeGrokBuildEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"]
         ]
         for profile in MCPClientToolPolicyProfile.allCases {
             XCTAssertEqual(

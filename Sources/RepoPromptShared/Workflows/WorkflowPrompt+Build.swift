@@ -5,7 +5,7 @@ extension RepoPromptWorkflowPrompts {
 
 	/// Core MCP Builder workflow content - shared across slash commands, MCP prompts, and copy presets.
 	/// Does NOT include surface-specific content like YAML frontmatter or embedded file tree mentions.
-	static let rpBuildCore = rpBuildCore(variant: .mcp)
+	public static let rpBuildCore = rpBuildCore(variant: .mcp)
 
 	/// Generate build workflow content for a specific variant.
 	static func rpBuildCore(variant: WorkflowPromptVariant) -> String {

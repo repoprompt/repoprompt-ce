@@ -7,6 +7,17 @@ import XCTest
 @MainActor
 final class WorktreeAPISmokeHarnessTests: XCTestCase {
     func testManageWorktreeAndAgentRunAPISmokeFlow() async throws {
+        let defaults = UserDefaults.standard
+        let previousServe = defaults.object(forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+        defaults.set(false, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+        defer {
+            if let previousServe {
+                defaults.set(previousServe, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+            }
+        }
+
         #if DEBUG
             let startupTrace = WorktreeStartupEventTraceSink()
             let startupTraceToken = WorktreeStartupInstrumentation.addEventObserverForTesting { event, sequence in
@@ -907,6 +918,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
         let host = WorkspaceFileEditHost(
             store: store,
+            target: .existing(readRecord),
             lookupRootScope: lookupContext.rootScope,
             createPathResolutionPolicy: .canonicalAliasFirst,
             selectCreatedFiles: false

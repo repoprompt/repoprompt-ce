@@ -644,8 +644,8 @@ package enum MCPDomainCanonicalToolDefinitions {
         "ZXN0aW9ucy4gRWFjaCBxdWVzdGlvbiByZXF1aXJlcyBzdGFibGUgYGlkYCBhbmQgYHF1ZXN0aW9uYCBmaWVsZHMuIFVzZSBgYWxsb3dzX211bHRpcGxlYCBh",
         "bmQgYGFsbG93c19jdXN0b21gIGZvciBzZWxlY3Rpb24vY3VzdG9tLWFuc3dlciBiZWhhdmlvci5cbi0gYHRpdGxlYDogT3B0aW9uYWwgdGl0bGUgZm9yIHRo",
         "ZSB3aXphcmQgY2FyZC5cbi0gYGNvbnRleHRgOiBPcHRpb25hbCBvdmVyYWxsIGNvbnRleHQgc2hvd24gYWJvdmUgdGhlIHF1ZXN0aW9ucy5cbi0gYHRpbWVv",
-        "dXRfc2Vjb25kc2A6IE9wdGlvbmFsIHRpbWVvdXQgaW4gc2Vjb25kcyBmb3IgdGhlIHdob2xlIGludGVyYWN0aW9uLiBEZWZhdWx0cyB0byB0aGUgd29ya3Nw",
-        "YWNlIHF1ZXN0aW9uLXRpbWVvdXQgc2V0dGluZy5cblxuKipSZXNwb25zZToqKlxuLSBgYW5zd2Vyc2A6IE9iamVjdCBrZXllZCBieSBxdWVzdGlvbiBJRC4g",
+        "dXRfc2Vjb25kc2A6IE9wdGlvbmFsIHRpbWVvdXQgaW4gc2Vjb25kcyBmb3IgdGhlIHdob2xlIGludGVyYWN0aW9uLiBEZWZhdWx0cyB0byB0aGUgZ2xvYmFs",
+        "IFF1ZXN0aW9uIFRpbWVvdXQgcHJlZmVyZW5jZS5cblxuKipSZXNwb25zZToqKlxuLSBgYW5zd2Vyc2A6IE9iamVjdCBrZXllZCBieSBxdWVzdGlvbiBJRC4g",
         "RWFjaCB2YWx1ZSBjb250YWlucyBgYW5zd2Vyc2AsIGBzZWxlY3RlZF9vcHRpb25zYCwgYGN1c3RvbV9yZXNwb25zZWAsIGFuZCBgc2tpcHBlZGAuXG4tIGB0",
         "aW1lZF9vdXRgOiBUcnVlIGlmIHRoZSBpbnRlcmFjdGlvbiB0aW1lZCBvdXQuXG4tIGBza2lwcGVkYDogVHJ1ZSBpZiB1c2VyIGV4cGxpY2l0bHkgc2tpcHBl",
         "ZCB0aGUgaW50ZXJhY3Rpb24uXG4tIGBlbGFwc2VkX3NlY29uZHNgOiBIb3cgbG9uZyB0aGUgdXNlciB0b29rIHRvIHJlc3BvbmQuIiwiaW5wdXRTY2hlbWEi",
@@ -664,7 +664,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         "d2hlbiBzZWxlY3RlZC4iLCJ0eXBlIjoic3RyaW5nIn19LCJyZXF1aXJlZCI6WyJsYWJlbCJdLCJ0eXBlIjoib2JqZWN0In1dfSwidHlwZSI6ImFycmF5In0s",
         "InF1ZXN0aW9uIjp7ImRlc2NyaXB0aW9uIjoiUXVlc3Rpb24gdGV4dCB0byBzaG93IHRoZSB1c2VyLiIsInR5cGUiOiJzdHJpbmcifX0sInJlcXVpcmVkIjpb",
         "ImlkIiwicXVlc3Rpb24iXSwidHlwZSI6Im9iamVjdCJ9LCJ0eXBlIjoiYXJyYXkifSwidGltZW91dF9zZWNvbmRzIjp7ImRlc2NyaXB0aW9uIjoiVGltZW91",
-        "dCBpbiBzZWNvbmRzIGZvciB0aGUgd2hvbGUgaW50ZXJhY3Rpb24uIERlZmF1bHRzIHRvIHRoZSB3b3Jrc3BhY2UgcXVlc3Rpb24tdGltZW91dCBzZXR0aW5n",
+        "dCBpbiBzZWNvbmRzIGZvciB0aGUgd2hvbGUgaW50ZXJhY3Rpb24uIERlZmF1bHRzIHRvIHRoZSBnbG9iYWwgUXVlc3Rpb24gVGltZW91dCBwcmVmZXJlbmNl",
         "LiIsInR5cGUiOiJpbnRlZ2VyIn0sInRpdGxlIjp7ImRlc2NyaXB0aW9uIjoiT3B0aW9uYWwgdGl0bGUgc2hvd24gYWJvdmUgdGhlIHF1ZXN0aW9uIHdpemFy",
         "ZC4iLCJ0eXBlIjoic3RyaW5nIn19LCJyZXF1aXJlZCI6WyJxdWVzdGlvbnMiXSwidHlwZSI6Im9iamVjdCJ9LCJhbm5vdGF0aW9ucyI6eyJ0aXRsZSI6bnVs",
         "bCwicmVhZE9ubHlIaW50IjpmYWxzZSwiZGVzdHJ1Y3RpdmVIaW50IjpmYWxzZSwiaWRlbXBvdGVudEhpbnQiOm51bGwsIm9wZW5Xb3JsZEhpbnQiOmZhbHNl",
@@ -1047,6 +1047,16 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeGlobalSemantics(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if definition.name == MCPWindowToolName.readFile {
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description
+                    + "\n\n**Exact workspace paths**: Existing workspace files use literal-first exact resolution. Reuse a returned path unchanged with `read_file` or `apply_edits`; use `<root-alias>//<relative-path>` when explicit root qualification is needed. Basename, suffix, and head-trim matching are not supported. Approved external read paths remain read-only.",
+                inputSchema: definition.inputSchema,
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
         if definition.name == MCPWindowToolName.agentRun {
             let oldWaitDescription = "Returns `interaction_id` when input is pending."
             let currentWaitDescription = oldWaitDescription

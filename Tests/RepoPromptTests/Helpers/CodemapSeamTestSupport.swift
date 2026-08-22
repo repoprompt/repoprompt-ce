@@ -831,14 +831,23 @@ final class CodemapLockedCounter: @unchecked Sendable {
 }
 
 final class CodemapLockedValues<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [Value] = []
+    private let condition = AsyncTestCondition<[Value]>([])
 
     var values: [Value] {
-        lock.withLock { storage }
+        condition.snapshot()
     }
 
     func append(_ value: Value) {
-        lock.withLock { storage.append(value) }
+        condition.update { $0.append(value) }
+    }
+
+    func waitUntilCount(
+        _ expectedCount: Int,
+        timeout: TimeInterval = TestFenceDefaults.enterWait
+    ) async throws {
+        try await condition.waitUntil(
+            "codemap recorded value count \(expectedCount)",
+            timeout: timeout
+        ) { $0.count >= expectedCount }
     }
 }

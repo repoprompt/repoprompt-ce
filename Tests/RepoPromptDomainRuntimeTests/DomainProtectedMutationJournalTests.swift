@@ -4,6 +4,73 @@ import MCP
 import XCTest
 
 final class DomainProtectedMutationJournalTests: XCTestCase {
+    func testFailedBeforeWriteStatusDecodesAndReencodesCanonically() throws {
+        let decoder = JSONDecoder()
+        let status = try decoder.decode(
+            DomainMutationJournalStatus.self,
+            from: Data(#""failed_before_write""#.utf8)
+        )
+
+        XCTAssertEqual(status, .failedBeforeCommit)
+        XCTAssertEqual(
+            String(data: try JSONEncoder().encode(status), encoding: .utf8),
+            #""failed_before_commit""#
+        )
+        XCTAssertThrowsError(
+            try decoder.decode(
+                DomainMutationJournalStatus.self,
+                from: Data(#""unknown_status""#.utf8)
+            )
+        )
+    }
+
+    func testLegacyFailedBeforeWriteJournalRetriesAndRewritesCanonicalStatus() async throws {
+        let fixture = try M4BFixture()
+        let arguments = fixture.arguments(operationID: "legacy-failed-before-write")
+        let failingBinding = fixture.binding { _ in
+            throw DomainMutationPathFenceError.scopeUnavailable
+        }
+
+        await XCTAssertThrowsErrorAsync({
+            try await fixture.invoke(
+                failingBinding,
+                arguments: arguments,
+                requestIdentitySeed: "legacy-failed-before-write-request"
+            )
+        })
+
+        let persistence = fixture.runtime.persistenceCoordinator
+        let persistedCanonicalData = try await persistence.loadProtectedMutationJournalData()
+        let canonicalData = try XCTUnwrap(persistedCanonicalData)
+        let canonicalJSON = try XCTUnwrap(String(data: canonicalData, encoding: .utf8))
+        let legacyJSON = canonicalJSON.replacingOccurrences(
+            of: #""failed_before_commit""#,
+            with: #""failed_before_write""#
+        )
+        XCTAssertNotEqual(legacyJSON, canonicalJSON)
+        try await persistence.compareAndSwapProtectedMutationJournalData(
+            expectedDigest: DomainContentDigest.sha256(canonicalData),
+            data: Data(legacyJSON.utf8)
+        )
+
+        let restarted = try M4BFixture(storage: fixture.storage, root: fixture.root)
+        let retriedBinding = restarted.binding { _ in
+            try await MCPDomainMutationCommitContext.willCommit()
+            return .string("retried")
+        }
+        let result = try await restarted.invoke(
+            retriedBinding,
+            arguments: arguments,
+            requestIdentitySeed: "legacy-failed-before-write-request"
+        )
+
+        XCTAssertEqual(result.stringValue, "retried")
+        let persistedRewrittenData = try await restarted.runtime.persistenceCoordinator.loadProtectedMutationJournalData()
+        let rewrittenData = try XCTUnwrap(persistedRewrittenData)
+        let rewrittenJSON = try XCTUnwrap(String(data: rewrittenData, encoding: .utf8))
+        XCTAssertFalse(rewrittenJSON.contains("failed_before_write"))
+    }
+
     func testInternalMutationKeyReplaysWhilePublicCorrelationIDCanBeReused() async throws {
         let fixture = try M4BFixture()
         let calls = MutationCounter()

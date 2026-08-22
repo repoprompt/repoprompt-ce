@@ -8,14 +8,61 @@ func presentedSelectedContextCount(
     return authoritativeRowCount
 }
 
+func agentContextFilesShouldResetModel(
+    previousIdentity: AgentSelectedFilesModelIdentity,
+    currentIdentity: AgentSelectedFilesModelIdentity
+) -> Bool {
+    !previousIdentity.hasSameMutationRoute(as: currentIdentity)
+}
+
+func agentContextFilesCanMutateCurrentModel(
+    isSwitchBlankingRows: Bool,
+    isSwitchingComposeTab: Bool,
+    canMutateDisplayedModel: Bool,
+    sourceTabID: UUID?,
+    activeTabID: UUID?
+) -> Bool {
+    !isSwitchBlankingRows
+        && !isSwitchingComposeTab
+        && canMutateDisplayedModel
+        && sourceTabID != nil
+        && sourceTabID == activeTabID
+}
+
+func agentContextFilesReviewMutationIsFenced(
+    pendingIdentities: Set<WorkspaceSelectionIdentity>,
+    targetIdentity: WorkspaceSelectionIdentity?
+) -> Bool {
+    targetIdentity.map(pendingIdentities.contains) ?? false
+}
+
+func agentContextFileBrowseRouteProof(
+    activeIdentity: WorkspaceSelectionIdentity?,
+    sourceTabID: UUID?,
+    lookupContext: WorkspaceLookupContext
+) -> AgentContextFileBrowseRouteProof? {
+    guard let activeIdentity, activeIdentity.tabID == sourceTabID else { return nil }
+    return AgentContextFileBrowseRouteProof(identity: activeIdentity, lookupContext: lookupContext)
+}
+
+func agentContextFileBrowseShouldTerminateForTargetChange(
+    isBrowseActive: Bool,
+    hasMutationTarget: Bool,
+    sessionMatchesTarget: Bool
+) -> Bool {
+    isBrowseActive && (!hasMutationTarget || !sessionMatchesTarget)
+}
+
 struct AgentContextDrawerFilesTab: View {
     @ObservedObject var detailStore: AgentContextDrawerDetailStore
     @ObservedObject var modelCoordinator: AgentSelectedFilesModelCoordinator
     let exportContext: AgentContextExportViewContext
     let isSwitchBlankingRows: Bool
 
+    @ObservedObject var browseModel: AgentContextFileBrowseModel
     @ObservedObject private var fontScale = FontScaleManager.shared
     @StateObject private var previewCoordinator = AgentSelectedFilePreviewLoadCoordinator()
+    @State private var browseEntryTask: Task<Void, Never>?
 
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -124,33 +171,57 @@ struct AgentContextDrawerFilesTab: View {
     }
 
     private var previewVisibleRows: [AgentContextExportRow] {
-        isSwitchHidingRows ? [] : activeRows
+        (isSwitchHidingRows || browseModel.isActive) ? [] : activeRows
+    }
+
+    private var canMutateDisplayedModel: Bool {
+        agentContextFilesCanMutateCurrentModel(
+            isSwitchBlankingRows: isSwitchBlankingRows,
+            isSwitchingComposeTab: exportContext.promptManager.isSwitchingComposeTab,
+            canMutateDisplayedModel: modelCoordinator.canMutateDisplayedModel,
+            sourceTabID: currentModel?.source.tabID,
+            activeTabID: exportContext.selectionCoordinator?.activeTabID()
+        )
     }
 
     private var canMutateCurrentModel: Bool {
-        guard !isSwitchBlankingRows else { return false }
-        guard !exportContext.promptManager.isSwitchingComposeTab else { return false }
-        guard modelCoordinator.canMutateDisplayedModel else { return false }
-        guard let model = currentModel,
-              let sourceTabID = model.source.tabID,
-              let selectionCoordinator = exportContext.selectionCoordinator
-        else { return false }
-        return selectionCoordinator.activeTabID() == sourceTabID
+        guard let routeProof = currentMutationRouteProof else { return false }
+        return !agentContextFilesReviewMutationIsFenced(
+            pendingIdentities: browseModel.pendingMutationIdentities,
+            targetIdentity: routeProof.identity
+        )
+    }
+
+    private var currentMutationRouteProof: AgentContextFileBrowseRouteProof? {
+        guard canMutateDisplayedModel,
+              let model = currentModel
+        else { return nil }
+        return agentContextFileBrowseRouteProof(
+            activeIdentity: exportContext.selectionCoordinator?.activeSelectionIdentity(),
+            sourceTabID: model.source.tabID,
+            lookupContext: model.lookupContext
+        )
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            controls
-            subtabSwitcher
-            content
+            if browseModel.isActive {
+                AgentContextFileBrowseView(model: browseModel)
+            } else {
+                controls
+                subtabSwitcher
+                content
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
         .onAppear {
+            browseModel.updateMutationRouteProof(currentMutationRouteProof)
             refreshIfNeeded()
             adjustActiveSubtab()
         }
         .onDisappear {
+            terminateBrowseSession()
             previewCoordinator.reconcileVisibleRows([])
             if !isSwitchBlankingRows {
                 modelCoordinator.cancelLoading(keepLoadedModel: true)
@@ -159,12 +230,49 @@ struct AgentContextDrawerFilesTab: View {
         .onReceive(exportContext.selectionChangesPublisher) { change in
             guard !isSwitchBlankingRows else { return }
             guard !exportContext.promptManager.isSwitchingComposeTab else { return }
+            browseModel.applySelectionChange(change, exportRows: modelCoordinator.rowSplit.rows)
             handleSelectionChange(change, isVisible: true)
         }
-        .onChange(of: exportContext.modelRequestIdentity) { _, _ in
+        .onChange(of: exportContext.modelRequestIdentity) { previousIdentity, currentIdentity in
             guard !isSwitchBlankingRows else { return }
             guard !exportContext.promptManager.isSwitchingComposeTab else { return }
+            guard agentContextFilesShouldResetModel(
+                previousIdentity: previousIdentity,
+                currentIdentity: currentIdentity
+            ) else { return }
             resetOrRefresh(isVisible: true)
+        }
+        .onChange(of: currentMutationRouteProof) { _, proof in
+            browseModel.updateMutationRouteProof(proof)
+        }
+        .onChange(of: isSwitchBlankingRows) { _, isBlanking in
+            if isBlanking { terminateBrowseSession() }
+        }
+        .onChange(of: modelCoordinator.model) { _, newModel in
+            guard browseModel.isActive, let newModel else { return }
+            let routeProof = agentContextFileBrowseRouteProof(
+                activeIdentity: exportContext.selectionCoordinator?.activeSelectionIdentity(),
+                sourceTabID: newModel.source.tabID,
+                lookupContext: newModel.lookupContext
+            )
+            let sessionMatchesTarget = routeProof.map {
+                browseModel.sessionMatches(identity: $0.identity, lookupContext: $0.lookupContext)
+            } ?? false
+            if agentContextFileBrowseShouldTerminateForTargetChange(
+                isBrowseActive: browseModel.isActive,
+                hasMutationTarget: routeProof != nil,
+                sessionMatchesTarget: sessionMatchesTarget
+            ) {
+                terminateBrowseSession()
+                return
+            }
+            browseModel.updateAuthoritativeSelection(newModel.source.selection, exportRows: newModel.rows)
+        }
+        .onChange(of: browseModel.isActive) { _, isActive in
+            previewCoordinator.reconcileVisibleRows(isActive ? [] : previewVisibleRows)
+        }
+        .onReceive(exportContext.promptManager.$codeMapsGloballyDisabled) { disabled in
+            browseModel.setCodeMapsGloballyDisabled(disabled)
         }
         .onChange(of: fileRows.count) { _, _ in adjustActiveSubtab() }
         .onChange(of: codemapRows.count) { _, _ in adjustActiveSubtab() }
@@ -199,6 +307,15 @@ struct AgentContextDrawerFilesTab: View {
                         .foregroundStyle(.tertiary)
                 }
                 Spacer()
+                Button {
+                    enterBrowseMode()
+                } label: {
+                    Label("Add", systemImage: "plus")
+                        .font(fontPreset.captionFont)
+                }
+                .buttonStyle(CustomButtonStyle(verticalPadding: 4, horizontalPadding: 9))
+                .disabled(!canMutateCurrentModel || currentModel == nil)
+                .hoverTooltip(canMutateCurrentModel ? "Browse workspace files" : "Selection mutation is unavailable for this Agent context")
                 Button {
                     guard let model = currentModel else { return }
                     clearSelection(for: model)
@@ -423,6 +540,35 @@ struct AgentContextDrawerFilesTab: View {
                 remove(row, from: model)
             }
         )
+    }
+
+    private func terminateBrowseSession() {
+        browseEntryTask?.cancel()
+        browseEntryTask = nil
+        browseModel.end()
+    }
+
+    private func enterBrowseMode() {
+        guard canMutateCurrentModel,
+              let model = currentModel,
+              let target = exportContext.activeSelectionMutationTarget(for: model.source)
+        else { return }
+        previewCoordinator.reconcileVisibleRows([])
+        let lookupContext = model.lookupContext
+        browseModel.updateMutationRouteProof(
+            AgentContextFileBrowseRouteProof(identity: target.identity, lookupContext: lookupContext)
+        )
+        let exportRows = modelCoordinator.rowSplit.rows
+        let codeMapsGloballyDisabled = exportContext.promptManager.codeMapsGloballyDisabled
+        browseEntryTask?.cancel()
+        browseEntryTask = Task {
+            await browseModel.begin(
+                target: target,
+                lookupContext: lookupContext,
+                exportRows: exportRows,
+                codeMapsGloballyDisabled: codeMapsGloballyDisabled
+            )
+        }
     }
 
     private func refreshIfNeeded(force: Bool = false, preserveDisplayedModel: Bool = false) {

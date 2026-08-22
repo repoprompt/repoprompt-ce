@@ -23,6 +23,7 @@ struct AgentContextControlDrawerView: View {
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let oracleViewModel: OracleViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
+    @ObservedObject var fileBrowseModel: AgentContextFileBrowseModel
     let windowID: Int
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
@@ -354,9 +355,6 @@ struct AgentContextControlDrawerView: View {
 
     private var header: some View {
         HStack(spacing: 14) {
-            Text("Compose")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 15, weight: .semibold))
-
             AgentContextDrawerTokenEstimatePill(
                 tokenCounter: promptManager.tokenCountingViewModel,
                 runtimeVM: runtimeVM,
@@ -374,7 +372,7 @@ struct AgentContextControlDrawerView: View {
                     .frame(width: 28, height: 28)
             }
             .buttonStyle(.plain)
-            .hoverTooltip("Close Compose")
+            .hoverTooltip("Close Context Composer")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
@@ -388,7 +386,8 @@ struct AgentContextControlDrawerView: View {
                 detailStore: detailStore,
                 modelCoordinator: modelCoordinator,
                 exportContext: exportContext,
-                isSwitchBlankingRows: isSwitchBlankingSelectedFiles
+                isSwitchBlankingRows: isSwitchBlankingSelectedFiles,
+                browseModel: fileBrowseModel
             )
         case .builder:
             AgentContextDrawerBuilderTab(

@@ -4,6 +4,14 @@ struct AgentSelectedFilesModelIdentity: Equatable, Hashable {
     let exportContextIdentity: AgentContextExportIdentity
     let filePathDisplay: FilePathDisplay
     let codeMapUsage: CodeMapUsage
+
+    func hasSameMutationRoute(as other: AgentSelectedFilesModelIdentity) -> Bool {
+        exportContextIdentity.tabID == other.exportContextIdentity.tabID
+            && exportContextIdentity.activeAgentSessionID == other.exportContextIdentity.activeAgentSessionID
+            && exportContextIdentity.worktreeBindingFingerprint == other.exportContextIdentity.worktreeBindingFingerprint
+            && filePathDisplay == other.filePathDisplay
+            && codeMapUsage == other.codeMapUsage
+    }
 }
 
 struct AgentSelectedFilesModelRequest {
@@ -271,6 +279,11 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         return completedDisplayedModelMatches(displayedIdentity)
     }
 
+    private func displayedModelCanMutateDuringRefresh(to identity: AgentSelectedFilesModelIdentity) -> Bool {
+        guard displayedModelIsMutable, let displayedIdentity else { return false }
+        return displayedIdentity.hasSameMutationRoute(as: identity)
+    }
+
     private var refreshTask: Task<Void, Never>?
     private let cachedModelLimit = 5
     private var cachedModels: [AgentSelectedFilesModelIdentity: AgentContextExportModel] = [:]
@@ -413,6 +426,8 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             return .skippedLoaded
         }
 
+        let canMutatePreservedDisplayedModel = preserveDisplayedModel
+            && displayedModelCanMutateDuringRefresh(to: request.identity)
         cancelActiveRefresh(reason: "startReplacement", fields: refreshFields)
 
         let shouldClearLoadedModel = loadedIdentity != request.identity
@@ -430,7 +445,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             model: shouldClearDisplayedModel ? nil : state.model,
             rowSplit: shouldClearDisplayedModel ? .empty : state.rowSplit,
             isLoading: true,
-            canMutateDisplayedModel: false
+            canMutateDisplayedModel: canMutatePreservedDisplayedModel
         )
         debugStats.resolverStarts += 1
         refreshFields["shouldClearLoadedModel"] = String(shouldClearLoadedModel)
@@ -477,7 +492,7 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
                         model: publishedFileRowsModel,
                         rowSplit: fileRowsSplit,
                         isLoading: true,
-                        canMutateDisplayedModel: false
+                        canMutateDisplayedModel: canMutatePreservedDisplayedModel
                     )
                     displayedIdentity = request.identity
                     recordVisibleFileMetricsSnapshot(

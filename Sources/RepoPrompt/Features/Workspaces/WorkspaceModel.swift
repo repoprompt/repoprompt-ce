@@ -205,28 +205,23 @@ struct ContextBuilderOverrides: Codable, Equatable {
 struct ContextBuilderTabConfig: Codable, Equatable {
     var instructions: String = ""
 
-    /// Auto-generate a plan after Context Builder completes (nil = use workspace default)
-    var autoGeneratePlan: Bool? = nil
-    /// Selected follow-up type for auto-generate (plan/review/question) - defaults to "plan"
+    /// Selected follow-up type for analysis (plan/review/question)
     var followUpTypeRaw: String? = nil
-    /// Selected context builder prompt IDs for this tab
+    /// Selected Context Builder prompt IDs for this tab
     var selectedContextBuilderPromptIDs: [UUID] = []
 
     private enum CodingKeys: String, CodingKey {
         case instructions
-        case autoGeneratePlan
         case followUpTypeRaw
         case selectedContextBuilderPromptIDs
     }
 
     init(
         instructions: String = "",
-        autoGeneratePlan: Bool? = nil,
         followUpTypeRaw: String? = nil,
         selectedContextBuilderPromptIDs: [UUID] = []
     ) {
         self.instructions = instructions
-        self.autoGeneratePlan = autoGeneratePlan
         self.followUpTypeRaw = followUpTypeRaw
         self.selectedContextBuilderPromptIDs = selectedContextBuilderPromptIDs
     }

@@ -9,8 +9,10 @@ import fcntl
 import io
 import json
 import os
+import queue
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -28,7 +30,30 @@ if str(SCRIPT_DIR) not in sys.path:
 import conductor  # noqa: E402
 
 
+def pid_is_executing(pid: int) -> bool:
+    completed = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "stat="],
+        text=True,
+        capture_output=True,
+        timeout=2.0,
+    )
+    state = completed.stdout.strip()
+    return completed.returncode == 0 and bool(state) and not state.startswith("Z")
+
+
 class LifecycleTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._states: list[conductor.DaemonState] = []
+
+    def tearDown(self) -> None:
+        for state in self._states:
+            with state.condition:
+                workers = list(state._worker_threads)
+            for worker in workers:
+                worker.join(timeout=2.0)
+            state._io_worker.join()
+            state._output_pump.close()
+
     def make_state(self) -> tuple[tempfile.TemporaryDirectory[str], conductor.DaemonState]:
         tmp = tempfile.TemporaryDirectory()
         root = Path(tmp.name)
@@ -46,7 +71,9 @@ class LifecycleTestCase(unittest.TestCase):
             daemon_meta_path=root / "daemon.json",
             running_processes_path=root / "running.json",
         )
-        return tmp, conductor.DaemonState(paths)
+        state = conductor.DaemonState(paths)
+        self._states.append(state)
+        return tmp, state
 
     def make_job(
         self,
@@ -75,9 +102,1907 @@ class LifecycleTestCase(unittest.TestCase):
         )
 
 
+class ConductorControlPlaneIsolationTests(LifecycleTestCase):
+    def test_gated_log_write_does_not_block_status_snapshot(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "gated-log", "build", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def gated_write(*_args: object) -> None:
+            entered.set()
+            self.assertTrue(release.wait(1.0))
+
+        with mock.patch.object(state, "_write_job_log_record", side_effect=gated_write):
+            with state.condition:
+                state._append_system_line_locked(job, "gated\n")
+            self.assertTrue(entered.wait(1.0))
+
+            def snapshot() -> None:
+                state.status_payload()
+                finished.set()
+
+            reader = threading.Thread(target=snapshot)
+            reader.start()
+            self.assertTrue(finished.wait(1.0), "status waited on external log I/O")
+            release.set()
+            reader.join(timeout=1.0)
+
+        self.assertFalse(reader.is_alive())
+
+    def test_gated_process_discovery_releases_central_condition_and_discards_stale_result(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "gated-ps", "build", {}, ["build"], job_state="running")
+        job.job_generation = 4
+        job.process_generation = 7
+        job.process_pid = 123
+        job.process_start = "old"
+        job.tracked_processes = {123: "old"}
+        state.jobs[job.ticket] = job
+        entered = threading.Event()
+        release = threading.Event()
+        completed = threading.Event()
+
+        def gated_snapshot() -> dict[int, tuple[int, str]]:
+            entered.set()
+            self.assertTrue(release.wait(1.0))
+            return {123: (1, "old"), 456: (123, "child")}
+
+        def discover() -> None:
+            with state.condition:
+                state._refresh_process_tree_locked(job)
+            completed.set()
+
+        with mock.patch.object(conductor, "process_table_snapshot", side_effect=gated_snapshot):
+            worker = threading.Thread(target=discover)
+            worker.start()
+            self.assertTrue(entered.wait(1.0))
+            payload = state.status_payload()
+            self.assertEqual(payload["runningJobs"][0]["ticket"], job.ticket)
+            with state.condition:
+                job.process_generation += 1
+            release.set()
+            self.assertTrue(completed.wait(1.0))
+            worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn(456, job.tracked_processes)
+
+    def test_running_registry_rejects_older_generation_after_newer_publication(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        state._running_registry_generation = 2
+        newer = {"version": 2, "generation": 2, "processes": [{"ticket": "new"}]}
+        older = {"version": 2, "generation": 1, "processes": [{"ticket": "old"}]}
+
+        state._publish_running_processes(2, newer)
+        state._publish_running_processes(1, older)
+
+        persisted = json.loads(state.paths.running_processes_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["generation"], 2)
+        self.assertEqual(persisted["processes"][0]["ticket"], "new")
+
+    def test_phase_generation_and_heavy_admission_are_additive_payload_fields(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "phase", "build", {}, ["build"], job_state="running")
+        job.job_generation = 9
+        job.process_generation = 3
+        job.phase = "waitingGlobalHeavy"
+        job.global_heavy_admission_state = "waiting"
+
+        payload = job.to_payload()
+
+        self.assertEqual(payload["phase"], "waitingGlobalHeavy")
+        self.assertEqual(payload["jobGeneration"], 9)
+        self.assertEqual(payload["processGeneration"], 3)
+        self.assertTrue(payload["globalHeavyAdmission"]["displayOnly"])
+        self.assertEqual(payload["globalHeavyAdmission"]["state"], "waiting")
+
+    def test_daemon_contact_health_distinguishes_unresponsive_ambiguous_and_stopped(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        error = socket.timeout("gated")
+
+        with mock.patch.object(conductor, "read_pid", return_value=42), mock.patch.object(
+            conductor, "pid_alive", return_value=True
+        ), mock.patch.object(conductor, "verify_daemon_pid_identity", return_value=True), mock.patch.object(
+            Path, "exists", return_value=True
+        ):
+            unresponsive = conductor.daemon_contact_health(state.paths, error)
+        with mock.patch.object(conductor, "read_pid", return_value=42), mock.patch.object(
+            conductor, "pid_alive", return_value=True
+        ), mock.patch.object(conductor, "verify_daemon_pid_identity", return_value=False), mock.patch.object(
+            Path, "exists", return_value=True
+        ):
+            ambiguous = conductor.daemon_contact_health(state.paths, error)
+        with mock.patch.object(conductor, "read_pid", return_value=None), mock.patch.object(
+            Path, "exists", return_value=False
+        ):
+            stopped = conductor.daemon_contact_health(state.paths, error)
+
+        self.assertIs(unresponsive["running"], True)
+        self.assertEqual(unresponsive["health"]["state"], "unresponsive")
+        self.assertIs(ambiguous["running"], None)
+        self.assertEqual(ambiguous["health"]["state"], "ambiguous")
+        self.assertIs(stopped["running"], False)
+        self.assertEqual(stopped["health"]["state"], "stopped")
+
+
+class ConductorCheckpointThreeTests(LifecycleTestCase):
+    def write_stale_metadata(self, state: conductor.DaemonState, pid: int = 999_999) -> None:
+        state.paths.pid_path.write_text(f"{pid}\n", encoding="utf-8")
+        state.paths.daemon_meta_path.write_text(
+            json.dumps(
+                {
+                    "pid": pid,
+                    "repoRoot": str(state.paths.repo_root),
+                    "repoHash": state.paths.repo_hash,
+                    "script": str(Path(conductor.__file__).resolve()),
+                    "processStart": "stale-start",
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(state.paths.daemon_meta_path, 0o600)
+
+    def test_ambiguous_live_socket_is_preserved_and_blocks_replacement(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(state.paths.socket_path))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+
+        result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "ambiguous")
+        self.assertTrue(state.paths.pid_path.exists())
+        self.assertTrue(state.paths.socket_path.exists())
+        self.assertTrue(state.paths.daemon_meta_path.exists())
+        with mock.patch.object(conductor, "cleanup_stale_files", return_value=result), mock.patch.object(
+            conductor,
+            "compatible_daemon_status_or_stop_idle_mismatch",
+            return_value=(None, conductor.ConductorError("unresponsive fixture")),
+        ), self.assertRaises(conductor.DaemonContactError):
+            conductor.ensure_daemon(state.paths)
+
+    def test_proven_reused_pid_with_absent_socket_is_recovered(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state, pid=4242)
+
+        with mock.patch.object(conductor, "pid_alive", return_value=True), mock.patch.object(
+            conductor, "process_start_token", return_value="different-process"
+        ):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "cleaned")
+        self.assertIn("proven pid reuse", result.reason)
+        self.assertFalse(state.paths.pid_path.exists())
+        self.assertFalse(state.paths.daemon_meta_path.exists())
+
+    def test_proven_reused_pid_with_live_socket_preserves_ambiguous_evidence(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state, pid=4242)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(state.paths.socket_path))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+
+        with mock.patch.object(conductor, "pid_alive", return_value=True), mock.patch.object(
+            conductor, "process_start_token", return_value="different-process"
+        ):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "ambiguous")
+        self.assertTrue(state.paths.pid_path.exists())
+        self.assertTrue(state.paths.daemon_meta_path.exists())
+
+    def test_refused_stale_socket_is_removed_with_unchanged_exact_evidence(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(state.paths.socket_path))
+        listener.close()
+        state.paths.running_processes_path.write_text('{"version":2,"processes":[]}', encoding="utf-8")
+
+        result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "cleaned")
+        self.assertTrue(result.cleaned)
+        self.assertFalse(state.paths.pid_path.exists())
+        self.assertFalse(state.paths.socket_path.exists())
+        self.assertFalse(state.paths.daemon_meta_path.exists())
+        self.assertFalse(state.paths.running_processes_path.exists())
+
+    def test_worker_cleanup_preserves_registry_identity_for_final_stale_evidence_check(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+        registry_identity = conductor._path_identity(state.paths.running_processes_path)
+
+        cleanup = conductor.cleanup_running_process_groups(state.paths)
+
+        self.assertTrue(cleanup["safeToForget"])
+        self.assertEqual(conductor._path_identity(state.paths.running_processes_path), registry_identity)
+
+    def test_stale_cleanup_rejects_registry_replacement_during_worker_cleanup(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+
+        def replace_registry(_paths: conductor.Paths) -> dict[str, object]:
+            conductor._atomic_write_json(
+                state.paths.running_processes_path,
+                {"version": 3, "generation": 2, "processes": []},
+            )
+            return {"safeToForget": True}
+
+        with mock.patch.object(conductor, "cleanup_running_process_groups", side_effect=replace_registry):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "ambiguous")
+        self.assertFalse(result.cleaned)
+        self.assertIn("evidence changed before cleanup", result.reason)
+        self.assertTrue(state.paths.pid_path.exists())
+        self.assertTrue(state.paths.daemon_meta_path.exists())
+        self.assertTrue(state.paths.running_processes_path.exists())
+
+    def test_stale_cleanup_start_lock_cannot_unlink_replacement_registry(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        conductor._atomic_write_json(
+            state.paths.running_processes_path,
+            {"version": 3, "generation": 1, "processes": []},
+        )
+        ready_path = state.paths.state_dir / "replacement-ready"
+        acquired_path = state.paths.state_dir / "replacement-acquired"
+        child: subprocess.Popen[str] | None = None
+        original_unlink = Path.unlink
+
+        def unlink_with_waiting_replacement(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal child
+            if path == state.paths.pid_path and child is None:
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        textwrap.dedent(
+                            """
+                            import fcntl
+                            import json
+                            import os
+                            import sys
+                            from pathlib import Path
+
+                            lock_path, registry_path, ready_path, acquired_path = map(Path, sys.argv[1:])
+                            ready_path.write_text("ready", encoding="utf-8")
+                            with lock_path.open("a+") as lock_file:
+                                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                                acquired_path.write_text("acquired", encoding="utf-8")
+                                temporary = registry_path.with_suffix(".replacement")
+                                temporary.write_text(
+                                    json.dumps({"version": 3, "generation": 2, "processes": []}),
+                                    encoding="utf-8",
+                                )
+                                os.replace(temporary, registry_path)
+                            """
+                        ),
+                        str(state.paths.lock_path),
+                        str(state.paths.running_processes_path),
+                        str(ready_path),
+                        str(acquired_path),
+                    ],
+                    text=True,
+                )
+                deadline = time.monotonic() + 2.0
+                while not ready_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready_path.exists(), "replacement process did not reach the start-lock barrier")
+                # With the cleanup transaction holding daemon.start.lock, the
+                # replacement cannot acquire or publish before stale evidence
+                # unlinking finishes. Without that lock this wait observes the
+                # replacement and the following pathname unlink deletes it.
+                deadline = time.monotonic() + 0.2
+                while not acquired_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(acquired_path.exists())
+            original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", new=unlink_with_waiting_replacement):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        assert child is not None
+        self.assertEqual(child.wait(timeout=2.0), 0)
+        self.assertEqual(result.state, "cleaned")
+        self.assertFalse(state.paths.pid_path.exists())
+        self.assertFalse(state.paths.daemon_meta_path.exists())
+        replacement = json.loads(state.paths.running_processes_path.read_text(encoding="utf-8"))
+        self.assertEqual(replacement["generation"], 2)
+
+    def test_recovery_signals_only_exact_pid_start_and_pgid_anchor(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "processes": [
+                        {"pid": 101, "pgid": 201, "processStart": "exact"},
+                        {"pid": 102, "pgid": 202, "processStart": "reused"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            conductor,
+            "process_table_snapshot",
+            return_value={101: (1, "exact"), 102: (1, "different")},
+        ), mock.patch.object(conductor.os, "getpgrp", return_value=999), mock.patch.object(
+            conductor.os, "getpgid", side_effect=lambda pid: {101: 201, 102: 202}[pid]
+        ), mock.patch.object(conductor.os, "killpg") as killpg:
+            report = conductor.signal_running_process_groups(state.paths, signal.SIGTERM)
+
+        killpg.assert_called_once_with(201, signal.SIGTERM)
+        self.assertEqual(report["verified"], [101])
+        self.assertEqual(report["skipped"], [102])
+
+    def test_stale_daemon_cleanup_terminates_wrapper_and_detached_cache_attempt_group(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        ticket = "11111111-1111-1111-1111-111111111111"
+        attempt_record = state.paths.jobs_dir / f"{ticket}.cache-attempt.json"
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "processes": [
+                        {
+                            "ticket": ticket,
+                            "pid": 101,
+                            "pgid": 101,
+                            "processStart": "wrapper-start",
+                            "cacheAttemptRecord": attempt_record.name,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        conductor._atomic_write_json(
+            attempt_record,
+            {
+                "version": 1,
+                "state": "active",
+                "ticket": ticket,
+                "wrapperPID": 101,
+                "wrapperStartToken": "wrapper-start",
+                "attemptPID": 202,
+                "attemptPGID": 202,
+                "attemptStartToken": "attempt-start",
+            },
+        )
+        snapshot = {
+            101: (1, "wrapper-start"),
+            202: (101, "attempt-start"),
+            # This descendant shares attempt pgid 202; killpg(202) covers both.
+            303: (202, "descendant-start"),
+        }
+
+        def signal_group(pgid: int, _sig: signal.Signals) -> None:
+            if pgid == 101:
+                snapshot.pop(101, None)
+            elif pgid == 202:
+                snapshot.pop(202, None)
+                snapshot.pop(303, None)
+
+        with mock.patch.object(conductor, "process_table_snapshot", side_effect=lambda: dict(snapshot)), mock.patch.object(
+            conductor.os, "getpgrp", return_value=999
+        ), mock.patch.object(
+            conductor.os, "getpgid", side_effect=lambda pid: {101: 101, 202: 202}[pid]
+        ), mock.patch.object(conductor.os, "killpg", side_effect=signal_group) as killpg, mock.patch.object(
+            conductor, "_wait_for_recovery_targets_exit", return_value=[]
+        ):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "cleaned")
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(101, signal.SIGTERM), mock.call(202, signal.SIGTERM)],
+        )
+        self.assertFalse(attempt_record.exists())
+        self.assertFalse(state.paths.running_processes_path.exists())
+        self.assertFalse(state.paths.pid_path.exists())
+        self.assertFalse(state.paths.daemon_meta_path.exists())
+
+    def assert_attempt_rollover_is_recovered(self, *, initial_record_present: bool) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        ticket = "44444444-4444-4444-4444-444444444444"
+        attempt_record = state.paths.jobs_dir / f"{ticket}.cache-attempt.json"
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "processes": [
+                        {
+                            "ticket": ticket,
+                            "pid": 101,
+                            "pgid": 101,
+                            "processStart": "wrapper-start",
+                            "cacheAttemptRecord": attempt_record.name,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        snapshot = {101: (1, "wrapper-start")}
+        if initial_record_present:
+            conductor._atomic_write_json(
+                attempt_record,
+                {
+                    "version": 1,
+                    "state": "active",
+                    "ticket": ticket,
+                    "wrapperPID": 101,
+                    "wrapperStartToken": "wrapper-start",
+                    "attemptPID": 202,
+                    "attemptPGID": 202,
+                    "attemptStartToken": "attempt-a",
+                },
+            )
+            snapshot[202] = (101, "attempt-a")
+
+        def signal_group(pgid: int, _sig: signal.Signals) -> None:
+            if pgid == 101:
+                # Simulate the cache wrapper committing attempt B immediately
+                # before TERM takes effect. Recovery must re-read after wrapper
+                # exit instead of unlinking the newly replaced sidecar.
+                conductor._atomic_write_json(
+                    attempt_record,
+                    {
+                        "version": 1,
+                        "state": "active",
+                        "ticket": ticket,
+                        "wrapperPID": 101,
+                        "wrapperStartToken": "wrapper-start",
+                        "attemptPID": 404,
+                        "attemptPGID": 404,
+                        "attemptStartToken": "attempt-b",
+                    },
+                )
+                snapshot.pop(101, None)
+                snapshot.pop(202, None)
+                snapshot[404] = (1, "attempt-b")
+            elif pgid == 404:
+                snapshot.pop(404, None)
+
+        with mock.patch.object(conductor, "process_table_snapshot", side_effect=lambda: dict(snapshot)), mock.patch.object(
+            conductor.os, "getpgrp", return_value=999
+        ), mock.patch.object(
+            conductor.os, "getpgid", side_effect=lambda pid: {101: 101, 202: 202, 404: 404}[pid]
+        ), mock.patch.object(conductor.os, "killpg", side_effect=signal_group) as killpg, mock.patch.object(
+            conductor, "_wait_for_recovery_targets_exit", return_value=[]
+        ):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "cleaned")
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(101, signal.SIGTERM), mock.call(404, signal.SIGTERM)],
+        )
+        self.assertFalse(attempt_record.exists())
+        self.assertFalse(state.paths.running_processes_path.exists())
+
+    def test_stale_cleanup_recovers_attempt_a_to_b_rollover(self) -> None:
+        self.assert_attempt_rollover_is_recovered(initial_record_present=True)
+
+    def test_stale_cleanup_recovers_missing_to_published_attempt_transition(self) -> None:
+        self.assert_attempt_rollover_is_recovered(initial_record_present=False)
+
+    def test_reused_cache_attempt_identity_is_not_signaled(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        ticket = "22222222-2222-2222-2222-222222222222"
+        attempt_record = state.paths.jobs_dir / f"{ticket}.cache-attempt.json"
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "processes": [
+                        {
+                            "ticket": ticket,
+                            "pid": 101,
+                            "pgid": 101,
+                            "processStart": "wrapper-start",
+                            "cacheAttemptRecord": attempt_record.name,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        conductor._atomic_write_json(
+            attempt_record,
+            {
+                "version": 1,
+                "state": "active",
+                "ticket": ticket,
+                "wrapperPID": 101,
+                "wrapperStartToken": "wrapper-start",
+                "attemptPID": 202,
+                "attemptPGID": 202,
+                "attemptStartToken": "old-attempt-start",
+            },
+        )
+        snapshot = {101: (1, "wrapper-start"), 202: (1, "reused-attempt-start")}
+
+        with mock.patch.object(conductor, "process_table_snapshot", return_value=snapshot), mock.patch.object(
+            conductor.os, "getpgrp", return_value=999
+        ), mock.patch.object(conductor.os, "getpgid", return_value=101), mock.patch.object(
+            conductor.os, "killpg"
+        ) as killpg:
+            report = conductor.signal_running_process_groups(state.paths, signal.SIGTERM)
+
+        killpg.assert_called_once_with(101, signal.SIGTERM)
+        self.assertEqual(report["verified"], [101])
+        self.assertEqual(report["skipped"], [202])
+        attempt_group = next(group for group in report["groups"] if group["kind"] == "cacheAttempt")
+        self.assertEqual(attempt_group["state"], "stale")
+        self.assertTrue(report["identityComplete"])
+
+    def test_ambiguous_cache_attempt_record_preserves_stale_daemon_evidence(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_stale_metadata(state)
+        ticket = "33333333-3333-3333-3333-333333333333"
+        attempt_record = state.paths.jobs_dir / f"{ticket}.cache-attempt.json"
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "processes": [
+                        {
+                            "ticket": ticket,
+                            "pid": 101,
+                            "pgid": 101,
+                            "processStart": "wrapper-start",
+                            "cacheAttemptRecord": attempt_record.name,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        conductor._atomic_write_json(
+            attempt_record,
+            {
+                "version": 1,
+                "state": "active",
+                "ticket": ticket,
+                "wrapperPID": 101,
+                "wrapperStartToken": "mismatched-wrapper",
+                "attemptPID": 202,
+                "attemptPGID": 202,
+                "attemptStartToken": "attempt-start",
+            },
+        )
+
+        with mock.patch.object(
+            conductor, "process_table_snapshot", return_value={101: (1, "wrapper-start")}
+        ), mock.patch.object(conductor.os, "getpgrp", return_value=999), mock.patch.object(
+            conductor.os, "getpgid", return_value=101
+        ), mock.patch.object(conductor.os, "killpg"):
+            result = conductor.cleanup_stale_files(state.paths)
+
+        self.assertEqual(result.state, "ambiguous")
+        self.assertFalse(result.cleaned)
+        self.assertTrue(attempt_record.exists())
+        self.assertTrue(state.paths.running_processes_path.exists())
+        self.assertTrue(state.paths.pid_path.exists())
+        self.assertTrue(state.paths.daemon_meta_path.exists())
+
+    def test_force_stop_waits_for_nonabortable_cache_publication_and_reports_policy(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "publishing", "build", {}, ["build"], job_state="running")
+        job.phase = "publishingCache"
+        state.jobs[job.ticket] = job
+        state.active_lanes["build"] = job.ticket
+        deferred: list[tuple[object, tuple[object, ...]]] = []
+
+        class DeferredThread:
+            def __init__(self, *, target: object, args: tuple[object, ...] = (), **_kwargs: object) -> None:
+                deferred.append((target, args))
+
+            def start(self) -> None:
+                return None
+
+        with mock.patch.object(conductor.threading, "Thread", DeferredThread):
+            payload = state.stop(force=True)
+
+        self.assertFalse(job.cancel_requested)
+        self.assertIn("non-abortable", job.cancellation_ignored_reason or "")
+        self.assertEqual(
+            payload["forceStop"],
+            {
+                "requested": True,
+                "publicationPolicy": "waitForNonAbortableAtomicPublication",
+                "publicationWaitTickets": [job.ticket],
+                "publicationWaitTimeoutSeconds": conductor.BUILD_CACHE_FORCE_STOP_WAIT_SECONDS,
+                "cancellationIgnored": True,
+            },
+        )
+        self.assertEqual(len(deferred), 1)
+        server = mock.Mock()
+        state.server = server
+
+        def complete_publication(*_args: object, **_kwargs: object) -> None:
+            self.assertFalse(server.shutdown.called)
+            job.state = "completed"
+            job.phase = "terminal"
+
+        with mock.patch.object(state.condition, "wait", side_effect=complete_publication) as wait, mock.patch.object(
+            conductor.time, "sleep"
+        ):
+            state._force_shutdown_when_canceled([job.ticket])
+
+        wait.assert_called_once_with(timeout=conductor.PROCESS_TREE_POLL_SECONDS)
+        server.shutdown.assert_called_once_with()
+
+    def test_force_stop_publication_wait_expiry_keeps_daemon_and_publication_intact(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "publishing-timeout", "build", {}, ["build"], job_state="running")
+        job.phase = "publishingCache"
+        job.cancellation_ignored_reason = "immutable cache publication is non-abortable"
+        state.jobs[job.ticket] = job
+        state.shutdown_requested = True
+        state.server = mock.Mock()
+
+        with mock.patch.object(conductor, "BUILD_CACHE_FORCE_STOP_WAIT_SECONDS", 0.0), mock.patch.object(
+            state, "_warn_job_locked"
+        ) as warn, mock.patch.object(conductor.time, "sleep"):
+            state._force_shutdown_when_canceled([job.ticket])
+
+        self.assertFalse(state.shutdown_requested)
+        self.assertEqual(job.state, "running")
+        self.assertEqual(job.phase, "publishingCache")
+        state.server.shutdown.assert_not_called()
+        warn.assert_called_once_with(
+            job,
+            "buildCachePublicationStopWaitExpired",
+            "daemon stop --force left non-abortable cache publication running after bounded wait",
+        )
+
+    def test_concurrent_terminal_waiters_coalesce_summary_and_both_receive_result(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "summary", "build", {}, ["build"], job_state="completed")
+        job.exit_code = 0
+        job.log_path.write_text("Created: /tmp/App.app\n", encoding="utf-8")
+        state.jobs[job.ticket] = job
+        summarize_entered = threading.Event()
+        second_refresh_entered = threading.Event()
+        release_summary = threading.Event()
+        calls = 0
+        refresh_calls = 0
+        refresh_lock = threading.Lock()
+        results: dict[str, dict] = {}
+        original_refresh = state._refresh_output_summary
+        synchronization_timeout = conductor.LOG_FLUSH_WAIT_SECONDS
+
+        def summarize(*_args: object, **_kwargs: object) -> dict:
+            nonlocal calls
+            calls += 1
+            summarize_entered.set()
+            self.assertTrue(release_summary.wait(synchronization_timeout))
+            return {"headline": "completed successfully", "sections": []}
+
+        def refresh(actual_job: conductor.Job) -> None:
+            nonlocal refresh_calls
+            with refresh_lock:
+                refresh_calls += 1
+                if refresh_calls == 2:
+                    second_refresh_entered.set()
+            original_refresh(actual_job)
+
+        def wait(name: str) -> None:
+            results[name] = state.job_wait(job.ticket, None, timeout=synchronization_timeout)
+
+        with mock.patch.object(conductor.OutputSummarizer, "summarize_file", side_effect=summarize), mock.patch.object(
+            state, "_refresh_output_summary", side_effect=refresh
+        ):
+            first = threading.Thread(target=wait, args=("first",))
+            second = threading.Thread(target=wait, args=("second",))
+            first.start()
+            self.assertTrue(summarize_entered.wait(synchronization_timeout))
+            second.start()
+            self.assertTrue(second_refresh_entered.wait(synchronization_timeout))
+            release_summary.set()
+            first.join(timeout=synchronization_timeout)
+            second.join(timeout=synchronization_timeout)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(calls, 1)
+        self.assertEqual(results["first"]["outputSummary"]["headline"], "completed successfully")
+        self.assertEqual(results["second"]["outputSummary"]["headline"], "completed successfully")
+        self.assertEqual(job.phase, "terminal")
+
+    def test_tail_fragments_and_total_bytes_are_bounded(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "tail", "build", {}, [], job_state="running")
+
+        with state.condition:
+            for index in range(100):
+                state._append_tail_locked(job, f"{index}:" + "x" * 8_000 + "\n")
+
+        self.assertLessEqual(len(job.tail), conductor.LOG_TAIL_LINES)
+        self.assertLessEqual(
+            sum(len(line.encode("utf-8")) for line in job.tail),
+            conductor.LOG_TAIL_MAX_BYTES,
+        )
+        self.assertTrue(all(len(line.encode("utf-8")) <= conductor.LOG_TAIL_FRAGMENT_MAX_BYTES for line in job.tail))
+        self.assertEqual(job.tail_bytes, sum(len(line.encode("utf-8")) for line in job.tail))
+
+    def test_tail_multibyte_truncation_accounts_reencoded_fragment_exactly(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "tail-utf8", "build", {}, [], job_state="running")
+
+        with state.condition:
+            state._append_tail_locked(job, "é" * conductor.LOG_TAIL_FRAGMENT_MAX_BYTES + "\n")
+
+        self.assertEqual(job.tail_bytes, sum(len(line.encode("utf-8")) for line in job.tail))
+        self.assertLessEqual(job.tail_bytes, conductor.LOG_TAIL_MAX_BYTES)
+
+    def test_log_flush_frontier_does_not_skip_earlier_unsettled_sequence(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "log-frontier", "build", {}, [], job_state="running")
+        job.log_sequence = 2
+
+        with state.condition:
+            state._settle_job_log_sequence_locked(job, 2)
+            self.assertEqual(job.log_flushed_sequence, 0)
+            self.assertEqual(job.log_settled_sequences, {2})
+            state._settle_job_log_sequence_locked(job, 1)
+
+        self.assertEqual(job.log_flushed_sequence, 2)
+        self.assertEqual(job.log_settled_sequences, set())
+
+    def test_force_stop_ignores_corrupt_legacy_worker_registry_after_exact_daemon_verification(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        state.paths.running_processes_path.write_text("{corrupt", encoding="utf-8")
+        alive = iter([True, False, False, False])
+
+        with mock.patch.object(conductor, "read_pid", return_value=4242), mock.patch.object(
+            conductor, "pid_alive", side_effect=lambda _pid: next(alive)
+        ), mock.patch.object(conductor, "verify_daemon_pid_identity", return_value=True), mock.patch.object(
+            conductor, "process_table_snapshot", return_value={}
+        ), mock.patch.object(conductor.os, "kill"), mock.patch.object(
+            conductor, "cleanup_stale_files", return_value=conductor.DaemonRecoveryResult("cleaned", True, "fixture")
+        ):
+            payload = conductor.force_stop_unresponsive_daemon(state.paths)
+
+        self.assertTrue(payload["stopped"])
+        self.assertIn("registry:", payload["workerSignals"]["term"]["invalid"][0])
+
+    def test_protocol_11_registry_skips_identityless_entry_and_signals_exact_entry(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        state.paths.running_processes_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "processes": [
+                        {"pid": 101, "pgid": 201},
+                        {"pid": 102, "pgid": 202, "processStart": "exact"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(conductor, "process_table_snapshot", return_value={102: (1, "exact")}), mock.patch.object(
+            conductor.os, "getpgrp", return_value=999
+        ), mock.patch.object(conductor.os, "getpgid", return_value=202), mock.patch.object(conductor.os, "killpg") as killpg:
+            report = conductor.signal_running_process_groups(state.paths, signal.SIGTERM)
+
+        killpg.assert_called_once_with(202, signal.SIGTERM)
+        self.assertEqual(report["verified"], [102])
+        self.assertEqual(report["invalid"], ["entry 0: missing exact identity evidence"])
+
+    def test_summary_does_not_wait_for_unrelated_io_backlog_after_own_log_is_flushed(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "independent-flush", "build", {}, ["build"], job_state="completed")
+        job.exit_code = 0
+        job.log_sequence = 4
+        job.log_flushed_sequence = 4
+        job.log_path.write_text("Created: /tmp/App.app\n", encoding="utf-8")
+        state.jobs[job.ticket] = job
+        backlog_entered = threading.Event()
+        backlog_release = threading.Event()
+        summary_complete = threading.Event()
+
+        def gated_unrelated_io() -> None:
+            backlog_entered.set()
+            backlog_release.wait()
+
+        self.assertTrue(state._io_worker.submit(gated_unrelated_io))
+        self.assertTrue(backlog_entered.wait(1.0))
+        refresher = threading.Thread(target=lambda: (state._refresh_output_summary(job), summary_complete.set()))
+        refresher.start()
+        self.assertTrue(summary_complete.wait(1.0), "summary waited for unrelated global I/O backlog")
+        backlog_release.set()
+        refresher.join(timeout=1.0)
+        self.assertFalse(refresher.is_alive())
+        self.assertEqual(job.output_summary["headline"], "completed successfully")
+
+    def test_cancel_cleanup_wait_returns_pending_at_bounded_deadline(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "cancel-bounded", "build", {}, ["build"], job_state="running")
+        job.cleanup_in_flight = True
+        state.jobs[job.ticket] = job
+
+        with mock.patch.object(state, "_request_process_cleanup_locked"), mock.patch.object(
+            conductor.time, "monotonic", side_effect=[100.0, 100.0 + conductor.CANCEL_CLEANUP_WAIT_SECONDS]
+        ):
+            payload = state.job_cancel(job.ticket, None)
+
+        self.assertTrue(payload["cancellationPending"])
+        self.assertTrue(job.cancel_requested)
+        self.assertEqual(job.phase, "canceling")
+
+    def test_output_registration_transfers_ownership_without_waiting_for_pump_thread(self) -> None:
+        pump = conductor.ProcessOutputPump.__new__(conductor.ProcessOutputPump)
+        submitted: list[tuple[str, conductor.ProcessOutputChannel]] = []
+        pump._submit = lambda command, channel: submitted.append((command, channel))
+
+        channel = pump.register("ticket", 42, "pipe")
+
+        self.assertEqual(submitted, [("register", channel)])
+        self.assertFalse(channel.registered.is_set())
+
+    def test_output_completion_wait_starts_after_pump_acknowledges_finalization(self) -> None:
+        channel = conductor.ProcessOutputChannel("ticket", 42, "pipe")
+        order: list[str] = []
+        channel.result = conductor.ProcessOutputResult(False, None, 17)
+        channel.completion = mock.Mock()
+        channel.completion.is_set.return_value = False
+        channel.completion.wait.side_effect = lambda timeout: order.append(f"completion:{timeout}") or True
+        channel.finalization_started = mock.Mock()
+        channel.finalization_started.wait.side_effect = lambda timeout: order.append(f"started:{timeout}") or True
+
+        result = conductor.ProcessOutputPump.wait_for_completion(channel)
+
+        self.assertEqual(
+            order,
+            [
+                f"started:{conductor.OUTPUT_FINALIZATION_WAIT_SECONDS}",
+                f"completion:{conductor.OUTPUT_FINALIZATION_WAIT_SECONDS}",
+            ],
+        )
+        self.assertEqual(result, channel.result)
+
+    def test_output_pump_shutdown_closes_queued_reader_and_rejects_new_transfer(self) -> None:
+        pump = conductor.ProcessOutputPump.__new__(conductor.ProcessOutputPump)
+        pump._submission_lock = threading.Lock()
+        pump._stopping = True
+        pump._commands = queue.Queue()
+        pump._channels = {}
+        pump._selector = mock.Mock()
+        closed: list[int] = []
+        pump._close_fd = closed.append
+        pump._on_line = lambda _ticket, _line: None
+        channel = conductor.ProcessOutputChannel("ticket", 43, "pipe")
+        pump._commands.put_nowait(("register", channel))
+
+        pump._finish_queued_channels("pumpShutdown")
+
+        self.assertEqual(closed, [43])
+        self.assertEqual(channel.result.reason, "pumpShutdown")
+        with self.assertRaisesRegex(conductor.ConductorError, "output pump is stopped"):
+            pump._submit("register", conductor.ProcessOutputChannel("new", 44, "pipe"))
+
+    def test_output_finalization_deadline_drain_is_bounded_for_active_inherited_writer(self) -> None:
+        pump = conductor.ProcessOutputPump.__new__(conductor.ProcessOutputPump)
+        pump._clock = lambda: 10.0
+        pump._selector = mock.Mock()
+        pump._close_fd = lambda _fd: None
+        pump._on_line = lambda _ticket, _line: None
+        channel = conductor.ProcessOutputChannel("ticket", 42, "pipe", finalization_deadline=9.0)
+        pump._channels = {42: channel}
+        reads = 0
+
+        def endless_read(active: conductor.ProcessOutputChannel) -> None:
+            nonlocal reads
+            reads += 1
+            active.bytes_read += 128 * 1024
+
+        pump._read_available = endless_read
+        pump._finish_expired_channels()
+
+        self.assertEqual(reads, conductor.OUTPUT_FINALIZATION_DRAIN_MAX_BYTES // (128 * 1024))
+        self.assertIsNotNone(channel.result)
+        assert channel.result is not None
+        self.assertTrue(channel.result.truncated)
+        self.assertEqual(channel.result.reason, "inheritedWriterDeadline")
+
+    def test_health_warning_expires_and_daemon_returns_to_healthy(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        state._daemon_infrastructure_warnings.append(
+            {"kind": "old", "message": "old warning", "observedAt": 100.0}
+        )
+        with mock.patch.object(conductor, "now", return_value=100.0 + conductor.INFRASTRUCTURE_WARNING_TTL_SECONDS + 1.0):
+            payload = state.status_payload()
+
+        self.assertEqual(payload["health"]["state"], "healthy")
+        self.assertEqual(payload["health"]["issues"], [])
+
+    def make_fair_metadata(self, label: str) -> dict[str, object]:
+        return {
+            "lockKind": "global-heavy",
+            "ticket": label,
+            "operation": "build",
+            "operationLabel": label,
+            "repoRoot": "/fixture",
+            "repoHash": "fixture",
+            "worktree": "fixture",
+            "acquiredAt": conductor.now(),
+        }
+
+    def test_fair_queue_writer_retries_short_writes_before_atomic_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            coordinator = conductor.FairHeavyAdmission(self.make_fair_metadata("writer"), {})
+            self.addCleanup(coordinator.close)
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                payload["generation"] += 1
+                real_write = os.write
+                writes: list[int] = []
+
+                def short_write(fd: int, data: object) -> int:
+                    chunk = bytes(data)[:7]
+                    writes.append(len(chunk))
+                    return real_write(fd, chunk)
+
+                with mock.patch.object(conductor.os, "write", side_effect=short_write):
+                    coordinator._write_queue(payload)
+                persisted = coordinator._load_queue()
+
+            self.assertGreater(len(writes), 1)
+            self.assertEqual(persisted, payload)
+            coordinator._remove_own_waiter()
+
+    def test_fair_wait_exception_abandons_only_own_waiter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            first = conductor.FairHeavyAdmission(self.make_fair_metadata("first"), {})
+            second = conductor.FairHeavyAdmission(self.make_fair_metadata("second"), {})
+            self.addCleanup(first.close)
+            self.addCleanup(second.close)
+
+            with mock.patch.object(first, "_wait_until_acquired", side_effect=RuntimeError("fixture")), self.assertRaises(
+                RuntimeError
+            ):
+                first.wait()
+            with second._queue_lock():
+                waiter_ids = {item["waiterID"] for item in second._load_queue()["waiters"]}
+
+            self.assertNotIn(first.waiter_id, waiter_ids)
+            self.assertIn(second.waiter_id, waiter_ids)
+            lease = second.wait()
+            self.assertIsNotNone(lease)
+            assert lease is not None
+            lease.release()
+
+    def test_corrupt_fair_queue_is_quarantined_and_kernel_admission_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            queue_path = Path(tmp) / "global-heavy-queue.json"
+            queue_path.write_text("{not-json", encoding="utf-8")
+            os.chmod(queue_path, 0o600)
+            warnings: list[tuple[str, str]] = []
+
+            coordinator = conductor.FairHeavyAdmission(
+                self.make_fair_metadata("local"), {}, on_warning=lambda kind, message: warnings.append((kind, message))
+            )
+            self.addCleanup(coordinator.close)
+            lease = coordinator.wait()
+
+            self.assertIsNotNone(lease)
+            self.assertEqual(warnings[0][0], "fairQueueQuarantined")
+            self.assertEqual(len(list(Path(tmp).glob("global-heavy-queue.corrupt-*.json"))), 1)
+            assert lease is not None
+            lease.release()
+
+    def test_crashed_acquired_fair_holder_is_pruned_and_next_waiter_acquires(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            coordinator = conductor.FairHeavyAdmission(self.make_fair_metadata("next"), {})
+            self.addCleanup(coordinator.close)
+            dead_notify_path = coordinator.waiters_dir / "dead.sock"
+            dead_notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            dead_notify.bind(str(dead_notify_path))
+            self.addCleanup(dead_notify.close)
+            self.addCleanup(lambda: dead_notify_path.unlink(missing_ok=True))
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                payload["waiters"].insert(
+                    0,
+                    {
+                        "waiterID": "dead-holder",
+                        "sequence": 0,
+                        "state": "acquired",
+                        "ownerPID": 222,
+                        "ownerStartToken": "dead",
+                        "notifySocketPath": str(dead_notify_path),
+                        "acquiredSlotPath": str(Path(tmp) / "global-heavy-0.lock"),
+                    },
+                )
+                payload["generation"] += 1
+                coordinator._write_queue(payload)
+
+            with mock.patch.object(conductor, "process_table_snapshot", return_value={}):
+                lease = coordinator.wait()
+
+            self.assertIsNotNone(lease)
+            assert lease is not None
+            lease.release()
+
+    def test_head_waiter_competes_faster_and_surfaces_non_authoritative_legacy_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            coordinator = conductor.FairHeavyAdmission(self.make_fair_metadata("head"), {})
+            original_notify = coordinator.notify_socket
+            original_notify.close()
+            slot_path = Path(tmp) / "global-heavy-0.lock"
+            holder = slot_path.open("a+", encoding="utf-8")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            conductor.write_display_lock_metadata(holder, self.make_fair_metadata("legacy"))
+            self.addCleanup(holder.close)
+            timeouts: list[float] = []
+
+            class FakeNotify:
+                timeout = conductor.FAIR_HEAVY_RESCAN_SECONDS
+
+                def settimeout(self, value: float) -> None:
+                    self.timeout = value
+
+                def gettimeout(self) -> float:
+                    return self.timeout
+
+                def recv(self, _size: int) -> bytes:
+                    timeouts.append(self.timeout)
+                    raise socket.timeout
+
+                def close(self) -> None:
+                    pass
+
+            coordinator.notify_socket = FakeNotify()
+            updates: list[dict | None] = []
+            lease = coordinator.wait(
+                cancel_check=lambda: len(timeouts) >= 2,
+                update=lambda _position, _earlier: updates.append(coordinator.legacy_slot_holder),
+            )
+
+            self.assertIsNone(lease)
+            self.assertEqual(timeouts, [conductor.FAIR_HEAVY_HEAD_RESCAN_SECONDS] * 2)
+            observed = [item for item in updates if item is not None]
+            self.assertTrue(observed)
+            assert observed[-1] is not None
+            self.assertFalse(observed[-1]["authoritative"])
+            self.assertTrue(observed[-1]["displayOnly"])
+            self.assertEqual(observed[-1]["classification"], "legacyOrUnregistered")
+            self.assertEqual(observed[-1]["metadata"]["ticket"], "legacy")
+            with coordinator._queue_lock():
+                self.assertEqual(coordinator._load_queue()["waiters"], [])
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+    def test_head_waiter_fast_competition_decays_to_bounded_low_cost_cadence(self) -> None:
+        clock_value = [0.0]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            coordinator = conductor.FairHeavyAdmission(
+                self.make_fair_metadata("head-decay"), {}, clock=lambda: clock_value[0]
+            )
+            original_notify = coordinator.notify_socket
+            original_notify.close()
+            slot_path = Path(tmp) / "global-heavy-0.lock"
+            holder = slot_path.open("a+", encoding="utf-8")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            self.addCleanup(holder.close)
+            timeouts: list[float] = []
+            observed_cadences: list[float] = []
+
+            class FakeNotify:
+                timeout = conductor.FAIR_HEAVY_RESCAN_SECONDS
+
+                def settimeout(self, value: float) -> None:
+                    self.timeout = value
+
+                def recv(self, _size: int) -> bytes:
+                    timeouts.append(self.timeout)
+                    if len(timeouts) == 1:
+                        clock_value[0] = conductor.FAIR_HEAVY_HEAD_COMPETITION_SECONDS + 0.001
+                    raise socket.timeout
+
+                def close(self) -> None:
+                    pass
+
+            coordinator.notify_socket = FakeNotify()
+            lease = coordinator.wait(
+                cancel_check=lambda: len(timeouts) >= 2,
+                update=lambda _position, _earlier: observed_cadences.append(coordinator.current_rescan_seconds),
+            )
+
+            self.assertIsNone(lease)
+            self.assertEqual(
+                timeouts,
+                [conductor.FAIR_HEAVY_HEAD_RESCAN_SECONDS, conductor.FAIR_HEAVY_HEAD_DECAY_RESCAN_SECONDS],
+            )
+            self.assertIn(conductor.FAIR_HEAVY_HEAD_RESCAN_SECONDS, observed_cadences)
+            self.assertIn(conductor.FAIR_HEAVY_HEAD_DECAY_RESCAN_SECONDS, observed_cadences)
+            self.assertLess(conductor.FAIR_HEAVY_HEAD_DECAY_RESCAN_SECONDS, conductor.FAIR_HEAVY_RESCAN_SECONDS)
+            with coordinator._queue_lock():
+                self.assertEqual(coordinator._load_queue()["waiters"], [])
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+    def test_non_head_waiter_remains_low_cost_and_cancel_removes_only_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            first = conductor.FairHeavyAdmission(self.make_fair_metadata("first"), {})
+            second = conductor.FairHeavyAdmission(self.make_fair_metadata("second"), {})
+            self.addCleanup(first.close)
+            original_notify = second.notify_socket
+            original_notify.close()
+            timeouts: list[float] = []
+
+            class FakeNotify:
+                timeout = conductor.FAIR_HEAVY_RESCAN_SECONDS
+
+                def settimeout(self, value: float) -> None:
+                    self.timeout = value
+
+                def recv(self, _size: int) -> bytes:
+                    timeouts.append(self.timeout)
+                    raise socket.timeout
+
+                def close(self) -> None:
+                    pass
+
+            second.notify_socket = FakeNotify()
+            lease = second.wait(cancel_check=lambda: bool(timeouts))
+
+            self.assertIsNone(lease)
+            self.assertEqual(timeouts, [conductor.FAIR_HEAVY_RESCAN_SECONDS])
+            self.assertIsNone(second.legacy_slot_holder)
+            with first._queue_lock():
+                waiter_ids = {item["waiterID"] for item in first._load_queue()["waiters"]}
+            self.assertEqual(waiter_ids, {first.waiter_id})
+            first.abandon()
+
+    def test_global_wait_payload_labels_legacy_holder_non_authoritative(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "legacy-holder", "build", {}, ["build"], job_state="running")
+        observation = {
+            "displayOnly": True,
+            "authoritative": False,
+            "classification": "legacyOrUnregistered",
+            "slotPath": "/tmp/global-heavy-0.lock",
+            "metadata": {"pid": 61641, "ticket": "legacy-ticket"},
+        }
+        job.global_heavy_admission_state = "waiting"
+        job.global_heavy_slot_holder = "non-authoritative legacy slot holder"
+        job.global_heavy_legacy_slot_holder = observation
+        job.global_heavy_rescan_seconds = conductor.FAIR_HEAVY_HEAD_DECAY_RESCAN_SECONDS
+
+        payload = job.to_payload()["globalHeavyAdmission"]
+
+        self.assertEqual(payload["state"], "waiting")
+        self.assertEqual(payload["legacySlotHolder"], observation)
+        self.assertFalse(payload["legacySlotHolder"]["authoritative"])
+        self.assertTrue(payload["legacySlotHolder"]["displayOnly"])
+        self.assertEqual(payload["rescanSeconds"], conductor.FAIR_HEAVY_HEAD_DECAY_RESCAN_SECONDS)
+        self.assertEqual(payload["headCompetitionSeconds"], conductor.FAIR_HEAVY_HEAD_COMPETITION_SECONDS)
+
+    def test_process_table_snapshot_distinguishes_failure_from_authoritative_empty(self) -> None:
+        with mock.patch.object(
+            conductor.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["ps"], 2.0),
+        ):
+            self.assertIsNone(conductor.process_table_snapshot())
+
+        completed = subprocess.CompletedProcess(["ps"], 0, stdout="", stderr="")
+        with mock.patch.object(conductor.subprocess, "run", return_value=completed):
+            self.assertEqual(conductor.process_table_snapshot(), {})
+
+    def test_fair_pruning_retains_all_remote_waiters_after_inconclusive_forced_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            coordinator = conductor.FairHeavyAdmission(self.make_fair_metadata("local"), {})
+            self.addCleanup(coordinator.close)
+            remotes: list[socket.socket] = []
+            remote_paths: list[Path] = []
+            for index in range(2):
+                remote_path = coordinator.waiters_dir / f"remote-inconclusive-{index}.sock"
+                remote = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                remote.bind(str(remote_path))
+                remotes.append(remote)
+                remote_paths.append(remote_path)
+                self.addCleanup(remote.close)
+                self.addCleanup(remote_path.unlink, missing_ok=True)
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                for index, remote_path in enumerate(remote_paths):
+                    payload["waiters"].append(
+                        {
+                            "waiterID": f"remote-inconclusive-{index}",
+                            "sequence": 100 + index,
+                            "state": "waiting",
+                            "ownerPID": 222 + index,
+                            "ownerStartToken": "exact",
+                            "notifySocketPath": str(remote_path),
+                        }
+                    )
+                payload["generation"] += 1
+                coordinator._write_queue(payload)
+
+            coordinator._remote_process_snapshot = {}
+            coordinator._remote_process_snapshot_at = coordinator._clock()
+            with mock.patch.object(conductor, "process_table_snapshot", return_value=None) as snapshot:
+                _payload, _waiter, _position, ordered = coordinator._queue_snapshot()
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertTrue(
+                {"remote-inconclusive-0", "remote-inconclusive-1"}.issubset(
+                    {item["waiterID"] for item in ordered}
+                )
+            )
+
+            with mock.patch.object(conductor, "process_table_snapshot", return_value={}) as snapshot:
+                _payload, _waiter, _position, ordered = coordinator._queue_snapshot()
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertTrue(
+                {"remote-inconclusive-0", "remote-inconclusive-1"}.isdisjoint(
+                    {item["waiterID"] for item in ordered}
+                )
+            )
+            coordinator._remove_own_waiter()
+
+    def test_fair_remote_process_discovery_is_cached_for_one_second(self) -> None:
+        clock_value = [10.0]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            coordinator = conductor.FairHeavyAdmission(
+                self.make_fair_metadata("local"), {}, clock=lambda: clock_value[0]
+            )
+            self.addCleanup(coordinator.close)
+            remote_path = coordinator.waiters_dir / "remote.sock"
+            remote = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            remote.bind(str(remote_path))
+            self.addCleanup(remote.close)
+            self.addCleanup(lambda: remote_path.unlink(missing_ok=True))
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                payload["waiters"].append(
+                    {
+                        "waiterID": "remote",
+                        "sequence": 100,
+                        "state": "waiting",
+                        "ownerPID": 222,
+                        "ownerStartToken": "exact",
+                        "notifySocketPath": str(remote_path),
+                    }
+                )
+                payload["generation"] += 1
+                coordinator._write_queue(payload)
+
+            with mock.patch.object(conductor, "process_table_snapshot", return_value={222: (1, "exact")}) as snapshot:
+                coordinator._queue_snapshot()
+                clock_value[0] += 0.5
+                coordinator._queue_snapshot()
+                clock_value[0] += conductor.FAIR_PROCESS_SNAPSHOT_TTL_SECONDS
+                coordinator._queue_snapshot()
+
+            self.assertEqual(snapshot.call_count, 2)
+            self.assertEqual(coordinator.notify_socket.gettimeout(), conductor.FAIR_HEAVY_RESCAN_SECONDS)
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                payload["waiters"] = [item for item in payload["waiters"] if item["waiterID"] != "remote"]
+                payload["generation"] += 1
+                coordinator._write_queue(payload)
+            coordinator._remove_own_waiter()
+
+    def test_cached_negative_process_snapshot_is_refreshed_before_pruning_new_waiter(self) -> None:
+        clock_value = [20.0]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            coordinator = conductor.FairHeavyAdmission(
+                self.make_fair_metadata("local"), {}, clock=lambda: clock_value[0]
+            )
+            self.addCleanup(coordinator.close)
+            coordinator._remote_process_snapshot = {}
+            coordinator._remote_process_snapshot_at = clock_value[0]
+            remote_path = coordinator.waiters_dir / "newborn.sock"
+            remote = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            remote.bind(str(remote_path))
+            self.addCleanup(remote.close)
+            self.addCleanup(lambda: remote_path.unlink(missing_ok=True))
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                payload["waiters"].append(
+                    {
+                        "waiterID": "newborn",
+                        "sequence": 100,
+                        "state": "waiting",
+                        "ownerPID": 222,
+                        "ownerStartToken": "newborn-start",
+                        "notifySocketPath": str(remote_path),
+                    }
+                )
+                payload["generation"] += 1
+                coordinator._write_queue(payload)
+
+            with mock.patch.object(
+                conductor, "process_table_snapshot", return_value={222: (1, "newborn-start")}
+            ) as snapshot:
+                coordinator._queue_snapshot()
+            with coordinator._queue_lock():
+                waiter_ids = {item["waiterID"] for item in coordinator._load_queue()["waiters"]}
+
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertIn("newborn", waiter_ids)
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                payload["waiters"] = [item for item in payload["waiters"] if item["waiterID"] != "newborn"]
+                payload["generation"] += 1
+                coordinator._write_queue(payload)
+            coordinator._remove_own_waiter()
+
+    def test_malformed_fair_waiter_record_quarantines_entire_advisory_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            first = conductor.FairHeavyAdmission(self.make_fair_metadata("first"), {})
+            with first._queue_lock():
+                payload = first._load_queue()
+                payload["waiters"].append(
+                    {
+                        "waiterID": "malformed",
+                        "sequence": "not-an-integer",
+                        "state": "waiting",
+                        "ownerPID": 222,
+                        "ownerStartToken": "remote",
+                        "notifySocketPath": str(first.waiters_dir / "missing.sock"),
+                    }
+                )
+                payload["generation"] += 1
+                first._write_queue(payload)
+            with self.assertRaisesRegex(conductor.ConductorError, "identity disappeared"):
+                first._queue_snapshot()
+            first.close()
+
+            second = conductor.FairHeavyAdmission(self.make_fair_metadata("second"), {})
+            lease = second.wait()
+            self.assertEqual(len(list(Path(tmp).glob("global-heavy-queue.corrupt-*.json"))), 1)
+            self.assertIsNotNone(lease)
+            assert lease is not None
+            lease.release()
+
+    def test_fair_waiter_cancel_removes_only_middle_and_preserves_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            first = conductor.FairHeavyAdmission(self.make_fair_metadata("first"), {})
+            middle = conductor.FairHeavyAdmission(self.make_fair_metadata("middle"), {})
+            last = conductor.FairHeavyAdmission(self.make_fair_metadata("last"), {})
+            self.addCleanup(first.close)
+            self.addCleanup(middle.close)
+            self.addCleanup(last.close)
+
+            self.assertEqual(middle._queue_snapshot()[2], 2)
+            self.assertEqual(last._queue_snapshot()[2], 3)
+            middle._remove_own_waiter()
+            middle.close()
+
+            self.assertEqual(first._queue_snapshot()[2], 1)
+            self.assertEqual(last._queue_snapshot()[2], 2)
+            first._remove_own_waiter()
+            last._remove_own_waiter()
+
+    def test_fair_release_notifies_next_and_kernel_flock_remains_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            external = (Path(tmp) / "global-heavy-0.lock").open("a+", encoding="utf-8")
+            fcntl.flock(external.fileno(), fcntl.LOCK_EX)
+            first = conductor.FairHeavyAdmission(self.make_fair_metadata("first"), {})
+            self.addCleanup(first.close)
+            attempted = threading.Event()
+            acquired: list[conductor.FairHeavyLease | None] = []
+
+            def wait_for_slot() -> None:
+                acquired.append(first.wait(update=lambda _position, _earlier: attempted.set()))
+
+            waiter = threading.Thread(target=wait_for_slot)
+            waiter.start()
+            self.assertTrue(attempted.wait(1.0))
+            self.assertEqual(acquired, [], "queue metadata granted admission without kernel flock")
+            fcntl.flock(external.fileno(), fcntl.LOCK_UN)
+            external.close()
+            conductor.FairHeavyAdmission._notify([str(first.notify_path)])
+            waiter.join(timeout=1.0)
+
+            self.assertFalse(waiter.is_alive())
+            lease = acquired[0]
+            self.assertIsNotNone(lease)
+            assert lease is not None
+            lease.release()
+
+    def test_fair_release_hands_eligibility_to_next_waiter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            first = conductor.FairHeavyAdmission(self.make_fair_metadata("first"), {})
+            first_lease = first.wait()
+            self.assertIsNotNone(first_lease)
+            second = conductor.FairHeavyAdmission(self.make_fair_metadata("second"), {})
+            waiting = threading.Event()
+            acquired: list[conductor.FairHeavyLease | None] = []
+
+            def acquire_second() -> None:
+                acquired.append(second.wait(update=lambda position, _earlier: waiting.set() if position == 2 else None))
+
+            thread = threading.Thread(target=acquire_second)
+            thread.start()
+            self.assertTrue(waiting.wait(1.0))
+            self.assertEqual(acquired, [])
+            assert first_lease is not None
+            first_lease.release()
+            thread.join(timeout=1.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertIsNotNone(acquired[0])
+            assert acquired[0] is not None
+            acquired[0].release()
+
+    def test_fair_pruning_removes_reused_pid_waiter_but_retains_exact_remote_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            coordinator = conductor.FairHeavyAdmission(self.make_fair_metadata("local"), {})
+            self.addCleanup(coordinator.close)
+            exact_notify_path = coordinator.waiters_dir / "remote-exact.sock"
+            reused_notify_path = coordinator.waiters_dir / "remote-reused.sock"
+            exact_notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            reused_notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            exact_notify.bind(str(exact_notify_path))
+            reused_notify.bind(str(reused_notify_path))
+            self.addCleanup(exact_notify.close)
+            self.addCleanup(reused_notify.close)
+            self.addCleanup(lambda: exact_notify_path.unlink(missing_ok=True))
+            self.addCleanup(lambda: reused_notify_path.unlink(missing_ok=True))
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                payload["waiters"].extend(
+                    [
+                        {
+                            "waiterID": "remote-exact",
+                            "sequence": 100,
+                            "state": "waiting",
+                            "ownerPID": 222,
+                            "ownerStartToken": "exact",
+                            "notifySocketPath": str(exact_notify_path),
+                        },
+                        {
+                            "waiterID": "remote-reused",
+                            "sequence": 101,
+                            "state": "waiting",
+                            "ownerPID": 333,
+                            "ownerStartToken": "old",
+                            "notifySocketPath": str(reused_notify_path),
+                        },
+                    ]
+                )
+                coordinator._write_queue(payload)
+
+            with mock.patch.object(
+                conductor,
+                "process_table_snapshot",
+                return_value={222: (1, "exact"), 333: (1, "new")},
+            ):
+                coordinator._queue_snapshot()
+            with coordinator._queue_lock():
+                waiter_ids = {item["waiterID"] for item in coordinator._load_queue()["waiters"]}
+
+            self.assertIn(coordinator.waiter_id, waiter_ids)
+            self.assertIn("remote-exact", waiter_ids)
+            self.assertNotIn("remote-reused", waiter_ids)
+            with coordinator._queue_lock():
+                payload = coordinator._load_queue()
+                payload["waiters"] = [item for item in payload["waiters"] if item["waiterID"] != "remote-exact"]
+                payload["generation"] += 1
+                coordinator._write_queue(payload)
+            coordinator._remove_own_waiter()
+
+    def test_two_fair_slots_admit_first_two_and_hold_third_in_fifo(self) -> None:
+        env = {"REPOPROMPT_DEV_HEAVY_SLOTS": "2"}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            conductor, "machine_lock_dir", return_value=Path(tmp)
+        ), mock.patch.object(conductor, "process_start_token", return_value="owner"):
+            first = conductor.FairHeavyAdmission(self.make_fair_metadata("first"), env)
+            second = conductor.FairHeavyAdmission(self.make_fair_metadata("second"), env)
+            third = conductor.FairHeavyAdmission(self.make_fair_metadata("third"), env)
+            first_lease = first.wait()
+            second_lease = second.wait()
+
+            self.assertIsNotNone(first_lease)
+            self.assertIsNotNone(second_lease)
+            assert first_lease is not None and second_lease is not None
+            self.assertNotEqual(first_lease.lock_path, second_lease.lock_path)
+            self.assertEqual(third._queue_snapshot()[2], 3)
+            third._remove_own_waiter()
+            third.close()
+            first_lease.release()
+            second_lease.release()
+
+    def test_unlaned_capacity_releases_after_launch_failure(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "unlaned-failure", "guardrails", {}, [], job_state="running")
+        state.jobs[job.ticket] = job
+        state.active_unlaned.add(job.ticket)
+
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            conductor.subprocess, "Popen", side_effect=OSError("fixture launch failure")
+        ), mock.patch.object(state, "_schedule_locked"), mock.patch.object(state, "_refresh_output_summary"):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "failed")
+        self.assertNotIn(job.ticket, state.active_unlaned)
+
+    def test_unlaned_capacity_bounds_resource_jobs_but_exempts_cheap_status_tool(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        tickets = [f"unlaned-{index}" for index in range(conductor.MAX_UNLANED_JOBS + 1)]
+        for ticket in tickets:
+            state.jobs[ticket] = self.make_job(state, ticket, "guardrails", {}, [], job_state="queued")
+        exempt = self.make_job(state, "format-tools-status", "format-tools-status", {}, [], job_state="queued")
+        state.jobs[exempt.ticket] = exempt
+        state.queue = tickets + [exempt.ticket]
+        started: list[str] = []
+
+        class FakeThread:
+            def __init__(self, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self) -> None:
+                started.append(self.args[0])
+
+            def join(self, timeout=None) -> None:
+                del timeout
+
+        with mock.patch.object(conductor.threading, "Thread", FakeThread):
+            with state.condition:
+                state._schedule_locked()
+                payload = state.status_payload()
+
+        self.assertEqual(set(started), set(tickets[: conductor.MAX_UNLANED_JOBS] + [exempt.ticket]))
+        self.assertEqual(state.jobs[tickets[-1]].state, "queued")
+        self.assertEqual(state.jobs[exempt.ticket].state, "running")
+        blocker = state._job_payload_locked(state.jobs[tickets[-1]])["blockedBy"][-1]
+        self.assertEqual(blocker["kind"], "unlanedCapacity")
+        self.assertEqual(blocker["activeCount"], conductor.MAX_UNLANED_JOBS)
+        self.assertEqual(payload["unlanedCapacity"]["activeCount"], conductor.MAX_UNLANED_JOBS)
+
+
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 11)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 16)
+
+    def test_server_listen_backlog_matches_bounded_handler_capacity(self) -> None:
+        self.assertEqual(conductor.ThreadedUnixServer.request_queue_size, conductor.MAX_ACTIVE_REQUEST_HANDLERS)
+
+    def test_explicit_wait_timeout_survives_repeated_server_clamps(self) -> None:
+        clock_value = [0.0]
+        wait_durations: list[float] = []
+
+        def fake_request(_paths: conductor.Paths, request: dict, timeout: float = 1.0) -> dict:
+            del timeout
+            self.assertEqual(request["type"], "job-wait")
+            duration = float(request["timeout"])
+            wait_durations.append(duration)
+            clock_value[0] += duration
+            state = "completed" if len(wait_durations) == 3 else "running"
+            return {"ticket": "ticket", "state": state, "operation": "build", "logTail": []}
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+            payload = conductor.wait_for_terminal(
+                mock.Mock(),
+                "ticket",
+                None,
+                json_mode=True,
+                user_timeout=5.0,
+                clock=lambda: clock_value[0],
+                poll_wait=lambda _seconds: None,
+            )
+
+        self.assertEqual(payload["state"], "completed")
+        self.assertEqual(sum(wait_durations), 3.0)
+        self.assertTrue(all(duration <= conductor.MAX_SERVER_WAIT_SECONDS for duration in wait_durations))
+
+    def test_explicit_wait_timeout_expires_only_at_client_deadline(self) -> None:
+        clock_value = [0.0]
+        wait_durations: list[float] = []
+
+        def fake_request(_paths: conductor.Paths, request: dict, timeout: float = 1.0) -> dict:
+            del timeout
+            duration = float(request["timeout"])
+            wait_durations.append(duration)
+            clock_value[0] += duration
+            return {"ticket": "ticket", "state": "running", "operation": "build", "logTail": []}
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+            payload = conductor.wait_for_terminal(
+                mock.Mock(),
+                "ticket",
+                None,
+                json_mode=True,
+                user_timeout=5.0,
+                clock=lambda: clock_value[0],
+                poll_wait=lambda _seconds: None,
+            )
+
+        self.assertTrue(payload["waitTimedOut"])
+        self.assertEqual(sum(wait_durations), 5.0)
+        self.assertGreater(len(wait_durations), 1)
+
+    def test_wait_rejects_terminal_response_observed_after_client_deadline(self) -> None:
+        clock_value = [0.0]
+        transport_timeouts: list[float] = []
+
+        def fake_request(_paths: conductor.Paths, _request: dict, timeout: float = 1.0) -> dict:
+            transport_timeouts.append(timeout)
+            clock_value[0] = 6.0
+            return {"ticket": "ticket", "state": "completed", "operation": "build", "logTail": []}
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+            payload = conductor.wait_for_terminal(
+                mock.Mock(),
+                "ticket",
+                None,
+                json_mode=True,
+                user_timeout=5.0,
+                clock=lambda: clock_value[0],
+                poll_wait=lambda _seconds: None,
+            )
+
+        self.assertTrue(payload["waitTimedOut"])
+        self.assertLessEqual(transport_timeouts[0], 5.0)
+
+    def test_zero_and_near_deadline_waits_keep_meaningful_rpc_contact_window(self) -> None:
+        for user_timeout in (0.0, 0.02):
+            with self.subTest(user_timeout=user_timeout):
+                clock_value = [100.0]
+                requests: list[dict] = []
+                transport_timeouts: list[float] = []
+
+                def fake_request(_paths: conductor.Paths, request: dict, timeout: float = 1.0) -> dict:
+                    requests.append(dict(request))
+                    transport_timeouts.append(timeout)
+                    clock_value[0] += max(0.001, user_timeout + 0.001)
+                    return {"ticket": "ticket", "state": "running", "operation": "build", "logTail": []}
+
+                with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+                    payload = conductor.wait_for_terminal(
+                        mock.Mock(),
+                        "ticket",
+                        None,
+                        json_mode=True,
+                        user_timeout=user_timeout,
+                        clock=lambda: clock_value[0],
+                        poll_wait=lambda _seconds: None,
+                    )
+
+                self.assertTrue(payload["waitTimedOut"])
+                self.assertEqual(len(requests), 1)
+                self.assertAlmostEqual(requests[0]["timeout"], user_timeout)
+                self.assertEqual(transport_timeouts, [conductor.WAIT_RPC_CONTACT_SECONDS])
+
+    def test_wait_capacity_errors_and_handler_drops_degrade_to_bounded_status_polling(self) -> None:
+        for initial_error in (
+            "server wait-handler capacity exhausted; poll job status and retry",
+            "daemon closed connection without a response",
+        ):
+            with self.subTest(initial_error=initial_error):
+                requests: list[str] = []
+                pauses: list[float] = []
+
+                def fake_request(_paths: conductor.Paths, request: dict, timeout: float = 1.0) -> dict:
+                    del timeout
+                    requests.append(request["type"])
+                    if len(requests) == 1:
+                        raise conductor.ConductorError(initial_error)
+                    state = "completed" if requests.count("job-status") == 2 else "running"
+                    return {"ticket": "ticket", "state": state, "operation": "build", "logTail": []}
+
+                with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+                    payload = conductor.wait_for_terminal(
+                        mock.Mock(),
+                        "ticket",
+                        None,
+                        json_mode=True,
+                        clock=lambda: 0.0,
+                        poll_wait=pauses.append,
+                    )
+
+                self.assertEqual(payload["state"], "completed")
+                self.assertEqual(requests, ["job-wait", "job-status", "job-status"])
+                self.assertEqual(pauses, [conductor.WAIT_STATUS_POLL_SECONDS])
+
+    def test_degraded_wait_tolerates_dropped_status_poll_without_spinning(self) -> None:
+        requests: list[str] = []
+        pauses: list[float] = []
+
+        def fake_request(_paths: conductor.Paths, request: dict, timeout: float = 1.0) -> dict:
+            del timeout
+            requests.append(request["type"])
+            if len(requests) == 1:
+                raise conductor.ConductorError("server wait-handler capacity exhausted; poll job status and retry")
+            if len(requests) == 2:
+                raise conductor.ConductorError("daemon closed connection without a response")
+            return {"ticket": "ticket", "state": "completed", "operation": "build", "logTail": []}
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+            payload = conductor.wait_for_terminal(
+                mock.Mock(),
+                "ticket",
+                None,
+                json_mode=True,
+                clock=lambda: 0.0,
+                poll_wait=pauses.append,
+            )
+
+        self.assertEqual(payload["state"], "completed")
+        self.assertEqual(requests, ["job-wait", "job-status", "job-status"])
+        self.assertEqual(pauses, [conductor.WAIT_STATUS_POLL_SECONDS])
+
+    def test_identity_verified_wait_timeout_degrades_until_terminal_summary_is_ready(self) -> None:
+        requests: list[str] = []
+        pauses: list[float] = []
+        contact_error = conductor.DaemonContactError(
+            "could not contact daemon: timed out",
+            {
+                "running": True,
+                "health": {"state": "unresponsive", "processIdentityVerified": True},
+            },
+        )
+
+        def fake_request(_paths: conductor.Paths, request: dict, timeout: float = 1.0) -> dict:
+            del timeout
+            requests.append(request["type"])
+            if len(requests) <= 2:
+                raise contact_error
+            return {"ticket": "ticket", "state": "completed", "operation": "build", "logTail": []}
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+            payload = conductor.wait_for_terminal(
+                mock.Mock(),
+                "ticket",
+                None,
+                json_mode=True,
+                clock=lambda: 0.0,
+                poll_wait=pauses.append,
+            )
+
+        self.assertEqual(payload["state"], "completed")
+        self.assertEqual(requests, ["job-wait", "job-status", "job-status"])
+        self.assertEqual(pauses, [conductor.WAIT_STATUS_POLL_SECONDS])
+
+    def test_identity_verified_wait_timeout_retries_are_bounded(self) -> None:
+        requests: list[str] = []
+        pauses: list[float] = []
+        contact_error = conductor.DaemonContactError(
+            "could not contact daemon: timed out",
+            {
+                "running": True,
+                "health": {"state": "unresponsive", "processIdentityVerified": True},
+            },
+        )
+
+        def fake_request(_paths: conductor.Paths, request: dict, timeout: float = 1.0) -> dict:
+            del timeout
+            requests.append(request["type"])
+            raise contact_error
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+            with self.assertRaises(conductor.DaemonContactError):
+                conductor.wait_for_terminal(
+                    mock.Mock(),
+                    "ticket",
+                    None,
+                    json_mode=True,
+                    clock=lambda: 0.0,
+                    poll_wait=pauses.append,
+                )
+
+        self.assertEqual(len(requests), conductor.MAX_CONSECUTIVE_WAIT_CONTACT_FAILURES + 1)
+        self.assertEqual(requests[0], "job-wait")
+        self.assertTrue(all(request == "job-status" for request in requests[1:]))
+        self.assertEqual(
+            pauses,
+            [conductor.WAIT_STATUS_POLL_SECONDS] * (conductor.MAX_CONSECUTIVE_WAIT_CONTACT_FAILURES - 1),
+        )
+
+    def test_ambiguous_wait_contact_failure_does_not_poll(self) -> None:
+        requests: list[str] = []
+        contact_error = conductor.DaemonContactError(
+            "could not contact daemon: timed out",
+            {
+                "running": None,
+                "health": {"state": "ambiguous", "processIdentityVerified": False},
+            },
+        )
+
+        def fake_request(_paths: conductor.Paths, request: dict, timeout: float = 1.0) -> dict:
+            del timeout
+            requests.append(request["type"])
+            raise contact_error
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request):
+            with self.assertRaises(conductor.DaemonContactError):
+                conductor.wait_for_terminal(
+                    mock.Mock(),
+                    "ticket",
+                    None,
+                    json_mode=True,
+                    clock=lambda: 0.0,
+                    poll_wait=lambda _seconds: None,
+                )
+
+        self.assertEqual(requests, ["job-wait"])
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -189,7 +2114,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(enqueue_launch.call_args.args[2], {"subcommand": "launch-existing", "appArgs": ["--demo"]})
 
-    def test_app_relaunch_delegates_split_internal_runner_with_live_lane_and_timeout(self) -> None:
+    def test_app_relaunch_delegates_split_internal_runner_with_build_live_lanes_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = conductor.OperationRegistry(Path(tmp))
             argv, lanes, _cwd, _env, timeout = registry.prepare(
@@ -201,11 +2126,30 @@ class LifecycleQueueTests(LifecycleTestCase):
 
         self.assertIn("__operation_runner", argv)
         self.assertIn("debug_app_build_then_launch", argv[-1])
-        self.assertEqual(lanes, ["liveApp"])
+        self.assertEqual(lanes, ["build", "liveApp"])
         self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
         self.assertIn("app_launch_existing", launch_existing_argv[-1])
         self.assertEqual(launch_existing_lanes, ["liveApp"])
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
+
+    def test_building_live_operations_share_build_lane_without_expanding_nonbuilding_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            mutators = (
+                {"operation": "run", "args": {}},
+                {"operation": "app", "args": {"subcommand": "relaunch"}},
+                {"operation": "smoke", "args": {"launch": True}},
+            )
+            nonmutators = (
+                {"operation": "app", "args": {"subcommand": "stop"}},
+                {"operation": "app", "args": {"subcommand": "launch-existing"}},
+                {"operation": "smoke", "args": {"packagedApp": "/tmp/RepoPrompt CE.app"}},
+            )
+            mutator_lanes = [registry.prepare(request)[1] for request in mutators]
+            nonmutator_lanes = [registry.prepare(request)[1] for request in nonmutators]
+
+        self.assertTrue(all("build" in lanes for lanes in mutator_lanes))
+        self.assertTrue(all("build" not in lanes for lanes in nonmutator_lanes))
 
     def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,11 +2314,8 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.addCleanup(tmp.cleanup)
         job = self.make_job(state, "job-devnull", "build", {}, ["build"], job_state="running")
         state.jobs[job.ticket] = job
-        fake_stdout = mock.Mock()
-        fake_stdout.readline.side_effect = [b""]
         fake_process = mock.Mock()
         fake_process.pid = os.getpid()
-        fake_process.stdout = fake_stdout
         fake_process.wait.return_value = 0
 
         with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
@@ -385,9 +2326,91 @@ class LifecycleQueueTests(LifecycleTestCase):
             state._run_job(job.ticket)
 
         job_launch = next(call for call in popen.call_args_list if call.kwargs.get("stdin") == subprocess.DEVNULL)
-        self.assertEqual(job_launch.kwargs["stdout"], subprocess.PIPE)
+        self.assertIsInstance(job_launch.kwargs["stdout"], int)
         self.assertEqual(job_launch.kwargs["stderr"], subprocess.STDOUT)
         self.assertEqual(state.jobs[job.ticket].state, "completed")
+
+    def test_output_pump_registration_failure_cleans_process_group_when_snapshot_is_inconclusive(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "registration-failure", "fixture", {}, [], job_state="running")
+        state.jobs[job.ticket] = job
+        real_popen = subprocess.Popen
+        spawned: list[subprocess.Popen[bytes]] = []
+        descendant_pids: list[int] = []
+        ready_path = state.paths.state_dir / "registration-descendant.pid"
+        fixture_script = """
+import os
+import sys
+import time
+
+child_pid = os.fork()
+if child_pid == 0:
+    time.sleep(60)
+    os._exit(0)
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    handle.write(str(child_pid))
+    handle.flush()
+time.sleep(60)
+"""
+
+        def spawn(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            argv = args[0] if args else kwargs.get("args")
+            if isinstance(argv, (list, tuple)) and fixture_script in argv:
+                spawned.append(process)
+            return process
+
+        def fail_registration(*_args: object, **_kwargs: object) -> None:
+            deadline = time.monotonic() + conductor.LOG_FLUSH_WAIT_SECONDS
+            ready = threading.Event()
+            while not ready_path.exists() and time.monotonic() < deadline:
+                ready.wait(0.01)
+            self.assertTrue(ready_path.exists(), "fixture descendant did not publish readiness")
+            descendant_pids.append(int(ready_path.read_text(encoding="utf-8")))
+            raise conductor.ConductorError("fixture registration failure")
+
+        def cleanup_spawned() -> None:
+            for process in spawned:
+                if process.poll() is None:
+                    process.terminate()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=1.0)
+            for pid in descendant_pids:
+                if pid_is_executing(pid):
+                    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                        os.kill(pid, signal.SIGKILL)
+
+        self.addCleanup(cleanup_spawned)
+        prepared = (
+            [sys.executable, "-c", fixture_script, str(ready_path)],
+            [],
+            state.paths.repo_root,
+            dict(os.environ),
+            60.0,
+        )
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            state.registry, "prepare", return_value=prepared
+        ), mock.patch.object(conductor.subprocess, "Popen", side_effect=spawn), mock.patch.object(
+            state._output_pump, "register", side_effect=fail_registration
+        ), mock.patch.object(conductor, "process_table_snapshot", return_value=None), mock.patch.object(
+            state, "_schedule_locked"
+        ), mock.patch.object(
+            state, "_refresh_output_summary"
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(len(descendant_pids), 1)
+        self.assertIsNotNone(job.process_start)
+        self.assertTrue(job.process_group_identity_confirmed)
+        self.assertEqual(job.state, "failed")
+        self.assertIn("fixture registration failure", job.result_summary or "")
+        self.assertIsNotNone(spawned[0].poll(), "registration failure leaked its root child")
+        self.assertFalse(
+            pid_is_executing(descendant_pids[0]),
+            "registration failure leaked a descendant while process discovery was inconclusive",
+        )
 
     def test_daemon_timeout_preserves_timeout_result_when_root_resists_sigkill(self) -> None:
         tmp, state = self.make_state()
@@ -425,6 +2448,37 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertTrue(job.timed_out)
         self.assertIn("job processes remained alive after SIGKILL escalation", job.error or "")
         self.assertNotIn("daemon runner error", job.result_summary or "")
+
+    def test_termination_snapshots_verified_tree_before_root_group_signal(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "ordered-signal", "fixture", {}, ["build"], job_state="running")
+        verified = {101: (1, "root"), 202: (101, "child")}
+        depths = {101: 0, 202: 1}
+        order: list[str] = []
+
+        with mock.patch.object(
+            state,
+            "_refresh_process_tree_locked",
+            side_effect=lambda _job: (order.append("discover") or (verified, depths, True)),
+        ), mock.patch.object(
+            state,
+            "_signal_process_group_id_locked",
+            side_effect=lambda _job, _signal: (order.append("group") or True),
+        ), mock.patch.object(
+            state,
+            "_signal_verified_processes_locked",
+            side_effect=lambda _job, _signal, actual, actual_depths: (
+                order.append("tree")
+                or self.assertEqual(actual, verified)
+                or self.assertEqual(actual_depths, depths)
+                or 2
+            ),
+        ):
+            with state.condition:
+                state._terminate_process_group_locked(job, "fixture")
+
+        self.assertEqual(order, ["discover", "group", "tree"])
 
     def test_process_group_signal_requires_verified_job_identity(self) -> None:
         tmp, state = self.make_state()
@@ -557,7 +2611,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         deadline = time.time() + 3.0
         while time.time() < deadline and conductor.pid_alive(grandchild_pid):
             time.sleep(0.05)
-        self.assertFalse(conductor.pid_alive(grandchild_pid))
+        self.assertFalse(pid_is_executing(grandchild_pid))
 
     def test_run_operation_command_uses_devnull_stdin(self) -> None:
         completed = subprocess.CompletedProcess(["echo", "ok"], 0, "ok\n", "")
@@ -635,6 +2689,7 @@ class LifecycleQueueTests(LifecycleTestCase):
                 print(log)
                 sys.exit(1)
             print("CLOSED_FD_REGRESSION_OK")
+            state._io_worker.join()
             tmp.cleanup()
             """
         )
@@ -689,9 +2744,9 @@ class LifecycleQueueTests(LifecycleTestCase):
         state.jobs[old_run.ticket] = old_run
         state.active_lanes = {lane: old_run.ticket for lane in old_run.lanes}
 
-        with mock.patch.object(state, "_terminate_process_group_locked") as terminate, mock.patch.object(
+        with mock.patch.object(state, "_request_process_cleanup_locked") as request_cleanup, mock.patch.object(
             state, "_schedule_locked"
-        ), mock.patch.object(conductor.threading, "Thread"):
+        ):
             payload = state.enqueue({"operation": "app", "args": {"subcommand": "stop"}})
 
         stop = state.jobs[payload["ticket"]]
@@ -699,7 +2754,10 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(old_run.state, "running")
         self.assertEqual(state.active_lanes["liveApp"], old_run.ticket)
         self.assertTrue(stop.args["guardDelayedLaunch"])
-        terminate.assert_called_once()
+        request_cleanup.assert_called_once_with(
+            old_run,
+            reason=f"superseded by app stop {payload['ticket']}",
+        )
 
     def test_superseded_job_without_pid_is_signaled_after_delayed_assignment_then_escalated(self) -> None:
         tmp, state = self.make_state()
@@ -709,10 +2767,17 @@ class LifecycleQueueTests(LifecycleTestCase):
         state.active_lanes = {lane: old_run.ticket for lane in old_run.lanes}
         real_thread = threading.Thread
 
+        def wait_for_exit(*_args: object, **_kwargs: object) -> bool:
+            if not hasattr(wait_for_exit, "called"):
+                wait_for_exit.called = True  # type: ignore[attr-defined]
+                return True
+            old_run.state = "canceled"
+            return False
+
         with mock.patch.object(state, "_terminate_process_group_locked") as terminate, mock.patch.object(
             state, "_kill_process_group_locked"
         ) as kill, mock.patch.object(
-            state, "_wait_for_process_tree_exit_locked", side_effect=[True, False]
+            state, "_wait_for_process_tree_exit_locked", side_effect=wait_for_exit
         ), mock.patch.object(state, "_schedule_locked"), mock.patch.object(
             conductor, "TERMINATE_GRACE_SECONDS", 0.01
         ), mock.patch.object(conductor.threading, "Thread") as thread_factory:
@@ -720,7 +2785,8 @@ class LifecycleQueueTests(LifecycleTestCase):
             terminate.assert_not_called()
             target = thread_factory.call_args.kwargs["target"]
             args = thread_factory.call_args.kwargs["args"]
-            self.assertFalse(args[2])
+            self.assertIsInstance(args[0], conductor.JobLease)
+            self.assertEqual(args[0].ticket, old_run.ticket)
             worker = real_thread(target=target, args=args)
             worker.start()
             time.sleep(0.03)
@@ -832,7 +2898,10 @@ class LifecycleQueueTests(LifecycleTestCase):
         while time.monotonic() < deadline:
             with state.condition:
                 job = state.jobs[ticket]
-                if job.state in conductor.TERMINAL_STATES:
+                # A job becomes terminal before the runner's final persistence
+                # and lane-release work is complete. Wait for that finalizer so
+                # TemporaryDirectory cleanup cannot race its record write.
+                if job.state in conductor.TERMINAL_STATES and ticket not in state.active_lanes.values():
                     return job
             time.sleep(0.01)
         with state.condition:
@@ -859,7 +2928,9 @@ class LifecycleQueueTests(LifecycleTestCase):
             daemon_meta_path=state_dir / "daemon.json",
             running_processes_path=state_dir / "running.json",
         )
-        return conductor.DaemonState(paths)
+        state = conductor.DaemonState(paths)
+        self._states.append(state)
+        return state
 
     def test_global_heavy_slot_serializes_build_lane_jobs_across_daemons(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -871,7 +2942,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         state_b = self.make_state_for_global_slot(root, "daemon-b", shared_socket_parent)
 
         lock_root = root / "machine-locks"
-        with mock.patch.object(conductor, "GLOBAL_HEAVY_SLOT_POLL_SECONDS", 0.01), mock.patch.object(
+        with mock.patch.object(conductor, "FAIR_HEAVY_RESCAN_SECONDS", 0.01), mock.patch.object(
             conductor, "machine_lock_dir", return_value=lock_root
         ):
             payload_a = state_a.enqueue(
@@ -910,7 +2981,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         shared_socket_parent.mkdir()
         state = self.make_state_for_global_slot(root, "daemon", shared_socket_parent)
         lock_root = root / "machine-locks"
-        with mock.patch.object(conductor, "GLOBAL_HEAVY_SLOT_POLL_SECONDS", 0.01), mock.patch.object(
+        with mock.patch.object(conductor, "FAIR_HEAVY_RESCAN_SECONDS", 0.01), mock.patch.object(
             conductor, "machine_lock_dir", return_value=lock_root
         ):
             lock_path = lock_root / "global-heavy-0.lock"
@@ -944,6 +3015,48 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(job.result_summary, "canceled before global heavy slot")
         self.assertIsNone(job.process_pid)
         self.assertIsNone(job.process_started_at)
+        self.assertIn("job canceled before global heavy slot", "".join(job.tail))
+
+    def test_cancel_after_global_heavy_acquisition_terminalizes_job_before_releasing_stale_lease(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "late-heavy-cancel", "build", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        released = threading.Event()
+
+        class AcquiredLease:
+            lock_path = state.paths.state_dir / "global-heavy-0.lock"
+
+            def release(self) -> None:
+                released.set()
+
+        acquired = AcquiredLease()
+        assert_false = self.assertFalse
+
+        class Coordinator:
+            waiter_id = "waiter"
+            current_rescan_seconds = conductor.FAIR_HEAVY_HEAD_RESCAN_SECONDS
+            legacy_slot_holder = None
+
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def wait(self, cancel_check: object, update: object) -> AcquiredLease:
+                assert_false(cancel_check())
+                with state.condition:
+                    job.cancel_requested = True
+                return acquired
+
+        with mock.patch.object(conductor, "FairHeavyAdmission", Coordinator):
+            lease = state._acquire_global_heavy_slot(job.ticket)
+
+        self.assertIsNone(lease)
+        self.assertTrue(released.is_set())
+        self.assertEqual(job.state, "canceled")
+        self.assertEqual(job.phase, "terminal")
+        self.assertEqual(job.exit_code, 130)
+        self.assertEqual(job.result_summary, "canceled before global heavy slot")
+        self.assertEqual(job.global_heavy_admission_state, "released")
         self.assertIn("job canceled before global heavy slot", "".join(job.tail))
 
     def test_socket_parent_does_not_shard_global_heavy_slots(self) -> None:
@@ -1095,25 +3208,101 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
 
     def test_process_output_transport_closes_native_pty_descriptors_idempotently(self) -> None:
         transport = conductor.ProcessOutputTransport.create("pty")
-        fds = [transport.master_fd, transport.slave_fd]
+        fds = [transport.reader_fd, transport.writer_fd]
         self.assertTrue(all(isinstance(fd, int) for fd in fds))
-        process = mock.Mock(stdout=None)
 
-        transport.attach_process(process)
-        transport.close_reader()
+        transport.close_all()
         transport.close_all()
 
         self.assert_fds_closed([int(fd) for fd in fds if fd is not None])
 
+    def test_process_output_transport_transfers_reader_without_runner_close(self) -> None:
+        transport = conductor.ProcessOutputTransport.create("pipe")
+        reader_fd = transport.transfer_reader()
+        writer_fd = transport.writer_fd
+
+        transport.close_all()
+
+        os.fstat(reader_fd)
+        self.assert_fds_closed([int(writer_fd)])
+        os.close(reader_fd)
+
+    def test_output_pump_owns_reader_close_and_flushes_unterminated_eof(self) -> None:
+        chunks: list[bytes] = []
+        lines: list[bytes] = []
+        close_threads: list[str] = []
+
+        def close_fd(fd: int) -> None:
+            close_threads.append(threading.current_thread().name)
+            os.close(fd)
+
+        pump = conductor.ProcessOutputPump(
+            lambda _ticket, chunk: chunks.append(chunk),
+            lambda _ticket, line: lines.append(line),
+            close_fd=close_fd,
+        )
+        self.addCleanup(pump.close)
+        reader_fd, writer_fd = os.pipe()
+        os.set_blocking(reader_fd, False)
+        channel = pump.register("normal-eof", reader_fd, "pipe")
+
+        os.write(writer_fd, b"complete\nunterminated")
+        os.close(writer_fd)
+
+        self.assertTrue(channel.completion.wait(1.0))
+        self.assertEqual(channel.result, conductor.ProcessOutputResult(False, None, 21))
+        self.assertEqual(b"".join(chunks), b"complete\nunterminated")
+        self.assertEqual(lines, [b"complete\n", b"unterminated"])
+        self.assertEqual(close_threads, ["conductor-output-pump"])
+        self.assert_fds_closed([reader_fd])
+
+    def test_output_pump_finalization_bounds_inherited_writer_and_marks_truncation(self) -> None:
+        clock_value = 100.0
+        closed = threading.Event()
+
+        def clock() -> float:
+            return clock_value
+
+        def close_fd(fd: int) -> None:
+            os.close(fd)
+            closed.set()
+
+        pump = conductor.ProcessOutputPump(
+            lambda *_args: None,
+            lambda *_args: None,
+            clock=clock,
+            close_fd=close_fd,
+        )
+        self.addCleanup(pump.close)
+        reader_fd, inherited_writer_fd = os.pipe()
+        os.set_blocking(reader_fd, False)
+        channel = pump.register("inherited-writer", reader_fd, "pipe")
+
+        pump.request_finalization(channel)
+        self.assertTrue(channel.finalization_started.wait(1.0))
+        clock_value += conductor.OUTPUT_FINALIZATION_SECONDS
+        pump._wake_writer.send(b"x")
+
+        self.assertTrue(channel.completion.wait(1.0))
+        self.assertEqual(
+            channel.result,
+            conductor.ProcessOutputResult(True, "inheritedWriterDeadline", 0),
+        )
+        self.assertTrue(closed.is_set())
+        self.assert_fds_closed([reader_fd])
+        os.close(inherited_writer_fd)
+
     def test_pty_eio_is_eof_without_waiting_for_popen_to_reap_child(self) -> None:
-        transport = conductor.ProcessOutputTransport(kind="pty", master_fd=123)
-        process = mock.Mock()
+        closed: list[int] = []
+        pump = conductor.ProcessOutputPump(lambda *_args: None, lambda *_args: None, close_fd=closed.append)
+        self.addCleanup(pump.close)
+        channel = conductor.ProcessOutputChannel(ticket="pty-eio", read_fd=123, kind="pty")
 
         with mock.patch.object(conductor.os, "read", side_effect=OSError(errno.EIO, "fixture EIO")):
-            self.assertEqual(transport.read_chunk(process), b"")
+            pump._read_available(channel)
 
-        process.poll.assert_not_called()
-        transport.master_fd = None
+        self.assertEqual(channel.result, conductor.ProcessOutputResult(False, None, 0))
+        self.assertEqual(closed, [123])
 
     def test_output_relay_frames_split_multiple_crlf_unterminated_and_sgr_markers(self) -> None:
         tmp, state = self.make_state()
@@ -1135,12 +3324,19 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             ).encode(),
             b"",
         ]
-        transport = mock.Mock()
-        transport.read_chunk.side_effect = chunks
-        process = mock.Mock()
         log = io.BytesIO()
-
-        state._read_process_output(job.ticket, process, log, transport)
+        pump = conductor.ProcessOutputPump(
+            lambda _ticket, chunk: log.write(chunk),
+            state._submit_process_output_line,
+        )
+        self.addCleanup(pump.close)
+        reader_fd, writer_fd = os.pipe()
+        os.set_blocking(reader_fd, False)
+        channel = pump.register(job.ticket, reader_fd, "pipe")
+        for chunk in chunks[:-1]:
+            os.write(writer_fd, chunk)
+        os.close(writer_fd)
+        self.assertTrue(channel.completion.wait(1.0))
 
         self.assertEqual(log.getvalue(), b"".join(chunks[:-1]))
         self.assertEqual(job.xctest_progress_sequence, 4)
@@ -1151,7 +3347,6 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(len(job.tail), 4)
         self.assertTrue(job.tail[0].endswith("\r\n"))
         self.assertFalse(job.tail[-1].endswith("\n"))
-        transport.close_reader.assert_called_once_with()
 
     def test_watchdog_trigger_snapshot_is_immutable_after_later_progress(self) -> None:
         tmp, state = self.make_state()
@@ -1216,12 +3411,20 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         state.jobs[job.ticket] = job
         state.active_lanes = {"build": job.ticket}
         opened_fds: list[int] = []
+        closed_fds: list[int] = []
         real_openpty = os.openpty
+        real_close = os.close
 
         def tracking_openpty() -> tuple[int, int]:
             pair = real_openpty()
             opened_fds.extend(pair)
             return pair
+
+        def tracking_close(fd: int) -> None:
+            closed_fds.append(fd)
+            real_close(fd)
+
+        state._output_pump._close_fd = tracking_close
 
         def prepare(_request: dict) -> tuple[list[str], list[str], Path, dict[str, str], float]:
             return argv, ["build"], root, os.environ.copy(), 5.0
@@ -1230,7 +3433,7 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             state.registry, "prepare", side_effect=prepare
         ), mock.patch.object(
             conductor.os, "openpty", side_effect=tracking_openpty
-        ), mock.patch.object(
+        ), mock.patch.object(conductor.os, "close", side_effect=tracking_close), mock.patch.object(
             state,
             "_xctest_process_snapshot_locked",
             return_value=(None, []),
@@ -1253,23 +3456,29 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(job.diagnostics[0]["currentTest"], test_name)
         self.assertLess(log.index(marker), log.index(watchdog_line))
         self.assertFalse(state._process_tree_alive_locked(job))
-        self.assert_fds_closed(opened_fds)
+        self.assertTrue(set(opened_fds).issubset(closed_fds))
 
     def test_pty_descriptors_close_when_process_launch_fails(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
         job = self.make_watchdog_job(state)
         opened_fds: list[int] = []
+        closed_fds: list[int] = []
         real_openpty = os.openpty
+        real_close = os.close
 
         def tracking_openpty() -> tuple[int, int]:
             pair = real_openpty()
             opened_fds.extend(pair)
             return pair
 
+        def tracking_close(fd: int) -> None:
+            closed_fds.append(fd)
+            real_close(fd)
+
         with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
             conductor.os, "openpty", side_effect=tracking_openpty
-        ), mock.patch.object(
+        ), mock.patch.object(conductor.os, "close", side_effect=tracking_close), mock.patch.object(
             conductor.subprocess,
             "Popen",
             side_effect=OSError("fixture launch failure"),
@@ -1278,7 +3487,7 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
 
         self.assertEqual(job.state, "failed")
         self.assertIn("fixture launch failure", job.error or "")
-        self.assert_fds_closed(opened_fds)
+        self.assertTrue(set(opened_fds).issubset(closed_fds))
 
     def test_output_transport_cleanup_runs_for_success_timeout_and_cancellation(self) -> None:
         for terminal_path in ["success", "timeout", "cancellation"]:
@@ -1289,11 +3498,7 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 job.ticket = f"cleanup-{terminal_path}"
                 job.log_path = state.paths.jobs_dir / f"{job.ticket}.log"
                 state.jobs = {job.ticket: job}
-                transport = mock.Mock()
-                transport.kind = "pty"
-                transport.popen_stdout = 101
-                transport.popen_stderr = 101
-                transport.read_chunk.return_value = b""
+                transport = conductor.ProcessOutputTransport.create("pty")
                 fake_process = mock.Mock(stdout=None)
                 fake_process.pid = os.getpid()
                 fake_process.poll.return_value = 0
@@ -1341,9 +3546,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 ):
                     state._run_job(job.ticket)
 
-                transport.attach_process.assert_called_once_with(fake_process)
-                transport.close_reader.assert_called()
-                transport.close_all.assert_called_once_with()
+                self.assertIsNone(transport.reader_fd)
+                self.assertIsNone(transport.writer_fd)
+                self.assertTrue(transport.reader_transferred)
                 if terminal_path == "success":
                     self.assertEqual(job.state, "completed")
                 elif terminal_path == "timeout":
@@ -1618,6 +3823,7 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         terminate.assert_called_once_with(job, reason="XCTest progress stall measurement invalid")
         kill.assert_called_once()
         self.assertEqual(wait_for_exit.call_count, 2)
+        state._io_worker.join()
         self.assertIn("could not confirm descendant exit", job.log_path.read_text(encoding="utf-8"))
 
     def test_stall_diagnostic_file_is_bounded(self) -> None:
@@ -1834,7 +4040,10 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
         return bool(predicate())
 
     def process_identity_alive(self, pid: int, start_token: str) -> bool:
-        record = conductor.process_table_snapshot().get(pid)
+        snapshot = conductor.process_table_snapshot()
+        if snapshot is None:
+            return True
+        record = snapshot.get(pid)
         return record is not None and record[1] == start_token
 
     def run_detached_descendant_fixture(self, termination: str) -> None:
@@ -1854,12 +4063,14 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
 
             marker = Path(sys.argv[1])
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            marker.write_text(json.dumps({
+            temporary = marker.with_suffix(".tmp")
+            temporary.write_text(json.dumps({
                 "pid": os.getpid(),
                 "ppid": os.getppid(),
                 "pgid": os.getpgid(0),
                 "sid": os.getsid(0),
             }), encoding="utf-8")
+            temporary.replace(marker)
             while True:
                 time.sleep(0.1)
             """
@@ -1882,13 +4093,15 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
                 stderr=sys.stderr,
                 start_new_session=True,
             )
-            parent_marker.write_text(json.dumps({{
+            temporary = parent_marker.with_suffix(".tmp")
+            temporary.write_text(json.dumps({{
                 "pid": os.getpid(),
                 "ppid": os.getppid(),
                 "pgid": os.getpgid(0),
                 "sid": os.getsid(0),
                 "childPID": child.pid,
             }}), encoding="utf-8")
+            temporary.replace(parent_marker)
             while True:
                 time.sleep(0.1)
             """

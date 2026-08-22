@@ -253,6 +253,46 @@ final class ProcessTerminationExitStatusTests: XCTestCase {
         XCTAssertTrue(ProcessTermination.childIsTerminalOrAlreadyReaped(spawned.pid))
     }
 
+    func testTerminalChildProbeRejectsStoppedChild() async throws {
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sleep",
+            arguments: ["60"],
+            environment: [:],
+            workingDirectory: nil
+        )
+        spawned.stdin?.closeFile()
+        var didReap = false
+        defer {
+            if !didReap {
+                _ = Darwin.kill(spawned.pid, SIGKILL)
+            }
+        }
+
+        XCTAssertEqual(Darwin.kill(spawned.pid, SIGSTOP), 0)
+        let deadline = Date().addingTimeInterval(2)
+        var observedStoppedStatus = false
+        while Date() < deadline {
+            var info = siginfo_t()
+            let result = Darwin.waitid(P_PID, id_t(spawned.pid), &info, WSTOPPED | WNOHANG | WNOWAIT)
+            if result == 0, info.si_pid == spawned.pid, info.si_code == CLD_STOPPED {
+                observedStoppedStatus = true
+                break
+            }
+            if result == -1, errno != EINTR {
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertTrue(observedStoppedStatus)
+        XCTAssertFalse(ProcessTermination.childIsTerminalOrAlreadyReaped(spawned.pid))
+        XCTAssertEqual(Darwin.kill(spawned.pid, SIGKILL), 0)
+        let status = try await ProcessTermination.reapChildStatus(pid: spawned.pid)
+        didReap = true
+        XCTAssertEqual(status, .uncaughtSignal(signal: SIGKILL))
+        XCTAssertTrue(ProcessTermination.childIsTerminalOrAlreadyReaped(spawned.pid))
+    }
+
     func testObservedTerminationEscalatesBeforeGroupOnlyCleanup() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ProcessTerminationExitStatusTests-\(UUID().uuidString)", isDirectory: true)

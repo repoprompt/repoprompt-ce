@@ -8,6 +8,7 @@ final class MCPDomainConnectionCallAdmissionTests: XCTestCase {
             limit: 1,
             controlLimit: 1,
             smallReadLimit: 1,
+            fileReadLimit: 1,
             gitReadLimit: 1,
             fileSearchLimit: 1
         )
@@ -21,6 +22,7 @@ final class MCPDomainConnectionCallAdmissionTests: XCTestCase {
             limit: 2,
             controlLimit: 1,
             smallReadLimit: 1,
+            fileReadLimit: 1,
             gitReadLimit: 1,
             fileSearchLimit: 1
         )
@@ -34,12 +36,29 @@ final class MCPDomainConnectionCallAdmissionTests: XCTestCase {
         XCTAssertEqual(registry.entry(for: connectionID)?.replacementGeneration, 3)
     }
 
+    func testDiagnosticsKeepFileReadAndSmallReadLaneLimitsDistinct() async {
+        let limiters = MCPDomainConnectionCallLimiters(
+            limit: 1,
+            controlLimit: 8,
+            smallReadLimit: 2,
+            fileReadLimit: ContentReadConcurrencyCapacity.maximumConcurrentReads,
+            gitReadLimit: 2,
+            fileSearchLimit: 4
+        )
+
+        let snapshot = await limiters.diagnosticsSnapshot()
+        XCTAssertEqual(snapshot.smallRead.limit, 2)
+        XCTAssertEqual(snapshot.fileRead.limit, ContentReadConcurrencyCapacity.maximumConcurrentReads)
+        XCTAssertEqual(snapshot.laneCount, MCPDomainConnectionCallLane.allCases.count)
+    }
+
     func testTentativeCloseRestoresQueuedAdmissionToExactReplacement() async throws {
         let sleepGate = AdmissionSleepGate()
         let original = MCPDomainConnectionCallLimiters(
             limit: 1,
             controlLimit: 1,
             smallReadLimit: 1,
+            fileReadLimit: 1,
             gitReadLimit: 1,
             fileSearchLimit: 1,
             idleWaitSleep: { duration in try await sleepGate.sleep(duration) }
@@ -48,6 +67,7 @@ final class MCPDomainConnectionCallAdmissionTests: XCTestCase {
             limit: 1,
             controlLimit: 1,
             smallReadLimit: 1,
+            fileReadLimit: 1,
             gitReadLimit: 1,
             fileSearchLimit: 1
         )

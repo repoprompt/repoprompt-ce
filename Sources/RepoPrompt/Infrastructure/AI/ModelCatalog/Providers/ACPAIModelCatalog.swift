@@ -8,12 +8,30 @@ struct ACPDynamicModelRecord: Codable, Hashable {
     let isProviderDefault: Bool
     let supportedReasoningEfforts: [String]
     let defaultReasoningEffort: String?
+    /// Variant provenance for synthesized effort options. Optional so records persisted
+    /// before effort support decode unchanged.
+    var effortVariant: AgentModelEffortVariant? = nil
 }
 
 struct ACPDynamicProviderRecord: Codable, Hashable {
     let providerID: String
     let currentModelRaw: String?
+    /// Active reasoning effort for providers with direct effort authority (e.g. Grok).
+    /// Optional so records persisted before effort support decode unchanged.
+    var currentEffortRaw: String? = nil
     let options: [ACPDynamicModelRecord]
+
+    init(
+        providerID: String,
+        currentModelRaw: String?,
+        currentEffortRaw: String? = nil,
+        options: [ACPDynamicModelRecord]
+    ) {
+        self.providerID = providerID
+        self.currentModelRaw = currentModelRaw
+        self.currentEffortRaw = currentEffortRaw
+        self.options = options
+    }
 }
 
 enum ACPDynamicModelStore {
@@ -81,6 +99,7 @@ enum ACPDynamicModelStore {
         return ACPDynamicProviderRecord(
             providerID: providerID.rawValue,
             currentModelRaw: normalizedCurrentModelRaw(snapshot.currentModelRaw, options: options),
+            currentEffortRaw: snapshot.currentEffortRaw,
             options: options
         )
     }
@@ -89,7 +108,11 @@ enum ACPDynamicModelStore {
         let options = record.options.compactMap(modelOption(from:))
         guard !options.isEmpty else { return nil }
         let currentModelRaw = normalizedCurrentModelRaw(record.currentModelRaw, options: record.options)
-        return ACPDiscoveredSessionModels(options: options, currentModelRaw: currentModelRaw)
+        return ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: currentModelRaw,
+            currentEffortRaw: record.currentEffortRaw
+        )
     }
 
     private static func loadProviderRecords(defaults: UserDefaults) -> [ACPDynamicProviderRecord] {
@@ -128,7 +151,8 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: option.isPlaceholderDefault,
             isProviderDefault: option.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: option.defaultReasoningEffort?.rawValue
+            defaultReasoningEffort: option.defaultReasoningEffort?.rawValue,
+            effortVariant: option.effortVariant
         )
     }
 
@@ -145,7 +169,8 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: record.isPlaceholderDefault,
             isProviderDefault: record.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort)
+            defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort),
+            effortVariant: record.effortVariant
         )
     }
 
@@ -196,7 +221,10 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: existing.isPlaceholderDefault || candidate.isPlaceholderDefault,
             isProviderDefault: existing.isProviderDefault || candidate.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort
+            defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort,
+            // Variant provenance is semantic identity, not metadata: keep it only when both
+            // records agree, so a real base (nil) never inherits stale variant provenance.
+            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil
         )
     }
 
@@ -291,6 +319,10 @@ enum ACPAIModelCatalog {
         cursorModelOptionsFromStore().map { .cursorCustom(name: $0.rawValue) }
     }
 
+    static func grokBuildModelsFromStore() -> [AIModel] {
+        grokBuildModelOptionsFromStore().map { .grokBuildCustom(name: $0.rawValue) }
+    }
+
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
@@ -307,6 +339,13 @@ enum ACPAIModelCatalog {
             return discovered
         }
         return cursorModelOptionsFromStore()
+            .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+    }
+
+    static func grokBuildModelOption(for rawValue: String) -> AgentModelOption? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return grokBuildModelOptionsFromStore()
             .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
     }
 
@@ -334,6 +373,13 @@ enum ACPAIModelCatalog {
         let discovered = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options ?? []
         guard !discovered.isEmpty else { return [fallback] }
         return [fallback] + discovered.filter { !isCursorAutoOption($0) }
+    }
+
+    private static func grokBuildModelOptionsFromStore() -> [AgentModelOption] {
+        AgentModelCatalog.options(
+            for: .grokBuild,
+            availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+        )
     }
 
     private static func isCursorAutoOption(_ option: AgentModelOption) -> Bool {

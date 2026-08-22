@@ -1250,7 +1250,10 @@ enum AgentContextExportResolver {
                 )
             }
         } else if codeMapUsage == .auto || codeMapUsage == .complete {
-            var seenIDs = Set(rowEntries.map(\.entry.id))
+            var seenAccountingIdentities = PromptContextAccountingIdentitySet()
+            for rowEntry in rowEntries {
+                _ = seenAccountingIdentities.insert(rowEntry.entry)
+            }
             let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
             for rendered in codemapPresentation.orderedEntries {
                 guard !resolution.selectedFileIDs.contains(rendered.fileID),
@@ -1269,7 +1272,7 @@ enum AgentContextExportResolver {
                     canRemove: codeMapUsage == .auto,
                     removesAutomaticSourceIntent: codeMapUsage == .auto,
                     to: &rowEntries,
-                    seenIDs: &seenIDs
+                    seenAccountingIdentities: &seenAccountingIdentities
                 )
             }
         }
@@ -1708,7 +1711,7 @@ enum AgentContextExportResolver {
         var rows: [RowResolutionEntry] = []
         var missingPaths: [String] = []
         var invalidPaths: [String] = []
-        var seenIDs = Set<ResolvedPromptFileEntryID>()
+        var seenAccountingIdentities = PromptContextAccountingIdentitySet()
         var selectedFileIDs = Set<UUID>()
 
         let selectedRequests = selection.selectedPaths.map {
@@ -1725,61 +1728,17 @@ enum AgentContextExportResolver {
             ]
         )
 
-        for path in selection.selectedPaths {
-            let result = await selectedLookupResult(
-                for: path,
-                batchedResults: selectedLookupResults,
-                store: store,
-                profile: profile,
-                rootScope: rootScope
-            )
-            guard let result else {
-                if await appendDirectoryRows(
-                    for: path,
-                    store: store,
-                    rootScope: rootScope,
-                    selectedFileIDs: &selectedFileIDs,
-                    rows: &rows,
-                    seenIDs: &seenIDs
-                ) {
-                    continue
-                }
-                missingPaths.append(path)
-                continue
-            }
-
-            if let file = result.file {
-                selectedFileIDs.insert(file.id)
-                let ranges = sliceRanges(for: path, file: file, location: result.location, in: selection.slices)
-                let entry = ResolvedPromptFileEntry(
-                    file: file,
-                    lineRanges: ranges,
-                    mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
-                    loadedContent: nil,
-                    rootFolderPath: result.location.rootPath
-                )
-                append(entry, canRemove: true, to: &rows, seenIDs: &seenIDs)
-            } else if let folder = result.folder {
-                let files = await store.files(inRoot: folder.rootID)
-                let prefix = folder.standardizedRelativePath
-                for file in files where prefix.isEmpty || file.standardizedRelativePath == prefix || file.standardizedRelativePath.hasPrefix(prefix + "/") {
-                    selectedFileIDs.insert(file.id)
-                    let entry = ResolvedPromptFileEntry(
-                        file: file,
-                        mode: .fullFile,
-                        loadedContent: nil,
-                        rootFolderPath: result.location.rootPath
-                    )
-                    append(entry, canRemove: false, to: &rows, seenIDs: &seenIDs)
-                }
-            } else {
-                invalidPaths.append(path)
+        var selectedPathResultsByPath = selectedLookupResults
+        for path in selection.selectedPaths where selectedPathResultsByPath[path] == nil {
+            if let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) {
+                selectedPathResultsByPath[path] = result
             }
         }
+        let directlySelectedFileIDs = Set(selectedPathResultsByPath.values.compactMap { $0.file?.id })
 
-        let orderedSlicePaths = selection.slices.keys.sorted(by: utf8Precedes)
+        let orderedSlicePaths = StoredSelectionPathNormalization.orderedSlicePaths(selection.slices)
         let slicePaths = orderedSlicePaths.filter { path in
-            selection.slices[path]?.isEmpty == false && selectedLookupResults[path] == nil
+            selection.slices[path]?.isEmpty == false && selectedPathResultsByPath[path] == nil
         }
         let sliceLookupRequests = slicePaths.map {
             WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
@@ -1798,9 +1757,87 @@ enum AgentContextExportResolver {
                 "resultCount": String(sliceLookupResults.count)
             ]
         )
+        var slicePathResults: [String: WorkspacePathLookupResult] = [:]
+        var sliceRangesByFileID: [UUID: [LineRange]] = [:]
         for path in orderedSlicePaths {
             guard let ranges = selection.slices[path], !ranges.isEmpty else { continue }
-            guard let result = selectedLookupResults[path] ?? sliceLookupResults[path] else {
+            let result: WorkspacePathLookupResult? = if let cached = selectedPathResultsByPath[path]
+                ?? sliceLookupResults[path]
+            {
+                cached
+            } else {
+                await store.lookupPath(path, profile: profile, rootScope: rootScope)
+            }
+            guard let result else { continue }
+            slicePathResults[path] = result
+            if let file = result.file {
+                StoredSelectionPathNormalization.mergeSliceRanges(
+                    ranges,
+                    for: file.id,
+                    into: &sliceRangesByFileID
+                )
+            }
+        }
+
+        for path in selection.selectedPaths {
+            let result = selectedPathResultsByPath[path]
+            guard let result else {
+                if await appendDirectoryRows(
+                    for: path,
+                    store: store,
+                    rootScope: rootScope,
+                    directlySelectedFileIDs: directlySelectedFileIDs,
+                    sliceRangesByFileID: sliceRangesByFileID,
+                    selectedFileIDs: &selectedFileIDs,
+                    rows: &rows,
+                    seenAccountingIdentities: &seenAccountingIdentities
+                ) {
+                    continue
+                }
+                missingPaths.append(path)
+                continue
+            }
+
+            if let file = result.file {
+                selectedFileIDs.insert(file.id)
+                let ranges = sliceRangesByFileID[file.id]
+                let entry = ResolvedPromptFileEntry(
+                    file: file,
+                    lineRanges: ranges,
+                    mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
+                    loadedContent: nil,
+                    rootFolderPath: result.location.rootPath
+                )
+                append(entry, canRemove: true, to: &rows, seenAccountingIdentities: &seenAccountingIdentities)
+            } else if let folder = result.folder {
+                let files = await store.files(inRoot: folder.rootID)
+                let prefix = folder.standardizedRelativePath
+                for file in files where prefix.isEmpty || file.standardizedRelativePath == prefix || file.standardizedRelativePath.hasPrefix(prefix + "/") {
+                    guard !directlySelectedFileIDs.contains(file.id) else { continue }
+                    selectedFileIDs.insert(file.id)
+                    let ranges = sliceRangesByFileID[file.id]
+                    let entry = ResolvedPromptFileEntry(
+                        file: file,
+                        lineRanges: ranges,
+                        mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
+                        loadedContent: nil,
+                        rootFolderPath: result.location.rootPath
+                    )
+                    append(
+                        entry,
+                        canRemove: ranges?.isEmpty == false,
+                        to: &rows,
+                        seenAccountingIdentities: &seenAccountingIdentities
+                    )
+                }
+            } else {
+                invalidPaths.append(path)
+            }
+        }
+
+        for path in orderedSlicePaths {
+            guard selection.slices[path]?.isEmpty == false else { continue }
+            guard let result = slicePathResults[path] else {
                 missingPaths.append(path)
                 continue
             }
@@ -1808,7 +1845,9 @@ enum AgentContextExportResolver {
                 invalidPaths.append(path)
                 continue
             }
-            guard !selectedFileIDs.contains(file.id) else { continue }
+            guard !selectedFileIDs.contains(file.id),
+                  let ranges = sliceRangesByFileID[file.id]
+            else { continue }
             selectedFileIDs.insert(file.id)
             let entry = ResolvedPromptFileEntry(
                 file: file,
@@ -1817,7 +1856,7 @@ enum AgentContextExportResolver {
                 loadedContent: nil,
                 rootFolderPath: result.location.rootPath
             )
-            append(entry, canRemove: true, to: &rows, seenIDs: &seenIDs)
+            append(entry, canRemove: true, to: &rows, seenAccountingIdentities: &seenAccountingIdentities)
         }
 
         AgentSelectedFilesDiagnostics.durationEvent(
@@ -1956,9 +1995,11 @@ enum AgentContextExportResolver {
         for path: String,
         store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope,
+        directlySelectedFileIDs: Set<UUID>,
+        sliceRangesByFileID: [UUID: [LineRange]],
         selectedFileIDs: inout Set<UUID>,
         rows: inout [RowResolutionEntry],
-        seenIDs: inout Set<ResolvedPromptFileEntryID>
+        seenAccountingIdentities: inout PromptContextAccountingIdentitySet
     ) async -> Bool {
         let roots = await store.rootRefs(scope: rootScope)
         var handled = false
@@ -1970,14 +2011,22 @@ enum AgentContextExportResolver {
             handled = true
             let files = await store.files(inRoot: root.id)
             for file in files where relativePrefix.isEmpty || file.standardizedRelativePath.hasPrefix(relativePrefix + "/") {
+                guard !directlySelectedFileIDs.contains(file.id) else { continue }
                 selectedFileIDs.insert(file.id)
+                let ranges = sliceRangesByFileID[file.id]
                 let entry = ResolvedPromptFileEntry(
                     file: file,
-                    mode: .fullFile,
+                    lineRanges: ranges,
+                    mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
                     loadedContent: nil,
                     rootFolderPath: root.standardizedFullPath
                 )
-                append(entry, canRemove: false, to: &rows, seenIDs: &seenIDs)
+                append(
+                    entry,
+                    canRemove: ranges?.isEmpty == false,
+                    to: &rows,
+                    seenAccountingIdentities: &seenAccountingIdentities
+                )
             }
         }
         return handled
@@ -1996,46 +2045,14 @@ enum AgentContextExportResolver {
         return StandardizedPath.relative(expanded)
     }
 
-    private static func selectedLookupResult(
-        for path: String,
-        batchedResults: [String: WorkspacePathLookupResult],
-        store: WorkspaceFileContextStore,
-        profile: PathLocateProfile,
-        rootScope: WorkspaceLookupRootScope
-    ) async -> WorkspacePathLookupResult? {
-        if let result = batchedResults[path] { return result }
-        return await store.lookupPath(path, profile: profile, rootScope: rootScope)
-    }
-
-    private static func sliceRanges(
-        for path: String,
-        file: WorkspaceFileRecord,
-        location: WorkspacePathLocation,
-        in slices: [String: [LineRange]]
-    ) -> [LineRange]? {
-        let candidateKeys = [
-            path,
-            StandardizedPath.absolute(path),
-            file.relativePath,
-            file.standardizedRelativePath,
-            file.fullPath,
-            file.standardizedFullPath,
-            location.absolutePath
-        ]
-        for key in candidateKeys {
-            if let ranges = slices[key] { return ranges }
-        }
-        return nil
-    }
-
     private static func append(
         _ entry: ResolvedPromptFileEntry,
         canRemove: Bool,
         removesAutomaticSourceIntent: Bool = false,
         to rows: inout [RowResolutionEntry],
-        seenIDs: inout Set<ResolvedPromptFileEntryID>
+        seenAccountingIdentities: inout PromptContextAccountingIdentitySet
     ) {
-        guard seenIDs.insert(entry.id).inserted else { return }
+        guard seenAccountingIdentities.insert(entry) else { return }
         rows.append(RowResolutionEntry(
             entry: entry,
             canRemove: canRemove,

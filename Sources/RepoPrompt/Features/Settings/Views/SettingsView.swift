@@ -391,6 +391,7 @@ struct SettingsView: View {
             AgentModeGeneralSettingsView(
                 promptVM: promptViewModel,
                 apiSettingsVM: apiSettingsViewModel,
+                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -1038,12 +1039,12 @@ enum SettingsTab: String, CaseIterable {
                 "rewrite",
                 "augment",
                 "preserve",
-                "auto plan",
-                "plan generation",
+                "follow-up analysis",
+                "plan review question",
                 "claude code",
                 "codex",
                 "analysis budget",
-                "plan token budget",
+                "selected context",
                 "custom prompts",
                 "custom instructions",
                 "ui runs",

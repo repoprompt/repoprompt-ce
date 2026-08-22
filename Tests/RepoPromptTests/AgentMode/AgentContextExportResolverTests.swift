@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -1683,6 +1684,103 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         XCTAssertTrue(model.rows.allSatisfy { !$0.canRemove })
     }
 
+    func testRowsAndMetricsPreserveExplicitSliceRegardlessOfContainingFolderOrder() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportAccountingIdentity")
+        let sources = root.appendingPathComponent("Sources")
+        let targetURL = sources.appendingPathComponent("Target.swift")
+        let otherURL = sources.appendingPathComponent("Other.swift")
+        let targetContent = "skip\nselected line\nskip\n"
+        let otherContent = "let other = true\n"
+        try write(targetContent, to: targetURL)
+        try write(otherContent, to: otherURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let sliceRange = LineRange(start: 2, end: 2)
+
+        func resolve(selectedPaths: [String]) async throws -> AgentContextExportModel {
+            try await AgentContextExportResolver.resolveModel(
+                source: AgentContextExportSource(
+                    tabID: UUID(),
+                    promptText: "Review accounting identity",
+                    selection: StoredSelection(
+                        selectedPaths: selectedPaths,
+                        slices: [targetURL.path: [sliceRange]],
+                        codemapAutoEnabled: false
+                    ),
+                    selectedMetaPromptIDs: [],
+                    tabName: "Accounting Identity",
+                    activeAgentSessionID: nil,
+                    worktreeBindings: []
+                ),
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .none
+            )
+        }
+
+        let directFirst = try await resolve(selectedPaths: [targetURL.path, sources.path])
+        let folderFirst = try await resolve(selectedPaths: [sources.path, targetURL.path])
+
+        XCTAssertEqual(folderFirst.rows, directFirst.rows)
+        XCTAssertEqual(folderFirst.totalSelectedDisplayTokens, directFirst.totalSelectedDisplayTokens)
+        XCTAssertEqual(folderFirst.rows.count, 2)
+        XCTAssertEqual(Set(folderFirst.rows.map(\.id.fileID)).count, 2)
+        XCTAssertEqual(Set(folderFirst.rows.map(\.physicalPath)).count, 2)
+        let targetRow = try XCTUnwrap(folderFirst.rows.first {
+            $0.physicalPath == targetURL.standardizedFileURL.path
+        })
+        XCTAssertEqual(targetRow.kind, .slices)
+        XCTAssertEqual(targetRow.lineRanges, [sliceRange])
+        XCTAssertTrue(targetRow.canRemove)
+
+        let renderedSlice = SliceAssemblyBuilder.build(from: targetContent, ranges: [sliceRange]).combinedText
+        let expectedTotal = TokenCalculationService.estimateTokens(for: renderedSlice)
+            + TokenCalculationService.estimateTokens(for: otherContent)
+        XCTAssertEqual(folderFirst.totalSelectedDisplayTokens, expectedTotal)
+        XCTAssertEqual(targetRow.metrics.knownValues?.tokenCount, TokenCalculationService.estimateTokens(for: renderedSlice))
+    }
+
+    func testRowsMergeSliceRangesForAliasesOfSameFile() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportSliceAliases")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        try write("one\ntwo\nthree\nfour\n", to: targetURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let aliasPath = root.path + "/./Target.swift"
+        let ranges = [
+            LineRange(start: 1, end: 1),
+            LineRange(start: 4, end: 4)
+        ]
+        let model = try await AgentContextExportResolver.resolveModel(
+            source: AgentContextExportSource(
+                tabID: UUID(),
+                promptText: "Review slice aliases",
+                selection: StoredSelection(
+                    slices: [
+                        targetURL.path: [ranges[0]],
+                        aliasPath: [ranges[1]]
+                    ],
+                    codemapAutoEnabled: false
+                ),
+                selectedMetaPromptIDs: [],
+                tabName: "Slice Aliases",
+                activeAgentSessionID: nil,
+                worktreeBindings: []
+            ),
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+
+        XCTAssertEqual(model.rows.count, 1)
+        let row = try XCTUnwrap(model.rows.first)
+        XCTAssertEqual(row.kind, .slices)
+        XCTAssertEqual(row.lineRanges, ranges)
+        XCTAssertTrue(row.canRemove)
+    }
+
     @MainActor
     func testSourceBuilderUsesRequestedInactiveTabInsteadOfActiveSnapshot() {
         let requestedTabID = UUID()
@@ -1879,6 +1977,150 @@ final class AgentContextExportResolverTests: WorkspaceFileContextStoreCodemapSea
         XCTAssertEqual(state.selectedPrompts.map(\.id), [storedPromptID])
         XCTAssertEqual(state.selectedPrompts.map(\.content), [storedPrompt.content])
         XCTAssertEqual(promptManager.promptSelection(for: .copy), [storedPromptID])
+    }
+
+    @MainActor
+    func testPromptRowPresentationsGateManagementToManualCustomPrompts() throws {
+        let store = WorkspaceFileContextStore()
+        let promptManager = makePrompt(store: store, windowID: 41012)
+        let builtIn = try XCTUnwrap(promptManager.builtInStoredPrompts.first)
+        let custom = PromptViewModel.StoredPrompt(
+            id: UUID(),
+            title: "Custom instructions",
+            content: "Custom body"
+        )
+        promptManager.storedPrompts = [builtIn, custom]
+        promptManager.selectCopyPreset(
+            BuiltInCopyPresets.manual.id,
+            applySettings: false,
+            restoreManualSnapshot: false
+        )
+        promptManager.updatePromptSelection([custom.id], for: .copy)
+        let exportContext = AgentContextExportViewContext(
+            promptManager: promptManager,
+            selectionCoordinator: nil,
+            currentTabID: nil,
+            activeAgentSessionID: nil,
+            worktreeBindingsProvider: nil
+        )
+        let promptTab = AgentContextDrawerPromptTab(
+            promptManager: promptManager,
+            modelCoordinator: AgentSelectedFilesModelCoordinator(),
+            exportContext: exportContext,
+            isSwitchBlankingSelectedFiles: false
+        )
+
+        let manualRows = promptTab.makeRenderState().promptRows
+
+        XCTAssertEqual(manualRows.map(\.id), [builtIn.id, custom.id])
+        XCTAssertTrue(manualRows[0].allowsSelectionMutation)
+        XCTAssertTrue(manualRows[0].allowsCopy)
+        XCTAssertFalse(manualRows[0].allowsDestructiveManagement)
+        XCTAssertFalse(manualRows[0].isSelected)
+        XCTAssertTrue(manualRows[1].allowsSelectionMutation)
+        XCTAssertTrue(manualRows[1].allowsCopy)
+        XCTAssertTrue(manualRows[1].allowsDestructiveManagement)
+        XCTAssertTrue(manualRows[1].isSelected)
+
+        let customPreset = CopyPreset(
+            name: "Stored prompt presentation",
+            includeMetaPrompts: true,
+            storedPromptIds: [custom.id]
+        )
+        let presetManager = CopyPresetManager.shared
+        presetManager.add(customPreset)
+        defer { presetManager.remove(id: customPreset.id) }
+        promptManager.selectCopyPreset(customPreset.id)
+
+        let presetRows = promptTab.makeRenderState().promptRows
+
+        XCTAssertEqual(presetRows.map(\.id), [custom.id])
+        XCTAssertFalse(presetRows[0].allowsSelectionMutation)
+        XCTAssertFalse(presetRows[0].allowsCopy)
+        XCTAssertFalse(presetRows[0].allowsDestructiveManagement)
+        XCTAssertTrue(presetRows[0].isSelected)
+    }
+
+    @MainActor
+    func testStoredPromptClipboardWritesExactContentWithoutPackaging() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptClipboard-\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        let prompt = PromptViewModel.StoredPrompt(
+            id: UUID(),
+            title: "Title that must not be copied",
+            content: "  first line\n<instructions>exact</instructions>\n\n"
+        )
+
+        let didWrite = AgentContextStoredPromptClipboard.write(prompt: prompt, to: pasteboard)
+
+        XCTAssertTrue(didWrite)
+        XCTAssertEqual(pasteboard.string(forType: .string), prompt.content)
+        XCTAssertFalse(pasteboard.string(forType: .string)?.contains(prompt.title) ?? true)
+    }
+
+    @MainActor
+    func testStoredPromptClipboardMissingIDPreservesExistingContent() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptMissing-\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString("existing clipboard content", forType: .string))
+
+        let didWrite = AgentContextStoredPromptClipboard.write(
+            promptID: UUID(),
+            from: [],
+            to: pasteboard
+        )
+
+        XCTAssertNil(didWrite)
+        XCTAssertEqual(pasteboard.string(forType: .string), "existing clipboard content")
+    }
+
+    @MainActor
+    func testStoredPromptCopyResolvesLatestContentAtInvocation() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptLatest-\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        let promptID = UUID()
+        let latestPrompt = PromptViewModel.StoredPrompt(
+            id: promptID,
+            title: "Current",
+            content: "latest content"
+        )
+
+        let didWrite = AgentContextStoredPromptClipboard.write(
+            promptID: promptID,
+            from: [latestPrompt],
+            to: pasteboard
+        )
+
+        XCTAssertEqual(didWrite, true)
+        XCTAssertEqual(pasteboard.string(forType: .string), latestPrompt.content)
+    }
+
+    @MainActor
+    func testSupersededContextCopyCannotOverwriteStoredPromptCopyAcrossOwners() async {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoredPromptIntent-\(UUID().uuidString)"))
+        defer { pasteboard.clearContents() }
+        let buildFence = TestReleaseFence(name: "suspended prompt context build")
+        let prompt = PromptViewModel.StoredPrompt(
+            id: UUID(),
+            title: "Latest",
+            content: "newer stored prompt content"
+        )
+        let staleIntent = PromptClipboardIntentCoordinator.shared.begin()
+        let staleCopy = Task {
+            await PromptClipboardIntentCoordinator.shared.buildAndWrite(intent: staleIntent, to: pasteboard) {
+                await buildFence.enterAndWait()
+                return "stale full context"
+            }
+        }
+
+        await buildFence.waitUntilEntered()
+        XCTAssertTrue(AgentContextStoredPromptClipboard.write(prompt: prompt, to: pasteboard))
+        buildFence.release()
+
+        let staleCopyDidWrite = await staleCopy.value
+        XCTAssertFalse(staleCopyDidWrite)
+        XCTAssertEqual(pasteboard.string(forType: .string), prompt.content)
     }
 
     @MainActor

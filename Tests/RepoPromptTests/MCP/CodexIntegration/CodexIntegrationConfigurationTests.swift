@@ -33,6 +33,34 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         return lines[..<firstHeaderIndex].filter { $0.contains("tool_output_token_limit") }
     }
 
+    func testCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
+        let arguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: [],
+            fullAccess: false
+        ).args
+
+        XCTAssertFalse(arguments.contains("--full-auto"))
+        XCTAssertEqual(
+            Array(arguments.suffix(4)),
+            ["--json", "--skip-git-repo-check", "--sandbox", "workspace-write"]
+        )
+    }
+
+    func testCodexExecUsesBypassOnlyForExplicitFullAccess() {
+        let arguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: [],
+            fullAccess: true
+        ).args
+
+        XCTAssertFalse(arguments.contains("--full-auto"))
+        XCTAssertFalse(arguments.contains("--sandbox"))
+        XCTAssertTrue(arguments.contains("--dangerously-bypass-approvals-and-sandbox"))
+    }
+
     private func occurrences(of needle: String, in haystack: String) -> Int {
         guard !needle.isEmpty else { return 0 }
         return haystack.components(separatedBy: needle).count - 1
@@ -486,6 +514,72 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertFalse(execArguments.contains { $0.contains("features.parallel_tool_calls") })
     }
 
+    func testRuntimePoliciesForceOptionalCapabilitiesOffExceptDirectNativeAgentModeChoices() {
+        let policy = CodexOverrides.ToolPolicy(
+            toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,
+            shellToolEnabled: false,
+            webSearchRequestEnabled: false,
+            multiAgentEnabled: false
+        )
+        let capabilityKeys = [
+            "features.apps",
+            "features.plugins",
+            "features.tool_call_mcp_elicitation",
+            "features.tool_suggest"
+        ]
+
+        let cliOverrides = CodexOverrides.cliConfigArgs(toolPolicy: policy)
+        let appServerOverrides = CodexOverrides.appServerConfigMap(toolPolicy: policy)
+        for key in capabilityKeys {
+            XCTAssertTrue(cliOverrides.contains("\(key)=false"), key)
+            XCTAssertEqual(appServerOverrides[key] as? Bool, false, key)
+        }
+
+        let nativeAgentDefaults = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            shellToolEnabled: false,
+            computerUseEnabled: true
+        )
+        for key in capabilityKeys {
+            XCTAssertEqual(nativeAgentDefaults[key] as? Bool, false, key)
+        }
+
+        let nativeAgentChoices = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            shellToolEnabled: false,
+            capabilities: CodexCapabilitySettings(
+                appsEnabled: true,
+                pluginsEnabled: false,
+                mcpElicitationEnabled: true,
+                toolSuggestionsEnabled: false
+            ),
+            computerUseEnabled: false
+        )
+        XCTAssertEqual(nativeAgentChoices["features.apps"] as? Bool, true)
+        XCTAssertEqual(nativeAgentChoices["features.plugins"] as? Bool, false)
+        XCTAssertEqual(nativeAgentChoices["features.tool_call_mcp_elicitation"] as? Bool, true)
+        XCTAssertEqual(nativeAgentChoices["features.tool_suggest"] as? Bool, false)
+
+        let interactiveChatOverrides = CodexCLIProvider().interactiveConfigOverrides(
+            excludeServers: []
+        )
+        for key in capabilityKeys {
+            XCTAssertEqual(interactiveChatOverrides[key] as? Bool, false, key)
+        }
+
+        let headlessOverrides = CodexIntegrationConfiguration.configOverrides(for: .agentRun)
+        for key in capabilityKeys {
+            XCTAssertTrue(headlessOverrides.contains("\(key)=false"), key)
+        }
+
+        let execArguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: []
+        ).args
+        for key in capabilityKeys {
+            XCTAssertTrue(execArguments.contains("\(key)=false"), key)
+        }
+    }
+
     func testOwnedCodeModePolicyIsExactIdempotentAndPreservesUnrelatedSettings() {
         let input = """
         model = "user-model"
@@ -584,7 +678,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
 
         XCTAssertFalse(result.changed)
         XCTAssertEqual(result.content, input)
-        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.145.0") == true)
+        XCTAssertTrue(result.conflictMessage?.contains("minimum 0.149.0") == true)
         XCTAssertFalse(result.content.contains("direct_only_tool_namespaces"))
     }
 

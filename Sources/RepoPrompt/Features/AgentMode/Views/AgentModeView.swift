@@ -1852,6 +1852,10 @@ struct AgentModeChatDetailView: View {
         runInteractionSnapshot.pendingApproval?.id
     }
 
+    private var pendingCodexHookReviewID: UUID? {
+        runInteractionSnapshot.pendingCodexHookReview?.id
+    }
+
     private var pendingMCPElicitationID: UUID? {
         runInteractionSnapshot.pendingMCPElicitationRequest?.id
     }
@@ -1861,7 +1865,10 @@ struct AgentModeChatDetailView: View {
     }
 
     private var isInteractionBlockerVisible: Bool {
-        pendingApprovalID != nil || pendingMCPElicitationID != nil || pendingApplyEditsReviewID != nil
+        pendingCodexHookReviewID != nil
+            || pendingApprovalID != nil
+            || pendingMCPElicitationID != nil
+            || pendingApplyEditsReviewID != nil
     }
 
     var body: some View {
@@ -2399,7 +2406,24 @@ struct AgentModeChatDetailView: View {
             transcriptBlockRows(blocks: visibleTranscriptBlocks)
         }
         runningIndicatorSlot
-        if let review = runInteractionSnapshot.pendingApplyEditsReview {
+        if let request = runInteractionSnapshot.pendingCodexHookReview {
+            CodexHookReviewCard(
+                request: request,
+                isStrictModeEnabled: {
+                    agentModeVM.isCodexHookApprovalStrictModeEnabled()
+                },
+                onDecision: { decision in
+                    guard let tabID = currentTabID else { return }
+                    try await agentModeVM.submitCodexHookReviewDecision(
+                        tabID: tabID,
+                        requestID: request.id,
+                        decision: decision
+                    )
+                }
+            )
+            .id("pendingCodexHookReview")
+            .transition(.opacity)
+        } else if let review = runInteractionSnapshot.pendingApplyEditsReview {
             AgentApplyEditsReviewCard(
                 review: review,
                 onAccept: {
@@ -2761,7 +2785,7 @@ struct AgentModeChatDetailView: View {
                 cancelActiveToolsAction: cancelAction
             ),
             promptManager: promptManager,
-            handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id) : nil,
+            handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id, runInteraction: runInteraction) : nil,
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
             rawToolResultPayloadRenderRevision: transcript.presentation
                 .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
@@ -3239,12 +3263,12 @@ struct AgentModeChatDetailView: View {
 
     // MARK: - Handoff
 
-    private func handoffConfig(for itemID: UUID) -> AgentHandoffConfig {
+    private func handoffConfig(for itemID: UUID, runInteraction: AgentRunInteractionUISnapshot) -> AgentHandoffConfig {
         AgentHandoffConfig(
             itemID: itemID,
-            defaultDestinationAgent: runInteractionSnapshot.selectedAgent,
-            defaultModelRaw: runInteractionSnapshot.selectedModelRaw,
-            defaultReasoningEffortRaw: runInteractionSnapshot.selectedReasoningEffortRaw,
+            defaultDestinationAgent: runInteraction.selectedAgent,
+            defaultModelRaw: runInteraction.selectedModelRaw,
+            defaultReasoningEffortRaw: runInteraction.selectedReasoningEffortRaw,
             availableAgentsProvider: { [weak agentModeVM] in
                 agentModeVM?.availableAgents ?? []
             },

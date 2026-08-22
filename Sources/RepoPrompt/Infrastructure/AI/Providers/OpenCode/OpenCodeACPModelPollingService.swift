@@ -5,7 +5,7 @@ protocol OpenCodeACPModelDiscoveryClient: Sendable {
 }
 
 struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClient {
-    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
+    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
     typealias ControllerFactory = @Sendable (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
 
     private let providerFactory: ProviderFactory
@@ -25,7 +25,7 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
                     )
                 )
             }
-            return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+            return try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -44,7 +44,7 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
             attachments: [],
             taskLabelKind: nil
         )
-        guard let provider = providerFactory(.openCode, nil) else { return nil }
+        guard let provider = try await providerFactory(.openCode, nil) else { return nil }
         let support = try await provider.support(for: request)
         guard support == .supported else {
             throw AIProviderError.invalidConfiguration(

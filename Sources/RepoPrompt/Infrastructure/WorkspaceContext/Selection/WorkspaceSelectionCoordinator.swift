@@ -558,6 +558,25 @@ final class WorkspaceSelectionCoordinator {
         )
     }
 
+    /// Applies an exclusive target state to exact store-derived paths for one captured selection identity.
+    @discardableResult
+    func setPreResolvedFilePathsInSelection(
+        _ absolutePaths: [String],
+        targetState: WorkspacePreResolvedSelectionTargetState,
+        for identity: WorkspaceSelectionIdentity,
+        lookupContext: WorkspaceLookupContext
+    ) async -> TransactionResult? {
+        await transformSelection(for: identity, source: .runtimeMutation) { latestSelection in
+            let physicalSelection = lookupContext.physicalizeSelection(latestSelection)
+            let updatedPhysicalSelection = self.mutationService.setPreResolvedFilePaths(
+                base: physicalSelection,
+                absolutePaths: absolutePaths,
+                targetState: targetState
+            )
+            return lookupContext.logicalizeSelection(updatedPhysicalSelection)
+        }
+    }
+
     @discardableResult
     func persistVirtualSelection(
         _ selection: StoredSelection,

@@ -15,17 +15,12 @@ import XCTest
     final class ContextBuilderWorktreeInheritanceTests: XCTestCase {
         func testExplicitInactiveWorkspaceContextBuilderUsesTargetAuthorityWithoutVisibleProjection() async throws {
             try await runInactiveWorkspaceAuthorityScenario(
-                bindTargetFirst: false,
                 validationStartsIncomplete: true
             )
         }
 
-        func testBoundInactiveWorkspaceContextBuilderUsesTargetAuthorityWithoutVisibleProjection() async throws {
-            try await runInactiveWorkspaceAuthorityScenario(bindTargetFirst: true)
-        }
-
         func testInactiveWorkspaceContextBuilderSurvivesVisibleTabSwitchAndCancelsWithoutLateProjection() async throws {
-            try await runInactiveWorkspaceAuthorityScenario(bindTargetFirst: false, cancelDuringRun: true)
+            try await runInactiveWorkspaceAuthorityScenario(cancelDuringRun: true)
         }
 
         func testInactiveWorkspaceContextBuilderFailsClosedWhenTargetProjectionIsUnavailable() async throws {
@@ -1029,10 +1024,20 @@ import XCTest
                         files: ["Sources/Selected.swift": "let ce = 1\n"]
                     )
                     let ceFile = ceRoot.appendingPathComponent("Sources/Selected.swift")
-                    try await fixture.contextA.window.workspaceManager.addFolder(
-                        ceRoot,
-                        to: XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
+                    let workspaceManager = fixture.contextA.window.workspaceManager
+                    let workspaceIndex = try XCTUnwrap(
+                        workspaceManager.workspaces.firstIndex { $0.id == fixture.contextA.workspaceID }
                     )
+                    workspaceManager.workspaces[workspaceIndex].repoPaths.append(ceRoot.path)
+                    let ceRootRecord = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                        in: fixture.contextA.window,
+                        path: ceRoot.path
+                    )
+                    defer {
+                        Task {
+                            await fixture.contextA.window.workspaceFileContextStore.unloadRoot(id: ceRootRecord.id)
+                        }
+                    }
                     let orderedRepoPaths = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.activeWorkspace
                     ).repoPaths.map { ($0 as NSString).standardizingPath }
@@ -1863,7 +1868,6 @@ import XCTest
         }
 
         private func runInactiveWorkspaceAuthorityScenario(
-            bindTargetFirst: Bool,
             cancelDuringRun: Bool = false,
             validationStartsIncomplete: Bool = false
         ) async throws {
@@ -1889,8 +1893,12 @@ import XCTest
                 ))
                 let settings = GlobalSettingsStore.shared
                 let previousPresetSetting = settings.mcpShowModelPresets()
+                let previousBehaviorSettings = settings.contextBuilderBehaviorSettings()
                 settings.setMCPShowModelPresets(false, commit: false)
-                defer { settings.setMCPShowModelPresets(previousPresetSetting, commit: false) }
+                defer {
+                    settings.setMCPShowModelPresets(previousPresetSetting, commit: false)
+                    settings.setContextBuilderBehaviorSettings(previousBehaviorSettings, commit: false)
+                }
 
                 do {
                     try await authorityRuntime.start()
@@ -1905,6 +1913,7 @@ import XCTest
                         "inactive-workspace-authority-\(fixture.contextB.workspaceID.uuidString)",
                         isDirectory: true
                     )
+                    sourceWorkspaceB.isEphemeral = false
                     sourceWorkspaceB.customStoragePath = authorityDirectory
                     let authorityURL = authorityDirectory.appendingPathComponent("workspace.json")
                     let authorityClient = DomainWorkspaceAuthorityClient(
@@ -1976,15 +1985,25 @@ import XCTest
                             ]
                         )
                     )
+                    let globalBehavior = ContextBuilderBehaviorSettings(
+                        contextTokenBudget: 43210,
+                        analysisTokenBudget: 54321,
+                        enhancementMode: .augment,
+                        questionTimeoutSeconds: 91,
+                        allowUIClarifyingQuestions: false,
+                        allowMCPClarifyingQuestions: true,
+                        followUpAnalysisEnabled: false
+                    )
+                    settings.setContextBuilderBehaviorSettings(globalBehavior, commit: false)
                     var settingsB = settings.chatSettings(for: fixture.contextB.workspaceID)
-                    settingsB.discoveryTokenBudget = 43210
-                    settingsB.discoveryPlanTokenBudget = 54321
-                    settingsB.discoveryAllowClarifyingQuestionsForMCP = true
-                    settingsB.discoveryQuestionTimeoutSeconds = 91
+                    settingsB.discoveryTokenBudget = 11111
+                    settingsB.discoveryPlanTokenBudget = 22222
+                    settingsB.discoveryQuestionTimeoutSeconds = 7
                     settings.updateChatSettings(settingsB, commit: false)
                     var settingsA = settings.chatSettings(for: fixture.contextA.workspaceID)
-                    settingsA.discoveryAllowClarifyingQuestionsForMCP = true
-                    settingsA.discoveryQuestionTimeoutSeconds = 7
+                    settingsA.discoveryTokenBudget = 33333
+                    settingsA.discoveryPlanTokenBudget = 44444
+                    settingsA.discoveryQuestionTimeoutSeconds = 5
                     settings.updateChatSettings(settingsA, commit: false)
                     _ = await window.selectionCoordinator.persistSelection(
                         StoredSelection(
@@ -2042,27 +2061,19 @@ import XCTest
                         agent: viewModel.selectedAgent,
                         model: viewModel.selectedModelRaw,
                         instructions: viewModel.contextBuilderInstructions,
-                        tokenBudget: viewModel.tokenBudget,
+                        tokenBudget: viewModel.contextTokenBudget,
                         log: viewModel.agentLog.map(\.message),
                         busy: viewModel.isAgentBusy,
                         controlled: viewModel.isMCPControlledRun
                     )
 
                     let endpoint = try fixture.endpointA()
-                    if bindTargetFirst {
-                        _ = try await endpoint.callTool(
-                            name: "bind_context",
-                            arguments: ["op": "bind", "context_id": fixture.contextB.tabID.uuidString]
-                        )
-                    }
-                    var arguments: [String: Any] = [
+                    let arguments: [String: Any] = [
                         "instructions": "Inspect workspace B only.",
                         "response_type": "plan",
-                        "_rawJSON": true
+                        "_rawJSON": true,
+                        "context_id": fixture.contextB.tabID.uuidString
                     ]
-                    if !bindTargetFirst {
-                        arguments["context_id"] = fixture.contextB.tabID.uuidString
-                    }
                     var removedTargetSnapshot: ComposeTabState?
                     if let gate {
                         let request = Task {
@@ -2119,7 +2130,7 @@ import XCTest
                             agent: viewModel.selectedAgent,
                             model: viewModel.selectedModelRaw,
                             instructions: viewModel.contextBuilderInstructions,
-                            tokenBudget: viewModel.tokenBudget,
+                            tokenBudget: viewModel.contextTokenBudget,
                             log: viewModel.agentLog.map(\.message),
                             busy: viewModel.isAgentBusy,
                             controlled: viewModel.isMCPControlledRun
@@ -2148,7 +2159,7 @@ import XCTest
                         XCTAssertEqual(viewModel.selectedAgent, visibleAfterSwitch.agent)
                         XCTAssertEqual(viewModel.selectedModelRaw, visibleAfterSwitch.model)
                         XCTAssertEqual(viewModel.contextBuilderInstructions, visibleAfterSwitch.instructions)
-                        XCTAssertEqual(viewModel.tokenBudget, visibleAfterSwitch.tokenBudget)
+                        XCTAssertEqual(viewModel.contextTokenBudget, visibleAfterSwitch.tokenBudget)
                         XCTAssertEqual(viewModel.agentLog.map(\.message), visibleAfterSwitch.log)
                         XCTAssertEqual(viewModel.isAgentBusy, visibleAfterSwitch.busy)
                         XCTAssertEqual(viewModel.isMCPControlledRun, visibleAfterSwitch.controlled)
@@ -2187,7 +2198,7 @@ import XCTest
                             XCTAssertEqual(viewModel.selectedModelRaw, visibleBefore.model)
                         }
                         XCTAssertEqual(viewModel.contextBuilderInstructions, visibleBefore.instructions)
-                        XCTAssertEqual(viewModel.tokenBudget, visibleBefore.tokenBudget)
+                        XCTAssertEqual(viewModel.contextTokenBudget, visibleBefore.tokenBudget)
                         XCTAssertEqual(viewModel.agentLog.map(\.message), visibleBefore.log)
                         XCTAssertEqual(viewModel.isAgentBusy, visibleBefore.busy)
                         XCTAssertEqual(viewModel.isMCPControlledRun, visibleBefore.controlled)

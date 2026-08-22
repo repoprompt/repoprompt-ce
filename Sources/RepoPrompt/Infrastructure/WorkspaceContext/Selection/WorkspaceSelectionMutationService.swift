@@ -46,6 +46,12 @@ enum WorkspacePreResolvedFullFileMutationMode {
     case remove
 }
 
+enum WorkspacePreResolvedSelectionTargetState: Equatable {
+    case full
+    case codemapOnly
+    case unselected
+}
+
 struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
     static let `default` = Self()
 
@@ -92,6 +98,24 @@ struct WorkspaceCodemapAutomaticSelectionWaiter {
     }
 }
 
+struct WorkspaceCodemapAutomaticSelectionClock {
+    let now: @Sendable () -> ContinuousClock.Instant
+
+    static let production = Self { ContinuousClock.now }
+}
+
+struct WorkspaceCodemapAutomaticSelectionDemandChangeWaiter {
+    let wait: @Sendable (
+        WorkspaceFileContextStore,
+        WorkspaceCodemapArtifactDemandTicket,
+        ContinuousClock.Instant
+    ) async -> WorkspaceCodemapArtifactDemandResult
+
+    static let production = Self { store, ticket, deadline in
+        await store.waitForCodemapArtifactDemandChange(ticket, deadline: deadline)
+    }
+}
+
 private actor WorkspaceCodemapAutomaticSelectionDemandOwnership {
     private var retainedTargetTickets = Set<WorkspaceCodemapArtifactDemandTicket>()
 
@@ -101,6 +125,25 @@ private actor WorkspaceCodemapAutomaticSelectionDemandOwnership {
             retainedTargetTickets.insert(ticket)
         case .notAcquired:
             break
+        }
+    }
+
+    func owns(_ ticket: WorkspaceCodemapArtifactDemandTicket) -> Bool {
+        retainedTargetTickets.contains(ticket)
+    }
+
+    func replaceConsumed(
+        _ oldTicket: WorkspaceCodemapArtifactDemandTicket,
+        with result: WorkspaceCodemapArtifactDemandResult
+    ) {
+        retainedTargetTickets.remove(oldTicket)
+        let replacement: WorkspaceCodemapArtifactDemandTicket? = switch result {
+        case let .pending(ticket): ticket
+        case let .ready(ready): ready.ticket
+        case .unavailable: nil
+        }
+        if let replacement {
+            retainedTargetTickets.insert(replacement)
         }
     }
 
@@ -116,6 +159,8 @@ struct WorkspaceSelectionMutationService {
     let codemapsGloballyDisabledMessage: String
     let automaticSelectionPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
     let automaticSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
+    let automaticSelectionClock: WorkspaceCodemapAutomaticSelectionClock
+    let automaticSelectionDemandChangeWaiter: WorkspaceCodemapAutomaticSelectionDemandChangeWaiter
     let removePathsDidCaptureExistingHook: @Sendable (StoredSelection) async -> Void
 
     init(
@@ -124,6 +169,8 @@ struct WorkspaceSelectionMutationService {
         codemapsGloballyDisabledMessage: String = "Code maps are disabled for this tool.",
         automaticSelectionPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .default,
         automaticSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production,
+        automaticSelectionClock: WorkspaceCodemapAutomaticSelectionClock = .production,
+        automaticSelectionDemandChangeWaiter: WorkspaceCodemapAutomaticSelectionDemandChangeWaiter = .production,
         removePathsDidCaptureExistingHook: @escaping @Sendable (StoredSelection) async -> Void = { _ in }
     ) {
         self.store = store
@@ -131,6 +178,8 @@ struct WorkspaceSelectionMutationService {
         self.codemapsGloballyDisabledMessage = codemapsGloballyDisabledMessage
         self.automaticSelectionPolicy = automaticSelectionPolicy
         self.automaticSelectionWaiter = automaticSelectionWaiter
+        self.automaticSelectionClock = automaticSelectionClock
+        self.automaticSelectionDemandChangeWaiter = automaticSelectionDemandChangeWaiter
         self.removePathsDidCaptureExistingHook = removePathsDidCaptureExistingHook
     }
 
@@ -310,6 +359,50 @@ struct WorkspaceSelectionMutationService {
             manualCodemapPaths: base.manualCodemapPaths.filter { !selectedSet.contains($0) },
             slices: slices,
             codemapAutoEnabled: base.codemapAutoEnabled
+        )
+    }
+
+    /// Sets store-revalidated files to one exclusive selection representation for Context Composer browse toggles.
+    /// MCP Git artifact mutations use `mutatePreResolvedFullFilePaths` because they have different representation semantics.
+    func setPreResolvedFilePaths(
+        base: StoredSelection,
+        absolutePaths: [String],
+        targetState: WorkspacePreResolvedSelectionTargetState
+    ) -> StoredSelection {
+        let identities = StoredSelectionPathNormalization.standardizedPaths(absolutePaths)
+        guard !identities.isEmpty else { return base }
+
+        let identitySet = Set(identities)
+        var selectedPaths = StoredSelectionPathNormalization.standardizedPaths(base.selectedPaths)
+        var manualCodemapPaths = StoredSelectionPathNormalization.standardizedPaths(base.manualCodemapPaths)
+        var slices = StoredSelectionPathNormalization.standardizedSlices(base.slices)
+
+        switch targetState {
+        case .full:
+            var selectedSet = Set(selectedPaths)
+            for identity in identities where selectedSet.insert(identity).inserted {
+                selectedPaths.append(identity)
+            }
+            manualCodemapPaths.removeAll { identitySet.contains($0) }
+            slices = slices.filter { !identitySet.contains($0.key) }
+        case .codemapOnly:
+            selectedPaths.removeAll { identitySet.contains($0) }
+            slices = slices.filter { !identitySet.contains($0.key) }
+            var manualCodemapSet = Set(manualCodemapPaths)
+            for identity in identities where manualCodemapSet.insert(identity).inserted {
+                manualCodemapPaths.append(identity)
+            }
+        case .unselected:
+            selectedPaths.removeAll { identitySet.contains($0) }
+            manualCodemapPaths.removeAll { identitySet.contains($0) }
+            slices = slices.filter { !identitySet.contains($0.key) }
+        }
+
+        return StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: manualCodemapPaths,
+            slices: slices,
+            codemapAutoEnabled: targetState == .codemapOnly ? false : base.codemapAutoEnabled
         )
     }
 
@@ -733,7 +826,7 @@ struct WorkspaceSelectionMutationService {
         for key in preflight {
             let raw = rawLookup[key] ?? key
             if let file = resolved[key] {
-                if supportsCodemap(file) {
+                if Self.supportsCodemap(file) {
                     if seen.insert(file.standardizedFullPath).inserted { candidates.append(file) }
                 } else {
                     await unavailable.append("codemap unavailable: \(displayPath(for: file, rootScope: rootScope))")
@@ -752,7 +845,7 @@ struct WorkspaceSelectionMutationService {
                         var supported = 0
                         var unsupported = 0
                         for file in folder.files {
-                            if supportsCodemap(file) {
+                            if Self.supportsCodemap(file) {
                                 if seen.insert(file.standardizedFullPath).inserted { candidates.append(file) }
                                 supported += 1
                             } else {
@@ -881,12 +974,18 @@ struct WorkspaceSelectionMutationService {
                 resultsByTarget[target] = owned.result
             }
 
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: automaticSelectionPolicy.maximumTotalWait)
+            let deadline = automaticSelectionClock.now().advanced(
+                by: automaticSelectionPolicy.maximumTotalWait
+            )
             for round in 0 ..< automaticSelectionPolicy.maximumReadinessRounds {
                 try Task.checkCancellation()
                 var waiting = false
+                var hasBusy = false
                 var retryAfter: [Int] = []
+                var pendingTickets: [(
+                    target: WorkspaceCodemapAutomaticSelectionTarget,
+                    ticket: WorkspaceCodemapArtifactDemandTicket
+                )] = []
                 for (target, current) in resultsByTarget {
                     let refreshed: WorkspaceCodemapArtifactDemandResult = switch current {
                     case let .pending(ticket):
@@ -896,10 +995,12 @@ struct WorkspaceSelectionMutationService {
                     }
                     resultsByTarget[target] = refreshed
                     switch refreshed {
-                    case .pending:
+                    case let .pending(ticket):
                         waiting = true
+                        pendingTickets.append((target, ticket))
                     case let .unavailable(.busy(milliseconds)):
                         waiting = true
+                        hasBusy = true
                         if let milliseconds { retryAfter.append(milliseconds) }
                     case .ready, .unavailable:
                         break
@@ -907,22 +1008,64 @@ struct WorkspaceSelectionMutationService {
                 }
                 guard waiting,
                       round + 1 < automaticSelectionPolicy.maximumReadinessRounds,
-                      clock.now < deadline
+                      automaticSelectionClock.now() < deadline
                 else { break }
+
+                if !pendingTickets.isEmpty, !hasBusy {
+                    let firstCompletion: (
+                        target: WorkspaceCodemapAutomaticSelectionTarget,
+                        result: WorkspaceCodemapArtifactDemandResult
+                    )? = try await withThrowingTaskGroup(
+                        of: (
+                            target: WorkspaceCodemapAutomaticSelectionTarget,
+                            result: WorkspaceCodemapArtifactDemandResult
+                        ).self
+                    ) { group in
+                        for pending in pendingTickets {
+                            group.addTask {
+                                try Task.checkCancellation()
+                                let result = await automaticSelectionDemandChangeWaiter.wait(
+                                    store,
+                                    pending.ticket,
+                                    deadline
+                                )
+                                try Task.checkCancellation()
+                                return (pending.target, result)
+                            }
+                        }
+                        guard let first = try await group.next() else { return nil }
+                        group.cancelAll()
+                        return first
+                    }
+                    if let firstCompletion {
+                        resultsByTarget[firstCompletion.target] = firstCompletion.result
+                    }
+                    continue
+                }
+
                 try await waitForAutomaticSelectionReadiness(
                     round: round,
                     suggestedMilliseconds: retryAfter,
-                    clock: clock,
                     deadline: deadline
                 )
                 for (target, current) in resultsByTarget {
                     guard case .unavailable(.busy) = current,
                           let rootReceipt = rootReceiptByEpoch[target.rootEpoch]
                     else { continue }
-                    if let priorTicket = ticketsByTarget.removeValue(forKey: target) {
-                        _ = await store.cancelCodemapArtifactDemand(priorTicket)
-                    }
-                    if let owned = await store.requestAutomaticCodemapTargetWithOwnership(
+                    if let priorTicket = ticketsByTarget[target],
+                       await ownership.owns(priorTicket)
+                    {
+                        let retried = await store.retryBusyCodemapArtifactDemand(
+                            priorTicket,
+                            priority: .background
+                        )
+                        let oldStatus = await store.codemapArtifactDemandStatus(priorTicket)
+                        if case .unavailable(.staleCurrentness) = oldStatus {
+                            await ownership.replaceConsumed(priorTicket, with: retried)
+                            ticketsByTarget[target] = automaticSelectionTicket(from: retried)
+                        }
+                        resultsByTarget[target] = retried
+                    } else if let owned = await store.requestAutomaticCodemapTargetWithOwnership(
                         target: target,
                         rootReceipt: rootReceipt,
                         rootScope: rootScope,
@@ -1045,10 +1188,19 @@ struct WorkspaceSelectionMutationService {
         }
     }
 
+    private func automaticSelectionTicket(
+        from result: WorkspaceCodemapArtifactDemandResult
+    ) -> WorkspaceCodemapArtifactDemandTicket? {
+        switch result {
+        case let .pending(ticket): ticket
+        case let .ready(ready): ready.ticket
+        case .unavailable: nil
+        }
+    }
+
     private func waitForAutomaticSelectionReadiness(
         round: Int,
         suggestedMilliseconds: [Int],
-        clock: ContinuousClock,
         deadline: ContinuousClock.Instant
     ) async throws {
         let shift = min(round, 20)
@@ -1057,7 +1209,7 @@ struct WorkspaceSelectionMutationService {
         let suggested = suggestedMilliseconds.max() ?? 0
         let milliseconds = max(bounded, suggested)
         let proposed = Duration.milliseconds(milliseconds)
-        let remaining = clock.now.duration(to: deadline)
+        let remaining = automaticSelectionClock.now().duration(to: deadline)
         guard remaining > .zero else { return }
         try await automaticSelectionWaiter.sleep(min(proposed, remaining))
     }
@@ -1170,7 +1322,7 @@ struct WorkspaceSelectionMutationService {
         return mutated
     }
 
-    private func supportsCodemap(_ file: WorkspaceFileRecord) -> Bool {
+    static func supportsCodemap(_ file: WorkspaceFileRecord) -> Bool {
         let ext = (file.name as NSString).pathExtension.lowercased()
         guard !ext.isEmpty else { return false }
         return SyntaxManager.supportsCodeMap(fileExtension: ext)

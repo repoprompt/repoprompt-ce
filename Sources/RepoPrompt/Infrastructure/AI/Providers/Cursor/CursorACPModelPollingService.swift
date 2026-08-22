@@ -5,7 +5,7 @@ protocol CursorACPModelDiscoveryClient: Sendable {
 }
 
 struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
-    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
+    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
     typealias ControllerFactory = @Sendable (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
 
     private let providerFactory: ProviderFactory
@@ -23,7 +23,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
                     )
                 )
             }
-            return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+            return try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -43,7 +43,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
             attachments: [],
             taskLabelKind: nil
         )
-        guard let provider = providerFactory(.cursor, preferredModel) else { return nil }
+        guard let provider = try await providerFactory(.cursor, preferredModel) else { return nil }
         let support = try await provider.support(for: request)
         guard support == .supported else {
             throw AIProviderError.invalidConfiguration(

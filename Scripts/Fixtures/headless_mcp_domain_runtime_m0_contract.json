@@ -241,7 +241,8 @@
     "admission": {
       "exclusive": ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "workspace_context", "prompt", "apply_edits", "manage_worktree"],
       "control": ["oracle_utils", "ask_oracle", "oracle_send", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
-      "small_read": ["get_code_structure", "get_file_tree", "read_file", "oracle_chat_log"],
+      "small_read": ["get_code_structure", "get_file_tree", "oracle_chat_log"],
+      "file_read": ["read_file"],
       "git_read": ["git"],
       "file_search": ["file_search"]
     },
@@ -301,7 +302,8 @@
       "agent_mode_claude_engineer": "canonical",
       "agent_mode_codex_engineer": "suppress_read_only_hint",
       "agent_mode_open_code_engineer": "canonical",
-      "agent_mode_cursor_engineer": "canonical"
+      "agent_mode_cursor_engineer": "canonical",
+      "agent_mode_grok_build_engineer": "canonical"
     },
     "resolved_tool_policy_projection_classification": "production_policy_projection_not_runtime_registry_evidence",
     "resolved_tool_policy_projection": {
@@ -313,7 +315,8 @@
       "agent_mode_claude_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
       "agent_mode_codex_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
       "agent_mode_open_code_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
-      "agent_mode_cursor_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"]
+      "agent_mode_cursor_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
+      "agent_mode_grok_build_engineer": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"]
     }
   },
   "dependencies": {
@@ -694,7 +697,7 @@
     "reason": "The preserved record says authorization-UI behavior was not probed and startup_scan_approved is false.",
     "prohibited_claim": "Direct packaged-child Keychain access works.",
     "prescribed_fallback": "Parent-owned secure storage and a minimum-scope in-memory credential handoff; debug alternate-in-memory storage remains nonpersistent.",
-    "secure_account_catalog_count": 23,
+    "secure_account_catalog_count": 24,
     "observation_status": "not_observed_approval_required",
     "record_classification": "unresolved_procedure_record_not_empirical_evidence",
     "prescribed_measurement_milestone": "before_M5_credential_transport"

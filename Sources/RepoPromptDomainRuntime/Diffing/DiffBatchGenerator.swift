@@ -43,7 +43,7 @@ package enum DiffBatchGenerator {
         outcomes.reserveCapacity(edits.count)
         allChunks.reserveCapacity(edits.count)
 
-        // Pre‑compute the high‑precision line‑index for first‑hit optimisation.
+        // Precompute matching data once so replace-all edits can keep full-file coordinates.
         var processed: [DiffGenerationUtility.LineData] = []
         processed.reserveCapacity(orig.count)
         for line in orig {
@@ -60,13 +60,14 @@ package enum DiffBatchGenerator {
 
                 let diff = try await DiffGenerationUtility.generateDiff(
                     fileContent: orig,
-                    lineIndexMap: start == 0 ? indexMap : nil, // optimisation only for first search
+                    lineIndexMap: start == 0 || edit.replaceAll ? indexMap : nil,
                     startSelector: nil,
                     endSelector: nil,
                     searchBlock: edit.search.isEmpty ? nil : edit.search,
                     newContent: sanitizedContent,
                     action: edit.search.isEmpty ? .rewrite : .modify,
                     diffPrecision: prec,
+                    processedFileContent: edit.replaceAll ? processed : nil,
                     searchStartLine: start,
                     mcpAmbiguityCheck: edit.replaceAll ? false : mcpAmbiguityCheck,
                     replaceAll: edit.replaceAll,

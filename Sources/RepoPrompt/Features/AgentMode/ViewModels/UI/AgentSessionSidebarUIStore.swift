@@ -3,6 +3,7 @@ import Foundation
 struct AgentSessionSidebarSnapshot: Equatable {
     var searchText: String
     var visibleSessionCount: Int
+    var archivedVisibleSessionCount: Int
     var collapsedThreadKeys: Set<AgentSidebarThreadKey> = []
     /// Thread keys that have already received one-shot default collapse handling
     /// during this view-model lifetime. Explicit user expand/collapse actions
@@ -20,20 +21,110 @@ struct AgentSessionSidebarSnapshot: Equatable {
     /// with `attentionRunStateByTabID` and intentionally not persisted.
     var attentionMarkedAtByTabID: [UUID: Date] = [:]
     var revision: Int = 0
+    var rowContentRevision: Int = 0
 }
 
 @MainActor
 final class AgentSessionSidebarUIStore: ObservableObject {
     @Published private(set) var snapshot = AgentSessionSidebarSnapshot(
         searchText: "",
-        visibleSessionCount: AgentModeViewModel.sessionSidebarPageSize
+        visibleSessionCount: AgentModeViewModel.sessionSidebarPageSize,
+        archivedVisibleSessionCount: AgentModeViewModel.sessionSidebarArchivedPageSize
     )
+    @Published private(set) var selectionState = AgentSidebarSelectionState()
 
-    func update(searchText: String, visibleSessionCount: Int) {
+    func update(searchText: String, visibleSessionCount: Int, archivedVisibleSessionCount: Int) {
         var next = snapshot
         next.searchText = searchText
         next.visibleSessionCount = visibleSessionCount
-        _ = publish(next, eventName: "sessionSidebar", force: false)
+        next.archivedVisibleSessionCount = archivedVisibleSessionCount
+        _ = publish(
+            next,
+            eventName: "sessionSidebar",
+            force: false,
+            affectsRowContent: false
+        )
+    }
+
+    func handleSelectionGesture(
+        _ gesture: AgentSidebarSelectionGesture,
+        identity: AgentSidebarSelectionIdentity,
+        renderedOrder: [AgentSidebarSelectionIdentity],
+        workspaceID: UUID
+    ) -> AgentSidebarSelectionGestureDisposition {
+        var next = selectionState
+        let disposition = next.handle(
+            gesture,
+            identity: identity,
+            renderedOrder: renderedOrder,
+            workspaceID: workspaceID
+        )
+        publishSelection(next, eventName: "sessionSidebar.selection.gesture")
+        return disposition
+    }
+
+    func selectAll(renderedOrder: [AgentSidebarSelectionIdentity], workspaceID: UUID) {
+        var next = selectionState
+        next.selectAll(renderedOrder: renderedOrder, workspaceID: workspaceID)
+        publishSelection(next, eventName: "sessionSidebar.selection.selectAll")
+    }
+
+    func clearSelection() {
+        var next = selectionState
+        next.clear()
+        publishSelection(next, eventName: "sessionSidebar.selection.clear")
+    }
+
+    func reconcileSelection(renderedOrder: [AgentSidebarSelectionIdentity], workspaceID: UUID?) {
+        var next = selectionState
+        next.reconcile(renderedOrder: renderedOrder, workspaceID: workspaceID)
+        publishSelection(next, eventName: "sessionSidebar.selection.reconcile")
+    }
+
+    func beginBulkAction(kind: AgentSidebarBulkActionKind, targetCount: Int, workspaceID: UUID) -> UUID? {
+        guard selectionState.inFlightAction == nil, targetCount > 0 else { return nil }
+        let token = UUID()
+        var next = selectionState
+        next.workspaceID = workspaceID
+        next.notice = nil
+        next.inFlightAction = AgentSidebarBulkActionOperation(
+            token: token,
+            workspaceID: workspaceID,
+            kind: kind,
+            targetCount: targetCount
+        )
+        next.revision &+= 1
+        publishSelection(next, eventName: "sessionSidebar.selection.bulkBegin")
+        return token
+    }
+
+    func isCurrentBulkAction(token: UUID, workspaceID: UUID) -> Bool {
+        selectionState.inFlightAction?.token == token
+            && selectionState.inFlightAction?.workspaceID == workspaceID
+    }
+
+    func finishBulkAction(token: UUID, workspaceID: UUID, notice: AgentSidebarBulkActionNotice?) {
+        guard isCurrentBulkAction(token: token, workspaceID: workspaceID) else { return }
+        var next = selectionState
+        next.inFlightAction = nil
+        if next.selectedIdentities.isEmpty { next.workspaceID = nil }
+        next.notice = notice
+        next.revision &+= 1
+        publishSelection(next, eventName: "sessionSidebar.selection.bulkFinish")
+    }
+
+    func invalidateSelectionForWorkspaceChange() {
+        var next = AgentSidebarSelectionState()
+        next.revision = selectionState.revision &+ 1
+        publishSelection(next, eventName: "sessionSidebar.selection.workspaceChange")
+    }
+
+    func dismissBulkActionNotice() {
+        guard selectionState.notice != nil else { return }
+        var next = selectionState
+        next.notice = nil
+        next.revision &+= 1
+        publishSelection(next, eventName: "sessionSidebar.selection.noticeDismiss")
     }
 
     func isThreadCollapsed(_ key: AgentSidebarThreadKey) -> Bool {
@@ -151,6 +242,23 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         _ = publish(snapshot, eventName: "sessionSidebar.refresh", force: true)
     }
 
+    private func publishSelection(_ next: AgentSidebarSelectionState, eventName: String) {
+        guard next != selectionState else { return }
+        selectionState = next
+        #if DEBUG
+            AgentModePerfDiagnostics.recordStoreUpdate(
+                eventName,
+                published: true,
+                details: [
+                    "revision": String(next.revision),
+                    "selectedCount": String(next.selectedIdentities.count),
+                    "hasAnchor": String(next.anchor != nil),
+                    "inFlightKind": next.inFlightAction?.kind.rawValue ?? "none"
+                ]
+            )
+        #endif
+    }
+
     /// Publishes the next snapshot if it differs from the current one (or if
     /// `force` is true). Returns whether a new revision was emitted so callers
     /// can fall back to their own refresh path when nothing changed.
@@ -158,7 +266,8 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     private func publish(
         _ proposedSnapshot: AgentSessionSidebarSnapshot,
         eventName: String,
-        force: Bool
+        force: Bool,
+        affectsRowContent: Bool = true
     ) -> Bool {
         var next = proposedSnapshot
         guard force || next != snapshot else {
@@ -168,6 +277,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             return false
         }
         next.revision &+= 1
+        if affectsRowContent { next.rowContentRevision &+= 1 }
         snapshot = next
         #if DEBUG
             AgentModePerfDiagnostics.recordStoreUpdate(

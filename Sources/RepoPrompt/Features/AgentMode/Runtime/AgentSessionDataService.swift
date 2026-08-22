@@ -1359,15 +1359,37 @@ actor AgentSessionDataService {
     }
 
     func deleteAgentSessions(forComposeTabID tabID: UUID, for workspace: WorkspaceModel) async throws {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
-        var candidateFilesByPath: [String: URL] = [:]
+        let failures = await deleteAgentSessions(forComposeTabIDs: [tabID], for: workspace)
+        if let failure = failures[tabID] { throw failure }
+    }
+
+    func deleteAgentSessions(
+        forComposeTabIDs tabIDs: Set<UUID>,
+        for workspace: WorkspaceModel
+    ) async -> [UUID: Error] {
+        guard !tabIDs.isEmpty else { return [:] }
+        let agentSessionsFolder: URL
+        do {
+            agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        } catch {
+            return Dictionary(uniqueKeysWithValues: tabIDs.map { ($0, error) })
+        }
+
+        var candidateByPath: [String: (fileURL: URL, tabID: UUID)] = [:]
         if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
-            for record in index.entries where record.composeTabID == tabID {
-                candidateFilesByPath[agentSessionsFolder.appendingPathComponent(record.filename).path] = agentSessionsFolder.appendingPathComponent(record.filename)
+            for record in index.entries {
+                guard let tabID = record.composeTabID, tabIDs.contains(tabID) else { continue }
+                let fileURL = agentSessionsFolder.appendingPathComponent(record.filename)
+                candidateByPath[fileURL.path] = (fileURL, tabID)
             }
         }
 
-        let files = try await listAgentSessions(for: workspace)
+        let files: [URL]
+        do {
+            files = try await listAgentSessions(for: workspace)
+        } catch {
+            return Dictionary(uniqueKeysWithValues: tabIDs.map { ($0, error) })
+        }
         for fileURL in files {
             guard
                 let stub = try? await loadAgentSessionStub(
@@ -1375,15 +1397,28 @@ actor AgentSessionDataService {
                     recoverMissingMetadata: false,
                     persistRecoveredMetadata: false
                 ),
-                stub.composeTabID == tabID
+                let tabID = stub.composeTabID,
+                tabIDs.contains(tabID)
             else { continue }
-            candidateFilesByPath[fileURL.path] = fileURL
+            candidateByPath[fileURL.path] = (fileURL, tabID)
         }
 
-        for fileURL in candidateFilesByPath.values.sorted(by: { $0.path < $1.path }) {
-            try await deleteSessionFileDurably(fileURL.standardizedFileURL)
+        var failures: [UUID: Error] = [:]
+        for candidate in candidateByPath.values.sorted(by: { $0.fileURL.path < $1.fileURL.path }) {
+            do {
+                try await deleteSessionFileDurably(candidate.fileURL.standardizedFileURL)
+            } catch {
+                failures[candidate.tabID] = error
+            }
         }
-        await removeMetadataRecords(matching: { $0.composeTabID == tabID }, folder: agentSessionsFolder)
+        let successfulTabIDs = tabIDs.subtracting(failures.keys)
+        await removeMetadataRecords(
+            matching: { record in
+                record.composeTabID.map { successfulTabIDs.contains($0) } == true
+            },
+            folder: agentSessionsFolder
+        )
+        return failures
     }
 
     private func deleteSessionFileDurably(_ fileURL: URL) async throws {

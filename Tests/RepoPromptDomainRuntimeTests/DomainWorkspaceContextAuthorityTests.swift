@@ -4,6 +4,87 @@ import Foundation
 import XCTest
 
 final class DomainWorkspaceContextAuthorityTests: XCTestCase {
+    func testEphemeralDocumentsCannotEnterDurableWorkspaceAuthority() async throws {
+        let fixture = try Fixture.make(includeWorkspace: false)
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let document = try fixture.document(prompt: "temporary", ephemeral: true)
+
+        let registered = await runtime.workspaceStore.registerReadDocument(document)
+        XCTAssertTrue(registered.document.metadata.isEphemeral)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+
+        let createEnvelope = DomainWorkspaceCommandEnvelope(
+            operationID: UUID(),
+            expectedCatalogRevision: 0,
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .createWorkspace(document)
+        )
+        let created = await runtime.workspaceStore.execute(createEnvelope)
+        XCTAssertEqual(created.disposition, .invalid)
+        XCTAssertEqual(created.errorCode, .invalidDocument)
+        XCTAssertEqual(created.diagnostic, "ephemeral_workspace_not_persistable")
+
+        let replayedCreate = await runtime.workspaceStore.execute(createEnvelope)
+        XCTAssertEqual(replayedCreate.disposition, .deduplicated)
+        XCTAssertEqual(replayedCreate.errorCode, .invalidDocument)
+        XCTAssertEqual(replayedCreate.diagnostic, "ephemeral_workspace_not_persistable")
+
+        let replaced = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .replaceWorkingDocument(document)
+        ))
+        XCTAssertEqual(replaced.disposition, .invalid)
+        XCTAssertEqual(replaced.errorCode, .invalidDocument)
+        XCTAssertEqual(replaced.diagnostic, "ephemeral_workspace_not_persistable")
+        let catalog = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(catalog.workspaces.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+    }
+
+    func testPersistedEphemeralWorkspaceRejectsSaveAndConflictResolutionCommands() async throws {
+        let fixture = try Fixture.make(includeWorkspace: false)
+        defer { fixture.remove() }
+        try FileManager.default.createDirectory(
+            at: fixture.workspaceFile.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let document = try fixture.document(prompt: "legacy ephemeral", ephemeral: true)
+        try document.documentBytes.write(to: fixture.workspaceFile)
+        try fixture.writeLegacyIndex()
+
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let loaded = await runtime.workspaceStore.snapshot()
+        XCTAssertEqual(loaded.workspaces.first?.document.metadata.isEphemeral, true)
+
+        let save = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .saveWorkspaceDocument(workspaceID: fixture.workspaceID)
+        ))
+        XCTAssertEqual(save.disposition, .invalid)
+        XCTAssertEqual(save.errorCode, .invalidDocument)
+        XCTAssertEqual(save.diagnostic, "ephemeral_workspace_not_persistable")
+
+        let resolve = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .resolveExternalConflict(
+                workspaceID: fixture.workspaceID,
+                acceptExternal: true,
+                protectedAgentIdentities: []
+            )
+        ))
+        XCTAssertEqual(resolve.disposition, .invalid)
+        XCTAssertEqual(resolve.errorCode, .invalidDocument)
+        XCTAssertEqual(resolve.diagnostic, "ephemeral_workspace_not_persistable")
+        XCTAssertEqual(try Data(contentsOf: fixture.workspaceFile), document.documentBytes)
+    }
+
     func testAwaitedReadRegistrationRoutesMissingWorkspaceWithoutPersistence() async throws {
         let fixture = try Fixture.make(includeWorkspace: false)
         defer { fixture.remove() }
@@ -212,6 +293,67 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         let finalSnapshot = await finalRuntime.workspaceStore.snapshot()
         XCTAssertTrue(finalSnapshot.workspaces.isEmpty)
         XCTAssertEqual(finalSnapshot.health, .writable)
+    }
+
+    func testDeleteKeepsAuthoritativeTombstoneWhenArtifactCleanupFails() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let snapshot = await runtime.workspaceStore.snapshot()
+        let workspace = try XCTUnwrap(snapshot.workspaces.first)
+        let workspaceDirectory = fixture.workspaceFile.deletingLastPathComponent()
+        let workspaceRoot = workspaceDirectory.deletingLastPathComponent()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555],
+            ofItemAtPath: workspaceDirectory.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555],
+            ofItemAtPath: workspaceRoot.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: workspaceRoot.path
+            )
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: workspaceDirectory.path
+            )
+        }
+
+        let envelope = DomainWorkspaceCommandEnvelope(
+            operationID: UUID(),
+            expectedCatalogRevision: snapshot.catalogRevision,
+            expectedWorkspaceRevision: workspace.revisions.workingRevision,
+            origin: .standalone,
+            command: .deleteWorkspace(workspaceID: fixture.workspaceID)
+        )
+        let deleted = await runtime.workspaceStore.execute(envelope)
+
+        XCTAssertEqual(deleted.disposition, .applied)
+        XCTAssertNil(deleted.errorCode)
+        XCTAssertTrue(deleted.diagnostic?.hasPrefix("artifact_cleanup_incomplete:") == true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspaceDirectory.path))
+        let authoritativeAfter = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(authoritativeAfter.workspaces.isEmpty)
+
+        let replayed = await runtime.workspaceStore.execute(envelope)
+        XCTAssertEqual(replayed.disposition, .deduplicated)
+        XCTAssertEqual(replayed.diagnostic, deleted.diagnostic)
+        let authoritativeAfterReplay = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(authoritativeAfterReplay.workspaces.isEmpty)
+
+        _ = await runtime.shutdown()
+        let restartedRuntime = fixture.runtime()
+        try await restartedRuntime.start()
+        defer { Task { _ = await restartedRuntime.shutdown() } }
+        let replayedAfterRestart = await restartedRuntime.workspaceStore.execute(envelope)
+        XCTAssertEqual(replayedAfterRestart.disposition, .deduplicated)
+        XCTAssertEqual(replayedAfterRestart.diagnostic, deleted.diagnostic)
+        let authoritativeAfterRestart = await restartedRuntime.workspaceStore.snapshot()
+        XCTAssertTrue(authoritativeAfterRestart.workspaces.isEmpty)
     }
 
     func testRecreateSameWorkspaceIDClearsDeletionSidecarAcrossRestart() async throws {
@@ -1807,14 +1949,16 @@ private struct Fixture {
 
     func document(
         prompt: String,
-        name: String = "Fixture"
+        name: String = "Fixture",
+        ephemeral: Bool = false
     ) throws -> DomainWorkspaceDocument {
         try document(
             workspaceID: workspaceID,
             contextID: contextID,
             fileURL: workspaceFile,
             prompt: prompt,
-            name: name
+            name: name,
+            ephemeral: ephemeral
         )
     }
 
@@ -1847,7 +1991,8 @@ private struct Fixture {
         contextID: UUID,
         fileURL: URL,
         prompt: String,
-        name: String = "Fixture"
+        name: String = "Fixture",
+        ephemeral: Bool = false
     ) throws -> DomainWorkspaceDocument {
         let object: [String: Any] = [
             "id": workspaceID.uuidString,
@@ -1856,6 +2001,7 @@ private struct Fixture {
             "repoPaths": ["/tmp/repo"],
             "isSystemWorkspace": false,
             "isHiddenInMenus": false,
+            "ephemeralFlag": ephemeral,
             "activeComposeTabID": contextID.uuidString,
             "composeTabs": [[
                 "id": contextID.uuidString,

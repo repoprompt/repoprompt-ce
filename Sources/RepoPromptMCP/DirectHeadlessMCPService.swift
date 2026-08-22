@@ -79,20 +79,20 @@ actor DirectHeadlessMCPService {
                 ephemeralGrantedOperations: Self.topLevelDefaultMutationOperations
             )
         )
-        try await prepared.childEndpoint.start { [weak self] fd, peerPID, handshake in
-            await self?.servePrivateChild(
-                fd: fd,
-                peerPID: peerPID,
-                handshake: handshake,
-                prepared: prepared
-            )
-        }
         let transport = MCPStdioServerTransport(
             writeStallTimeout: .seconds(5),
             logger: logger
         )
 
         do {
+            try await prepared.childEndpoint.start { [weak self] fd, peerPID, handshake in
+                await self?.servePrivateChild(
+                    fd: fd,
+                    peerPID: peerPID,
+                    handshake: handshake,
+                    prepared: prepared
+                )
+            }
             try await server.start(transport: transport)
             let terminal = await transport.waitUntilTerminal()
             logger.debug("Headless stdio terminal", metadata: ["reason": "\(terminal)"])
@@ -151,81 +151,104 @@ actor DirectHeadlessMCPService {
             )
         })
         try await runtime.start()
-        let workingDirectories = locations.workingDirectories
-        if locations.mayBootstrapIsolatedWorkspace {
-            try await ensureExplicitIsolatedWorkspace(
-                runtime: runtime,
-                roots: workingDirectories
+        do {
+            let workingDirectories = locations.workingDirectories
+            if locations.mayBootstrapIsolatedWorkspace {
+                try await ensureExplicitIsolatedWorkspace(
+                    runtime: runtime,
+                    roots: workingDirectories
+                )
+            }
+            let initialRoute = try await DirectHeadlessWorktreeRouting.resolveInitialRoute(
+                workingDirectories: workingDirectories,
+                catalog: runtime.workspaceStore.snapshot()
             )
-        }
 
-        let scopeID = DomainStandaloneScopeID()
-        let connectionID = UUID()
-        let scope = try await runtime.standaloneScopeCoordinator.register(
-            scopeID: scopeID,
-            connectionID: connectionID,
-            workingDirectories: workingDirectories
-        )
-        let context = DirectHeadlessDomainContext(runtime: runtime, scopeID: scopeID)
-        let workspace = DirectHeadlessWorkspaceBackend(context: context)
-        let global = DirectHeadlessGlobalBackend(runtime: runtime, scopeID: scopeID, context: context)
-        let providerCoordinator = DirectHeadlessProviderCoordinator(
-            runtime: runtime,
-            context: context,
-            environment: environment
-        )
-        let backends = MCPDomainStandaloneCapabilityBackends(
-            global: global,
-            workspace: workspace,
-            filesystem: DirectHeadlessFilesystemBackend(context: context),
-            conversation: DirectHeadlessConversationBackend(coordinator: providerCoordinator),
-            versionControl: DirectHeadlessVersionControlBackend(runtime: runtime, context: context),
-            agent: DirectHeadlessAgentBackend(coordinator: providerCoordinator),
-            history: DirectHeadlessHistoryBackend(runtime: runtime)
-        )
-        let installation = try await MCPDomainStandaloneToolInstaller.install(
-            runtime: runtime,
-            scopeID: scopeID,
-            backends: backends
-        )
-        let privateEndpointDirectory = URL(
-            fileURLWithPath: "/tmp/rpce-h-\(geteuid())-\(runtime.identity.runtimeID.uuidString.prefix(8))",
-            isDirectory: true
-        )
-        let childEndpoint = DirectHeadlessChildEndpoint(
-            directory: privateEndpointDirectory,
-            logger: logger
-        )
-        await childLaunchCoordinator.configure(
-            runtime: runtime,
-            endpointDescriptor: childEndpoint.socketURL.path
-        )
-        let parentProcessID = getppid()
-        let verifiedFingerprint = Self.verifiedExecutableFingerprint(processID: parentProcessID)
-        let principal = DomainClientPrincipal(
-            principalID: connectionID,
-            stableKey: "headless-stdio:\(parentProcessID)",
-            displayName: CLIEventLogger.detectClientName() ?? "headless-stdio-client",
-            kind: .runScoped,
-            assurance: verifiedFingerprint == nil ? .displayNameOnly : .verifiedProcess,
-            processID: verifiedFingerprint == nil ? nil : parentProcessID,
-            runID: scopeID.rawValue,
-            provider: "direct-stdio",
-            verifiedIdentityFingerprint: verifiedFingerprint,
-            claimedProcessID: nil
-        )
-        return PreparedRuntime(
-            runtime: runtime,
-            scopeID: scopeID,
-            connectionID: connectionID,
-            connectionGeneration: scope.registration.generation,
-            installation: installation,
-            context: context,
-            principal: principal,
-            childEndpoint: childEndpoint,
-            childLaunchCoordinator: childLaunchCoordinator,
-            providerCoordinator: providerCoordinator
-        )
+            let scopeID = DomainStandaloneScopeID()
+            let connectionID = UUID()
+            let scope = try await runtime.standaloneScopeCoordinator.register(
+                scopeID: scopeID,
+                connectionID: connectionID,
+                workingDirectories: initialRoute.bindingWorkingDirectories
+            )
+            let context = DirectHeadlessDomainContext(
+                runtime: runtime,
+                scopeID: scopeID,
+                processRootOverlay: initialRoute.rootOverlay
+            )
+            let settingsStore = DomainDirectSettingsStore(
+                persistence: runtime.persistenceCoordinator,
+                profileIdentifier: runtime.configuration.profileIdentifier
+            )
+            let workspace = DirectHeadlessWorkspaceBackend(context: context)
+            let global = DirectHeadlessGlobalBackend(
+                runtime: runtime,
+                scopeID: scopeID,
+                context: context,
+                settingsStore: settingsStore
+            )
+            let providerCoordinator = DirectHeadlessProviderCoordinator(
+                runtime: runtime,
+                context: context,
+                settingsStore: settingsStore,
+                environment: environment
+            )
+            let backends = MCPDomainStandaloneCapabilityBackends(
+                global: global,
+                workspace: workspace,
+                filesystem: DirectHeadlessFilesystemBackend(context: context),
+                conversation: DirectHeadlessConversationBackend(coordinator: providerCoordinator),
+                versionControl: DirectHeadlessVersionControlBackend(runtime: runtime, context: context),
+                agent: DirectHeadlessAgentBackend(coordinator: providerCoordinator),
+                history: DirectHeadlessHistoryBackend(runtime: runtime)
+            )
+            let installation = try await MCPDomainStandaloneToolInstaller.install(
+                runtime: runtime,
+                scopeID: scopeID,
+                backends: backends
+            )
+            let privateEndpointDirectory = URL(
+                fileURLWithPath: "/tmp/rpce-h-\(geteuid())-\(runtime.identity.runtimeID.uuidString.prefix(8))",
+                isDirectory: true
+            )
+            let childEndpoint = DirectHeadlessChildEndpoint(
+                directory: privateEndpointDirectory,
+                logger: logger
+            )
+            await childLaunchCoordinator.configure(
+                runtime: runtime,
+                endpointDescriptor: childEndpoint.socketURL.path
+            )
+            let parentProcessID = getppid()
+            let verifiedFingerprint = Self.verifiedExecutableFingerprint(processID: parentProcessID)
+            let principal = DomainClientPrincipal(
+                principalID: connectionID,
+                stableKey: "headless-stdio:\(parentProcessID)",
+                displayName: CLIEventLogger.detectClientName() ?? "headless-stdio-client",
+                kind: .runScoped,
+                assurance: verifiedFingerprint == nil ? .displayNameOnly : .verifiedProcess,
+                processID: verifiedFingerprint == nil ? nil : parentProcessID,
+                runID: scopeID.rawValue,
+                provider: "direct-stdio",
+                verifiedIdentityFingerprint: verifiedFingerprint,
+                claimedProcessID: nil
+            )
+            return PreparedRuntime(
+                runtime: runtime,
+                scopeID: scopeID,
+                connectionID: connectionID,
+                connectionGeneration: scope.registration.generation,
+                installation: installation,
+                context: context,
+                principal: principal,
+                childEndpoint: childEndpoint,
+                childLaunchCoordinator: childLaunchCoordinator,
+                providerCoordinator: providerCoordinator
+            )
+        } catch {
+            _ = await runtime.shutdown()
+            throw error
+        }
     }
 
     private func installHandlers(
@@ -279,6 +302,10 @@ actor DirectHeadlessMCPService {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }
             do {
+                let arguments = try Self.validatedCallArguments(
+                    toolName: params.name,
+                    arguments: params.arguments ?? [:]
+                )
                 let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(params.name)
                     ? .application
                     : .standalone(id: prepared.scopeID)
@@ -296,7 +323,7 @@ actor DirectHeadlessMCPService {
                     invocationID: invocationID,
                     connectionID: connection.connectionID,
                     resolution: resolution,
-                    arguments: params.arguments ?? [:],
+                    arguments: arguments,
                     securityContext: security
                 ))
                 return Self.successResult(result)
@@ -395,12 +422,15 @@ actor DirectHeadlessMCPService {
         )
     }
 
-    private static func securityContext(
+    static func securityContext(
         prepared: PreparedRuntime,
         connection: ConnectionContext,
         invocationID: UUID
     ) async -> DomainToolInvocationSecurityContext {
-        let snapshot = try? await prepared.context.snapshot(connectionID: connection.connectionID)
+        let snapshot = try? await prepared.context.snapshot(
+            connectionID: connection.connectionID,
+            sessionID: connection.principal.runID
+        )
         return DomainToolInvocationSecurityContext(
             principal: connection.principal,
             connectionID: connection.connectionID,
@@ -439,6 +469,7 @@ actor DirectHeadlessMCPService {
         if normalized.contains("claude") { return .agentModeClaudeEngineer }
         if normalized.contains("opencode") { return .agentModeOpenCodeEngineer }
         if normalized.contains("cursor") { return .agentModeCursorEngineer }
+        if normalized.contains("grok") { return .agentModeGrokBuildEngineer }
         return .agentModeGenericEngineer
     }
 
@@ -515,5 +546,26 @@ actor DirectHeadlessMCPService {
             content: [.text(text: message, annotations: nil, _meta: nil)],
             isError: true
         )
+    }
+
+    nonisolated static func validatedCallArguments(
+        toolName: String,
+        arguments: [String: Value]
+    ) throws -> [String: Value] {
+        let supportedOperations: Set<String>
+        switch toolName {
+        case "agent_run":
+            supportedOperations = ["start", "poll", "wait", "cancel"]
+        case "agent_explore":
+            supportedOperations = ["start", "poll", "wait", "cancel"]
+        default:
+            return arguments
+        }
+        guard let operation = arguments["op"]?.stringValue,
+              supportedOperations.contains(operation)
+        else {
+            throw MCPError.invalidParams("\(toolName) requires a supported string op")
+        }
+        return arguments
     }
 }

@@ -5,11 +5,16 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import os
+import socket
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Optional
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -275,6 +280,37 @@ class OutputSummarizerTests(unittest.TestCase):
         self.assertLessEqual(rendered_chars, conductor.SUMMARY_MAX_CHARS)
         self.assertTrue(summary["truncated"] or summary["omittedLineCount"] > 0)
 
+    def test_lowercase_warning_at_start_is_counted_and_shown(self) -> None:
+        summary = summarize(
+            "swift-build",
+            "completed",
+            0,
+            [
+                "warning: cannot find user version number for module 'Dependency'\n",
+                "Sources/Foo.swift:10:5: warning: unused variable\n",
+            ],
+        )
+
+        self.assertEqual(summary["warningCount"], 2)
+        warnings = section(summary, "Warnings")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("cannot find user version number", warnings[0])
+
+    def test_summary_version_and_duration_are_included(self) -> None:
+        summary = summarize("build", "completed", 0, ["==> Build\n"])
+
+        self.assertEqual(summary["version"], conductor.SUMMARY_VERSION)
+        self.assertIn("summaryDurationSeconds", summary)
+        self.assertIsInstance(summary["summaryDurationSeconds"], float)
+        self.assertGreaterEqual(summary["summaryDurationSeconds"], 0.0)
+
+    def test_minimal_summary_version_and_duration_are_included(self) -> None:
+        summary = conductor.OutputSummarizer._minimal_summary("build", "failed", 1, "note")
+
+        self.assertEqual(summary["version"], conductor.SUMMARY_VERSION)
+        self.assertIn("summaryDurationSeconds", summary)
+        self.assertEqual(summary["summaryDurationSeconds"], 0.0)
+
     def test_ansi_and_long_lines_are_cleaned(self) -> None:
         long_error = "\x1b[31mERROR: " + ("x" * 1000) + "\x1b[0m\n"
         summary = summarize("build", "failed", 1, [long_error])
@@ -501,6 +537,188 @@ class OutputSummarizerTests(unittest.TestCase):
             payload = state.list_jobs(None)
 
         self.assertNotIn("outputSummary", payload["jobs"][0])
+        state._output_pump.close()
+
+    def test_repeated_findings_coalesce_without_unbounded_seen_state(self) -> None:
+        summary = summarize("build", "failed", 1, ["ERROR: repeated failure\n"] * 50)
+
+        failures = section(summary, "Failure highlights")
+        self.assertEqual(len(failures), 1)
+        self.assertIn("repeated", failures[0])
+
+    def test_summary_line_limit_does_not_overconsume_iterator(self) -> None:
+        consumed = 0
+
+        def lines():
+            nonlocal consumed
+            while True:
+                consumed += 1
+                yield f"WARNING: item {consumed}\n"
+
+        with mock.patch.object(conductor, "SUMMARY_INPUT_MAX_LINES", 5):
+            summary = summarize("build", "failed", 1, lines())
+
+        self.assertEqual(consumed, 5)
+        self.assertTrue(summary["inputTruncated"])
+        self.assertTrue(summary["inputLineLimitReached"])
+        self.assertFalse(summary["inputByteLimitReached"])
+
+    def test_safe_file_sampling_reports_omitted_middle_and_rejects_nonregular_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "job.log"
+            log.write_bytes(b"head-one\nhead-two\nmiddle\ntail-one\ntail-two\n")
+            sample = conductor.read_safe_regular_file_sample(log, 18, 18)
+            symlink = root / "link.log"
+            symlink.symlink_to(log)
+            fifo = root / "fifo.log"
+            os.mkfifo(fifo)
+
+            self.assertGreater(sample.omitted_bytes, 0)
+            self.assertIn(b"conductor omitted", sample.content)
+            with self.assertRaises((OSError, conductor.ConductorError)):
+                conductor.read_safe_regular_file_sample(root, 10, 10)
+            with self.assertRaises((OSError, conductor.ConductorError)):
+                conductor.read_safe_regular_file_sample(symlink, 10, 10)
+            with self.assertRaises((OSError, conductor.ConductorError)):
+                conductor.read_safe_regular_file_sample(fifo, 10, 10)
+
+    def test_full_log_rendering_is_bounded_and_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "large.log"
+            log.write_bytes(b"0123456789\n" * 20)
+            with mock.patch.object(conductor, "FULL_LOG_HEAD_BYTES", 24), mock.patch.object(
+                conductor, "FULL_LOG_TAIL_BYTES", 24
+            ), contextlib.redirect_stdout(io.StringIO()) as output:
+                conductor.print_full_log({"logPath": str(log), "logTail": []})
+
+        rendered = output.getvalue()
+        self.assertIn("raw log rendering bounded", rendered)
+        self.assertIn("conductor omitted", rendered)
+        self.assertLess(len(rendered), 1000)
+
+    def test_request_shape_bounds_nesting_collections_and_strings(self) -> None:
+        nested: object = "leaf"
+        for _ in range(conductor.MAX_JSON_DEPTH + 1):
+            nested = [nested]
+        with self.assertRaises(conductor.ConductorError):
+            conductor.validate_json_shape(nested)
+        with self.assertRaises(conductor.ConductorError):
+            conductor.validate_json_shape(list(range(conductor.MAX_JSON_COLLECTION_ENTRIES + 1)))
+        with self.assertRaises(conductor.ConductorError):
+            conductor.validate_json_shape("x" * (conductor.MAX_JSON_STRING_BYTES + 1))
+
+    def test_client_rejects_incomplete_oversized_and_mismatched_responses(self) -> None:
+        def run_response(response_factory, response_limit: int = 128) -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                socket_path = Path(tmp) / "server.sock"
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(socket_path))
+                listener.listen(1)
+                done = threading.Event()
+
+                def serve() -> None:
+                    connection, _address = listener.accept()
+                    with connection:
+                        with connection.makefile("rb") as request_file:
+                            request = json.loads(request_file.readline().decode("utf-8"))
+                        connection.sendall(response_factory(request))
+                    listener.close()
+                    done.set()
+
+                server = threading.Thread(target=serve)
+                server.start()
+                paths = mock.Mock(socket_path=socket_path)
+                with mock.patch.object(conductor, "MAX_RESPONSE_BYTES", response_limit), self.assertRaises(
+                    conductor.ConductorError
+                ):
+                    conductor.request_daemon(paths, {"type": "status"}, timeout=1.0)
+                self.assertTrue(done.wait(1.0))
+                server.join(timeout=1.0)
+
+        run_response(lambda request: json.dumps({"id": request["id"], "ok": True, "payload": {}}).encode("utf-8"))
+        run_response(lambda _request: b"x" * 129)
+        run_response(lambda _request: b'{"id":"different","ok":true,"payload":{}}\n')
+
+    def test_server_rejects_oversized_and_nonterminated_requests(self) -> None:
+        for raw in [
+            b"x" * 65 + b"\n",
+            b'{"id":"x","type":"status"}',
+            b'{"id":"x","type":"status"}\ntrailing',
+        ]:
+            with self.subTest(raw=raw[:10]):
+                state = mock.Mock()
+                server = mock.Mock()
+                server.state = state
+                server.wait_permits = threading.BoundedSemaphore(1)
+                server_side, client_side = socket.socketpair()
+                with mock.patch.object(conductor, "MAX_REQUEST_BYTES", 64):
+                    handler = threading.Thread(
+                        target=conductor.RequestHandler,
+                        args=(server_side, ("local", 0), server),
+                    )
+                    handler.start()
+                    client_side.sendall(raw)
+                    client_side.shutdown(socket.SHUT_WR)
+                    with client_side.makefile("rb") as response_file:
+                        response = json.loads(response_file.readline().decode("utf-8"))
+                    handler.join(timeout=1.0)
+                client_side.close()
+                server_side.close()
+
+                self.assertFalse(response["ok"])
+                state.status_payload.assert_not_called()
+
+    def test_server_caps_total_handlers_and_clamps_wait_duration(self) -> None:
+        server = conductor.ThreadedUnixServer.__new__(conductor.ThreadedUnixServer)
+        server.handler_permits = threading.BoundedSemaphore(1)
+        self.assertTrue(server.handler_permits.acquire(blocking=False))
+        request = mock.Mock()
+        with mock.patch.object(server, "shutdown_request") as shutdown:
+            server.process_request(request, ("local", 0))
+        shutdown.assert_called_once_with(request)
+
+        state = mock.Mock()
+        state.job_wait.return_value = {"state": "running"}
+        conductor.handle_request(
+            state,
+            {"type": "job-wait", "ticket": "ticket", "timeout": 60},
+        )
+        self.assertEqual(state.job_wait.call_args.args[2], conductor.MAX_SERVER_WAIT_SECONDS)
+
+    def test_disconnected_wait_releases_wait_permit_without_mutating_job(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        job_state = {"state": "running"}
+        state = mock.Mock()
+
+        def wait(*_args: object) -> dict:
+            entered.set()
+            self.assertTrue(release.wait(1.0))
+            return dict(job_state)
+
+        state.job_wait.side_effect = wait
+        server = mock.Mock()
+        server.state = state
+        server.wait_permits = threading.BoundedSemaphore(1)
+        server_side, client_side = socket.socketpair()
+        handler = threading.Thread(
+            target=conductor.RequestHandler,
+            args=(server_side, ("local", 0), server),
+        )
+        handler.start()
+        request = {"id": "wait", "type": "job-wait", "ticket": "ticket", "timeout": 60}
+        client_side.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        self.assertTrue(entered.wait(1.0))
+        client_side.close()
+        release.set()
+        handler.join(timeout=1.0)
+        server_side.close()
+
+        self.assertFalse(handler.is_alive())
+        self.assertEqual(job_state, {"state": "running"})
+        self.assertTrue(server.wait_permits.acquire(blocking=False))
+        server.wait_permits.release()
 
 
 if __name__ == "__main__":

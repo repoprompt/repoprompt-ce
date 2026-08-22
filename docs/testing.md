@@ -81,6 +81,19 @@ Define the workload, acceptance threshold, comparable environment, sample count,
 
 Use focused before/after measurements to attribute a change, then exercise the full affected boundary before making repository-wide performance claims. Store durable evidence only when it has continuing review value; otherwise keep raw logs and machine-specific samples local. Do not create a replacement executable registry, method census, append-only repository scoreboard, or mandatory artifact hierarchy merely to track test counts.
 
+## Live Codex Desktop direct-headless worktree routing
+
+Run this release acceptance only from a Codex Desktop task whose repository root is an existing linked worktree and whose RepoPrompt launcher selects `--backend headless` with that exact root in `REPOPROMPT_MCP_WORKING_DIRS`. The canonical checkout must already belong to one saved RepoPrompt CE workspace. This lane validates an installed release candidate; it does not build, install, launch, stop, or relaunch RepoPrompt, create a workspace, or create a worktree.
+
+Record the saved workspace file hash and `git worktree list --porcelain` before starting. In the same Codex task:
+
+1. Call `bind_context` with `op=status`. Require a bound context from the saved canonical workspace, then use `get_file_tree`, `read_file`, and `git status` to prove the task's linked worktree is the physical execution root. A path that exists only in the canonical checkout must remain outside the root fence.
+2. Start two detached `agent_run` sessions with `worktree=@current` and bounded read-only instructions that report a worktree-only marker. Save both returned session IDs and require them to be distinct.
+3. Reconcile both exact session IDs with `agent_run op=wait` and inspect them with `agent_manage op=list_sessions`. Require both terminal snapshots to report the same exact `worktree_root_path`, repository identity, and worktree identity, and require both markers to come from that worktree. Cancel and reconcile any nonterminal session before ending the task. Nested `orchestrate` acceptance belongs to the separate direct-headless workflow/tool-policy change and is not a release gate for this standalone routing change.
+4. Recheck `git worktree list --porcelain`, the saved workspace file hash, and workspace catalog count. Require no added worktree, no changed saved workspace, no temporary workspace, and no durable worktree binding. Repeat once with an explicit different existing selector and require only that session's physical root to change.
+
+The Codex Desktop pre-start app-CLI isolation fallback remains in place through this acceptance and the release that contains the fix. Removing or bypassing it is a separate post-release change after the recorded acceptance passes; a failed or unavailable direct-headless check leaves the fallback unchanged.
+
 ## Live Agent Mode file-tool performance diagnostic
 
 `Scripts/benchmark_agent_mode_file_tools.py` measures paired `file_search` and `read_file` calls from exactly two concurrent Explore sessions: the normal workspace root and a linked worktree. It requires an already-running RepoPrompt CE DEBUG app and never launches, stops, or relaunches the app.

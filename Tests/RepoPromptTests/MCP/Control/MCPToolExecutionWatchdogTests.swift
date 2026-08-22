@@ -180,7 +180,10 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         guard case let .admitted(settlementSlot) = registry.admit(
             windowID: windowID,
             connectionID: UUID(),
-            invocationID: UUID()
+            invocationID: UUID(),
+            toolName: "get_code_structure",
+            now: .zero,
+            handlerPhase: { nil }
         ) else {
             return XCTFail("Expected settlement lease")
         }
@@ -230,7 +233,10 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         guard case let .admitted(settlementSlot) = registry.admit(
             windowID: windowID,
             connectionID: UUID(),
-            invocationID: UUID()
+            invocationID: UUID(),
+            toolName: "get_code_structure",
+            now: .zero,
+            handlerPhase: { nil }
         ) else {
             return XCTFail("Expected settlement lease")
         }
@@ -404,7 +410,10 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         guard case let .admitted(settlementSlot) = registry.admit(
             windowID: windowID,
             connectionID: UUID(),
-            invocationID: UUID()
+            invocationID: UUID(),
+            toolName: "get_code_structure",
+            now: .zero,
+            handlerPhase: { nil }
         ) else {
             return XCTFail("Expected settlement lease")
         }
@@ -466,7 +475,10 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         guard case let .admitted(settlementSlot) = registry.admit(
             windowID: windowID,
             connectionID: UUID(),
-            invocationID: UUID()
+            invocationID: UUID(),
+            toolName: "get_code_structure",
+            now: .zero,
+            handlerPhase: { nil }
         ) else {
             return XCTFail("Expected settlement lease")
         }
@@ -559,6 +571,10 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let invocationID = UUID()
         let event = MCPToolExecutionTraceEvent(
             toolName: MCPWindowToolName.manageSelection,
+            operationIdentity: MCPDomainToolCatalog.operationIdentity(
+                for: MCPWindowToolName.manageSelection,
+                input: .missing
+            ),
             connectionID: UUID(),
             invocationID: invocationID,
             runID: nil,

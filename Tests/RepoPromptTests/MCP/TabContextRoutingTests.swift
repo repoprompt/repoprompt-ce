@@ -445,6 +445,57 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testPendingPolicyReadSelectionLineageInstallsAfterQueuedRoutePromotion() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let liveConnectionID = UUID()
+        let replacementConnectionID = UUID()
+        let snapshot = ComposeTabState(id: tabID, name: "Agent")
+
+        window.mcpServer.installTabContext(
+            clientID: liveConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false
+        )
+        window.mcpServer.installTabContext(
+            clientID: nil,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false
+        )
+
+        let token = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+            connectionID: replacementConnectionID,
+            runID: runID,
+            windowID: window.windowID,
+            clientName: "agent"
+        ))
+
+        XCTAssertEqual(token.displacedConnectionID, liveConnectionID)
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: replacementConnectionID
+            ),
+            [liveConnectionID]
+        )
+    }
+
+    @MainActor
     func testPendingPolicyReadSelectionLineageSurvivesSameConnectionTokenSupersession() throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -1950,17 +2001,22 @@ final class TabContextRoutingTests: XCTestCase {
 
         let activeTabID = UUID()
         let tabID = UUID()
-        let workspace = window.workspaceManager.createWorkspace(
+        let workspace = WorkspaceModel(
             name: "Selection Tool Persistence \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
-            ephemeral: true
+            composeTabs: [
+                ComposeTabState(id: activeTabID, name: "Active"),
+                ComposeTabState(id: tabID, name: "Agent")
+            ],
+            activeComposeTabID: activeTabID
         )
+        window.workspaceManager.workspaces.append(workspace)
+        let initialSavedURL = try await window.workspaceManager.saveWorkspaceToFileAsync(
+            workspace,
+            source: .directUnknown
+        )
+        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: initialSavedURL)
         let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
-        window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-            ComposeTabState(id: activeTabID, name: "Active"),
-            ComposeTabState(id: tabID, name: "Agent")
-        ]
-        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = activeTabID
         await window.workspaceManager.switchWorkspace(
             to: window.workspaceManager.workspaces[workspaceIndex],
             saveState: false,

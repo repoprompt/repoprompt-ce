@@ -185,6 +185,9 @@ extension MCPServerViewModel {
         let previousRunPrimaryConnectionID: UUID?
         let previousPendingPolicyTokenID: UUID?
         let previousWindowID: Int?
+        var promotedContext: TabContextSnapshot?
+        var promotedContextClientName: String?
+        var promotedContextWindowID: Int?
     }
 
     /// Ordered, immutable coordinator lanes displaced by one pending-policy replacement.
@@ -379,6 +382,10 @@ extension MCPServerViewModel {
 
         func contains(clientName: String, windowID: Int, runID: UUID) -> Bool {
             storage[clientName]?[windowID]?[runID] != nil
+        }
+
+        func contains(clientName: String, runID: UUID) -> Bool {
+            storage[clientName]?.values.contains { $0[runID] != nil } == true
         }
 
         @discardableResult
@@ -1129,13 +1136,8 @@ extension MCPServerViewModel {
             throw TabBindError.tabNotFound(tabID)
         }
 
-        // Tear down any previous binding for this connection
-        if tabContextByConnectionID[connectionID] != nil {
-            releaseBinding(connectionID: connectionID)
-        }
-
-        // Explicit tab-context bindings preserve the tab's stored state unless a caller opts into
-        // active selection flushing through the snapshot helper.
+        // Build the replacement before releasing a usable binding. A stale or otherwise invalid
+        // target must not turn a failed rebind into an unbound connection.
         var context = try makeTabContextSnapshot(
             tabID: tab.id,
             workspaceID: ws.id,
@@ -1145,6 +1147,10 @@ extension MCPServerViewModel {
             captureActiveUIState: false,
             flushActiveSelection: false
         )
+
+        if tabContextByConnectionID[connectionID] != nil {
+            releaseBinding(connectionID: connectionID)
+        }
 
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
@@ -1361,7 +1367,8 @@ extension MCPServerViewModel {
     private func bindPendingContextToConnection(
         clientName: String,
         windowID: Int,
-        connectionID: UUID
+        connectionID: UUID,
+        registerRunMapping: Bool = true
     ) -> TabContextSnapshot? {
         let queueBefore = pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
         let runHint = connectionIDToRunID[connectionID]
@@ -1389,7 +1396,9 @@ extension MCPServerViewModel {
                 activateReadFileAutoSelection(&rebound)
                 tabContextByConnectionID[connectionID] = rebound
                 presentationWindowByConnection[connectionID] = rebound.windowID
-                _ = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
+                if registerRunMapping {
+                    _ = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
+                }
                 recordLastContext(clientName: clientName, context: rebound)
                 beginMirroringForConnection(connectionID, context: rebound)
                 tabContextLog("bindPendingContextToConnection handover: runID=\(runID) tab=\(rebound.tabID) \(previousConnection) -> \(connectionID) queueBefore=\(queueBefore)")
@@ -1421,9 +1430,13 @@ extension MCPServerViewModel {
         publishDomainRoutingBinding(connectionID: connectionID, context: context)
         presentationWindowByConnection[connectionID] = context.windowID
         if let runID = context.runID {
-            let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: context.windowID)
-            // If we successfully registered the mapping, or if the initial runHint matched, count it as used
-            usedRunHint = usedRunHint || (runHint == runID) || mappingSucceeded
+            if registerRunMapping {
+                let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: context.windowID)
+                // If we successfully registered the mapping, or if the initial runHint matched, count it as used
+                usedRunHint = usedRunHint || (runHint == runID) || mappingSucceeded
+            } else {
+                usedRunHint = usedRunHint || runHint == runID
+            }
         }
         recordLastContext(clientName: clientName, context: context)
         beginMirroringForConnection(connectionID, context: context)
@@ -1432,6 +1445,31 @@ extension MCPServerViewModel {
             "bindPendingContextToConnection clientName=\(clientName) window=\(windowID) connectionID=\(connectionID) runID=\(context.runID?.uuidString ?? "nil") tab=\(context.tabID) queueBefore=\(queueBefore) remaining=\(result.remaining) usedRunHint=\(usedRunHint) fallback=false"
         )
         return context
+    }
+
+    @MainActor
+    @discardableResult
+    func promotePendingContextForRunMapping(
+        clientName: String,
+        windowID: Int,
+        connectionID: UUID
+    ) -> TabContextSnapshot? {
+        guard connectionIDToRunID[connectionID] != nil,
+              let runID = connectionIDToRunID[connectionID],
+              pendingRunScopedTabContexts.contains(
+                  clientName: clientName,
+                  windowID: windowID,
+                  runID: runID
+              )
+        else {
+            return nil
+        }
+        return bindPendingContextToConnection(
+            clientName: clientName,
+            windowID: windowID,
+            connectionID: connectionID,
+            registerRunMapping: false
+        )
     }
 
     struct RequestMetadata {
@@ -1862,7 +1900,8 @@ extension MCPServerViewModel {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext,
         contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey,
-        expectedBaseSelection: StoredSelection
+        expectedBaseSelection: StoredSelection,
+        automaticCodemapDisposition: MCPReadFileAutoSelectionCoordinator.AutomaticCodemapDisposition
     ) async -> ReadFileAutoSelectionAuthoritativeResult? {
         guard isReadFileAutoSelectionContextCurrent(contextKey) else { return nil }
 
@@ -1900,7 +1939,8 @@ extension MCPServerViewModel {
         )
         guard MCPReadFileAutoSelectionCoordinator.authoritativeSelection(
             expectedBaseForPreservation,
-            isPreservedBy: persistedSelection
+            isPreservedBy: persistedSelection,
+            automaticCodemapDisposition: automaticCodemapDisposition
         ),
             let target = currentReadFileAutoSelectionTab(for: contextKey)
         else { return nil }
@@ -1983,7 +2023,26 @@ extension MCPServerViewModel {
         tabID: UUID,
         workspaceID: UUID?
     ) async throws -> WorkspaceLookupContext {
-        let snapshot = try makeTabContextSnapshot(
+        try await resolveProspectiveFileToolLookupContext(
+            tabID: tabID,
+            workspaceID: workspaceID
+        ).lookupContext
+    }
+
+    struct ProspectiveFileToolLookupResolution {
+        let lookupContext: WorkspaceLookupContext
+        let sourceIdentity: AgentWorkspaceLookupContextIdentity
+        fileprivate let visibleRootFingerprint: String
+        fileprivate let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot?
+    }
+
+    @MainActor
+    func resolveProspectiveFileToolLookupContext(
+        tabID: UUID,
+        workspaceID: UUID?
+    ) async throws -> ProspectiveFileToolLookupResolution {
+        let visibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        var snapshot = try makeTabContextSnapshot(
             tabID: tabID,
             workspaceID: workspaceID,
             windowID: windowID,
@@ -1992,7 +2051,152 @@ extension MCPServerViewModel {
             captureActiveUIState: false,
             flushActiveSelection: false
         )
-        return await lookupContext(for: snapshot)
+        guard await hydrateFileToolLookupSnapshotIfNeeded(&snapshot, connectionID: nil) else {
+            let source = AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: snapshot.activeAgentSessionID,
+                worktreeBindingState: snapshot.worktreeBindingState
+            )
+            return ProspectiveFileToolLookupResolution(
+                lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
+                sourceIdentity: source.identity,
+                visibleRootFingerprint: visibleRootFingerprint,
+                sessionRootLifetimeSnapshot: nil
+            )
+        }
+
+        let source = AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: snapshot.activeAgentSessionID,
+            worktreeBindingState: snapshot.worktreeBindingState
+        )
+        let lookupContext = await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
+            source: source,
+            store: promptVM.workspaceFileContextStore
+        )
+        let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot? = if let bindingProjection = lookupContext.bindingProjection {
+            await promptVM.workspaceFileContextStore.sessionBoundRootScopeValidationSnapshot(
+                lookupContext.rootScope,
+                expectedPhysicalRoots: bindingProjection.physicalRootRefs
+            )
+        } else {
+            nil
+        }
+        let currentVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard currentVisibleRootFingerprint == visibleRootFingerprint,
+              lookupContext.bindingProjection == nil || sessionRootLifetimeSnapshot != nil,
+              fileToolLookupSnapshotIsCurrent(snapshot, connectionID: nil),
+              fileToolBindingSourceIsCurrent(source, for: snapshot)
+        else {
+            #if DEBUG
+                fileToolLookupContextStaleCompletionCount += 1
+            #endif
+            return ProspectiveFileToolLookupResolution(
+                lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
+                sourceIdentity: source.identity,
+                visibleRootFingerprint: visibleRootFingerprint,
+                sessionRootLifetimeSnapshot: nil
+            )
+        }
+        if let sessionRootLifetimeSnapshot {
+            guard await sessionRootLifetimeSnapshot.isCurrent() else {
+                #if DEBUG
+                    fileToolLookupContextStaleCompletionCount += 1
+                #endif
+                return ProspectiveFileToolLookupResolution(
+                    lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
+                    sourceIdentity: source.identity,
+                    visibleRootFingerprint: visibleRootFingerprint,
+                    sessionRootLifetimeSnapshot: nil
+                )
+            }
+        }
+        return ProspectiveFileToolLookupResolution(
+            lookupContext: lookupContext,
+            sourceIdentity: source.identity,
+            visibleRootFingerprint: visibleRootFingerprint,
+            sessionRootLifetimeSnapshot: sessionRootLifetimeSnapshot
+        )
+    }
+
+    @MainActor
+    func prospectiveFileToolLookupSourceIsCurrent(
+        tabID: UUID,
+        workspaceID: UUID,
+        expectedSourceIdentity: AgentWorkspaceLookupContextIdentity
+    ) -> Bool {
+        guard var snapshot = try? makeTabContextSnapshot(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: windowID,
+            runID: nil,
+            explicitlyBound: false,
+            captureActiveUIState: false,
+            flushActiveSelection: false
+        ) else { return false }
+
+        if let sessionID = snapshot.activeAgentSessionID {
+            snapshot.worktreeBindingState = agentWorktreeBindingStateProvider?(sessionID, snapshot.tabID) ?? .unhydrated
+        } else {
+            snapshot.worktreeBindingState = .notApplicable
+        }
+        let source = AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: snapshot.activeAgentSessionID,
+            worktreeBindingState: snapshot.worktreeBindingState
+        )
+        return fileToolLookupSnapshotIsCurrent(snapshot, connectionID: nil)
+            && source.identity == expectedSourceIdentity
+    }
+
+    @MainActor
+    func performIfProspectiveFileToolLookupResolutionIsCurrent(
+        _ resolution: ProspectiveFileToolLookupResolution,
+        tabID: UUID,
+        workspaceID: UUID,
+        operation: @MainActor () throws -> Void
+    ) async throws -> Bool {
+        guard prospectiveFileToolLookupSourceIsCurrent(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            expectedSourceIdentity: resolution.sourceIdentity
+        ) else { return false }
+
+        let currentVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard currentVisibleRootFingerprint == resolution.visibleRootFingerprint else { return false }
+        if let sessionRootLifetimeSnapshot = resolution.sessionRootLifetimeSnapshot {
+            guard await sessionRootLifetimeSnapshot.isCurrent() else { return false }
+        }
+
+        #if DEBUG
+            if let debugAfterFileToolLookupContextRootValidationForTesting {
+                await debugAfterFileToolLookupContextRootValidationForTesting()
+            }
+        #endif
+
+        let finalVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard finalVisibleRootFingerprint == resolution.visibleRootFingerprint,
+              prospectiveFileToolLookupSourceIsCurrent(
+                  tabID: tabID,
+                  workspaceID: workspaceID,
+                  expectedSourceIdentity: resolution.sourceIdentity
+              )
+        else { return false }
+
+        if let sessionRootLifetimeSnapshot = resolution.sessionRootLifetimeSnapshot {
+            var operationError: Error?
+            let didPerform = sessionRootLifetimeSnapshot.performIfGenerationCurrent {
+                do {
+                    try operation()
+                } catch {
+                    operationError = error
+                }
+            }
+            if let operationError {
+                throw operationError
+            }
+            return didPerform
+        }
+
+        try operation()
+        return true
     }
 
     @MainActor
@@ -2028,34 +2232,11 @@ extension MCPServerViewModel {
                 }
             }
 
-            if let sessionID = snapshot.activeAgentSessionID {
-                if snapshot.runID == nil,
-                   let agentWorktreeBindingStateProvider
-                {
-                    snapshot.worktreeBindingState = agentWorktreeBindingStateProvider(sessionID, snapshot.tabID)
-                }
-                if snapshot.worktreeBindingState == .unhydrated,
-                   let agentWorktreeBindingStateResolver
-                {
-                    let bindingGeneration = snapshot.readFileAutoSelectionGeneration
-                    let hydratedState = await agentWorktreeBindingStateResolver(sessionID, snapshot.tabID)
-                    guard fileToolLookupSnapshotIsCurrent(
-                        snapshot,
-                        connectionID: metadata.connectionID,
-                        expectedBindingGeneration: bindingGeneration
-                    ),
-                        agentWorktreeBindingStateProvider?(sessionID, snapshot.tabID) == hydratedState
-                        || agentWorktreeBindingStateProvider == nil
-                    else {
-                        #if DEBUG
-                            fileToolLookupContextStaleCompletionCount += 1
-                        #endif
-                        return AgentWorkspaceLookupContextResolver.failClosedLookupContext
-                    }
-                    snapshot.worktreeBindingState = hydratedState
-                }
-            } else {
-                snapshot.worktreeBindingState = .notApplicable
+            guard await hydrateFileToolLookupSnapshotIfNeeded(
+                &snapshot,
+                connectionID: metadata.connectionID
+            ) else {
+                return AgentWorkspaceLookupContextResolver.failClosedLookupContext
             }
 
             resolved?.snapshot = snapshot
@@ -2307,6 +2488,43 @@ extension MCPServerViewModel {
             pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)
         }
         return adjustedLookupContext
+    }
+
+    @MainActor
+    private func hydrateFileToolLookupSnapshotIfNeeded(
+        _ snapshot: inout TabContextSnapshot,
+        connectionID: UUID?
+    ) async -> Bool {
+        guard let sessionID = snapshot.activeAgentSessionID else {
+            snapshot.worktreeBindingState = .notApplicable
+            return true
+        }
+        if snapshot.runID == nil,
+           let agentWorktreeBindingStateProvider
+        {
+            snapshot.worktreeBindingState = agentWorktreeBindingStateProvider(sessionID, snapshot.tabID)
+        }
+        guard snapshot.worktreeBindingState == .unhydrated,
+              let agentWorktreeBindingStateResolver
+        else { return true }
+
+        let bindingGeneration = snapshot.readFileAutoSelectionGeneration
+        let hydratedState = await agentWorktreeBindingStateResolver(sessionID, snapshot.tabID)
+        guard fileToolLookupSnapshotIsCurrent(
+            snapshot,
+            connectionID: connectionID,
+            expectedBindingGeneration: bindingGeneration
+        ),
+            agentWorktreeBindingStateProvider?(sessionID, snapshot.tabID) == hydratedState
+            || agentWorktreeBindingStateProvider == nil
+        else {
+            #if DEBUG
+                fileToolLookupContextStaleCompletionCount += 1
+            #endif
+            return false
+        }
+        snapshot.worktreeBindingState = hydratedState
+        return true
     }
 
     /// Resolves mutation routing and lookup authority together so an inactive,
@@ -3582,7 +3800,8 @@ extension MCPServerViewModel {
     func registerPendingPolicyRunIDMapping(
         connectionID: UUID,
         runID: UUID,
-        windowID: Int
+        windowID: Int,
+        clientName: String? = nil
     ) -> PendingPolicyRunIDMappingToken? {
         if let bound = tabContextByConnectionID[connectionID],
            let boundRun = bound.runID,
@@ -3603,7 +3822,7 @@ extension MCPServerViewModel {
         }
 
         let previousRunID = connectionIDToRunID[connectionID]
-        let token = PendingPolicyRunIDMappingToken(
+        var token = PendingPolicyRunIDMappingToken(
             id: UUID(),
             connectionID: connectionID,
             runID: runID,
@@ -3613,10 +3832,11 @@ extension MCPServerViewModel {
             previousRunID: previousRunID,
             previousRunPrimaryConnectionID: previousRunID.flatMap { connectionIDByRunID[$0] },
             previousPendingPolicyTokenID: previousRunID.flatMap { pendingPolicyRunIDMappingTokenIDByRunID[$0] },
-            previousWindowID: presentationWindowByConnection[connectionID]
+            previousWindowID: presentationWindowByConnection[connectionID],
+            promotedContext: nil,
+            promotedContextClientName: nil,
+            promotedContextWindowID: nil
         )
-        installReadFileAutoSelectionHandoverLineage(for: token)
-
         if let displacedConnectionID = token.displacedConnectionID,
            connectionIDToRunID[displacedConnectionID] == runID
         {
@@ -3632,6 +3852,18 @@ extension MCPServerViewModel {
         connectionIDByRunID[runID] = connectionID
         connectionIDToRunID[connectionID] = runID
         pendingPolicyRunIDMappingTokenIDByRunID[runID] = token.id
+        if let clientName,
+           let promotedContext = promotePendingContextForRunMapping(
+               clientName: clientName,
+               windowID: windowID,
+               connectionID: connectionID
+           )
+        {
+            token.promotedContext = promotedContext
+            token.promotedContextClientName = clientName
+            token.promotedContextWindowID = windowID
+        }
+        installReadFileAutoSelectionHandoverLineage(for: token)
         tabContextLog("registerPendingPolicyRunIDMapping connectionID=\(connectionID) runID=\(runID) windowID=\(windowID)")
         return token
     }
@@ -3664,8 +3896,6 @@ extension MCPServerViewModel {
 
         readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
         guard token.displacedConnectionRunID == token.runID,
-              connectionIDByRunID[token.runID] == displacedConnectionID,
-              connectionIDToRunID[displacedConnectionID] == token.runID,
               let displacedContext = tabContextByConnectionID[displacedConnectionID],
               displacedContext.runID == token.runID,
               successorContext.windowID == displacedContext.windowID,
@@ -3726,6 +3956,25 @@ extension MCPServerViewModel {
         }
 
         pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: token.runID)
+        let promotedContextToRestore: (context: TabContextSnapshot, clientName: String, windowID: Int)? = {
+            guard let promotedContext = token.promotedContext,
+                  let promotedRunID = promotedContext.runID,
+                  let promotedContextClientName = token.promotedContextClientName,
+                  let promotedContextWindowID = token.promotedContextWindowID,
+                  let boundContext = tabContextByConnectionID[token.connectionID],
+                  boundContext.runID == promotedRunID,
+                  boundContext.tabID == promotedContext.tabID,
+                  boundContext.windowID == promotedContext.windowID,
+                  boundContext.workspaceID == promotedContext.workspaceID,
+                  !pendingRunScopedTabContexts.contains(
+                      clientName: promotedContextClientName,
+                      runID: promotedRunID
+                  )
+            else {
+                return nil
+            }
+            return (promotedContext, promotedContextClientName, promotedContextWindowID)
+        }()
         removeTabContext(
             forConnectionID: token.connectionID,
             clientName: clientName,
@@ -3733,6 +3982,13 @@ extension MCPServerViewModel {
             runID: token.runID,
             removeQueuedPendingContext: false
         )
+        if let promotedContextToRestore {
+            _ = pendingRunScopedTabContexts.enqueueReplacing(
+                promotedContextToRestore.context,
+                clientName: promotedContextToRestore.clientName,
+                windowID: promotedContextToRestore.windowID
+            )
+        }
         if connectionIDByRunID[token.runID] == token.connectionID {
             connectionIDByRunID.removeValue(forKey: token.runID)
         }

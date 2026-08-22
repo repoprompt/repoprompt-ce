@@ -245,20 +245,165 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         )
     }
 
-    func testToggleComposeShortcutOutsideAgentModeDoesNotArmPresentation() async throws {
+    func testFilesTabMutationGateRequiresStableMatchingActiveTab() {
+        let tabID = UUID()
+        XCTAssertTrue(agentContextFilesCanMutateCurrentModel(
+            isSwitchBlankingRows: false,
+            isSwitchingComposeTab: false,
+            canMutateDisplayedModel: true,
+            sourceTabID: tabID,
+            activeTabID: tabID
+        ))
+        XCTAssertFalse(agentContextFilesCanMutateCurrentModel(
+            isSwitchBlankingRows: true,
+            isSwitchingComposeTab: false,
+            canMutateDisplayedModel: true,
+            sourceTabID: tabID,
+            activeTabID: tabID
+        ))
+        XCTAssertFalse(agentContextFilesCanMutateCurrentModel(
+            isSwitchBlankingRows: false,
+            isSwitchingComposeTab: true,
+            canMutateDisplayedModel: true,
+            sourceTabID: tabID,
+            activeTabID: tabID
+        ))
+        XCTAssertFalse(agentContextFilesCanMutateCurrentModel(
+            isSwitchBlankingRows: false,
+            isSwitchingComposeTab: false,
+            canMutateDisplayedModel: false,
+            sourceTabID: tabID,
+            activeTabID: tabID
+        ))
+        XCTAssertFalse(agentContextFilesCanMutateCurrentModel(
+            isSwitchBlankingRows: false,
+            isSwitchingComposeTab: false,
+            canMutateDisplayedModel: true,
+            sourceTabID: tabID,
+            activeTabID: UUID()
+        ))
+        XCTAssertFalse(agentContextFilesCanMutateCurrentModel(
+            isSwitchBlankingRows: false,
+            isSwitchingComposeTab: false,
+            canMutateDisplayedModel: true,
+            sourceTabID: nil,
+            activeTabID: tabID
+        ))
+    }
+
+    func testFilesTabRequestIdentityResetSkipsSelectionOnlyChanges() {
+        let tabID = UUID()
+        func identity(
+            selection: StoredSelection,
+            tabID: UUID,
+            codeMapUsage: CodeMapUsage = .none
+        ) -> AgentSelectedFilesModelIdentity {
+            AgentSelectedFilesModelIdentity(
+                exportContextIdentity: AgentContextExportIdentity(
+                    tabID: tabID,
+                    selection: selection,
+                    activeAgentSessionID: nil,
+                    worktreeBindingFingerprint: ""
+                ),
+                filePathDisplay: .relative,
+                codeMapUsage: codeMapUsage
+            )
+        }
+
+        let previousIdentity = identity(
+            selection: StoredSelection(selectedPaths: ["Sources/Existing.swift"]),
+            tabID: tabID
+        )
+        let changedSelectionIdentity = identity(
+            selection: StoredSelection(selectedPaths: ["Sources/Existing.swift", "Sources/Added.swift"]),
+            tabID: tabID
+        )
+
+        XCTAssertFalse(agentContextFilesShouldResetModel(
+            previousIdentity: previousIdentity,
+            currentIdentity: changedSelectionIdentity
+        ))
+        XCTAssertTrue(agentContextFilesShouldResetModel(
+            previousIdentity: previousIdentity,
+            currentIdentity: identity(
+                selection: previousIdentity.exportContextIdentity.selection,
+                tabID: tabID,
+                codeMapUsage: .complete
+            )
+        ))
+        XCTAssertTrue(agentContextFilesShouldResetModel(
+            previousIdentity: previousIdentity,
+            currentIdentity: identity(
+                selection: previousIdentity.exportContextIdentity.selection,
+                tabID: UUID()
+            )
+        ))
+    }
+
+    func testFilesTabRouteProofUsesPureActiveIdentityAndDisplayedLookupContext() {
+        let identity = WorkspaceSelectionIdentity(workspaceID: UUID(), tabID: UUID())
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: .visibleWorkspacePlusGitData,
+            bindingProjection: nil
+        )
+
+        XCTAssertEqual(
+            agentContextFileBrowseRouteProof(
+                activeIdentity: identity,
+                sourceTabID: identity.tabID,
+                lookupContext: lookupContext
+            ),
+            AgentContextFileBrowseRouteProof(identity: identity, lookupContext: lookupContext)
+        )
+        XCTAssertNil(agentContextFileBrowseRouteProof(
+            activeIdentity: identity,
+            sourceTabID: UUID(),
+            lookupContext: lookupContext
+        ))
+        XCTAssertNil(agentContextFileBrowseRouteProof(
+            activeIdentity: nil,
+            sourceTabID: identity.tabID,
+            lookupContext: lookupContext
+        ))
+    }
+
+    func testFilesTabBrowseTerminationDependsOnlyOnActiveTargetMatch() {
+        XCTAssertFalse(agentContextFileBrowseShouldTerminateForTargetChange(
+            isBrowseActive: false,
+            hasMutationTarget: false,
+            sessionMatchesTarget: false
+        ))
+        XCTAssertTrue(agentContextFileBrowseShouldTerminateForTargetChange(
+            isBrowseActive: true,
+            hasMutationTarget: false,
+            sessionMatchesTarget: false
+        ))
+        XCTAssertTrue(agentContextFileBrowseShouldTerminateForTargetChange(
+            isBrowseActive: true,
+            hasMutationTarget: true,
+            sessionMatchesTarget: false
+        ))
+        XCTAssertFalse(agentContextFileBrowseShouldTerminateForTargetChange(
+            isBrowseActive: true,
+            hasMutationTarget: true,
+            sessionMatchesTarget: true
+        ))
+    }
+
+    func testToggleContextComposerShortcutOutsideAgentModeDoesNotArmPresentation() async throws {
         try await withFixture { fixture in
             let drawerStore = fixture.viewModel.ui.contextDrawer
             XCTAssertFalse(drawerStore.isPresented)
 
             fixture.viewModel.setAgentModeActive(false)
-            GlobalKeyboardShortcutsCoordinator.shared.test_toggleComposeInspector(in: fixture.window)
+            GlobalKeyboardShortcutsCoordinator.shared.test_toggleContextComposer(in: fixture.window)
             XCTAssertFalse(drawerStore.isPresented)
 
             fixture.viewModel.setAgentModeActive(true)
-            GlobalKeyboardShortcutsCoordinator.shared.test_toggleComposeInspector(in: fixture.window)
+            GlobalKeyboardShortcutsCoordinator.shared.test_toggleContextComposer(in: fixture.window)
             XCTAssertTrue(drawerStore.isPresented)
 
-            GlobalKeyboardShortcutsCoordinator.shared.test_toggleComposeInspector(in: fixture.window)
+            GlobalKeyboardShortcutsCoordinator.shared.test_toggleContextComposer(in: fixture.window)
             XCTAssertFalse(drawerStore.isPresented)
         }
     }

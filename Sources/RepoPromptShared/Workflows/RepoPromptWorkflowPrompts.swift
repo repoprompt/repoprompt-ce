@@ -3,7 +3,7 @@ import Foundation
 /// Provider-neutral RepoPrompt workflow prompt renderers.
 /// These prompts are installed as managed skills/commands and exposed through Agent Mode,
 /// MCP prompts, and prompt-copy surfaces.
-enum RepoPromptWorkflowPrompts {
+public enum RepoPromptWorkflowPrompts {
     /// Bump when skill content changes.
     /// Version 2: Added embedded version markers to frontmatter, fixed CLI help reference.
     /// Version 3: Added rp-oracle-export command.
@@ -66,9 +66,9 @@ enum RepoPromptWorkflowPrompts {
     /// Version 60: Adds rp-deep-plan — a delegation-heavy planning workflow that produces a polished `docs/plans/<topic>-<YYYY-MM-DD>.md` document. Mandatory first interactive action is `ask_user` to pick a user-involvement mode (up front / mid-flow / hands-off); the rest of the run pauses for grounded ambiguity-shaping questions only at the chosen checkpoint. Phase 2 fans out explore agents across in-workspace seams, optional external research, and optional prior art lanes. Phase 4 runs `context_builder` in plan mode with `export_response:true` and merges the architectural bones into the plan (not a verbatim append) before deleting the standalone export. Phase 6 is a bounded one-page design-agent critique (under-specified seams / contradictions / overplanning risk / order-changing questions only) — explicitly non-authorial. Phase 7 is the orchestrator's editorial polish: shorter, organized, free of contradiction, no transcript dumps. Hands-off mode becomes interactive at the final hand-off.
     /// Version 61: rp-deep-plan — adds explicit halt-on-`ask_user`-timeout handling for involvement-mode checkpoints. When the user has actively picked a mode that promises a pause (Up front → Phase 1.5, Mid-flow → Phase 5) and a downstream `ask_user` returns `timed_out: true`, the workflow halts at that checkpoint instead of proceeding with assumed answers — resuming from the same prompt when the user replies. The Phase 1 involvement-mode prompt itself is exempt: a timeout there means "no signal" and falls through to Hands-off (same as `skipped: true`), so the workflow doesn't stall before any direction has been given. Adds a Core principle, a Phase 1 "Handling the answer" sub-section that distinguishes the three result shapes, halt reminders at the end of Phase 1.5 / Phase 5, and a matching anti-pattern.
     /// Version 62: rp-deep-plan — reframes the plan pass so the context_builder export is a preservation baseline, not an unquestionable authority: the final plan keeps its supported implementation-bearing detail, allows evidence-backed correction, removal, and lossless consolidation, and never trims accurate detail merely for brevity. Phase 4 builds a coverage ledger while reading the export; Phase 6 is a completeness/correctness critic scoped to the generated plan response only; Phase 7.5 walks the ledger as a fidelity check before deleting the export. Also states the plan is the sole deliverable (workflow artifacts like the critique are expected).
-    static let skillsVersion = 62
+    public static let skillsVersion = 62
 
-    static func render(
+    public static func render(
         id: RepoPromptWorkflowID,
         variant: WorkflowPromptVariant,
         includeSessionCleanupGuidance: Bool = true
@@ -103,7 +103,7 @@ enum RepoPromptWorkflowPrompts {
     ///   - description: The skill description
     ///   - variant: The tool variant (mcp or cli)
     /// - Returns: Complete YAML frontmatter block including version markers
-    static func codexSkillAgentPolicy(forSkillNamed name: String, variant: WorkflowPromptVariant) -> String {
+    public static func codexSkillAgentPolicy(forSkillNamed name: String, variant: WorkflowPromptVariant) -> String {
         // Only the MCP variant of `rp-reminder` is implicitly invokable. The CLI variant
         // (`rp-reminder-cli`) must be invoked explicitly, matching every other skill.
         let implicitlyInvokableSkills: Set = ["rp-reminder"]
@@ -133,7 +133,7 @@ enum RepoPromptWorkflowPrompts {
     }
 
     /// Strips YAML frontmatter (content between --- markers at the start).
-    static func stripYAMLFrontmatter(_ content: String) -> String {
+    public static func stripYAMLFrontmatter(_ content: String) -> String {
         let lines = content.components(separatedBy: "\n")
         guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else {
             return content

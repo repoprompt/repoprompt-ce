@@ -33,7 +33,7 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
 
         XCTAssertEqual(resolvedPath, StandardizedPath.absolute(exportPath))
         let readableService = WorkspaceReadableFileService(store: store)
-        switch await readableService.resolveReadableFile(resolvedPath, profile: .mcpRead, rootScope: .visibleWorkspace) {
+        switch try await readableService.resolveReadableFile(resolvedPath, rootScope: .visibleWorkspace) {
         case let .some(.workspace(file)):
             XCTAssertEqual(file.standardizedFullPath, resolvedPath)
             let content = try await store.readContent(rootID: rootRecord.id, relativePath: file.standardizedRelativePath)
@@ -81,9 +81,8 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: logicalExportPath))
         XCTAssertTrue(FileManager.default.fileExists(atPath: physicalExportPath))
         XCTAssertEqual(try String(contentsOfFile: physicalExportPath), "# Bound Worktree Export")
-        let readable = await WorkspaceReadableFileService(store: store).resolveReadableFile(
+        let readable = try await WorkspaceReadableFileService(store: store).resolveReadableFile(
             lookupContext.translateInputPath(resolvedPath),
-            profile: .mcpRead,
             rootScope: lookupContext.rootScope
         )
         guard case let .workspace(file) = readable else {
@@ -138,7 +137,7 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
 
         XCTAssertEqual(resolvedPath, exportPath)
         let readableService = WorkspaceReadableFileService(store: store)
-        let ignoredReadableFile = await readableService.resolveReadableFile(exportPath, profile: .mcpRead, rootScope: .visibleWorkspace)
+        let ignoredReadableFile = try await readableService.resolveReadableFile(exportPath, rootScope: .visibleWorkspace)
         guard case let .workspace(file) = ignoredReadableFile else {
             return XCTFail("Ignored generated export should remain exactly readable through read_file semantics")
         }

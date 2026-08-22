@@ -258,9 +258,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Model name that will be used for MCP plan generation (resolved at run start)
         var mcpPlanModel: String?
 
-        /// Per-run MCP token budget override for this tab (non-persistent)
-        var tokenBudgetOverrideForRun: Int?
-
         /// True if agent output was copied to prompt area (set during completion)
         var usedAgentOutputAsPrompt: Bool = false
 
@@ -273,8 +270,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         var runStartPromptText: String?
         /// File selection captured when discovery run started
         var runStartSelection: StoredSelection?
-        /// Selected context builder prompt IDs captured when run started
+        /// Selected Context Builder prompt IDs captured when run started
         var runStartContextBuilderPromptIDs: Set<UUID>?
+        /// Origin-resolved behavior captured with the prompt and selection
+        var runStartBehavior: ContextBuilderRunBehavior?
         /// Agent/model used for the most recent run (kept for log display + cleanup)
         var lastRunAgentKind: AgentProviderKind?
         var lastRunModelRaw: String?
@@ -315,10 +314,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Live Oracle chat session used by MCP follow-up streaming.
         var followUpOracleSessionID: UUID?
 
-        /// Per-tab auto-generate plan setting (loaded from tab config)
-        var autoGeneratePlan: Bool = false
-
-        /// Per-tab selected follow-up type for auto-generate (plan/review/question)
+        /// Per-tab selected follow-up type for automatic analysis
         var selectedFollowUpType: ContextBuilderFollowUpType = .plan
 
         @discardableResult
@@ -401,7 +397,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             pendingAskUserRunID = nil
             askUserTimeoutTask = nil
             pendingAskUserTimeoutGeneration = 0
-            autoGeneratePlan = false
             selectedFollowUpType = .plan
         }
     }
@@ -620,48 +615,31 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
     }
 
-    @Published var tokenBudget: Int = ContextBuilderDefaults.discoveryTokenBudget {
-        didSet {
-            guard tokenBudget != oldValue else { return }
-            guard !isRestoringState else { return }
-            persistTokenBudgetToWorkspace()
-            if let session = activeSession {
-                persistSessionConfig(session)
-            }
-        }
+    var contextTokenBudget: Int {
+        get { settingsManager.contextBuilderBehaviorSettings().contextTokenBudget }
+        set { updateContextBuilderBehavior { $0.contextTokenBudget = newValue } }
     }
 
-    @Published var enhancementMode: PromptEnhancementMode = ContextBuilderDefaults.enhancementMode {
-        didSet {
-            guard enhancementMode != oldValue else { return }
-            guard !isRestoringState else { return }
-            persistEnhancementModeToWorkspace()
-            if let session = activeSession {
-                persistSessionConfig(session)
-            }
-        }
+    var analysisTokenBudget: Int {
+        get { settingsManager.contextBuilderBehaviorSettings().analysisTokenBudget }
+        set { updateContextBuilderBehavior { $0.analysisTokenBudget = newValue } }
     }
 
-    @Published var autoGeneratePlan: Bool = ContextBuilderDefaults.autoGeneratePlan {
-        didSet {
-            guard autoGeneratePlan != oldValue else { return }
-            guard !isRestoringState else { return }
-            // Persist to tab/session
-            if let session = activeSession {
-                session.autoGeneratePlan = autoGeneratePlan
-                persistSessionConfig(session)
-            }
-            // Also persist as workspace default so new tabs inherit this setting
-            persistAutoGeneratePlanToWorkspace()
-        }
+    var enhancementMode: PromptEnhancementMode {
+        get { settingsManager.contextBuilderBehaviorSettings().enhancementMode }
+        set { updateContextBuilderBehavior { $0.enhancementMode = newValue } }
     }
 
-    /// Selected follow-up type for auto-generate (plan/review/question) - per-tab setting
+    var followUpAnalysisEnabled: Bool {
+        get { settingsManager.contextBuilderBehaviorSettings().followUpAnalysisEnabled }
+        set { updateContextBuilderBehavior { $0.followUpAnalysisEnabled = newValue } }
+    }
+
+    /// Selected follow-up type for automatic analysis (plan/review/question)
     @Published var selectedFollowUpType: ContextBuilderFollowUpType = .plan {
         didSet {
             guard selectedFollowUpType != oldValue else { return }
             guard !isRestoringState else { return }
-            // Persist to tab/session
             if let session = activeSession {
                 session.selectedFollowUpType = selectedFollowUpType
                 persistSessionConfig(session)
@@ -669,43 +647,38 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
     }
 
-    @Published var allowClarifyingQuestions: Bool = ContextBuilderDefaults.allowClarifyingQuestions {
-        didSet {
-            guard allowClarifyingQuestions != oldValue else { return }
-            guard !isRestoringState else { return }
-            persistAllowClarifyingQuestionsToWorkspace()
-            // When turning off main toggle, also turn off MCP toggle to avoid inconsistent state
-            if !allowClarifyingQuestions, allowClarifyingQuestionsForMCP {
-                allowClarifyingQuestionsForMCP = false
+    var allowUIClarifyingQuestions: Bool {
+        get { settingsManager.contextBuilderBehaviorSettings().allowUIClarifyingQuestions }
+        set {
+            updateContextBuilderBehavior { settings in
+                settings.allowUIClarifyingQuestions = newValue
+                if !newValue {
+                    settings.allowMCPClarifyingQuestions = false
+                }
             }
         }
     }
 
-    /// Allow clarifying questions when discovery is triggered via MCP (defaults false)
-    @Published var allowClarifyingQuestionsForMCP: Bool = ContextBuilderDefaults.allowClarifyingQuestionsForMCP {
-        didSet {
-            guard allowClarifyingQuestionsForMCP != oldValue else { return }
-            guard !isRestoringState else { return }
-            persistAllowClarifyingQuestionsForMCPToWorkspace()
-        }
+    var allowMCPClarifyingQuestions: Bool {
+        get { settingsManager.contextBuilderBehaviorSettings().allowMCPClarifyingQuestions }
+        set { updateContextBuilderBehavior { $0.allowMCPClarifyingQuestions = newValue } }
     }
 
-    /// Timeout (in seconds) for clarifying question responses (workspace-scoped)
-    @Published var questionTimeoutSeconds: TimeInterval = ContextBuilderDefaults.questionTimeoutSeconds {
-        didSet {
-            guard questionTimeoutSeconds != oldValue else { return }
-            guard !isRestoringState else { return }
-            persistQuestionTimeoutToWorkspace()
-        }
+    var questionTimeoutSeconds: TimeInterval {
+        get { settingsManager.contextBuilderBehaviorSettings().questionTimeoutSeconds }
+        set { updateContextBuilderBehavior { $0.questionTimeoutSeconds = newValue } }
     }
 
-    /// Token budget for plan generation (workspace-scoped)
-    @Published var planTokenBudget: Int = ContextBuilderDefaults.planTokenBudget {
-        didSet {
-            guard planTokenBudget != oldValue else { return }
-            guard !isRestoringState else { return }
-            persistPlanTokenBudgetToWorkspace()
-        }
+    func resetContextBuilderBehaviorSettings() {
+        settingsManager.setContextBuilderBehaviorSettings(ContextBuilderDefaults.behaviorSettings, commit: true)
+    }
+
+    private func updateContextBuilderBehavior(
+        _ mutation: (inout ContextBuilderBehaviorSettings) -> Void
+    ) {
+        var settings = settingsManager.contextBuilderBehaviorSettings()
+        mutation(&settings)
+        settingsManager.setContextBuilderBehaviorSettings(settings, commit: true)
     }
 
     @Published private(set) var sessions: [UUID: TabSession] = [:]
@@ -888,7 +861,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private weak var oracleViewModel: OracleViewModel?
     private let maxHistoryCount = 5
     private var isRestoringState = false
-    private let settingsManager = GlobalSettingsStore.shared
+    private let settingsManager: GlobalSettingsStore
     private var cancellables = Set<AnyCancellable>()
 
     private var currentWorkspaceID: UUID? {
@@ -913,6 +886,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var codexModelsSubscriptionTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
+    private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private let codexModelPollingService: CodexModelPollingService
     private var hasPreparedForWindowClose = false
 
@@ -923,6 +897,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
         oracleViewModel: OracleViewModel,
+        settingsManager: GlobalSettingsStore = .shared,
         providerFactory: ProviderFactory? = nil,
         codexModelPollingService: CodexModelPollingService = .shared
     ) {
@@ -930,6 +905,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.workspaceManager = workspaceManager
         self.mcpServer = mcpServer
         self.oracleViewModel = oracleViewModel
+        self.settingsManager = settingsManager
         self.codexModelPollingService = codexModelPollingService
         self.providerFactory = providerFactory ?? { agent, modelString, workspacePath in
             AgentRuntimeProviderService.shared.makeProvider(
@@ -982,14 +958,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // Live cross-window sync: when another window mutates the shared global store
-        // (Context Builder agent/model, role defaults), re-apply the persisted selection
-        // without waiting for a workspace switch or recommendations pass. Dispatched to the
-        // main queue and guarded by `isRestoringState` to prevent feedback loops.
+        // Live cross-window sync for computed global settings and persisted model selection
         settingsManager.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self else { return }
+                objectWillChange.send()
                 guard !isRestoringState else { return }
                 applyEffectiveAgentModel()
             }
@@ -1119,6 +1093,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
+        updateGrokBuildModelPolling(startPolling: startCursorPolling)
     }
 
     private func updateCodexModelPolling() {
@@ -1235,7 +1210,46 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         cursorModelsSubscriptionTask = nil
     }
 
+    private func updateGrokBuildModelPolling(startPolling: Bool = true) {
+        guard selectedAgent == .grokBuild else {
+            stopGrokBuildModelsSubscription()
+            return
+        }
+        guard startPolling,
+              AgentModelCatalog.isAgentAvailable(.grokBuild, availability: agentAvailabilityContext)
+        else {
+            return
+        }
+        startGrokBuildModelsSubscriptionIfNeeded()
+    }
+
+    private func startGrokBuildModelsSubscriptionIfNeeded() {
+        guard !hasPreparedForWindowClose else { return }
+        guard grokBuildModelsSubscriptionTask == nil else { return }
+        let workspacePath = currentWorkspacePath
+        grokBuildModelsSubscriptionTask = Task { [weak self, workspacePath] in
+            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await _ in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    acpDynamicModelRevision &+= 1
+                    handleAgentProviderAvailabilityChanged()
+                    syncSelectedACPModelFromRegistryIfNeeded(for: .grokBuild)
+                }
+            }
+        }
+    }
+
+    private func stopGrokBuildModelsSubscription() {
+        grokBuildModelsSubscriptionTask?.cancel()
+        grokBuildModelsSubscriptionTask = nil
+    }
+
     private func syncSelectedACPModelFromRegistryIfNeeded(for agent: AgentProviderKind) {
+        // Grok's "default" selection must stick: a discovered session's current model is
+        // never auto-adopted as an explicit selection (default sends no model mutation).
+        guard agent != .grokBuild else { return }
         guard selectedAgent == agent,
               let providerID = agent.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
@@ -1271,7 +1285,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         guard let id else {
             clearBindings()
             applyEffectiveAgentModel()
-            applyWorkspaceDiscoverySettings(from: workspaceManager?.activeWorkspace)
             return
         }
         let session = session(for: id)
@@ -1285,7 +1298,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         guard let tabID = currentTabID else {
             clearBindings()
             applyEffectiveAgentModel()
-            applyWorkspaceDiscoverySettings(from: workspaceManager?.activeWorkspace)
             return
         }
         // Reset guard to allow re-emit when view appears after being hidden.
@@ -1319,33 +1331,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             workspaceID: manager.activeWorkspace?.id ?? currentWorkspaceID
         )
 
-        // Load workspace-scoped settings (tokenBudget, enhancementMode, etc.).
-        // Reading settings for a workspace ID seeds-and-saves defaults for unseen IDs,
-        // so never synthesize a placeholder UUID here: during startup/restore races with
-        // no active workspace that would write garbage entries into globalSettings.json.
-        let workspaceSettings: ChatGlobalSettings? = {
-            guard let workspaceID = manager.activeWorkspace?.id ?? currentWorkspaceID else { return nil }
-            return settingsManager.chatSettings(for: workspaceID)
-        }()
-
-        // Token budget: workspace setting
-        tokenBudget = workspaceSettings?.discoveryTokenBudget ?? ContextBuilderDefaults.discoveryTokenBudget
-
-        // Enhancement mode: workspace setting
-        if let modeString = workspaceSettings?.discoveryEnhancementMode,
-           let mode = PromptEnhancementMode(rawValue: modeString)
-        {
-            enhancementMode = mode
-        } else {
-            enhancementMode = .fullRewrite
-        }
-
-        // Auto-generate plan: tab setting, falling back to workspace default
-        let workspaceAutoGenerate = workspaceSettings?.discoveryAutoGeneratePlan ?? ContextBuilderDefaults.autoGeneratePlan
-        let tabAutoGenerate = tabState.contextBuilder.autoGeneratePlan ?? workspaceAutoGenerate
-        session.autoGeneratePlan = tabAutoGenerate
-        autoGeneratePlan = tabAutoGenerate
-
         // Selected follow-up type: tab setting, defaults to .plan
         let tabFollowUpType: ContextBuilderFollowUpType = if let rawType = tabState.contextBuilder.followUpTypeRaw,
                                                              let parsedType = ContextBuilderFollowUpType(rawValue: rawType)
@@ -1356,15 +1341,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         session.selectedFollowUpType = tabFollowUpType
         selectedFollowUpType = tabFollowUpType
-
-        // Allow clarifying questions: workspace setting only (not tab-specific), defaults to true for UI
-        allowClarifyingQuestions = workspaceSettings?.discoveryAllowClarifyingQuestions ?? true
-        // Allow clarifying questions for MCP: workspace setting only, defaults to false
-        allowClarifyingQuestionsForMCP = workspaceSettings?.discoveryAllowClarifyingQuestionsForMCP ?? false
-        // Question timeout: workspace setting only
-        questionTimeoutSeconds = workspaceSettings?.discoveryQuestionTimeoutSeconds ?? ContextBuilderDefaults.questionTimeoutSeconds
-        // Plan token budget: workspace setting only, defaults to 120k
-        planTokenBudget = workspaceSettings?.discoveryPlanTokenBudget ?? 120_000
 
         // Apply agent/model from the effective Agent Models profile when a configured provider is currently available.
         if let normalizedAgentSelection {
@@ -1395,11 +1371,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         mcpPlanModel = session.mcpPlanModel
         // Per-tab clarifying questions state
         pendingAskUser = session.pendingAskUser
-        // Per-tab auto-generate plan setting
-        autoGeneratePlan = session.autoGeneratePlan
         // Per-tab selected follow-up type
         selectedFollowUpType = session.selectedFollowUpType
-        // Agent/model are global; token budget and enhancement mode are workspace-scoped.
+        // Agent/model and behavior settings resolve outside tab state.
         contextBuilderInstructions = session.contextBuilderInstructions
         selectedContextBuilderPromptIDs = session.selectedContextBuilderPromptIDs
         isRestoringState = false
@@ -1434,14 +1408,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         contextBuilderInstructions = ""
         selectedContextBuilderPromptIDs = []
-        tokenBudget = ContextBuilderDefaults.discoveryTokenBudget
-        enhancementMode = ContextBuilderDefaults.enhancementMode
-        autoGeneratePlan = ContextBuilderDefaults.autoGeneratePlan
         selectedFollowUpType = .plan
-        allowClarifyingQuestions = ContextBuilderDefaults.allowClarifyingQuestions
-        allowClarifyingQuestionsForMCP = ContextBuilderDefaults.allowClarifyingQuestionsForMCP
-        questionTimeoutSeconds = ContextBuilderDefaults.questionTimeoutSeconds
-        planTokenBudget = ContextBuilderDefaults.planTokenBudget
         isRestoringState = false
         updateDynamicModelPolling(startCursorPolling: false)
     }
@@ -1519,10 +1486,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let retainedMCPRunTabs = Set(activeRecords.filter(\.origin.isMCP).map(\.tabID))
         tabsWithActiveContextBuilderRun.formIntersection(retainedMCPRunTabs)
 
-        guard let workspace else { return }
-        // Apply workspace defaults after clearing bindings (will be overridden by tab-specific settings when tab loads)
+        guard workspace != nil else { return }
         applyEffectiveAgentModel()
-        applyWorkspaceDiscoverySettings(from: workspace)
         // Manually trigger tab reload since $activeComposeTabID uses .removeDuplicates()
         // and won't emit if the tab ID hasn't changed. Since we just set lastProcessedTabID = nil,
         // onTabChanged will reload the current tab's state.
@@ -1608,30 +1573,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         isRestoringState = false
         refreshAvailableAgents()
         updateDynamicModelPolling(startCursorPolling: false)
-    }
-
-    /// Load workspace-scoped discovery defaults (token budget, enhancement mode, clarifying questions, plan budget).
-    /// Used during workspace switch to initialize defaults before tab-specific settings are loaded.
-    private func applyWorkspaceDiscoverySettings(from workspace: WorkspaceModel?) {
-        guard let id = workspace?.id ?? currentWorkspaceID else { return }
-        let settings = settingsManager.chatSettings(for: id)
-
-        isRestoringState = true
-        tokenBudget = settings.discoveryTokenBudget ?? ContextBuilderDefaults.discoveryTokenBudget
-        // Restore enhancement mode from raw value, with migration from old Bool setting
-        if let modeString = settings.discoveryEnhancementMode,
-           let mode = PromptEnhancementMode(rawValue: modeString)
-        {
-            enhancementMode = mode
-        } else {
-            enhancementMode = ContextBuilderDefaults.enhancementMode
-        }
-        allowClarifyingQuestions = settings.discoveryAllowClarifyingQuestions ?? ContextBuilderDefaults.allowClarifyingQuestions
-        allowClarifyingQuestionsForMCP = settings.discoveryAllowClarifyingQuestionsForMCP ?? ContextBuilderDefaults.allowClarifyingQuestionsForMCP
-        questionTimeoutSeconds = settings.discoveryQuestionTimeoutSeconds ?? ContextBuilderDefaults.questionTimeoutSeconds
-        planTokenBudget = settings.discoveryPlanTokenBudget ?? ContextBuilderDefaults.planTokenBudget
-        autoGeneratePlan = settings.discoveryAutoGeneratePlan ?? ContextBuilderDefaults.autoGeneratePlan
-        isRestoringState = false
     }
 
     /// Update the effective Agent Models profile's Context Builder selection.
@@ -1723,7 +1664,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "The target workspace Context Builder provider is not available. Verify its Models settings and provider credentials."]
             )
         }
-        let settings = settingsManager.chatSettings(for: identity.workspaceID)
+        let behaviorSettings = settingsManager.contextBuilderBehaviorSettings()
         let providerWorkspacePath = workspaceContext?.providerWorkspacePath ?? workspace.repoPaths.first
         guard let providerWorkspacePath else {
             throw NSError(
@@ -1742,21 +1683,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "The target workspace provider root is unavailable: \(providerWorkspacePath)"]
             )
         }
-        let enhancement = settings.discoveryEnhancementMode
-            .flatMap { PromptEnhancementMode(rawValue: $0) }
-            ?? ContextBuilderDefaults.enhancementMode
-        let inactiveTarget = manager.activeWorkspaceID != identity.workspaceID
+        let wantsResponse = responseType.flatMap {
+            ContextBuilderResponseType(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        }?.wantsResponse ?? false
+        let runBehavior = ContextBuilderRunBehavior.mcp(
+            settings: behaviorSettings,
+            wantsResponse: wantsResponse,
+            targetIsActive: manager.activeWorkspaceID == identity.workspaceID
+        )
         let configuration = ContextBuilderMCPRunConfiguration(
             identity: identity,
             nestedTabContext: nestedTabContext,
             providerWorkspacePath: StandardizedPath.absolute(providerWorkspacePath),
-            discoveryTokenBudget: settings.discoveryTokenBudget ?? ContextBuilderDefaults.discoveryTokenBudget,
-            planTokenBudget: settings.discoveryPlanTokenBudget ?? ContextBuilderDefaults.planTokenBudget,
-            enhancementMode: enhancement,
-            allowClarifyingQuestions: inactiveTarget
-                ? false
-                : settings.discoveryAllowClarifyingQuestionsForMCP ?? ContextBuilderDefaults.allowClarifyingQuestionsForMCP,
-            questionTimeoutSeconds: settings.discoveryQuestionTimeoutSeconds ?? ContextBuilderDefaults.questionTimeoutSeconds,
+            runBehavior: runBehavior,
             responseType: responseType,
             planningModelRaw: profile.planningModelRaw,
             isSystemWorkspace: workspace.isSystemWorkspace
@@ -1768,75 +1707,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
     }
 
-    @MainActor
-    func resolvedMCPContextBuilderBudget(for workspaceID: UUID, wantsResponse: Bool) -> Int {
-        let settings = settingsManager.chatSettings(for: workspaceID)
-        return ContextBuilderBudgetResolver.resolveBudget(
-            wantsResponse: wantsResponse,
-            discoveryTokenBudget: settings.discoveryTokenBudget,
-            planTokenBudget: settings.discoveryPlanTokenBudget
-        )
-    }
-
-    /// Update workspace defaults for token budget (used as default when creating new tabs).
-    /// Note: Settings are saved to both the current tab and workspace defaults.
-    private func persistTokenBudgetToWorkspace() {
-        guard !isRestoringState, let wsID = currentWorkspaceID else { return }
-        var settings = settingsManager.chatSettings(for: wsID)
-        settings.discoveryTokenBudget = tokenBudget
-        settingsManager.updateChatSettings(settings, commit: true)
-    }
-
-    /// Update workspace defaults for enhancement mode (used as default when creating new tabs).
-    /// Note: Settings are saved to both the current tab and workspace defaults.
-    private func persistEnhancementModeToWorkspace() {
-        guard !isRestoringState, let wsID = currentWorkspaceID else { return }
-        var settings = settingsManager.chatSettings(for: wsID)
-        settings.discoveryEnhancementMode = enhancementMode.rawValue
-        settingsManager.updateChatSettings(settings, commit: true)
-    }
-
-    /// Update workspace setting for allowing clarifying questions during discovery.
-    private func persistAllowClarifyingQuestionsToWorkspace() {
-        guard !isRestoringState, let wsID = currentWorkspaceID else { return }
-        var settings = settingsManager.chatSettings(for: wsID)
-        settings.discoveryAllowClarifyingQuestions = allowClarifyingQuestions
-        settingsManager.updateChatSettings(settings, commit: true)
-    }
-
-    /// Update workspace setting for allowing clarifying questions during MCP-triggered discovery.
-    private func persistAllowClarifyingQuestionsForMCPToWorkspace() {
-        guard !isRestoringState, let wsID = currentWorkspaceID else { return }
-        var settings = settingsManager.chatSettings(for: wsID)
-        settings.discoveryAllowClarifyingQuestionsForMCP = allowClarifyingQuestionsForMCP
-        settingsManager.updateChatSettings(settings, commit: true)
-    }
-
-    /// Update workspace setting for question timeout.
-    private func persistQuestionTimeoutToWorkspace() {
-        guard !isRestoringState, let wsID = currentWorkspaceID else { return }
-        var settings = settingsManager.chatSettings(for: wsID)
-        settings.discoveryQuestionTimeoutSeconds = questionTimeoutSeconds
-        settingsManager.updateChatSettings(settings, commit: true)
-    }
-
-    /// Update workspace setting for plan token budget.
-    private func persistPlanTokenBudgetToWorkspace() {
-        guard !isRestoringState, let wsID = currentWorkspaceID else { return }
-        var settings = settingsManager.chatSettings(for: wsID)
-        settings.discoveryPlanTokenBudget = planTokenBudget
-        settingsManager.updateChatSettings(settings, commit: true)
-    }
-
-    /// Update workspace default for auto-generate plan setting.
-    /// This ensures new tabs inherit the user's preference instead of falling back to a potentially stale default.
-    private func persistAutoGeneratePlanToWorkspace() {
-        guard !isRestoringState, let wsID = currentWorkspaceID else { return }
-        var settings = settingsManager.chatSettings(for: wsID)
-        settings.discoveryAutoGeneratePlan = autoGeneratePlan
-        settingsManager.updateChatSettings(settings, commit: true)
-    }
-
     // MARK: - Persistence
 
     private func persistSessionConfig(_ session: TabSession, markWorkspaceDirty: Bool = true) {
@@ -1844,11 +1714,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
               let manager = workspaceManager,
               var tab = manager.composeTab(with: session.tabID) else { return }
 
-        // Persist tab-specific settings only. Agent/model are global, while token settings
-        // are workspace-scoped; neither belongs in the tab configuration.
+        // Persist only tab-specific Context Builder state
         tab.contextBuilder = ContextBuilderTabConfig(
             instructions: session.contextBuilderInstructions,
-            autoGeneratePlan: session.autoGeneratePlan,
             followUpTypeRaw: session.selectedFollowUpType.rawValue,
             selectedContextBuilderPromptIDs: Array(session.selectedContextBuilderPromptIDs)
         )
@@ -2022,7 +1890,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             tabID: UUID,
             instructionsOverride: String? = nil,
             tokenBudgetOverride: Int? = nil,
-            persistTokenBudget _: Bool = true,
             enhancementModeOverride: PromptEnhancementMode? = nil,
             agentOverride: AgentProviderKind? = nil,
             modelOverrideRaw: String? = nil,
@@ -2058,15 +1925,18 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 responseType: responseType
             )
             let base = resolved.configuration
+            let runBehavior = ContextBuilderRunBehavior(
+                tokenBudget: tokenBudgetOverride ?? base.runBehavior.tokenBudget,
+                enhancementMode: enhancementModeOverride ?? base.runBehavior.enhancementMode,
+                questionTimeoutSeconds: base.runBehavior.questionTimeoutSeconds,
+                allowClarifyingQuestions: base.runBehavior.allowClarifyingQuestions,
+                automaticFollowUp: nil
+            )
             let configuration = ContextBuilderMCPRunConfiguration(
                 identity: identity,
                 nestedTabContext: nested,
                 providerWorkspacePath: base.providerWorkspacePath,
-                discoveryTokenBudget: tokenBudgetOverride ?? base.discoveryTokenBudget,
-                planTokenBudget: tokenBudgetOverride ?? base.planTokenBudget,
-                enhancementMode: enhancementModeOverride ?? base.enhancementMode,
-                allowClarifyingQuestions: base.allowClarifyingQuestions,
-                questionTimeoutSeconds: base.questionTimeoutSeconds,
+                runBehavior: runBehavior,
                 responseType: responseType,
                 planningModelRaw: base.planningModelRaw,
                 isSystemWorkspace: base.isSystemWorkspace
@@ -2236,6 +2106,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             session.didUserCancelActiveContextBuilderRun = true
         }
         cancelPendingQuestion(for: session, expectedRunID: record.runID)
+        let automaticFollowUp = session.runStartBehavior?.automaticFollowUp
         clearRunStartState(for: session)
         record.takeConfigurationRestoration()?()
         if outcome != .completed,
@@ -2256,8 +2127,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             saveRunToHistory(for: session)
         }
 
-        if outcome == .completed, !session.usedAgentOutputAsPrompt {
-            maybeAutoGeneratePlan(for: session)
+        if outcome == .completed, !session.usedAgentOutputAsPrompt, let automaticFollowUp {
+            maybeGenerateAutomaticFollowUp(automaticFollowUp, for: session)
         }
 
         updateRuntimeBindings(from: session)
@@ -2521,20 +2392,27 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let mcpPreparedMessage: AgentMessage?
             if record.origin.isMCP {
                 debugLog("Building MCP-initiated agent message before acquiring the one-shot routing policy")
-                mcpPreparedMessage = await buildAgentMessage(
-                    for: session,
-                    runID: runID,
-                    workspaceContext: record.workspaceContext,
-                    mcpConfiguration: record.mcpConfiguration,
-                    agentKind: record.agentKind
-                )
+                do {
+                    mcpPreparedMessage = try await buildAgentMessage(
+                        for: session,
+                        runID: runID,
+                        workspaceContext: record.workspaceContext,
+                        mcpConfiguration: record.mcpConfiguration,
+                        agentKind: record.agentKind
+                    )
+                } catch {
+                    return .failed(error.localizedDescription)
+                }
                 guard acceptsEvents(from: record) else { return .cancelled }
             } else {
                 mcpPreparedMessage = nil
             }
 
             debugLog("Acquiring headless run lease (gate + policy)...")
-            let additionalTools = additionalToolsForContextBuilderAgent(record: record)
+            guard let runBehavior = session.runStartBehavior else {
+                return .failed(ContextBuilderRunError.missingRunBehavior.localizedDescription)
+            }
+            let additionalTools = additionalToolsForContextBuilderAgent(runBehavior: runBehavior)
             let windowID = mcpServer.windowID
             let spec = AgentRunSpec(
                 type: .discover,
@@ -2617,7 +2495,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     message = mcpPreparedMessage
                 } else {
                     debugLog("Building agent message")
-                    message = await buildAgentMessage(
+                    message = try await buildAgentMessage(
                         for: session,
                         runID: runID,
                         workspaceContext: record.workspaceContext,
@@ -3180,10 +3058,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     // MARK: - MCP tool restrictions
 
-    private func additionalToolsForContextBuilderAgent(record: ContextBuilderRunRecord) -> Set<String>? {
-        let shouldAllowQuestions = record.mcpConfiguration?.allowClarifyingQuestions
-            ?? (record.session.isMCPControlledRun ? allowClarifyingQuestionsForMCP : allowClarifyingQuestions)
-        return shouldAllowQuestions ? DiscoverMCPToolPolicy.grantedTools : nil
+    private func additionalToolsForContextBuilderAgent(
+        runBehavior: ContextBuilderRunBehavior
+    ) -> Set<String>? {
+        runBehavior.allowClarifyingQuestions ? DiscoverMCPToolPolicy.grantedTools : nil
     }
 
     private func restoreToolRestrictions(agent: AgentProviderKind, runID: UUID) async {
@@ -3252,7 +3130,30 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot,
         on record: ContextBuilderRunRecord
     ) async -> Bool {
-        guard record.installCommittedTabSnapshot(snapshot) else { return false }
+        guard record.installCommittedTabSnapshot(snapshot) else {
+            #if DEBUG
+                let recordWorkspaceName = workspaceManager?.workspaces.first(where: {
+                    $0.composeTabs.contains(where: { $0.id == record.tabID })
+                })?.name ?? "unknown"
+                let snapshotWorkspaceName = workspaceManager?.workspaces.first(where: {
+                    $0.composeTabs.contains(where: { $0.id == snapshot.identity.tabID })
+                })?.name ?? "unknown"
+                await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                    runID: record.runID,
+                    event: "context_builder.commit_retain_rejected",
+                    fields: [
+                        "snapshot_nested_run_id": snapshot.nestedRunID.uuidString,
+                        "snapshot_identity_tab_id": snapshot.identity.tabID.uuidString,
+                        "snapshot_identity_workspace_id": snapshot.identity.workspaceID.uuidString,
+                        "snapshot_workspace_name": snapshotWorkspaceName,
+                        "record_tab_id": record.tabID.uuidString,
+                        "record_workspace_name": recordWorkspaceName,
+                        "already_installed": String(record.committedTabSnapshot != nil)
+                    ]
+                )
+            #endif
+            return false
+        }
         #if DEBUG
             runTestHooks?.committedTabSnapshotCaptured?(record.runID, snapshot)
             await runTestHooks?.afterCommittedTabSnapshotCaptured?(record.runID, snapshot)
@@ -3636,62 +3537,27 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         workspaceContext: ContextBuilderWorkspaceContext?,
         mcpConfiguration: ContextBuilderMCPRunConfiguration? = nil,
         agentKind: AgentProviderKind? = nil
-    ) async -> AgentMessage {
-        // Determine token budget:
-        // - MCP runs: prefer any explicit per-run override, otherwise derive budget from response_type
-        // - UI runs with auto-generate enabled: use planTokenBudget (larger budget for plan/review/question context)
-        // - UI runs without auto-generate: use regular tokenBudget
-        // Note: MCP budget selection is independent of UI's autoGeneratePlan setting to avoid cross-feature coupling
-        let effectiveBudget: Int
-        if let mcpConfiguration {
-            effectiveBudget = session.tokenBudgetOverrideForRun ?? mcpConfiguration.effectiveTokenBudget
-        } else if session.isMCPControlledRun {
-            let wantsResponse = session.mcpResponseType.flatMap { raw in
-                ContextBuilderResponseType(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-            }?.wantsResponse ?? false
-            let resolvedMCPBudget = ContextBuilderBudgetResolver.resolveBudget(
-                wantsResponse: wantsResponse,
-                discoveryTokenBudget: tokenBudget,
-                planTokenBudget: planTokenBudget
-            )
-            effectiveBudget = session.tokenBudgetOverrideForRun ?? resolvedMCPBudget
-        } else if session.autoGeneratePlan {
-            // UI path with auto-generate: use larger plan budget
-            effectiveBudget = planTokenBudget
-        } else {
-            // UI path without auto-generate: use regular budget
-            effectiveBudget = tokenBudget
+    ) async throws -> AgentMessage {
+        guard let runBehavior = session.runStartBehavior else {
+            throw ContextBuilderRunError.missingRunBehavior
         }
-        let adjustedBudget = max(0, effectiveBudget - 1500)
+        let adjustedBudget = max(0, runBehavior.tokenBudget - 1500)
+        let responseType = mcpConfiguration?.responseType
+            ?? runBehavior.automaticFollowUp?.responseTypeString
 
-        // Use MCP-specific setting for MCP-controlled runs, UI setting for UI-triggered runs
-        let clarifyingEnabledForRun = mcpConfiguration?.allowClarifyingQuestions
-            ?? (session.isMCPControlledRun ? allowClarifyingQuestionsForMCP : allowClarifyingQuestions)
-
-        // Determine response type for discovery prompt:
-        // - MCP runs: use mcpResponseType (set by MCP handler)
-        // - UI runs with auto-generate: use selectedFollowUpType's response string (so review mode gets git guidance)
-        // - UI runs without auto-generate: nil (clarify mode)
-        let responseType: String? = if let mcpConfiguration {
-            mcpConfiguration.responseType
-        } else if session.isMCPControlledRun {
-            session.mcpResponseType
-        } else if session.autoGeneratePlan {
-            session.selectedFollowUpType.responseTypeString
-        } else {
-            nil
-        }
-
-        debugLog("buildAgentMessage: isMCPControlledRun=\(session.isMCPControlledRun), autoGeneratePlan=\(session.autoGeneratePlan), selectedFollowUpType=\(session.selectedFollowUpType), responseType=\(responseType ?? "nil"), effectiveBudget=\(effectiveBudget)")
+        debugLog(
+            "buildAgentMessage: isMCPControlledRun=\(session.isMCPControlledRun), "
+                + "responseType=\(responseType ?? "nil"), tokenBudget=\(runBehavior.tokenBudget)"
+        )
 
         let systemPrompt = SystemPromptService.discoverPrompt(
             tokenBudget: adjustedBudget,
             agentKind: agentKind ?? selectedAgent,
-            enhancementMode: mcpConfiguration?.enhancementMode ?? enhancementMode,
-            allowClarifyingQuestions: clarifyingEnabledForRun,
+            enhancementMode: runBehavior.enhancementMode,
+            allowClarifyingQuestions: runBehavior.allowClarifyingQuestions,
             responseType: responseType,
             instructions: session.contextBuilderInstructions,
-            questionTimeoutSeconds: mcpConfiguration?.questionTimeoutSeconds ?? questionTimeoutSeconds
+            questionTimeoutSeconds: runBehavior.questionTimeoutSeconds
         )
         debugLog("System prompt includes ask_user: \(systemPrompt.contains("ask_user"))")
         let userMessage = await buildAgentUserMessage(
@@ -3879,6 +3745,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         workspaceContext: ContextBuilderWorkspaceContext? = nil,
         mcpConfiguration: ContextBuilderMCPRunConfiguration? = nil
     ) {
+        if let mcpConfiguration {
+            session.runStartBehavior = mcpConfiguration.runBehavior
+        } else {
+            session.runStartBehavior = ContextBuilderRunBehavior.ui(
+                settings: settingsManager.contextBuilderBehaviorSettings(),
+                selectedFollowUp: session.selectedFollowUpType
+            )
+        }
+
         if let workspaceContext {
             session.runStartContextBuilderPromptIDs = Set(workspaceContext.frozenTabContext.selectedContextBuilderPromptIDs)
             session.runStartPromptText = workspaceContext.frozenTabContext.promptText
@@ -3930,6 +3805,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.runStartPromptText = nil
         session.runStartSelection = nil
         session.runStartContextBuilderPromptIDs = nil
+        session.runStartBehavior = nil
     }
 
     // MARK: - Error handling
@@ -4222,49 +4098,36 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         return (tabName?.isEmpty == false) ? tabName! : defaultName
     }
 
-    /// Called when a tab's discovery run completes successfully.
-    /// If auto-generate is enabled and the run is not MCP-controlled,
-    /// start background plan generation for that tab.
-    private func maybeAutoGeneratePlan(for session: TabSession) {
-        // 0. Only auto-generate for truly completed runs without user cancel intent
+    /// Starts the run-start-captured automatic analysis after successful discovery.
+    private func maybeGenerateAutomaticFollowUp(
+        _ followUp: ContextBuilderFollowUpType,
+        for session: TabSession
+    ) {
         guard session.agentRunState == .completed else {
-            debugLog("Auto-plan skipped: run not completed for tab=\(session.tabID)")
+            debugLog("Automatic analysis skipped: run not completed for tab=\(session.tabID)")
             return
         }
         guard !session.didUserCancelActiveContextBuilderRun, !session.isCancelling else {
-            debugLog("Auto-plan skipped: user cancellation detected for tab=\(session.tabID)")
+            debugLog("Automatic analysis skipped: user cancellation detected for tab=\(session.tabID)")
             return
         }
-
-        // 1. Respect per-tab setting (falls back to workspace default if not explicitly set)
-        guard session.autoGeneratePlan else {
-            debugLog("Auto-plan disabled; skipping for tab=\(session.tabID)")
-            return
-        }
-
-        // 2. MCP runs manage their own plan generation
         guard !session.isMCPControlledRun else {
-            debugLog("Auto-plan suppressed for MCP-controlled run tab=\(session.tabID)")
+            debugLog("Automatic analysis suppressed for MCP-controlled run tab=\(session.tabID)")
             return
         }
-
-        // 3. Need a OracleViewModel to drive follow-up generation
         guard let oracleVM = oracleViewModel else {
-            debugLog("Auto-plan: OracleViewModel not set; skipping for tab=\(session.tabID)")
+            debugLog("Automatic analysis: OracleViewModel not set; skipping for tab=\(session.tabID)")
             return
         }
-
-        // 4. Only auto-generate if there's a non-empty effective prompt
         guard effectivePrompt(for: session.tabID) != nil else {
-            debugLog("Auto-plan: no effective prompt; skipping for tab=\(session.tabID)")
+            debugLog("Automatic analysis: no effective prompt; skipping for tab=\(session.tabID)")
             return
         }
 
-        // Use the centralized chat name logic and selected follow-up type
         let chatName = chatNameForTab(session.tabID)
-        let mode = session.selectedFollowUpType.headlessMode
+        let mode = followUp.headlessMode
 
-        debugLog("Auto-plan: starting background generation for tab=\(session.tabID), mode=\(mode)")
+        debugLog("Automatic analysis: starting background generation for tab=\(session.tabID), mode=\(mode)")
         startBackgroundPlanGeneration(
             tabID: session.tabID,
             oracleViewModel: oracleVM,
@@ -4455,6 +4318,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         clearPendingBackgroundPlanUIRefresh(for: tabID)
         applyPlanPreview(to: session)
         updateRuntimeBindings(from: session)
+    }
+
+    func activeRunBehavior(for tabID: UUID?) -> ContextBuilderRunBehavior? {
+        guard let tabID,
+              let record = runRegistry.activeRecord(tabID: tabID),
+              acceptsEvents(from: record)
+        else {
+            return nil
+        }
+        return record.session.runStartBehavior
     }
 
     /// Returns the plan status for a specific tab, centralizing the view's switch logic.
@@ -5067,6 +4940,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             return false
         }
         return record.runID == runID
+    }
+
+    func capturedQuestionTimeoutSeconds(tabID: UUID, runID: UUID) -> TimeInterval? {
+        guard let record = runRegistry.activeRecord(tabID: tabID),
+              record.runID == runID,
+              acceptsEvents(from: record)
+        else {
+            return nil
+        }
+        return record.session.runStartBehavior?.questionTimeoutSeconds
     }
 
     func askUserInteraction(

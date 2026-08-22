@@ -4,6 +4,10 @@ import Foundation
 protocol CodexSessionControllerTurnDispatchTestDefaults: CodexSessionControlling {}
 
 extension CodexSessionControllerTurnDispatchTestDefaults {
+    func listHooksForCurrentWorkspace() async throws -> CodexHookInventory {
+        try CodexHookInventory(executionCWD: "/tmp", hooks: [])
+    }
+
     func startUserTurn(
         text _: String,
         images _: [AgentImageAttachment],

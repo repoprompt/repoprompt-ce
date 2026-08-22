@@ -586,6 +586,7 @@
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.ordinary.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.control.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.smallRead.rawValue"))
+            XCTAssertTrue(sibling.contains("MCPConnectionCallLane.fileRead.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.gitRead.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.fileSearch.rawValue"))
             XCTAssertTrue(sibling.contains("maximum_active_count"))
@@ -1085,10 +1086,11 @@
                 XCTAssertEqual((autoSelection[key] as? NSNumber)?.intValue, 0, key)
             }
             let smallReadLaneLimit = ServerNetworkManager.smallReadCallLaneLimit
+            let fileReadLaneLimit = ServerNetworkManager.fileReadCallLaneLimit
             let controlLaneLimit = ServerNetworkManager.controlCallLaneLimit
             let gitReadLaneLimit = ServerNetworkManager.gitReadCallLaneLimit
             let fileSearchLaneLimit = ServerNetworkManager.fileSearchCallLaneLimit
-            let totalLaneLimit = 1 + controlLaneLimit + smallReadLaneLimit + gitReadLaneLimit + fileSearchLaneLimit
+            let totalLaneLimit = 1 + controlLaneLimit + smallReadLaneLimit + fileReadLaneLimit + gitReadLaneLimit + fileSearchLaneLimit
             let limiter = try XCTUnwrap(runtime["limiter"] as? [String: Any])
             XCTAssertEqual(limiter["found"] as? Bool, true)
             XCTAssertEqual(limiter["connection_id"] as? String, connectionID.uuidString)
@@ -1106,6 +1108,7 @@
                 ("ordinary", 1),
                 ("control", controlLaneLimit),
                 ("small_read", smallReadLaneLimit),
+                ("file_read", fileReadLaneLimit),
                 ("git_read", gitReadLaneLimit),
                 ("file_search", fileSearchLaneLimit)
             ] {

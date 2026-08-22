@@ -211,12 +211,104 @@ actor WindowSessionDiskWriter {
     }
 }
 
+@MainActor
+final class WorkspaceActivityCoordinator {
+    struct ActivationLease: Equatable {
+        fileprivate let id: UUID
+        fileprivate let workspaceID: UUID
+    }
+
+    struct DeletionLease: Equatable {
+        fileprivate let id: UUID
+        let workspaceIDs: Set<UUID>
+    }
+
+    struct DeletionClaim: Equatable {
+        let lease: DeletionLease
+        let blockedReasonsByWorkspaceID: [UUID: String]
+    }
+
+    private final class WeakWorkspaceManager {
+        weak var value: WorkspaceManagerViewModel?
+
+        init(_ value: WorkspaceManagerViewModel) {
+            self.value = value
+        }
+    }
+
+    private var workspaceManagersByOwnerID: [UUID: WeakWorkspaceManager] = [:]
+    private var activationWorkspaceIDByLeaseID: [UUID: UUID] = [:]
+    private var deletionLeaseIDByWorkspaceID: [UUID: UUID] = [:]
+
+    func register(ownerID: UUID, workspaceManager: WorkspaceManagerViewModel) {
+        workspaceManagersByOwnerID[ownerID] = WeakWorkspaceManager(workspaceManager)
+    }
+
+    func unregister(ownerID: UUID) {
+        workspaceManagersByOwnerID.removeValue(forKey: ownerID)
+    }
+
+    func beginActivation(workspaceID: UUID) -> ActivationLease? {
+        guard deletionLeaseIDByWorkspaceID[workspaceID] == nil else { return nil }
+        let lease = ActivationLease(id: UUID(), workspaceID: workspaceID)
+        activationWorkspaceIDByLeaseID[lease.id] = workspaceID
+        return lease
+    }
+
+    func endActivation(_ lease: ActivationLease) {
+        guard activationWorkspaceIDByLeaseID[lease.id] == lease.workspaceID else { return }
+        activationWorkspaceIDByLeaseID.removeValue(forKey: lease.id)
+    }
+
+    func claimDeletion(workspaceIDs: Set<UUID>) -> DeletionClaim {
+        pruneReleasedWorkspaceManagers()
+        let activeWorkspaceIDs = Set(workspaceManagersByOwnerID.values.compactMap {
+            $0.value?.activeWorkspaceID
+        })
+        let activatingWorkspaceIDs = Set(activationWorkspaceIDByLeaseID.values)
+        let leaseID = UUID()
+        var claimedWorkspaceIDs = Set<UUID>()
+        var blockedReasonsByWorkspaceID: [UUID: String] = [:]
+
+        for workspaceID in workspaceIDs {
+            if activeWorkspaceIDs.contains(workspaceID) {
+                blockedReasonsByWorkspaceID[workspaceID] = "Workspace is active in an open window."
+            } else if activatingWorkspaceIDs.contains(workspaceID) {
+                blockedReasonsByWorkspaceID[workspaceID] = "Workspace is being activated in another window."
+            } else if deletionLeaseIDByWorkspaceID[workspaceID] != nil {
+                blockedReasonsByWorkspaceID[workspaceID] = "Workspace deletion is already in progress."
+            } else {
+                deletionLeaseIDByWorkspaceID[workspaceID] = leaseID
+                claimedWorkspaceIDs.insert(workspaceID)
+            }
+        }
+
+        return DeletionClaim(
+            lease: DeletionLease(id: leaseID, workspaceIDs: claimedWorkspaceIDs),
+            blockedReasonsByWorkspaceID: blockedReasonsByWorkspaceID
+        )
+    }
+
+    func releaseDeletion(_ lease: DeletionLease) {
+        for workspaceID in lease.workspaceIDs where deletionLeaseIDByWorkspaceID[workspaceID] == lease.id {
+            deletionLeaseIDByWorkspaceID.removeValue(forKey: workspaceID)
+        }
+    }
+
+    private func pruneReleasedWorkspaceManagers() {
+        workspaceManagersByOwnerID = workspaceManagersByOwnerID.filter { $0.value.value != nil }
+    }
+}
+
 /// Manages all the open WindowState objects, letting you easily
 /// find the "latest" one or broadcast to all windows if needed.
 @MainActor
 class WindowStatesManager: ObservableObject {
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
+
+    /// Serializes workspace activation and deletion claims across every app window.
+    let workspaceActivityCoordinator = WorkspaceActivityCoordinator()
 
     /// Flag indicating the app is terminating. When true, observation-triggering
     /// operations should be skipped to prevent EXC_BAD_ACCESS crashes during shutdown.
@@ -956,6 +1048,7 @@ class WindowStatesManager: ObservableObject {
         await CodexModelPollingService.shared.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
+        await GrokBuildACPModelPollingService.shared.shutdown()
     }
 
     // MARK: - Instance Number Management

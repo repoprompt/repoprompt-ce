@@ -28,69 +28,52 @@ struct WorkspaceFileMutationWriteResult: Equatable {
 struct WorkspaceFileMutationService {
     let store: WorkspaceFileContextStore
 
+    func resolveExactExistingFile(
+        _ input: WorkspaceExactFileInput,
+        namespace: WorkspaceExactFileNamespace
+    ) async throws -> WorkspaceExactExistingFileResolution {
+        try await store.resolveExactExistingWorkspaceFile(input, namespace: namespace)
+    }
+
     func exactExistingFile(
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceFileRecord? {
-        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let isAbsoluteInput = (trimmed as NSString).expandingTildeInPath.hasPrefix("/")
-        if await store.exactPathResolutionIssue(for: trimmed, kind: .file, rootScope: rootScope) != nil {
-            guard await store.pruneMissingCatalogFilesForExactMutationLookup(trimmed, rootScope: rootScope) else { return nil }
-            guard await store.exactPathResolutionIssue(for: trimmed, kind: .file, rootScope: rootScope) == nil else { return nil }
-        }
-        switch await store.lookupCatalogFileForExplicitRequest(trimmed, rootScope: rootScope) {
-        case let .matched(file):
-            return await store.validateCatalogFileStillPresent(file)
-        case .ambiguous, .blocked:
-            return nil
-        case .noCandidate:
-            break
-        }
-        switch try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope) {
-        case let .some(.materialized(file)):
-            return await store.validateCatalogFileStillPresent(file)
-        case .some(.ambiguous), .some(.blocked):
-            return nil
-        case .some(.noCandidate):
-            // Explicit absolute lookup already checked the exact on-disk target across the
-            // authorized roots. A miss must not fall through to whole-catalog path matching:
-            // Context Builder can invalidate those indexes and make this literal mutation wait
-            // behind an unrelated rebuild.
-            if isAbsoluteInput { return nil }
-        case .none:
-            break
-        }
-        guard let file = await store.lookupPath(
-            WorkspacePathLookupRequest(userPath: trimmed, profile: .moveSourceExact, rootScope: rootScope)
-        )?.file else { return nil }
-        return await store.validateCatalogFileStillPresent(file)
+        guard let input = try? WorkspaceExactFileInput.parse(userPath) else { return nil }
+        let roots = await store.rootRefs(scope: rootScope)
+        let namespace = WorkspaceExactFileNamespace.identity(roots: roots)
+        guard let resolution = try? await resolveExactExistingFile(input, namespace: namespace),
+              case let .matched(match) = resolution
+        else { return nil }
+        return match.file
     }
 
     func resolveExactExistingFileForMutation(
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> WorkspaceFileRecord {
-        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let file = await exactExistingFile(trimmed, rootScope: rootScope) {
-            return file
-        }
-        switch try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope) {
-        case let .some(.materialized(file)):
-            if let current = await store.validateCatalogFileStillPresent(file) { return current }
-        case .some(.ambiguous):
+        let input: WorkspaceExactFileInput
+        do {
+            input = try WorkspaceExactFileInput.parse(userPath)
+        } catch let issue as PathResolutionIssue {
             throw FileManagerError.fileSystemServiceNotFoundWithContext(
-                "Path '\(userPath)' matches multiple workspace roots. Use a root-qualified or absolute path."
+                PathResolutionIssueRenderer.message(for: issue)
             )
-        case .some(.blocked):
-            throw FileManagerError.fileSystemServiceNotFoundWithContext("Unsafe workspace file path: \(userPath).")
-        case .some(.noCandidate), .none:
-            break
         }
-        if let issue = await store.exactPathResolutionIssue(for: trimmed, kind: .file, rootScope: rootScope) {
-            throw FileManagerError.fileSystemServiceNotFoundWithContext(PathResolutionIssueRenderer.message(for: issue))
+        let roots = await store.rootRefs(scope: rootScope)
+        let namespace = WorkspaceExactFileNamespace.identity(roots: roots)
+        switch try await resolveExactExistingFile(input, namespace: namespace) {
+        case let .matched(match):
+            return match.file
+        case let .issue(issue):
+            throw FileManagerError.fileSystemServiceNotFoundWithContext(
+                PathResolutionIssueRenderer.message(for: issue)
+            )
+        case .directory:
+            throw FileManagerError.fileSystemServiceNotFoundWithContext("Path is a directory: \(userPath).")
+        case .claimedMissing, .noCandidate:
+            throw FileManagerError.fileSystemServiceNotFoundWithContext("Unknown or unloaded path: \(userPath).")
         }
-        throw FileManagerError.fileSystemServiceNotFoundWithContext("Unknown or unloaded path: \(userPath).")
     }
 
     func readText(file: WorkspaceFileRecord) async throws -> String? {
@@ -108,6 +91,29 @@ struct WorkspaceFileMutationService {
             rootMappings: mutationRootMappings
         )
         let result = try await store.editFile(rootID: file.rootID, relativePath: file.standardizedRelativePath, newContent: content)
+        if let result {
+            return .fromCatalogMaterialization(result)
+        }
+        return WorkspaceFileMutationWriteResult(diskSucceeded: true, materializedFile: nil, catalogIneligibility: nil)
+    }
+
+    @discardableResult
+    func overwriteIfUnchanged(
+        file: WorkspaceFileRecord,
+        content: String,
+        expectedOriginalContent: String,
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
+    ) async throws -> WorkspaceFileMutationWriteResult {
+        try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+            [file.standardizedFullPath],
+            rootMappings: mutationRootMappings
+        )
+        let result = try await store.editFile(
+            rootID: file.rootID,
+            relativePath: file.standardizedRelativePath,
+            newContent: content,
+            expectedOriginalContent: expectedOriginalContent
+        )
         if let result {
             return .fromCatalogMaterialization(result)
         }

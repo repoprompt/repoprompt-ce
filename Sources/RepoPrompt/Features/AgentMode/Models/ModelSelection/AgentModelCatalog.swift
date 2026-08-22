@@ -6,6 +6,7 @@ enum AgentModelCatalog {
         let codexAvailable: Bool
         let openCodeAvailable: Bool
         let cursorAvailable: Bool
+        let grokBuildAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
         let customClaudeCompatibleConfigured: Bool
@@ -15,6 +16,7 @@ enum AgentModelCatalog {
             codexAvailable: false,
             openCodeAvailable: false,
             cursorAvailable: false,
+            grokBuildAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
             customClaudeCompatibleConfigured: false
@@ -26,6 +28,7 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable && providers.contains(.codex),
                 openCodeAvailable: false,
                 cursorAvailable: cursorAvailable && providers.contains(.cursor),
+                grokBuildAvailable: grokBuildAvailable && providers.contains(.grokBuild),
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured && providers.contains(.claudeCode)
@@ -39,6 +42,7 @@ enum AgentModelCatalog {
                 codexAvailable: true,
                 openCodeAvailable: true,
                 cursorAvailable: false,
+                grokBuildAvailable: false,
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -50,6 +54,7 @@ enum AgentModelCatalog {
             codexAvailable: Bool = true,
             openCodeAvailable: Bool = true,
             cursorAvailable: Bool = false,
+            grokBuildAvailable: Bool = false,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
             customClaudeCompatibleConfigured: Bool = false
@@ -58,6 +63,7 @@ enum AgentModelCatalog {
             self.codexAvailable = codexAvailable
             self.openCodeAvailable = openCodeAvailable
             self.cursorAvailable = cursorAvailable
+            self.grokBuildAvailable = grokBuildAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
             self.customClaudeCompatibleConfigured = customClaudeCompatibleConfigured
@@ -80,6 +86,7 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable || agentKind == .codexExec,
                 openCodeAvailable: openCodeAvailable || agentKind == .openCode,
                 cursorAvailable: cursorAvailable || agentKind == .cursor,
+                grokBuildAvailable: grokBuildAvailable || agentKind == .grokBuild,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured || agentKind == .customClaudeCompatible
@@ -179,14 +186,15 @@ enum AgentModelCatalog {
         .codexExec,
         .claudeCode,
         .openCode,
-        .cursor
+        .cursor,
+        .grokBuild
     ]
 
     static func selectableAgents(
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        [.codexExec, .claudeCode, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
             .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
     }
 
@@ -216,6 +224,8 @@ enum AgentModelCatalog {
             availability.openCodeAvailable
         case .cursor:
             availability.cursorAvailable
+        case .grokBuild:
+            availability.grokBuildAvailable
         }
     }
 
@@ -228,6 +238,11 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return AgentModel.cursorAuto.rawValue
         }
+        if agentKind == .grokBuild {
+            // Grok's default must never become a discovered session's current model:
+            // "default" sends no model mutation and follows Grok's own configuration.
+            return AgentModel.defaultModel.rawValue
+        }
         if isAgentAvailable(agentKind, availability: availability),
            let preferredModelRaw = resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw
         {
@@ -239,7 +254,7 @@ enum AgentModelCatalog {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
-        case .codexExec, .openCode:
+        case .codexExec, .openCode, .grokBuild:
             return AgentModel.defaultModel.rawValue
         }
     }
@@ -329,6 +344,18 @@ enum AgentModelCatalog {
             }
             return fallbacks
         }
+        if agentKind == .grokBuild {
+            let fallback = staticOption(.defaultModel, for: .grokBuild)
+            guard let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
+                  !discoveredOptions.isEmpty
+            else {
+                return [fallback]
+            }
+            let discoveredWithoutDefault = discoveredOptions.filter {
+                $0.rawValue.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+            }
+            return [fallback] + discoveredWithoutDefault
+        }
         if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
            !discoveredOptions.isEmpty
         {
@@ -347,7 +374,7 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
@@ -371,6 +398,11 @@ enum AgentModelCatalog {
         }
         if agentKind == .cursor,
            normalized.caseInsensitiveCompare(AgentModel.cursorComposer2.rawValue) == .orderedSame
+        {
+            return true
+        }
+        if agentKind == .grokBuild,
+           normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
         {
             return true
         }
@@ -1368,7 +1400,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild:
             nil
         }
     }
@@ -1571,7 +1603,7 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild:
             true
         }
     }
@@ -1821,7 +1853,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt54MiniMedium.rawValue),
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.codexMini.rawValue),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue),
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .engineer:
             [
@@ -1830,7 +1863,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeSonnet.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .pair:
             [
@@ -1839,7 +1873,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeOpus.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .design:
             [
@@ -1848,7 +1883,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolMedium.rawValue)
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolMedium.rawValue),
+                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         }
     }

@@ -44,6 +44,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             `{"path": "file.swift", "edits": [{"search": "old1", "replace": "new1"}, {"search": "old2", "replace": "new2"}]}`
 
             Note: Modes are mutually exclusive. Providing more than one will result in an error.
+            Existing workspace files use exact, literal-first paths. Reuse the path returned by `read_file`; `<root-alias>//<relative-path>` explicitly selects a root when needed. Approved external read paths are not editable. Missing-file creation keeps its separate destination rules and does not accept the explicit `//` form.
 
             Options: `verbose` (show diff), `on_missing` (for rewrite only: "error" | "create", default: "error")
             Edits are literal. Use real JSON newlines for multi-line search/replace (not `\\n`). If a match fails, the tool may retry internally with escape decoding.
@@ -107,11 +108,22 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             ) {
                 return Self.retryableFailureSummary(request: request, failure: failure)
             }
-            let effectivePath = lookupContext.translateInputPath(request.path)
-            let displayPath = lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: effectivePath, display: .relative) ?? request.path
+            let exactInput: WorkspaceExactFileInput
             do {
-                _ = try await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
-                    userPath: effectivePath,
+                exactInput = try WorkspaceExactFileInput.parse(request.path)
+            } catch let issue as PathResolutionIssue {
+                throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
+            }
+            let store = await MainActor.run { dependencies.context.promptVM.workspaceFileContextStore }
+            let roots = await store.rootRefs(scope: lookupContext.rootScope)
+            let namespace = lookupContext.exactFileNamespace(storeRoots: roots)
+            let freshnessPath = switch exactInput {
+            case let .absolute(path): lookupContext.translateInputPath(path)
+            case .explicitRoot, .relative: exactInput.renderedPath
+            }
+            do {
+                _ = try await store.awaitAppliedIngressForExplicitRequest(
+                    userPath: freshnessPath,
                     fallbackScope: lookupContext.rootScope,
                     timeout: .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
                 )
@@ -121,13 +133,34 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                     failure: .workspaceFreshnessUnavailable()
                 )
             }
-            if let issue = await dependencies.context.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: effectivePath, kind: .file, rootScope: lookupContext.rootScope) {
+
+            let mutationService = WorkspaceFileMutationService(store: store)
+            let resolution = try await mutationService.resolveExactExistingFile(exactInput, namespace: namespace)
+            let effectivePath: String
+            let displayPath: String
+            let target: WorkspaceFileEditHost.Target
+            switch resolution {
+            case let .matched(match):
+                effectivePath = match.file.standardizedFullPath
+                displayPath = match.canonicalPath
+                target = .existing(match.file)
+            case let .issue(issue):
                 throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
+            case .directory:
+                throw MCPError.invalidParams("'\(request.path)' is a folder; apply_edits requires a file path.")
+            case .claimedMissing, .noCandidate:
+                if case .explicitRoot = exactInput {
+                    throw MCPError.invalidParams("File '\(request.path)' does not exist. Explicit root-qualified paths identify existing files only.")
+                }
+                effectivePath = lookupContext.translateInputPath(request.path)
+                displayPath = request.path
+                target = .create(path: effectivePath)
             }
-            let store = await MainActor.run { dependencies.context.promptVM.workspaceFileContextStore }
+
             let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
             let host = WorkspaceFileEditHost(
                 store: store,
+                target: target,
                 selectionCoordinator: dependencies.context.selectionCoordinator,
                 lookupRootScope: lookupContext.rootScope,
                 createPathResolutionPolicy: .canonicalAliasFirst,
@@ -205,11 +238,22 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                         EditFlowPerf.Stage.ApplyEdits.hostWrite,
                         EditFlowPerf.Dimensions(fileBytes: previewResult.updatedText.utf8.count, appliedCount: previewResult.editsApplied)
                     ) {
-                        try await host.writeText(
-                            path: effectivePath,
-                            content: previewResult.updatedText,
-                            overwrite: preview.exists
-                        )
+                        if preview.exists {
+                            guard let originalText = preview.originalText else {
+                                throw MCPError.internalError("Existing-file preview did not capture its original content.")
+                            }
+                            try await host.writeTextIfUnchanged(
+                                path: effectivePath,
+                                content: previewResult.updatedText,
+                                expectedOriginalText: originalText
+                            )
+                        } else {
+                            try await host.writeText(
+                                path: effectivePath,
+                                content: previewResult.updatedText,
+                                overwrite: false
+                            )
+                        }
                     }
                     let freshness = await postMutationFreshness(
                         userPath: effectivePath,

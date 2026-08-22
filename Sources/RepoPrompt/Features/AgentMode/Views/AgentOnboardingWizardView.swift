@@ -1125,6 +1125,19 @@ private struct ProvidersStepView: View {
                     requiresPro: false,
                     onTest: { viewModel.testCursor() }
                 )
+
+                CompactProviderRow(
+                    name: "Grok Build",
+                    icon: "bolt.circle.fill",
+                    description: "xAI Grok Build ACP runtime — Agent Mode and Context Builder via `grok agent stdio`",
+                    isConnected: viewModel.grokBuildConnected,
+                    isLoading: viewModel.isLoadingGrokBuild,
+                    errorText: viewModel.grokBuildError,
+                    setupHint: "Install Grok Build and run 'grok login'",
+                    isRecommended: false,
+                    requiresPro: false,
+                    onTest: { viewModel.testGrokBuild() }
+                )
             }
         }
     }

@@ -121,6 +121,34 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
         }
     }
 
+    func testHookApprovalStaleInteractionDiagnosticDoesNotLeakMetadata() async throws {
+        let fixture = try await ControlledApprovalSessionFixture.make()
+        addTeardownBlock { @MainActor in await fixture.cleanup() }
+        let currentInteractionID = try fixture.installHookApprovalPrivacySentinels()
+        let staleInteractionID = UUID()
+        let pendingReview = try XCTUnwrap(fixture.session.pendingCodexHookReview)
+        let expectedMessage = "interaction_id \"\(staleInteractionID.uuidString)\" does not match the current pending hook_approval interaction_id \"\(currentInteractionID.uuidString)\". No response was applied. Call agent_run with op=\"poll\" or op=\"wait\" and session_id=\"\(fixture.sessionID.uuidString)\" to fetch the latest snapshot before responding."
+
+        await assertInvalidParams(
+            service: fixture.service,
+            sessionID: fixture.sessionID,
+            interactionID: staleInteractionID,
+            arguments: ["response": .string("approve_selected")],
+            expectedMessage: expectedMessage,
+            label: "hook approval stale identity"
+        )
+        XCTAssertEqual(fixture.session.pendingCodexHookReview, pendingReview)
+        for sentinel in [
+            "HOOK_KEY_SENTINEL",
+            "HOOK_PATH_SENTINEL",
+            "HOOK_HASH_SENTINEL",
+            "HOOK_COMMAND_SENTINEL",
+            "HOOK_ERROR_SENTINEL"
+        ] {
+            XCTAssertFalse(expectedMessage.contains(sentinel), sentinel)
+        }
+    }
+
     private func assertInvalidParams(
         service: AgentRunMCPToolService,
         sessionID: UUID,
@@ -138,7 +166,11 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
             _ = try await service.execute(args: args)
             XCTFail("Expected invalid params: \(label)")
         } catch let error as MCPError {
-            XCTAssertEqual(String(describing: error), "[-32602] Invalid params: \(expectedMessage)", label)
+            XCTAssertEqual(error.code, -32602, label)
+            guard case let .invalidParams(message) = error else {
+                return XCTFail("Expected MCPError.invalidParams for \(label), got code \(error.code)")
+            }
+            XCTAssertEqual(message, expectedMessage, label)
         } catch {
             XCTFail("Expected MCPError.invalidParams for \(label), got \(error)")
         }
@@ -152,83 +184,48 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
             "ELICITATION_SENTINEL", "ASSISTANT_SENTINEL", "RESPONSE_SENTINEL", "WORKTREE_SENTINEL"
         ]
 
-        let window: WindowState
-        let sessionID: UUID
-        let session: AgentModeViewModel.TabSession
-        let service: AgentRunMCPToolService
+        private let context: AgentRunMCPControlledSessionContext
 
-        private init(window: WindowState, sessionID: UUID, session: AgentModeViewModel.TabSession) {
-            self.window = window
-            self.sessionID = sessionID
-            self.session = session
-            let windowID = window.windowID
-            service = AgentRunMCPToolService(
-                toolName: MCPWindowToolName.agentRun,
-                captureRequestMetadata: {
-                    MCPServerViewModel.RequestMetadata(
-                        connectionID: UUID(),
-                        clientName: "agent-run-respond-diagnostics-tests",
-                        windowID: windowID
-                    )
-                },
-                requireTargetWindow: { window },
-                resolveRequestedTabID: { _ in nil },
-                resolveSpawnParentSourceTabID: { _ in nil },
-                resolveSpawnParentSessionID: { _, _ in nil },
-                withHeartbeat: { _, _, _, _, operation in try await operation() },
-                startRun: { _, _, _, _, _, _, _, _, _, _, _ in
-                    throw MCPError.internalError("startRun should not be used by respond diagnostics tests")
-                }
-            )
+        var window: WindowState {
+            context.window
+        }
+
+        var sessionID: UUID {
+            context.sessionID
+        }
+
+        var session: AgentModeViewModel.TabSession {
+            context.session
+        }
+
+        var service: AgentRunMCPToolService {
+            context.service
+        }
+
+        private init(context: AgentRunMCPControlledSessionContext) {
+            self.context = context
         }
 
         static func make() async throws -> ControlledApprovalSessionFixture {
-            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
-
-            let window = WindowState()
-            WindowStatesManager.shared.registerWindowState(window)
-            do {
-                let workspace = window.workspaceManager.createWorkspace(
-                    name: "Respond Diagnostics \(UUID().uuidString.prefix(8))",
-                    repoPaths: [FileManager.default.currentDirectoryPath],
-                    ephemeral: true
-                )
-                await window.workspaceManager.switchWorkspace(
-                    to: workspace,
-                    saveState: false,
-                    reason: "agentRunRespondDiagnosticsTests"
-                )
-                guard let activeWorkspace = window.workspaceManager.activeWorkspace else {
-                    throw MCPError.internalError("Expected active ephemeral workspace")
-                }
-                window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-
-                let sessionID = UUID()
-                let session = await window.agentModeViewModel.ensureSessionReady(tabID: UUID())
-                _ = window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
-                try await window.agentModeViewModel.mcpActivateControlContext(
-                    forTabID: session.tabID,
-                    sessionID: sessionID,
-                    originatingConnectionID: nil,
-                    startPending: true
-                )
-                session.runState = .waitingForApproval
-                return ControlledApprovalSessionFixture(window: window, sessionID: sessionID, session: session)
-            } catch {
-                window.beginClose()
-                await window.tearDown()
-                WindowStatesManager.shared.unregisterWindowState(window)
-                throw error
-            }
+            let context = try await AgentRunMCPControlledSessionContext.make(
+                workspaceNamePrefix: "Respond Diagnostics",
+                workspaceSwitchReason: "agentRunRespondDiagnosticsTests",
+                clientName: "agent-run-respond-diagnostics-tests",
+                unusedStartRunMessage: "startRun should not be used by respond diagnostics tests"
+            )
+            context.session.runState = .waitingForApproval
+            return ControlledApprovalSessionFixture(context: context)
         }
 
         var currentPendingInteractionID: UUID? {
-            session.pendingWorktreeMergeReview?.id ?? session.pendingPermissionsRequest?.id ?? session.pendingApproval?.id
+            session.pendingCodexHookReview?.id
+                ?? session.pendingWorktreeMergeReview?.id
+                ?? session.pendingPermissionsRequest?.id
+                ?? session.pendingApproval?.id
         }
 
         func clearPendingApprovals() {
+            session.pendingCodexHookReview = nil
             session.pendingWorktreeMergeReview = nil
             session.pendingPermissionsRequest = nil
             session.pendingApproval = nil
@@ -253,6 +250,32 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
                 details: privacySentinels ? [.init(label: "OPTION_SENTINEL", value: "RESPONSE_SENTINEL")] : []
             )
             return id
+        }
+
+        func installHookApprovalPrivacySentinels() throws -> UUID {
+            let metadata = try CodexHookMetadata(
+                eventName: "PreToolUse",
+                source: "project",
+                sourcePath: "/private/HOOK_PATH_SENTINEL",
+                key: "HOOK_KEY_SENTINEL",
+                currentHash: "HOOK_HASH_SENTINEL",
+                enabled: true,
+                handlerType: "command",
+                trustStatus: .untrusted,
+                commandOrHandler: "HOOK_COMMAND_SENTINEL"
+            )
+            let request = AgentCodexHookReviewRequest(
+                tabID: session.tabID,
+                runAttemptID: nil,
+                runID: nil,
+                executionCWD: "/private/HOOK_PATH_SENTINEL",
+                hooks: [AgentCodexHookReviewHook(metadata: metadata)],
+                phase: .writeFailed,
+                errorMessage: "HOOK_ERROR_SENTINEL",
+                gateGeneration: 1
+            )
+            session.pendingCodexHookReview = request
+            return request.id
         }
 
         @discardableResult
@@ -283,9 +306,7 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
         }
 
         func cleanup() async {
-            window.beginClose()
-            await window.tearDown()
-            WindowStatesManager.shared.unregisterWindowState(window)
+            await context.cleanup()
         }
 
         private static func makePreview() -> GitWorktreeMergePreview {

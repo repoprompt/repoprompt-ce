@@ -245,7 +245,7 @@ final class CodexSteerAckTrackerTests: XCTestCase {
 
         let replacementController = AckTrackerCodexController(gate: AckTrackerSteerGate())
         let replacementRunID = UUID()
-        session.runID = replacementRunID
+        session.installRunID(replacementRunID)
         session.runState = .running
         session.beginRunAttempt(source: "test.codexAckReplacementNoWake.replacement")
         session.codexController = replacementController
@@ -408,7 +408,7 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         )
         viewModel.test_setMCPControlledTabIDs([tabID])
         session.selectedAgent = .codexExec
-        session.runID = runID
+        session.installRunID(runID)
         session.runState = .running
         session.beginRunAttempt(source: source)
         session.codexController = controller
@@ -554,7 +554,7 @@ private enum AckTrackerTestError: LocalizedError {
     }
 }
 
-private final class AckTrackerCodexController: CodexSessionControlling {
+private final class AckTrackerCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     private let gate: AckTrackerSteerGate
     private let steerResult: Result<CodexTurnSteerReceipt, Error>?
     private(set) var hasActiveThread = true
@@ -617,6 +617,7 @@ private final class AckTrackerCodexController: CodexSessionControlling {
     }
 
     func compactThread() async throws {}
+
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil
     }

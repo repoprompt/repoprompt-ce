@@ -49,6 +49,13 @@ enum MCPClientIdentity {
         {
             return "cursor"
         }
+        // Grok Build presents `grok-shell-<injected server name>` (e.g.
+        // `grok-shell-RepoPromptCE`); `matchesFamily` only admits numeric/version suffixes,
+        // so this family needs a literal prefix branch with a separator-boundary check
+        // (`grok-shellx` must not match).
+        if normalized == "grok-shell" || normalized.hasPrefix("grok-shell-") {
+            return "grok-shell"
+        }
         if matchesFamily(normalized, tokens: ["claude", "ai"]) { return "claude-ai" }
         if matchesFamily(normalized, tokens: ["repoprompt", "cli"]) { return "repoprompt-cli" }
         return nil

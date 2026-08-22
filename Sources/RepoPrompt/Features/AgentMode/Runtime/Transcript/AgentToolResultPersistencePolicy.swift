@@ -48,6 +48,10 @@ enum AgentToolResultSanitizationPurpose {
     case persistentStorage
 }
 
+/// Durable tool-result persistence for every ACP provider. The `cursorACP*` symbols are
+/// named for the first provider that used them; recognition is content-based on the
+/// canonical `acp_status` payload produced by `ACPToolUpdateResultAdapter`, so Cursor,
+/// Grok Build, and future ACP providers share this policy.
 enum AgentToolResultPersistencePolicy {
     static let maxPersistedToolSummaryBytes = 2048
     private static let cursorACPPersistedDiffBytesLimit = 1200

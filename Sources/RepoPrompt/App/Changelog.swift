@@ -27,6 +27,7 @@ class Changelog {
         - Updated Z.ai GLM defaults to GLM-5.2 with 1M-context Claude Code routing support
 
         ### Fixes
+        - MCP `read_file` now returns exact paths reusable by `apply_edits`, and rejects fuzzy basename or suffix matches
         - Fixed file tree churn when folders changed on disk
         - Fixed Oracle preview transcripts showing in the wrong chat
         - Fixed the prompt export copy button disappearing in long Agent Mode sessions
@@ -79,6 +80,7 @@ class Changelog {
             - Updated Z.ai GLM defaults to GLM-5.2 with 1M-context Claude Code routing support
 
             ### Fixes
+            - MCP `read_file` now returns exact paths reusable by `apply_edits`, and rejects fuzzy basename or suffix matches
             - Fixed file tree churn when folders changed on disk
             - Fixed Oracle preview transcripts showing in the wrong chat
             - Fixed the prompt export copy button disappearing in long Agent Mode sessions

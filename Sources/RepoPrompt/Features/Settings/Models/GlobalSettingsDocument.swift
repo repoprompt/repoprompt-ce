@@ -107,10 +107,15 @@ struct GlobalSettingsDocument: Codable {
     }
 
     private static func decodeUUIDKeyedDictionary<Value>(_ values: [String: Value]) -> [UUID: Value] {
-        values.reduce(into: [UUID: Value]()) { result, entry in
-            guard let uuid = UUID(uuidString: entry.key) else { return }
-            result[uuid] = entry.value
+        var winners: [UUID: (rawKey: String, value: Value)] = [:]
+        for rawKey in values.keys.sorted() {
+            guard let uuid = UUID(uuidString: rawKey), let value = values[rawKey] else { continue }
+            let canonicalKey = uuid.uuidString
+            if winners[uuid] == nil || rawKey == canonicalKey {
+                winners[uuid] = (rawKey, value)
+            }
         }
+        return winners.mapValues(\.value)
     }
 }
 
@@ -353,6 +358,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
     var ui: UISettings?
     var promptPackaging: PromptPackagingSettings?
     var modelSelection: ModelSelectionSettings?
+    var contextBuilder: ContextBuilderSettings?
     var mcp: MCPSettings?
     var fileSystem: FileSystemSettings?
     var agentMode: AgentModeSettings?
@@ -363,6 +369,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         ui: UISettings? = nil,
         promptPackaging: PromptPackagingSettings? = nil,
         modelSelection: ModelSelectionSettings? = nil,
+        contextBuilder: ContextBuilderSettings? = nil,
         mcp: MCPSettings? = nil,
         fileSystem: FileSystemSettings? = nil,
         agentMode: AgentModeSettings? = nil,
@@ -372,6 +379,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.ui = ui
         self.promptPackaging = promptPackaging
         self.modelSelection = modelSelection
+        self.contextBuilder = contextBuilder
         self.mcp = mcp
         self.fileSystem = fileSystem
         self.agentMode = agentMode
@@ -466,6 +474,34 @@ struct GlobalScalarPreferences: Codable, Equatable {
         }
     }
 
+    struct ContextBuilderSettings: Codable, Equatable {
+        var contextTokenBudget: Int?
+        var analysisTokenBudget: Int?
+        var enhancementMode: String?
+        var questionTimeoutSeconds: TimeInterval?
+        var allowUIClarifyingQuestions: Bool?
+        var allowMCPClarifyingQuestions: Bool?
+        var followUpAnalysisEnabled: Bool?
+
+        init(
+            contextTokenBudget: Int? = nil,
+            analysisTokenBudget: Int? = nil,
+            enhancementMode: String? = nil,
+            questionTimeoutSeconds: TimeInterval? = nil,
+            allowUIClarifyingQuestions: Bool? = nil,
+            allowMCPClarifyingQuestions: Bool? = nil,
+            followUpAnalysisEnabled: Bool? = nil
+        ) {
+            self.contextTokenBudget = contextTokenBudget
+            self.analysisTokenBudget = analysisTokenBudget
+            self.enhancementMode = enhancementMode
+            self.questionTimeoutSeconds = questionTimeoutSeconds
+            self.allowUIClarifyingQuestions = allowUIClarifyingQuestions
+            self.allowMCPClarifyingQuestions = allowMCPClarifyingQuestions
+            self.followUpAnalysisEnabled = followUpAnalysisEnabled
+        }
+    }
+
     struct MCPSettings: Codable, Equatable {
         var autoStart: Bool?
         var showModelPresets: Bool?
@@ -557,6 +593,12 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var codexGoalSupportEnabled: Bool?
         var codexReasoningSummariesEnabled: Bool?
         var codexMemoriesEnabled: Bool?
+        var codexAppsEnabled: Bool?
+        var codexPluginsEnabled: Bool?
+        var codexMCPElicitationEnabled: Bool?
+        var codexToolSuggestionsEnabled: Bool?
+        var codexHookApprovalStrictModeEnabled: Bool?
+        var codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]?
         var providerConversationCleanupAction: String?
         var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         var agentSessionHandoffInstructions: String?
@@ -572,6 +614,12 @@ struct GlobalScalarPreferences: Codable, Equatable {
             codexGoalSupportEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
             codexMemoriesEnabled: Bool? = nil,
+            codexAppsEnabled: Bool? = nil,
+            codexPluginsEnabled: Bool? = nil,
+            codexMCPElicitationEnabled: Bool? = nil,
+            codexToolSuggestionsEnabled: Bool? = nil,
+            codexHookApprovalStrictModeEnabled: Bool? = nil,
+            codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]? = nil,
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil
@@ -586,6 +634,12 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
             self.codexMemoriesEnabled = codexMemoriesEnabled
+            self.codexAppsEnabled = codexAppsEnabled
+            self.codexPluginsEnabled = codexPluginsEnabled
+            self.codexMCPElicitationEnabled = codexMCPElicitationEnabled
+            self.codexToolSuggestionsEnabled = codexToolSuggestionsEnabled
+            self.codexHookApprovalStrictModeEnabled = codexHookApprovalStrictModeEnabled
+            self.codexHookApprovalStrictModeWorkspaceOverrides = codexHookApprovalStrictModeWorkspaceOverrides
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions

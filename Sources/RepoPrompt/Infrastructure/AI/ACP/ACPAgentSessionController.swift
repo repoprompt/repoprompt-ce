@@ -269,6 +269,14 @@ actor ACPAgentSessionController {
     private var loadSessionSupported = false
     private var discoveredSessionModels: ACPDiscoveredSessionModels?
     private var sessionModelConfigOptionID: String?
+    /// True when the provider conforms to `ACPDirectSessionModelProvider` and the session
+    /// advertised no modern `configOptions` model selector, so model application flows
+    /// through the provider-owned direct RPC (e.g. Grok's `session/set_model`).
+    private var sessionModelDirectSelectionSupported = false
+    /// True only when `discoveredSessionModels` was parsed from THIS session's live
+    /// session/new|load response. Post-mutation state updates never promote warmed
+    /// registry data to live authority — effort-bearing selections require this.
+    private var sessionModelSnapshotHasLiveAuthority = false
     private var sessionModelFailureReason: String?
     private var sessionModeSnapshot: SessionModeSnapshot?
     private var sessionModeFailureReason: String?
@@ -334,6 +342,18 @@ actor ACPAgentSessionController {
               normalizedWorkspacePath(runRequest.workspacePath) == normalizedWorkspacePath(request.workspacePath)
         else {
             return false
+        }
+        if provider.providerID == .grokBuild {
+            // Grok full access is a launch flag and "default" sends no model RPC, so a live
+            // process can never move between permission profiles or back to the provider
+            // default: those transitions must build a fresh controller.
+            guard runRequest.autoApproveAllToolPermissions == request.autoApproveAllToolPermissions else {
+                return false
+            }
+            guard normalizedModelString(runRequest.modelString) == normalizedModelString(request.modelString) else {
+                return false
+            }
+            return true
         }
         // Selection changes are already blocked/managed by the agent-mode UI while
         // a run is active. For live steering, controller identity + provider +
@@ -655,9 +675,141 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+            }
+            if provider.providerID == .grokBuild, sessionModelConfigOptionID == nil {
+                // Direct (SessionModelState) path: no modern selector was advertised, so
+                // model application flows through the provider-owned RPC.
+                guard sessionModelDirectSelectionSupported,
+                      let directProvider = provider as? ACPDirectSessionModelProvider
+                else {
+                    throw ControllerError.requestFailed("Grok Build ACP runtime does not advertise model switching.")
+                }
+                let (matchedOption, snapshotOptions, matchedLiveSnapshot) = try canonicalDirectSessionModelOption(model)
+                // Effort-compound selections (`grok-4.6-low`) decompose against the
+                // advertised option set — never by suffix guessing — into the base option
+                // plus an explicit effort. Bare raws resolve to the model's advertised
+                // default effort so a bare pick after a variant pick resets effort instead
+                // of silently keeping the previous one.
+                guard let decomposition = GrokBuildModelSpecifier.decompose(
+                    raw: matchedOption.rawValue,
+                    options: snapshotOptions
+                ) else {
+                    throw ControllerError.requestFailed("Grok Build model '\(model)' is not in the discovered model set. Refresh Grok Build models and retry.")
+                }
+                let baseModel = decomposition.base.rawValue
+                // "Effort-capable but default unknown" is not "effort-free": a bare pick on
+                // such a model could silently keep whatever effort is active. Require an
+                // explicit variant instead of guessing.
+                if decomposition.explicitEffort == nil,
+                   !decomposition.base.supportedReasoningEfforts.isEmpty,
+                   decomposition.base.defaultReasoningEffort == nil
+                {
+                    throw ControllerError.requestFailed(
+                        "Grok Build model '\(baseModel)' advertises reasoning efforts but no authoritative default; choose an explicit effort (e.g. \(baseModel)-high)."
+                    )
+                }
+                let resolvedEffort = decomposition.explicitEffort ?? decomposition.base.defaultReasoningEffort
+                // Fail closed on unadvertised efforts before any RPC: grok silently ignores
+                // unknown efforts while still acknowledging the base model, so an effort
+                // outside the base option's advertised list must never leave the client.
+                // Effort authority must also come from the LIVE session: a warmed-registry
+                // fallback can carry efforts the provider has since removed, and the wire
+                // would still Ok the base. Model-only requests may use the warmed snapshot
+                // because the echoed base id confirms them.
+                if let resolvedEffort {
+                    guard decomposition.base.supportedReasoningEfforts.contains(resolvedEffort) else {
+                        throw ControllerError.requestFailed(
+                            "Grok Build model '\(baseModel)' does not advertise reasoning effort '\(resolvedEffort.rawValue)'."
+                        )
+                    }
+                    guard matchedLiveSnapshot else {
+                        throw ControllerError.requestFailed(
+                            "Grok Build effort selection requires the live session model set. Refresh Grok Build models and retry."
+                        )
+                    }
+                }
+                let canonicalModel = GrokBuildModelSpecifier(
+                    baseModel: baseModel,
+                    reasoningEffort: resolvedEffort
+                ).compoundRaw
+                // A nil resolved effort means "no effort mutation requested" (effort-free
+                // model), not "no active effort" — it always no-ops when the base matches.
+                let effortAlreadyMatches = resolvedEffort.map {
+                    normalizedDirectEffort(discoveredSessionModels?.currentEffortRaw) == normalizedDirectEffort($0.rawValue)
+                } ?? true
+                if discoveredSessionModels?.currentModelRaw == baseModel, effortAlreadyMatches {
+                    return
+                }
+                let selectionRequest = directProvider.makeDirectModelSelectionRequest(
+                    sessionID: sessionID,
+                    baseModelRaw: baseModel,
+                    reasoningEffortRaw: resolvedEffort?.rawValue
+                )
+                // A rejected direct selection preserves the session's current model. Grok
+                // answers `session/set_model` with `_meta.model` = {"Ok": id} | {"Err": …};
+                // the Err variant is a failure even though the RPC itself succeeded. Fail
+                // closed: only an `Ok` echoing the requested base model may update local
+                // model authority — missing, malformed, or mismatched acknowledgements leave
+                // the session's real current model unknown, so local state must not move.
+                let selectionResponse: RequestResponse
+                do {
+                    selectionResponse = try await sendRequestResponse(
+                        method: selectionRequest.method,
+                        params: selectionRequest.params
+                    )
+                } catch {
+                    // A throw here (timeout, EOF, cancellation, decode failure) is also an
+                    // ambiguous post-dispatch outcome: the request may have been applied.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
+                    throw error
+                }
+                let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any]
+                let hasOk = modelOutcome?.keys.contains("Ok") == true
+                let hasErr = modelOutcome?.keys.contains("Err") == true
+                if hasErr, !hasOk {
+                    // An exclusive Err is a confirmed rejection: the session's current model
+                    // is untouched, so local authority stays valid.
+                    let modelError = modelOutcome?["Err"] ?? "unknown"
+                    throw ControllerError.requestFailed("Grok Build rejected model '\(canonicalModel)': \(modelError)")
+                }
+                guard !hasErr,
+                      hasOk,
+                      let confirmedModel = modelOutcome?["Ok"] as? String,
+                      confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                      .caseInsensitiveCompare(selectionRequest.expectedConfirmationModelRaw) == .orderedSame
+                else {
+                    // Ambiguous post-send outcome (missing/malformed/mixed/mismatched ack):
+                    // the server may or may not have applied anything, and neither the
+                    // requested nor the prior model is confirmed. Invalidate current
+                    // model/effort authority so stale state can never short-circuit a
+                    // corrective selection; the advertised options remain live and valid.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
+                    throw ControllerError.protocolViolation(
+                        "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
+                    )
+                }
+                // The selection was already validated as a snapshot member; never append
+                // recovery options here — an appended compound would lack effortVariant
+                // provenance and later read back as a real base.
+                let updatedOptions = discoveredSessionModels?.options
+                    ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID)?.options
+                    ?? []
+                // The Ok confirms only the base model. An effort-bearing mutation leaves
+                // the session's active effort UNCONFIRMED (grok applies advertised efforts
+                // but never echoes them), so record it as unknown until a fresh session
+                // config parse confirms it; a model-only request preserves the last
+                // confirmed effort.
+                let updated = ACPDiscoveredSessionModels(
+                    options: updatedOptions,
+                    currentModelRaw: baseModel,
+                    currentEffortRaw: resolvedEffort == nil ? discoveredSessionModels?.currentEffortRaw : nil
+                )
+                discoveredSessionModels = updated
+                _ = AgentACPModelRegistry.shared.updateDiscoveredModels(updated, for: provider.providerID)
+                return
             }
             if provider.providerID == .cursor,
                normalizedCursorModelAlias(model) == AgentModel.cursorAuto.rawValue,
@@ -692,6 +844,51 @@ actor ACPAgentSessionController {
                 requiredModelValue: configValue
             )
         }
+    }
+
+    /// Validation for direct (non-configOptions) model selection: exact/case-insensitive
+    /// match against the live session snapshot first, then the warmed persisted registry
+    /// (a `session/load` response may legitimately omit model metadata on some providers).
+    private func canonicalDirectSessionModelOption(
+        _ requestedValue: String
+    ) throws -> (option: AgentModelOption, options: [AgentModelOption], matchedLiveSnapshot: Bool) {
+        if let live = discoveredSessionModels {
+            if let match = live.option(matching: requestedValue) {
+                return (match, live.options, sessionModelSnapshotHasLiveAuthority)
+            }
+            throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
+        }
+        if let warmed = AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID),
+           let match = warmed.option(matching: requestedValue)
+        {
+            return (match, warmed.options, false)
+        }
+        throw ControllerError.requestFailed("Grok Build model '\(requestedValue)' is not in the discovered model set. Refresh Grok Build models and retry.")
+    }
+
+    private func normalizedDirectEffort(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed.lowercased()
+    }
+
+    /// Clears current model/effort authority after an ambiguous `session/set_model` outcome
+    /// (post-dispatch throw, or a missing/malformed/mixed/mismatched acknowledgement). The
+    /// advertised options stay — they came from the live session or warmed registry and are
+    /// still the valid advertisement — but nothing about the session's current model or
+    /// effort is confirmed anymore. Works for warmed-only sessions too (discoveredSessionModels
+    /// may be nil there), and never promotes warmed data to live authority.
+    private func invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: [AgentModelOption]) {
+        let options = discoveredSessionModels?.options ?? snapshotOptions
+        guard !options.isEmpty else { return }
+        let cleared = ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: nil,
+            currentEffortRaw: nil
+        )
+        discoveredSessionModels = cleared
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(cleared, for: provider.providerID)
     }
 
     func setSessionMode(_ modeID: String) async throws {
@@ -1011,6 +1208,8 @@ actor ACPAgentSessionController {
         process = nil
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
+        sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -1087,15 +1286,39 @@ actor ACPAgentSessionController {
         stderrFramer.feed(data) { lineData in
             guard
                 let trimmed = trimmedASCIIWhitespace(lineData),
-                let text = String(data: trimmed, encoding: .utf8),
-                !text.isEmpty
+                let rawText = String(data: trimmed, encoding: .utf8),
+                !rawText.isEmpty
             else { return }
+            let text = Self.strippingANSIEscapeSequences(from: rawText)
+            guard !text.isEmpty else { return }
             stderrLineCount += 1
             lastStderrPreview = Self.truncatedDiagnosticPreview(text)
             recordActivePromptStderrLine(text)
             diagnose(.stderrLine(text))
+            guard provider.shouldEmitStderrLine(text) else { return }
             emit(.stream(AIStreamResult(type: "system", text: text)))
         }
+    }
+
+    /// CLI providers log with terminal colors; ANSI escape sequences would render as raw
+    /// `[2m…[0m` artifacts in the transcript.
+    private static func strippingANSIEscapeSequences(from text: String) -> String {
+        guard text.contains("\u{1B}") else { return text }
+        var result = ""
+        result.reserveCapacity(text.count)
+        var iterator = text.makeIterator()
+        while let character = iterator.next() {
+            guard character == "\u{1B}" else {
+                result.append(character)
+                continue
+            }
+            // Skip a CSI sequence: ESC [ parameters…final-byte (@–~).
+            guard let opener = iterator.next(), opener == "[" else { continue }
+            while let byte = iterator.next() {
+                if ("@" ... "~").contains(byte) { break }
+            }
+        }
+        return result
     }
 
     private func handleJSONLine(_ lineData: Data) {
@@ -1912,6 +2135,8 @@ actor ACPAgentSessionController {
     private func beginOpeningSessionConfiguration() {
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
+        sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
@@ -2274,6 +2499,7 @@ actor ACPAgentSessionController {
         switch parseModernModelSnapshot(from: response) {
         case let .valid(configID, models):
             sessionModelConfigOptionID = configID
+            sessionModelDirectSelectionSupported = false
             sessionModelFailureReason = nil
             parsed = models
             if response["models"] != nil {
@@ -2282,18 +2508,39 @@ actor ACPAgentSessionController {
         case .absent:
             sessionModelConfigOptionID = nil
             sessionModelFailureReason = nil
-            parsed = nil
-            if response["models"] != nil {
-                diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+            if let directProvider = provider as? ACPDirectSessionModelProvider {
+                switch directProvider.parseDirectSessionModelSnapshot(from: response) {
+                case let .valid(models):
+                    sessionModelDirectSelectionSupported = true
+                    parsed = models
+                case .absent:
+                    // Conforming providers guarantee the direct selection RPC; explicit
+                    // models validate against this snapshot or the warmed registry.
+                    sessionModelDirectSelectionSupported = true
+                    parsed = nil
+                case let .malformed(reason):
+                    sessionModelDirectSelectionSupported = false
+                    sessionModelFailureReason = reason
+                    parsed = nil
+                    diagnose(.info("ACP session advertised malformed provider model metadata: \(reason)"))
+                }
+            } else {
+                sessionModelDirectSelectionSupported = false
+                parsed = nil
+                if response["models"] != nil {
+                    diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+                }
             }
         case let .malformed(reason):
             sessionModelConfigOptionID = nil
+            sessionModelDirectSelectionSupported = false
             sessionModelFailureReason = reason
             parsed = nil
             diagnose(.info("ACP session advertised a malformed modern model config option; legacy fallback is disabled: \(reason)"))
         }
 
         discoveredSessionModels = parsed
+        sessionModelSnapshotHasLiveAuthority = parsed != nil
         guard let parsed else { return }
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(parsed, for: provider.providerID)
     }
@@ -2481,7 +2728,10 @@ actor ACPAgentSessionController {
         sessionID: String,
         stopReason: String?
     ) -> AIStreamResult {
-        let usage = response["usage"] as? [String: Any]
+        // Grok Build carries usage under `_meta.usage` with the same field names; top-level
+        // `usage` remains the preferred ACP-standard location.
+        let usage = (response["usage"] as? [String: Any])
+            ?? ((response["_meta"] as? [String: Any])?["usage"] as? [String: Any])
         let inputTokens = intValue(usage?["inputTokens"])
         let outputTokens = intValue(usage?["outputTokens"])
         let cachedReadTokens = intValue(usage?["cachedReadTokens"])
@@ -2692,19 +2942,42 @@ actor ACPAgentSessionController {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
         case .openCode, .cursor:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
+        case .grokBuild:
+            grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
         }
-        return optionID(for: options, preferences: preferences) ?? options.first?.optionID ?? ""
+        let filteredOptions = safePermissionOptionsForAutoSelection(options)
+        return optionID(for: filteredOptions, preferences: preferences) ?? filteredOptions.first?.optionID ?? ""
+    }
+
+    private func grokBuildAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
+        if sessionScoped {
+            return [
+                .optionID("allow-edits-session"),
+                .optionID("always"),
+                .optionID("allow_always"),
+                .kind("allow_always")
+            ]
+        }
+        return [
+            .optionID("allow-once"),
+            .optionID("once"),
+            .optionID("allow_once"),
+            .kind("allow_once")
+        ]
     }
 
     private func preferredRejectOptionID(for options: [PermissionOption]) -> String? {
         optionID(for: options, preferences: [
+            .optionID("reject-once"),
             .optionID("reject_once"),
             .optionID("reject"),
             .kind("reject_once"),
             .kind("reject"),
             .optionID("reject_always"),
+            .optionID("reject-always"),
             .kind("reject_always"),
             .optionID("deny_once"),
+            .optionID("deny-once"),
             .optionID("deny"),
             .kind("deny_once"),
             .kind("deny"),
@@ -2718,7 +2991,9 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode:
+        case .openCode, .grokBuild:
+            // Grok full access is provider-native (`grok agent --always-approve stdio`); the
+            // controller never auto-selects permission options for it.
             return nil
         }
     }
@@ -2770,10 +3045,28 @@ actor ACPAgentSessionController {
                 .optionID("allow_once"),
                 .kind("allow_once")
             ]
+        case .grokBuild:
+            // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
+            // session-scoped `allow-edits-session` here.
+            [
+                .optionID("allow-once"),
+                .optionID("once"),
+                .optionID("allow_once"),
+                .kind("allow_once")
+            ]
         }
 
-        guard let optionID = optionID(for: options, preferences: preferences) else { return nil }
+        guard let optionID = optionID(for: safePermissionOptionsForAutoSelection(options), preferences: preferences) else { return nil }
         return AutoApprovalSelection(optionID: optionID, match: match)
+    }
+
+    /// Options that must never be picked by an automatic or fallback selection path.
+    /// Grok's `enable-always-approve` is typed AllowOnce for backward compatibility, so a
+    /// bare kind match would select it — it is excluded by explicit ID before any matching.
+    private func safePermissionOptionsForAutoSelection(_ options: [PermissionOption]) -> [PermissionOption] {
+        options.filter { option in
+            ACPPermissionOptionPolicy.isAutoSelectable(optionID: option.optionID, for: provider.providerID)
+        }
     }
 
     private func isStrictACPRepoPromptPermissionMatch(
@@ -2953,6 +3246,8 @@ actor ACPAgentSessionController {
                 "RP_CURSOR_RAW_CAPTURE_PATH"
             case .openCode:
                 "RP_OPENCODE_ACP_RAW_CAPTURE_PATH"
+            case .grokBuild:
+                "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)

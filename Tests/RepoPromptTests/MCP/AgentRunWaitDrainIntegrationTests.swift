@@ -93,7 +93,7 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
 
             let session = await harness.viewModel.ensureSessionReady(tabID: UUID())
             session.selectedAgent = .openCode
-            session.runID = harness.parentRunID
+            session.installRunID(harness.parentRunID)
             session.runState = .running
             _ = session.beginRunAttempt(source: "test.staleManualWake")
 
@@ -146,7 +146,7 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             let sessionID = UUID()
             let session = await harness.viewModel.ensureSessionReady(tabID: UUID())
             session.selectedAgent = selectedAgent
-            session.runID = harness.parentRunID
+            session.installRunID(harness.parentRunID)
             session.runState = .running
             _ = session.beginRunAttempt(source: "test.staleProviderWake")
             _ = harness.viewModel.test_installPersistentSessionBinding(
@@ -207,7 +207,7 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
         if let ownership = session.activeRunOwnership {
             session.endRunAttempt(ifCurrent: ownership, source: source)
         }
-        session.runID = UUID()
+        session.installRunID(UUID())
         _ = session.beginRunAttempt(source: source)
         session.runState = .running
     }

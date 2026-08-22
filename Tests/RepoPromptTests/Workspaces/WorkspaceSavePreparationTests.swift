@@ -891,20 +891,26 @@ import XCTest
             XCTAssertEqual(afterEmptyRename.publicationSequence, beforeEmptyRename.publicationSequence)
             XCTAssertEqual(manager.workspace(withID: workspaceID)?.name, "Runtime Renamed")
 
-            let deleteModel = try XCTUnwrap(manager.workspace(withID: workspaceID))
+            let deletionTarget = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: distractor.id,
+                description: "ordinary deletion target"
+            )
+            let deletionTargetDirectory = deletionTarget.document.fileURL.deletingLastPathComponent()
+            let deleteModel = try XCTUnwrap(manager.workspace(withID: distractor.id))
             let deleteSucceeded = await manager.deleteWorkspaceAsync(deleteModel)
             XCTAssertTrue(deleteSucceeded)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: authoritativeDirectory.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: deletionTargetDirectory.path))
             let afterDelete = await runtime.workspaceStore.snapshot()
             let recreated = await runtime.workspaceStore.execute(.init(
                 operationID: UUID(),
                 expectedCatalogRevision: afterDelete.catalogRevision,
                 expectedWorkspaceRevision: 0,
                 origin: .standalone,
-                command: .createWorkspace(hidden.document)
+                command: .createWorkspace(deletionTarget.document)
             ))
             XCTAssertEqual(recreated.disposition, .applied)
-            XCTAssertTrue(FileManager.default.fileExists(atPath: authoritativeURL.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: deletionTarget.document.fileURL.path))
         }
 
         func testCancelledWorkingCommitAdoptsAuthorityBaselineForNextSave() async throws {

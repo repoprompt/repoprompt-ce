@@ -144,6 +144,337 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertNil(persisted.chatSettings[workspaceID]?.contextBuilderAgentModelRaw)
     }
 
+    func testContextBuilderBehaviorSettingsResolveCanonicalDefaults() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let store = try makeStore(at: temp.appendingPathComponent("Settings/globalSettings.json"))
+
+        XCTAssertEqual(store.contextBuilderBehaviorSettings(), ContextBuilderDefaults.behaviorSettings)
+    }
+
+    func testContextBuilderBehaviorSettingsPersistAndReloadAllFields() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        let expected = ContextBuilderBehaviorSettings(
+            contextTokenBudget: 43210,
+            analysisTokenBudget: 54321,
+            enhancementMode: .augment,
+            questionTimeoutSeconds: 91,
+            allowUIClarifyingQuestions: false,
+            allowMCPClarifyingQuestions: true,
+            followUpAnalysisEnabled: true
+        )
+
+        store.setContextBuilderBehaviorSettings(expected)
+
+        XCTAssertEqual(try makeStore(at: fileURL).contextBuilderBehaviorSettings(), expected)
+    }
+
+    func testContextBuilderBehaviorScalarWritePreservesSiblingGroups() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let siblings = GlobalScalarPreferences(
+            ui: .init(showTooltips: false),
+            promptPackaging: .init(duplicateUserInstructionsAtTop: true),
+            mcp: .init(autoStart: false),
+            telemetry: .init(enabled: false),
+            modelOverrides: .init(diffOverrides: ["model": true])
+        )
+        try fileStore.save(GlobalSettingsDocument(scalarPreferences: siblings))
+        let store = try makeStore(at: fileURL)
+
+        store.setContextBuilderBehaviorSettings(ContextBuilderDefaults.behaviorSettings)
+
+        let persisted = try fileStore.load().scalarPreferences
+        XCTAssertEqual(persisted?.ui, siblings.ui)
+        XCTAssertEqual(persisted?.promptPackaging, siblings.promptPackaging)
+        XCTAssertEqual(persisted?.mcp, siblings.mcp)
+        XCTAssertEqual(persisted?.telemetry, siblings.telemetry)
+        XCTAssertEqual(persisted?.modelOverrides, siblings.modelOverrides)
+    }
+
+    func testContextBuilderBehaviorSettingsRemainBaselineSchemaVersionTwo() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+
+        store.setContextBuilderBehaviorSettings(ContextBuilderDefaults.behaviorSettings)
+
+        XCTAssertEqual(try GlobalSettingsFileStore(fileURL: fileURL).load().schemaVersion, 2)
+    }
+
+    func testContextBuilderMigrationPreservesWorkspaceAgentModelsSchemaVersionFour() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let workspaceID = UUID()
+        let profile = AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue)
+        try fileStore.save(GlobalSettingsDocument(agentModelsSettings: [
+            workspaceID: WorkspaceAgentModelsSettings(
+                inheritanceMode: .useWorkspaceOverrides,
+                profile: profile
+            )
+        ]))
+
+        _ = try makeStore(at: fileURL)
+
+        let persisted = try fileStore.load()
+        XCTAssertEqual(persisted.schemaVersion, GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
+        XCTAssertEqual(persisted.agentModelsSettings[workspaceID]?.profile, profile)
+        XCTAssertNotNil(persisted.scalarPreferences?.contextBuilder)
+    }
+
+    func testContextBuilderMigrationCanonicalizesAgentModelsUUIDWithoutDroppingUnknownProfileFields() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let workspaceID = UUID()
+        try fileStore.save(GlobalSettingsDocument(agentModelsSettings: [
+            workspaceID: WorkspaceAgentModelsSettings(
+                inheritanceMode: .useWorkspaceOverrides,
+                profile: AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue)
+            )
+        ]))
+
+        var rawRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        var rawAgentModels = try XCTUnwrap(rawRoot["agentModelsSettingsByWorkspaceID"] as? [String: Any])
+        var rawWorkspace = try XCTUnwrap(rawAgentModels.removeValue(forKey: workspaceID.uuidString) as? [String: Any])
+        rawWorkspace["unknownWorkspaceField"] = ["future": true]
+        var rawProfile = try XCTUnwrap(rawWorkspace["profile"] as? [String: Any])
+        rawProfile["unknownProfileField"] = ["future": "preserve"]
+        rawWorkspace["profile"] = rawProfile
+        rawAgentModels[workspaceID.uuidString.lowercased()] = rawWorkspace
+        rawRoot["agentModelsSettingsByWorkspaceID"] = rawAgentModels
+        try JSONSerialization.data(withJSONObject: rawRoot, options: [.prettyPrinted, .sortedKeys]).write(to: fileURL)
+
+        _ = try makeStore(at: fileURL)
+
+        let migratedRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        XCTAssertEqual(
+            migratedRoot["schemaVersion"] as? Int,
+            GlobalSettingsDocument.workspaceAgentModelsSchemaVersion
+        )
+        let migratedAgentModels = try XCTUnwrap(
+            migratedRoot["agentModelsSettingsByWorkspaceID"] as? [String: Any]
+        )
+        XCTAssertEqual(Set(migratedAgentModels.keys), [workspaceID.uuidString])
+        let migratedWorkspace = try XCTUnwrap(migratedAgentModels[workspaceID.uuidString] as? [String: Any])
+        let unknownWorkspaceField = try XCTUnwrap(
+            migratedWorkspace["unknownWorkspaceField"] as? [String: Any]
+        )
+        XCTAssertEqual(unknownWorkspaceField["future"] as? Bool, true)
+        let migratedProfile = try XCTUnwrap(migratedWorkspace["profile"] as? [String: Any])
+        let unknownProfileField = try XCTUnwrap(migratedProfile["unknownProfileField"] as? [String: Any])
+        XCTAssertEqual(unknownProfileField["future"] as? String, "preserve")
+        let migratedScalarPreferences = try XCTUnwrap(
+            migratedRoot["scalarPreferences"] as? [String: Any]
+        )
+        XCTAssertNotNil(migratedScalarPreferences["contextBuilder"])
+    }
+
+    func testAgentModelsDuplicateUUIDCanonicalWinnerMatchesMemoryAndDisk() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let workspaceID = UUID()
+        try fileStore.save(GlobalSettingsDocument(agentModelsSettings: [
+            workspaceID: WorkspaceAgentModelsSettings(
+                inheritanceMode: .useWorkspaceOverrides,
+                profile: AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue)
+            )
+        ]))
+
+        var rawRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        var rawAgentModels = try XCTUnwrap(rawRoot["agentModelsSettingsByWorkspaceID"] as? [String: Any])
+        var canonicalWorkspace = try XCTUnwrap(rawAgentModels[workspaceID.uuidString] as? [String: Any])
+        canonicalWorkspace["unknownCanonicalField"] = ["future": "preserve"]
+        rawAgentModels[workspaceID.uuidString] = canonicalWorkspace
+        var lowercaseWorkspace = canonicalWorkspace
+        var lowercaseProfile = try XCTUnwrap(lowercaseWorkspace["profile"] as? [String: Any])
+        lowercaseProfile["planningModelRaw"] = AIModel.claude4Sonnet.rawValue
+        lowercaseWorkspace["profile"] = lowercaseProfile
+        lowercaseWorkspace["unknownCanonicalField"] = ["future": "discard"]
+        rawAgentModels[workspaceID.uuidString.lowercased()] = lowercaseWorkspace
+        rawRoot["agentModelsSettingsByWorkspaceID"] = rawAgentModels
+        try JSONSerialization.data(withJSONObject: rawRoot, options: [.prettyPrinted, .sortedKeys]).write(to: fileURL)
+
+        let store = try makeStore(at: fileURL)
+
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
+            AIModel.gpt54Pro.rawValue
+        )
+        let migratedRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        let migratedAgentModels = try XCTUnwrap(
+            migratedRoot["agentModelsSettingsByWorkspaceID"] as? [String: Any]
+        )
+        XCTAssertEqual(Set(migratedAgentModels.keys), [workspaceID.uuidString])
+        let migratedWorkspace = try XCTUnwrap(migratedAgentModels[workspaceID.uuidString] as? [String: Any])
+        let unknownCanonicalField = try XCTUnwrap(
+            migratedWorkspace["unknownCanonicalField"] as? [String: Any]
+        )
+        XCTAssertEqual(unknownCanonicalField["future"] as? String, "preserve")
+    }
+
+    func testLegacyWorkspaceContextBuilderBehaviorMigratesFieldByFieldInUUIDOrder() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let firstID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        let secondID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+        var first = ChatGlobalSettings(workspaceID: firstID)
+        first.discoveryTokenBudget = 43210
+        first.discoveryEnhancementMode = "invalid"
+        first.discoveryAllowClarifyingQuestions = false
+        var second = ChatGlobalSettings(workspaceID: secondID)
+        second.discoveryTokenBudget = 99999
+        second.discoveryPlanTokenBudget = 54321
+        second.discoveryEnhancementMode = PromptEnhancementMode.augment.rawValue
+        second.discoveryQuestionTimeoutSeconds = 91
+        second.discoveryAllowClarifyingQuestionsForMCP = true
+        second.discoveryAutoGeneratePlan = true
+        try GlobalSettingsFileStore(fileURL: fileURL).save(GlobalSettingsDocument(
+            chatSettings: [secondID: second, firstID: first]
+        ))
+
+        let settings = try makeStore(at: fileURL).contextBuilderBehaviorSettings()
+
+        XCTAssertEqual(settings.contextTokenBudget, 43210)
+        XCTAssertEqual(settings.analysisTokenBudget, 54321)
+        XCTAssertEqual(settings.enhancementMode, .augment)
+        XCTAssertEqual(settings.questionTimeoutSeconds, 91)
+        XCTAssertFalse(settings.allowUIClarifyingQuestions)
+        XCTAssertTrue(settings.allowMCPClarifyingQuestions)
+        XCTAssertTrue(settings.followUpAnalysisEnabled)
+    }
+
+    func testExistingContextBuilderScalarGroupWinsOverAllLegacyWorkspaceFields() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let workspaceID = UUID()
+        var legacy = ChatGlobalSettings(workspaceID: workspaceID)
+        legacy.discoveryTokenBudget = 11111
+        legacy.discoveryPlanTokenBudget = 22222
+        let persisted = GlobalScalarPreferences.ContextBuilderSettings(contextTokenBudget: 77777)
+        try GlobalSettingsFileStore(fileURL: fileURL).save(GlobalSettingsDocument(
+            chatSettings: [workspaceID: legacy],
+            scalarPreferences: GlobalScalarPreferences(contextBuilder: persisted)
+        ))
+
+        let settings = try makeStore(at: fileURL).contextBuilderBehaviorSettings()
+
+        XCTAssertEqual(settings.contextTokenBudget, 77777)
+        XCTAssertEqual(settings.analysisTokenBudget, ContextBuilderDefaults.analysisTokenBudget)
+    }
+
+    func testLegacyWorkspaceContextBuilderBehaviorFieldsAreRemovedAfterMigration() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let workspaceID = UUID()
+        var legacy = ChatGlobalSettings(workspaceID: workspaceID)
+        legacy.discoveryTokenBudget = 43210
+        legacy.discoveryEnhancementMode = PromptEnhancementMode.preserve.rawValue
+        legacy.discoveryAutoGeneratePlan = true
+        legacy.discoveryAllowClarifyingQuestions = false
+        legacy.discoveryAllowClarifyingQuestionsForMCP = true
+        legacy.discoveryQuestionTimeoutSeconds = 91
+        legacy.discoveryPlanTokenBudget = 54321
+        try GlobalSettingsFileStore(fileURL: fileURL).save(GlobalSettingsDocument(chatSettings: [workspaceID: legacy]))
+
+        _ = try makeStore(at: fileURL)
+        let persisted = try String(contentsOf: fileURL, encoding: .utf8)
+
+        for key in [
+            "discoveryTokenBudget",
+            "discoveryEnhancementMode",
+            "discoveryAutoGeneratePlan",
+            "discoveryAllowClarifyingQuestions",
+            "discoveryAllowClarifyingQuestionsForMCP",
+            "discoveryQuestionTimeoutSeconds",
+            "discoveryPlanTokenBudget"
+        ] {
+            XCTAssertFalse(persisted.contains(key), key)
+        }
+    }
+
+    func testLegacyGlobalDefaultsContextBuilderBehaviorNeverBecomesAuthority() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try GlobalSettingsFileStore(fileURL: fileURL).save(GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(
+                discoverAgentRaw: nil,
+                discoverModelsByAgent: nil,
+                discoveryTokenBudget: 1,
+                discoveryEnhancementMode: PromptEnhancementMode.preserve.rawValue
+            )
+        ))
+
+        let settings = try makeStore(at: fileURL).contextBuilderBehaviorSettings()
+
+        XCTAssertEqual(settings.contextTokenBudget, ContextBuilderDefaults.contextTokenBudget)
+        XCTAssertEqual(settings.enhancementMode, ContextBuilderDefaults.enhancementMode)
+    }
+
+    func testLegacyContextBuilderTabFollowUpAnalysisIsIgnoredAndRemovedOnEncode() throws {
+        let data = Data(
+            #"{"discover":{"instructions":"Keep this","autoGeneratePlan":true,"followUpTypeRaw":"review","selectedContextBuilderPromptIDs":[]}}"#.utf8
+        )
+
+        let decoded = try JSONDecoder().decode(ComposeTabState.self, from: data)
+        let encoded = try String(data: JSONEncoder().encode(decoded), encoding: .utf8)
+
+        XCTAssertEqual(decoded.contextBuilder.instructions, "Keep this")
+        XCTAssertEqual(decoded.contextBuilder.followUpTypeRaw, "review")
+        XCTAssertFalse(try XCTUnwrap(encoded).contains("autoGeneratePlan"))
+    }
+
+    func testContextBuilderBehaviorSetterPublishesObjectWillChangeWithoutAgentModelsNotification() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let store = try makeStore(at: temp.appendingPathComponent("Settings/globalSettings.json"))
+        var emissions = 0
+        var agentModelNotifications = 0
+        let emissionCancellable = store.objectWillChange.sink { emissions += 1 }
+        let notification = NotificationCenter.default.addObserver(
+            forName: .agentModelsSettingsDidChange,
+            object: store,
+            queue: nil
+        ) { _ in
+            agentModelNotifications += 1
+        }
+        defer {
+            emissionCancellable.cancel()
+            NotificationCenter.default.removeObserver(notification)
+        }
+        var settings = store.contextBuilderBehaviorSettings()
+        settings.contextTokenBudget += 5000
+
+        store.setContextBuilderBehaviorSettings(settings)
+        store.setContextBuilderBehaviorSettings(settings)
+
+        XCTAssertEqual(emissions, 1)
+        XCTAssertEqual(agentModelNotifications, 0)
+    }
+
     func testTelemetrySettingsDefaultPersistAndMirrorMasterOptOut() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
@@ -999,7 +1330,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temp) }
         let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let versionFourJSON = #"{"schemaVersion":4,"updatedAt":"2026-06-27T13:11:41Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"agentModelsSettingsByWorkspaceID":{"workspace-1":{"selectedAgentRaw":"claudeCode"}},"globalDefaults":{"discoverAgentRaw":"claudeCode","discoverModelsByAgent":{"claudeCode":"haiku"}},"scalarPreferences":{"ui":{"appearanceMode":"dark"},"modelSelection":{"planningModel":"haiku"},"agentMode":{"agentSessionHandoffInstructions":"  Imported verbatim  "}}}"#
+        let versionFourJSON = #"{"schemaVersion":4,"updatedAt":"2026-06-27T13:11:41Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"agentModelsSettingsByWorkspaceID":{"workspace-1":{"selectedAgentRaw":"claudeCode"}},"globalDefaults":{"discoverAgentRaw":"claudeCode","discoverModelsByAgent":{"claudeCode":"haiku"}},"scalarPreferences":{"ui":{"appearanceMode":"dark"},"modelSelection":{"planningModel":"haiku"},"contextBuilder":{"contextTokenBudget":43210,"analysisTokenBudget":54321,"enhancementMode":"augment","questionTimeoutSeconds":91,"allowUIClarifyingQuestions":false,"allowMCPClarifyingQuestions":true,"followUpAnalysisEnabled":true},"fileSystem":{"globalIgnoreDefaults":"custom"},"agentMode":{"agentSessionHandoffInstructions":"  Imported verbatim  "}}}"#
         try Data(versionFourJSON.utf8).write(to: fileURL)
 
         let store = try makeStore(at: fileURL)
@@ -1012,11 +1343,14 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(store.globalContextBuilderAgentSelection().modelRaw, "haiku")
         XCTAssertEqual(store.planningModelRaw(), "haiku")
         XCTAssertEqual(store.agentSessionHandoffInstructions(), "  Imported verbatim  ")
+        XCTAssertEqual(store.contextBuilderBehaviorSettings().contextTokenBudget, 43210)
+        XCTAssertEqual(store.contextBuilderBehaviorSettings().analysisTokenBudget, 54321)
+        XCTAssertEqual(store.globalIgnoreDefaults(), "custom")
 
         let persisted = try String(contentsOf: fileURL, encoding: .utf8)
-        XCTAssertTrue(persisted.contains(#""schemaVersion" : 4"#))
+        XCTAssertTrue(persisted.contains(#""schemaVersion" : 2"#))
         XCTAssertTrue(persisted.contains(#""schemaLineage" : "repoprompt-ce.global-settings""#))
-        XCTAssertTrue(persisted.contains("agentModelsSettingsByWorkspaceID"))
+        XCTAssertFalse(persisted.contains("agentModelsSettingsByWorkspaceID"))
 
         let backupDir = fileURL.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true)
         let backups = try FileManager.default.contentsOfDirectory(atPath: backupDir.path)
@@ -1229,6 +1563,86 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             GlobalSettingsDocument.baselineSchemaVersion
         )
         XCTAssertEqual(try falseV4Backups(in: backupDirectory).count, 1)
+    }
+
+    func testFalseV4StoreLoadPreservesUnknownFieldsWhileMigratingContextBuilder() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let workspaceID = UUID()
+        var legacy = ChatGlobalSettings(workspaceID: workspaceID)
+        legacy.discoveryTokenBudget = 43210
+        legacy.discoveryPlanTokenBudget = 54321
+        legacy.discoveryEnhancementMode = PromptEnhancementMode.augment.rawValue
+        legacy.discoveryQuestionTimeoutSeconds = 91
+        legacy.discoveryAllowClarifyingQuestions = false
+        legacy.discoveryAllowClarifyingQuestionsForMCP = true
+        legacy.discoveryAutoGeneratePlan = true
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument(
+            chatSettings: [workspaceID: legacy],
+            scalarPreferences: GlobalScalarPreferences(
+                agentMode: .init(agentSessionHandoffInstructions: "Preserve instructions")
+            )
+        ))
+
+        var rawRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        rawRoot["schemaVersion"] = GlobalSettingsDocument.workspaceAgentModelsSchemaVersion
+        rawRoot["agentModelsSettingsByWorkspaceID"] = [String: Any]()
+        rawRoot["unknownRoot"] = ["preserve": 42]
+        var rawScalarPreferences = try XCTUnwrap(rawRoot["scalarPreferences"] as? [String: Any])
+        rawScalarPreferences["unknownGroup"] = ["future": "preserve"]
+        rawRoot["scalarPreferences"] = rawScalarPreferences
+        var rawChatSettings = try XCTUnwrap(rawRoot["chatSettingsByWorkspaceID"] as? [String: Any])
+        var rawWorkspace = try XCTUnwrap(rawChatSettings[workspaceID.uuidString] as? [String: Any])
+        rawWorkspace["unknownWorkspaceField"] = ["future": true]
+        rawChatSettings[workspaceID.uuidString] = rawWorkspace
+        rawRoot["chatSettingsByWorkspaceID"] = rawChatSettings
+        let original = try JSONSerialization.data(withJSONObject: rawRoot, options: [.prettyPrinted, .sortedKeys])
+        try original.write(to: fileURL)
+
+        let store = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+
+        let behavior = store.contextBuilderBehaviorSettings()
+        XCTAssertEqual(behavior.contextTokenBudget, 43210)
+        XCTAssertEqual(behavior.analysisTokenBudget, 54321)
+        XCTAssertEqual(behavior.enhancementMode, .augment)
+        XCTAssertEqual(behavior.questionTimeoutSeconds, 91)
+        XCTAssertFalse(behavior.allowUIClarifyingQuestions)
+        XCTAssertTrue(behavior.allowMCPClarifyingQuestions)
+        XCTAssertTrue(behavior.followUpAnalysisEnabled)
+
+        let migratedRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        )
+        XCTAssertEqual(migratedRoot["schemaVersion"] as? Int, GlobalSettingsDocument.baselineSchemaVersion)
+        let unknownRoot = try XCTUnwrap(migratedRoot["unknownRoot"] as? [String: Any])
+        XCTAssertEqual(unknownRoot["preserve"] as? Int, 42)
+        let migratedScalarPreferences = try XCTUnwrap(migratedRoot["scalarPreferences"] as? [String: Any])
+        let unknownGroup = try XCTUnwrap(migratedScalarPreferences["unknownGroup"] as? [String: Any])
+        XCTAssertEqual(unknownGroup["future"] as? String, "preserve")
+        XCTAssertNotNil(migratedScalarPreferences["contextBuilder"])
+        let migratedFileSystem = try XCTUnwrap(migratedScalarPreferences["fileSystem"] as? [String: Any])
+        XCTAssertEqual(
+            migratedFileSystem["globalIgnoreDefaults"] as? String,
+            IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
+        )
+        let migratedChatSettings = try XCTUnwrap(migratedRoot["chatSettingsByWorkspaceID"] as? [String: Any])
+        let migratedWorkspace = try XCTUnwrap(migratedChatSettings[workspaceID.uuidString] as? [String: Any])
+        let unknownWorkspaceField = try XCTUnwrap(migratedWorkspace["unknownWorkspaceField"] as? [String: Any])
+        XCTAssertEqual(unknownWorkspaceField["future"] as? Bool, true)
+        XCTAssertNil(migratedWorkspace["discoveryTokenBudget"])
+        XCTAssertNil(migratedWorkspace["discoveryPlanTokenBudget"])
+
+        let backupDirectory = fileURL.deletingLastPathComponent().appendingPathComponent("Backups")
+        let backups = try falseV4Backups(in: backupDirectory)
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(backups.first)), original)
     }
 
     func testFalseV4WithoutWorkspaceProfilesKeyAlsoNormalizes() throws {
@@ -1482,7 +1896,8 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
         XCTAssertEqual(patched.copySettings(for: workspaceID).fileTreeOption, .files)
-        XCTAssertEqual(patched.chatSettings(for: workspaceID).discoveryTokenBudget, 64000)
+        XCTAssertNil(patched.chatSettings(for: workspaceID).discoveryTokenBudget)
+        XCTAssertEqual(patched.contextBuilderBehaviorSettings().contextTokenBudget, 64000)
         XCTAssertEqual(patched.globalContextBuilderAgentSelection().agentRaw, "codexExec")
         patched.setShowTooltips(false)
 
@@ -1502,7 +1917,8 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(reloaded.appearanceModeRaw(), "System")
         XCTAssertFalse(reloaded.showTooltips())
         XCTAssertEqual(reloaded.copySettings(for: workspaceID).fileTreeOption, .files)
-        XCTAssertEqual(reloaded.chatSettings(for: workspaceID).discoveryTokenBudget, 64000)
+        XCTAssertNil(reloaded.chatSettings(for: workspaceID).discoveryTokenBudget)
+        XCTAssertEqual(reloaded.contextBuilderBehaviorSettings().contextTokenBudget, 64000)
     }
 
     // MARK: - Agent Models scoped settings
@@ -1641,6 +2057,12 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
                 preferredComposeModelRaw: tuple.compose,
                 syncChatModelWithOracle: true
             )
+            var scalarPreferences = seededScalarPreferences(modelSelection: .init(
+                preferredComposeModel: tuple.compose,
+                planningModel: tuple.planning,
+                syncChatModelWithOracle: true
+            ))
+            scalarPreferences.contextBuilder = completeContextBuilderScalarSettings()
             let invalidDocument = GlobalSettingsDocument(
                 agentModelsSettings: [
                     dormantWorkspaceID: WorkspaceAgentModelsSettings(
@@ -1648,13 +2070,25 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
                         profile: workspaceProfile
                     )
                 ],
-                scalarPreferences: seededScalarPreferences(modelSelection: .init(
-                    preferredComposeModel: tuple.compose,
-                    planningModel: tuple.planning,
-                    syncChatModelWithOracle: true
-                ))
+                scalarPreferences: scalarPreferences
             )
             try fileStore.save(invalidDocument)
+            var rawRoot = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+            )
+            rawRoot["unknownRoot"] = ["future": "preserve"]
+            var rawScalarPreferences = try XCTUnwrap(rawRoot["scalarPreferences"] as? [String: Any])
+            rawScalarPreferences["unknownGroup"] = ["future": true]
+            rawRoot["scalarPreferences"] = rawScalarPreferences
+            var rawAgentModels = try XCTUnwrap(rawRoot["agentModelsSettingsByWorkspaceID"] as? [String: Any])
+            var rawWorkspace = try XCTUnwrap(rawAgentModels[dormantWorkspaceID.uuidString] as? [String: Any])
+            var rawProfile = try XCTUnwrap(rawWorkspace["profile"] as? [String: Any])
+            rawProfile["unknownProfileField"] = ["future": 42]
+            rawWorkspace["profile"] = rawProfile
+            rawAgentModels[dormantWorkspaceID.uuidString] = rawWorkspace
+            rawRoot["agentModelsSettingsByWorkspaceID"] = rawAgentModels
+            try JSONSerialization.data(withJSONObject: rawRoot, options: [.prettyPrinted, .sortedKeys])
+                .write(to: fileURL)
 
             let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
 
@@ -1665,6 +2099,21 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             XCTAssertEqual(repairedWorkspace.planningModelRaw, tuple.planning)
             XCTAssertEqual(repairedWorkspace.preferredComposeModelRaw, tuple.compose)
             XCTAssertFalse(repairedWorkspace.syncChatModelWithOracle)
+
+            let repairedRawRoot = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+            )
+            XCTAssertNotNil(repairedRawRoot["unknownRoot"])
+            let repairedRawScalars = try XCTUnwrap(repairedRawRoot["scalarPreferences"] as? [String: Any])
+            XCTAssertNotNil(repairedRawScalars["unknownGroup"])
+            let repairedRawAgentModels = try XCTUnwrap(
+                repairedRawRoot["agentModelsSettingsByWorkspaceID"] as? [String: Any]
+            )
+            let repairedRawWorkspace = try XCTUnwrap(
+                repairedRawAgentModels[dormantWorkspaceID.uuidString] as? [String: Any]
+            )
+            let repairedRawProfile = try XCTUnwrap(repairedRawWorkspace["profile"] as? [String: Any])
+            XCTAssertNotNil(repairedRawProfile["unknownProfileField"])
 
             store.setShowDatesInMessageTimestamps(true)
 
@@ -2577,6 +3026,18 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         return defaults
     }
 
+    private func completeContextBuilderScalarSettings() -> GlobalScalarPreferences.ContextBuilderSettings {
+        GlobalScalarPreferences.ContextBuilderSettings(
+            contextTokenBudget: ContextBuilderDefaults.contextTokenBudget,
+            analysisTokenBudget: ContextBuilderDefaults.analysisTokenBudget,
+            enhancementMode: ContextBuilderDefaults.enhancementMode.rawValue,
+            questionTimeoutSeconds: ContextBuilderDefaults.questionTimeoutSeconds,
+            allowUIClarifyingQuestions: ContextBuilderDefaults.allowUIClarifyingQuestions,
+            allowMCPClarifyingQuestions: ContextBuilderDefaults.allowMCPClarifyingQuestions,
+            followUpAnalysisEnabled: ContextBuilderDefaults.followUpAnalysisEnabled
+        )
+    }
+
     private func seededScalarPreferences(
         ui: GlobalScalarPreferences.UISettings? = nil,
         modelSelection: GlobalScalarPreferences.ModelSelectionSettings? = nil,
@@ -2765,6 +3226,13 @@ private final class CountingGlobalSettingsFileStore: GlobalSettingsFileStoring {
         saved.schemaVersion = saved.requiredSchemaVersion
         saved.schemaLineage = GlobalSettingsDocument.schemaLineage
         self.document = saved
+    }
+
+    func saveStartupMigrationPreservingUnknownFields(
+        _ document: GlobalSettingsDocument,
+        includeModelSelectionRepair _: Bool
+    ) throws {
+        try save(document)
     }
 
     func performUserInitiatedRecovery(replacementDocument _: GlobalSettingsDocument) -> Bool {

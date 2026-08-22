@@ -345,6 +345,14 @@ actor DomainWorkspaceContextAuthority {
                 diagnostic: diagnostic
             )
         }
+        if rejectsEphemeralPersistence(envelope.command) {
+            return recordTransientOutcome(
+                envelope: envelope,
+                disposition: .invalid,
+                errorCode: .invalidDocument,
+                diagnostic: "ephemeral_workspace_not_persistable"
+            )
+        }
         if let workspaceID, unavailableWorkspaces[workspaceID] != nil {
             return recordTransientOutcome(
                 envelope: envelope,
@@ -419,6 +427,18 @@ actor DomainWorkspaceContextAuthority {
         }
     }
 
+    private func rejectsEphemeralPersistence(_ command: DomainWorkspaceCommand) -> Bool {
+        switch command {
+        case let .createWorkspace(document), let .replaceWorkingDocument(document):
+            document.metadata.isEphemeral
+        case let .saveWorkspaceDocument(workspaceID),
+             let .resolveExternalConflict(workspaceID, _, _):
+            records[workspaceID]?.document.metadata.isEphemeral == true
+        case .deleteWorkspace:
+            false
+        }
+    }
+
     private func commandDocument(_ command: DomainWorkspaceCommand) -> DomainWorkspaceDocument? {
         switch command {
         case let .createWorkspace(document), let .replaceWorkingDocument(document):
@@ -455,7 +475,9 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: makeSnapshot(record))
             }
-            if case let .createWorkspace(document) = envelope.command {
+            if (prior.disposition == .applied || prior.disposition == .unchanged),
+               case let .createWorkspace(document) = envelope.command
+            {
                 do {
                     catalogRevision = try await max(
                         catalogRevision,
@@ -485,7 +507,9 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: nil)
             }
-            if case let .createWorkspace(document) = envelope.command {
+            if (prior.disposition == .applied || prior.disposition == .unchanged),
+               case let .createWorkspace(document) = envelope.command
+            {
                 do {
                     catalogRevision = try await max(
                         catalogRevision,
@@ -747,6 +771,22 @@ actor DomainWorkspaceContextAuthority {
                     )
                 }
             case let .changed(document, metadata):
+                if document.metadata.isEphemeral || record.document.metadata.isEphemeral {
+                    record.document = document
+                    record.fileMetadata = metadata
+                    records[workspaceID] = record
+                    readRegistrations.removeValue(forKey: workspaceID)
+                    publish(
+                        kind: .externalReloaded,
+                        workspaceID: workspaceID,
+                        contextID: nil,
+                        operationID: nil,
+                        revisions: record.revisions,
+                        diagnostic: "ephemeral_external_reload_not_persisted"
+                    )
+                    changed = true
+                    continue
+                }
                 #if DEBUG
                     if let testBeforeExternalReconciliation {
                         await testBeforeExternalReconciliation(workspaceID)
@@ -1333,16 +1373,22 @@ actor DomainWorkspaceContextAuthority {
                 now: operation.recordedAt
             )
             records.removeValue(forKey: workspaceID)
-            globalOperations.insert(operation)
             catalogRevision = deleted.catalogRevision
+            let cleanupDiagnostic = deleted.tombstone.operation.diagnostic
             let outcome = DomainCommandOutcome(
                 operationID: envelope.operationID,
                 disposition: .applied,
                 before: record.revisions,
                 after: nil,
                 catalogRevision: catalogRevision,
-                resultingDigest: nil
+                resultingDigest: nil,
+                diagnostic: cleanupDiagnostic
             )
+            globalOperations.insert(DomainRecordedOperation(
+                fingerprint: fingerprint,
+                recordedAt: operation.recordedAt,
+                outcome: outcome
+            ))
             publish(
                 kind: .workspaceDeleted,
                 workspaceID: workspaceID,
@@ -1350,7 +1396,7 @@ actor DomainWorkspaceContextAuthority {
                 operationID: envelope.operationID,
                 origin: envelope.origin,
                 revisions: nil,
-                diagnostic: nil
+                diagnostic: cleanupDiagnostic
             )
             recordMetric(envelope: envelope, outcome: outcome, byteCount: 0)
             return outcome
