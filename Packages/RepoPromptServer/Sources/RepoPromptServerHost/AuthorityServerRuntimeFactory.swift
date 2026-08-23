@@ -87,9 +87,17 @@ private struct RestoreActivationRequest: Decodable {
     let backupSequence: Int64
     let backupCreatedAt: String
     let backupManifestSHA256: String
+    let sourceNamespaceKind: String
+    let sourceDatabaseIdentityDigest: String
+    let targetNamespaceKind: String
+    let targetDatabaseIdentityDigest: String
+    let missingExternalOptionalAssetIDs: [String]?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, acknowledged, backupSequence, backupCreatedAt
+        case sourceNamespaceKind, sourceDatabaseIdentityDigest
+        case targetNamespaceKind, targetDatabaseIdentityDigest
+        case missingExternalOptionalAssetIDs
         case restoredFromStoreID = "restoredFromStoreId"
         case backupManifestSHA256 = "backupManifestSha256"
     }
@@ -99,12 +107,24 @@ public extension RepoPromptAuthorityHostFactory {
     static func startServer(
         configuration: AuthorityServerRuntimeConfiguration
     ) async throws -> AuthorityServerRuntime {
-        let host = try await start(configuration: configuration.host)
+        let stateDirectory = URL(fileURLWithPath: configuration.host.namespace.databasePath)
+            .deletingLastPathComponent().path
+        let requestURL = URL(fileURLWithPath: stateDirectory).appendingPathComponent("restore-request.json")
+        if FileManager.default.fileExists(atPath: requestURL.path),
+           configuration.restoreActivationTokenPath == nil
+        {
+            throw ServiceAPIError(
+                code: .quiescing,
+                message: "Restored store requires an explicit activation token before startup"
+            )
+        }
+        let hostConfiguration = configuration.restoreActivationTokenPath == nil
+            ? configuration.host
+            : configuration.host.allowingPendingRestoreRebind()
+        let host = try await start(configuration: hostConfiguration)
         do {
             let instanceID = host.instanceID
             let store = try await host.storeForRecovery()
-            let stateDirectory = URL(fileURLWithPath: configuration.host.namespace.databasePath)
-                .deletingLastPathComponent().path
 
             if let tokenPath = configuration.restoreActivationTokenPath {
                 let token = try Data(contentsOf: URL(fileURLWithPath: tokenPath))
@@ -114,7 +134,6 @@ public extension RepoPromptAuthorityHostFactory {
                         message: "Restore activation token must contain at least 256 bits"
                     )
                 }
-                let requestURL = URL(fileURLWithPath: stateDirectory).appendingPathComponent("restore-request.json")
                 var metadata = try await store.metadata()
                 if metadata.activationState == "active", FileManager.default.fileExists(atPath: requestURL.path) {
                     let request = try JSONDecoder.serviceDecoder.decode(
@@ -123,7 +142,10 @@ public extension RepoPromptAuthorityHostFactory {
                     )
                     guard request.schemaVersion == 1,
                           request.acknowledged,
-                          request.restoredFromStoreID == metadata.storeID,
+                          request.sourceNamespaceKind == request.targetNamespaceKind,
+                          request.targetNamespaceKind == configuration.host.namespace.servingMode.rawValue,
+                          request.targetDatabaseIdentityDigest == configuration.host.namespace.namespaceID,
+                          request.sourceDatabaseIdentityDigest != request.targetDatabaseIdentityDigest,
                           request.backupSequence >= 0,
                           request.backupCreatedAt.utf8.count <= 128,
                           request.backupManifestSHA256.range(
@@ -136,13 +158,20 @@ public extension RepoPromptAuthorityHostFactory {
                             message: "Restore activation request is invalid or does not match this store"
                         )
                     }
-                    _ = try await store.prepareRestoredStore(
+                    _ = try await store.activateRestoredNamespace(
                         from: request.restoredFromStoreID,
                         backupSequence: request.backupSequence,
-                        digest: request.backupManifestSHA256,
-                        activationToken: token
+                        manifestDigest: request.backupManifestSHA256,
+                        sourceNamespaceKind: request.sourceNamespaceKind,
+                        sourceDatabaseIdentityDigest: request.sourceDatabaseIdentityDigest,
+                        targetNamespaceKind: request.targetNamespaceKind,
+                        targetDatabaseIdentityDigest: request.targetDatabaseIdentityDigest,
+                        missingExternalOptionalAssetIDs: request.missingExternalOptionalAssetIDs ?? [],
+                        activationToken: token,
+                        instanceID: instanceID
                     )
                     metadata = try await store.metadata()
+                    try FileManager.default.removeItem(at: requestURL)
                 }
                 if metadata.activationState == "restore_prepared" {
                     _ = try await store.activateRestoredStore(

@@ -5,7 +5,8 @@ import SQLiteNIO
 
 extension SQLiteServiceStore: OwnedResourceRepository {
     public func reserveOwnedResource(_ record: OwnedResourceRecord) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(record)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let externalID = record.externalID,
                let existing = try await ownedResource(externalID: externalID, kind: record.kind)
             {
@@ -18,7 +19,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
                 return
             }
             do {
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO owned_resources(resource_id,schema_version,kind,project_id,session_id,run_id,external_id,internal_path_identity,temporary_path_identity,lifecycle_state,observed_bytes,content_digest,metadata_json,retention_deadline,cleanup_attempts,cleanup_error,created_at,updated_at) VALUES(?,2,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     [
                         .text(record.resourceID.uuidString), .text(record.kind.rawValue),
@@ -48,20 +49,20 @@ extension SQLiteServiceStore: OwnedResourceRepository {
     }
 
     public func ownedResource(externalID: UUID, kind: OwnedResourceKind) async throws -> OwnedResourceRecord? {
-        try await connection.query(
+        try await database.query(
             "SELECT * FROM owned_resources WHERE external_id=? AND kind=? ORDER BY created_at DESC LIMIT 1",
             [.text(externalID.uuidString), .text(kind.rawValue)]
         ).first.map(decodeOwnedResource)
     }
 
     public func ownedResources(states: Set<OwnedResourceLifecycleState>? = nil) async throws -> [OwnedResourceRecord] {
-        let records = try await connection.query("SELECT * FROM owned_resources ORDER BY created_at,resource_id").map(decodeOwnedResource)
+        let records = try await database.query("SELECT * FROM owned_resources ORDER BY created_at,resource_id").map(decodeOwnedResource)
         guard let states else { return records }
         return records.filter { states.contains($0.lifecycleState) }
     }
 
     public func activeOwnedWorktree(bindingID: UUID) async throws -> ActiveOwnedWorktreeSnapshot? {
-        let row = try await connection.query(
+        let row = try await database.query(
             "SELECT w.binding_id,w.project_id,w.root_id,w.session_id,w.physical_path,w.branch,r.canonical_path AS source_root FROM worktree_bindings w JOIN project_roots r ON r.root_id=w.root_id AND r.project_id=w.project_id WHERE w.binding_id=? AND w.ownership_state='active' AND w.session_id IS NOT NULL AND r.writable=1",
             [.text(bindingID.uuidString)]
         ).first
@@ -92,8 +93,12 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         authority: ActiveOwnedWorktreeSnapshot,
         contentDigest: String
     ) async throws -> OwnedResourceRecord {
-        try await transaction {
-            guard let current = try await connection.query(
+        let retainedBytes = authority.physicalPath.utf8.count
+            + authority.sourceRoot.utf8.count
+            + authority.branch.utf8.count
+            + contentDigest.utf8.count
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            guard let current = try await database.query(
                 "SELECT * FROM owned_resources WHERE resource_id=?",
                 [.text(resourceID.uuidString)]
             ).first.map(decodeOwnedResource) else {
@@ -117,7 +122,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
             else {
                 throw ServiceAPIError(code: .worktreeConflict, message: "Legacy worktree ownership no longer matches its durable binding")
             }
-            let duplicates = try await connection.query(
+            let duplicates = try await database.query(
                 "SELECT binding_id FROM worktree_bindings WHERE project_id=? AND root_id=? AND session_id=? AND ownership_state='active' AND binding_id<>? LIMIT 1",
                 [
                     .text(authority.projectID.uuidString),
@@ -129,11 +134,11 @@ extension SQLiteServiceStore: OwnedResourceRepository {
             guard duplicates.isEmpty else {
                 throw ServiceAPIError(code: .worktreeConflict, message: "Legacy worktree ownership is not unique")
             }
-            _ = try await connection.query(
+            _ = try await database.query(
                 "UPDATE owned_resources SET content_digest=?,updated_at=? WHERE resource_id=? AND content_digest IS NULL AND lifecycle_state='active'",
                 [.text(contentDigest), .float(Date().timeIntervalSince1970), .text(resourceID.uuidString)]
             )
-            guard let updated = try await connection.query(
+            guard let updated = try await database.query(
                 "SELECT * FROM owned_resources WHERE resource_id=?",
                 [.text(resourceID.uuidString)]
             ).first.map(decodeOwnedResource), updated.contentDigest == contentDigest else {
@@ -151,8 +156,9 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         contentDigest: String?,
         cleanupError: String?
     ) async throws -> OwnedResourceRecord {
-        try await transaction {
-            guard let current = try await connection.query(
+        let retainedBytes = (contentDigest?.utf8.count ?? 0) + (cleanupError?.utf8.count ?? 0)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            guard let current = try await database.query(
                 "SELECT * FROM owned_resources WHERE resource_id=?",
                 [.text(resourceID.uuidString)]
             ).first.map(decodeOwnedResource) else {
@@ -168,7 +174,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
                 contentDigest: contentDigest,
                 cleanupError: cleanupError
             )
-            _ = try await connection.query(
+            _ = try await database.query(
                 "UPDATE owned_resources SET lifecycle_state=?,observed_bytes=?,content_digest=?,cleanup_attempts=?,cleanup_error=?,updated_at=? WHERE resource_id=? AND lifecycle_state=?",
                 [
                     .text(updated.lifecycleState.rawValue),
@@ -187,7 +193,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
 
     public func acquireWorktreeMergeLease(_ lease: WorktreeMergeLeaseRecord) async throws {
         do {
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO worktree_merge_leases(lease_id,binding_id,expected_binding_revision,strategy,target_path,pre_merge_head,state,owner_instance_id,conflict_artifact_path,error_code,started_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     .text(lease.leaseID.uuidString), .text(lease.bindingID.uuidString), .integer(Int(lease.expectedBindingRevision)),
@@ -203,7 +209,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
     }
 
     public func renewWorktreeMergeLease(leaseID: UUID, ownerInstanceID: UUID, expiresAt: Date) async throws {
-        let current = try await connection.query(
+        let current = try await database.query(
             "SELECT state,owner_instance_id FROM worktree_merge_leases WHERE lease_id=?",
             [.text(leaseID.uuidString)]
         ).first
@@ -212,7 +218,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         else {
             throw ServiceAPIError(code: .worktreeConflict, message: "Merge lease renewal is stale")
         }
-        _ = try await connection.query(
+        _ = try await database.query(
             "UPDATE worktree_merge_leases SET expires_at=?,updated_at=? WHERE lease_id=? AND state='running' AND owner_instance_id=?",
             [.float(expiresAt.timeIntervalSince1970), .float(Date().timeIntervalSince1970), .text(leaseID.uuidString), .text(ownerInstanceID.uuidString)]
         )
@@ -225,8 +231,12 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         conflictArtifactPath: String?,
         errorCode: String?
     ) async throws -> WorktreeMergeLeaseRecord {
-        try await transaction {
-            guard let row = try await connection.query("SELECT * FROM worktree_merge_leases WHERE lease_id=?", [.text(leaseID.uuidString)]).first else {
+        let retainedBytes = try retainedInputBytes(
+            expectedStates.map(\.rawValue).sorted()
+                + [state.rawValue, conflictArtifactPath ?? "", errorCode ?? ""]
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            guard let row = try await database.query("SELECT * FROM worktree_merge_leases WHERE lease_id=?", [.text(leaseID.uuidString)]).first else {
                 throw ServiceAPIError(code: .notFound, message: "Merge lease was not found")
             }
             let current = try decodeMergeLease(row)
@@ -235,7 +245,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
                 throw ServiceAPIError(code: .worktreeConflict, message: "Merge lease transition is stale")
             }
             let now = Date()
-            _ = try await connection.query(
+            _ = try await database.query(
                 "UPDATE worktree_merge_leases SET state=?,conflict_artifact_path=?,error_code=?,updated_at=? WHERE lease_id=? AND state=?",
                 [
                     .text(state.rawValue), conflictArtifactPath.map(SQLiteData.text) ?? .null,
@@ -262,7 +272,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
     }
 
     public func worktreeMergeLeases(nonterminalOnly: Bool = false) async throws -> [WorktreeMergeLeaseRecord] {
-        let rows = try await connection.query("SELECT * FROM worktree_merge_leases ORDER BY started_at,lease_id")
+        let rows = try await database.query("SELECT * FROM worktree_merge_leases ORDER BY started_at,lease_id")
         let leases = try rows.map(decodeMergeLease)
         return nonterminalOnly ? leases.filter { !$0.state.isTerminal } : leases
     }
@@ -271,7 +281,7 @@ extension SQLiteServiceStore: OwnedResourceRepository {
         // Readiness is polled continuously and provider probes retain bounded
         // lifecycle history. Aggregate in SQLite so health does not materialize
         // and decode every historical provider row on each poll.
-        let aggregateRows = try await connection.query(
+        let aggregateRows = try await database.query(
             "SELECT kind,lifecycle_state,COUNT(*) AS resource_count,COALESCE(SUM(observed_bytes),0) AS resource_bytes,MIN(updated_at) AS oldest_updated_at FROM owned_resources GROUP BY kind,lifecycle_state ORDER BY kind,lifecycle_state"
         )
         let aggregates = try aggregateRows.map { row -> OwnedResourceAggregate in
@@ -289,11 +299,11 @@ extension SQLiteServiceStore: OwnedResourceRepository {
                 oldestAgeSeconds: max(0, now.timeIntervalSince(oldest))
             )
         }
-        let core = try await connection.query(
+        let core = try await database.query(
             "SELECT COALESCE(SUM(CASE WHEN cleanup_error IS NOT NULL AND lifecycle_state<>'deleted' THEN 1 ELSE 0 END),0) AS cleanup_failures,COALESCE(SUM(CASE WHEN kind='artifact' AND lifecycle_state='missing' THEN 1 ELSE 0 END),0) AS missing_artifacts,COALESCE(SUM(CASE WHEN lifecycle_state IN ('missing','corrupt') THEN 1 ELSE 0 END),0) AS unhealthy_resources,COALESCE(SUM(CASE WHEN lifecycle_state IN ('preparing','prepared','cleanup_pending','quarantined') AND retention_deadline IS NOT NULL AND retention_deadline<=? THEN 1 ELSE 0 END),0) AS abandoned_reservations FROM owned_resources WHERE kind NOT IN ('provider_home','provider_credential_copy','provider_output')",
             [.float(now.timeIntervalSince1970)]
         ).first
-        let lease = try await connection.query(
+        let lease = try await database.query(
             "SELECT COALESCE(SUM(CASE WHEN state='conflicted' THEN 1 ELSE 0 END),0) AS conflicted_leases,COALESCE(SUM(CASE WHEN expires_at<=? AND state<>'conflicted' THEN 1 ELSE 0 END),0) AS expired_leases FROM worktree_merge_leases WHERE state NOT IN ('aborted','committed','failed')",
             [.float(now.timeIntervalSince1970)]
         ).first
@@ -318,18 +328,18 @@ extension SQLiteServiceStore: OwnedResourceRepository {
             throw ServiceAPIError(code: .persistenceUnavailable, message: "Prepared owned resource does not match durable publication")
         }
         guard current.lifecycleState != .active else { return }
-        _ = try await connection.query(
+        _ = try await database.query(
             "UPDATE owned_resources SET lifecycle_state='active',updated_at=? WHERE resource_id=? AND lifecycle_state='prepared'",
             [.float(Date().timeIntervalSince1970), .text(current.resourceID.uuidString)]
         )
     }
 
     func commitPreparedMergeLeaseIfPresent(bindingID: UUID, expectedRevision: Int64) async throws {
-        guard let row = try await connection.query(
+        guard let row = try await database.query(
             "SELECT lease_id FROM worktree_merge_leases WHERE binding_id=? AND expected_binding_revision=? AND state='prepared' ORDER BY started_at DESC LIMIT 1",
             [.text(bindingID.uuidString), .integer(Int(expectedRevision))]
         ).first, let leaseID = row.column("lease_id")?.string else { return }
-        _ = try await connection.query(
+        _ = try await database.query(
             "UPDATE worktree_merge_leases SET state='committed',updated_at=? WHERE lease_id=? AND state='prepared'",
             [.float(Date().timeIntervalSince1970), .text(leaseID)]
         )

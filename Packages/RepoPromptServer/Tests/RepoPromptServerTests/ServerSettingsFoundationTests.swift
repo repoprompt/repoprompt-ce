@@ -1038,7 +1038,7 @@ final class ServerSettingsFoundationTests: XCTestCase {
         XCTAssertEqual(recoveredModelPresets.presets.first?.order, 0)
         XCTAssertFalse(recoveredAdvanced.settings.codeMapsEnabled)
         XCTAssertEqual(recoveredSelectionPresets.presets.first?.name, "Sources")
-        XCTAssertEqual(recoveredMetadata.schemaVersion, 6)
+        XCTAssertEqual(recoveredMetadata.schemaVersion, SchemaV7.version)
         XCTAssertTrue(operational.migrationsValid)
         try await store.close()
     }

@@ -1,6 +1,17 @@
 enum SchemaV2 {
     static let version = 2
+    /// Legacy prototype ledger alias. Never rewrite an existing row.
     static let digest = "repoprompt-service-schema-v2-owned-resources-archives-restore-counters"
+    static let transformationID = "owned-resources-archives-restore-counters-v1"
+    static let canonicalDigest = "sha256:f6a8d2628909e73e95302537ac970ae4bfa090df59a86729eaa4d4552bf6992c"
+    static var definition: MigrationDefinition {
+        MigrationDefinition(
+            version: version,
+            transformationID: transformationID,
+            statements: statements + dataStatements,
+            transformationSteps: []
+        )
+    }
 
     static let statements: [String] = [
         "CREATE TABLE IF NOT EXISTS session_event_counters(session_id TEXT PRIMARY KEY,event_count INTEGER NOT NULL,last_sequence INTEGER NOT NULL)",
@@ -17,5 +28,11 @@ enum SchemaV2 {
         "CREATE UNIQUE INDEX IF NOT EXISTS owned_resources_external_identity ON owned_resources(kind,external_id) WHERE external_id IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS owned_resources_live_path ON owned_resources(internal_path_identity) WHERE lifecycle_state != 'deleted'",
         "CREATE INDEX IF NOT EXISTS owned_resources_state_deadline ON owned_resources(lifecycle_state,retention_deadline)"
+    ]
+
+    static let dataStatements: [String] = [
+        "UPDATE owned_resources SET created_at=CASE WHEN created_at=0 THEN unixepoch() ELSE created_at END,updated_at=CASE WHEN updated_at=0 THEN unixepoch() ELSE updated_at END",
+        "INSERT OR IGNORE INTO session_event_counters(session_id,event_count,last_sequence) SELECT session_id,COUNT(*),MAX(global_sequence) FROM events WHERE session_id IS NOT NULL GROUP BY session_id",
+        "UPDATE service_metadata SET schema_version=2,last_event_timestamp=COALESCE((SELECT MAX(timestamp) FROM events),0) WHERE fixed_id=1",
     ]
 }

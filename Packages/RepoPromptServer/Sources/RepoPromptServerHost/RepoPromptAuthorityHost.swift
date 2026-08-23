@@ -29,6 +29,7 @@ public struct AuthorityHostConfiguration: Sendable {
     public let mutationDrainMaximum: Duration
     public let admittedWorkDrainMaximum: Duration
     public let shutdownHooks: AuthorityHostShutdownHooks
+    var allowsPendingRestoreRebind = false
 
     public init(
         namespace: AuthorityNamespaceDescriptor,
@@ -44,6 +45,12 @@ public struct AuthorityHostConfiguration: Sendable {
         self.mutationDrainMaximum = mutationDrainMaximum
         self.admittedWorkDrainMaximum = admittedWorkDrainMaximum
         self.shutdownHooks = shutdownHooks
+    }
+
+    func allowingPendingRestoreRebind() -> Self {
+        var copy = self
+        copy.allowsPendingRestoreRebind = true
+        return copy
     }
 }
 
@@ -226,7 +233,10 @@ public actor RepoPromptAuthorityHost {
             }
             storeValue = try await SQLiteServiceStore.openForServing(
                 storage: .file(configuration.namespace.databasePath),
-                eventSigningKey: eventSigningKey
+                eventSigningKey: eventSigningKey,
+                namespaceKind: configuration.namespace.servingMode.rawValue,
+                databaseIdentityDigest: configuration.namespace.namespaceID,
+                allowPendingRestoreRebind: configuration.allowsPendingRestoreRebind
             )
             stateValue = .recoveringResources
         } catch let error as ServiceAPIError {

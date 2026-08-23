@@ -34,23 +34,57 @@ public struct PersistedProcessFamily: Codable, Hashable, Sendable {
     public let state: String
 }
 
+struct EventRetentionObservation: Sendable, Equatable {
+    var candidateQueryCount = 0
+    var archiveMutationCount = 0
+    var maximumScannedRows = 0
+    var totalScannedRows = 0
+    var maximumScannedEnvelopeBytes = 0
+    var totalScannedEnvelopeBytes = 0
+    var maximumMaterializedRows = 0
+    var totalMaterializedRows = 0
+    var maximumMaterializedEnvelopeBytes = 0
+    var totalMaterializedEnvelopeBytes = 0
+}
+
 public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     public typealias Metadata = AuthorityStoreMetadata
 
     public enum Storage: Sendable { case memory, file(String) }
 
-    let connection: SQLiteConnection
+    let database: SQLiteDatabaseExecutor
     let encoder: JSONEncoder
     let decoder: JSONDecoder
     private let eventSigningKey: PersistenceEventSigningKey?
     private let faultInjector: PersistenceFaultInjector
     let storagePath: String?
     private var closed = false
-    private var transactionActive = false
-    private var transactionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var faultInjectionEnabled = false
+    private var eventRetentionObservation = EventRetentionObservation()
 
-    private init(connection: SQLiteConnection, eventSigningKey: PersistenceEventSigningKey?, faultInjector: PersistenceFaultInjector, storagePath: String?) {
-        self.connection = connection
+    /// Closed admission vocabulary for every store-owned transaction. The
+    /// transaction body remains a private implementation detail of this actor;
+    /// package clients cannot supply SQL or a suspension-capable closure.
+    enum StoreTransactionWorkload {
+        case interactive(estimatedEncodedBytes: Int)
+        case bulk(estimatedEncodedBytes: Int)
+
+        var operationClass: SQLiteOperationClass {
+            switch self {
+            case .interactive: .interactive
+            case .bulk: .bulk
+            }
+        }
+
+        var estimatedEncodedBytes: Int {
+            switch self {
+            case let .interactive(bytes), let .bulk(bytes): bytes
+            }
+        }
+    }
+
+    private init(database: SQLiteDatabaseExecutor, eventSigningKey: PersistenceEventSigningKey?, faultInjector: PersistenceFaultInjector, storagePath: String?) {
+        self.database = database
         self.eventSigningKey = eventSigningKey
         self.faultInjector = faultInjector
         self.storagePath = storagePath
@@ -64,16 +98,76 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         // shutdown and checkpoints WAL. This safety net prevents SQLiteNIO's
         // deinit assertion from masking the original error when construction
         // or an async caller unwinds before reaching that close boundary.
-        let connection = connection
-        Task { try? await connection.close() }
+        let database = database
+        Task { try? await database.close() }
     }
 
-    public static func open(storage: Storage, eventSigningKey: PersistenceEventSigningKey? = nil, faultInjector: PersistenceFaultInjector = .none) async throws -> SQLiteServiceStore {
+    public static func open(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil
+    ) async throws -> SQLiteServiceStore {
+        try await open(storage: storage, eventSigningKey: eventSigningKey, faultInjector: .none)
+    }
+
+    static func open(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil,
+        faultInjector: PersistenceFaultInjector
+    ) async throws -> SQLiteServiceStore {
+        try await openConfigured(
+            storage: storage,
+            eventSigningKey: eventSigningKey,
+            faultInjector: faultInjector,
+            executorCapacity: SQLiteDatabaseExecutor.defaultCapacity,
+            executorReservedControlCapacity: SQLiteDatabaseExecutor.defaultReservedControlCapacity,
+            executorMaximumAdmissionWaiters: SQLiteDatabaseExecutor.defaultMaximumAdmissionWaiters,
+            executorMaximumProducerEncodedBytes: SQLiteDatabaseExecutor.defaultMaximumProducerEncodedBytes
+        )
+    }
+
+    /// Test-only package seam for exercising the production store surface at a
+    /// smaller but proportionally identical scheduler capacity.
+    static func openForExecutorSaturationTesting(
+        storage: Storage,
+        capacity: Int,
+        reservedControlCapacity: Int,
+        maximumAdmissionWaiters: Int,
+        maximumProducerEncodedBytes: Int
+    ) async throws -> SQLiteServiceStore {
+        try await openConfigured(
+            storage: storage,
+            eventSigningKey: nil,
+            faultInjector: .none,
+            executorCapacity: capacity,
+            executorReservedControlCapacity: reservedControlCapacity,
+            executorMaximumAdmissionWaiters: maximumAdmissionWaiters,
+            executorMaximumProducerEncodedBytes: maximumProducerEncodedBytes
+        )
+    }
+
+    private static func openConfigured(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey?,
+        faultInjector: PersistenceFaultInjector,
+        executorCapacity: Int,
+        executorReservedControlCapacity: Int,
+        executorMaximumAdmissionWaiters: Int,
+        executorMaximumProducerEncodedBytes: Int
+    ) async throws -> SQLiteServiceStore {
+        if try servingFileState(storage) == .existingSQLite {
+            try await preflightExistingStore(storage: storage, validation: .current)
+        }
         let location: SQLiteConnection.Storage = switch storage { case .memory: .memory
         case let .file(path): .file(path: path) }
-        let connection = try await SQLiteConnection.open(storage: location)
+        let database = try await SQLiteDatabaseExecutor.open(
+            storage: location,
+            capacity: executorCapacity,
+            reservedControlCapacity: executorReservedControlCapacity,
+            maximumAdmissionWaiters: executorMaximumAdmissionWaiters,
+            maximumProducerEncodedBytes: executorMaximumProducerEncodedBytes
+        )
         let store = SQLiteServiceStore(
-            connection: connection,
+            database: database,
             eventSigningKey: eventSigningKey,
             faultInjector: faultInjector,
             storagePath: {
@@ -81,9 +175,26 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 return nil
             }()
         )
-        try await store.migrate()
-        try await store.integrityCheck()
-        return store
+        do {
+            if try await store.hasSchemaMetadata() {
+                // Existing stores are inspected before WAL, foreign-key, busy,
+                // or any other connection configuration can mutate bytes.
+                try await store.validateCurrentServingSchema(requestedKind: nil, requestedDatabaseIdentityDigest: nil)
+                try await store.configureDatabase()
+            } else {
+                try await store.configureDatabase()
+                try await store.initializeLatest(
+                    namespaceKind: "server",
+                    databaseIdentityDigest: store.defaultDatabaseIdentityDigest
+                )
+            }
+            try await store.integrityCheck()
+            await store.enableFaultInjection()
+            return store
+        } catch {
+            try? await store.close(clean: false)
+            throw error
+        }
     }
 
     /// Named offline seam used only after `AuthorityMaintenanceSession` owns the
@@ -92,13 +203,84 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     public static func openForMaintenance(
         storage: Storage,
         eventSigningKey: PersistenceEventSigningKey? = nil,
-        faultInjector: PersistenceFaultInjector = .none
+        requestedNamespaceKind: String? = nil,
+        requestedDatabaseIdentityDigest: String? = nil
     ) async throws -> SQLiteServiceStore {
-        try await open(
+        try await openForMaintenance(
             storage: storage,
             eventSigningKey: eventSigningKey,
-            faultInjector: faultInjector
+            faultInjector: .none,
+            requestedNamespaceKind: requestedNamespaceKind,
+            requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest
         )
+    }
+
+    static func openForMaintenance(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil,
+        faultInjector: PersistenceFaultInjector,
+        requestedNamespaceKind: String? = nil,
+        requestedDatabaseIdentityDigest: String? = nil
+    ) async throws -> SQLiteServiceStore {
+        if try servingFileState(storage) == .existingSQLite {
+            try await preflightExistingStore(
+                storage: storage,
+                validation: .maintenance(
+                    requestedKind: requestedNamespaceKind,
+                    requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest
+                )
+            )
+        }
+        let location: SQLiteConnection.Storage = switch storage {
+        case .memory: .memory
+        case let .file(path): .file(path: path)
+        }
+        let database = try await SQLiteDatabaseExecutor.open(storage: location)
+        let store = SQLiteServiceStore(
+            database: database,
+            eventSigningKey: eventSigningKey,
+            faultInjector: faultInjector,
+            storagePath: {
+                if case let .file(path) = storage { return path }
+                return nil
+            }()
+        )
+        do {
+            if try await store.hasSchemaMetadata() {
+                try await store.validateKnownMaintenanceSchema(
+                    requestedKind: requestedNamespaceKind,
+                    requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest
+                )
+                try await store.configureDatabase()
+            } else {
+                let tables = try await database.query(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+                guard tables.isEmpty else {
+                    throw ServiceAPIError(
+                        code: .authorityPurposeMismatch,
+                        message: "SQLite file is foreign or has an ambiguous RepoPrompt authority identity"
+                    )
+                }
+                let databaseIdentityDigest: String
+                if let requestedDatabaseIdentityDigest {
+                    databaseIdentityDigest = requestedDatabaseIdentityDigest
+                } else {
+                    databaseIdentityDigest = await store.defaultDatabaseIdentityDigest
+                }
+                try await store.configureDatabase()
+                try await store.initializeLatest(
+                    namespaceKind: requestedNamespaceKind ?? "server",
+                    databaseIdentityDigest: databaseIdentityDigest
+                )
+            }
+            try await store.integrityCheck()
+            await store.enableFaultInjection()
+            return store
+        } catch {
+            try? await store.close(clean: false)
+            throw error
+        }
     }
 
     /// Serving never advances a nonempty store. A brand-new empty database may
@@ -107,16 +289,57 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     public static func openForServing(
         storage: Storage,
         eventSigningKey: PersistenceEventSigningKey? = nil,
-        faultInjector: PersistenceFaultInjector = .none
+        namespaceKind: String = "server",
+        databaseIdentityDigest: String? = nil,
+        allowPendingRestoreRebind: Bool = false
     ) async throws -> SQLiteServiceStore {
+        try await openForServing(
+            storage: storage,
+            eventSigningKey: eventSigningKey,
+            faultInjector: .none,
+            namespaceKind: namespaceKind,
+            databaseIdentityDigest: databaseIdentityDigest,
+            allowPendingRestoreRebind: allowPendingRestoreRebind
+        )
+    }
+
+    static func openForServing(
+        storage: Storage,
+        eventSigningKey: PersistenceEventSigningKey? = nil,
+        faultInjector: PersistenceFaultInjector,
+        namespaceKind: String = "server",
+        databaseIdentityDigest: String? = nil,
+        allowPendingRestoreRebind: Bool = false
+    ) async throws -> SQLiteServiceStore {
+        if case let .file(path) = storage {
+            let incompleteRestore = URL(fileURLWithPath: path).deletingLastPathComponent()
+                .appendingPathComponent("restore-incomplete.json")
+            guard !FileManager.default.fileExists(atPath: incompleteRestore.path) else {
+                throw ServiceAPIError(
+                    code: .quiescing,
+                    message: "Restored namespace publication is incomplete",
+                    retryable: false
+                )
+            }
+        }
         let fileState = try servingFileState(storage)
+        if fileState == .existingSQLite {
+            try await preflightExistingStore(
+                storage: storage,
+                validation: .serving(
+                    requestedKind: namespaceKind,
+                    requestedDatabaseIdentityDigest: databaseIdentityDigest,
+                    allowPendingRestoreRebind: allowPendingRestoreRebind
+                )
+            )
+        }
         let location: SQLiteConnection.Storage = switch storage {
         case .memory: .memory
         case let .file(path): .file(path: path)
         }
-        let connection = try await SQLiteConnection.open(storage: location)
+        let database = try await SQLiteDatabaseExecutor.open(storage: location)
         let store = SQLiteServiceStore(
-            connection: connection,
+            database: database,
             eventSigningKey: eventSigningKey,
             faultInjector: faultInjector,
             storagePath: {
@@ -127,9 +350,19 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         do {
             switch fileState {
             case .newStore:
-                try await store.migrate()
+                try await store.configureDatabase()
+                let identityDigest: String
+                if let databaseIdentityDigest {
+                    identityDigest = databaseIdentityDigest
+                } else {
+                    identityDigest = await store.defaultDatabaseIdentityDigest
+                }
+                try await store.initializeLatest(
+                    namespaceKind: namespaceKind,
+                    databaseIdentityDigest: identityDigest
+                )
             case .existingSQLite:
-                let identityRows = try await connection.query(
+                let identityRows = try await database.query(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('service_metadata','schema_migrations') ORDER BY name"
                 )
                 let identityTables = Set(identityRows.compactMap { $0.column("name")?.string })
@@ -139,9 +372,15 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                         message: "SQLite file is foreign or has an ambiguous RepoPrompt authority identity"
                     )
                 }
-                try await store.validateCurrentServingSchema()
+                try await store.validateCurrentServingSchema(
+                    requestedKind: namespaceKind,
+                    requestedDatabaseIdentityDigest: databaseIdentityDigest,
+                    allowPendingRestoreRebind: allowPendingRestoreRebind
+                )
+                try await store.configureDatabase()
             }
             try await store.integrityCheck()
+            await store.enableFaultInjection()
             return store
         } catch {
             try? await store.close(clean: false)
@@ -149,8 +388,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         }
     }
 
-    private func validateCurrentServingSchema() async throws {
-        let metadataRows = try await connection.query(
+    private func validateCurrentServingSchema(
+        requestedKind: String?,
+        requestedDatabaseIdentityDigest: String?,
+        allowPendingRestoreRebind: Bool = false
+    ) async throws {
+        let metadataRows = try await database.query(
             "SELECT schema_version FROM service_metadata WHERE fixed_id=1"
         )
         guard metadataRows.count == 1,
@@ -161,50 +404,115 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 message: "Authority store metadata is missing or ambiguous"
             )
         }
-        let expectedMigrations = [
-            1: "v1",
-            SchemaV2.version: SchemaV2.digest,
-            SchemaV3.version: SchemaV3.digest,
-            SchemaV4.version: SchemaV4.digest,
-            SchemaV5.version: SchemaV5.digest,
-            SchemaV6.version: SchemaV6.digest
-        ]
-        let rows = try await connection.query("SELECT version,digest FROM schema_migrations ORDER BY version")
-        var migrations: [Int: String] = [:]
-        for row in rows {
-            guard let version = row.column("version")?.integer,
-                  let digest = row.column("digest")?.string,
-                  migrations[version] == nil,
-                  expectedMigrations[version] == digest
-            else {
-                throw ServiceAPIError(
-                    code: .authorityPurposeMismatch,
-                    message: "Authority migration ledger is malformed or unrecognized"
-                )
-            }
-            migrations[version] = digest
-        }
-        guard (1 ... SchemaV6.version).contains(metadataVersion),
-              migrations[1] == expectedMigrations[1],
-              migrations[metadataVersion] == expectedMigrations[metadataVersion]
-        else {
+        if metadataVersion > SchemaV7.version {
             throw ServiceAPIError(
-                code: .authorityPurposeMismatch,
-                message: "Authority migration ledger does not identify a recognized store"
+                code: .forwardSchemaUnsupported,
+                message: "Authority store schema is newer than this binary",
+                retryable: false
             )
         }
-        guard metadataVersion == SchemaV6.version,
-              migrations == expectedMigrations
-        else {
+        try await validateMigrationLedger(metadataVersion: metadataVersion)
+        guard metadataVersion == SchemaV7.version else {
             throw ServiceAPIError(
                 code: .migrationRequired,
                 message: "Authority store requires offline migration before serving",
                 retryable: false
             )
         }
+        let restoreRequestExists = storagePath.map {
+            FileManager.default.fileExists(
+                atPath: URL(fileURLWithPath: $0).deletingLastPathComponent()
+                    .appendingPathComponent("restore-request.json").path
+            )
+        } ?? false
+        try await validateNamespaceIdentity(
+            requestedKind: requestedKind,
+            requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest,
+            allowDatabaseRebind: allowPendingRestoreRebind && restoreRequestExists
+        )
+        try await SchemaV7.validateFinalV6Shape(using: database)
     }
 
-    private enum ServingFileState {
+    private enum ExistingStorePreflight {
+        case current
+        case maintenance(requestedKind: String?, requestedDatabaseIdentityDigest: String?)
+        case serving(
+            requestedKind: String,
+            requestedDatabaseIdentityDigest: String?,
+            allowPendingRestoreRebind: Bool
+        )
+    }
+
+    /// SQLite can recover a hot journal or WAL as part of opening a writable
+    /// connection. Inspect a private byte-for-byte snapshot first so pending,
+    /// forward, digest, and namespace-kind refusals cannot mutate the original.
+    private static func preflightExistingStore(
+        storage: Storage,
+        validation: ExistingStorePreflight
+    ) async throws {
+        guard case let .file(originalPath) = storage else { return }
+        let original = URL(fileURLWithPath: originalPath)
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("repoprompt-sqlite-preflight-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: workspace,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let snapshot = workspace.appendingPathComponent(original.lastPathComponent)
+        for suffix in ["", "-wal", "-shm"] {
+            let source = URL(fileURLWithPath: original.path + suffix)
+            guard FileManager.default.fileExists(atPath: source.path) else { continue }
+            try FileManager.default.copyItem(
+                at: source,
+                to: URL(fileURLWithPath: snapshot.path + suffix)
+            )
+        }
+        let database = try await SQLiteDatabaseExecutor.open(storage: .file(path: snapshot.path))
+        let store = SQLiteServiceStore(
+            database: database,
+            eventSigningKey: nil,
+            faultInjector: .none,
+            storagePath: originalPath
+        )
+        do {
+            let identityRows = try await database.query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('service_metadata','schema_migrations') ORDER BY name"
+            )
+            let identityTables = Set(identityRows.compactMap { $0.column("name")?.string })
+            guard identityTables == Set(["schema_migrations", "service_metadata"]) else {
+                throw ServiceAPIError(
+                    code: .authorityPurposeMismatch,
+                    message: "SQLite file is foreign or has an ambiguous RepoPrompt authority identity"
+                )
+            }
+            switch validation {
+            case .current:
+                try await store.validateCurrentServingSchema(
+                    requestedKind: nil,
+                    requestedDatabaseIdentityDigest: nil
+                )
+            case let .maintenance(requestedKind, requestedDatabaseIdentityDigest):
+                try await store.validateKnownMaintenanceSchema(
+                    requestedKind: requestedKind,
+                    requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest
+                )
+            case let .serving(requestedKind, requestedDatabaseIdentityDigest, allowPendingRestoreRebind):
+                try await store.validateCurrentServingSchema(
+                    requestedKind: requestedKind,
+                    requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest,
+                    allowPendingRestoreRebind: allowPendingRestoreRebind
+                )
+            }
+            try await store.close(clean: false)
+        } catch {
+            try? await store.close(clean: false)
+            throw error
+        }
+    }
+
+    private enum ServingFileState: Equatable {
         case newStore
         case existingSQLite
     }
@@ -253,15 +561,15 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     public func close(clean: Bool = true) async throws {
         guard !closed else { return }
         if clean {
-            _ = try await connection.query("UPDATE service_metadata SET last_clean_shutdown = 1 WHERE fixed_id = 1")
-            _ = try await connection.query("PRAGMA wal_checkpoint(TRUNCATE)")
+            _ = try await database.query("UPDATE service_metadata SET last_clean_shutdown = 1 WHERE fixed_id = 1")
+            _ = try await database.query("PRAGMA wal_checkpoint(TRUNCATE)")
         }
-        try await connection.close()
+        try await database.close()
         closed = true
     }
 
     public func authorityStore_metadata() async throws -> Metadata {
-        let row = try await requireRow(connection.query("SELECT store_id, schema_version, next_global_sequence, replay_floor, last_clean_shutdown, activation_state, activation_generation, activation_instance_id FROM service_metadata WHERE fixed_id = 1"))
+        let row = try await requireRow(database.query("SELECT store_id, schema_version, next_global_sequence, replay_floor, last_clean_shutdown, activation_state, activation_generation, activation_instance_id FROM service_metadata WHERE fixed_id = 1"))
         return try Metadata(
             storeID: requireUUID(row.column("store_id")?.string),
             schemaVersion: row.column("schema_version")?.integer ?? 1,
@@ -285,8 +593,9 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         correlationID: UUID,
         payload: Data
     ) async throws -> EventEnvelope {
-        try await transaction {
-            try await appendEvent(
+        let retainedBytes = try checkedRetainedByteSum(payload.count, retainedEncodedBytes(actor))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            return try await appendEvent(
                 projectID: projectID,
                 sessionID: nil,
                 rootSessionID: nil,
@@ -313,10 +622,19 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         idempotencyResponse: Data? = nil,
         idempotencyStatus: Int? = nil
     ) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(rootIdentities),
+                idempotencyResponse?.count ?? 0,
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency)
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             if let expectedRevision {
-                let observed = try await Int64(connection.query(
+                let observed = try await Int64(database.query(
                     "SELECT revision FROM projects WHERE project_id=?",
                     [.text(snapshot.projectID.uuidString)]
                 ).first?.column("revision")?.integer ?? 0)
@@ -326,15 +644,15 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             }
             try await validateExpectedCursor(snapshot.cursor)
             let snapshotJSON = try encodeText(snapshot)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO projects(project_id, schema_version, name, creator_json, lifecycle_state, revision, snapshot_json, created_at, updated_at) VALUES(?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,lifecycle_state=excluded.lifecycle_state,revision=excluded.revision,snapshot_json=excluded.snapshot_json,updated_at=CURRENT_TIMESTAMP",
                 [.text(snapshot.projectID.uuidString), .text(snapshot.name), .text(encodeText(actor)), .text(snapshot.state.rawValue), .integer(Int(snapshot.revision)), .text(snapshotJSON)]
             )
             let existingRootIdentities = try await projectRootIdentities(projectID: snapshot.projectID)
-            _ = try await connection.query("DELETE FROM project_roots WHERE project_id=?", [.text(snapshot.projectID.uuidString)])
+            _ = try await database.query("DELETE FROM project_roots WHERE project_id=?", [.text(snapshot.projectID.uuidString)])
             for root in snapshot.roots {
                 let identity = rootIdentities[root.rootID] ?? existingRootIdentities[root.rootID] ?? "pending"
-                _ = try await connection.query("INSERT INTO project_roots(root_id,project_id,schema_version,logical_name,canonical_path,filesystem_identity,writable,revision) VALUES(?,?,1,?,?,?,?,?) ON CONFLICT(root_id) DO UPDATE SET logical_name=excluded.logical_name,canonical_path=excluded.canonical_path,filesystem_identity=excluded.filesystem_identity,writable=excluded.writable,revision=excluded.revision", [.text(root.rootID.uuidString), .text(snapshot.projectID.uuidString), .text(root.logicalName), .text(root.canonicalPath), .text(identity), .integer(root.writable ? 1 : 0), .integer(Int(root.revision))])
+                _ = try await database.query("INSERT INTO project_roots(root_id,project_id,schema_version,logical_name,canonical_path,filesystem_identity,writable,revision) VALUES(?,?,1,?,?,?,?,?) ON CONFLICT(root_id) DO UPDATE SET logical_name=excluded.logical_name,canonical_path=excluded.canonical_path,filesystem_identity=excluded.filesystem_identity,writable=excluded.writable,revision=excluded.revision", [.text(root.rootID.uuidString), .text(snapshot.projectID.uuidString), .text(root.logicalName), .text(root.canonicalPath), .text(identity), .integer(root.writable ? 1 : 0), .integer(Int(root.revision))])
                 try await activatePreparedOwnedResourceIfPresent(
                     externalID: root.rootID,
                     kind: .cloneStaging,
@@ -367,7 +685,16 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         idempotencyResponse: Data? = nil,
         initialSelection: SelectionSnapshot? = nil
     ) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try sessionRetainedBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(
+                idempotencyResponse?.count ?? 0,
+                retainedEncodedBytes(initialSelection),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency)
+            )
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             try await persistSessionInTransaction(snapshot, eventType: eventType, actor: actor, correlationID: correlationID, idempotency: idempotency, idempotencyResponse: idempotencyResponse, initialSelection: initialSelection)
         }
     }
@@ -384,7 +711,19 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         initialCollaboration: CollaborationMetadataSnapshot,
         initialWorktrees: [WorktreeBindingSnapshot] = []
     ) async throws -> (session: EventEnvelope, agent: EventEnvelope, worktrees: [EventEnvelope]) {
-        try await transaction {
+        let retainedBytes = try sessionRetainedBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(agent),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency),
+                retainedEncodedBytes(initialSelection),
+                retainedEncodedBytes(initialPermissions),
+                retainedEncodedBytes(initialCollaboration),
+                retainedEncodedBytes(initialWorktrees)
+            )
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             try await persistNewSessionInTransaction(snapshot, agent: agent, actor: actor, correlationID: correlationID, agentCorrelationID: agentCorrelationID, idempotency: idempotency, initialSelection: initialSelection, initialPermissions: initialPermissions, initialCollaboration: initialCollaboration, initialWorktrees: initialWorktrees)
         }
     }
@@ -411,7 +750,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 throw ServiceAPIError(code: .worktreeConflict, message: "Initial worktree does not belong to the new session")
             }
             try await ensureUniqueActiveWorktree(worktree)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?)",
                 [.text(worktree.bindingID.uuidString), .text(worktree.projectID.uuidString), .text(worktree.rootID.uuidString), .text(snapshot.sessionID.uuidString), .text(worktree.baseRef), .text(worktree.branch), .text(worktree.physicalPath), .text(worktree.ownershipState.rawValue), .text(worktree.mergeState.rawValue), .integer(Int(worktree.revision))]
             )
@@ -434,19 +773,23 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func persistImportedProject(_ snapshot: ProjectSnapshot, sourceDigest: String, actor: ExternalActor) async throws -> Bool {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(sourceDigest.utf8.count, retainedEncodedBytes(actor))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if try await importAuditExists(kind: "legacy.project", digest: sourceDigest) { return false }
             if try await project(id: snapshot.projectID) != nil {
                 throw ServiceAPIError(code: .idempotencyConflict, message: "Legacy import project ID already exists with different provenance")
             }
             try await validateExpectedCursor(snapshot.cursor)
             let snapshotJSON = try encodeText(snapshot)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO projects(project_id,schema_version,name,creator_json,lifecycle_state,revision,snapshot_json,created_at,updated_at) VALUES(?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 [.text(snapshot.projectID.uuidString), .text(snapshot.name), .text(encodeText(actor)), .text(snapshot.state.rawValue), .integer(Int(snapshot.revision)), .text(snapshotJSON)]
             )
             for root in snapshot.roots {
-                _ = try await connection.query("INSERT INTO project_roots(root_id,project_id,schema_version,logical_name,canonical_path,filesystem_identity,writable,revision) VALUES(?,?,1,?,?,?,?,?)", [.text(root.rootID.uuidString), .text(snapshot.projectID.uuidString), .text(root.logicalName), .text(root.canonicalPath), .text("legacy-import"), .integer(root.writable ? 1 : 0), .integer(Int(root.revision))])
+                _ = try await database.query("INSERT INTO project_roots(root_id,project_id,schema_version,logical_name,canonical_path,filesystem_identity,writable,revision) VALUES(?,?,1,?,?,?,?,?)", [.text(root.rootID.uuidString), .text(snapshot.projectID.uuidString), .text(root.logicalName), .text(root.canonicalPath), .text("legacy-import"), .integer(root.writable ? 1 : 0), .integer(Int(root.revision))])
             }
             let eventPayload = try encoder.encode(ProjectEventWirePayload(snapshot))
             _ = try await appendEvent(projectID: snapshot.projectID, sessionID: nil, rootSessionID: nil, runID: nil, sessionSequence: nil, type: .projectCreated, generation: nil, turnEpoch: nil, actor: actor, correlationID: UUID(), payload: eventPayload)
@@ -456,12 +799,17 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func persistImportedSession(_ snapshot: SessionSnapshot, sourceDigest: String, actor: ExternalActor) async throws -> Bool {
-        try await transaction {
+        let retainedBytes = try sessionRetainedBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(sourceDigest.utf8.count, retainedEncodedBytes(actor))
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             if try await importAuditExists(kind: "legacy.session", digest: sourceDigest) { return false }
             if try await session(id: snapshot.sessionID) != nil {
                 throw ServiceAPIError(code: .idempotencyConflict, message: "Legacy import session ID already exists with different provenance")
             }
             try await validateExpectedCursor(snapshot.cursor)
+            try await persistTranscriptEntriesInBulk(snapshot)
             let snapshotJSON = try encodeText(snapshot)
             let bindings: [SQLiteData] = [
                 .text(snapshot.sessionID.uuidString), .text(snapshot.projectID.uuidString), snapshot.parentSessionID.map { .text($0.uuidString) } ?? .null,
@@ -469,10 +817,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 snapshot.model.map(SQLiteData.text) ?? .null, .text(snapshot.visibility.rawValue), .integer(Int(snapshot.runGeneration)), .integer(Int(snapshot.turnEpoch)),
                 .integer(Int(snapshot.revision)), .text(snapshotJSON)
             ]
-            _ = try await connection.query("INSERT INTO sessions(session_id,project_id,parent_session_id,root_session_id,schema_version,creator_external_id,lifecycle_state,provider_kind,model,visibility,run_generation,turn_epoch,revision,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", bindings)
-            for entry in snapshot.transcript {
-                _ = try await connection.query("INSERT INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)", [.text(snapshot.sessionID.uuidString), .text(entry.entryID.uuidString), .integer(Int(entry.sessionSequence)), .text(encodeText(entry)), .text(PersistenceCryptography.bodyDigest(encoder.encode(entry)))])
-            }
+            _ = try await database.query("INSERT INTO sessions(session_id,project_id,parent_session_id,root_session_id,schema_version,creator_external_id,lifecycle_state,provider_kind,model,visibility,run_generation,turn_epoch,revision,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", bindings)
             let event = try await appendEvent(projectID: snapshot.projectID, sessionID: snapshot.sessionID, rootSessionID: snapshot.rootSessionID, runID: nil, sessionSequence: nil, type: .sessionCreated, generation: snapshot.runGeneration, turnEpoch: snapshot.turnEpoch, actor: actor, correlationID: UUID(), payload: Data(snapshotJSON.utf8))
             if [.completed, .failed, .canceled, .interrupted, .archived].contains(snapshot.state) {
                 try await saveCheckpoint(scope: "session:\(snapshot.sessionID.uuidString)", sequence: event.globalSequence, snapshot: Data(snapshotJSON.utf8), retentionClass: "terminal")
@@ -491,22 +836,22 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             throw ServiceAPIError(code: .quiescing, message: "JSON import requires a new, cleanly stopped, or resumable import store")
         }
         if !resumable, !completed {
-            try await transaction { try await recordImportAudit(kind: "legacy.import.started", digest: sourceDigest) }
+            try await transaction(.interactive(estimatedEncodedBytes: sourceDigest.utf8.count)) { try await recordImportAudit(kind: "legacy.import.started", digest: sourceDigest) }
         }
     }
 
     public func completeLegacyImport(sourceDigest: String) async throws {
         guard try await !importAuditExists(kind: "legacy.import.completed", digest: sourceDigest) else { return }
-        try await transaction { try await recordImportAudit(kind: "legacy.import.completed", digest: sourceDigest) }
+        try await transaction(.interactive(estimatedEncodedBytes: sourceDigest.utf8.count)) { try await recordImportAudit(kind: "legacy.import.completed", digest: sourceDigest) }
     }
 
     public func project(id: UUID) async throws -> ProjectSnapshot? {
-        guard let row = try await connection.query("SELECT snapshot_json FROM projects WHERE project_id = ?", [.text(id.uuidString)]).first, let text = row.column("snapshot_json")?.string else { return nil }
+        guard let row = try await database.query("SELECT snapshot_json FROM projects WHERE project_id = ?", [.text(id.uuidString)]).first, let text = row.column("snapshot_json")?.string else { return nil }
         return try decoder.decode(ProjectSnapshot.self, from: Data(text.utf8))
     }
 
     public func authorityStore_projectRootIdentities(projectID: UUID) async throws -> [UUID: String] {
-        let rows = try await connection.query(
+        let rows = try await database.query(
             "SELECT root_id, filesystem_identity FROM project_roots WHERE project_id = ?",
             [.text(projectID.uuidString)]
         )
@@ -516,7 +861,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func session(id: UUID) async throws -> SessionSnapshot? {
-        guard let row = try await connection.query("SELECT snapshot_json FROM sessions WHERE session_id = ?", [.text(id.uuidString)]).first, let text = row.column("snapshot_json")?.string else { return nil }
+        guard let row = try await database.query("SELECT snapshot_json FROM sessions WHERE session_id = ?", [.text(id.uuidString)]).first, let text = row.column("snapshot_json")?.string else { return nil }
         return try decoder.decode(SessionSnapshot.self, from: Data(text.utf8))
     }
 
@@ -524,7 +869,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     /// transaction so adapters never observe an impossible lifecycle/interaction
     /// combination assembled across two revisions.
     public func authorityStore_sessionWithInteractions(id: UUID) async throws -> SessionSnapshot? {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
             guard let base = try await session(id: id) else { return nil }
             let currentInteractions = try await interactions(sessionID: id)
             return base.replacing(interactions: currentInteractions)
@@ -540,7 +885,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_allSessionsWithInteractions() async throws -> [SessionSnapshot] {
-        try await transaction {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
             let sessions = try await allSessions()
             var result: [SessionSnapshot] = []
             for base in sessions {
@@ -552,7 +897,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistAgent(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshot, additional: retainedEncodedBytes(actor))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             try await persistAgentInTransaction(snapshot, projectID: projectID, actor: actor, correlationID: correlationID, eventType: eventType)
         }
     }
@@ -567,9 +913,16 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         guard [.toolStarted, .toolUpdated, .toolCompleted, .toolFailed].contains(eventType) else {
             throw ServiceAPIError(code: .invalidRequest, message: "Tool invocation requires a tool event type")
         }
-        let run = try await latestRun(sessionID: session.sessionID)
-        return try await transaction {
-            try await appendEvent(
+        let retainedBytes = try sessionRetainedBytes(
+            session,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(snapshot),
+                retainedEncodedBytes(actor)
+            )
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
+            let run = try await latestRun(sessionID: session.sessionID)
+            return try await appendEvent(
                 projectID: session.projectID,
                 sessionID: session.sessionID,
                 agentID: session.sessionID,
@@ -589,9 +942,9 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
     public func authorityStore_agents(rootSessionID: UUID? = nil) async throws -> [AgentSnapshot] {
         let rows = if let rootSessionID {
-            try await connection.query("SELECT * FROM agents WHERE root_session_id=? ORDER BY created_at", [.text(rootSessionID.uuidString)])
+            try await database.query("SELECT * FROM agents WHERE root_session_id=? ORDER BY created_at", [.text(rootSessionID.uuidString)])
         } else {
-            try await connection.query("SELECT * FROM agents ORDER BY created_at")
+            try await database.query("SELECT * FROM agents ORDER BY created_at")
         }
         return try rows.map { row in
             guard let agentID = UUID(uuidString: row.column("agent_id")?.string ?? ""),
@@ -604,14 +957,17 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistRun(_ snapshot: ProviderRunSnapshot) async throws {
-        _ = try await connection.query(
+        let encodedBytes = try encoder.encode(snapshot).count
+        _ = try await database.query(
             "INSERT INTO runs(run_id,session_id,schema_version,provider_kind,provider_session_id,state,generation,turn_epoch,start_reason,end_reason,started_at,ended_at) VALUES(?,?,1,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET provider_session_id=excluded.provider_session_id,state=excluded.state,turn_epoch=excluded.turn_epoch,end_reason=excluded.end_reason,ended_at=excluded.ended_at",
-            [.text(snapshot.runID.uuidString), .text(snapshot.sessionID.uuidString), .text(snapshot.provider.rawValue), snapshot.providerSessionID.map(SQLiteData.text) ?? .null, .text(snapshot.state), .integer(Int(snapshot.generation)), .integer(Int(snapshot.turnEpoch)), .text(snapshot.startReason), snapshot.endReason.map(SQLiteData.text) ?? .null, .float(snapshot.startedAt.timeIntervalSince1970), snapshot.endedAt.map { .float($0.timeIntervalSince1970) } ?? .null]
+            [.text(snapshot.runID.uuidString), .text(snapshot.sessionID.uuidString), .text(snapshot.provider.rawValue), snapshot.providerSessionID.map(SQLiteData.text) ?? .null, .text(snapshot.state), .integer(Int(snapshot.generation)), .integer(Int(snapshot.turnEpoch)), .text(snapshot.startReason), snapshot.endReason.map(SQLiteData.text) ?? .null, .float(snapshot.startedAt.timeIntervalSince1970), snapshot.endedAt.map { .float($0.timeIntervalSince1970) } ?? .null],
+            operationClass: .control,
+            estimatedEncodedBytes: encodedBytes
         )
     }
 
     public func authorityStore_latestRun(sessionID: UUID) async throws -> ProviderRunSnapshot? {
-        guard let row = try await connection.query("SELECT * FROM runs WHERE session_id=? ORDER BY generation DESC LIMIT 1", [.text(sessionID.uuidString)]).first,
+        guard let row = try await database.query("SELECT * FROM runs WHERE session_id=? ORDER BY generation DESC LIMIT 1", [.text(sessionID.uuidString)]).first,
               let runID = UUID(uuidString: row.column("run_id")?.string ?? ""),
               let provider = ProviderKind(rawValue: row.column("provider_kind")?.string ?? ""),
               let state = row.column("state")?.string,
@@ -628,7 +984,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         }
         let after = cursor?.globalSequence ?? meta.replayFloor
         let bounded = max(1, min(limit, 1000))
-        let rows = try await connection.query("SELECT envelope_json FROM events WHERE global_sequence > ? ORDER BY global_sequence LIMIT ?", [.integer(Int(after)), .integer(bounded)])
+        let rows = try await database.query("SELECT envelope_json FROM events WHERE global_sequence > ? ORDER BY global_sequence LIMIT ?", [.integer(Int(after)), .integer(bounded)])
         let events: [EventEnvelope] = try rows.compactMap { row in guard let text = row.column("envelope_json")?.string else { return nil }
             let decoded = try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
             return try canonicalEventForPublication(decoded)
@@ -638,16 +994,20 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
     public func authorityStore_idempotencyResult(_ input: IdempotencyInput) async throws -> (response: Data, status: Int)? {
         guard let value = try await existingIdempotency(input) else {
-            try await faultInjector.hit(.afterIdempotencyPreflightMiss)
+            try await hitFault(.afterIdempotencyPreflightMiss)
             return nil
         }
         return (response: value.0, status: value.1)
     }
 
     public func authorityStore_persistSelection(_ snapshot: SelectionSnapshot, projectID: UUID, rootSessionID: UUID, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(actor), retainedIdempotencyBytes(idempotency))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO session_selections(session_id,schema_version,allowed_roots_json,selection_json,selection_revision,binding_revision,transactional_commit_id) VALUES(?,1,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET selection_json=excluded.selection_json,selection_revision=excluded.selection_revision,binding_revision=excluded.binding_revision,transactional_commit_id=excluded.transactional_commit_id",
                 [.text(snapshot.sessionID.uuidString), .text(encodeText(Array(Set(snapshot.entries.map(\.rootID))))), .text(encodeText(snapshot)), .integer(Int(snapshot.revision)), .integer(Int(snapshot.bindingRevision)), .text(UUID().uuidString)]
             )
@@ -658,12 +1018,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_selection(sessionID: UUID) async throws -> SelectionSnapshot? {
-        guard let text = try await connection.query("SELECT selection_json FROM session_selections WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("selection_json")?.string else { return nil }
+        guard let text = try await database.query("SELECT selection_json FROM session_selections WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("selection_json")?.string else { return nil }
         return try decoder.decode(SelectionSnapshot.self, from: Data(text.utf8))
     }
 
     public func authorityStore_sessionContext(sessionID: UUID) async throws -> SessionContextSnapshot? {
-        guard let row = try await connection.query(
+        guard let row = try await database.query(
             "SELECT prompt_text,selection_revision,context_revision FROM session_contexts WHERE session_id=?",
             [.text(sessionID.uuidString)]
         ).first else { return nil }
@@ -681,8 +1041,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         actor: ExternalActor,
         correlationID: UUID
     ) async throws -> EventEnvelope {
-        try await transaction {
-            _ = try await connection.query(
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(session), retainedEncodedBytes(actor))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            _ = try await database.query(
                 "INSERT INTO session_contexts(session_id,schema_version,prompt_text,selection_revision,context_revision,frozen_context_json,updated_at) VALUES(?,1,?,?,?,'{}',CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET prompt_text=excluded.prompt_text,selection_revision=excluded.selection_revision,context_revision=excluded.context_revision,updated_at=CURRENT_TIMESTAMP",
                 [
                     .text(snapshot.sessionID.uuidString),
@@ -711,10 +1075,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     /// or emitting a transcript event. Desktop updates this in memory on every
     /// usage frame; Linux persists the same fields so the portal ring can poll.
     public func authorityStore_upsertContextUsage(_ usage: ContextUsageWireSnapshot, sessionID: UUID) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(usage)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             guard let base = try await session(id: sessionID) else { return }
             let next = base.replacing(contextUsage: usage.merging(onto: base.contextUsage))
-            _ = try await connection.query(
+            _ = try await database.query(
                 "UPDATE sessions SET snapshot_json=?, updated_at=CURRENT_TIMESTAMP WHERE session_id=?",
                 [.text(try encodeText(next)), .text(sessionID.uuidString)]
             )
@@ -722,14 +1087,18 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_selectionTemplate(projectID: UUID) async throws -> ProjectSelectionTemplateSnapshot? {
-        guard let text = try await connection.query("SELECT selection_json FROM project_selection_templates WHERE project_id=?", [.text(projectID.uuidString)]).first?.column("selection_json")?.string else { return nil }
+        guard let text = try await database.query("SELECT selection_json FROM project_selection_templates WHERE project_id=?", [.text(projectID.uuidString)]).first?.column("selection_json")?.string else { return nil }
         return try decoder.decode(ProjectSelectionTemplateSnapshot.self, from: Data(text.utf8))
     }
 
     public func authorityStore_persistSelectionTemplate(_ snapshot: ProjectSelectionTemplateSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(actor), retainedIdempotencyBytes(idempotency))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO project_selection_templates(template_id,project_id,schema_version,selection_json,revision,transactional_commit_id) VALUES(?,?,1,?,?,?) ON CONFLICT(template_id) DO UPDATE SET selection_json=excluded.selection_json,revision=excluded.revision,transactional_commit_id=excluded.transactional_commit_id",
                 [.text(snapshot.projectID.uuidString), .text(snapshot.projectID.uuidString), .text(encodeText(snapshot)), .integer(Int(snapshot.revision)), .text(UUID().uuidString)]
             )
@@ -740,7 +1109,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistPermissions(_ snapshot: ExecutionPermissionSnapshot, projectID: UUID, rootSessionID: UUID, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshot, additional: retainedIdempotencyBytes(idempotency))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await upsertPermissions(snapshot)
             let event = try await appendEvent(projectID: projectID, sessionID: snapshot.sessionID, rootSessionID: rootSessionID, runID: nil, sessionSequence: nil, type: .permissionUpdated, generation: nil, turnEpoch: nil, actor: snapshot.updatedActor, correlationID: correlationID, payload: encoder.encode(snapshot))
@@ -750,7 +1120,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_permissions(sessionID: UUID) async throws -> ExecutionPermissionSnapshot? {
-        guard let row = try await connection.query("SELECT mode,provider_settings_json,revision,updated_actor_json FROM execution_permissions WHERE session_id=?", [.text(sessionID.uuidString)]).first,
+        guard let row = try await database.query("SELECT mode,provider_settings_json,revision,updated_actor_json FROM execution_permissions WHERE session_id=?", [.text(sessionID.uuidString)]).first,
               let mode = row.column("mode")?.string,
               let settings = row.column("provider_settings_json")?.string,
               let actor = row.column("updated_actor_json")?.string
@@ -759,7 +1129,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_collaboration(sessionID: UUID) async throws -> CollaborationMetadataSnapshot? {
-        guard let row = try await connection.query("SELECT visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,collaboration_acknowledgement_json FROM collaboration_metadata WHERE session_id=?", [.text(sessionID.uuidString)]).first,
+        guard let row = try await database.query("SELECT visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,collaboration_acknowledgement_json FROM collaboration_metadata WHERE session_id=?", [.text(sessionID.uuidString)]).first,
               let visibility = Visibility(rawValue: row.column("visibility")?.string ?? ""),
               let controllerUserID = row.column("controller_user_id")?.string
         else { return nil }
@@ -770,14 +1140,24 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_installInitialPolicies(permissions: ExecutionPermissionSnapshot, collaboration: CollaborationMetadataSnapshot) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(permissions, additional: try encoder.encode(collaboration).count)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if try await self.permissions(sessionID: permissions.sessionID) == nil { try await upsertPermissions(permissions) }
             if try await self.collaboration(sessionID: collaboration.sessionID) == nil { try await upsertCollaboration(collaboration) }
         }
     }
 
     public func authorityStore_persistCollaboration(_ metadata: CollaborationMetadataSnapshot, session: SessionSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput, idempotencyResponse: Data? = nil) async throws -> [EventEnvelope] {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            metadata,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(session),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency),
+                idempotencyResponse?.count ?? 0
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await upsertCollaboration(metadata)
             let payload = try encoder.encode(metadata)
@@ -789,10 +1169,18 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistInteraction(_ snapshot: InteractionSnapshot, session: SessionSnapshot, actor: ExternalActor?, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(session),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency)
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             let actorJSON = try actor.map(encodeText)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO interactions(interaction_id,session_id,run_id,agent_id,schema_version,kind,state,payload_json,created_at,expires_at,settled_at,settled_actor_json,revision) VALUES(?,?,?,?,1,?,?,?,CURRENT_TIMESTAMP,?,?,?,?) ON CONFLICT(interaction_id) DO UPDATE SET state=excluded.state,payload_json=excluded.payload_json,settled_at=excluded.settled_at,settled_actor_json=excluded.settled_actor_json,revision=excluded.revision",
                 [.text(snapshot.interactionID.uuidString), .text(session.sessionID.uuidString), snapshot.runID.map { .text($0.uuidString) } ?? .null, snapshot.agentID.map { .text($0.uuidString) } ?? .null, .text(snapshot.kind.rawValue), .text(snapshot.state.rawValue), .text(snapshot.payload.base64EncodedString()), snapshot.expiresAt.map { .float($0.timeIntervalSince1970) } ?? .null, snapshot.state == .resolved ? .float(Date().timeIntervalSince1970) : .null, actorJSON.map(SQLiteData.text) ?? .null, .integer(Int(snapshot.revision))]
             )
@@ -804,9 +1192,10 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistInteractionDeliveryState(_ snapshot: InteractionSnapshot, sessionID: UUID, actor: ExternalActor?) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshot, additional: retainedEncodedBytes(actor))
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let actorJSON = try actor.map(encodeText)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "UPDATE interactions SET state=?,payload_json=?,settled_at=?,settled_actor_json=?,revision=? WHERE interaction_id=? AND session_id=?",
                 [.text(snapshot.state.rawValue), .text(snapshot.payload.base64EncodedString()), snapshot.state == .resolved ? .float(Date().timeIntervalSince1970) : .null, actorJSON.map(SQLiteData.text) ?? .null, .integer(Int(snapshot.revision)), .text(snapshot.interactionID.uuidString), .text(sessionID.uuidString)]
             )
@@ -814,7 +1203,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_interactions(sessionID: UUID) async throws -> [InteractionSnapshot] {
-        try await connection.query("SELECT interaction_id,run_id,agent_id,kind,state,payload_json,revision,expires_at FROM interactions WHERE session_id=? ORDER BY created_at", [.text(sessionID.uuidString)]).map { row in
+        try await database.query("SELECT interaction_id,run_id,agent_id,kind,state,payload_json,revision,expires_at FROM interactions WHERE session_id=? ORDER BY created_at", [.text(sessionID.uuidString)]).map { row in
             guard let id = UUID(uuidString: row.column("interaction_id")?.string ?? ""),
                   let kind = InteractionSnapshot.Kind(rawValue: row.column("kind")?.string ?? ""),
                   let state = InteractionSnapshot.State(rawValue: row.column("state")?.string ?? "")
@@ -825,13 +1214,14 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_oracleChat(chatID: UUID) async throws -> OracleChatState? {
-        guard let text = try await connection.query("SELECT chat_json FROM oracle_chats WHERE chat_id=?", [.text(chatID.uuidString)]).first?.column("chat_json")?.string else { return nil }
+        guard let text = try await database.query("SELECT chat_json FROM oracle_chats WHERE chat_id=?", [.text(chatID.uuidString)]).first?.column("chat_json")?.string else { return nil }
         return try decoder.decode(OracleChatState.self, from: Data(text.utf8))
     }
 
     public func authorityStore_persistOracleChat(_ chat: OracleChatState) async throws {
-        try await transaction {
-            _ = try await connection.query(
+        let retainedBytes = try retainedInputBytes(chat)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            _ = try await database.query(
                 "INSERT INTO oracle_chats(chat_id,session_id,schema_version,chat_json,revision,created_at,updated_at) VALUES(?,?,1,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(chat_id) DO UPDATE SET chat_json=excluded.chat_json,revision=excluded.revision,updated_at=CURRENT_TIMESTAMP",
                 [.text(chat.chatID.uuidString), .text(chat.sessionID.uuidString), .text(encodeText(chat)), .integer(Int(chat.revision))]
             )
@@ -839,10 +1229,14 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistWorktree(_ snapshot: WorktreeBindingSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput? = nil) async throws -> EventEnvelope {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(actor), retainedIdempotencyBytes(idempotency))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await ensureUniqueActiveWorktree(snapshot)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                 [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
             )
@@ -861,11 +1255,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         actor: ExternalActor,
         correlationID: UUID
     ) async throws -> [EventEnvelope] {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(snapshots, additional: retainedEncodedBytes(actor))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             var events: [EventEnvelope] = []
             for snapshot in snapshots {
                 try await ensureUniqueActiveWorktree(snapshot)
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?)",
                     [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
                 )
@@ -897,7 +1292,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         actor: ExternalActor,
         correlationID: UUID
     ) async throws -> [EventEnvelope] {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            snapshots,
+            additional: checkedRetainedByteSum(retainedEncodedBytes(session), retainedEncodedBytes(actor))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             var events: [EventEnvelope] = []
             let activeKeys = snapshots.compactMap { snapshot -> String? in
                 guard snapshot.ownershipState == .active, let sessionID = snapshot.sessionID else { return nil }
@@ -911,7 +1310,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             }
             for snapshot in ordered {
                 try await ensureUniqueActiveWorktree(snapshot)
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,base_ref=excluded.base_ref,branch=excluded.branch,physical_path=excluded.physical_path,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                     [.text(snapshot.bindingID.uuidString), .text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.baseRef), .text(snapshot.branch), .text(snapshot.physicalPath), .text(snapshot.ownershipState.rawValue), .text(snapshot.mergeState.rawValue), .integer(Int(snapshot.revision))]
                 )
@@ -934,14 +1333,23 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_persistWorktreeBinding(_ worktree: WorktreeBindingSnapshot, selection: SelectionSnapshot, session: SessionSnapshot, actor: ExternalActor, correlationID: UUID, idempotency: IdempotencyInput) async throws -> (worktree: EventEnvelope, selection: EventEnvelope) {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            worktree,
+            additional: checkedRetainedByteSum(
+                retainedEncodedBytes(selection),
+                retainedEncodedBytes(session),
+                retainedEncodedBytes(actor),
+                retainedIdempotencyBytes(idempotency)
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             if let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
             try await ensureUniqueActiveWorktree(worktree)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO worktree_bindings(binding_id,project_id,root_id,session_id,schema_version,base_ref,branch,physical_path,ownership_state,merge_state,revision) VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET session_id=excluded.session_id,ownership_state=excluded.ownership_state,merge_state=excluded.merge_state,revision=excluded.revision",
                 [.text(worktree.bindingID.uuidString), .text(worktree.projectID.uuidString), .text(worktree.rootID.uuidString), worktree.sessionID.map { .text($0.uuidString) } ?? .null, .text(worktree.baseRef), .text(worktree.branch), .text(worktree.physicalPath), .text(worktree.ownershipState.rawValue), .text(worktree.mergeState.rawValue), .integer(Int(worktree.revision))]
             )
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO session_selections(session_id,schema_version,allowed_roots_json,selection_json,selection_revision,binding_revision,transactional_commit_id) VALUES(?,1,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET selection_json=excluded.selection_json,selection_revision=excluded.selection_revision,binding_revision=excluded.binding_revision,transactional_commit_id=excluded.transactional_commit_id",
                 [.text(selection.sessionID.uuidString), .text(encodeText(Array(Set(selection.entries.map(\.rootID))))), .text(encodeText(selection)), .integer(Int(selection.revision)), .integer(Int(selection.bindingRevision)), .text(UUID().uuidString)]
             )
@@ -953,16 +1361,20 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_worktrees(projectID: UUID) async throws -> [WorktreeBindingSnapshot] {
-        try await connection.query("SELECT * FROM worktree_bindings WHERE project_id=? ORDER BY binding_id", [.text(projectID.uuidString)]).map(decodeWorktree)
+        try await database.query("SELECT * FROM worktree_bindings WHERE project_id=? ORDER BY binding_id", [.text(projectID.uuidString)]).map(decodeWorktree)
     }
 
     public func authorityStore_worktree(bindingID: UUID) async throws -> WorktreeBindingSnapshot? {
-        try await connection.query("SELECT * FROM worktree_bindings WHERE binding_id=?", [.text(bindingID.uuidString)]).first.map(decodeWorktree)
+        try await database.query("SELECT * FROM worktree_bindings WHERE binding_id=?", [.text(bindingID.uuidString)]).first.map(decodeWorktree)
     }
 
     public func authorityStore_persistArtifact(_ snapshot: ArtifactSnapshot, storageReference: String, actor: ExternalActor?, correlationID: UUID) async throws -> EventEnvelope {
-        try await transaction {
-            _ = try await connection.query(
+        let retainedBytes = try retainedInputBytes(
+            snapshot,
+            additional: checkedRetainedByteSum(storageReference.utf8.count, retainedEncodedBytes(actor))
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            _ = try await database.query(
                 "INSERT INTO artifacts(artifact_id,project_id,session_id,schema_version,kind,logical_name,content_digest,storage_reference,size,created_sequence,created_at,retention_state) VALUES(?,?,?,1,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)",
                 [.text(snapshot.artifactID.uuidString), .text(snapshot.projectID.uuidString), snapshot.sessionID.map { .text($0.uuidString) } ?? .null, .text(snapshot.kind), .text(snapshot.logicalName), .text(snapshot.contentDigest), .text(storageReference), .integer(Int(snapshot.size)), .integer(Int(snapshot.createdCursor.globalSequence)), .text(snapshot.retentionState)]
             )
@@ -973,33 +1385,39 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
     public func authorityStore_artifacts(sessionID: UUID) async throws -> [(snapshot: ArtifactSnapshot, storageReference: String)] {
         let meta = try await metadata()
-        return try await connection.query("SELECT * FROM artifacts WHERE session_id=? AND retention_state!='deleted' ORDER BY created_sequence", [.text(sessionID.uuidString)]).map { try decodeArtifact($0, storeID: meta.storeID) }
+        return try await database.query("SELECT * FROM artifacts WHERE session_id=? AND retention_state!='deleted' ORDER BY created_sequence", [.text(sessionID.uuidString)]).map { try decodeArtifact($0, storeID: meta.storeID) }
     }
 
     public func authorityStore_artifact(id: UUID) async throws -> (snapshot: ArtifactSnapshot, storageReference: String)? {
         let meta = try await metadata()
-        return try await connection.query("SELECT * FROM artifacts WHERE artifact_id=? AND retention_state!='deleted'", [.text(id.uuidString)]).first.map { try decodeArtifact($0, storeID: meta.storeID) }
+        return try await database.query("SELECT * FROM artifacts WHERE artifact_id=? AND retention_state!='deleted'", [.text(id.uuidString)]).first.map { try decodeArtifact($0, storeID: meta.storeID) }
     }
 
     public func authorityStore_installWorkflows(_ workflows: [WorkflowSnapshot]) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(workflows)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             for workflow in workflows {
-                _ = try await connection.query("INSERT INTO workflows(workflow_id,schema_version,source,name,definition_json,content_digest,enabled) VALUES(?,1,?,?,?,?,?) ON CONFLICT(workflow_id) DO UPDATE SET source=excluded.source,name=excluded.name,definition_json=excluded.definition_json,content_digest=excluded.content_digest,enabled=excluded.enabled", [.text(workflow.workflowID), .text(workflow.source), .text(workflow.name), .text(workflow.definition), .text(workflow.contentDigest), .integer(workflow.enabled ? 1 : 0)])
+                _ = try await database.query("INSERT INTO workflows(workflow_id,schema_version,source,name,definition_json,content_digest,enabled) VALUES(?,1,?,?,?,?,?) ON CONFLICT(workflow_id) DO UPDATE SET source=excluded.source,name=excluded.name,definition_json=excluded.definition_json,content_digest=excluded.content_digest,enabled=excluded.enabled", [.text(workflow.workflowID), .text(workflow.source), .text(workflow.name), .text(workflow.definition), .text(workflow.contentDigest), .integer(workflow.enabled ? 1 : 0)])
             }
             return ()
         }
     }
 
     public func workflows() async throws -> [WorkflowSnapshot] {
-        try await connection.query("SELECT * FROM workflows WHERE enabled=1 ORDER BY name").map { row in
+        try await database.query("SELECT * FROM workflows WHERE enabled=1 ORDER BY name").map { row in
             WorkflowSnapshot(workflowID: row.column("workflow_id")?.string ?? "", source: row.column("source")?.string ?? "", name: row.column("name")?.string ?? "", definition: row.column("definition_json")?.string ?? "", contentDigest: row.column("content_digest")?.string ?? "", enabled: row.column("enabled")?.bool ?? false)
         }
     }
 
     public func persistProcessFamily(runID: UUID, leader: PersistedProcessIdentity, connectionGeneration: Int64 = 1, containmentMode: String = "process-group", state: String = "running") async throws {
-        try await transaction {
+        let retainedBytes = leader.bootID.utf8.count
+            + leader.executablePath.utf8.count
+            + leader.helperTokenDigest.utf8.count
+            + containmentMode.utf8.count
+            + state.utf8.count
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let executableDigest = PersistenceCryptography.bodyDigest(Data(leader.executablePath.utf8))
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO process_families(run_id,schema_version,leader_pid,pgid,process_start_time,boot_id,executable_digest,executable_path,helper_token_digest,connection_generation,containment_mode,state) VALUES(?,1,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET leader_pid=excluded.leader_pid,pgid=excluded.pgid,process_start_time=excluded.process_start_time,boot_id=excluded.boot_id,executable_digest=excluded.executable_digest,executable_path=excluded.executable_path,helper_token_digest=excluded.helper_token_digest,connection_generation=excluded.connection_generation,containment_mode=excluded.containment_mode,state=excluded.state",
                 [.text(runID.uuidString), .integer(Int(leader.pid)), .integer(Int(leader.processGroupID)), .integer(Int(leader.startTimeTicks)), .text(leader.bootID), .text(executableDigest), .text(leader.executablePath), .text(leader.helperTokenDigest), .integer(Int(connectionGeneration)), .text(containmentMode), .text(state)]
             )
@@ -1008,13 +1426,16 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func persistProcessMembers(runID: UUID, members: [PersistedProcessIdentity], terminalState: String? = nil) async throws {
-        try await transaction {
+        let retainedBytes = members.reduce(terminalState?.utf8.count ?? 0) {
+            $0 + $1.bootID.utf8.count + $1.executablePath.utf8.count + $1.helperTokenDigest.utf8.count
+        }
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             try await persistProcessMembersWithoutTransaction(runID: runID, members: members, terminalState: terminalState)
         }
     }
 
     public func activeProcessFamilies() async throws -> [PersistedProcessFamily] {
-        try await connection.query("SELECT f.*,m.parent_pid AS leader_parent_pid,m.session_id AS leader_session_id FROM process_families f LEFT JOIN process_members m ON m.run_id=f.run_id AND m.pid=f.leader_pid AND m.start_time=f.process_start_time WHERE f.state IN ('running','terminating') ORDER BY f.run_id").map { row in
+        try await database.query("SELECT f.*,m.parent_pid AS leader_parent_pid,m.session_id AS leader_session_id FROM process_families f LEFT JOIN process_members m ON m.run_id=f.run_id AND m.pid=f.leader_pid AND m.start_time=f.process_start_time WHERE f.state IN ('running','terminating') ORDER BY f.run_id").map { row in
             guard let runID = UUID(uuidString: row.column("run_id")?.string ?? "") else {
                 throw ServiceAPIError(code: .persistenceUnavailable, message: "Persisted process family run ID is invalid")
             }
@@ -1033,8 +1454,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func updateProcessFamilyState(runID: UUID, state: String, members: [PersistedProcessIdentity] = []) async throws {
-        try await transaction {
-            _ = try await connection.query("UPDATE process_families SET state=? WHERE run_id=?", [.text(state), .text(runID.uuidString)])
+        let retainedBytes = members.reduce(state.utf8.count) {
+            $0 + $1.bootID.utf8.count + $1.executablePath.utf8.count + $1.helperTokenDigest.utf8.count
+        }
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            _ = try await database.query("UPDATE process_families SET state=? WHERE run_id=?", [.text(state), .text(runID.uuidString)])
             if !members.isEmpty {
                 try await persistProcessMembersWithoutTransaction(runID: runID, members: members, terminalState: state)
             }
@@ -1042,21 +1466,22 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func processFamilyState(runID: UUID) async throws -> String? {
-        try await connection.query("SELECT state FROM process_families WHERE run_id=?", [.text(runID.uuidString)]).first?.column("state")?.string
+        try await database.query("SELECT state FROM process_families WHERE run_id=?", [.text(runID.uuidString)]).first?.column("state")?.string
     }
 
     public func consumeNonce(direction: String, keyID: String, nonce: String, observedAt: Date, expiresAt: Date) async throws {
         do {
-            _ = try await connection.query("INSERT INTO request_nonces(direction,key_id,nonce,observed_at,expires_at) VALUES(?,?,?,?,?)", [.text(direction), .text(keyID), .text(nonce), .float(observedAt.timeIntervalSince1970), .float(expiresAt.timeIntervalSince1970)])
+            _ = try await database.query("INSERT INTO request_nonces(direction,key_id,nonce,observed_at,expires_at) VALUES(?,?,?,?,?)", [.text(direction), .text(keyID), .text(nonce), .float(observedAt.timeIntervalSince1970), .float(expiresAt.timeIntervalSince1970)])
         } catch { throw ServiceAPIError(code: .internalAuthFailed, message: "Nonce has already been used") }
     }
 
     public func consumeAuthorizationDecision(_ decision: AuthorizationDecision) async throws {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(decision)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let scope = decision.sessionID.map { "session:\($0.uuidString)" }
                 ?? decision.projectID.map { "project:\($0.uuidString)" }
                 ?? "global"
-            if try await connection.query("SELECT 1 FROM consumed_authorization_decisions WHERE decision_id=?", [.text(decision.decisionID.uuidString)]).first != nil {
+            if try await database.query("SELECT 1 FROM consumed_authorization_decisions WHERE decision_id=?", [.text(decision.decisionID.uuidString)]).first != nil {
                 throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision was already consumed")
             }
             if let sessionID = decision.sessionID, let collaboration = try await collaboration(sessionID: sessionID) {
@@ -1072,58 +1497,330 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                     else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revisions do not match durable session policy") }
                 }
             }
-            if let row = try await connection.query("SELECT policy_revision,controller_revision,membership_revision FROM authorization_revision_fences WHERE scope_key=?", [.text(scope)]).first {
+            if let row = try await database.query("SELECT policy_revision,controller_revision,membership_revision FROM authorization_revision_fences WHERE scope_key=?", [.text(scope)]).first {
                 guard decision.policyRevision >= Int64(row.column("policy_revision")?.integer ?? 0),
                       decision.controllerRevision >= Int64(row.column("controller_revision")?.integer ?? 0),
                       decision.membershipRevision >= Int64(row.column("membership_revision")?.integer ?? 0)
                 else { throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Authorization decision revision regressed") }
             }
-            _ = try await connection.query("INSERT INTO consumed_authorization_decisions(decision_id,scope_key,actor_id,policy_revision,controller_revision,membership_revision,consumed_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", [.text(decision.decisionID.uuidString), .text(scope), .text(decision.actor.userID), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
-            _ = try await connection.query("INSERT INTO authorization_revision_fences(scope_key,policy_revision,controller_revision,membership_revision,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(scope_key) DO UPDATE SET policy_revision=MAX(policy_revision,excluded.policy_revision),controller_revision=MAX(controller_revision,excluded.controller_revision),membership_revision=MAX(membership_revision,excluded.membership_revision),updated_at=CURRENT_TIMESTAMP", [.text(scope), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
+            _ = try await database.query("INSERT INTO consumed_authorization_decisions(decision_id,scope_key,actor_id,policy_revision,controller_revision,membership_revision,consumed_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)", [.text(decision.decisionID.uuidString), .text(scope), .text(decision.actor.userID), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
+            _ = try await database.query("INSERT INTO authorization_revision_fences(scope_key,policy_revision,controller_revision,membership_revision,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(scope_key) DO UPDATE SET policy_revision=MAX(policy_revision,excluded.policy_revision),controller_revision=MAX(controller_revision,excluded.controller_revision),membership_revision=MAX(membership_revision,excluded.membership_revision),updated_at=CURRENT_TIMESTAMP", [.text(scope), .integer(Int(decision.policyRevision)), .integer(Int(decision.controllerRevision)), .integer(Int(decision.membershipRevision))])
         }
     }
 
     public func authorityStore_checkpoint() async throws {
-        _ = try await connection.query("PRAGMA wal_checkpoint(TRUNCATE)")
+        _ = try await database.query("PRAGMA wal_checkpoint(TRUNCATE)", operationClass: .control)
+    }
+
+    private struct EventArchiveCandidate: Sendable {
+        let globalSequence: Int64
+        let timestampBitPattern: UInt64
+        let envelopeBytes: Int
+    }
+
+    private struct EventArchiveBatchPlan: Sendable {
+        let storeID: UUID
+        let replayFloor: Int64
+        let nextGlobalSequence: Int64
+        let candidates: [EventArchiveCandidate]
+        let rawEnvelopeBytes: Int
+
+        var throughSequence: Int64 { candidates.last?.globalSequence ?? replayFloor }
+    }
+
+    private enum EventArchivePlanError: Error {
+        case stale
     }
 
     public func enforceEventRetention(policy: EventRetentionPolicy = .init(), now: Date = Date()) async throws -> UUID? {
-        let meta = try await metadata()
-        let latest = meta.nextGlobalSequence - 1
         let ageBoundary = now.addingTimeInterval(-policy.minimumLiveAge).timeIntervalSince1970
-        let rows = try await connection.query(
-            "SELECT global_sequence,timestamp FROM events WHERE global_sequence>? ORDER BY global_sequence",
-            [.integer(Int(meta.replayFloor))]
-        )
-        var ageEligibleThrough = meta.replayFloor
-        for row in rows {
-            guard (row.column("timestamp")?.double ?? .greatestFiniteMagnitude) < ageBoundary else { break }
-            ageEligibleThrough = Int64(row.column("global_sequence")?.integer ?? Int(ageEligibleThrough))
+        while true {
+            try Task.checkCancellation()
+            let meta = try await eventArchiveMetadata()
+            let latest = meta.nextGlobalSequence - 1
+            let (countEligibleThrough, underflow) = latest.subtractingReportingOverflow(policy.minimumLiveEventCount)
+            guard !underflow, countEligibleThrough > meta.replayFloor else { return nil }
+            guard let plan = try await eventArchivePlan(
+                metadata: meta,
+                through: countEligibleThrough,
+                ageBoundary: ageBoundary,
+                maximumBatch: policy.maximumArchiveBatch
+            ) else { return nil }
+            do {
+                return try await archiveEvents(plan: plan)
+            } catch EventArchivePlanError.stale {
+                continue
+            }
         }
-        guard let through = policy.eligibleThrough(latestSequence: latest, ageEligibleThrough: ageEligibleThrough, replayFloor: meta.replayFloor) else { return nil }
-        return try await archiveEvents(through: through)
     }
 
-    func archiveEvents(through sequence: Int64) async throws -> UUID? {
-        try await transaction {
-            let meta = try await metadata()
-            let bounded = min(sequence, meta.nextGlobalSequence - 1)
-            guard bounded > meta.replayFloor else { return nil }
-            let rows = try await connection.query(
-                "SELECT envelope_json FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence",
-                [.integer(Int(meta.replayFloor)), .integer(Int(bounded))]
-            )
-            let events = try rows.compactMap { row -> EventEnvelope? in
-                guard let text = row.column("envelope_json")?.string else { return nil }
-                return try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
+    func archiveEvents(
+        through sequence: Int64,
+        maximumBatch: Int = SQLiteDatabaseExecutor.maximumBulkRows
+    ) async throws -> UUID? {
+        while true {
+            try Task.checkCancellation()
+            let meta = try await eventArchiveMetadata()
+            guard let plan = try await eventArchivePlan(
+                metadata: meta,
+                through: sequence,
+                ageBoundary: nil,
+                maximumBatch: maximumBatch
+            ) else { return nil }
+            do {
+                return try await archiveEvents(plan: plan)
+            } catch EventArchivePlanError.stale {
+                continue
             }
-            guard let first = events.first, let last = events.last,
-                  first.globalSequence == meta.replayFloor + 1,
-                  last.globalSequence == bounded,
-                  events.enumerated().allSatisfy({ $0.element.globalSequence == first.globalSequence + Int64($0.offset) })
-            else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Event archive prefix is not contiguous") }
+        }
+    }
+
+    func eventRetentionObservationForTesting() -> EventRetentionObservation {
+        eventRetentionObservation
+    }
+
+    private func eventArchiveMetadata() async throws -> (storeID: UUID, nextGlobalSequence: Int64, replayFloor: Int64) {
+        let row = try await requireRow(database.query(
+            "SELECT store_id,next_global_sequence,replay_floor FROM service_metadata WHERE fixed_id=1",
+            operationClass: .bulk,
+            estimatedEncodedBytes: 3 * MemoryLayout<UInt64>.size
+        ))
+        return (
+            try requireUUID(row.column("store_id")?.string),
+            Int64(row.column("next_global_sequence")?.integer ?? 1),
+            Int64(row.column("replay_floor")?.integer ?? 0)
+        )
+    }
+
+    private func eventArchivePlan(
+        metadata: (storeID: UUID, nextGlobalSequence: Int64, replayFloor: Int64),
+        through requestedSequence: Int64,
+        ageBoundary: Double?,
+        maximumBatch: Int
+    ) async throws -> EventArchiveBatchPlan? {
+        let latest = metadata.nextGlobalSequence - 1
+        let bounded = min(requestedSequence, latest)
+        guard bounded > metadata.replayFloor else { return nil }
+        guard maximumBatch > 0 else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Event archive batch limit must be positive",
+                retryable: false
+            )
+        }
+        let rowLimit = min(maximumBatch, SQLiteDatabaseExecutor.maximumBulkRows)
+        let rows = try await database.query(
+            "SELECT global_sequence,timestamp,LENGTH(CAST(envelope_json AS BLOB)) AS envelope_bytes FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence LIMIT ?",
+            [.integer(Int(metadata.replayFloor)), .integer(Int(bounded)), .integer(rowLimit)],
+            operationClass: .bulk,
+            estimatedEncodedBytes: rowLimit * 3 * MemoryLayout<UInt64>.size
+        )
+        let scannedEnvelopeBytes = rows.reduce(into: 0) { total, row in
+            let bytes = max(0, row.column("envelope_bytes")?.integer ?? 0)
+            total = saturatingSum(total, bytes)
+        }
+        eventRetentionObservation.candidateQueryCount = saturatingSum(
+            eventRetentionObservation.candidateQueryCount,
+            1
+        )
+        eventRetentionObservation.maximumScannedRows = max(
+            eventRetentionObservation.maximumScannedRows,
+            rows.count
+        )
+        eventRetentionObservation.totalScannedRows = saturatingSum(
+            eventRetentionObservation.totalScannedRows,
+            rows.count
+        )
+        eventRetentionObservation.maximumScannedEnvelopeBytes = max(
+            eventRetentionObservation.maximumScannedEnvelopeBytes,
+            scannedEnvelopeBytes
+        )
+        eventRetentionObservation.totalScannedEnvelopeBytes = saturatingSum(
+            eventRetentionObservation.totalScannedEnvelopeBytes,
+            scannedEnvelopeBytes
+        )
+        let confirmedMetadata = try await eventArchiveMetadata()
+        guard confirmedMetadata.storeID == metadata.storeID,
+              confirmedMetadata.replayFloor == metadata.replayFloor
+        else { throw EventArchivePlanError.stale }
+
+        var candidates: [EventArchiveCandidate] = []
+        candidates.reserveCapacity(rowLimit)
+        var rawEnvelopeBytes = 0
+        var expectedSequence = metadata.replayFloor + 1
+        for row in rows {
+            try Task.checkCancellation()
+            guard let sequenceValue = row.column("global_sequence")?.integer,
+                  let timestamp = row.column("timestamp")?.double,
+                  timestamp.isFinite,
+                  let envelopeByteCount = row.column("envelope_bytes")?.integer,
+                  envelopeByteCount > 0
+            else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Event archive eligibility metadata is invalid",
+                    retryable: false
+                )
+            }
+            let sequence = Int64(sequenceValue)
+            guard sequence == expectedSequence else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Event archive prefix is not contiguous",
+                    retryable: false
+                )
+            }
+            guard ageBoundary.map({ timestamp < $0 }) != false else { break }
+            let (nextRawBytes, rawOverflow) = rawEnvelopeBytes.addingReportingOverflow(envelopeByteCount)
+            let (canonicalEstimate, canonicalOverflow) = nextRawBytes.addingReportingOverflow(candidates.count + 2)
+            if rawOverflow || canonicalOverflow
+                || nextRawBytes > SQLiteDatabaseExecutor.maximumBulkEncodedBytes
+                || canonicalEstimate > SQLiteDatabaseExecutor.maximumBulkEncodedBytes
+            {
+                guard !candidates.isEmpty else {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "Event at sequence \(sequence) exceeds the durable archive batch limit",
+                        retryable: false
+                    )
+                }
+                break
+            }
+            candidates.append(.init(
+                globalSequence: sequence,
+                timestampBitPattern: timestamp.bitPattern,
+                envelopeBytes: envelopeByteCount
+            ))
+            rawEnvelopeBytes = nextRawBytes
+            expectedSequence += 1
+        }
+        guard !candidates.isEmpty else { return nil }
+        return EventArchiveBatchPlan(
+            storeID: metadata.storeID,
+            replayFloor: metadata.replayFloor,
+            nextGlobalSequence: metadata.nextGlobalSequence,
+            candidates: candidates,
+            rawEnvelopeBytes: rawEnvelopeBytes
+        )
+    }
+
+    private func archiveEvents(plan: EventArchiveBatchPlan) async throws -> UUID {
+        let reservation = try eventArchiveReservation(plan: plan)
+        eventRetentionObservation.archiveMutationCount = saturatingSum(
+            eventRetentionObservation.archiveMutationCount,
+            1
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: reservation)) {
+            let meta = try await eventArchiveMetadata()
+            guard meta.storeID == plan.storeID,
+                  meta.replayFloor == plan.replayFloor,
+                  meta.nextGlobalSequence >= plan.nextGlobalSequence
+            else { throw EventArchivePlanError.stale }
+            let rows = try await database.query(
+                "SELECT global_sequence,timestamp,envelope_json FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence LIMIT ?",
+                [.integer(Int(plan.replayFloor)), .integer(Int(plan.throughSequence)), .integer(plan.candidates.count)],
+                operationClass: .bulk,
+                estimatedEncodedBytes: plan.rawEnvelopeBytes
+                    + plan.candidates.count * 2 * MemoryLayout<UInt64>.size
+            )
+            let materializedBytes = rows.reduce(into: 0) { total, row in
+                total = saturatingSum(total, row.column("envelope_json")?.string?.utf8.count ?? 0)
+            }
+            eventRetentionObservation.maximumMaterializedRows = max(
+                eventRetentionObservation.maximumMaterializedRows,
+                rows.count
+            )
+            eventRetentionObservation.totalMaterializedRows = saturatingSum(
+                eventRetentionObservation.totalMaterializedRows,
+                rows.count
+            )
+            eventRetentionObservation.maximumMaterializedEnvelopeBytes = max(
+                eventRetentionObservation.maximumMaterializedEnvelopeBytes,
+                materializedBytes
+            )
+            eventRetentionObservation.totalMaterializedEnvelopeBytes = saturatingSum(
+                eventRetentionObservation.totalMaterializedEnvelopeBytes,
+                materializedBytes
+            )
+            guard rows.count == plan.candidates.count,
+                  materializedBytes == plan.rawEnvelopeBytes
+            else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Event archive batch changed after eligibility planning",
+                    retryable: false
+                )
+            }
+
+            var events: [EventEnvelope] = []
+            events.reserveCapacity(rows.count)
+            for (row, candidate) in zip(rows, plan.candidates) {
+                try Task.checkCancellation()
+                guard Int64(row.column("global_sequence")?.integer ?? -1) == candidate.globalSequence,
+                      row.column("timestamp")?.double?.bitPattern == candidate.timestampBitPattern,
+                      let text = row.column("envelope_json")?.string,
+                      text.utf8.count == candidate.envelopeBytes
+                else {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "Event archive batch identity changed after eligibility planning",
+                        retryable: false
+                    )
+                }
+                let event = try decoder.decode(EventEnvelope.self, from: Data(text.utf8))
+                guard event.globalSequence == candidate.globalSequence else {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "Event archive envelope sequence is invalid",
+                        retryable: false
+                    )
+                }
+                events.append(event)
+            }
+
+            var canonicalEntryBytes = 0
+            var archiveCount = 0
+            for event in events {
+                try Task.checkCancellation()
+                let entryBytes = try encoder.encode(event).count
+                let (nextEntryBytes, entryOverflow) = canonicalEntryBytes.addingReportingOverflow(entryBytes)
+                let (arrayBytes, arrayOverflow) = nextEntryBytes.addingReportingOverflow(archiveCount + 2)
+                if entryOverflow || arrayOverflow || arrayBytes > SQLiteDatabaseExecutor.maximumBulkEncodedBytes {
+                    guard archiveCount > 0 else {
+                        throw ServiceAPIError(
+                            code: .persistenceUnavailable,
+                            message: "Event at sequence \(event.globalSequence) exceeds the canonical archive batch limit",
+                            retryable: false
+                        )
+                    }
+                    break
+                }
+                canonicalEntryBytes = nextEntryBytes
+                archiveCount += 1
+            }
+            let archivedEvents = Array(events.prefix(archiveCount))
+            guard let first = archivedEvents.first, let last = archivedEvents.last,
+                  first.globalSequence == plan.replayFloor + 1,
+                  archivedEvents.enumerated().allSatisfy({
+                      $0.element.globalSequence == first.globalSequence + Int64($0.offset)
+                  })
+            else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Event archive prefix is not contiguous",
+                    retryable: false
+                )
+            }
+            let bytes = try encoder.encode(archivedEvents)
+            guard bytes.count <= SQLiteDatabaseExecutor.maximumBulkEncodedBytes else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Canonical event archive exceeds the durable batch limit",
+                    retryable: false
+                )
+            }
+            try Task.checkCancellation()
             let archiveID = UUID()
-            let bytes = try encoder.encode(events)
             let compressed = EventArchiveCompression.compress(bytes)
             let digest = PersistenceCryptography.bodyDigest(bytes)
             let compressedDigest = PersistenceCryptography.bodyDigest(compressed)
@@ -1134,26 +1831,55 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 retentionClass: "pre_compaction",
                 archiveID: archiveID
             )
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO event_archive_blobs(archive_id,store_id,first_sequence,last_sequence,event_count,compression,compressed_events_base64,uncompressed_digest,compressed_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 [
                     .text(archiveID.uuidString), .text(meta.storeID.uuidString), .integer(Int(first.globalSequence)),
-                    .integer(Int(last.globalSequence)), .integer(events.count), .text(EventArchiveCompression.algorithm),
+                    .integer(Int(last.globalSequence)), .integer(archivedEvents.count), .text(EventArchiveCompression.algorithm),
                     .text(compressed.base64EncodedString()), .text(digest), .text(compressedDigest),
                     .float(Date().timeIntervalSince1970)
                 ]
             )
-            _ = try await connection.query(
+            _ = try await database.query(
                 "DELETE FROM events WHERE global_sequence>=? AND global_sequence<=?",
                 [.integer(Int(first.globalSequence)), .integer(Int(last.globalSequence))]
             )
-            _ = try await connection.query("UPDATE service_metadata SET replay_floor=? WHERE fixed_id=1", [.integer(Int(last.globalSequence))])
+            _ = try await database.query(
+                "UPDATE service_metadata SET replay_floor=? WHERE fixed_id=1 AND store_id=? AND replay_floor=?",
+                [.integer(Int(last.globalSequence)), .text(plan.storeID.uuidString), .integer(Int(plan.replayFloor))]
+            )
+            let changed = try await requireRow(database.query("SELECT changes() AS changed"))
+                .column("changed")?.integer
+            guard changed == 1 else { throw EventArchivePlanError.stale }
             return archiveID
         }
     }
 
+    private func eventArchiveReservation(plan: EventArchiveBatchPlan) throws -> Int {
+        let compressedBound = EventArchiveCompression.maximumCompressedBytes(
+            forInputBytes: SQLiteDatabaseExecutor.maximumBulkEncodedBytes
+        )
+        let checkpointBase64Bound = ((SQLiteDatabaseExecutor.maximumBulkEncodedBytes + 2) / 3) * 4
+        let archiveBase64Bound = ((compressedBound + 2) / 3) * 4
+        return try checkedRetainedByteSum(
+            plan.rawEnvelopeBytes,
+            plan.rawEnvelopeBytes,
+            SQLiteDatabaseExecutor.maximumBulkEncodedBytes,
+            compressedBound,
+            checkpointBase64Bound,
+            archiveBase64Bound,
+            plan.candidates.count * 3 * MemoryLayout<UInt64>.size,
+            4_096
+        )
+    }
+
+    private func saturatingSum(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : sum
+    }
+
     public func archivedEvents(archiveID: UUID) async throws -> [EventEnvelope] {
-        if let row = try await connection.query("SELECT * FROM event_archive_blobs WHERE archive_id=?", [.text(archiveID.uuidString)]).first {
+        if let row = try await database.query("SELECT * FROM event_archive_blobs WHERE archive_id=?", [.text(archiveID.uuidString)]).first {
             guard row.column("compression")?.string == EventArchiveCompression.algorithm,
                   let encoded = row.column("compressed_events_base64")?.string,
                   let compressed = Data(base64Encoded: encoded),
@@ -1170,12 +1896,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             else { throw ServiceAPIError(code: .persistenceUnavailable, message: "Event archive sequence metadata is invalid", retryable: false) }
             return events
         }
-        guard let text = try await connection.query("SELECT canonical_events_json FROM event_archives WHERE archive_id=?", [.text(archiveID.uuidString)]).first?.column("canonical_events_json")?.string else { throw ServiceAPIError(code: .notFound, message: "Event archive not found") }
+        guard let text = try await database.query("SELECT canonical_events_json FROM event_archives WHERE archive_id=?", [.text(archiveID.uuidString)]).first?.column("canonical_events_json")?.string else { throw ServiceAPIError(code: .notFound, message: "Event archive not found") }
         return try decoder.decode([EventEnvelope].self, from: Data(text.utf8))
     }
 
     public func snapshotCheckpoints(scope: String) async throws -> [(sequence: Int64, digest: String)] {
-        try await connection.query("SELECT sequence,digest FROM snapshot_checkpoints WHERE scope=? ORDER BY sequence", [.text(scope)]).map { (Int64($0.column("sequence")?.integer ?? 0), $0.column("digest")?.string ?? "") }
+        try await database.query("SELECT sequence,digest FROM snapshot_checkpoints WHERE scope=? ORDER BY sequence", [.text(scope)]).map { (Int64($0.column("sequence")?.integer ?? 0), $0.column("digest")?.string ?? "") }
     }
 
     public func prepareRestoredStore(
@@ -1197,47 +1923,167 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         let projects = try await allProjects().map { replacingCursor($0, cursor: restoredCursor) }
         let sessions = try await allSessions().map { replacingCursor($0, cursor: restoredCursor) }
         let tokenDigest = PersistenceCryptography.bodyDigest(activationToken)
-        try await transaction {
-            _ = try await connection.query(
+        let retainedBytes = try retainedInputBytes(
+            projects,
+            additional: encoder.encode(sessions).count + digest.utf8.count + activationToken.count
+        )
+        try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
+            _ = try await database.query(
                 "UPDATE service_metadata SET restored_from_store_id=store_id,store_id=?,restore_backup_sequence=?,restore_digest=?,replay_floor=?,next_global_sequence=?,last_clean_shutdown=0,activation_state='restore_prepared',activation_generation=activation_generation+1,activation_token_digest=?,activation_instance_id=NULL WHERE fixed_id=1",
                 [.text(fresh.uuidString), .integer(Int(backupSequence)), .text(digest), .integer(Int(restoredFloor)), .integer(Int(restoredFloor + 1)), .text(tokenDigest)]
             )
             // Preserve prior records for expiry/audit while making their cached
             // responses unreachable in the fresh store namespace.
-            _ = try await connection.query(
+            _ = try await database.query(
                 "UPDATE idempotency_records SET idempotency_key=? || idempotency_key",
                 [.text("restored:\(fresh.uuidString):")]
             )
             for project in projects {
-                _ = try await connection.query("UPDATE projects SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE project_id=?", [.text(encodeText(project)), .text(project.projectID.uuidString)])
+                _ = try await database.query("UPDATE projects SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE project_id=?", [.text(encodeText(project)), .text(project.projectID.uuidString)])
             }
             for session in sessions {
-                _ = try await connection.query("UPDATE sessions SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE session_id=?", [.text(encodeText(session)), .text(session.sessionID.uuidString)])
+                _ = try await database.query("UPDATE sessions SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE session_id=?", [.text(encodeText(session)), .text(session.sessionID.uuidString)])
             }
             let provenance = try encodeText(["priorStoreId": priorStoreID.uuidString, "freshStoreId": fresh.uuidString, "digest": digest])
             try await saveCheckpoint(scope: "store:\(fresh.uuidString):restore", sequence: restoredFloor, snapshot: Data(provenance.utf8), retentionClass: "restore")
-            _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_prepared',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(provenance)])
+            _ = try await database.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_prepared',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(provenance)])
             return ()
         }
         return fresh
     }
 
     public func activateRestoredStore(activationToken: Data, instanceID: UUID) async throws -> UUID {
-        try await transaction {
-            let row = try await requireRow(connection.query("SELECT store_id,activation_state,activation_token_digest FROM service_metadata WHERE fixed_id=1"))
+        try await transaction(.interactive(estimatedEncodedBytes: activationToken.count)) {
+            let row = try await requireRow(database.query("SELECT store_id,activation_state,activation_token_digest FROM service_metadata WHERE fixed_id=1"))
             guard row.column("activation_state")?.string == "restore_prepared",
                   row.column("activation_token_digest")?.string == PersistenceCryptography.bodyDigest(activationToken)
             else {
                 throw ServiceAPIError(code: .quiescing, message: "Restored store activation is fenced")
             }
             let storeID = try requireUUID(row.column("store_id")?.string)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "UPDATE service_metadata SET activation_state='active',activation_token_digest=NULL,activation_instance_id=?,last_clean_shutdown=0 WHERE fixed_id=1 AND activation_state='restore_prepared'",
                 [.text(instanceID.uuidString)]
             )
             let payload = try encodeText(["storeId": storeID.uuidString, "instanceId": instanceID.uuidString])
-            _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_activated',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(payload)])
+            _ = try await database.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_activated',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(payload)])
             return storeID
+        }
+    }
+
+    /// V7 restore activation fence. The archived namespace kind is immutable;
+    /// only the canonical physical database identity and store cursor identity
+    /// are rebound, in the same transaction that consumes the activation token.
+    public func activateRestoredNamespace(
+        from priorStoreID: UUID,
+        backupSequence: Int64,
+        manifestDigest: String,
+        sourceNamespaceKind: String,
+        sourceDatabaseIdentityDigest: String,
+        targetNamespaceKind: String,
+        targetDatabaseIdentityDigest: String,
+        missingExternalOptionalAssetIDs: [String] = [],
+        activationToken: Data,
+        instanceID: UUID
+    ) async throws -> UUID {
+        guard !activationToken.isEmpty,
+              sourceNamespaceKind == targetNamespaceKind,
+              sourceDatabaseIdentityDigest != targetDatabaseIdentityDigest
+        else {
+            throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Restore namespace rebind request is invalid")
+        }
+        let current = try await metadata()
+        let namespaceRow = try await requireRow(database.query(
+            "SELECT namespace_kind,database_identity_digest FROM authority_namespace_identity WHERE fixed_id=1"
+        ))
+        if current.storeID != priorStoreID {
+            let restoredFrom = try await database.query(
+                "SELECT restored_from_store_id FROM service_metadata WHERE fixed_id=1"
+            ).first?.column("restored_from_store_id")?.string.flatMap(UUID.init(uuidString:))
+            guard restoredFrom == priorStoreID,
+                  namespaceRow.column("namespace_kind")?.string == targetNamespaceKind,
+                  namespaceRow.column("database_identity_digest")?.string == targetDatabaseIdentityDigest
+            else {
+                throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Restore activation provenance does not match")
+            }
+            return current.storeID
+        }
+        guard current.activationState == "active",
+              namespaceRow.column("namespace_kind")?.string == sourceNamespaceKind,
+              namespaceRow.column("database_identity_digest")?.string == sourceDatabaseIdentityDigest
+        else {
+            throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Archived namespace identity does not match the restored store")
+        }
+
+        let degradedProviderIDs = Set(missingExternalOptionalAssetIDs.compactMap { logicalID -> String? in
+            let components = logicalID.split(separator: ".", maxSplits: 2).map(String.init)
+            guard components.count == 3,
+                  components[0] == "provider",
+                  components[1].range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil
+            else { return nil }
+            return components[1]
+        })
+        let fresh = UUID()
+        let restoredFloor = max(backupSequence, current.nextGlobalSequence - 1)
+        let restoredCursor = ServiceCursor(storeID: fresh, globalSequence: restoredFloor)
+        let projects = try await allProjects().map { replacingCursor($0, cursor: restoredCursor) }
+        let sessions = try await allSessions().map { replacingCursor($0, cursor: restoredCursor) }
+        let sessionBytes = try retainedEncodedBytes(sessions)
+        let externalAssetBytes = missingExternalOptionalAssetIDs.reduce(activationToken.count) { $0 + $1.utf8.count }
+        let additionalRetainedBytes = try checkedRetainedByteSum(
+            sessionBytes,
+            externalAssetBytes,
+            manifestDigest.utf8.count,
+            sourceNamespaceKind.utf8.count,
+            sourceDatabaseIdentityDigest.utf8.count,
+            targetNamespaceKind.utf8.count,
+            targetDatabaseIdentityDigest.utf8.count
+        )
+        let retainedBytes = try retainedInputBytes(
+            projects,
+            additional: additionalRetainedBytes
+        )
+        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
+            _ = try await database.query(
+                "UPDATE service_metadata SET restored_from_store_id=store_id,store_id=?,restore_backup_sequence=?,restore_digest=?,replay_floor=?,next_global_sequence=?,last_clean_shutdown=0,activation_state='active',activation_generation=activation_generation+1,activation_token_digest=NULL,activation_instance_id=? WHERE fixed_id=1 AND store_id=?",
+                [.text(fresh.uuidString), .integer(Int(backupSequence)), .text(manifestDigest), .integer(Int(restoredFloor)), .integer(Int(restoredFloor + 1)), .text(instanceID.uuidString), .text(priorStoreID.uuidString)]
+            )
+            _ = try await database.query(
+                "UPDATE authority_namespace_identity SET database_identity_digest=? WHERE fixed_id=1 AND namespace_kind=? AND database_identity_digest=?",
+                [.text(targetDatabaseIdentityDigest), .text(targetNamespaceKind), .text(sourceDatabaseIdentityDigest)]
+            )
+            _ = try await database.query(
+                "UPDATE idempotency_records SET idempotency_key=? || idempotency_key",
+                [.text("restored:\(fresh.uuidString):")]
+            )
+            for project in projects {
+                _ = try await database.query("UPDATE projects SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE project_id=?", [.text(encodeText(project)), .text(project.projectID.uuidString)])
+            }
+            for session in sessions {
+                _ = try await database.query("UPDATE sessions SET snapshot_json=?,updated_at=CURRENT_TIMESTAMP WHERE session_id=?", [.text(encodeText(session)), .text(session.sessionID.uuidString)])
+            }
+            for providerID in degradedProviderIDs.sorted() {
+                _ = try await database.query(
+                    "UPDATE provider_settings SET enabled=0,revision=revision+1,updated_at=? WHERE provider_id=?",
+                    [.float(Date().timeIntervalSince1970), .text(providerID)]
+                )
+                _ = try await database.query(
+                    "UPDATE provider_connections SET state='attention',test_state='notTested',detail='Restored dependency unavailable; explicit fingerprint revalidation required',revision=revision+1,updated_at=? WHERE provider_id=?",
+                    [.float(Date().timeIntervalSince1970), .text(providerID)]
+                )
+            }
+            let provenance = try encodeText([
+                "priorStoreId": priorStoreID.uuidString,
+                "freshStoreId": fresh.uuidString,
+                "sourceNamespaceKind": sourceNamespaceKind,
+                "sourceDatabaseIdentityDigest": sourceDatabaseIdentityDigest,
+                "targetDatabaseIdentityDigest": targetDatabaseIdentityDigest,
+                "missingExternalOptionalAssetIDs": missingExternalOptionalAssetIDs.sorted().joined(separator: ","),
+                "digest": manifestDigest,
+            ])
+            try await saveCheckpoint(scope: "store:\(fresh.uuidString):restore", sequence: restoredFloor, snapshot: Data(provenance.utf8), retentionClass: "restore")
+            _ = try await database.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_activated',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(provenance)])
+            return fresh
         }
     }
 
@@ -1261,7 +2107,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         let meta = try await metadata()
         let sequence = meta.nextGlobalSequence
         let keyID = eventSigningKey?.keyID ?? "unsigned-local"
-        let lastTimestamp = try await connection.query("SELECT last_event_timestamp FROM service_metadata WHERE fixed_id=1").first?.column("last_event_timestamp")?.double ?? 0
+        let lastTimestamp = try await database.query("SELECT last_event_timestamp FROM service_metadata WHERE fixed_id=1").first?.column("last_event_timestamp")?.double ?? 0
         let eventTimestamp = Date(timeIntervalSince1970: max(Date().timeIntervalSince1970, lastTimestamp))
         let objectPayload = try EventPayload(jsonData: payload)
         let eventID = UUID()
@@ -1277,20 +2123,20 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             turnEpoch.map { .integer(Int($0)) } ?? .null, actorJSON.map(SQLiteData.text) ?? .null, .text(encodeText(objectPayload)),
             .text(digest), .float(envelope.timestamp.timeIntervalSince1970), .text(encodeText(envelope))
         ]
-        _ = try await connection.query("INSERT INTO events(global_sequence,event_id,project_id,session_id,agent_id,parent_agent_id,root_session_id,run_id,session_sequence,event_type,payload_version,generation,turn_epoch,actor_json,payload_json,digest,timestamp,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bindings)
-        try await faultInjector.hit(.afterEventInsertBeforeSequenceAdvance)
-        _ = try await connection.query(
+        _ = try await database.query("INSERT INTO events(global_sequence,event_id,project_id,session_id,agent_id,parent_agent_id,root_session_id,run_id,session_sequence,event_type,payload_version,generation,turn_epoch,actor_json,payload_json,digest,timestamp,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bindings)
+        try await hitFault(.afterEventInsertBeforeSequenceAdvance)
+        _ = try await database.query(
             "UPDATE service_metadata SET next_global_sequence=next_global_sequence+1,last_clean_shutdown=0,last_event_timestamp=? WHERE fixed_id=1",
             [.float(eventTimestamp.timeIntervalSince1970)]
         )
         if let sessionID {
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO session_event_counters(session_id,event_count,last_sequence) VALUES(?,1,?) ON CONFLICT(session_id) DO UPDATE SET event_count=event_count+1,last_sequence=excluded.last_sequence",
                 [.text(sessionID.uuidString), .integer(Int(sequence))]
             )
-            let count = try await connection.query("SELECT event_count FROM session_event_counters WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("event_count")?.integer ?? 0
+            let count = try await database.query("SELECT event_count FROM session_event_counters WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("event_count")?.integer ?? 0
             if count > 0, count.isMultiple(of: 1000),
-               let snapshot = try await connection.query("SELECT snapshot_json FROM sessions WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("snapshot_json")?.string
+               let snapshot = try await database.query("SELECT snapshot_json FROM sessions WHERE session_id=?", [.text(sessionID.uuidString)]).first?.column("snapshot_json")?.string
             {
                 try await saveCheckpoint(scope: "session:\(sessionID.uuidString)", sequence: sequence, snapshot: Data(snapshot.utf8), retentionClass: "rolling")
             }
@@ -1301,7 +2147,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     private func persistProcessMembersWithoutTransaction(runID: UUID, members: [PersistedProcessIdentity], terminalState: String?) async throws {
         for member in members {
             let executableIdentity = PersistenceCryptography.bodyDigest(Data(member.executablePath.utf8))
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO process_members(run_id,pid,schema_version,parent_pid,pgid,session_id,start_time,executable_identity,first_observed_at,last_observed_at,terminal_state) VALUES(?,?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?) ON CONFLICT(run_id,pid,start_time) DO UPDATE SET parent_pid=excluded.parent_pid,pgid=excluded.pgid,session_id=excluded.session_id,executable_identity=excluded.executable_identity,last_observed_at=CURRENT_TIMESTAMP,terminal_state=excluded.terminal_state",
                 [.text(runID.uuidString), .integer(Int(member.pid)), .integer(Int(member.parentPID)), .integer(Int(member.processGroupID)), .integer(Int(member.sessionID)), .integer(Int(member.startTimeTicks)), .text(executableIdentity), terminalState.map(SQLiteData.text) ?? .null]
             )
@@ -1309,11 +2155,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     private func importAuditExists(kind: String, digest: String) async throws -> Bool {
-        try await connection.query("SELECT 1 FROM audit_events WHERE event_type=? AND payload_json=? LIMIT 1", [.text(kind), .text(digest)]).first != nil
+        try await database.query("SELECT 1 FROM audit_events WHERE event_type=? AND payload_json=? LIMIT 1", [.text(kind), .text(digest)]).first != nil
     }
 
     private func recordImportAudit(kind: String, digest: String) async throws {
-        _ = try await connection.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,1,?,?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(kind), .text(digest)])
+        _ = try await database.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,1,?,?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(kind), .text(digest)])
     }
 
     func persistSessionInTransaction(
@@ -1328,6 +2174,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     ) async throws -> EventEnvelope {
         try await validateExpectedCursor(snapshot.cursor)
         if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
+        try await persistTranscriptEntriesInBulk(snapshot)
         let snapshotJSON = try encodeText(snapshot)
         let sessionBindings: [SQLiteData] = [
             .text(snapshot.sessionID.uuidString), .text(snapshot.projectID.uuidString), snapshot.parentSessionID.map { .text($0.uuidString) } ?? .null,
@@ -1335,12 +2182,9 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             snapshot.model.map(SQLiteData.text) ?? .null, .text(snapshot.visibility.rawValue), .integer(Int(snapshot.runGeneration)), .integer(Int(snapshot.turnEpoch)),
             .integer(Int(snapshot.revision)), .text(snapshotJSON)
         ]
-        _ = try await connection.query("INSERT INTO sessions(session_id,project_id,parent_session_id,root_session_id,schema_version,creator_external_id,lifecycle_state,provider_kind,model,visibility,run_generation,turn_epoch,revision,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET lifecycle_state=excluded.lifecycle_state,run_generation=excluded.run_generation,turn_epoch=excluded.turn_epoch,revision=excluded.revision,snapshot_json=excluded.snapshot_json,updated_at=CURRENT_TIMESTAMP", sessionBindings)
-        for entry in snapshot.transcript {
-            _ = try await connection.query("INSERT OR IGNORE INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)", [.text(snapshot.sessionID.uuidString), .text(entry.entryID.uuidString), .integer(Int(entry.sessionSequence)), .text(encodeText(entry)), .text(PersistenceCryptography.bodyDigest(encoder.encode(entry)))])
-        }
+        _ = try await database.query("INSERT INTO sessions(session_id,project_id,parent_session_id,root_session_id,schema_version,creator_external_id,lifecycle_state,provider_kind,model,visibility,run_generation,turn_epoch,revision,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET lifecycle_state=excluded.lifecycle_state,run_generation=excluded.run_generation,turn_epoch=excluded.turn_epoch,revision=excluded.revision,snapshot_json=excluded.snapshot_json,updated_at=CURRENT_TIMESTAMP", sessionBindings)
         if let initialSelection {
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO session_selections(session_id,schema_version,allowed_roots_json,selection_json,selection_revision,binding_revision,transactional_commit_id) VALUES(?,1,?,?,?,?,?) ON CONFLICT(session_id) DO NOTHING",
                 [.text(initialSelection.sessionID.uuidString), .text(encodeText(Array(Set(initialSelection.entries.map(\.rootID))))), .text(encodeText(initialSelection)), .integer(Int(initialSelection.revision)), .integer(Int(initialSelection.bindingRevision)), .text(UUID().uuidString)]
             )
@@ -1360,7 +2204,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     private func persistAgentInTransaction(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
-        _ = try await connection.query(
+        _ = try await database.query(
             "INSERT INTO agents(agent_id,session_id,root_session_id,parent_agent_id,schema_version,provider_native_identity,role,label,lifecycle_state,revision,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(agent_id) DO UPDATE SET provider_native_identity=excluded.provider_native_identity,role=excluded.role,label=excluded.label,lifecycle_state=excluded.lifecycle_state,revision=excluded.revision,updated_at=CURRENT_TIMESTAMP",
             [.text(snapshot.agentID.uuidString), .text(snapshot.sessionID.uuidString), .text(snapshot.rootSessionID.uuidString), snapshot.parentAgentID.map { .text($0.uuidString) } ?? .null, snapshot.providerNativeIdentity.map(SQLiteData.text) ?? .null, .text(snapshot.role), snapshot.label.map(SQLiteData.text) ?? .null, .text(snapshot.state.rawValue), .integer(Int(snapshot.revision))]
         )
@@ -1368,7 +2212,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     private func upsertPermissions(_ snapshot: ExecutionPermissionSnapshot) async throws {
-        _ = try await connection.query(
+        _ = try await database.query(
             "INSERT INTO execution_permissions(session_id,schema_version,mode,provider_settings_json,revision,updated_actor_json,updated_at) VALUES(?,1,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,provider_settings_json=excluded.provider_settings_json,revision=excluded.revision,updated_actor_json=excluded.updated_actor_json,updated_at=CURRENT_TIMESTAMP",
             [.text(snapshot.sessionID.uuidString), .text(snapshot.mode), .text(encodeText(snapshot.providerSettings)), .integer(Int(snapshot.revision)), .text(encodeText(snapshot.updatedActor))]
         )
@@ -1376,7 +2220,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
     private func upsertCollaboration(_ metadata: CollaborationMetadataSnapshot) async throws {
         let acknowledgement: SQLiteData = try metadata.collaborationAcknowledgement.map { try .text(encodeText($0)) } ?? .null
-        _ = try await connection.query(
+        _ = try await database.query(
             "INSERT INTO collaboration_metadata(session_id,schema_version,visibility,collaborative_steering_enabled,controller_user_id,policy_revision,controller_revision,membership_revision,collaboration_acknowledgement_json,updated_at) VALUES(?,1,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET visibility=excluded.visibility,collaborative_steering_enabled=excluded.collaborative_steering_enabled,controller_user_id=excluded.controller_user_id,policy_revision=excluded.policy_revision,controller_revision=excluded.controller_revision,membership_revision=excluded.membership_revision,collaboration_acknowledgement_json=excluded.collaboration_acknowledgement_json,updated_at=CURRENT_TIMESTAMP",
             [.text(metadata.sessionID.uuidString), .text(metadata.visibility.rawValue), .integer(metadata.collaborativeSteeringEnabled ? 1 : 0), .text(metadata.controllerUserID), .integer(Int(metadata.policyRevision)), .integer(Int(metadata.controllerRevision)), .integer(Int(metadata.membershipRevision)), acknowledgement]
         )
@@ -1394,7 +2238,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_providerConnections() async throws -> [StoredProviderConnection] {
-        try await connection.query("SELECT provider_id,connection_id,authentication_method,state,account_label,expires_at,last_tested_at,test_state,detail,key_helper_configured,workload_identity_configured,credential_reference,created_at,updated_at,revision FROM provider_connections ORDER BY provider_id").map { row in
+        try await database.query("SELECT provider_id,connection_id,authentication_method,state,account_label,expires_at,last_tested_at,test_state,detail,key_helper_configured,workload_identity_configured,credential_reference,created_at,updated_at,revision FROM provider_connections ORDER BY provider_id").map { row in
             guard let rawProvider = row.column("provider_id")?.string,
                   let providerID = ProviderSettingsID(rawValue: rawProvider),
                   let rawConnection = row.column("connection_id")?.string,
@@ -1458,14 +2302,20 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         expectedRevision: Int64,
         audit: ProviderConnectionAuditMutation? = nil
     ) async throws -> StoredProviderConnection {
-        try await transaction {
+        let retainedBytes = try checkedRetainedByteSum(
+            value.record.providerID.rawValue.utf8.count,
+            value.record.accountLabel?.utf8.count ?? 0,
+            value.record.detail?.utf8.count ?? 0,
+            retainedProviderAuditBytes(audit)
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             try Self.validateProviderConnection(value)
-            let observed = try await Int64(connection.query("SELECT revision FROM provider_connections WHERE provider_id=?", [.text(value.record.providerID.rawValue)]).first?.column("revision")?.integer ?? 0)
+            let observed = try await Int64(database.query("SELECT revision FROM provider_connections WHERE provider_id=?", [.text(value.record.providerID.rawValue)]).first?.column("revision")?.integer ?? 0)
             guard observed == expectedRevision, value.record.revision == expectedRevision + 1 else {
                 throw ServiceAPIError(code: .staleRevision, message: "Provider connection revision is stale", currentRevision: observed)
             }
             let record = value.record
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO provider_connections(provider_id,schema_version,connection_id,authentication_method,state,account_label,expires_at,last_tested_at,test_state,detail,key_helper_configured,workload_identity_configured,credential_reference,created_at,updated_at,revision) VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider_id) DO UPDATE SET connection_id=excluded.connection_id,authentication_method=excluded.authentication_method,state=excluded.state,account_label=excluded.account_label,expires_at=excluded.expires_at,last_tested_at=excluded.last_tested_at,test_state=excluded.test_state,detail=excluded.detail,key_helper_configured=excluded.key_helper_configured,workload_identity_configured=excluded.workload_identity_configured,credential_reference=excluded.credential_reference,updated_at=excluded.updated_at,revision=excluded.revision",
                 [
                     .text(record.providerID.rawValue), .text(record.connectionID.uuidString), .text(record.authenticationMethod.rawValue), .text(record.state.rawValue),
@@ -1492,8 +2342,20 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         expectedRevision: Int64,
         audit: ProviderConnectionAuditMutation? = nil
     ) async throws {
-        try await transaction {
-            let current = try await connection.query("SELECT connection_id,revision FROM provider_connections WHERE provider_id=?", [.text(providerID.rawValue)]).first
+        var retainedInputs = [providerID.rawValue]
+        if let audit {
+            retainedInputs += [
+                audit.operation,
+                audit.attribution.actorID,
+                audit.attribution.actorLabel,
+                audit.attribution.channel,
+                audit.authenticationMethod?.rawValue ?? "",
+                audit.result,
+            ]
+        }
+        let retainedBytes = try retainedInputBytes(retainedInputs)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            let current = try await database.query("SELECT connection_id,revision FROM provider_connections WHERE provider_id=?", [.text(providerID.rawValue)]).first
             let observed = Int64(current?.column("revision")?.integer ?? 0)
             guard observed == expectedRevision else {
                 throw ServiceAPIError(code: .staleRevision, message: "Provider connection revision is stale", currentRevision: observed)
@@ -1503,7 +2365,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             else {
                 throw ServiceAPIError(code: .persistenceUnavailable, message: "Provider connection identifier is invalid", retryable: false)
             }
-            _ = try await connection.query("DELETE FROM provider_connections WHERE provider_id=?", [.text(providerID.rawValue)])
+            _ = try await database.query("DELETE FROM provider_connections WHERE provider_id=?", [.text(providerID.rawValue)])
             if let audit {
                 try await appendProviderConnectionAuditInTransaction(
                     providerID: providerID,
@@ -1515,7 +2377,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_appendProviderConnectionAudit(providerID: ProviderSettingsID, connectionID: UUID?, operation: String, attribution: ProviderMutationAttribution, authenticationMethod: ProviderAuthenticationMethod?, result: String) async throws {
-        try await transaction {
+        let retainedBytes = operation.utf8.count
+            + attribution.actorID.utf8.count
+            + attribution.actorLabel.utf8.count
+            + attribution.channel.utf8.count
+            + result.utf8.count
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             try await appendProviderConnectionAuditInTransaction(
                 providerID: providerID,
                 connectionID: connectionID,
@@ -1525,7 +2392,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func providerConnectionAudit() async throws -> [ProviderConnectionAuditRecord] {
-        try await connection.query("SELECT audit_id,provider_id,connection_id,operation,actor_id,actor_label,channel,authentication_method,result,created_at FROM provider_connection_audit ORDER BY created_at").map { row in
+        try await database.query("SELECT audit_id,provider_id,connection_id,operation,actor_id,actor_label,channel,authentication_method,result,created_at FROM provider_connection_audit ORDER BY created_at").map { row in
             guard let auditID = row.column("audit_id")?.string.flatMap(UUID.init(uuidString:)),
                   let providerID = row.column("provider_id")?.string.flatMap(ProviderSettingsID.init(rawValue:)),
                   let operation = row.column("operation")?.string,
@@ -1573,7 +2440,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         mutation: ProviderConnectionAuditMutation
     ) async throws {
         try Self.validateProviderAudit(mutation)
-        _ = try await connection.query(
+        _ = try await database.query(
             "INSERT INTO provider_connection_audit(audit_id,schema_version,provider_id,connection_id,operation,actor_id,actor_label,channel,authentication_method,result,created_at) VALUES(?,1,?,?,?,?,?,?,?,?,?)",
             [
                 .text(UUID().uuidString),
@@ -1645,7 +2512,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func portalDesktopSettings() async throws -> OperatorDesktopSettingsRecord? {
-        guard let row = try await connection.query(
+        guard let row = try await database.query(
             "SELECT schema_version,values_json,revision,updated_at FROM portal_desktop_settings WHERE fixed_id=1"
         ).first,
             let valuesJSON = row.column("values_json")?.string
@@ -1663,14 +2530,15 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         _ snapshot: OperatorDesktopSettingsRecord,
         expectedRevision: Int64
     ) async throws -> OperatorDesktopSettingsRecord {
-        try await transaction {
-            let observed = Int64(try await connection.query(
+        let retainedBytes = try retainedInputBytes(snapshot)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            let observed = Int64(try await database.query(
                 "SELECT revision FROM portal_desktop_settings WHERE fixed_id=1"
             ).first?.column("revision")?.integer ?? 0)
             guard observed == expectedRevision, snapshot.revision == expectedRevision + 1 else {
                 throw ServiceAPIError(code: .staleRevision, message: "Settings revision is stale", currentRevision: observed)
             }
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO portal_desktop_settings(fixed_id,schema_version,values_json,revision,updated_at) VALUES(1,1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET values_json=excluded.values_json,revision=excluded.revision,updated_at=excluded.updated_at",
                 [.text(encodeText(snapshot.values)), .integer(Int(snapshot.revision)), .float(snapshot.updatedAt.timeIntervalSince1970)]
             )
@@ -1679,7 +2547,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     public func authorityStore_providerSettings() async throws -> [ProviderSettingsPreference] {
-        try await connection.query(
+        try await database.query(
             "SELECT provider_id,enabled,default_model,reasoning_effort,speed_mode,service_tier,revision FROM provider_settings ORDER BY provider_id"
         ).map { row in
             guard let rawID = row.column("provider_id")?.string,
@@ -1705,8 +2573,9 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         expectedRevision: Int64,
         audit: ProviderConnectionAuditMutation? = nil
     ) async throws -> ProviderSettingsPreference {
-        try await transaction {
-            let observed = try await Int64(connection.query(
+        let retainedBytes = try retainedInputBytes(value, additional: retainedProviderAuditBytes(audit))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            let observed = try await Int64(database.query(
                 "SELECT revision FROM provider_settings WHERE provider_id=?",
                 [.text(value.providerID.rawValue)]
             ).first?.column("revision")?.integer ?? 0)
@@ -1717,7 +2586,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             let reasoningEffort: SQLiteData = value.reasoningEffort.map(SQLiteData.text) ?? .null
             let speedMode: SQLiteData = value.speedMode.map(SQLiteData.text) ?? .null
             let serviceTier: SQLiteData = value.serviceTier.map(SQLiteData.text) ?? .null
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO provider_settings(provider_id,schema_version,enabled,default_model,reasoning_effort,speed_mode,service_tier,revision,updated_at) VALUES(?,1,?,?,?,?,?,?,?) ON CONFLICT(provider_id) DO UPDATE SET enabled=excluded.enabled,default_model=excluded.default_model,reasoning_effort=excluded.reasoning_effort,speed_mode=excluded.speed_mode,service_tier=excluded.service_tier,revision=excluded.revision,updated_at=excluded.updated_at",
                 [.text(value.providerID.rawValue), .integer(value.enabled ? 1 : 0), defaultModel, reasoningEffort, speedMode, serviceTier, .integer(Int(value.revision)), .float(Date().timeIntervalSince1970)]
             )
@@ -1732,123 +2601,396 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         }
     }
 
-    private func migrate() async throws {
-        _ = try await connection.query("PRAGMA foreign_keys=ON")
-        _ = try await connection.query("PRAGMA journal_mode=WAL")
-        _ = try await connection.query("PRAGMA synchronous=FULL")
-        _ = try await connection.query("PRAGMA busy_timeout=5000")
-        for statement in SchemaV1.statements {
-            _ = try await connection.query(statement)
-        }
-        try await addColumnIfMissing(table: "events", column: "agent_id", definition: "TEXT")
-        try await addColumnIfMissing(table: "events", column: "parent_agent_id", definition: "TEXT")
-        try await addColumnIfMissing(table: "service_metadata", column: "last_event_timestamp", definition: "REAL NOT NULL DEFAULT 0")
-        try await addColumnIfMissing(table: "service_metadata", column: "activation_state", definition: "TEXT NOT NULL DEFAULT 'active'")
-        try await addColumnIfMissing(table: "service_metadata", column: "activation_generation", definition: "INTEGER NOT NULL DEFAULT 1")
-        try await addColumnIfMissing(table: "service_metadata", column: "activation_token_digest", definition: "TEXT")
-        try await addColumnIfMissing(table: "service_metadata", column: "activation_instance_id", definition: "TEXT")
-        try await addColumnIfMissing(table: "collaboration_metadata", column: "collaboration_acknowledgement_json", definition: "TEXT")
-        try await rewriteLegacyPersistedJSONKeys()
-        try await addColumnIfMissing(table: "owned_resources", column: "external_id", definition: "TEXT")
-        try await addColumnIfMissing(table: "owned_resources", column: "temporary_path_identity", definition: "TEXT")
-        try await addColumnIfMissing(table: "owned_resources", column: "content_digest", definition: "TEXT")
-        try await addColumnIfMissing(table: "owned_resources", column: "metadata_json", definition: "TEXT NOT NULL DEFAULT '{}'")
-        try await addColumnIfMissing(table: "owned_resources", column: "created_at", definition: "REAL NOT NULL DEFAULT 0")
-        try await addColumnIfMissing(table: "owned_resources", column: "updated_at", definition: "REAL NOT NULL DEFAULT 0")
-        try await addColumnIfMissing(table: "snapshot_checkpoints", column: "retention_class", definition: "TEXT NOT NULL DEFAULT 'rolling'")
-        try await addColumnIfMissing(table: "snapshot_checkpoints", column: "archive_id", definition: "TEXT")
-        _ = try await connection.query(
-            "CREATE TABLE IF NOT EXISTS operator_accounts(username TEXT PRIMARY KEY,password_salt TEXT NOT NULL,password_hash TEXT NOT NULL,iterations INTEGER NOT NULL,created_at TEXT NOT NULL)"
+    private var defaultDatabaseIdentityDigest: String {
+        let identity = storagePath.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
+        } ?? "memory:\(ObjectIdentifier(self))"
+        return MigrationEvidenceDigest.sha256(Data(identity.utf8))
+    }
+
+    private func configureDatabase() async throws {
+        _ = try await database.query("PRAGMA foreign_keys=ON", operationClass: .control)
+        _ = try await database.query("PRAGMA journal_mode=WAL", operationClass: .control)
+        _ = try await database.query("PRAGMA synchronous=FULL", operationClass: .control)
+        _ = try await database.query("PRAGMA busy_timeout=5000", operationClass: .control)
+    }
+
+    private func hasSchemaMetadata() async throws -> Bool {
+        let rows = try await database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='service_metadata'"
         )
-        _ = try await connection.query(
-            "CREATE TABLE IF NOT EXISTS operator_sessions(session_id TEXT PRIMARY KEY,username TEXT NOT NULL,token_hash TEXT NOT NULL,created_at TEXT NOT NULL,expires_at REAL NOT NULL)"
+        return !rows.isEmpty
+    }
+
+    private func initializeLatest(
+        namespaceKind: String,
+        databaseIdentityDigest: String
+    ) async throws {
+        let existing = try await database.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
-        _ = try await connection.query(
-            "CREATE TABLE IF NOT EXISTS operator_setup_tokens(token_hash TEXT PRIMARY KEY,created_at TEXT NOT NULL,consumed_at TEXT)"
+        guard existing.isEmpty else {
+            throw ServiceAPIError(
+                code: .authorityPurposeMismatch,
+                message: "Refusing to initialize a nonempty unrecognized SQLite store"
+            )
+        }
+        try await applySchemaV1()
+        try await applySchemaV2()
+        try await applySchemaV3()
+        try await applySchemaV4()
+        try await applySchemaV5()
+        try await applySchemaV6()
+        try await applySchemaV7(
+            namespaceKind: namespaceKind,
+            databaseIdentityDigest: databaseIdentityDigest
         )
-        for statement in SchemaV2.statements {
-            _ = try await connection.query(statement)
+    }
+
+    public func migrateToLatest(
+        verifiedBackup: VerifiedMigrationBackup,
+        namespaceKind: String,
+        databaseIdentityDigest: String
+    ) async throws -> MigrationSourceEvidence {
+        let before = try await migrationSourceEvidence()
+        guard before == verifiedBackup.source else {
+            throw ServiceAPIError(
+                code: .persistenceUnavailable,
+                message: "Verified backup does not match the current migration source store",
+                retryable: false
+            )
         }
-        for statement in SchemaV3.statements {
-            _ = try await connection.query(statement)
+        guard !verifiedBackup.archiveSHA256.isEmpty,
+              !verifiedBackup.manifestSHA256.isEmpty,
+              !verifiedBackup.verifierFingerprint.isEmpty
+        else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Identity-backed backup verification evidence is incomplete"
+            )
         }
-        for statement in SchemaV4.statements {
-            _ = try await connection.query(statement)
-        }
-        for statement in SchemaV5.statements {
-            _ = try await connection.query(statement)
-        }
-        for statement in SchemaV6.statements {
-            _ = try await connection.query(statement)
-        }
-        let count = try await connection.query("SELECT COUNT(*) AS count FROM service_metadata").first?.column("count")?.integer ?? 0
-        if count == 0 {
-            _ = try await connection.query("INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)", [.text(UUID().uuidString)])
-            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v1',1,'initial durable service schema','v1',CURRENT_TIMESTAMP)")
-        }
-        let v2 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=2").first
-        if let v2 {
-            guard v2.column("digest")?.string == SchemaV2.digest else {
-                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v2 migration digest mismatch", retryable: false)
-            }
-        } else {
-            _ = try await connection.query("UPDATE owned_resources SET created_at=CASE WHEN created_at=0 THEN unixepoch() ELSE created_at END,updated_at=CASE WHEN updated_at=0 THEN unixepoch() ELSE updated_at END")
-            _ = try await connection.query("INSERT OR IGNORE INTO session_event_counters(session_id,event_count,last_sequence) SELECT session_id,COUNT(*),MAX(global_sequence) FROM events WHERE session_id IS NOT NULL GROUP BY session_id")
-            _ = try await connection.query("UPDATE service_metadata SET schema_version=2,last_event_timestamp=COALESCE((SELECT MAX(timestamp) FROM events),0) WHERE fixed_id=1")
-            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v2',2,'owned resources, immutable archives, protected checkpoints, and restore activation',?,CURRENT_TIMESTAMP)", [.text(SchemaV2.digest)])
-        }
-        let v3 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=3").first
-        if let v3 {
-            guard v3.column("digest")?.string == SchemaV3.digest else {
-                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v3 migration digest mismatch", retryable: false)
-            }
-        } else {
-            _ = try await connection.query("UPDATE service_metadata SET schema_version=3 WHERE fixed_id=1")
-            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v3',3,'provider settings and browser-safe portal preferences',?,CURRENT_TIMESTAMP)", [.text(SchemaV3.digest)])
-        }
-        let v4 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=4").first
-        if let v4 {
-            guard v4.column("digest")?.string == SchemaV4.digest else {
-                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v4 migration digest mismatch", retryable: false)
-            }
-        } else {
-            _ = try await connection.query("UPDATE service_metadata SET schema_version=4 WHERE fixed_id=1")
-            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v4',4,'provider connection metadata and secret-free audit attribution',?,CURRENT_TIMESTAMP)", [.text(SchemaV4.digest)])
-        }
-        let v5 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=5").first
-        if let v5 {
-            guard v5.column("digest")?.string == SchemaV5.digest else {
-                throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v5 migration digest mismatch", retryable: false)
-            }
-        } else {
-            _ = try await connection.query("UPDATE service_metadata SET schema_version=5 WHERE fixed_id=1")
-            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v5',5,'server-authoritative Desktop settings projection',?,CURRENT_TIMESTAMP)", [.text(SchemaV5.digest)])
-        }
-        let v6 = try await connection.query("SELECT digest FROM schema_migrations WHERE version=6").first
-        if let v6 {
-            let observedDigest = v6.column("digest")?.string
-            if observedDigest != SchemaV6.digest {
-                guard let observedDigest, SchemaV6.compatiblePriorDigests.contains(observedDigest) else {
-                    throw ServiceAPIError(code: .persistenceUnavailable, message: "Schema v6 migration digest mismatch", retryable: false)
-                }
-                _ = try await connection.query(
-                    "UPDATE schema_migrations SET description='typed revisioned server settings plus agent composer transactional acceptance and semantic presentation',digest=?,applied_at=CURRENT_TIMESTAMP WHERE version=6",
-                    [.text(SchemaV6.digest)]
+
+        do {
+            var version = before.schemaVersion
+            if version > SchemaV7.version {
+                throw ServiceAPIError(
+                    code: .forwardSchemaUnsupported,
+                    message: "Authority store schema is newer than this maintenance tool"
                 )
             }
-        } else {
-            _ = try await connection.query("UPDATE service_metadata SET schema_version=6 WHERE fixed_id=1")
-            _ = try await connection.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v6',6,'typed revisioned server settings plus agent composer transactional acceptance and semantic presentation',?,CURRENT_TIMESTAMP)", [.text(SchemaV6.digest)])
+            if version == SchemaV7.version {
+                try await validateNamespaceIdentity(
+                    requestedKind: namespaceKind,
+                    requestedDatabaseIdentityDigest: databaseIdentityDigest,
+                    allowDatabaseRebind: false
+                )
+                return before
+            }
+            if version < SchemaV2.version { try await applySchemaV2(); version = SchemaV2.version }
+            if version < SchemaV3.version { try await applySchemaV3(); version = SchemaV3.version }
+            if version < SchemaV4.version { try await applySchemaV4(); version = SchemaV4.version }
+            if version < SchemaV5.version { try await applySchemaV5(); version = SchemaV5.version }
+            if version < SchemaV6.version { try await applySchemaV6(); version = SchemaV6.version }
+            if version < SchemaV7.version {
+                try await applySchemaV7(
+                    namespaceKind: namespaceKind,
+                    databaseIdentityDigest: databaseIdentityDigest
+                )
+            }
+        } catch let error as SQLiteError {
+            switch error.reason {
+            case .busy, .busyInRecovery, .busyInSnapshot, .busyTimeout, .locked,
+                 .lockedBySharedCache, .lockedVirtualTable:
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "SQLite migration could not acquire its exclusive transaction",
+                    retryable: true
+                )
+            default:
+                throw error
+            }
+        }
+        try await integrityCheck()
+        return try await migrationSourceEvidence()
+    }
+
+    public func migrationSourceEvidence() async throws -> MigrationSourceEvidence {
+        guard let storagePath else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Migration backup evidence requires a file-backed store"
+            )
+        }
+        _ = try await database.query("PRAGMA wal_checkpoint(TRUNCATE)", operationClass: .control)
+        guard let row = try await database.query(
+            "SELECT store_id,schema_version,next_global_sequence FROM service_metadata WHERE fixed_id=1",
+            operationClass: .control
+        ).first,
+            let storeIDValue = row.column("store_id")?.string,
+            let storeID = UUID(uuidString: storeIDValue),
+            let schemaVersion = row.column("schema_version")?.integer,
+            let nextGlobalSequence = row.column("next_global_sequence")?.integer
+        else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Migration source metadata is invalid")
+        }
+        let ledgerRows = try await database.query(
+            "SELECT migration_id,version,description,digest,applied_at FROM schema_migrations ORDER BY version",
+            operationClass: .control
+        )
+        let ledgerMaterial = try ledgerRows.map { ledgerRow -> String in
+            guard let migrationID = ledgerRow.column("migration_id")?.string,
+                  let version = ledgerRow.column("version")?.integer,
+                  let description = ledgerRow.column("description")?.string,
+                  let digest = ledgerRow.column("digest")?.string,
+                  let appliedAt = ledgerRow.column("applied_at")?.string
+            else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Migration ledger row is invalid")
+            }
+            return "\(version)\u{0}\(migrationID)\u{0}\(description)\u{0}\(digest)\u{0}\(appliedAt)"
+        }.joined(separator: "\n")
+        let sqliteData = try Data(contentsOf: URL(fileURLWithPath: storagePath), options: [.mappedIfSafe])
+        return MigrationSourceEvidence(
+            storeID: storeID,
+            schemaVersion: schemaVersion,
+            nextGlobalSequence: Int64(nextGlobalSequence),
+            sqliteSHA256: MigrationEvidenceDigest.sha256(sqliteData),
+            migrationLedgerSHA256: MigrationEvidenceDigest.sha256(Data(ledgerMaterial.utf8))
+        )
+    }
+
+    private func validateKnownMaintenanceSchema(
+        requestedKind: String?,
+        requestedDatabaseIdentityDigest: String?
+    ) async throws {
+        guard let version = try await database.query(
+            "SELECT schema_version FROM service_metadata WHERE fixed_id=1"
+        ).first?.column("schema_version")?.integer else {
+            throw ServiceAPIError(code: .authorityPurposeMismatch, message: "Authority metadata is missing")
+        }
+        if version > SchemaV7.version {
+            throw ServiceAPIError(
+                code: .forwardSchemaUnsupported,
+                message: "Authority store schema is newer than this maintenance tool"
+            )
+        }
+        guard version >= SchemaV1.version else {
+            throw ServiceAPIError(code: .authorityPurposeMismatch, message: "Authority schema version is invalid")
+        }
+        try await validateMigrationLedger(metadataVersion: version)
+        if version == SchemaV7.version {
+            try await validateNamespaceIdentity(
+                requestedKind: requestedKind,
+                requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest,
+                allowDatabaseRebind: false
+            )
+        }
+    }
+
+    private func validateMigrationLedger(metadataVersion: Int) async throws {
+        let expected = MigrationLedgerPolicy.acceptedDigests
+        let rows = try await database.query("SELECT version,digest FROM schema_migrations ORDER BY version")
+        guard rows.count == metadataVersion else {
+            throw ServiceAPIError(code: .persistenceUnavailable, message: "Migration ledger is not sequential")
+        }
+        for (offset, row) in rows.enumerated() {
+            let version = offset + 1
+            guard row.column("version")?.integer == version,
+                  let observed = row.column("digest")?.string
+            else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Migration ledger is malformed")
+            }
+            guard expected[version]?.contains(observed) == true else {
+                throw ServiceAPIError(
+                    code: .persistenceUnavailable,
+                    message: "Schema v\(version) migration digest mismatch",
+                    retryable: false
+                )
+            }
+        }
+    }
+
+    private func validateNamespaceIdentity(
+        requestedKind: String?,
+        requestedDatabaseIdentityDigest: String?,
+        allowDatabaseRebind: Bool
+    ) async throws {
+        guard requestedKind != nil || requestedDatabaseIdentityDigest != nil else { return }
+        guard let row = try await database.query(
+            "SELECT namespace_kind,database_identity_digest FROM authority_namespace_identity WHERE fixed_id=1"
+        ).first,
+            let observedKind = row.column("namespace_kind")?.string,
+            let observedDigest = row.column("database_identity_digest")?.string
+        else {
+            throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Authority namespace stamp is missing")
+        }
+        if let requestedKind, observedKind != requestedKind {
+            throw ServiceAPIError(
+                code: .namespacePurposeMismatch,
+                message: "Authority namespace is stamped for a different product purpose",
+                retryable: false
+            )
+        }
+        if let requestedDatabaseIdentityDigest,
+           observedDigest != requestedDatabaseIdentityDigest,
+           !allowDatabaseRebind
+        {
+            throw ServiceAPIError(
+                code: .namespacePurposeMismatch,
+                message: "Authority namespace database identity does not match its canonical path",
+                retryable: false
+            )
+        }
+    }
+
+    private func applySchemaV1() async throws {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            try await executeMigrationStatements(SchemaV1.statements)
+            try await addLegacyFoundationColumns()
+            try await executeMigrationStatements(SchemaV1.operatorStatements)
+            _ = try await database.query("INSERT INTO service_metadata(fixed_id,store_id,schema_version,created_at,last_clean_shutdown,current_boot_epoch,next_global_sequence,replay_floor) VALUES(1,?,1,CURRENT_TIMESTAMP,0,1,1,0)", [.text(UUID().uuidString)])
+            try await hitFault(.beforeMigrationLedgerInsert)
+            _ = try await database.query("INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES('v1',1,'initial durable service schema',?,CURRENT_TIMESTAMP)", [.text(SchemaV1.canonicalDigest)])
+            try await hitFault(.afterMigrationLedgerInsert)
+        }
+    }
+
+    private func applySchemaV2() async throws {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            try await executeMigrationStatements(SchemaV2.statements)
+            try await executeMigrationStatements(SchemaV2.dataStatements)
+            try await insertMigration(version: 2, description: "owned resources, immutable archives, protected checkpoints, and restore activation", digest: SchemaV2.canonicalDigest)
+        }
+    }
+
+    private func applySchemaV3() async throws {
+        try await applySimpleMigration(version: 3, statements: SchemaV3.statements, description: "provider settings and browser-safe portal preferences", digest: SchemaV3.canonicalDigest)
+    }
+
+    private func applySchemaV4() async throws {
+        try await applySimpleMigration(version: 4, statements: SchemaV4.statements, description: "provider connection metadata and secret-free audit attribution", digest: SchemaV4.canonicalDigest)
+    }
+
+    private func applySchemaV5() async throws {
+        try await applySimpleMigration(version: 5, statements: SchemaV5.statements, description: "server-authoritative Desktop settings projection", digest: SchemaV5.canonicalDigest)
+    }
+
+    private func applySchemaV6() async throws {
+        try await applySimpleMigration(version: 6, statements: SchemaV6.statements, description: "typed revisioned server settings plus agent composer transactional acceptance and semantic presentation", digest: SchemaV6.canonicalDigest)
+    }
+
+    private func applySimpleMigration(
+        version: Int,
+        statements: [String],
+        description: String,
+        digest: String
+    ) async throws {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            try await executeMigrationStatements(statements)
+            _ = try await database.query("UPDATE service_metadata SET schema_version=? WHERE fixed_id=1", [.integer(version)])
+            try await insertMigration(version: version, description: description, digest: digest)
+        }
+    }
+
+    private func insertMigration(version: Int, description: String, digest: String) async throws {
+        try await hitFault(.beforeMigrationLedgerInsert)
+        _ = try await database.query(
+            "INSERT INTO schema_migrations(migration_id,version,description,digest,applied_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",
+            [.text("v\(version)"), .integer(version), .text(description), .text(digest)]
+        )
+        try await hitFault(.afterMigrationLedgerInsert)
+    }
+
+    private func applySchemaV7(
+        namespaceKind: String,
+        databaseIdentityDigest: String
+    ) async throws {
+        guard namespaceKind == "server" || namespaceKind == "directHeadless" else {
+            throw ServiceAPIError(code: .invalidRequest, message: "Namespace kind must be server or directHeadless")
+        }
+        guard databaseIdentityDigest.range(
+            of: "^[0-9a-f]{64}$",
+            options: .regularExpression
+        ) != nil else {
+            throw ServiceAPIError(
+                code: .invalidRequest,
+                message: "Database identity digest must be a lowercase SHA-256 digest"
+            )
+        }
+        let retainedBytes = try checkedRetainedByteSum(
+            namespaceKind.utf8.count,
+            databaseIdentityDigest.utf8.count
+        )
+        guard let observedDigest = try await database.query(
+            "SELECT digest FROM schema_migrations WHERE version=6"
+        ).first?.column("digest")?.string,
+            let normalizationPlan = SchemaV7.normalizationPlans[observedDigest]
+        else {
+            throw ServiceAPIError(
+                code: .persistenceUnavailable,
+                message: "Schema v6 migration digest is unknown",
+                retryable: false
+            )
+        }
+
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            if normalizationPlan.appliesFinalV6DDL {
+                // Historical prototype fixtures may receive only the frozen,
+                // idempotent final-v6 shape and legacy JSON-key normalization.
+                try await executeMigrationStatements(SchemaV1.operatorStatements)
+                try await executeMigrationStatements(SchemaV6.statements)
+                try await addLegacyFoundationColumns()
+            }
+            if normalizationPlan.rewritesLegacyJSONKeys {
+                try await rewriteLegacyPersistedJSONKeys()
+            }
+            try await SchemaV7.validateFinalV6Shape(using: database)
+            try await executeMigrationStatements(SchemaV7.statements)
+            _ = try await database.query(
+                "INSERT INTO schema_compatibility_audit(source_version,observed_digest,normalization_id,target_version,schema_shape_digest,applied_at) VALUES(6,?,?,7,?,?)",
+                [.text(observedDigest), .text(normalizationPlan.id), .text(SchemaV7.finalV6ShapeDigest), .float(Date().timeIntervalSince1970)]
+            )
+            try await hitFault(.afterMigrationStatement)
+            _ = try await database.query(
+                "INSERT INTO authority_namespace_identity(fixed_id,namespace_kind,database_identity_digest,created_at) VALUES(1,?,?,?)",
+                [.text(namespaceKind), .text(databaseIdentityDigest), .float(Date().timeIntervalSince1970)]
+            )
+            try await hitFault(.afterMigrationStatement)
+            _ = try await database.query("UPDATE service_metadata SET schema_version=7 WHERE fixed_id=1")
+            try await hitFault(.afterMigrationStatement)
+            try await insertMigration(
+                version: 7,
+                description: "prototype-v6 compatibility audit and authority namespace identity",
+                digest: SchemaV7.canonicalDigest
+            )
+        }
+    }
+
+    private func executeMigrationStatements(_ statements: [String]) async throws {
+        for statement in statements {
+            _ = try await database.query(statement, operationClass: .bulk)
+            try await hitFault(.afterMigrationStatement)
+        }
+    }
+
+    private func addLegacyFoundationColumns() async throws {
+        for column in SchemaV1.legacyColumns {
+            try await addColumnIfMissing(
+                table: column.table,
+                column: column.column,
+                definition: column.definition
+            )
         }
     }
 
     private func addColumnIfMissing(table: String, column: String, definition: String) async throws {
-        let columns = try await connection.query("PRAGMA table_info(\(table))")
+        let columns = try await database.query("PRAGMA table_info(\(table))")
         guard !columns.contains(where: { $0.column("name")?.string == column }) else { return }
-        _ = try await connection.query("ALTER TABLE \(table) ADD COLUMN \(column) \(definition)")
+        _ = try await database.query("ALTER TABLE \(table) ADD COLUMN \(column) \(definition)")
+        try await hitFault(.afterMigrationStatement)
     }
 
     private func rewriteLegacyPersistedJSONKeys() async throws {
+        try await normalizeLegacyCollaborationMetadataShape()
         let replacements = [
             (#""goblinUserId""#, #""userId""#),
             (#""goblin-explicit-selection""#, #""explicit-selection""#),
@@ -1862,78 +3004,267 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             ("collaboration_metadata", ["collaboration_acknowledgement_json"]),
         ]
         for (table, names) in columns {
-            let existing = Set((try await connection.query("PRAGMA table_info(\(table))")).compactMap { $0.column("name")?.string })
+            let existing = Set((try await database.query("PRAGMA table_info(\(table))")).compactMap { $0.column("name")?.string })
             for name in names where existing.contains(name) {
                 for (from, to) in replacements {
-                    _ = try await connection.query("UPDATE \(table) SET \(name) = REPLACE(\(name), ?, ?) WHERE \(name) LIKE '%' || ? || '%'", [.text(from), .text(to), .text(from)])
+                    _ = try await database.query("UPDATE \(table) SET \(name) = REPLACE(\(name), ?, ?) WHERE \(name) LIKE '%' || ? || '%'", [.text(from), .text(to), .text(from)])
+                    try await hitFault(.afterMigrationStatement)
                 }
             }
         }
-        let collaborationColumns = Set((try await connection.query("PRAGMA table_info(collaboration_metadata)")).compactMap { $0.column("name")?.string })
-        if collaborationColumns.contains("goblin_acknowledgement_json") {
-            if collaborationColumns.contains("collaboration_acknowledgement_json") {
-                _ = try await connection.query(
-                    "UPDATE collaboration_metadata SET collaboration_acknowledgement_json = goblin_acknowledgement_json WHERE collaboration_acknowledgement_json IS NULL AND goblin_acknowledgement_json IS NOT NULL"
-                )
-            }
-            _ = try await connection.query("ALTER TABLE collaboration_metadata DROP COLUMN goblin_acknowledgement_json")
+    }
+
+    private func normalizeLegacyCollaborationMetadataShape() async throws {
+        let canonicalColumns = [
+            "session_id", "schema_version", "visibility", "collaborative_steering_enabled",
+            "controller_user_id", "policy_revision", "controller_revision", "membership_revision",
+            "collaboration_acknowledgement_json", "updated_at",
+        ]
+        let observed = try await database.query("PRAGMA table_info(collaboration_metadata)")
+            .compactMap { $0.column("name")?.string }
+        guard observed != canonicalColumns else { return }
+        let columns = Set(observed)
+        let acknowledgementExpression: String
+        if columns.contains("collaboration_acknowledgement_json"),
+           columns.contains("goblin_acknowledgement_json")
+        {
+            acknowledgementExpression = "COALESCE(collaboration_acknowledgement_json,goblin_acknowledgement_json)"
+        } else if columns.contains("collaboration_acknowledgement_json") {
+            acknowledgementExpression = "collaboration_acknowledgement_json"
+        } else if columns.contains("goblin_acknowledgement_json") {
+            acknowledgementExpression = "goblin_acknowledgement_json"
+        } else {
+            acknowledgementExpression = "NULL"
         }
+        let statements = [
+            SchemaV7.collaborationRebuildCreateStatement,
+            SchemaV7.collaborationRebuildCopyStatement(
+                acknowledgementExpression: acknowledgementExpression
+            ),
+            SchemaV7.collaborationRebuildDropStatement,
+            SchemaV7.collaborationRebuildRenameStatement,
+        ]
+        try await executeMigrationStatements(statements)
     }
 
     private func integrityCheck() async throws {
-        let result = try await connection.query("PRAGMA quick_check").first?.columns.first?.data.string
+        let result = try await database.query("PRAGMA quick_check").first?.columns.first?.data.string
         guard result == "ok" else { throw ServiceAPIError(code: .persistenceUnavailable, message: "SQLite integrity check failed", retryable: false) }
     }
 
-    func transaction<T>(_ body: () async throws -> T) async throws -> T {
-        await acquireTransactionSlot()
+    private func enableFaultInjection() {
+        faultInjectionEnabled = true
+    }
+
+    private func hitFault(_ point: PersistenceFaultPoint) async throws {
+        guard faultInjectionEnabled else { return }
+        try await faultInjector.hit(point)
+    }
+
+    func retainedInputBytes<T: Encodable>(_ value: T, additional: Int = 0) throws -> Int {
+        try checkedRetainedByteSum(encoder.encode(value).count, additional)
+    }
+
+    func retainedEncodedBytes<T: Encodable>(_ value: T?) throws -> Int {
+        try value.map { try encoder.encode($0).count } ?? 0
+    }
+
+    func retainedIdempotencyBytes(_ value: IdempotencyInput?) throws -> Int {
+        guard let value else { return 0 }
+        return try checkedRetainedByteSum(
+            value.actorID.utf8.count,
+            value.operation.utf8.count,
+            value.key.utf8.count,
+            value.requestDigest.utf8.count
+        )
+    }
+
+    func retainedProviderAuditBytes(_ value: ProviderConnectionAuditMutation?) throws -> Int {
+        guard let value else { return 0 }
+        return try checkedRetainedByteSum(
+            value.operation.utf8.count,
+            value.attribution.actorID.utf8.count,
+            value.attribution.actorLabel.utf8.count,
+            value.attribution.channel.utf8.count,
+            value.authenticationMethod?.rawValue.utf8.count ?? 0,
+            value.result.utf8.count
+        )
+    }
+
+    func checkedRetainedByteSum(_ values: Int...) throws -> Int {
+        var total = 0
+        for value in values {
+            let (next, overflow) = total.addingReportingOverflow(value)
+            guard value >= 0, !overflow,
+                  next <= SQLiteDatabaseExecutor.defaultMaximumProducerEncodedBytes
+            else {
+                throw ServiceAPIError(
+                    code: .rateLimited,
+                    message: "SQLite typed operation exceeds the encoded producer-memory bound",
+                    retryable: true
+                )
+            }
+            total = next
+        }
+        return total
+    }
+
+    /// Persistence-module implementation detail. The closed workload value is
+    /// mandatory at every call site, and neither this closure nor raw SQL is
+    /// exposed outside this module. Only reviewed store implementation code can
+    /// suspend inside an open transaction; package clients submit typed commands.
+    func transaction<T: Sendable>(
+        _ workload: StoreTransactionWorkload,
+        _ body: () async throws -> T
+    ) async throws -> T {
+        let transactionID = UUID()
+        var committed = false
+        try await database.beginTransaction(
+            transactionID,
+            operationClass: workload.operationClass,
+            estimatedEncodedBytes: workload.estimatedEncodedBytes
+        )
         do {
-            _ = try await connection.query("BEGIN IMMEDIATE")
-            try await faultInjector.hit(.afterTransactionBegin)
-            let result = try await body()
-            try await faultInjector.hit(.beforeTransactionCommit)
-            _ = try await connection.query("COMMIT")
-            releaseTransactionSlot()
-            return result
+            return try await withTransactionID(transactionID) {
+                try await withOperationClass(workload.operationClass) {
+                    try await hitFault(.afterTransactionBegin)
+                    let result = try await body()
+                    try await hitFault(.beforeTransactionCommit)
+                    try await database.commitTransaction(transactionID)
+                    committed = true
+                    // Once COMMIT succeeds the durable result must be reported;
+                    // surfacing late cancellation would invite an unsafe retry.
+                    return result
+                }
+            }
         } catch let existing as ExistingIdempotency {
-            await rollbackIgnoringTaskCancellation()
-            releaseTransactionSlot()
+            if !committed {
+                do {
+                    try await database.rollbackTransaction(transactionID)
+                } catch {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "SQLite transaction rollback could not be confirmed",
+                        retryable: false
+                    )
+                }
+            }
             throw existing
         } catch {
-            await rollbackIgnoringTaskCancellation()
-            releaseTransactionSlot()
+            if !committed {
+                do {
+                    try await database.rollbackTransaction(transactionID)
+                } catch {
+                    throw ServiceAPIError(
+                        code: .persistenceUnavailable,
+                        message: "SQLite transaction rollback could not be confirmed",
+                        retryable: false
+                    )
+                }
+            }
             throw error
         }
     }
 
-    /// A provider cancellation may enter this catch path with the current task
-    /// already canceled. Running ROLLBACK on that task can itself be canceled
-    /// before SQLite observes it, leaving the connection inside BEGIN while the
-    /// transaction gate is released. Finalize on an uncanceled task and wait for
-    /// it before handing the slot to the next mutation.
-    private func rollbackIgnoringTaskCancellation() async {
-        let connection = connection
-        _ = try? await Task.detached {
-            try await connection.query("ROLLBACK")
-        }.value
+    private nonisolated(nonsending) func withTransactionID<T: Sendable>(
+        _ transactionID: UUID,
+        @_inheritActorContext operation: sending @isolated(any) () async throws -> T
+    ) async rethrows -> T {
+        let isolation = operation.isolation
+        return try await SQLiteExecutionContext.$transactionID.withValue(
+            transactionID,
+            operation: {
+                try await operation()
+            },
+            isolation: isolation
+        )
     }
 
-    private func acquireTransactionSlot() async {
-        guard transactionActive else {
-            transactionActive = true
-            return
-        }
-        await withCheckedContinuation { continuation in
-            transactionWaiters.append(continuation)
-        }
+    private nonisolated(nonsending) func withOperationClass<T: Sendable>(
+        _ operationClass: SQLiteOperationClass,
+        @_inheritActorContext operation: sending @isolated(any) () async throws -> T
+    ) async rethrows -> T {
+        let isolation = operation.isolation
+        return try await SQLiteExecutionContext.$operationClass.withValue(
+            operationClass,
+            operation: {
+                try await operation()
+            },
+            isolation: isolation
+        )
     }
 
-    private func releaseTransactionSlot() {
-        guard !transactionWaiters.isEmpty else {
-            transactionActive = false
-            return
+    private struct EncodedTranscriptEntry: Sendable {
+        let entryID: UUID
+        let sessionSequence: Int64
+        let json: String
+        let digest: String
+        let encodedBytes: Int
+    }
+
+    func sessionRetainedBytes(_ snapshot: SessionSnapshot, additional: Int = 0) throws -> Int {
+        for entry in snapshot.transcript {
+            guard try encoder.encode(entry).count <= SQLiteDatabaseExecutor.maximumBulkEncodedBytes else {
+                throw ServiceAPIError(
+                    code: .invalidRequest,
+                    message: "Transcript entry exceeds the durable bulk batch limit"
+                )
+            }
         }
-        transactionWaiters.removeFirst().resume()
+        return try retainedInputBytes(snapshot, additional: additional)
+    }
+
+    /// Lossless provider transcript ingestion inside the owning session
+    /// transaction. Only one bounded encoded chunk is retained at a time; a
+    /// later cursor/idempotency/event failure rolls every chunk back atomically.
+    private func persistTranscriptEntriesInBulk(_ snapshot: SessionSnapshot) async throws {
+        guard !snapshot.transcript.isEmpty else { return }
+        var chunk: [EncodedTranscriptEntry] = []
+        chunk.reserveCapacity(SQLiteDatabaseExecutor.maximumBulkRows)
+        var chunkBytes = 0
+
+        func encoded(_ entry: TranscriptEntry) throws -> EncodedTranscriptEntry {
+            let data = try encoder.encode(entry)
+            return EncodedTranscriptEntry(
+                entryID: entry.entryID,
+                sessionSequence: entry.sessionSequence,
+                json: String(decoding: data, as: UTF8.self),
+                digest: PersistenceCryptography.bodyDigest(data),
+                encodedBytes: data.count
+            )
+        }
+
+        func shouldFlush(adding value: EncodedTranscriptEntry) -> Bool {
+            !chunk.isEmpty && (chunk.count >= SQLiteDatabaseExecutor.maximumBulkRows
+                || chunkBytes + value.encodedBytes > SQLiteDatabaseExecutor.maximumBulkEncodedBytes)
+        }
+
+        func flush(_ values: [EncodedTranscriptEntry]) async throws {
+            guard !values.isEmpty else { return }
+            for value in values {
+                _ = try await database.query(
+                    "INSERT OR IGNORE INTO transcript_entries(session_id,entry_id,schema_version,session_sequence,entry_json,content_digest) VALUES(?,?,1,?,?,?)",
+                    [.text(snapshot.sessionID.uuidString), .text(value.entryID.uuidString), .integer(Int(value.sessionSequence)), .text(value.json), .text(value.digest)],
+                    estimatedEncodedBytes: value.encodedBytes
+                )
+            }
+        }
+
+        for entry in snapshot.transcript {
+            try Task.checkCancellation()
+            let value = try encoded(entry)
+            guard value.encodedBytes <= SQLiteDatabaseExecutor.maximumBulkEncodedBytes else {
+                throw ServiceAPIError(code: .invalidRequest, message: "Transcript entry exceeds the durable bulk batch limit")
+            }
+            if shouldFlush(adding: value) {
+                try await flush(chunk)
+                chunk.removeAll(keepingCapacity: true)
+                chunkBytes = 0
+            }
+            chunk.append(value)
+            chunkBytes += value.encodedBytes
+        }
+        try await flush(chunk)
     }
 
     private func validateExpectedCursor(_ cursor: ServiceCursor) async throws {
@@ -1942,7 +3273,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 
     private func decodeRows<T: Decodable>(_ sql: String, as: T.Type) async throws -> [T] {
-        try await connection.query(sql).compactMap { row in guard let text = row.column("snapshot_json")?.string else { return nil }
+        try await database.query(sql).compactMap { row in guard let text = row.column("snapshot_json")?.string else { return nil }
             return try decoder.decode(T.self, from: Data(text.utf8))
         }
     }
@@ -1963,7 +3294,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
     private func ensureUniqueActiveWorktree(_ snapshot: WorktreeBindingSnapshot) async throws {
         guard snapshot.ownershipState == .active, let sessionID = snapshot.sessionID else { return }
-        let collision = try await connection.query(
+        let collision = try await database.query(
             "SELECT binding_id FROM worktree_bindings WHERE project_id=? AND root_id=? AND session_id=? AND ownership_state=? AND binding_id<>? LIMIT 1",
             [.text(snapshot.projectID.uuidString), .text(snapshot.rootID.uuidString), .text(sessionID.uuidString), .text(WorktreeBindingSnapshot.OwnershipState.active.rawValue), .text(snapshot.bindingID.uuidString)]
         ).first
@@ -2020,7 +3351,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         archiveID: UUID? = nil
     ) async throws {
         let digest = PersistenceCryptography.bodyDigest(snapshot)
-        if let existing = try await connection.query(
+        if let existing = try await database.query(
             "SELECT digest,retention_class FROM snapshot_checkpoints WHERE scope=? AND sequence=?",
             [.text(scope), .integer(Int(sequence))]
         ).first {
@@ -2028,18 +3359,18 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 throw ServiceAPIError(code: .persistenceUnavailable, message: "Checkpoint identity collides with different content", retryable: false)
             }
             if existing.column("retention_class")?.string == "rolling", retentionClass != "rolling" {
-                _ = try await connection.query(
+                _ = try await database.query(
                     "UPDATE snapshot_checkpoints SET retention_class=?,archive_id=? WHERE scope=? AND sequence=?",
                     [.text(retentionClass), archiveID.map { .text($0.uuidString) } ?? .null, .text(scope), .integer(Int(sequence))]
                 )
             }
         } else {
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO snapshot_checkpoints(scope,sequence,schema_version,snapshot,digest,created_at,retention_class,archive_id) VALUES(?,?,2,?,?,CURRENT_TIMESTAMP,?,?)",
                 [.text(scope), .integer(Int(sequence)), .text(snapshot.base64EncodedString()), .text(digest), .text(retentionClass), archiveID.map { .text($0.uuidString) } ?? .null]
             )
         }
-        _ = try await connection.query(
+        _ = try await database.query(
             "DELETE FROM snapshot_checkpoints WHERE scope=? AND retention_class='rolling' AND sequence NOT IN (SELECT sequence FROM snapshot_checkpoints WHERE scope=? AND retention_class='rolling' ORDER BY sequence DESC LIMIT 3)",
             [.text(scope), .text(scope)]
         )
@@ -2052,13 +3383,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
 private extension SQLiteServiceStore {
     func existingIdempotency(_ input: IdempotencyInput) async throws -> (Data, Int)? {
-        guard let row = try await connection.query("SELECT request_digest,response_body,status FROM idempotency_records WHERE actor_id=? AND operation=? AND idempotency_key=?", [.text(input.actorID), .text(input.operation), .text(input.key)]).first else { return nil }
+        guard let row = try await database.query("SELECT request_digest,response_body,status FROM idempotency_records WHERE actor_id=? AND operation=? AND idempotency_key=?", [.text(input.actorID), .text(input.operation), .text(input.key)]).first else { return nil }
         guard row.column("request_digest")?.string == input.requestDigest else { throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was used with a different request") }
         let response = Data(base64Encoded: row.column("response_body")?.string ?? "") ?? Data()
         return (response, row.column("status")?.integer ?? 200)
     }
 
     func saveIdempotency(_ input: IdempotencyInput, status: Int, response: Data) async throws {
-        _ = try await connection.query("INSERT INTO idempotency_records(actor_id,operation,idempotency_key,request_digest,response_body,status,created_at,expires_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,datetime('now','+30 days'))", [.text(input.actorID), .text(input.operation), .text(input.key), .text(input.requestDigest), .text(response.base64EncodedString()), .integer(status)])
+        _ = try await database.query("INSERT INTO idempotency_records(actor_id,operation,idempotency_key,request_digest,response_body,status,created_at,expires_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,datetime('now','+30 days'))", [.text(input.actorID), .text(input.operation), .text(input.key), .text(input.requestDigest), .text(response.base64EncodedString()), .integer(status)])
     }
 }

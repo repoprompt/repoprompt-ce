@@ -1,6 +1,25 @@
 # syntax=docker/dockerfile:1.7
 FROM swift:6.2.4-noble AS build
+ARG TARGETARCH
+ARG AGE_VERSION=1.3.1
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) age_arch=amd64; age_sha=bdc69c09cbdd6cf8b1f333d372a1f58247b3a33146406333e30c0f26e8f51377 ;; \
+      arm64) age_arch=arm64; age_sha=c6878a324421b69e3e20b00ba17c04bc5c6dab0030cfe55bf8f68fa8d9e9093a ;; \
+      *) echo "unsupported age runtime architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    archive="age-v${AGE_VERSION}-linux-${age_arch}.tar.gz"; \
+    curl -fsSLo "/tmp/$archive" "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/$archive"; \
+    echo "$age_sha  /tmp/$archive" | sha256sum -c -; \
+    tar -xzf "/tmp/$archive" -C /tmp; \
+    install -D -m 0755 "/tmp/age/age" /out/usr/local/libexec/repoprompt/age; \
+    install -D -m 0755 "/tmp/age/age-keygen" /out/usr/local/libexec/repoprompt/age-keygen; \
+    sha256sum /out/usr/local/libexec/repoprompt/age | cut -d' ' -f1 > /out/usr/local/libexec/repoprompt/age.sha256; \
+    sha256sum /out/usr/local/libexec/repoprompt/age-keygen | cut -d' ' -f1 > /out/usr/local/libexec/repoprompt/age-keygen.sha256; \
+    chmod 0444 /out/usr/local/libexec/repoprompt/age.sha256 /out/usr/local/libexec/repoprompt/age-keygen.sha256; \
+    rm -rf "/tmp/$archive" /tmp/age
 COPY Packages/RepoPromptPortableRuntime Packages/RepoPromptPortableRuntime
 COPY Packages/RepoPromptServer Packages/RepoPromptServer
 WORKDIR /src/Packages/RepoPromptServer
@@ -22,7 +41,7 @@ LABEL org.opencontainers.image.title="RepoPromptServer" \
       org.opencontainers.image.revision="$REPOPROMPT_COMMIT" \
       org.opencontainers.image.created="$SOURCE_DATE_EPOCH" \
       io.repoprompt.protocol-version="1" \
-      io.repoprompt.schema-version="6" \
+      io.repoprompt.schema-version="7" \
       io.repoprompt.runtime-uid="65532" \
       io.repoprompt.port.internal-api="9443/tcp;mtls" \
       io.repoprompt.port.portal="9081/tcp;http-password" \
@@ -31,6 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /var/lib/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \
     install -d -o 65532 -g 65532 /var/lib/repoprompt/state /var/lib/repoprompt/artifacts /srv/repoprompt/projects /srv/repoprompt/worktrees /var/cache/repoprompt
 COPY --from=build /out/usr/local/bin/ /usr/local/bin/
+COPY --from=build /out/usr/local/libexec/ /usr/local/libexec/
 ENV REPOPROMPT_STATE_DB="/var/lib/repoprompt/state/repoprompt.sqlite" \
     REPOPROMPT_ARTIFACT_DIR="/var/lib/repoprompt/artifacts" \
     REPOPROMPT_PROJECT_DIR="/srv/repoprompt/projects" \

@@ -58,29 +58,42 @@ final class ServingMigrationRefusalTests: XCTestCase {
         }
     }
 
-    func testPendingMigrationIsRefusedWithoutLedgerOrSchemaMutation() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let path = directory.appendingPathComponent("state.sqlite").path
-        let initialized = try await SQLiteServiceStore.open(storage: .file(path))
-        _ = try await initialized.connection.query("UPDATE service_metadata SET schema_version=5 WHERE fixed_id=1")
-        let ledgerBefore = try await initialized.connection.query("SELECT version,digest FROM schema_migrations ORDER BY version").map(Self.ledgerRow)
-        try await initialized.close(clean: false)
+    func testEveryPendingVersionIsRefusedWithoutLedgerOrSchemaMutation() async throws {
+        for pendingVersion in 1 ... 6 {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let path = directory.appendingPathComponent("state.sqlite").path
+            try await StoreMigrationTestSupport.makeHistoricalStore(
+                at: URL(fileURLWithPath: path),
+                throughVersion: pendingVersion
+            )
+            let initialized = try await SQLiteDatabaseExecutor.open(storage: .file(path: path))
+            let ledgerBefore = try await initialized.query(
+                "SELECT version,digest FROM schema_migrations ORDER BY version"
+            ).map(Self.ledgerRow)
+            try await initialized.close()
+            let bytesBefore = try Data(contentsOf: URL(fileURLWithPath: path))
 
-        do {
-            _ = try await SQLiteServiceStore.openForServing(storage: .file(path))
-            XCTFail("serving unexpectedly migrated a nonempty store")
-        } catch let error as ServiceAPIError {
-            XCTAssertEqual(error.code, .migrationRequired)
+            do {
+                _ = try await SQLiteServiceStore.openForServing(storage: .file(path))
+                XCTFail("serving unexpectedly migrated schema v\(pendingVersion)")
+            } catch let error as ServiceAPIError {
+                XCTAssertEqual(error.code, .migrationRequired)
+            }
+
+            let connection = try await SQLiteConnection.open(storage: .file(path: path))
+            let version = try await connection.query(
+                "SELECT schema_version FROM service_metadata WHERE fixed_id=1"
+            ).first?.column("schema_version")?.integer
+            let ledgerAfter = try await connection.query(
+                "SELECT version,digest FROM schema_migrations ORDER BY version"
+            ).map(Self.ledgerRow)
+            try await connection.close()
+            XCTAssertEqual(version, pendingVersion)
+            XCTAssertEqual(ledgerAfter, ledgerBefore)
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytesBefore)
         }
-
-        let connection = try await SQLiteConnection.open(storage: .file(path: path))
-        let version = try await connection.query("SELECT schema_version FROM service_metadata WHERE fixed_id=1").first?.column("schema_version")?.integer
-        let ledgerAfter = try await connection.query("SELECT version,digest FROM schema_migrations ORDER BY version").map(Self.ledgerRow)
-        try await connection.close()
-        XCTAssertEqual(version, 5)
-        XCTAssertEqual(ledgerAfter, ledgerBefore)
     }
 
     private func makeDirectory() throws -> URL {

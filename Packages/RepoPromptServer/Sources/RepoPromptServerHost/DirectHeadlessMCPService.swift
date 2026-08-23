@@ -714,7 +714,7 @@ public actor RepoPromptDirectHeadlessComposition {
                 providerVaultKey: nil,
                 providerVaultDecryptionKeys: [],
                 providerVaultFilePath: stateRoot.appendingPathComponent("provider-credentials.vault").path,
-                restoreActivationTokenPath: nil,
+                restoreActivationTokenPath: environment["REPOPROMPT_RESTORE_ACTIVATION_TOKEN_FILE"],
                 projectSourcePolicy: .disabled,
                 projectSourceGitCredentials: try ProjectSourceGitCredentials()
             )

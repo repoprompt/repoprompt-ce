@@ -42,8 +42,8 @@ public struct StoreOperationalSnapshot: Codable, Sendable {
 
 public extension SQLiteServiceStore {
     func operationalSnapshot(now: Date = Date()) async throws -> StoreOperationalSnapshot {
-        let integrity = try await connection.query("PRAGMA quick_check").first?.columns.first?.data.string == "ok"
-        let migrations = try await connection.query("SELECT version,digest FROM schema_migrations ORDER BY version")
+        let integrity = try await database.query("PRAGMA quick_check").first?.columns.first?.data.string == "ok"
+        let migrations = try await database.query("SELECT version,digest FROM schema_migrations ORDER BY version")
         let migrationMap = Dictionary(uniqueKeysWithValues: migrations.compactMap { row -> (Int, String)? in
             guard let version = row.column("version")?.integer,
                   let digest = row.column("digest")?.string
@@ -51,18 +51,16 @@ public extension SQLiteServiceStore {
             return (version, digest)
         })
         let metadata = try await metadata()
-        let migrationsValid = metadata.schemaVersion == SchemaV6.version
-            && migrationMap[1] == "v1"
-            && migrationMap[SchemaV2.version] == SchemaV2.digest
-            && migrationMap[SchemaV3.version] == SchemaV3.digest
-            && migrationMap[SchemaV4.version] == SchemaV4.digest
-            && migrationMap[SchemaV5.version] == SchemaV5.digest
-            && migrationMap[SchemaV6.version] == SchemaV6.digest
+        let migrationsValid = metadata.schemaVersion == SchemaV7.version
+            && migrationMap.count == SchemaV7.version
+            && (1 ... SchemaV7.version).allSatisfy { version in
+                migrationMap[version].map { MigrationLedgerPolicy.accepts(version: version, digest: $0) } == true
+            }
         let liveEventCount = try await scalarInt("SELECT COUNT(*) AS value FROM events")
         let archiveSegmentCount = try await scalarInt("SELECT COUNT(*) AS value FROM event_archive_blobs")
         let archivedEventCount = try await scalarInt("SELECT COALESCE(SUM(event_count),0) AS value FROM event_archive_blobs")
         let compressedArchiveBytes = try await Int64(scalarInt("SELECT COALESCE(SUM((LENGTH(compressed_events_base64) * 3) / 4),0) AS value FROM event_archive_blobs"))
-        let checkpointCounts = try await connection.query("SELECT retention_class,COUNT(*) AS count FROM snapshot_checkpoints GROUP BY retention_class ORDER BY retention_class").map {
+        let checkpointCounts = try await database.query("SELECT retention_class,COUNT(*) AS count FROM snapshot_checkpoints GROUP BY retention_class ORDER BY retention_class").map {
             CheckpointRetentionCount(
                 retentionClass: $0.column("retention_class")?.string ?? "unknown",
                 count: $0.column("count")?.integer ?? 0
@@ -88,7 +86,7 @@ public extension SQLiteServiceStore {
     }
 
     func snapshotCheckpointDetails(scope: String) async throws -> [(sequence: Int64, digest: String, retentionClass: String)] {
-        try await connection.query(
+        try await database.query(
             "SELECT sequence,digest,retention_class FROM snapshot_checkpoints WHERE scope=? ORDER BY sequence",
             [.text(scope)]
         ).map {
@@ -101,7 +99,7 @@ public extension SQLiteServiceStore {
     }
 
     private func scalarInt(_ sql: String) async throws -> Int {
-        try await connection.query(sql).first?.column("value")?.integer ?? 0
+        try await database.query(sql).first?.column("value")?.integer ?? 0
     }
 
     private func fileBytes(_ path: String?) -> Int64 {

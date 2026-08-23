@@ -1,22 +1,25 @@
 import Foundation
 
-public enum PersistenceFaultPoint: String, Sendable {
+enum PersistenceFaultPoint: String, Sendable {
     case afterIdempotencyPreflightMiss
     case afterTransactionBegin
     case afterEventInsertBeforeSequenceAdvance
+    case afterMigrationStatement
+    case beforeMigrationLedgerInsert
+    case afterMigrationLedgerInsert
     case beforeTransactionCommit
 }
 
-public struct PersistenceFaultInjector: Sendable {
+struct PersistenceFaultInjector: Sendable {
     private let operation: @Sendable (PersistenceFaultPoint) async throws -> Void
 
-    public init(_ operation: @escaping @Sendable (PersistenceFaultPoint) async throws -> Void) {
+    init(_ operation: @escaping @Sendable (PersistenceFaultPoint) async throws -> Void) {
         self.operation = operation
     }
 
-    public func hit(_ point: PersistenceFaultPoint) async throws {
+    func hit(_ point: PersistenceFaultPoint) async throws {
         try await operation(point)
     }
 
-    public static let none = PersistenceFaultInjector { _ in }
+    static let none = PersistenceFaultInjector { _ in }
 }

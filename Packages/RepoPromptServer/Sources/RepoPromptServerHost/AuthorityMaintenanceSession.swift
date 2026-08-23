@@ -15,6 +15,9 @@ public enum AuthorityMaintenancePhase: String, Sendable, Equatable {
     case acquiringLease
     case openingStore
     case ready
+    case backingUp
+    case migrating
+    case restoring
     case mutating
     case closing
     case stopped
@@ -54,11 +57,37 @@ public actor AuthorityMaintenanceSession {
         storeWasOpened = true
     }
 
+    private init(
+        restoreConfiguration configuration: AuthorityMaintenanceConfiguration,
+        lease: AuthorityNamespaceLease
+    ) {
+        self.configuration = configuration
+        self.lease = lease
+        store = nil
+        phaseValue = .ready
+        phases = [.idle, .acquiringLease, .ready]
+        storeWasOpened = false
+    }
+
+    public static func acquireForRestore(
+        configuration: AuthorityMaintenanceConfiguration
+    ) throws -> AuthorityMaintenanceSession {
+        let acquisition = try AuthorityNamespaceLease.acquire(configuration.namespace)
+        return AuthorityMaintenanceSession(
+            restoreConfiguration: configuration,
+            lease: acquisition.lease
+        )
+    }
+
     public static func open(
         configuration: AuthorityMaintenanceConfiguration
     ) async throws -> AuthorityMaintenanceSession {
         try await open(configuration: configuration) { storage in
-            try await SQLiteServiceStore.openForMaintenance(storage: storage)
+            try await SQLiteServiceStore.openForMaintenance(
+                storage: storage,
+                requestedNamespaceKind: configuration.namespace.servingMode.rawValue,
+                requestedDatabaseIdentityDigest: configuration.namespace.namespaceID
+            )
         }
     }
 
@@ -115,6 +144,97 @@ public actor AuthorityMaintenanceSession {
             return report
         } catch {
             phaseValue = .ready
+            throw error
+        }
+    }
+
+    public func createBackup(
+        service: BackupRestoreService,
+        request: BackupCreateRequest
+    ) async throws -> BackupSidecarV1 {
+        guard phaseValue == .ready, let store else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Authority maintenance session is not open")
+        }
+        guard request.namespaceKind == configuration.namespace.servingMode.rawValue,
+              request.databaseIdentityDigest == configuration.namespace.namespaceID
+        else {
+            throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Backup request does not match the leased namespace")
+        }
+        phaseValue = .backingUp
+        phases.append(.backingUp)
+        do {
+            let sidecar = try await service.create(request: request, store: store)
+            phaseValue = .ready
+            phases.append(.ready)
+            return sidecar
+        } catch {
+            phaseValue = .ready
+            phases.append(.ready)
+            throw error
+        }
+    }
+
+    public func migrate(
+        service: BackupRestoreService,
+        verifiedBackup archiveURL: URL,
+        identityFileURL: URL
+    ) async throws -> MigrationSourceEvidence {
+        guard phaseValue == .ready, let store else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Authority maintenance session is not open")
+        }
+        phaseValue = .migrating
+        phases.append(.migrating)
+        do {
+            // Verification deliberately runs while the source lease remains
+            // held and immediately precedes the first migration transaction.
+            let verified = try await service.verify(
+                archiveURL: archiveURL,
+                identityFileURL: identityFileURL
+            )
+            guard verified.manifest.namespaceKind == configuration.namespace.servingMode.rawValue else {
+                throw ServiceAPIError(
+                    code: .namespacePurposeMismatch,
+                    message: "Verified backup belongs to a different namespace kind"
+                )
+            }
+            let evidence = try await store.migrateToLatest(
+                verifiedBackup: verified.migrationEvidence,
+                namespaceKind: configuration.namespace.servingMode.rawValue,
+                databaseIdentityDigest: configuration.namespace.namespaceID
+            )
+            phaseValue = .ready
+            phases.append(.ready)
+            return evidence
+        } catch {
+            phaseValue = .ready
+            phases.append(.ready)
+            throw error
+        }
+    }
+
+    public func prepareRestore(
+        service: BackupRestoreService,
+        request: BackupRestoreRequest
+    ) async throws -> BackupManifestV1 {
+        guard phaseValue == .ready, store == nil else {
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "Restore maintenance session is not ready")
+        }
+        guard request.targetRootURL.standardizedFileURL.path == configuration.namespace.storageRoot,
+              request.targetNamespaceKind == configuration.namespace.servingMode.rawValue,
+              request.targetDatabaseIdentityDigest == configuration.namespace.namespaceID
+        else {
+            throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Restore request does not match the leased target namespace")
+        }
+        phaseValue = .restoring
+        phases.append(.restoring)
+        do {
+            let manifest = try await service.prepareRestore(request)
+            phaseValue = .ready
+            phases.append(.ready)
+            return manifest
+        } catch {
+            phaseValue = .ready
+            phases.append(.ready)
             throw error
         }
     }

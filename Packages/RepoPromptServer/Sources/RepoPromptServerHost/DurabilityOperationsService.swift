@@ -61,9 +61,12 @@ public actor DurabilityOperationsService {
         var archivedSegments = 0
         var errorCode: String?
         do {
-            while try await store.enforceEventRetention(policy: retentionPolicy, now: now) != nil {
+            while !Task.isCancelled {
+                guard try await store.enforceEventRetention(policy: retentionPolicy, now: now) != nil else { break }
                 archivedSegments += 1
             }
+        } catch is CancellationError {
+            // A canceled maintenance run stops between atomic archive segments.
         } catch {
             errorCode = "retention_or_reconciliation_failed"
         }

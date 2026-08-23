@@ -117,7 +117,7 @@ final class PersistenceTests: XCTestCase {
         legacy["keyId"] = "legacy-key"
         legacy["signature"] = "legacy-signature"
         let legacyData = try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys, .withoutEscapingSlashes])
-        _ = try await store.connection.query("UPDATE events SET envelope_json=? WHERE global_sequence=?", [.text(String(decoding: legacyData, as: UTF8.self)), .integer(Int(event.globalSequence))])
+        _ = try await store.database.query("UPDATE events SET envelope_json=? WHERE global_sequence=?", [.text(String(decoding: legacyData, as: UTF8.self)), .integer(Int(event.globalSequence))])
 
         let replayPage = try await store.events(after: nil, limit: 1)
         let replayed = try XCTUnwrap(replayPage.events.first)
@@ -166,6 +166,48 @@ final class PersistenceTests: XCTestCase {
             XCTAssertEqual(event.globalSequence, 1)
             try await store.close()
         }
+    }
+
+    func testCancellationAfterBeginRollsBackBeforeUnrelatedWorkAdvances() async throws {
+        let gate = TransactionCancellationGate()
+        let injector = PersistenceFaultInjector { point in
+            if point == .afterTransactionBegin { await gate.pause() }
+        }
+        let store = try await SQLiteServiceStore.open(storage: .memory, faultInjector: injector)
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
+        let projectID = UUID()
+        let cursor = try await store.nextCursor()
+        let project = ProjectSnapshot(
+            projectID: projectID,
+            name: "Canceled",
+            creator: actor,
+            state: .active,
+            roots: [],
+            revision: 1,
+            cursor: cursor
+        )
+        let mutation = Task {
+            try await store.persistProject(
+                project,
+                eventType: .projectCreated,
+                actor: actor,
+                correlationID: UUID(),
+                idempotency: nil
+            )
+        }
+        await gate.waitUntilPaused()
+        mutation.cancel()
+        await gate.release()
+        do {
+            _ = try await mutation.value
+            XCTFail("canceled transaction unexpectedly committed")
+        } catch is CancellationError {}
+
+        let persistedProject = try await store.project(id: projectID)
+        let metadata = try await store.metadata()
+        XCTAssertNil(persistedProject)
+        XCTAssertEqual(metadata.nextGlobalSequence, 1)
+        try await store.close()
     }
 
     func testConcurrentIdenticalProjectCreationReplaysCommittedWinner() async throws {
@@ -419,6 +461,52 @@ final class PersistenceTests: XCTestCase {
         try await store.close()
     }
 
+    func testRejectedSessionCursorDoesNotCommitBulkTranscriptRows() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
+        let projectCursor = try await store.nextCursor()
+        let project = ProjectSnapshot(
+            projectID: UUID(),
+            name: "P",
+            creator: actor,
+            state: .active,
+            roots: [.init(rootID: UUID(), logicalName: "root", canonicalPath: "/tmp", writable: true)],
+            revision: 1,
+            cursor: projectCursor
+        )
+        _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+        let sessionID = UUID()
+        let rejected = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: project.projectID,
+            parentSessionID: nil,
+            rootSessionID: sessionID,
+            creator: actor,
+            provider: .codex,
+            model: nil,
+            visibility: .privateSession,
+            state: .idle,
+            runGeneration: 0,
+            turnEpoch: 0,
+            revision: 1,
+            transcript: [.init(entryID: UUID(), sessionSequence: 1, kind: .human, content: "must roll back", actor: actor, timestamp: Date())],
+            interactions: [],
+            cursor: .init(storeID: UUID(), globalSequence: 0)
+        )
+        do {
+            _ = try await store.persistSession(rejected, eventType: .sessionCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+            XCTFail("expected cursor rejection")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .staleRevision)
+        }
+        let count = try await store.database.query("SELECT COUNT(*) AS count FROM transcript_entries")
+            .first?.column("count")?.integer
+        XCTAssertEqual(count, 0)
+        let storedSession = try await store.session(id: sessionID)
+        XCTAssertNil(storedSession)
+        try await store.close()
+    }
+
     func testContextUsageSurvivesInteractionRebuildAndSilentUpsert() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let actor = ExternalActor(userID: "u1", username: "alice", displayName: "Alice")
@@ -445,6 +533,25 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(updated.contextUsage?.totalTotalTokens, 8_192)
         XCTAssertEqual(updated.contextUsage?.modelContextWindow, 200_000)
         try await store.close()
+    }
+}
+
+private actor TransactionCancellationGate {
+    private var paused = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        paused = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilPaused() async {
+        while !paused { await Task.yield() }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

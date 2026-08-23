@@ -1,4 +1,22 @@
 enum SchemaV1 {
+    static let version = 1
+    /// Legacy prototype ledger alias. Never rewrite an existing row.
+    static let digest = "v1"
+    static let transformationID = "initial-durable-service-schema-v1"
+    /// Compatibility alias written by the earlier PR4 draft before runtime
+    /// transformation identities were included. Never rewrite existing rows.
+    static let legacyCanonicalDigest = "sha256:09ae653881b5f14fd12c5417e3353b0ac2b5b75f730e088562cc4d107eadb5b1"
+    static let canonicalDigest = "sha256:9d62eb8ec385aa7ed4acd6412a8cc1c809363cd5def9b9e4a5334234e2b1e21b"
+    static var definition: MigrationDefinition {
+        MigrationDefinition(
+            version: version,
+            transformationID: transformationID,
+            statements: statements + operatorStatements,
+            transformationSteps: legacyColumns.map(\.identity) + [
+                "seed-service-metadata:v1:dynamic-store-id:next-sequence=1:replay-floor=0",
+            ]
+        )
+    }
     static let statements: [String] = [
         "CREATE TABLE IF NOT EXISTS service_metadata(fixed_id INTEGER PRIMARY KEY CHECK(fixed_id=1),store_id TEXT NOT NULL,schema_version INTEGER NOT NULL,created_at TEXT NOT NULL,last_clean_shutdown INTEGER NOT NULL,current_boot_epoch INTEGER NOT NULL,next_global_sequence INTEGER NOT NULL,replay_floor INTEGER NOT NULL,restored_from_store_id TEXT,restore_backup_sequence INTEGER,restore_digest TEXT)",
         "CREATE TABLE IF NOT EXISTS projects(project_id TEXT PRIMARY KEY,schema_version INTEGER NOT NULL,name TEXT NOT NULL,creator_json TEXT NOT NULL,lifecycle_state TEXT NOT NULL,revision INTEGER NOT NULL,snapshot_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
@@ -32,5 +50,30 @@ enum SchemaV1 {
         "CREATE INDEX IF NOT EXISTS events_session_sequence ON events(session_id,session_sequence)",
         "CREATE INDEX IF NOT EXISTS events_project_sequence ON events(project_id,global_sequence)",
         "CREATE INDEX IF NOT EXISTS request_nonces_expiry ON request_nonces(expires_at)"
+    ]
+
+    static let operatorStatements: [String] = [
+        "CREATE TABLE IF NOT EXISTS operator_accounts(username TEXT PRIMARY KEY,password_salt TEXT NOT NULL,password_hash TEXT NOT NULL,iterations INTEGER NOT NULL,created_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS operator_sessions(session_id TEXT PRIMARY KEY,username TEXT NOT NULL,token_hash TEXT NOT NULL,created_at TEXT NOT NULL,expires_at REAL NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS operator_setup_tokens(token_hash TEXT PRIMARY KEY,created_at TEXT NOT NULL,consumed_at TEXT)",
+    ]
+
+    static let legacyColumns: [LegacyColumnDefinition] = [
+        .init(table: "events", column: "agent_id", definition: "TEXT"),
+        .init(table: "events", column: "parent_agent_id", definition: "TEXT"),
+        .init(table: "service_metadata", column: "last_event_timestamp", definition: "REAL NOT NULL DEFAULT 0"),
+        .init(table: "service_metadata", column: "activation_state", definition: "TEXT NOT NULL DEFAULT 'active'"),
+        .init(table: "service_metadata", column: "activation_generation", definition: "INTEGER NOT NULL DEFAULT 1"),
+        .init(table: "service_metadata", column: "activation_token_digest", definition: "TEXT"),
+        .init(table: "service_metadata", column: "activation_instance_id", definition: "TEXT"),
+        .init(table: "collaboration_metadata", column: "collaboration_acknowledgement_json", definition: "TEXT"),
+        .init(table: "owned_resources", column: "external_id", definition: "TEXT"),
+        .init(table: "owned_resources", column: "temporary_path_identity", definition: "TEXT"),
+        .init(table: "owned_resources", column: "content_digest", definition: "TEXT"),
+        .init(table: "owned_resources", column: "metadata_json", definition: "TEXT NOT NULL DEFAULT '{}'"),
+        .init(table: "owned_resources", column: "created_at", definition: "REAL NOT NULL DEFAULT 0"),
+        .init(table: "owned_resources", column: "updated_at", definition: "REAL NOT NULL DEFAULT 0"),
+        .init(table: "snapshot_checkpoints", column: "retention_class", definition: "TEXT NOT NULL DEFAULT 'rolling'"),
+        .init(table: "snapshot_checkpoints", column: "archive_id", definition: "TEXT"),
     ]
 }

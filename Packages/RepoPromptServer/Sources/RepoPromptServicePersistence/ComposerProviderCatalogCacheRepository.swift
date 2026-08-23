@@ -5,14 +5,14 @@ import RepoPromptRuntimeModel
 public extension SQLiteServiceStore {
     func authorityStore_persistComposerProviderCatalog(_ record: StoredComposerProviderCatalog) async throws {
         let modelsJSON = String(decoding: try encoder.encode(record.models), as: UTF8.self)
-        _ = try await connection.query(
+        _ = try await database.query(
             "INSERT INTO composer_provider_catalog_cache(provider_id,schema_version,models_json,observed_at) VALUES(?,1,?,?) ON CONFLICT(provider_id) DO UPDATE SET schema_version=excluded.schema_version,models_json=excluded.models_json,observed_at=excluded.observed_at",
             [.text(record.providerID.rawValue), .text(modelsJSON), .float(record.observedAt.timeIntervalSince1970)]
         )
     }
 
     func authorityStore_composerProviderCatalog(providerID: ProviderSettingsID) async throws -> StoredComposerProviderCatalog? {
-        guard let row = try await connection.query("SELECT models_json,observed_at FROM composer_provider_catalog_cache WHERE provider_id=?", [.text(providerID.rawValue)]).first,
+        guard let row = try await database.query("SELECT models_json,observed_at FROM composer_provider_catalog_cache WHERE provider_id=?", [.text(providerID.rawValue)]).first,
               let modelsJSON = row.column("models_json")?.string,
               let data = modelsJSON.data(using: .utf8)
         else { return nil }

@@ -235,7 +235,7 @@ public extension SQLiteServiceStore {
             bindings.append(.text(scopeID))
         }
         let predicate = clauses.isEmpty ? "" : " WHERE \(clauses.joined(separator: " AND "))"
-        return try await connection.query(
+        return try await database.query(
             "SELECT audit_id,domain,scope_id,prior_revision,new_revision,operation,actor_id,actor_label,channel,payload_digest,created_at FROM settings_audit\(predicate) ORDER BY created_at,audit_id",
             bindings
         ).map { row in
@@ -302,25 +302,25 @@ private extension SQLiteServiceStore {
     ) async throws -> StoredSettingsDocument<Value>? {
         let row: SQLiteRow? = switch repository {
         case .agentModels:
-            try await connection.query("SELECT profile_json,revision,updated_at FROM agent_model_profiles WHERE scope_id=?", [.text(scopeID)]).first
+            try await database.query("SELECT profile_json,revision,updated_at FROM agent_model_profiles WHERE scope_id=?", [.text(scopeID)]).first
         case .subagentPermissions:
-            try await connection.query("SELECT settings_json,revision,updated_at FROM subagent_permission_settings WHERE fixed_id=1").first
+            try await database.query("SELECT settings_json,revision,updated_at FROM subagent_permission_settings WHERE fixed_id=1").first
         case .directAgentPermissions:
-            try await connection.query("SELECT settings_json,revision,updated_at FROM direct_agent_permission_settings WHERE fixed_id=1").first
+            try await database.query("SELECT settings_json,revision,updated_at FROM direct_agent_permission_settings WHERE fixed_id=1").first
         case .workspaceApprovals:
-            try await connection.query("SELECT settings_json,revision,updated_at FROM workspace_approval_settings WHERE fixed_id=1").first
+            try await database.query("SELECT settings_json,revision,updated_at FROM workspace_approval_settings WHERE fixed_id=1").first
         case .mcpDisabledTools:
-            try await connection.query("SELECT settings_json,revision,updated_at FROM mcp_disabled_tools WHERE fixed_id=1").first
+            try await database.query("SELECT settings_json,revision,updated_at FROM mcp_disabled_tools WHERE fixed_id=1").first
         case .mcpShowModelPresets:
-            try await connection.query("SELECT settings_json,revision,updated_at FROM mcp_show_model_presets WHERE fixed_id=1").first
+            try await database.query("SELECT settings_json,revision,updated_at FROM mcp_show_model_presets WHERE fixed_id=1").first
         case .contextBuilder:
-            try await connection.query("SELECT settings_json,revision,updated_at FROM context_builder_settings WHERE scope_id=?", [.text(scopeID)]).first
+            try await database.query("SELECT settings_json,revision,updated_at FROM context_builder_settings WHERE scope_id=?", [.text(scopeID)]).first
         case .mcpModelPresets:
-            try await connection.query("SELECT presets_json,revision,updated_at FROM mcp_model_presets WHERE fixed_id=1").first
+            try await database.query("SELECT presets_json,revision,updated_at FROM mcp_model_presets WHERE fixed_id=1").first
         case .advanced:
-            try await connection.query("SELECT settings_json,revision,updated_at FROM advanced_server_settings WHERE fixed_id=1").first
+            try await database.query("SELECT settings_json,revision,updated_at FROM advanced_server_settings WHERE fixed_id=1").first
         case .selectionPresets:
-            try await connection.query("SELECT presets_json,revision,updated_at FROM project_selection_presets WHERE project_id=?", [.text(scopeID)]).first
+            try await database.query("SELECT presets_json,revision,updated_at FROM project_selection_presets WHERE project_id=?", [.text(scopeID)]).first
         }
         guard let row else { return nil }
         let jsonColumn: String = switch repository {
@@ -348,7 +348,19 @@ private extension SQLiteServiceStore {
         audit: ServerSettingsAuditMutation
     ) async throws -> StoredSettingsDocument<Value> {
         try validateSettingsAudit(audit, domain: repository.domain, scopeID: scopeID)
-        return try await transaction {
+        let retainedBytes = try retainedInputBytes(
+            document.value,
+            additional: checkedRetainedByteSum(
+                scopeID.utf8.count,
+                sourceFence?.1.utf8.count ?? 0,
+                audit.operation.utf8.count,
+                audit.attribution.actorID.utf8.count,
+                audit.attribution.actorLabel.utf8.count,
+                audit.attribution.channel.utf8.count,
+                audit.payloadDigest.utf8.count
+            )
+        )
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let observed = try await settingsRevision(repository, scopeID: scopeID)
             guard observed == expectedRevision, document.revision == expectedRevision + 1 else {
                 throw ServiceAPIError(code: .staleRevision, message: "Typed settings revision is stale", currentRevision: observed)
@@ -364,52 +376,52 @@ private extension SQLiteServiceStore {
             let updatedAt = SQLiteData.float(document.updatedAt.timeIntervalSince1970)
             switch repository {
             case .agentModels:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO agent_model_profiles(scope_id,project_id,profile_json,revision,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(scope_id) DO UPDATE SET project_id=excluded.project_id,profile_json=excluded.profile_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(scopeID), projectID.map { .text($0.uuidString) } ?? .null, .text(json), revision, updatedAt]
                 )
             case .subagentPermissions:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO subagent_permission_settings(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
             case .directAgentPermissions:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO direct_agent_permission_settings(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
             case .workspaceApprovals:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO workspace_approval_settings(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
             case .mcpDisabledTools:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO mcp_disabled_tools(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
             case .mcpShowModelPresets:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO mcp_show_model_presets(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
             case .contextBuilder:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO context_builder_settings(scope_id,project_id,settings_json,revision,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(scope_id) DO UPDATE SET project_id=excluded.project_id,settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(scopeID), projectID.map { .text($0.uuidString) } ?? .null, .text(json), revision, updatedAt]
                 )
             case .mcpModelPresets:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO mcp_model_presets(fixed_id,presets_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET presets_json=excluded.presets_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
             case .advanced:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO advanced_server_settings(fixed_id,settings_json,revision,updated_at) VALUES(1,?,?,?) ON CONFLICT(fixed_id) DO UPDATE SET settings_json=excluded.settings_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(json), revision, updatedAt]
                 )
             case .selectionPresets:
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO project_selection_presets(project_id,presets_json,revision,updated_at) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET presets_json=excluded.presets_json,revision=excluded.revision,updated_at=excluded.updated_at",
                     [.text(scopeID), .text(json), revision, updatedAt]
                 )
@@ -429,25 +441,25 @@ private extension SQLiteServiceStore {
     func settingsRevision(_ repository: SettingsRepository, scopeID: String) async throws -> Int64 {
         let row: SQLiteRow? = switch repository {
         case .agentModels:
-            try await connection.query("SELECT revision FROM agent_model_profiles WHERE scope_id=?", [.text(scopeID)]).first
+            try await database.query("SELECT revision FROM agent_model_profiles WHERE scope_id=?", [.text(scopeID)]).first
         case .subagentPermissions:
-            try await connection.query("SELECT revision FROM subagent_permission_settings WHERE fixed_id=1").first
+            try await database.query("SELECT revision FROM subagent_permission_settings WHERE fixed_id=1").first
         case .directAgentPermissions:
-            try await connection.query("SELECT revision FROM direct_agent_permission_settings WHERE fixed_id=1").first
+            try await database.query("SELECT revision FROM direct_agent_permission_settings WHERE fixed_id=1").first
         case .workspaceApprovals:
-            try await connection.query("SELECT revision FROM workspace_approval_settings WHERE fixed_id=1").first
+            try await database.query("SELECT revision FROM workspace_approval_settings WHERE fixed_id=1").first
         case .mcpDisabledTools:
-            try await connection.query("SELECT revision FROM mcp_disabled_tools WHERE fixed_id=1").first
+            try await database.query("SELECT revision FROM mcp_disabled_tools WHERE fixed_id=1").first
         case .mcpShowModelPresets:
-            try await connection.query("SELECT revision FROM mcp_show_model_presets WHERE fixed_id=1").first
+            try await database.query("SELECT revision FROM mcp_show_model_presets WHERE fixed_id=1").first
         case .contextBuilder:
-            try await connection.query("SELECT revision FROM context_builder_settings WHERE scope_id=?", [.text(scopeID)]).first
+            try await database.query("SELECT revision FROM context_builder_settings WHERE scope_id=?", [.text(scopeID)]).first
         case .mcpModelPresets:
-            try await connection.query("SELECT revision FROM mcp_model_presets WHERE fixed_id=1").first
+            try await database.query("SELECT revision FROM mcp_model_presets WHERE fixed_id=1").first
         case .advanced:
-            try await connection.query("SELECT revision FROM advanced_server_settings WHERE fixed_id=1").first
+            try await database.query("SELECT revision FROM advanced_server_settings WHERE fixed_id=1").first
         case .selectionPresets:
-            try await connection.query("SELECT revision FROM project_selection_presets WHERE project_id=?", [.text(scopeID)]).first
+            try await database.query("SELECT revision FROM project_selection_presets WHERE project_id=?", [.text(scopeID)]).first
         }
         return Int64(row?.column("revision")?.integer ?? 0)
     }
@@ -460,7 +472,7 @@ private extension SQLiteServiceStore {
         mutation: ServerSettingsAuditMutation,
         createdAt: Date
     ) async throws {
-        _ = try await connection.query(
+        _ = try await database.query(
             "INSERT INTO settings_audit(audit_id,domain,scope_id,prior_revision,new_revision,operation,actor_id,actor_label,channel,payload_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             [
                 .text(UUID().uuidString),

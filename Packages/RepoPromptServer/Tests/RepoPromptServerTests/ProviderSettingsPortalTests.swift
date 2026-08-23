@@ -29,7 +29,7 @@ final class ProviderSettingsPortalTests: XCTestCase {
         let persisted = try await store.providerSettings()
         let metadata = try await store.metadata()
         XCTAssertEqual(persisted, [initial])
-        XCTAssertEqual(metadata.schemaVersion, 6)
+        XCTAssertEqual(metadata.schemaVersion, SchemaV7.version)
 
         do {
             _ = try await store.upsertProviderSettings(initial, expectedRevision: 0)

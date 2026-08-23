@@ -1,14 +1,13 @@
 enum SchemaV6 {
     static let version = 6
+    /// Legacy prototype ledger alias. Never rewrite an existing row.
     static let digest = "repoprompt-service-schema-v6-typed-mcp-show-model-presets"
-    static let compatiblePriorDigests: Set<String> = [
-        "repoprompt-service-schema-v6-typed-mcp-disabled-tools",
-        "repoprompt-service-schema-v6-typed-workspace-approvals",
-        "repoprompt-service-schema-v6-typed-direct-agent-permissions",
-        "repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit",
-        "repoprompt-service-schema-v6-agent-composer-semantic-acceptance",
-        "repoprompt-service-schema-v6-typed-settings-agent-composer-semantic-acceptance"
-    ]
+    static let transformationID = "typed-mcp-show-model-presets-v1"
+    static let legacyCanonicalDigest = "sha256:324e0e621e114c97eaee1ec8af4ebf3e7a02ea566ef91c2e878e4d0baefc68e1"
+    static let canonicalDigest = "sha256:9e0ba75b101f2121502db18154d1114176bc8581f140d540385ca2f6abf7a8fd"
+    static var definition: MigrationDefinition {
+        MigrationDefinition(version: version, transformationID: transformationID, statements: statements, transformationSteps: ["set-service-metadata-schema-version:6"])
+    }
 
     static let statements: [String] = [
         "CREATE TABLE IF NOT EXISTS agent_model_profiles(scope_id TEXT PRIMARY KEY,project_id TEXT,profile_json TEXT NOT NULL,revision INTEGER NOT NULL,updated_at REAL NOT NULL)",

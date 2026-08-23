@@ -5,21 +5,22 @@ import SQLiteNIO
 
 public extension SQLiteServiceStore {
     func authorityStore_bootstrapWorkflowRepository(builtins: [WorkflowSnapshot], now: Date = Date()) async throws {
-        try await transaction {
-            _ = try await connection.query(
+        let retainedBytes = try retainedInputBytes(builtins)
+        try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            _ = try await database.query(
                 "INSERT OR IGNORE INTO workflow_repository_state(fixed_id,collection_revision,include_session_cleanup_guidance,updated_at) VALUES(1,0,1,?)",
                 [.float(now.timeIntervalSince1970)]
             )
             let builtinIDs = Set(builtins.map(\.workflowID))
-            let installedBuiltinIDs = try await connection.query("SELECT workflow_id FROM workflows WHERE source='builtin'")
+            let installedBuiltinIDs = try await database.query("SELECT workflow_id FROM workflows WHERE source='builtin'")
                 .compactMap { $0.column("workflow_id")?.string }
             for workflowID in installedBuiltinIDs where !builtinIDs.contains(workflowID) {
-                _ = try await connection.query("DELETE FROM workflow_repository_metadata WHERE workflow_id=?", [.text(workflowID)])
-                _ = try await connection.query("DELETE FROM workflows WHERE workflow_id=? AND source='builtin'", [.text(workflowID)])
+                _ = try await database.query("DELETE FROM workflow_repository_metadata WHERE workflow_id=?", [.text(workflowID)])
+                _ = try await database.query("DELETE FROM workflows WHERE workflow_id=? AND source='builtin'", [.text(workflowID)])
             }
             for workflow in builtins {
                 let defaultVisible = workflow.workflowID == WorkflowRepositoryDefaults.hiddenBuiltInID ? 0 : 1
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT OR IGNORE INTO workflow_repository_metadata(workflow_id,visible,featured_order,row_revision,updated_at) VALUES(?,?,NULL,1,?)",
                     [.text(workflow.workflowID), .integer(defaultVisible), .float(now.timeIntervalSince1970)]
                 )
@@ -29,10 +30,10 @@ public extension SQLiteServiceStore {
     }
 
     func authorityStore_workflowRepositorySnapshot() async throws -> ServerWorkflowRepositorySnapshot {
-        let state = try await connection.query(
+        let state = try await database.query(
             "SELECT collection_revision,include_session_cleanup_guidance,updated_at FROM workflow_repository_state WHERE fixed_id=1"
         ).first
-        let rows = try await connection.query(
+        let rows = try await database.query(
             "SELECT w.workflow_id,w.source,w.name,w.definition_json,w.content_digest,w.enabled,m.visible,m.featured_order,m.row_revision FROM workflows w JOIN workflow_repository_metadata m ON m.workflow_id=w.workflow_id"
         )
         let workflows = try rows.map { row -> ServerWorkflowDefinition in
@@ -72,8 +73,16 @@ public extension SQLiteServiceStore {
         audit: ServerSettingsAuditMutation
     ) async throws -> ServerWorkflowRepositorySnapshot {
         try validateWorkflowAudit(audit)
-        return try await transaction {
-            let observed = Int64(try await connection.query(
+        let auditBytes = try retainedInputBytes([
+            audit.operation,
+            audit.attribution.actorID,
+            audit.attribution.actorLabel,
+            audit.attribution.channel,
+            audit.payloadDigest,
+        ])
+        let retainedBytes = try retainedInputBytes(snapshot, additional: auditBytes)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            let observed = Int64(try await database.query(
                 "SELECT collection_revision FROM workflow_repository_state WHERE fixed_id=1"
             ).first?.column("collection_revision")?.integer ?? 0)
             guard observed == expectedRevision, snapshot.revision == expectedRevision + 1 else {
@@ -81,15 +90,15 @@ public extension SQLiteServiceStore {
             }
 
             let desiredIDs = Set(snapshot.workflows.map(\.workflowID))
-            let customIDs = try await connection.query("SELECT workflow_id FROM workflows WHERE source='custom'").compactMap { $0.column("workflow_id")?.string }
+            let customIDs = try await database.query("SELECT workflow_id FROM workflows WHERE source='custom'").compactMap { $0.column("workflow_id")?.string }
             for workflowID in customIDs where !desiredIDs.contains(workflowID) {
-                _ = try await connection.query("DELETE FROM workflow_repository_metadata WHERE workflow_id=?", [.text(workflowID)])
-                _ = try await connection.query("DELETE FROM workflows WHERE workflow_id=? AND source='custom'", [.text(workflowID)])
+                _ = try await database.query("DELETE FROM workflow_repository_metadata WHERE workflow_id=?", [.text(workflowID)])
+                _ = try await database.query("DELETE FROM workflows WHERE workflow_id=? AND source='custom'", [.text(workflowID)])
             }
 
-            _ = try await connection.query("UPDATE workflow_repository_metadata SET featured_order=NULL")
+            _ = try await database.query("UPDATE workflow_repository_metadata SET featured_order=NULL")
             for workflow in snapshot.workflows {
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO workflows(workflow_id,schema_version,source,name,definition_json,content_digest,enabled) VALUES(?,1,?,?,?,?,?) ON CONFLICT(workflow_id) DO UPDATE SET source=excluded.source,name=excluded.name,definition_json=excluded.definition_json,content_digest=excluded.content_digest,enabled=excluded.enabled",
                     [
                         .text(workflow.workflowID),
@@ -100,7 +109,7 @@ public extension SQLiteServiceStore {
                         .integer(workflow.enabled ? 1 : 0)
                     ]
                 )
-                _ = try await connection.query(
+                _ = try await database.query(
                     "INSERT INTO workflow_repository_metadata(workflow_id,visible,featured_order,row_revision,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(workflow_id) DO UPDATE SET visible=excluded.visible,featured_order=excluded.featured_order,row_revision=excluded.row_revision,updated_at=excluded.updated_at",
                     [
                         .text(workflow.workflowID),
@@ -111,11 +120,11 @@ public extension SQLiteServiceStore {
                     ]
                 )
             }
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO workflow_repository_state(fixed_id,collection_revision,include_session_cleanup_guidance,updated_at) VALUES(1,?,1,?) ON CONFLICT(fixed_id) DO UPDATE SET collection_revision=excluded.collection_revision,updated_at=excluded.updated_at",
                 [.integer(Int(snapshot.revision)), .float(snapshot.updatedAt.timeIntervalSince1970)]
             )
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO settings_audit(audit_id,domain,scope_id,prior_revision,new_revision,operation,actor_id,actor_label,channel,payload_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     .text(UUID().uuidString),
@@ -141,16 +150,23 @@ public extension SQLiteServiceStore {
         audit: ServerSettingsAuditMutation
     ) async throws -> ServerWorkflowRepositorySnapshot {
         try validateWorkflowAudit(audit)
-        return try await transaction {
+        let retainedBytes = try retainedInputBytes([
+            audit.operation,
+            audit.attribution.actorID,
+            audit.attribution.actorLabel,
+            audit.attribution.channel,
+            audit.payloadDigest,
+        ])
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             let now = Date()
-            let observed = Int64(try await connection.query(
+            let observed = Int64(try await database.query(
                 "SELECT collection_revision FROM workflow_repository_state WHERE fixed_id=1"
             ).first?.column("collection_revision")?.integer ?? 0)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO workflow_repository_state(fixed_id,collection_revision,include_session_cleanup_guidance,updated_at) VALUES(1,0,?,?) ON CONFLICT(fixed_id) DO UPDATE SET include_session_cleanup_guidance=excluded.include_session_cleanup_guidance,updated_at=excluded.updated_at",
                 [.integer(includeSessionCleanupGuidance ? 1 : 0), .float(now.timeIntervalSince1970)]
             )
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO settings_audit(audit_id,domain,scope_id,prior_revision,new_revision,operation,actor_id,actor_label,channel,payload_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     .text(UUID().uuidString),

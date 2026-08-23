@@ -5,7 +5,7 @@ import SQLiteNIO
 
 public extension SQLiteServiceStore {
     func directProviderConfigurations() async throws -> [DirectProviderConfiguration] {
-        try await connection.query(
+        try await database.query(
             "SELECT configuration_json FROM provider_direct_configurations ORDER BY provider_id"
         ).map { row in
             guard let json = row.column("configuration_json")?.string else {
@@ -16,7 +16,7 @@ public extension SQLiteServiceStore {
     }
 
     func directProviderConfiguration(providerID: ProviderSettingsID) async throws -> DirectProviderConfiguration? {
-        guard let json = try await connection.query(
+        guard let json = try await database.query(
             "SELECT configuration_json FROM provider_direct_configurations WHERE provider_id=?",
             [.text(providerID.rawValue)]
         ).first?.column("configuration_json")?.string else { return nil }
@@ -29,11 +29,12 @@ public extension SQLiteServiceStore {
         expectedRevision: Int64,
         audit: ProviderConnectionAuditMutation? = nil
     ) async throws -> DirectProviderConfiguration {
-        try await transaction {
+        let retainedBytes = try retainedInputBytes(value, additional: retainedProviderAuditBytes(audit))
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
             guard value.providerID.isDirectAPI, value.revision == expectedRevision + 1 else {
                 throw ServiceAPIError(code: .invalidRequest, message: "Direct provider configuration revision is invalid")
             }
-            let observed = Int64(try await connection.query(
+            let observed = Int64(try await database.query(
                 "SELECT revision FROM provider_direct_configurations WHERE provider_id=?",
                 [.text(value.providerID.rawValue)]
             ).first?.column("revision")?.integer ?? 0)
@@ -41,7 +42,7 @@ public extension SQLiteServiceStore {
                 throw ServiceAPIError(code: .staleRevision, message: "Direct provider configuration revision is stale", currentRevision: observed)
             }
             let json = String(decoding: try encoder.encode(value), as: UTF8.self)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO provider_direct_configurations(provider_id,configuration_json,revision,updated_at) VALUES(?,?,?,?) ON CONFLICT(provider_id) DO UPDATE SET configuration_json=excluded.configuration_json,revision=excluded.revision,updated_at=excluded.updated_at",
                 [.text(value.providerID.rawValue), .text(json), .integer(Int(value.revision)), .float(value.updatedAt.timeIntervalSince1970)]
             )
@@ -57,7 +58,7 @@ public extension SQLiteServiceStore {
     }
 
     func authorityStore_providerModelCatalogs() async throws -> [ProviderModelCatalogSnapshot] {
-        try await connection.query(
+        try await database.query(
             "SELECT provider_id,catalog_json,revision,refreshed_at FROM provider_model_catalogs ORDER BY provider_id"
         ).map { row in
             guard let rawProviderID = row.column("provider_id")?.string,
@@ -74,7 +75,7 @@ public extension SQLiteServiceStore {
     }
 
     func authorityStore_providerModelCatalog(providerID: ProviderSettingsID) async throws -> ProviderModelCatalogSnapshot? {
-        guard let row = try await connection.query(
+        guard let row = try await database.query(
             "SELECT catalog_json,revision,refreshed_at FROM provider_model_catalogs WHERE provider_id=?",
             [.text(providerID.rawValue)]
         ).first,
@@ -96,8 +97,9 @@ public extension SQLiteServiceStore {
         models: [ProviderModelCatalogEntry],
         expectedRevision: Int64
     ) async throws -> ProviderModelCatalogSnapshot {
-        try await transaction {
-            let observed = Int64(try await connection.query(
+        let retainedBytes = try retainedInputBytes(models)
+        return try await transaction(.interactive(estimatedEncodedBytes: retainedBytes)) {
+            let observed = Int64(try await database.query(
                 "SELECT revision FROM provider_model_catalogs WHERE provider_id=?",
                 [.text(providerID.rawValue)]
             ).first?.column("revision")?.integer ?? 0)
@@ -107,7 +109,7 @@ public extension SQLiteServiceStore {
             let refreshedAt = Date()
             let next = ProviderModelCatalogSnapshot(providerID: providerID, models: models, revision: observed + 1, refreshedAt: refreshedAt)
             let json = String(decoding: try encoder.encode(models), as: UTF8.self)
-            _ = try await connection.query(
+            _ = try await database.query(
                 "INSERT INTO provider_model_catalogs(provider_id,catalog_json,revision,refreshed_at) VALUES(?,?,?,?) ON CONFLICT(provider_id) DO UPDATE SET catalog_json=excluded.catalog_json,revision=excluded.revision,refreshed_at=excluded.refreshed_at",
                 [.text(providerID.rawValue), .text(json), .integer(Int(next.revision)), .float(refreshedAt.timeIntervalSince1970)]
             )

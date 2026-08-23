@@ -9,6 +9,13 @@ enum EventArchiveCompression {
     static let algorithm = "packbits-v1"
     static let maximumDecodedBytes = 512 * 1024 * 1024
 
+    /// PackBits emits at most one control byte for each 128-byte literal block.
+    /// Repeated-byte blocks are smaller, so this is a strict format bound.
+    static func maximumCompressedBytes(forInputBytes inputBytes: Int) -> Int {
+        guard inputBytes > 0 else { return 0 }
+        return inputBytes + ((inputBytes + 127) / 128)
+    }
+
     static func compress(_ input: Data) -> Data {
         let bytes = [UInt8](input)
         var output: [UInt8] = []

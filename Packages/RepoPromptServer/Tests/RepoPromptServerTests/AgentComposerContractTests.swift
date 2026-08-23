@@ -840,6 +840,142 @@ final class AgentTurnIntentCompilerTests: XCTestCase {
 }
 
 final class AgentSubmissionCoordinatorTests: XCTestCase {
+    func testOversizedPreparedProjectRootFenceIsRejectedBeforeBeginOrAdmission() async throws {
+        let store = try await SQLiteServiceStore.openForExecutorSaturationTesting(
+            storage: .memory,
+            capacity: 32,
+            reservedControlCapacity: 16,
+            maximumAdmissionWaiters: 32,
+            maximumProducerEncodedBytes: 1_048_576
+        )
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let identity = testIdentity()
+        let sessionID = UUID()
+        let submissionID = UUID()
+        let actor = ExternalActor(userID: "actor-1", username: "actor", displayName: "Actor")
+        let config = testConfiguration(at: now)
+        let session = SessionSnapshot(
+            sessionID: sessionID,
+            projectID: UUID(),
+            parentSessionID: nil,
+            rootSessionID: sessionID,
+            creator: actor,
+            provider: .codex,
+            model: "fake",
+            visibility: .privateSession,
+            state: .idle,
+            runGeneration: 1,
+            turnEpoch: 1,
+            revision: 1,
+            transcript: [],
+            interactions: [],
+            cursor: .init(storeID: UUID(), globalSequence: 0)
+        )
+        let record = AgentSubmissionRecord(
+            submissionID: submissionID,
+            actorID: actor.userID,
+            targetKey: sessionID.uuidString,
+            operation: "startSession",
+            publicKey: submissionID.uuidString.lowercased(),
+            requestDigest: "request-digest",
+            state: .preparing,
+            sessionID: sessionID,
+            identity: identity,
+            preparedJSON: Data("prepared".utf8),
+            compiledInputJSON: Data("compiled".utf8),
+            createdAt: now,
+            updatedAt: now
+        )
+        let receipt = SubmissionReceipt(
+            submissionID: submissionID,
+            acceptedAt: now,
+            operation: "startSession",
+            sessionID: sessionID,
+            sessionRevision: 1,
+            requestAnchorID: identity.requestAnchorID,
+            runID: identity.runID,
+            generation: identity.generation,
+            turnEpoch: identity.turnEpoch,
+            runPhase: "preparing",
+            runStartedAt: now,
+            selectedConfiguration: .init(
+                catalogRevision: config.catalogRevision,
+                providerID: config.providerID,
+                modelID: config.modelID,
+                effortID: config.effortID,
+                permissionID: config.permissionID
+            ),
+            session: session
+        )
+        let prepared = PreparedNewAgentSession(
+            snapshot: session,
+            agent: .init(
+                agentID: sessionID,
+                sessionID: sessionID,
+                rootSessionID: sessionID,
+                parentAgentID: nil,
+                role: "root",
+                state: .idle,
+                revision: 1
+            ),
+            initialSelection: .init(sessionID: sessionID, entries: [], revision: 1),
+            initialPermissions: .init(
+                sessionID: sessionID,
+                mode: "workspace-write",
+                providerSettings: [:],
+                revision: 1,
+                updatedActor: actor
+            ),
+            initialCollaboration: .init(
+                sessionID: sessionID,
+                visibility: .privateSession,
+                collaborativeSteeringEnabled: false,
+                controllerUserID: actor.userID,
+                policyRevision: 1,
+                controllerRevision: 1,
+                membershipRevision: 1
+            ),
+            expectedProjectRevision: 1,
+            expectedProjectRootIDs: Array(repeating: UUID(), count: 30_000),
+            sessionCorrelationID: UUID(),
+            agentCorrelationID: UUID()
+        )
+        do {
+            _ = try await store.authorityStore_commitAgentSubmission(
+                record: record,
+                turn: .init(
+                    sessionID: sessionID,
+                    identity: identity,
+                    firstSequence: 1,
+                    lastSequence: 1,
+                    canonicalUserTurnJSON: Data("{}".utf8),
+                    effectiveConfiguration: config,
+                    createdAt: now,
+                    acceptedAt: now
+                ),
+                nextDefaults: .init(sessionID: sessionID, revision: 1, configuration: config, updatedAt: now),
+                runPresentation: .init(
+                    sessionID: sessionID,
+                    runID: identity.runID,
+                    generation: 1,
+                    turnEpoch: 1,
+                    phase: .preparing,
+                    phaseRevision: 1,
+                    runStartedAt: now
+                ),
+                receipt: receipt,
+                newSession: prepared
+            )
+            XCTFail("prepared project-root fence must be bounded before BEGIN")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .rateLimited)
+        }
+        let metrics = await store.database.metrics()
+        XCTAssertEqual(metrics.queuedByClass.values.reduce(0, +), 0)
+        XCTAssertEqual(metrics.waitingByClass.values.reduce(0, +), 0)
+        try await store.close(clean: false)
+    }
+
     func testAtomicAcceptanceStoresExactReceiptAndReplaysPreparedWinner() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let now = Date(timeIntervalSince1970: 1_700_000_000), identity = testIdentity(), sessionID = UUID(), submissionID = UUID()
@@ -889,8 +1025,8 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
     func testMigrationIsAdditiveAndDetectsLegacyLedgerGap() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let metadata = try await store.metadata()
-        XCTAssertEqual(metadata.schemaVersion, 6)
-        let tables = try await store.connection.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
+        XCTAssertEqual(metadata.schemaVersion, SchemaV7.version)
+        let tables = try await store.database.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
         XCTAssertTrue(Set(["projects", "sessions", "transcript_entries", "semantic_turns", "semantic_activities", "semantic_tools", "agent_submissions"]).isSubset(of: Set(tables)))
         let sessionID = UUID()
         try await store.advanceSemanticWatermark(sessionID: sessionID, semanticSequence: 2, legacySequence: 5, gapDetected: true, at: Date())
@@ -905,7 +1041,11 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent("repoprompt-combined-v6-\(UUID().uuidString).sqlite").path
         defer { try? FileManager.default.removeItem(atPath: path) }
 
-        var store: SQLiteServiceStore? = try await SQLiteServiceStore.open(storage: .file(path))
+        try await StoreMigrationTestSupport.makeV6Store(
+            at: URL(fileURLWithPath: path),
+            digest: "repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit"
+        )
+        var store: SQLiteServiceStore? = try await SQLiteServiceStore.openForMaintenance(storage: .file(path))
         let composerTables = [
             "composer_provider_catalog_cache", "agent_submissions", "effective_turn_configurations",
             "session_next_turn_defaults", "composer_attachments", "accepted_attachment_manifests",
@@ -913,21 +1053,28 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
             "semantic_ingestion_watermarks"
         ]
         for table in composerTables {
-            _ = try await store?.connection.query("DROP TABLE \(table)")
+            _ = try await store?.database.query("DROP TABLE IF EXISTS \(table)")
         }
-        _ = try await store?.connection.query(
-            "UPDATE schema_migrations SET description='typed revisioned server settings and digest-only audit',digest=? WHERE version=6",
-            [.text("repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit")]
+        let source = try await XCTUnwrap(store).migrationSourceEvidence()
+        _ = try await store?.migrateToLatest(
+            verifiedBackup: .init(
+                source: source,
+                archiveSHA256: String(repeating: "a", count: 64),
+                manifestSHA256: String(repeating: "b", count: 64),
+                verifierFingerprint: String(repeating: "c", count: 64)
+            ),
+            namespaceKind: "server",
+            databaseIdentityDigest: String(repeating: "d", count: 64)
         )
-        try await store?.close()
+        try await store?.close(clean: false)
         store = nil
 
         let upgraded = try await SQLiteServiceStore.open(storage: .file(path))
-        let tables = try await upgraded.connection.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
+        let tables = try await upgraded.database.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
         XCTAssertTrue(Set(["advanced_server_settings", "settings_audit", "provider_direct_configurations"]).isSubset(of: Set(tables)))
         XCTAssertTrue(Set(composerTables).isSubset(of: Set(tables)))
-        let digest = try await upgraded.connection.query("SELECT digest FROM schema_migrations WHERE version=6").first?.column("digest")?.string
-        XCTAssertEqual(digest, "repoprompt-service-schema-v6-typed-mcp-show-model-presets")
+        let digest = try await upgraded.database.query("SELECT digest FROM schema_migrations WHERE version=6").first?.column("digest")?.string
+        XCTAssertEqual(digest, "repoprompt-service-schema-v6-typed-settings-workflows-direct-providers-cas-audit")
         try await upgraded.close()
     }
 
@@ -1588,13 +1735,13 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
 
         let publishedSessions = try await fixture.authority.sessionSnapshots()
         XCTAssertTrue(publishedSessions.isEmpty)
-        let rows = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM sessions")
+        let rows = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM sessions")
         XCTAssertEqual(rows.first?.column("count")?.integer, 0)
-        let eventRows = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM events WHERE session_id IS NOT NULL")
+        let eventRows = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM events WHERE session_id IS NOT NULL")
         XCTAssertEqual(eventRows.first?.column("count")?.integer, 0)
-        let turnRows = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM semantic_turns")
+        let turnRows = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM semantic_turns")
         XCTAssertEqual(turnRows.first?.column("count")?.integer, 0)
-        let receiptRows = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' OR receipt_json IS NOT NULL")
+        let receiptRows = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' OR receipt_json IS NOT NULL")
         XCTAssertEqual(receiptRows.first?.column("count")?.integer, 0)
     }
 
@@ -1735,10 +1882,10 @@ final class RepoPromptHTTPStructuredStartAtomicityTests: XCTestCase {
         XCTAssertEqual(sessions.first?.transcript.map(\.content), ["accepted exactly once"])
         let turns = try await fixture.store.semanticTurns(sessionID: accepted.sessionID)
         XCTAssertEqual(turns.count, 1)
-        let sessionEvents = try await fixture.store.connection.query("SELECT event_type,COUNT(*) AS count FROM events WHERE session_id=? GROUP BY event_type", [.text(accepted.sessionID.uuidString)])
+        let sessionEvents = try await fixture.store.database.query("SELECT event_type,COUNT(*) AS count FROM events WHERE session_id=? GROUP BY event_type", [.text(accepted.sessionID.uuidString)])
         XCTAssertEqual(sessionEvents.first { $0.column("event_type")?.string == EventType.sessionCreated.rawValue }?.column("count")?.integer, 1)
         XCTAssertEqual(sessionEvents.first { $0.column("event_type")?.string == EventType.agentStarted.rawValue }?.column("count")?.integer, 1)
-        let storedReceipts = try await fixture.store.connection.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' AND receipt_json IS NOT NULL")
+        let storedReceipts = try await fixture.store.database.query("SELECT COUNT(*) AS count FROM agent_submissions WHERE state='accepted' AND receipt_json IS NOT NULL")
         XCTAssertEqual(storedReceipts.first?.column("count")?.integer, 1)
     }
 }
