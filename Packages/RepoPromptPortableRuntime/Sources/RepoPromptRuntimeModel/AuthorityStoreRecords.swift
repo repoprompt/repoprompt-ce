@@ -316,7 +316,7 @@ public struct IdempotencyInput: Sendable {
 
 public struct ExistingIdempotency: Error, Sendable { public let response: Data
     public let status: Int
-    init(_ value: (Data, Int)) {
+    public init(_ value: (Data, Int)) {
         response = value.0
         status = value.1
     }

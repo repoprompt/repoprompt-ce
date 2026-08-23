@@ -10,12 +10,23 @@ RepoPrompt CE has three release/update lanes:
   protected `release` environment.
 
 Every public artifact in both lanes is universal and must contain matching
-`arm64+x86_64` `RepoPrompt` and `repoprompt-mcp` executables. Public builds use
+`arm64+x86_64` `RepoPrompt`, `repoprompt-mcp`, and bundle-private
+`Contents/Helpers/repoprompt-mcp-headless-runtime` executables. Public builds use
 separate SwiftPM scratch directories per architecture, compare package resources
 before selecting one equivalent copy, merge unsigned products, and validate all
 packaged Mach-O architecture sets before and after signing and after ZIP
 extraction. Debug packages and local self-signed production packages remain
 host-native.
+
+The private helper is built from `Packages/RepoPromptServer`, embedded only at
+`Contents/Helpers/repoprompt-mcp-headless-runtime`, signed before the public MCP
+launcher and app, and verified as a regular non-symlink executable with the same
+architecture/signing policy as the enclosing artifact. Packaging and staged
+release inputs must also carry `repoprompt-mcp-headless-runtime.dSYM`; missing,
+unsigned, incompatible, or wrong-architecture helpers fail before MCP
+initialization and fail package/archive validation. Debug/Settings/release CLI
+status and installation links continue to target the managed public
+`Contents/MacOS/repoprompt-mcp` launcher—there is no standalone helper install.
 
 The packaged `repoprompt-mcp` exposes one final backend selector:
 `--backend app|headless|auto`. **`app` remains the release default.** Explicit

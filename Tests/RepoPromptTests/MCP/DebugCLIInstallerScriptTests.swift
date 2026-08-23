@@ -90,6 +90,7 @@ final class DebugCLIInstallerScriptTests: XCTestCase {
         let home: URL
         let appBundle: URL
         let bundledCLI: URL
+        let privateHelper: URL
         let userLink: URL
         let pathLink: URL
         let script: URL
@@ -100,15 +101,23 @@ final class DebugCLIInstallerScriptTests: XCTestCase {
             home = root.appendingPathComponent("home", isDirectory: true)
             appBundle = root.appendingPathComponent("RepoPrompt.app", isDirectory: true)
             bundledCLI = appBundle.appendingPathComponent("Contents/MacOS/repoprompt-mcp")
+            privateHelper = appBundle.appendingPathComponent("Contents/Helpers/repoprompt-mcp-headless-runtime")
             userLink = home.appendingPathComponent("RepoPrompt/repoprompt_ce_cli_debug")
             pathLink = root.appendingPathComponent("bin/rpce-cli-debug")
             script = try RepoRoot.url().appendingPathComponent("Scripts/install_debug_cli.sh")
 
             try FileManager.default.createDirectory(at: bundledCLI.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: privateHelper.deletingLastPathComponent(), withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: userLink.deletingLastPathComponent(), withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: pathLink.deletingLastPathComponent(), withIntermediateDirectories: true)
             try "#!/bin/sh\necho rpce-test-version\n".write(to: bundledCLI, atomically: true, encoding: .utf8)
+            try "#!/bin/sh\nif [ \"${1:-}\" = --print-launcher-contract-version ]; then echo 1; fi\n".write(
+                to: privateHelper,
+                atomically: true,
+                encoding: .utf8
+            )
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bundledCLI.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: privateHelper.path)
         }
 
         func run(_ action: String) throws -> (status: Int32, output: String) {

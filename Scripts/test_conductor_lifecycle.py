@@ -2209,6 +2209,73 @@ class LifecycleQueueTests(LifecycleTestCase):
             {"filter": "RuntimeModelTests", "testProduct": "RepoPromptRuntimeModelTests"},
         )
 
+    def test_server_operations_use_nested_package_build_lane_and_heavy_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            registry = conductor.OperationRegistry(repo_root)
+            build_argv, build_lanes, build_cwd, _env, _timeout = registry.prepare(
+                {"operation": "server-build", "args": {"product": "RepoPromptServer"}}
+            )
+            helper_argv, _, helper_cwd, _env, _timeout = registry.prepare(
+                {"operation": "server-build", "args": {"product": "repoprompt-mcp-headless-runtime"}}
+            )
+            test_argv, test_lanes, test_cwd, _env, _timeout = registry.prepare(
+                {
+                    "operation": "server-test",
+                    "args": {"filter": "AuthorityNamespaceLeaseTests", "testProduct": "RepoPromptServerTests"},
+                }
+            )
+            container_argv, container_lanes, container_cwd, _env, _timeout = registry.prepare(
+                {"operation": "server-container-test", "args": {}}
+            )
+
+        server_root = repo_root / "Packages" / "RepoPromptServer"
+        self.assertEqual(
+            build_argv,
+            ["swift", "build", "--product", "RepoPromptServer", "--disable-automatic-resolution"],
+        )
+        self.assertEqual(
+            helper_argv,
+            [
+                "swift", "build", "--product", "repoprompt-mcp-headless-runtime",
+                "--disable-automatic-resolution",
+            ],
+        )
+        self.assertEqual(build_lanes, ["build"])
+        self.assertEqual(build_cwd, server_root)
+        self.assertEqual(helper_cwd, server_root)
+        self.assertEqual(
+            test_argv,
+            [
+                "swift", "test", "--disable-automatic-resolution",
+                "--test-product", "RepoPromptServerTests",
+                "--filter", "AuthorityNamespaceLeaseTests",
+            ],
+        )
+        self.assertEqual(test_lanes, ["build"])
+        self.assertEqual(test_cwd, server_root)
+        self.assertEqual(container_argv, ["docker", "build", "-f", "Dockerfile.server", "."])
+        self.assertEqual(container_lanes, ["build"])
+        self.assertEqual(container_cwd, repo_root)
+        for operation in ("server-build", "server-test", "server-container-test"):
+            self.assertTrue(conductor.operation_requires_global_heavy_slot(operation, {}))
+
+    def test_server_test_cli_forwards_focus_options(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(
+                state.paths,
+                "server-test",
+                ["--test-product", "RepoPromptServerTests", "--filter", "AuthorityMutationGateTests"],
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            enqueue.call_args.args[2],
+            {"filter": "AuthorityMutationGateTests", "testProduct": "RepoPromptServerTests"},
+        )
+
     def test_codex_schema_check_delegates_bounded_gate_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

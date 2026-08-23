@@ -168,6 +168,9 @@ IMPLEMENTED_OPERATIONS = {
     "swift-build",
     "portable-build",
     "portable-test",
+    "server-build",
+    "server-test",
+    "server-container-test",
     "build",
     "package",
     "test",
@@ -215,6 +218,9 @@ Operation commands:
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
   ./conductor portable-build       # build Packages/RepoPromptPortableRuntime
   ./conductor portable-test [--filter <filter>] [--test-product <product>]
+  ./conductor server-build --product RepoPromptServer|repoprompt-mcp-headless-runtime
+  ./conductor server-test [--filter <filter>] [--test-product <product>]
+  ./conductor server-container-test
   ./conductor build
   ./conductor package debug|release
   ./conductor test [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
@@ -2845,7 +2851,7 @@ def job_consumes_unlaned_capacity(operation: str, lanes: Sequence[str]) -> bool:
 
 
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"swift-build", "portable-build", "portable-test", "build", "package", "test", "provider-test", "install-debug-cli"}:
+    if operation in {"swift-build", "portable-build", "portable-test", "server-build", "server-test", "server-container-test", "build", "package", "test", "provider-test", "install-debug-cli"}:
         return True
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
         return True
@@ -3203,7 +3209,7 @@ class OperationRegistry:
         if operation not in IMPLEMENTED_OPERATIONS:
             raise ConductorError(f"operation '{operation}' is not implemented")
 
-        if operation in {"test", "provider-test", "portable-test"}:
+        if operation in {"test", "provider-test", "portable-test", "server-test"}:
             self._validate_xctest_stall_options(args)
 
         env = self._base_env(verbose, request)
@@ -3250,6 +3256,20 @@ class OperationRegistry:
             if args.get("filter"):
                 argv.extend(["--filter", str(args["filter"])])
             return argv, ["build"], self.repo_root / "Packages" / "RepoPromptPortableRuntime", env, effective_timeout
+        if operation == "server-build":
+            product = str(args.get("product"))
+            if product not in {"RepoPromptServer", "repoprompt-mcp-headless-runtime"}:
+                raise ConductorError("server-build product is not allowlisted")
+            return ["swift", "build", "--product", product, "--disable-automatic-resolution"], ["build"], self.repo_root / "Packages" / "RepoPromptServer", env, effective_timeout
+        if operation == "server-test":
+            argv = ["swift", "test", "--disable-automatic-resolution"]
+            if args.get("testProduct"):
+                argv.extend(["--test-product", str(args["testProduct"])])
+            if args.get("filter"):
+                argv.extend(["--filter", str(args["filter"])])
+            return argv, ["build"], self.repo_root / "Packages" / "RepoPromptServer", env, effective_timeout
+        if operation == "server-container-test":
+            return ["docker", "build", "-f", "Dockerfile.server", "."], ["build"], cwd, env, effective_timeout
         if operation == "build":
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
@@ -4629,7 +4649,7 @@ class DaemonState:
 
     def _xctest_watchdog_enabled(self, job: Job) -> bool:
         return (
-            job.operation in {"test", "provider-test", "portable-test"}
+            job.operation in {"test", "provider-test", "portable-test", "server-test"}
             and job.args.get("xctestStallSeconds") is not None
         )
 
@@ -8214,6 +8234,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "check-format-tools",
         "install-format-tools",
         "portable-build",
+        "server-container-test",
     }:
         parse_no_args(f"conductor {operation}", rest)
     elif operation == "swift-build":
@@ -8221,12 +8242,17 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
         ns = parser.parse_args(rest)
         args["product"] = ns.product
+    elif operation == "server-build":
+        parser = argparse.ArgumentParser(prog="conductor server-build")
+        parser.add_argument("--product", required=True, choices=["RepoPromptServer", "repoprompt-mcp-headless-runtime"])
+        ns = parser.parse_args(rest)
+        args["product"] = ns.product
     elif operation == "package":
         parser = argparse.ArgumentParser(prog="conductor package")
         parser.add_argument("config", choices=["debug", "release"])
         ns = parser.parse_args(rest)
         args["config"] = ns.config
-    elif operation in {"test", "provider-test", "portable-test"}:
+    elif operation in {"test", "provider-test", "portable-test", "server-test"}:
         parser = argparse.ArgumentParser(prog=f"conductor {operation}")
         parser.add_argument("--filter")
         parser.add_argument("--test-product")

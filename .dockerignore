@@ -1,0 +1,14 @@
+.build
+.git
+.swiftpm
+AppBundle
+AppResources
+Sources
+Tests
+ThirdPartyLicenses
+Vendor
+docs
+prompt-exports
+Packages/RepoPromptAgentProviders
+Packages/RepoPromptPortableRuntime/.build
+Packages/RepoPromptServer/.build

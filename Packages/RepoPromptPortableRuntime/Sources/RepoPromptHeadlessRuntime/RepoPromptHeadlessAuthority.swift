@@ -28,6 +28,7 @@ public actor RepoPromptHeadlessAuthority {
     private let ids: any RuntimeIDGenerator
     private let filesystem: any FilesystemAuthorityPort
     private let commandRunner: any WorkspaceCommandRunning
+    private let codeMapBuilder: any WorkspaceCodeMapBuilding
     private let worktreeService: WorktreeRuntimeService?
     private let artifactService: ArtifactRuntimeService?
     private let providerAdapter: (any AgentProviderDispatcher)?
@@ -61,6 +62,7 @@ public actor RepoPromptHeadlessAuthority {
         ids: any RuntimeIDGenerator = SystemRuntimeIDGenerator(),
         filesystem: any FilesystemAuthorityPort = LocalFilesystemAuthority(),
         commandRunner: any WorkspaceCommandRunning = LocalWorkspaceCommandRunner(),
+        codeMapBuilder: any WorkspaceCodeMapBuilding = UnavailableWorkspaceCodeMapBuilder(),
         worktreeService: WorktreeRuntimeService? = nil,
         artifactService: ArtifactRuntimeService? = nil,
         providerAdapter: (any AgentProviderDispatcher)? = nil,
@@ -78,6 +80,7 @@ public actor RepoPromptHeadlessAuthority {
         self.ids = ids
         self.filesystem = filesystem
         self.commandRunner = commandRunner
+        self.codeMapBuilder = codeMapBuilder
         self.worktreeService = worktreeService
         self.artifactService = artifactService
         self.providerAdapter = providerAdapter
@@ -194,7 +197,7 @@ public actor RepoPromptHeadlessAuthority {
         }
         let project = ProjectAuthority(snapshot: snapshot, roots: roots)
         await projects.install(project)
-        tools[snapshot.projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+        tools[snapshot.projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner, codeMapBuilder: codeMapBuilder)
     }
 
     private func replayProject(response: Data, status: Int) async throws -> ProjectSnapshot {
@@ -343,7 +346,7 @@ public actor RepoPromptHeadlessAuthority {
             )
             let project = ProjectAuthority(snapshot: snapshot, roots: [root])
             await projects.install(project)
-            tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+            tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner, codeMapBuilder: codeMapBuilder)
             await eventHub.publish(event)
             await progress(.completed, revision: 4, code: "project_source_completed")
             return ProjectSourceOperationWireSnapshot(
@@ -521,7 +524,7 @@ public actor RepoPromptHeadlessAuthority {
             }
             let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
             await projects.install(project)
-            tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+            tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner, codeMapBuilder: codeMapBuilder)
             await eventHub.publish(event)
             await progress(.completed, revision: 4, code: "project_repository_completed")
             return result
@@ -575,7 +578,7 @@ public actor RepoPromptHeadlessAuthority {
         let roots = snapshot.roots.compactMap { root in identities[root.rootID].map { CanonicalRoot(snapshot: root, filesystemIdentity: $0) } }
         let project = ProjectAuthority(snapshot: snapshot, roots: roots)
         await projects.install(project)
-        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner, codeMapBuilder: codeMapBuilder)
         await eventHub.publish(event)
         return snapshot
     }
@@ -610,7 +613,7 @@ public actor RepoPromptHeadlessAuthority {
         let event = try await store.persistProject(snapshot, rootIdentities: Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.snapshot.rootID, $0.filesystemIdentity) }), eventType: .projectUpdated, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         let project = ProjectAuthority(snapshot: snapshot, roots: canonicalRoots)
         await projects.install(project)
-        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner, codeMapBuilder: codeMapBuilder)
         await eventHub.publish(event)
         return snapshot
     }
@@ -768,7 +771,7 @@ public actor RepoPromptHeadlessAuthority {
                 )
                 let projectAuthority = ProjectAuthority(snapshot: project, roots: canonicalRoots)
                 await projects.install(projectAuthority)
-                tools[seed.projectID] = ProjectToolAuthority(project: projectAuthority, filesystem: filesystem, commandRunner: commandRunner)
+                tools[seed.projectID] = ProjectToolAuthority(project: projectAuthority, filesystem: filesystem, commandRunner: commandRunner, codeMapBuilder: codeMapBuilder)
                 await eventHub.publish(event)
             }
 
@@ -1869,7 +1872,7 @@ public actor RepoPromptHeadlessAuthority {
         let event = try await store.persistProject(snapshot, rootIdentities: availableRootIdentities, eventType: .projectRefreshed, actor: actor, correlationID: ids.next(), idempotency: idempotency)
         let project = ProjectAuthority(snapshot: snapshot, roots: roots)
         await projects.install(project)
-        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner)
+        tools[projectID] = ProjectToolAuthority(project: project, filesystem: filesystem, commandRunner: commandRunner, codeMapBuilder: codeMapBuilder)
         await eventHub.publish(event)
         return snapshot
     }
@@ -4003,17 +4006,8 @@ public actor RepoPromptHeadlessAuthority {
             }.joined(separator: "\n\n")
         }
 
-        let prefix = """
-        RepoPrompt Server could not load the provider's saved native conversation. RepoPrompt owns the canonical conversation below. Treat it as the preceding conversation and continue naturally; do not claim the earlier context is unavailable.
-
-        <repoprompt_conversation>
-        """
-        let divider = """
-
-        </repoprompt_conversation>
-
-        <current_turn>
-        """
+        let prefix = "RepoPrompt Server could not load the provider's saved native conversation. RepoPrompt owns the canonical conversation below. Treat it as the preceding conversation and continue naturally; do not claim the earlier context is unavailable.\n\n<repoprompt_conversation>\n"
+        let divider = "\n\n</repoprompt_conversation>\n\n<current_turn>\n"
         let suffix = "\n</current_turn>"
         let maximumCharacters = 262_144
         let framingCount = prefix.count + divider.count + suffix.count
@@ -4444,7 +4438,7 @@ public actor RepoPromptHeadlessAuthority {
             return CanonicalRoot(snapshot: routed, filesystemIdentity: identity)
         }
         let routedSnapshot = ProjectSnapshot(projectID: snapshot.projectID, name: snapshot.name, creator: snapshot.creator, state: snapshot.state, roots: roots.map(\.snapshot), revision: snapshot.revision, cursor: snapshot.cursor)
-        return ProjectToolAuthority(project: ProjectAuthority(snapshot: routedSnapshot, roots: roots), filesystem: filesystem, commandRunner: commandRunner)
+        return ProjectToolAuthority(project: ProjectAuthority(snapshot: routedSnapshot, roots: roots), filesystem: filesystem, commandRunner: commandRunner, codeMapBuilder: codeMapBuilder)
     }
 
     private func replacingCursor(_ value: SessionSnapshot, cursor: ServiceCursor) -> SessionSnapshot {

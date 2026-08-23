@@ -45,7 +45,7 @@ portable_import_guard() {
     fail "portal session request/projection DTOs belong to future RepoPromptServiceProtocol"
   print_matches \
     "RuntimeModel retains a Crypto, transport-auth, or portal DTO dependency" \
-    grep -R -n -E '^import[[:space:]]+(Crypto|CryptoKit)([[:space:]]|$)|CanonicalSigning|ServiceEventSigningKey|Portal[A-Z]|ConnectProviderRequest|ProviderAuthFlow|ProviderAuthentication(Status|State)|ProviderAuthTransaction' \
+    grep -R -n -E '^import[[:space:]]+(Crypto|CryptoKit)([[:space:]]|$)|CanonicalSigning|ServiceEventSigningKey|Portal[A-Z]|ConnectProviderRequest|ProviderAuthTransaction' \
       "$portable_sources/RepoPromptRuntimeModel"
 
   print_matches \
@@ -53,8 +53,7 @@ portable_import_guard() {
     grep -R -n -E "$forbidden_imports" "$portable_sources"
   print_matches \
     "portable manifest/source resurrects the temporary Server graph" \
-    grep -R -n -E 'makeServerPackage|REPOPROMPT_SERVER_ONLY|RepoPromptHeadlessLaunchBridge' Package.swift "$portable_manifest" "$portable_sources"
-  [[ ! -e "Packages/RepoPromptServer" ]] || fail "PR 2 must not introduce the Server package graph"
+    grep -R -n -E 'makeServerPackage|REPOPROMPT_SERVER_ONLY' Package.swift "$portable_manifest" "$portable_sources"
   print_matches \
     "PR 2 contains premature proposal/application authority behavior" \
     grep -R -n -E 'InMemoryAuthorityStore|AuthorityTransitionCommand|AuthorityTransitionReceipt|func[[:space:]]+apply\(' \
@@ -143,9 +142,6 @@ PY
      ! grep -q 'swift build --product repoprompt-mcp --disable-automatic-resolution' "$portable_workflow"; then
     fail "portable CI path ownership must cover Portable and every documented Desktop mapping owner"
   fi
-  if grep -q 'Packages/RepoPromptServer/\*\*' "$portable_workflow"; then
-    fail "PR 2 portable CI must not claim a Server package graph that does not exist yet"
-  fi
   if [[ -f "Packages/RepoPromptServer/Package.swift" ]] && \
      ! grep -qF '.package(path: "../RepoPromptPortableRuntime")' "Packages/RepoPromptServer/Package.swift"; then
     fail "RepoPromptServer must consume the sibling portable package through ../RepoPromptPortableRuntime"
@@ -162,15 +158,153 @@ PY
   printf 'OK: portable import guard passed.\n'
 }
 
+server_import_guard() {
+  local server_root="Packages/RepoPromptServer"
+  local manifest="$server_root/Package.swift"
+  local server_sources="$server_root/Sources"
+
+  [[ -f "$manifest" ]] || fail "Server package manifest missing: $manifest"
+  [[ -f "$server_root/Package.resolved" ]] || fail "Server package lockfile missing"
+  [[ -f "Dockerfile.server" ]] || fail "canonical Server Dockerfile missing"
+  [[ -f ".github/workflows/server-runtime.yml" ]] || fail "Server CI workflow missing"
+
+  grep -qF '.package(path: "../RepoPromptPortableRuntime")' "$manifest" || \
+    fail "RepoPromptServer must consume the sibling portable package through ../RepoPromptPortableRuntime"
+  print_matches \
+    "root manifest must not resolve or link the Server package" \
+    grep -n -E 'Packages/RepoPromptServer|RepoPromptServerHost|RepoPromptService(Persistence|HTTP|Protocol)|sqlite-nio|hummingbird' Package.swift
+  print_matches \
+    "RepoPromptServerHost imports the HTTP target" \
+    grep -R -n -E '^import[[:space:]]+RepoPromptServiceHTTP([[:space:]]|$)' \
+      "$server_sources/RepoPromptServerHost"
+  print_matches \
+    "RepoPromptServiceHTTP imports concrete persistence or Host composition" \
+    grep -R -n -E '^import[[:space:]]+(RepoPromptServicePersistence|RepoPromptServerHost|RepoPromptHeadlessRuntime)([[:space:]]|$)' \
+      "$server_sources/RepoPromptServiceHTTP"
+  print_matches \
+    "state-free MCP adapter imports persistence or Host composition" \
+    grep -R -n -E '^import[[:space:]]+(RepoPromptServicePersistence|RepoPromptServerHost|RepoPromptHeadlessRuntime)([[:space:]]|$)' \
+      "$server_sources/RepoPromptMCPAdapter"
+  print_matches \
+    "child transport constructs a lease, store, or durable authority" \
+    grep -n -E 'AuthorityNamespaceLease|SQLiteServiceStore|RepoPromptHeadlessAuthority' \
+      "$server_sources/RepoPromptServerExecutable/HeadlessMCPSocketServer.swift" \
+      "$server_sources/RepoPromptServerExecutable/HeadlessMCPStdioBridge.swift" \
+      "$server_sources/RepoPromptServerHost/DirectHeadlessChildBridge.swift" \
+      "$server_sources/RepoPromptServerHost/DirectHeadlessChildEndpoint.swift"
+
+  local helper_files
+  helper_files="$(find "$server_sources/RepoPromptMCPHeadlessExecutable" -maxdepth 1 -type f -name '*.swift' -print | LC_ALL=C sort)"
+  if [[ "$helper_files" != "$server_sources/RepoPromptMCPHeadlessExecutable/RepoPromptMCPHeadless.swift" ]]; then
+    fail "private helper executable must remain a one-file bootstrap over Host + MCP adapter"
+    printf '%s\n' "$helper_files" >&2
+  fi
+  local direct_lease_acquisition
+  direct_lease_acquisition="$(grep -R -n -E 'AuthorityNamespaceLease\.acquire' "$server_sources" \
+    --include='*.swift' | grep -v -E '/(RepoPromptAuthorityHost|AuthorityMaintenanceSession)\.swift:' || true)"
+  if [[ -n "$direct_lease_acquisition" ]]; then
+    fail "only RepoPromptAuthorityHost or AuthorityMaintenanceSession may acquire the namespace lease"
+    printf '%s\n' "$direct_lease_acquisition" >&2
+  fi
+
+  if ! python3 - "$manifest" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+package = json.loads(subprocess.check_output([
+    "swift", "package", "--disable-sandbox", "--package-path", str(manifest.parent), "dump-package"
+], text=True))
+targets = {target["name"]: target for target in package["targets"]}
+
+def deps(name):
+    values = set()
+    for dependency in targets[name].get("dependencies", []):
+        if dependency.get("byName"):
+            values.add(dependency["byName"][0])
+        elif dependency.get("product"):
+            values.add(dependency["product"][0])
+    return values
+
+errors = []
+if "RepoPromptServiceHTTP" in deps("RepoPromptServerHost"):
+    errors.append("RepoPromptServerHost directly depends on RepoPromptServiceHTTP")
+if deps("RepoPromptMCPHeadlessExecutable") != {"RepoPromptServerHost", "RepoPromptMCPAdapter"}:
+    errors.append("private helper dependencies must be exactly Host + MCP adapter")
+required = {"RepoPromptServerHost", "RepoPromptServiceHTTP", "RepoPromptMCPAdapter"}
+if not required.issubset(deps("RepoPromptServerExecutable")):
+    errors.append("Server executable must compose Host + HTTP + MCP adapter")
+if errors:
+    raise SystemExit("\n".join(errors))
+PY
+  then
+    fail "Server package target dependency boundary drifted"
+  fi
+
+  if grep -q -E 'COPY[[:space:]]+(Package\.swift|Package\.resolved|Sources/|Tests/)' Dockerfile.server; then
+    fail "Dockerfile.server must build only the nested Portable + Server package graph"
+  fi
+  if ! grep -q 'Packages/RepoPromptServer' Dockerfile.server || \
+     ! grep -q 'Packages/RepoPromptPortableRuntime' Dockerfile.server; then
+    fail "Dockerfile.server must copy the sibling Server and Portable packages"
+  fi
+  if ! grep -q 'Packages/RepoPromptServer/\*\*' .github/workflows/server-runtime.yml || \
+     ! grep -q 'Packages/RepoPromptPortableRuntime/\*\*' .github/workflows/server-runtime.yml || \
+     ! grep -q 'Dockerfile.server' .github/workflows/server-runtime.yml; then
+    fail "Server CI path ownership is incomplete"
+  fi
+
+  if [[ "$failures" -ne 0 ]]; then
+    printf 'Server import guard failed (%s issue%s).\n' "$failures" "$([[ "$failures" == 1 ]] && printf '' || printf 's')" >&2
+    return 1
+  fi
+  printf 'OK: Server package/import guard passed.\n'
+}
+
+root_dependency_guard() {
+  local graph="${1:?root dependency JSON required}"
+  python3 - "$graph" <<'PY'
+import json
+import sys
+
+root = json.load(open(sys.argv[1]))
+forbidden = {"sqlite-nio", "hummingbird", "repopromptserver"}
+paths = []
+
+def walk(node, path):
+    name = (node.get("identity") or node.get("name") or "").lower()
+    current = path + [name]
+    if name in forbidden:
+        paths.append(" -> ".join(current))
+    for child in node.get("dependencies", []):
+        walk(child, current)
+
+walk(root, [])
+if paths:
+    raise SystemExit("Root dependency graph contains Server-only packages:\n" + "\n".join(paths))
+PY
+  printf 'OK: root dependency graph excludes Server-only packages.\n'
+}
+
 if [[ "${1:-}" == "portable-imports" ]]; then
   portable_import_guard
   exit 0
+elif [[ "${1:-}" == "server-imports" ]]; then
+  server_import_guard
+  exit 0
+elif [[ "${1:-}" == "root-dependencies" ]]; then
+  [[ "$#" -eq 2 ]] || { printf 'usage: %s root-dependencies <graph.json>\n' "$0" >&2; exit 64; }
+  root_dependency_guard "$2"
+  exit 0
 elif [[ "$#" -gt 0 ]]; then
-  printf 'usage: %s [portable-imports]\n' "$0" >&2
+  printf 'usage: %s [portable-imports|server-imports|root-dependencies <graph.json>]\n' "$0" >&2
   exit 64
 fi
 
 portable_import_guard
+server_import_guard
 
 # 0. Required layout roots/files should exist before negative scans run.
 required_dirs=(

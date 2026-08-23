@@ -1097,7 +1097,17 @@ public struct BuiltinWorkflowCatalog: Sendable {
     public init() {}
 
     public func workflows() throws -> [WorkflowSnapshot] {
-        try RepoPromptBuiltInAgentWorkflow.allCases.map { workflow in
+        let canonicalOrder: [RepoPromptBuiltInAgentWorkflow] = [
+            .investigate,
+            .build,
+            .oracleExport,
+            .review,
+            .refactor,
+            .orchestrate,
+            .optimize,
+            .deepPlan
+        ]
+        return try canonicalOrder.map { workflow in
             guard let promptID = RepoPromptWorkflowID(rawValue: workflow.rawValue) else {
                 throw ServiceAPIError(
                     code: .dependencyUnavailable,

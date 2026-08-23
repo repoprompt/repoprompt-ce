@@ -16,7 +16,7 @@ swift-crypto	4.5.0	https://github.com/apple/swift-crypto.git	swift-crypto/
 swift-distributed-tracing	1.4.1	https://github.com/apple/swift-distributed-tracing.git	swift-distributed-tracing/
 swift-http-structured-headers	1.7.0	https://github.com/apple/swift-http-structured-headers.git	swift-http-structured-headers/
 swift-http-types	1.5.1	https://github.com/apple/swift-http-types.git	swift-http-types/
-swift-log	1.6.3	https://github.com/apple/swift-log.git	swift-log/
+swift-log	1.14.0	https://github.com/apple/swift-log.git	swift-log/
 swift-markdown	0.6.0	https://github.com/swiftlang/swift-markdown	swift-markdown/
 swift-markdown-ui	2.4.1	https://github.com/gonzalezreal/swift-markdown-ui	swift-markdown-ui/
 swift-nio	2.99.0	https://github.com/apple/swift-nio.git	swift-nio/

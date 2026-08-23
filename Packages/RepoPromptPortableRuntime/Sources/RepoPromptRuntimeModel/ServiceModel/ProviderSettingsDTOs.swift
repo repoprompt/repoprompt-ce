@@ -202,6 +202,64 @@ public struct ClaudeCompatibleBackendSettings: Codable, Hashable, Sendable {
     }
 }
 
+public enum ProviderAuthFlowKind: String, Codable, Hashable, Sendable {
+    case browserOAuth
+    case deviceCodeBeta
+    case externalProvisioning
+}
+
+public struct ProviderAuthFlowDescriptor: Codable, Hashable, Sendable {
+    public let kind: ProviderAuthFlowKind
+    public let displayName: String
+    public let startable: Bool
+    public let detail: String?
+
+    public init(kind: ProviderAuthFlowKind, displayName: String, startable: Bool, detail: String? = nil) {
+        self.kind = kind
+        self.displayName = displayName
+        self.startable = startable
+        self.detail = detail
+    }
+}
+
+public enum ProviderAuthenticationState: String, Codable, Hashable, Sendable {
+    case authenticated
+    case attention
+    case notConfigured
+    case unknown
+}
+
+public struct ProviderAuthenticationStatus: Codable, Hashable, Sendable {
+    public let state: ProviderAuthenticationState
+    public let authenticated: Bool
+    public let method: ProviderAuthenticationMethod?
+    public let accountLabel: String?
+    public let planLabel: String?
+    public let authenticationLabel: String?
+    public let expiresAt: Date?
+    public let detail: String?
+
+    public init(
+        state: ProviderAuthenticationState,
+        authenticated: Bool,
+        method: ProviderAuthenticationMethod? = nil,
+        accountLabel: String? = nil,
+        planLabel: String? = nil,
+        authenticationLabel: String? = nil,
+        expiresAt: Date? = nil,
+        detail: String? = nil
+    ) {
+        self.state = state
+        self.authenticated = authenticated
+        self.method = method
+        self.accountLabel = accountLabel
+        self.planLabel = planLabel
+        self.authenticationLabel = authenticationLabel
+        self.expiresAt = expiresAt
+        self.detail = detail
+    }
+}
+
 public enum ProviderAuthenticationMethod: String, Codable, CaseIterable, Sendable {
     case browserOAuth
     case deviceCodeBeta
@@ -300,19 +358,22 @@ public struct ProviderSettingsCapabilities: Codable, Hashable, Sendable {
     public let supportsSpeedMode: Bool
     public let supportsServiceTier: Bool
     public let authenticationMethods: [ProviderAuthenticationMethod]
+    public let authFlows: [ProviderAuthFlowDescriptor]
 
     public init(
         supportsModelSelection: Bool,
         supportsReasoningEffort: Bool,
         supportsSpeedMode: Bool,
         supportsServiceTier: Bool,
-        authenticationMethods: [ProviderAuthenticationMethod] = []
+        authenticationMethods: [ProviderAuthenticationMethod] = [],
+        authFlows: [ProviderAuthFlowDescriptor] = []
     ) {
         self.supportsModelSelection = supportsModelSelection
         self.supportsReasoningEffort = supportsReasoningEffort
         self.supportsSpeedMode = supportsSpeedMode
         self.supportsServiceTier = supportsServiceTier
         self.authenticationMethods = authenticationMethods
+        self.authFlows = authFlows
     }
 }
 
@@ -347,6 +408,8 @@ public struct ProviderSettingsSnapshot: Codable, Hashable, Sendable {
     public let effectiveEnabled: Bool
     public let preference: ProviderSettingsPreference
     public let cli: ProviderCLIHealth?
+    /// Sanitized public authentication projection retained for Server HTTP compatibility.
+    public let authentication: ProviderAuthenticationStatus
     /// Whether a durable connection or external credential source is present.
     /// Readiness remains authoritative in `preflight`.
     public let configurationPresent: Bool
@@ -355,7 +418,7 @@ public struct ProviderSettingsSnapshot: Codable, Hashable, Sendable {
     public let capabilities: ProviderSettingsCapabilities
     public let models: [ProviderModelCatalogEntry]
 
-    public init(providerID: ProviderSettingsID, displayName: String, category: ProviderSettingsCategory, summary: String, deploymentAllowed: Bool, runtimePreflightVerified: Bool, effectiveEnabled: Bool, preference: ProviderSettingsPreference, cli: ProviderCLIHealth?, configurationPresent: Bool, connection: ProviderConnectionRecord? = nil, preflight: ProviderPreflightStatus = .init(ready: false, reason: .runtimeUnavailable, detail: "Provider preflight has not run"), capabilities: ProviderSettingsCapabilities, models: [ProviderModelCatalogEntry]) {
+    public init(providerID: ProviderSettingsID, displayName: String, category: ProviderSettingsCategory, summary: String, deploymentAllowed: Bool, runtimePreflightVerified: Bool, effectiveEnabled: Bool, preference: ProviderSettingsPreference, cli: ProviderCLIHealth?, authentication: ProviderAuthenticationStatus, configurationPresent: Bool? = nil, connection: ProviderConnectionRecord? = nil, preflight: ProviderPreflightStatus = .init(ready: false, reason: .runtimeUnavailable, detail: "Provider preflight has not run"), capabilities: ProviderSettingsCapabilities, models: [ProviderModelCatalogEntry]) {
         self.providerID = providerID
         self.displayName = displayName
         self.category = category
@@ -365,7 +428,8 @@ public struct ProviderSettingsSnapshot: Codable, Hashable, Sendable {
         self.effectiveEnabled = effectiveEnabled
         self.preference = preference
         self.cli = cli
-        self.configurationPresent = configurationPresent
+        self.authentication = authentication
+        self.configurationPresent = configurationPresent ?? (authentication.authenticated || connection != nil)
         self.connection = connection
         self.preflight = preflight
         self.capabilities = capabilities

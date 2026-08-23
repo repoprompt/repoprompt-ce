@@ -120,6 +120,7 @@ run_preflight() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/patches/keyboardshortcuts-2.3.0-resource-lookup.patch"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_private_headless_helper.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py"
     require_file "$CODEX_MANIFEST"
@@ -183,6 +184,7 @@ validate_public_app() {
     local signed_team_identifier="${4:-}"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$app_bundle" "$label MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$app_bundle" "arm64,x86_64" "$label architectures"
+    bash "$CONTROL_PLANE_SCRIPTS_DIR/validate_private_headless_helper.sh" "$app_bundle" "arm64,x86_64"
     local codex_verification_args=(
         --manifest "$CODEX_MANIFEST" verify-bundle
         --arch all
@@ -532,7 +534,9 @@ upload_required_sentry_symbols() {
         "$APP_NAME.dSYM" \
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "repoprompt-mcp" \
+        "repoprompt-mcp-headless-runtime.dSYM" \
+        "repoprompt-mcp-headless-runtime"
 }
 
 package_release_candidate() {
@@ -622,7 +626,9 @@ stage_publish_release() {
         "$APP_NAME.dSYM" \
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "repoprompt-mcp" \
+        "repoprompt-mcp-headless-runtime.dSYM" \
+        "repoprompt-mcp-headless-runtime"
     TMP_DIR="$(mktemp -d)"
     local stage_root="$TMP_DIR/release-stage"
     mkdir -p "$stage_root/.build/release"
@@ -634,7 +640,9 @@ stage_publish_release() {
         "$APP_NAME.dSYM" \
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "repoprompt-mcp" \
+        "repoprompt-mcp-headless-runtime.dSYM" \
+        "repoprompt-mcp-headless-runtime"
     cp "$ROOT_DIR/version.env" "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
     printf '%s\n' "$RELEASE_COMMIT" > "$stage_root/RELEASE_COMMIT"
@@ -666,7 +674,9 @@ publish_staged_release() {
         "$APP_NAME.dSYM" \
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "repoprompt-mcp" \
+        "repoprompt-mcp-headless-runtime.dSYM" \
+        "Contents/Helpers/repoprompt-mcp-headless-runtime"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
     prepare_dist

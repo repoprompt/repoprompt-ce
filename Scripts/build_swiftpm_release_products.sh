@@ -85,6 +85,8 @@ fi
 
 ARM64_BIN_DIR=""
 X86_64_BIN_DIR=""
+ARM64_SERVER_BIN_DIR=""
+X86_64_SERVER_BIN_DIR=""
 for arch in arm64 x86_64; do
     scratch="$SCRATCH_ROOT/$arch"
     run env \
@@ -101,16 +103,28 @@ for arch in arm64 x86_64; do
         --arch "$arch" \
         --scratch-path "$scratch" \
         --product repoprompt-mcp
+    server_scratch="$SCRATCH_ROOT/server-$arch"
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build \
+        --package-path "$ROOT_DIR/Packages/RepoPromptServer" \
+        "${SWIFT_BUILD_ARGS[@]}" \
+        --arch "$arch" \
+        --scratch-path "$server_scratch" \
+        --product repoprompt-mcp-headless-runtime \
+        --disable-automatic-resolution
     printf '+ %q ' "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --arch "$arch" --scratch-path "$scratch" --show-bin-path
     printf '\n'
     bin_dir="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --arch "$arch" --scratch-path "$scratch" --show-bin-path)"
+    server_bin_dir="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build --package-path "$ROOT_DIR/Packages/RepoPromptServer" "${SWIFT_BUILD_ARGS[@]}" --arch "$arch" --scratch-path "$server_scratch" --show-bin-path)"
     if [[ "$arch" == "arm64" ]]; then
         ARM64_BIN_DIR="$bin_dir"
+        ARM64_SERVER_BIN_DIR="$server_bin_dir"
     else
         X86_64_BIN_DIR="$bin_dir"
+        X86_64_SERVER_BIN_DIR="$server_bin_dir"
     fi
     require_exact_arch "$bin_dir/RepoPrompt" "$arch"
     require_exact_arch "$bin_dir/repoprompt-mcp" "$arch"
+    require_exact_arch "$server_bin_dir/repoprompt-mcp-headless-runtime" "$arch"
 done
 
 run "$RESOURCE_COMPARATOR" "$ARM64_BIN_DIR" "$X86_64_BIN_DIR"
@@ -129,9 +143,14 @@ run "$LIPO" -create \
     "$ARM64_BIN_DIR/repoprompt-mcp" \
     "$X86_64_BIN_DIR/repoprompt-mcp" \
     -output "$staged_output/repoprompt-mcp"
-run chmod +x "$staged_output/RepoPrompt" "$staged_output/repoprompt-mcp"
+run "$LIPO" -create \
+    "$ARM64_SERVER_BIN_DIR/repoprompt-mcp-headless-runtime" \
+    "$X86_64_SERVER_BIN_DIR/repoprompt-mcp-headless-runtime" \
+    -output "$staged_output/repoprompt-mcp-headless-runtime"
+run chmod +x "$staged_output/RepoPrompt" "$staged_output/repoprompt-mcp" "$staged_output/repoprompt-mcp-headless-runtime"
 require_exact_arch "$staged_output/RepoPrompt" "arm64,x86_64"
 require_exact_arch "$staged_output/repoprompt-mcp" "arm64,x86_64"
+require_exact_arch "$staged_output/repoprompt-mcp-headless-runtime" "arm64,x86_64"
 
 for resource in "$ARM64_BIN_DIR"/*.bundle "$ARM64_BIN_DIR/Sparkle.framework"; do
     [[ -e "$resource" ]] || continue

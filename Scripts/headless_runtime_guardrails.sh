@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 runtime_sources="Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime"
-direct_sources="Sources/RepoPromptMCP"
+direct_sources="Packages/RepoPromptServer/Sources/RepoPromptServerHost"
 
 if grep -R -n -E '^[[:space:]]*import[[:space:]]+(AppKit|SwiftUI)([[:space:]]|$)' "$runtime_sources"; then
   echo "error: RepoPromptDomainRuntime must remain independent of AppKit and SwiftUI" >&2
@@ -41,7 +41,7 @@ for retired in \
   TabScopedContext \
   DomainProtectedMutationStage \
   migratedToolNames; do
-  if grep -R -n --include='*.swift' "$retired" Sources; then
+  if grep -R -n --include='*.swift' "$retired" Sources Packages/RepoPromptServer/Sources; then
     echo "error: retired M7 migration authority remains in production sources: $retired" >&2
     exit 1
   fi

@@ -342,7 +342,10 @@ public final class PinnedFilesystemRoot: @unchecked Sendable {
             let next = component.withCString { openat(current, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
             guard next >= 0 else {
                 close(current)
-                throw ServiceAPIError(code: .rootUnauthorized, message: "Filesystem directory chain contains a symbolic link or non-directory")
+                throw ServiceAPIError(
+                    code: .rootUnauthorized,
+                    message: "Filesystem directory chain contains a symbolic link or non-directory at \(component) in \(standardized)"
+                )
             }
             close(current)
             current = next
@@ -427,19 +430,28 @@ public struct LocalFilesystemAuthority: FilesystemAuthorityPort {
     public init() {}
 
     public func canonicalizeRoot(_ path: String) throws -> (path: String, identity: String, isDirectory: Bool) {
-        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        guard let resolvedPointer = standardized.withCString({ realpath($0, nil) }) else {
             throw ServiceAPIError(code: .rootUnauthorized, message: "Project root must be an existing directory")
         }
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        defer { free(resolvedPointer) }
+        let resolvedBytes = UnsafeBufferPointer(
+            start: UnsafeRawPointer(resolvedPointer).assumingMemoryBound(to: UInt8.self),
+            count: strlen(resolvedPointer)
+        )
+        let canonicalPath = String(decoding: resolvedBytes, as: UTF8.self)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: canonicalPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ServiceAPIError(code: .rootUnauthorized, message: "Project root must be an existing directory")
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: canonicalPath)
         // Preserve the persisted identity contract used before extraction.
         // Birth-time fencing is a semantic migration and is deferred from PR 2.
         let identity = [attributes[.systemNumber], attributes[.systemFileNumber]]
             .compactMap(\.self)
             .map(String.init(describing:))
             .joined(separator: ":")
-        return (url.path, identity, true)
+        return (canonicalPath, identity, true)
     }
 
     public func contains(root: String, candidate: String) throws -> Bool {

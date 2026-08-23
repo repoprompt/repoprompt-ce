@@ -116,6 +116,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
                 "RepoPromptApp",
                 "RepoPromptCodeMapCore",
                 "RepoPromptDomainRuntime",
+                "RepoPromptHeadlessLaunchBridge",
                 "RepoPromptMCP",
                 "RepoPromptRuntimeModel",
                 "RepoPromptShared",

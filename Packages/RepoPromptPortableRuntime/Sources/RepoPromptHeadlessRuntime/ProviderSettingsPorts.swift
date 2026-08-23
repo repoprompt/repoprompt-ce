@@ -26,6 +26,7 @@ public struct ProviderCLIConfiguration: Codable, Hashable, Sendable {
 
 public protocol ProviderRuntimeSettingsAdapting: Sendable {
     func preflight(kind: ProviderKind) async -> ProviderCapability
+    func recoveryPreflight(kind: ProviderKind) async -> ProviderCapability
     func applyRuntimeDefaults(
         kind: ProviderKind,
         defaults: ProviderRuntimeDefaults
@@ -34,6 +35,12 @@ public protocol ProviderRuntimeSettingsAdapting: Sendable {
         providerID: ProviderSettingsID,
         defaults: ProviderRuntimeDefaults
     ) async throws
+}
+
+public extension ProviderRuntimeSettingsAdapting {
+    func recoveryPreflight(kind: ProviderKind) async -> ProviderCapability {
+        await preflight(kind: kind)
+    }
 }
 
 public protocol ProviderCredentialVaulting: Sendable {
@@ -100,12 +107,34 @@ public struct ProviderConnectionInput: Sendable {
         self.accountLabel = accountLabel
         self.expiresAt = expiresAt
     }
+
+    public init(
+        authenticationMethod: ProviderAuthenticationMethod,
+        credential: String,
+        accountLabel: String? = nil,
+        expiresAt: Date? = nil
+    ) {
+        self.init(
+            authenticationMethod: authenticationMethod,
+            credential: Data(credential.utf8),
+            accountLabel: accountLabel,
+            expiresAt: expiresAt
+        )
+    }
 }
 
 public enum ProviderManagedAuthenticationFlowKind: Sendable, Equatable {
     case browserOAuth
     case deviceCodeBeta
     case externalProvisioning
+}
+
+public struct ProviderManagedAuthenticationStartInput: Sendable, Equatable {
+    public let kind: ProviderManagedAuthenticationFlowKind
+
+    public init(kind: ProviderManagedAuthenticationFlowKind) {
+        self.kind = kind
+    }
 }
 
 public struct ProviderManagedAuthenticationFlowCapability: Sendable, Equatable {
@@ -174,6 +203,18 @@ public enum ProviderManagedAuthenticationState: Sendable, Equatable {
     case unavailable
 }
 
+public struct ProviderManagedAccountSummary: Sendable, Equatable {
+    public let account: String
+    public let plan: String
+    public let authentication: String
+
+    public init(account: String, plan: String, authentication: String) {
+        self.account = account
+        self.plan = plan
+        self.authentication = authentication
+    }
+}
+
 public protocol ProviderManagedAuthenticationDriving: Sendable {
     func authFlowDescriptor(
         providerID: ProviderSettingsID,
@@ -182,6 +223,7 @@ public protocol ProviderManagedAuthenticationDriving: Sendable {
     func authenticationState(
         providerID: ProviderSettingsID
     ) async -> ProviderManagedAuthenticationState
+    func accountSummary(providerID: ProviderSettingsID) async -> ProviderManagedAccountSummary?
     func discoverModelCatalog(
         providerID: ProviderSettingsID,
         forceRefresh: Bool
@@ -190,6 +232,10 @@ public protocol ProviderManagedAuthenticationDriving: Sendable {
 }
 
 public extension ProviderManagedAuthenticationDriving {
+    func accountSummary(providerID _: ProviderSettingsID) async -> ProviderManagedAccountSummary? {
+        nil
+    }
+
     func discoverModelCatalog(
         providerID _: ProviderSettingsID,
         forceRefresh _: Bool

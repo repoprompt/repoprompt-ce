@@ -80,6 +80,7 @@ validate_public_app() {
     local signed_team_identifier="${4:-}"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$app_bundle" "$label MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$app_bundle" "arm64,x86_64" "$label architectures"
+    bash "$CONTROL_PLANE_SCRIPTS_DIR/validate_private_headless_helper.sh" "$app_bundle" "arm64,x86_64"
     local codex_verification_args=(
         --manifest "$CODEX_MANIFEST" verify-bundle
         --arch all
@@ -183,7 +184,9 @@ stage_tip() {
         "$APP_NAME.dSYM" \
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "repoprompt-mcp" \
+        "repoprompt-mcp-headless-runtime.dSYM" \
+        "repoprompt-mcp-headless-runtime"
 
     TMP_DIR="$(mktemp -d)"
     local stage_root="$TMP_DIR/tip-stage"
@@ -196,7 +199,9 @@ stage_tip() {
         "$APP_NAME.dSYM" \
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "repoprompt-mcp" \
+        "repoprompt-mcp-headless-runtime.dSYM" \
+        "repoprompt-mcp-headless-runtime"
     write_tip_version_env "$stage_root/version.env"
     cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
@@ -379,7 +384,9 @@ sign_tip() {
         "$APP_NAME.dSYM" \
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "repoprompt-mcp" \
+        "repoprompt-mcp-headless-runtime.dSYM" \
+        "Contents/Helpers/repoprompt-mcp-headless-runtime"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
@@ -403,7 +410,9 @@ sign_tip() {
         "$APP_NAME.dSYM" \
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "repoprompt-mcp" \
+        "repoprompt-mcp-headless-runtime.dSYM" \
+        "repoprompt-mcp-headless-runtime"
 
     local distribution_dir="$TMP_DIR/distribution"
     mkdir -p "$distribution_dir"

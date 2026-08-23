@@ -13,6 +13,8 @@ import RepoPromptShared
 
 enum CLIPathInstaller {
     private static let logger = Logger(subsystem: "CLI.PathInstaller", category: "install")
+    private static let privateHeadlessHelperName = "repoprompt-mcp-headless-runtime"
+    private static let privateHeadlessHelperContractVersion = "1"
 
     #if DEBUG
         nonisolated static let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
@@ -44,7 +46,44 @@ enum CLIPathInstaller {
     /// Returns the path to the bundled CLI executable
     @MainActor
     static var bundledCLIPath: String? {
-        Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp")?.path
+        guard let publicLauncher = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp"),
+              bundledPrivateHeadlessHelperIsCompatible()
+        else {
+            return nil
+        }
+        return publicLauncher.path
+    }
+
+    @MainActor
+    private static func bundledPrivateHeadlessHelperIsCompatible() -> Bool {
+        let helper = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Helpers", isDirectory: true)
+            .appendingPathComponent(privateHeadlessHelperName, isDirectory: false)
+        let fileManager = FileManager.default
+        guard let values = try? helper.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              fileManager.isExecutableFile(atPath: helper.path)
+        else {
+            return false
+        }
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = helper
+        process.arguments = ["--print-launcher-contract-version"]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationReason == .exit, process.terminationStatus == 0 else { return false }
+            let contract = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return contract == privateHeadlessHelperContractVersion
+        } catch {
+            return false
+        }
     }
 
     /// Built-in Claude Code tools to disable in the claude-rp wrapper.

@@ -172,6 +172,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
+        "RepoPromptHeadlessLaunchBridge",
         "RepoPromptMCP",
         "RepoPromptRuntimeModel",
         "RepoPromptShared",
@@ -180,8 +181,8 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if set(_dependency_names(repo_prompt_tests)) != expected_test_dependencies | {"Markdown"}:
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptAgentRuntimeCore, RepoPromptApp, "
-            "RepoPromptCodeMapCore, RepoPromptDomainRuntime, RepoPromptMCP, "
-            "RepoPromptRuntimeModel, RepoPromptShared, and Markdown"
+            "RepoPromptCodeMapCore, RepoPromptDomainRuntime, RepoPromptHeadlessLaunchBridge, "
+            "RepoPromptMCP, RepoPromptRuntimeModel, RepoPromptShared, and Markdown"
         )
 
     portable_products = {

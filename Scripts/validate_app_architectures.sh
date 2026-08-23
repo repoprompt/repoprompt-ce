@@ -41,12 +41,15 @@ require_arches() {
 
 MAIN="$APP_BUNDLE/Contents/MacOS/RepoPrompt"
 HELPER="$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
+HEADLESS_HELPER="$APP_BUNDLE/Contents/Helpers/repoprompt-mcp-headless-runtime"
 require_regular_executable "$MAIN"
 require_regular_executable "$HELPER"
+require_regular_executable "$HEADLESS_HELPER"
 MAIN_ARCHES="$(architectures "$MAIN")" || fail "could not read main executable architectures"
 HELPER_ARCHES="$(architectures "$HELPER")" || fail "could not read MCP helper architectures"
-[[ -n "$MAIN_ARCHES" && "$MAIN_ARCHES" == "$HELPER_ARCHES" ]] ||
-    fail "$LABEL requires matching app/helper architectures: app=${MAIN_ARCHES:-<none>} helper=${HELPER_ARCHES:-<none>}"
+HEADLESS_HELPER_ARCHES="$(architectures "$HEADLESS_HELPER")" || fail "could not read private headless helper architectures"
+[[ -n "$MAIN_ARCHES" && "$MAIN_ARCHES" == "$HELPER_ARCHES" && "$MAIN_ARCHES" == "$HEADLESS_HELPER_ARCHES" ]] ||
+    fail "$LABEL requires matching app/helper architectures: app=${MAIN_ARCHES:-<none>} public-helper=${HELPER_ARCHES:-<none>} private-helper=${HEADLESS_HELPER_ARCHES:-<none>}"
 
 if [[ "$EXPECTED" == "matching" ]]; then
     printf 'OK: %s passed with matching app/helper architectures: %s\n' "$LABEL" "$MAIN_ARCHES"
@@ -59,6 +62,7 @@ EXPECTED="$(normalize_list "$EXPECTED")"
 MACHO_PATHS=(
     "$MAIN"
     "$HELPER"
+    "$HEADLESS_HELPER"
     "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
     "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate"
     "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater"

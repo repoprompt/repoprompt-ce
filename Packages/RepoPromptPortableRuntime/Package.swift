@@ -23,7 +23,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.0"),
-        .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
+        .package(url: "https://github.com/apple/swift-log.git", "1.6.3" ..< "2.0.0"),
         .package(url: "https://github.com/repoprompt/swift-sdk.git", revision: "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"),
         .package(
             url: "https://github.com/repoprompt/swift-tree-sitter.git",

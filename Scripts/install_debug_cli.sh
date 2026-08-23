@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEBUG_APP_ROOT="${REPOPROMPT_DEBUG_APP_ROOT:-$HOME/Library/Application Support/RepoPrompt CE/DebugApps}"
 APP_BUNDLE="${REPOPROMPT_DEBUG_APP_BUNDLE:-$DEBUG_APP_ROOT/RepoPrompt.app}"
 BUNDLED_CLI="$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
+PRIVATE_HEADLESS_HELPER="$APP_BUNDLE/Contents/Helpers/repoprompt-mcp-headless-runtime"
 USER_LINK="$HOME/RepoPrompt/repoprompt_ce_cli_debug"
 LEGACY_USER_LINK="$HOME/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug"
 PATH_LINK="${REPOPROMPT_DEBUG_CLI_INSTALL_PATH:-/usr/local/bin/rpce-cli-debug}"
@@ -40,6 +41,11 @@ EOF
 done
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+
+matching_private_helper(){
+	[[ -f "$PRIVATE_HEADLESS_HELPER" && ! -L "$PRIVATE_HEADLESS_HELPER" && -x "$PRIVATE_HEADLESS_HELPER" ]] || return 1
+	[[ "$("$PRIVATE_HEADLESS_HELPER" --print-launcher-contract-version 2>/dev/null || true)" == "1" ]]
+}
 
 is_managed_path_link(){
 	local path="${1:-$PATH_LINK}" target
@@ -86,6 +92,7 @@ ensure_bundled_cli(){
 	if [[ ! -x "$BUNDLED_CLI" ]]; then
 		fail "Debug CLI not found at '$BUNDLED_CLI'. Run 'make build' first, or use '$0 install --build'."
 	fi
+	matching_private_helper || fail "Debug app bundle is missing a compatible private headless runtime helper at '$PRIVATE_HEADLESS_HELPER'."
 }
 
 ensure_user_link(){
@@ -202,6 +209,11 @@ print_status(){
 		echo "  Bundled CLI: OK ($BUNDLED_CLI)"
 	else
 		echo "  Bundled CLI: missing ($BUNDLED_CLI)"
+	fi
+	if matching_private_helper; then
+		echo "  Private headless helper: OK ($PRIVATE_HEADLESS_HELPER, contract 1)"
+	else
+		echo "  Private headless helper: missing or incompatible ($PRIVATE_HEADLESS_HELPER)"
 	fi
 
 	if [[ -L "$USER_LINK" ]]; then

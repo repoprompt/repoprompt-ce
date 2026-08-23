@@ -1,13 +1,27 @@
 # Source Layout Ownership Map
 
-Current as of 2026-07-19 after the source-layout refactor, provider extraction, upstream Tree-sitter grammar migration, the thin-executable split, and the workspace, regex, and CodeMap core boundaries. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
+Current as of 2026-08-19 after the source-layout refactor, portable-runtime extraction, nested Server-package extraction, provider extraction, upstream Tree-sitter grammar migration, and the thin-executable split. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
 
 ## Current source tree shape
 
 ```text
+Packages/
+  RepoPromptPortableRuntime/    # cross-platform models, authority APIs, runtime cores, and portable owner tests
+  RepoPromptServer/             # leased Server host, persistence, wire/HTTP edge, executables, portal resources, and Server tests
+    Sources/
+      RepoPromptServerHost/     # lease/store/provider/resource/recovery/shutdown and mutation-gate lifecycle; never HTTP
+      RepoPromptServerOperations/
+      RepoPromptServicePersistence/
+      RepoPromptServiceProtocol/
+      RepoPromptServiceHTTP/    # HTTP router, portal, SSE, and metrics presentation
+      RepoPromptMCPAdapter/     # state-free adapter over RepoPromptMCPServing
+      RepoPromptServerExecutable/       # Server-only HTTP/TLS/listener/portal/MCP composition
+      RepoPromptMCPHeadlessExecutable/  # private helper entry over Host + MCP composition
+    Tests/RepoPromptServerTests/
 Sources/
   RepoPromptExecutable/          # thin shipped RepoPrompt executable target; sole @main and delegation only
     RepoPromptExecutable.swift
+  RepoPromptHeadlessLaunchBridge/ # private app-to-helper launch/contract bridge; no Server package dependency
   RepoPrompt/                    # internal RepoPromptApp implementation library target (not a package product)
     Support/                     # Obj-C bridging header / bridging-header-sensitive support owned by RepoPromptApp
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
@@ -47,25 +61,14 @@ Sources/
       VCS/                       # git/VCS substrate
       WorkspaceContext/          # context store, indexing, path lookup, slices, search, token accounting
     ThirdParty/                  # vendored SwiftPCRE2 wrapper
-  RepoPromptCodeMapCore/        # internal deterministic synchronous parsing/query/extraction and canonical artifact core
-  RepoPromptRegexCore/          # internal reusable PCRE2 wrapper/JIT runtime
   RepoPromptWorkspaceCore/      # internal Foundation-only workspace path values and deterministic policies
-  RepoPromptDomainRuntime/      # internal AppKit-free MCP runtime, workspace/context persistence, routing, and launch-token authority
-  RepoPromptShared/
-    MCP/                         # shared app/CLI MCP control protocol definitions
   RepoPromptMCP/                 # MCP CLI implementation
-  RepoPromptC/                   # C support target
-  CSwiftPCRE2/                   # C PCRE2 target
-  TreeSitterScannerSupport/      # narrow exact-snapshot JavaScript/Python scanner ABI fallback
 Tests/
-  RepoPromptCodeMapCoreTests/    # sole owner of pure CodeMap fixtures, goldens, and deterministic core tests
-  RepoPromptRegexCoreTests/      # direct reusable regex runtime tests
   RepoPromptWorkspaceCoreTests/  # direct deterministic tests owned by RepoPromptWorkspaceCore
-  RepoPromptDomainRuntimeTests/  # direct owner tests for the headless MCP runtime and workspace/context authority
   RepoPromptTests/               # app integration, persistence, workspace, presentation, UI, and MCP tests
 ```
 
-The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, and `RepoPromptDomainRuntime` are internal dependencies of `RepoPromptApp`, are not exposed as package products, and have direct owning test targets. `RepoPromptDomainRuntime` owns the AppKit-free, Sendable MCP runtime identity/lifecycle values, the canonical 27-tool name/capability/admission/client-policy catalog, immutable definitions and fingerprints, and the actor registry. App registration is process composition over that registry; no app-local registry facade or second schema authority remains. `RepoPromptCodeMapCoreTests` is the sole resource owner for pure CodeMap parser fixtures and goldens. Root app tests import `RepoPromptApp`; the separate `RepoPromptMCP` executable dependency remains unchanged.
+The external Desktop boundary remains stable: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. The root package owns Desktop, the public `repoprompt-mcp` launcher, and the narrow private-helper launch bridge; it has no dependency on `Packages/RepoPromptServer` or Server-only packages. Portable semantic/runtime owners and their tests live in `Packages/RepoPromptPortableRuntime`. The nested `Packages/RepoPromptServer` manifest depends on that package only through `../RepoPromptPortableRuntime` and owns both Server executables and Server tests.
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
@@ -92,6 +95,8 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
 - Deterministic workspace path values and policies with no app, UI, persistence, filesystem, process, or mutable authority may go under `Sources/RepoPromptWorkspaceCore`; direct tests go under `Tests/RepoPromptWorkspaceCoreTests`. The target is not a general non-UI bucket.
 - Cross-platform semantic identifiers, provider/model values, workflow values, authority protocols, and transport/persistence-neutral runtime cores belong under `Packages/RepoPromptPortableRuntime`. `RepoPromptRuntimeModel` and `RepoPromptAuthorityAPI` own downward-facing contracts; `RepoPromptAgentRuntimeCore` and `RepoPromptWorkspaceRuntimeCore` implement owner-scoped behavior; `RepoPromptHeadlessRuntime` is composition only. These targets must not import app, UI, Server wire, HTTP, or persistence modules. See [`portable-runtime-semantic-owners.md`](portable-runtime-semantic-owners.md).
+- Leased serving lifecycle belongs under `Packages/RepoPromptServer/Sources/RepoPromptServerHost`: namespace lease, serving-safe store open, provider/resource recovery, existing-event publication, cross-transport mutation admission, and bounded shutdown. Host must not import or depend on `RepoPromptServiceHTTP`, construct listeners, or expose a migrating serving mode. HTTP/TLS/listener/portal/SSE/metrics and HTTP+MCP assembly belong only to `RepoPromptServerExecutable`; the private helper composes direct-headless Host startup with MCP and no HTTP edge. The Server MCP adapter stays state-free over `RepoPromptMCPServing`; transports must not construct persistence or the authority.
+- Root app-to-helper compatibility wiring belongs under `Sources/RepoPromptHeadlessLaunchBridge`. It may validate and launch the bundle-private helper contract but must not reintroduce a root Server package dependency or a second durable backend.
 - AppKit-free MCP runtime identity/lifecycle configuration, canonical tool names, capability/admission/client classification, normalized schema fingerprints, Sendable tool definitions/bindings, the actor registry, workspace/context document and journal persistence, revision/CAS/event publication, connection/context routing, and run-launch-token authority belong under `Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime`; owner tests belong under `Packages/RepoPromptPortableRuntime/Tests/RepoPromptDomainRuntimeTests`. Application-scoped app-settings and routing registration is process-lifetime composition owned: AppDelegate startup explicitly registers canonical bindings and starts transport independently of window count, while catalog readiness only observes the canonical registry with a bounded fail-closed wait. App-side window and active-context values are presentation affinity, never domain identity or mutation authority. `RepoPromptDomainRuntime` must contain no `@MainActor`, AppKit, SwiftUI, Combine, window, or view-model dependency.
 - Deterministic synchronous CodeMap grammar descriptors, CodeMap-only queries, invocation-local parsing/extraction, provenance-free decoded source values, pipeline/key canonical encoding, artifact outcomes, and path-free canonical rendering belong under `Packages/RepoPromptPortableRuntime/Sources/RepoPromptCodeMapCore`; pure fixtures/goldens and owner tests belong only under `Packages/RepoPromptPortableRuntime/Tests/RepoPromptCodeMapCoreTests`.
 - Keep CodeMap decoding and raw-digest construction, validation/Git/worktree provenance, permits/cancellation, environment/performance aggregation, CAS/persistence, workspace authority, token/path/import presentation, syntax-query validation, UI/MCP, and selection-graph policy in `RepoPromptApp`. App syntax parsing retains direct `SwiftTreeSitter` linkage; it may consume immutable core grammar descriptors but must not share parser/cursor state.
@@ -166,6 +171,7 @@ The guardrail script verifies:
 
 - the shipped `RepoPrompt` executable source root contains only its entry file, declares exactly one `@main`, and the `RepoPromptApp` implementation declares none;
 - the root manifest consumes portable products from `Packages/RepoPromptPortableRuntime`, while that package owns `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptDomainRuntime`, their tests, and the new runtime/model/API targets without any upward dependency; the domain runtime remains AppKit/MainActor/provider/workspace-authority free, and app composition registers directly with its canonical registry without a compatibility facade; the CodeMap core owns grammar/scanner edges while the app retains direct `SwiftTreeSitter` syntax/query linkage;
+- the root dependency graph contains no Server package or Server-only dependency, while the nested Server manifest uses only the local portable-package path; `RepoPromptServerHost` cannot import/depend on HTTP and the private helper cannot link portal resources;
 - `Package.swift` keeps the `RepoPrompt` executable as a thin dependency on the internal `RepoPromptApp` target at `Sources/RepoPrompt`;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
@@ -198,6 +204,11 @@ Run the smallest focused validation that covers your change, then broaden as nee
 ```bash
 make dev-swift-build PRODUCT=RepoPrompt
 make dev-swift-build PRODUCT=repoprompt-mcp
+make dev-portable-build
+make dev-portable-test
+make dev-server-build PRODUCT=RepoPromptServer
+make dev-server-build PRODUCT=repoprompt-mcp-headless-runtime
+make dev-server-test
 make dev-test FILTER=CodexIntegrationConfigurationTests
 make dev-test FILTER=WorkspaceFileContextStoreTests
 make dev-test

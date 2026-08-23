@@ -3,6 +3,7 @@ import Foundation
 import Logging
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptHeadlessLaunchBridge
 import RepoPromptShared
 import ServiceLifecycle
 import SystemPackage
@@ -3599,16 +3600,6 @@ if case let .policyAdministration(arguments) = mode {
     await exit(RuntimePolicyAdministration.run(arguments: arguments))
 }
 
-if DirectHeadlessChildBridge.isRequested() {
-    do {
-        try await DirectHeadlessChildBridge.run()
-        exit(MCPCLIExitCode.ok.rawValue)
-    } catch {
-        fputs("RepoPrompt MCP private child bridge: \(error)\n", stderr)
-        exit(MCPCLIExitCode.connectionFailed.rawValue)
-    }
-}
-
 if case .proxy = mode {
     // Proxy/direct MCP mode is for a host-owned pipe or socket. Keep the ordinary terminal
     // help behavior independent of the selected backend, including an explicit `auto` path.
@@ -3682,10 +3673,9 @@ if case let .exec(options) = mode {
 
 if resolvedBackend == .headless {
     do {
-        try await DirectHeadlessMCPService(logger: log).run()
-        exit(MCPCLIExitCode.ok.rawValue)
+        try RepoPromptHeadlessLaunchBridge.replaceCurrentProcess()
     } catch {
-        fputs("RepoPrompt MCP headless: \(error)\n", stderr)
+        fputs("RepoPrompt MCP headless launcher: \(error)\n", stderr)
         exit(MCPCLIExitCode.unknownError.rawValue)
     }
 }

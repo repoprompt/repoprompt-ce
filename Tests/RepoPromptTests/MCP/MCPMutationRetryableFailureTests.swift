@@ -224,7 +224,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
     }
 
     func testCloseTabRepairsBoundNonActiveContextAfterCommit() throws {
-        let source = try Self.source("Sources/RepoPromptMCP/DirectHeadlessWorkspaceBackends.swift")
+        let source = try Self.source("Packages/RepoPromptServer/Sources/RepoPromptServerHost/DirectHeadlessWorkspaceBackends.swift")
         let body = try XCTUnwrap(source.slice(
             from: "        var selectedContextID: UUID?",
             to: "    private func resolveWorkspace("

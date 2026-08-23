@@ -29,13 +29,14 @@ require_release_sentry_symbols_when_enabled() {
     [[ -z "$nested_symlink" ]] ||
         release_sentry_symbols_fail "Sentry debug symbols must not contain symlinks: $nested_symlink" || return 1
 
-    local dsym_name executable_name dsym_dir dwarf_payload
+    local dsym_name executable_name dwarf_name dsym_dir dwarf_payload
     while (( $# > 0 )); do
         dsym_name="$1"
         executable_name="$2"
+        dwarf_name="${executable_name##*/}"
         shift 2
         dsym_dir="$symbols_dir/$dsym_name"
-        dwarf_payload="$dsym_dir/Contents/Resources/DWARF/$executable_name"
+        dwarf_payload="$dsym_dir/Contents/Resources/DWARF/$dwarf_name"
         [[ -d "$dsym_dir" && ! -L "$dsym_dir" ]] ||
             release_sentry_symbols_fail "Sentry-enabled release staging is missing required debug symbols: $dsym_dir" ||
             return 1
@@ -95,13 +96,18 @@ verify_release_sentry_symbol_uuids_before_signing() {
     command -v "$dwarfdump_bin" >/dev/null 2>&1 ||
         release_sentry_symbols_fail "Missing required command: $dwarfdump_bin" || return 1
 
-    local dsym_name executable_name dwarf_payload staged_executable symbol_uuids executable_uuids
+    local dsym_name executable_name dwarf_name dwarf_payload staged_executable symbol_uuids executable_uuids
     while (( $# > 0 )); do
         dsym_name="$1"
         executable_name="$2"
+        dwarf_name="${executable_name##*/}"
         shift 2
-        dwarf_payload="$symbols_dir/$dsym_name/Contents/Resources/DWARF/$executable_name"
-        staged_executable="$app_bundle/Contents/MacOS/$executable_name"
+        dwarf_payload="$symbols_dir/$dsym_name/Contents/Resources/DWARF/$dwarf_name"
+        if [[ "$executable_name" == */* ]]; then
+            staged_executable="$app_bundle/$executable_name"
+        else
+            staged_executable="$app_bundle/Contents/MacOS/$executable_name"
+        fi
         [[ -f "$staged_executable" && ! -L "$staged_executable" ]] ||
             release_sentry_symbols_fail "Missing staged executable for Sentry UUID validation: $executable_name" ||
             return 1

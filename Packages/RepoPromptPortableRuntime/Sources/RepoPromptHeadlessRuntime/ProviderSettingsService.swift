@@ -52,6 +52,8 @@ public actor ProviderSettingsService {
 
     private struct SanitizedAuthenticationDocument: Decodable {
         let authenticated: Bool
+        let method: ProviderAuthenticationMethod?
+        let expiresAt: Date?
     }
 
     private struct ExternalAuthenticationValidation {
@@ -80,6 +82,7 @@ public actor ProviderSettingsService {
     private var directConfigurations: [ProviderSettingsID: DirectProviderConfiguration] = [:]
     private var connections: [ProviderSettingsID: StoredProviderConnection] = [:]
     private var managedAuthFlowCapabilities: [ProviderSettingsID: [ProviderManagedAuthenticationFlowCapability]] = [:]
+    private var managedAccountSummaries: [ProviderSettingsID: ProviderManagedAccountSummary] = [:]
     private var authFlowContexts: [UUID: AuthFlowContext] = [:]
     private var statusRefreshTasks: [ProviderSettingsID: Task<Void, Never>] = [:]
     private var statusRefreshedAt: [ProviderSettingsID: Date] = [:]
@@ -388,6 +391,18 @@ public actor ProviderSettingsService {
         return status
     }
 
+    public func startAuthFlow(
+        providerID: ProviderSettingsID,
+        request: ProviderManagedAuthenticationStartInput,
+        attribution: ProviderMutationAttribution
+    ) async throws -> ProviderManagedAuthenticationTransaction {
+        try await startAuthFlow(
+            providerID: providerID,
+            kind: request.kind,
+            attribution: attribution
+        )
+    }
+
     public func pollAuthFlow(flowID: UUID, ownerID: String) async throws -> ProviderManagedAuthenticationTransaction {
         let status = try await authFlows.poll(flowID: flowID, ownerID: ownerID)
         guard status.state != .pending else { return status }
@@ -531,6 +546,14 @@ public actor ProviderSettingsService {
         return try snapshot(for: providerID)
     }
 
+    public func connect(
+        providerID: ProviderSettingsID,
+        request: ProviderConnectionInput,
+        attribution: ProviderMutationAttribution
+    ) async throws -> ProviderSettingsSnapshot {
+        try await connect(providerID: providerID, input: request, attribution: attribution)
+    }
+
     public func testConnection(providerID: ProviderSettingsID, attribution: ProviderMutationAttribution) async throws -> ProviderSettingsSnapshot {
         guard let stored = connections[providerID] else {
             throw ServiceAPIError(code: .notFound, message: "Provider connection is not configured")
@@ -656,6 +679,7 @@ public actor ProviderSettingsService {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Codex did not retain the completed server authentication")
         }
         let label = try safeLabel(accountLabel)
+        managedAccountSummaries[context.providerID] = await managedAuthentication.accountSummary(providerID: context.providerID)
         let now = Date()
         let record = ProviderConnectionRecord(
             connectionID: current?.record.connectionID ?? UUID(),
@@ -692,6 +716,14 @@ public actor ProviderSettingsService {
     private func reconcileManagedAuthentication(attribution: ProviderMutationAttribution) async throws {
         let providerID = ProviderSettingsID.codex
         let state = await managedAuthentication.authenticationState(providerID: providerID)
+        switch state {
+        case .authenticated:
+            managedAccountSummaries[providerID] = await managedAuthentication.accountSummary(providerID: providerID)
+        case .notAuthenticated:
+            managedAccountSummaries[providerID] = nil
+        case .unavailable:
+            break
+        }
         let current = connections[providerID]
         if current == nil, case let .authenticated(accountLabel) = state {
             let now = Date()
@@ -898,7 +930,7 @@ public actor ProviderSettingsService {
         }
 
         if providerID == .openCodeACP || providerID == .cursorACP || providerID == .grokBuildACP {
-            let capability = await adapter.preflight(kind: kind)
+            let capability = await adapter.recoveryPreflight(kind: kind)
             let valid = capability.enabled && capability.reasonUnavailable == nil
             let name = switch providerID {
             case .openCodeACP: "OpenCode"
@@ -987,7 +1019,7 @@ public actor ProviderSettingsService {
         }
         let task = Task { [weak self] in
             guard let self else { return }
-            await performProviderStatusRefresh(providerID: statusID)
+            await performProviderStatusRefresh(providerID: statusID, forceRuntimeProbe: force)
         }
         statusRefreshTasks[statusID] = task
         await task.value
@@ -995,7 +1027,7 @@ public actor ProviderSettingsService {
         statusRefreshedAt[statusID] = Date()
     }
 
-    private func performProviderStatusRefresh(providerID: ProviderSettingsID) async {
+    private func performProviderStatusRefresh(providerID: ProviderSettingsID, forceRuntimeProbe: Bool) async {
         guard let kind = providerID.runtimeKind,
               let configuration = configurations[kind]
         else { return }
@@ -1004,7 +1036,7 @@ public actor ProviderSettingsService {
             await refreshManagedAuthenticationCapabilities(providerID: providerID, forceRefresh: true)
             try? await reconcileManagedAuthentication(attribution: Self.lifecycleAttribution)
         }
-        await refreshRuntimePreflight(providerID: providerID, kind: kind)
+        await refreshRuntimePreflight(providerID: providerID, kind: kind, force: forceRuntimeProbe)
         if providerID == .codex,
            (try? snapshot(for: providerID).preflight.ready) == true,
            let models = try? await managedAuthentication.discoverModelCatalog(providerID: providerID, forceRefresh: false)
@@ -1052,8 +1084,12 @@ public actor ProviderSettingsService {
         }
     }
 
-    private func refreshRuntimePreflight(providerID: ProviderSettingsID, kind: ProviderKind) async {
-        let capability = await adapter.preflight(kind: kind)
+    private func refreshRuntimePreflight(providerID: ProviderSettingsID, kind: ProviderKind, force: Bool = false) async {
+        let capability = if force {
+            await adapter.recoveryPreflight(kind: kind)
+        } else {
+            await adapter.preflight(kind: kind)
+        }
         runtimePreflight[providerID] = capability.enabled && capability.reasonUnavailable == nil
     }
 
@@ -1094,6 +1130,7 @@ public actor ProviderSettingsService {
             cli: providerID.isDirectAPI || providerID.runtimeKind == nil
                 ? nil
                 : cliHealth[runtimeSettingsID] ?? ProviderCLIHealth(installed: false, healthy: false, detail: "CLI health has not been checked"),
+            authentication: authenticationStatus(providerID),
             configurationPresent: configurationPresent(providerID),
             connection: connection,
             preflight: preflight,
@@ -1103,6 +1140,51 @@ public actor ProviderSettingsService {
                 deploymentAllowed: deploymentAllowed
             ),
             models: models
+        )
+    }
+
+    private func authenticationStatus(_ providerID: ProviderSettingsID) -> ProviderAuthenticationStatus {
+        if let connection = connections[providerID]?.record {
+            let expired = connection.expiresAt.map { $0 <= Date() } ?? false
+            let summary = managedAccountSummaries[providerID]
+            return ProviderAuthenticationStatus(
+                state: connection.state == .connected && !expired ? .authenticated : .attention,
+                authenticated: connection.state == .connected && !expired,
+                method: connection.authenticationMethod,
+                accountLabel: summary?.account ?? connection.accountLabel,
+                planLabel: summary?.plan,
+                authenticationLabel: summary?.authentication,
+                expiresAt: connection.expiresAt,
+                detail: expired ? "Provider credential has expired" : connection.detail
+            )
+        }
+        if let path = authenticationStatusFiles[providerID],
+           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let document = try? JSONDecoder.serviceDecoder.decode(SanitizedAuthenticationDocument.self, from: data)
+        {
+            return ProviderAuthenticationStatus(
+                state: document.authenticated ? .authenticated : .attention,
+                authenticated: document.authenticated,
+                method: document.method,
+                expiresAt: document.expiresAt,
+                detail: document.authenticated ? "Authenticated" : "Authentication requires attention"
+            )
+        }
+        if let kind = providerID.runtimeKind,
+           providerID.ownsRuntimeAdmission,
+           let source = configurations[kind]?.credentialSourceDirectory,
+           FileManager.default.fileExists(atPath: source)
+        {
+            return ProviderAuthenticationStatus(
+                state: .unknown,
+                authenticated: false,
+                detail: "Credential home is mounted; sanitized account status is unavailable"
+            )
+        }
+        return ProviderAuthenticationStatus(
+            state: .notConfigured,
+            authenticated: false,
+            detail: "Provision credentials on the server"
         )
     }
 
@@ -1317,7 +1399,19 @@ public actor ProviderSettingsService {
         deploymentAllowed: Bool
     ) -> ProviderSettingsCapabilities {
         var supported = supportedAuthenticationMethods[providerID, default: []]
-        let managedCapabilities = managedAuthFlowCapabilities[providerID, default: []]
+        let refreshedManagedCapabilities = managedAuthFlowCapabilities[providerID, default: []]
+        let managedCapabilities: [ProviderManagedAuthenticationFlowCapability] = if refreshedManagedCapabilities.isEmpty, providerID == .codex, deploymentAllowed {
+            [
+                ProviderManagedAuthenticationFlowCapability(
+                    kind: .deviceCodeBeta,
+                    displayName: "ChatGPT device authorization",
+                    startable: false,
+                    detail: "Device authorization settings remain available while RepoPrompt checks the Codex runtime."
+                )
+            ]
+        } else {
+            refreshedManagedCapabilities
+        }
         if managedCapabilities.contains(where: { $0.kind == .deviceCodeBeta })
             || (providerID == .codex && deploymentAllowed)
         {
@@ -1328,7 +1422,20 @@ public actor ProviderSettingsService {
             supportsReasoningEffort: capabilities.supportsReasoningEffort,
             supportsSpeedMode: capabilities.supportsSpeedMode,
             supportsServiceTier: capabilities.supportsServiceTier,
-            authenticationMethods: ProviderAuthenticationMethod.allCases.filter(supported.contains)
+            authenticationMethods: ProviderAuthenticationMethod.allCases.filter(supported.contains),
+            authFlows: managedCapabilities.map { capability in
+                let kind: ProviderAuthFlowKind = switch capability.kind {
+                case .browserOAuth: .browserOAuth
+                case .deviceCodeBeta: .deviceCodeBeta
+                case .externalProvisioning: .externalProvisioning
+                }
+                return ProviderAuthFlowDescriptor(
+                    kind: kind,
+                    displayName: capability.displayName,
+                    startable: capability.startable,
+                    detail: capability.detail
+                )
+            }
         )
     }
 

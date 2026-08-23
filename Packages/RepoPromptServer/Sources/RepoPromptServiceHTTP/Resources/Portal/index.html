@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    />
+    <title>RepoPrompt Server</title>
+    <link rel="icon" href="assets/repoprompt-icon.png" />
+    <link rel="stylesheet" href="assets/portal.css" />
+  </head>
+  <body>
+    <div id="auth-gate" class="auth-gate" hidden>
+      <div class="auth-card native-material">
+        <img class="app-icon" src="assets/repoprompt-icon.png" alt="" />
+        <h1 id="auth-title">RepoPrompt Server</h1>
+        <p id="auth-copy" class="auth-copy">Checking operator access…</p>
+        <form id="auth-form" hidden>
+          <label id="auth-token-field" hidden>
+            Setup token
+            <input id="auth-token" name="setupToken" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>
+            Password
+            <input
+              id="auth-password"
+              type="password"
+              name="password"
+              autocomplete="current-password"
+              required
+            />
+          </label>
+          <label id="auth-confirm-field" hidden>
+            Confirm password
+            <input
+              id="auth-password-confirm"
+              type="password"
+              name="passwordConfirmation"
+              autocomplete="new-password"
+            />
+          </label>
+          <p id="auth-error" class="auth-error" role="alert" hidden></p>
+          <button id="auth-submit" class="primary-button" type="submit">
+            Continue
+          </button>
+        </form>
+      </div>
+    </div>
+    <button class="skip-link" type="button" data-action="skip-content">
+      Skip to content
+    </button>
+    <div id="app" class="app-frame">
+      <header class="titlebar">
+        <a
+          class="titlebar-leading"
+          href="#home"
+          data-route-link
+          aria-label="RepoPrompt Server home"
+        >
+          <img class="app-icon" src="assets/repoprompt-icon.png" alt="" />
+          <span class="workspace-title">
+            <strong id="active-workspace-name">RepoPrompt Server</strong>
+            <span id="service-caption">Connecting to server…</span>
+          </span>
+        </a>
+        <div class="window-title" aria-label="Current surface">
+          <span class="status-dot" id="service-dot" aria-hidden="true"></span>
+          <span id="window-title-text">Server Portal</span>
+        </div>
+        <nav class="titlebar-actions" aria-label="Portal actions">
+          <button
+            class="icon-button"
+            id="refresh-button"
+            type="button"
+            data-action="refresh"
+            data-icon="refresh"
+            aria-label="Refresh server state"
+          ></button>
+          <a
+            class="icon-button"
+            id="settings-button"
+            data-icon="settings"
+            data-route-link
+            href="#settings/overview"
+            aria-label="Open Settings"
+          ></a>
+        </nav>
+      </header>
+
+      <div
+        id="connection-banner"
+        class="connection-banner"
+        role="status"
+        hidden
+      >
+        <span data-icon="warning" aria-hidden="true"></span>
+        <span id="connection-banner-text"></span>
+        <button type="button" class="link-button" data-action="refresh">
+          Try again
+        </button>
+      </div>
+
+      <main id="home-shell" class="agent-shell" tabindex="-1">
+        <aside
+          class="agent-sidebar native-material"
+          aria-label="Projects and sessions"
+        >
+          <section class="project-switcher" aria-labelledby="projects-heading">
+            <div class="sidebar-heading-row">
+              <div>
+                <span class="eyebrow">Workspace</span>
+                <h1 id="projects-heading">Projects</h1>
+              </div>
+              <button
+                id="new-chat-button"
+                class="small-icon-button"
+                type="button"
+                data-action="new-chat"
+                data-icon="message"
+                aria-label="Start a new chat"
+              ></button>
+            </div>
+            <div
+              id="project-list"
+              class="project-list"
+              aria-live="polite"
+            ></div>
+          </section>
+
+          <div class="session-toolbar">
+            <label class="search-control session-search-control">
+              <span data-icon="search" aria-hidden="true"></span>
+              <input
+                id="session-search"
+                type="search"
+                placeholder="Search"
+                autocomplete="off"
+                aria-label="Search sessions"
+              />
+              <button
+                id="clear-session-search"
+                class="search-clear"
+                type="button"
+                data-action="clear-session-search"
+                data-icon="close"
+                aria-label="Clear session search"
+                hidden
+              ></button>
+            </label>
+          </div>
+
+          <section class="sessions-panel" aria-labelledby="sessions-heading">
+            <div class="sessions-label-row">
+              <h2 id="sessions-heading">Sessions</h2>
+              <span id="session-count">0</span>
+            </div>
+            <div
+              id="session-list"
+              class="session-list"
+              aria-live="polite"
+              aria-busy="true"
+            ></div>
+          </section>
+
+          <div class="sidebar-footnote">
+            <span data-icon="info" aria-hidden="true"></span>
+            <p>
+              Server settings, permissions, tools, workflows, and worktrees are
+              managed from Settings.
+            </p>
+          </div>
+        </aside>
+
+        <section class="agent-detail" aria-label="Agent session">
+          <header class="agent-detail-toolbar">
+            <div class="session-title-cluster">
+              <span
+                id="session-state-dot"
+                class="session-state-dot"
+                aria-hidden="true"
+              ></span>
+              <div>
+                <h2 id="active-session-title">Select a session</h2>
+                <div id="session-metadata" class="session-metadata"></div>
+              </div>
+            </div>
+            <span id="catalog-freshness" class="freshness-label">Loading…</span>
+          </header>
+
+          <div id="main-content" class="transcript-scroll" tabindex="-1">
+            <div
+              id="transcript-status"
+              class="transcript-status"
+              role="status"
+            ></div>
+            <button
+              id="load-earlier-button"
+              class="secondary-button load-earlier-button"
+              type="button"
+              data-action="load-earlier"
+              hidden
+            >
+              Load earlier messages
+            </button>
+            <div
+              id="transcript-list"
+              class="transcript-list"
+              aria-live="polite"
+              aria-busy="true"
+            ></div>
+          </div>
+
+          <form id="composer-form" class="composer-shell" data-agent-composer>
+            <div
+              id="composer-context-usage"
+              class="composer-context-usage"
+              hidden
+            >
+              <div
+                id="composer-context-usage-ring"
+                class="context-usage-ring"
+                role="meter"
+                aria-label="Context usage"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+              >
+                <svg viewBox="0 0 18 18" aria-hidden="true">
+                  <circle class="context-usage-track" cx="9" cy="9" r="7"></circle>
+                  <circle
+                    id="composer-context-usage-progress"
+                    class="context-usage-progress"
+                    cx="9"
+                    cy="9"
+                    r="7"
+                  ></circle>
+                </svg>
+                <span id="composer-context-usage-percent">0</span>
+              </div>
+            </div>
+            <div id="new-session-options" class="new-session-options" hidden>
+              <label>
+                Provider
+                <select id="composer-provider" name="providerId"></select>
+              </label>
+              <label>
+                Model
+                <select id="composer-model" name="model"></select>
+              </label>
+              <span id="composer-capability-help" class="field-help"></span>
+            </div>
+            <label class="sr-only" for="composer-text">Message</label>
+            <textarea
+              id="composer-text"
+              name="message"
+              rows="3"
+              maxlength="64000"
+              placeholder="Ask RepoPrompt anything…"
+            ></textarea>
+            <div class="composer-footer">
+              <span
+                id="composer-message"
+                class="composer-message"
+                role="status"
+              >
+                Select a session or start a new chat.
+              </span>
+              <button
+                id="composer-submit"
+                class="composer-send-button"
+                type="submit"
+                data-icon="send"
+                aria-label="Send message"
+              ></button>
+            </div>
+          </form>
+        </section>
+      </main>
+
+      <main id="settings-shell" class="settings-shell" hidden>
+        <button
+          id="settings-drawer-backdrop"
+          class="settings-drawer-backdrop"
+          type="button"
+          data-action="close-settings-drawer"
+          aria-label="Close settings navigation"
+          tabindex="-1"
+          hidden
+        ></button>
+        <aside
+          id="settings-sidebar"
+          class="settings-sidebar native-material"
+          aria-label="Settings navigation"
+        >
+          <div class="settings-search-wrap">
+            <label class="search-control">
+              <span data-icon="search" aria-hidden="true"></span>
+              <input
+                id="settings-search"
+                data-action="settings-search"
+                type="search"
+                placeholder="Search Settings"
+                autocomplete="off"
+                aria-label="Search settings"
+                aria-controls="settings-nav"
+                aria-describedby="settings-search-status"
+              />
+              <button
+                id="clear-settings-search"
+                class="search-clear"
+                type="button"
+                data-action="clear-settings-search"
+                data-icon="close"
+                aria-label="Clear settings search"
+                hidden
+              ></button>
+            </label>
+          </div>
+          <nav
+            id="settings-nav"
+            class="settings-nav"
+            aria-label="Settings sections"
+          >
+            <section data-settings-section>
+              <h2>Agent Mode</h2>
+              <a
+                href="#settings/overview"
+                data-route="overview"
+                data-route-link
+                data-icon="agent"
+                >Overview</a
+              >
+              <a
+                href="#settings/cli-providers"
+                data-route="cli-providers"
+                data-route-link
+                data-icon="terminal"
+                >CLI Providers</a
+              >
+              <a
+                href="#settings/agent-models"
+                data-route="agent-models"
+                data-route-link
+                data-icon="brain"
+                >Agent Models</a
+              >
+              <a
+                href="#settings/agent-permissions"
+                data-route="agent-permissions"
+                data-route-link
+                data-icon="shield"
+                >Agent Permissions</a
+              >
+              <a
+                href="#settings/agent-workflows"
+                data-route="agent-workflows"
+                data-route-link
+                data-icon="bolt"
+                >Agent Workflows</a
+              >
+              <a
+                href="#settings/context-builder"
+                data-route="context-builder"
+                data-route-link
+                data-icon="sparkles"
+                >Context Builder</a
+              >
+            </section>
+            <section data-settings-section>
+              <h2>General</h2>
+              <a
+                href="#settings/portal-appearance"
+                data-route="portal-appearance"
+                data-route-link
+                data-icon="appearance"
+                >Portal Appearance</a
+              >
+              <a
+                href="#settings/advanced"
+                data-route="advanced"
+                data-route-link
+                data-icon="sliders"
+                >Advanced</a
+              >
+            </section>
+            <section data-settings-section>
+              <h2>MCP Server</h2>
+              <a
+                href="#settings/mcp-server"
+                data-route="mcp-server"
+                data-route-link
+                data-icon="server"
+                >MCP Server</a
+              >
+              <a
+                href="#settings/mcp-tools"
+                data-route="mcp-tools"
+                data-route-link
+                data-icon="sliders"
+                >Tools</a
+              >
+              <a
+                href="#settings/workspace-approvals"
+                data-route="workspace-approvals"
+                data-route-link
+                data-icon="shield"
+                >Workspace Approvals</a
+              >
+              <a
+                href="#settings/model-presets"
+                data-route="model-presets"
+                data-route-link
+                data-icon="model"
+                >Model Presets</a
+              >
+            </section>
+            <section data-settings-section>
+              <h2>Models &amp; Providers</h2>
+              <a
+                href="#settings/api-providers"
+                data-route="api-providers"
+                data-route-link
+                data-icon="key"
+                >API Providers</a
+              >
+              <a
+                href="#settings/openrouter"
+                data-route="openrouter"
+                data-route-link
+                data-icon="network"
+                >OpenRouter</a
+              >
+              <a
+                href="#settings/custom-api"
+                data-route="custom-api"
+                data-route-link
+                data-icon="server"
+                >Custom API</a
+              >
+              <a
+                href="#settings/model-config"
+                data-route="model-config"
+                data-route-link
+                data-icon="sliders"
+                >Model Config</a
+              >
+            </section>
+            <section data-settings-section>
+              <h2>Workspaces</h2>
+              <a
+                href="#settings/manage-workspaces"
+                data-route="manage-workspaces"
+                data-route-link
+                data-icon="stack"
+                >Manage Workspaces</a
+              >
+              <a
+                href="#settings/manage-presets"
+                data-route="manage-presets"
+                data-route-link
+                data-icon="listStar"
+                >Manage Presets</a
+              >
+            </section>
+            <p id="settings-no-results" class="settings-no-results" hidden>
+              No settings found. Try different search terms.
+            </p>
+            <p
+              id="settings-search-status"
+              class="sr-only"
+              role="status"
+              aria-live="polite"
+            ></p>
+          </nav>
+        </aside>
+        <section class="settings-detail">
+          <div class="settings-detail-toolbar">
+            <div class="settings-toolbar-leading">
+              <button
+                id="settings-drawer-toggle"
+                class="settings-drawer-toggle"
+                type="button"
+                data-action="toggle-settings-drawer"
+                data-icon="sidebar"
+                aria-label="Open settings navigation"
+                aria-controls="settings-sidebar"
+                aria-expanded="false"
+              ></button>
+              <a class="back-link" href="#home" data-route-link
+                ><span data-icon="back"></span>Server Portal</a
+              >
+            </div>
+            <span id="settings-detail-title">Overview</span>
+            <span
+              id="settings-save-status"
+              class="freshness-label settings-save-status"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              >No changes saved yet</span
+            >
+          </div>
+          <div class="settings-scroll" id="settings-main-content" tabindex="-1">
+            <div
+              id="settings-content"
+              class="settings-content"
+              aria-live="polite"
+              aria-busy="true"
+            ></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="confirm-dialog" class="modal-backdrop" role="presentation" hidden>
+      <section
+        class="confirm-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-title"
+        aria-describedby="confirm-message"
+        tabindex="-1"
+      >
+        <div class="dialog-icon" data-icon="warning" aria-hidden="true"></div>
+        <h2 id="confirm-title">Confirm action</h2>
+        <p id="confirm-message"></p>
+        <div class="dialog-actions">
+          <button
+            type="button"
+            class="secondary-button"
+            data-action="cancel-confirm"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            id="confirm-action-button"
+            class="danger-button"
+            data-action="accept-confirm"
+          >
+            Continue
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div
+      id="toast-region"
+      class="toast-region"
+      aria-live="polite"
+      aria-atomic="false"
+    ></div>
+    <div
+      id="announcer"
+      class="sr-only"
+      aria-live="assertive"
+      aria-atomic="true"
+    ></div>
+    <script src="assets/portal.js" defer></script>
+  </body>
+</html>

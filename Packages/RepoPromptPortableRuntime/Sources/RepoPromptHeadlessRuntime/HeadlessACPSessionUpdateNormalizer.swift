@@ -5,8 +5,8 @@ import RepoPromptRuntimeModel
 
 /// Linux projection of Desktop `CursorACPEventNormalizer` + `ACPDefaultSessionUpdateNormalizer`.
 /// Cursor extension methods (`cursor/ask_question`, plans, todos) stay rejected, matching Desktop.
-enum HeadlessACPSessionUpdateNormalizer {
-    static func normalize(_ data: Data) throws -> [ProviderRuntimeEvent] {
+public enum HeadlessACPSessionUpdateNormalizer {
+    public static func normalize(_ data: Data) throws -> [ProviderRuntimeEvent] {
         guard let frame = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
         let method = frame["method"] as? String ?? ""
         let params = frame["params"] as? [String: Any] ?? [:]
@@ -21,7 +21,7 @@ enum HeadlessACPSessionUpdateNormalizer {
         return normalizeSessionUpdate(update)
     }
 
-    static func normalizeSessionUpdate(_ update: [String: Any]) -> [ProviderRuntimeEvent] {
+    public static func normalizeSessionUpdate(_ update: [String: Any]) -> [ProviderRuntimeEvent] {
         let type = (update["sessionUpdate"] as? String ?? "").lowercased()
         switch type {
         case "agent_message_chunk":
@@ -49,7 +49,7 @@ enum HeadlessACPSessionUpdateNormalizer {
     /// Desktop `ACPAgentSessionController.messageStopResult`: Grok Build carries
     /// usage under `_meta.usage` with the same field names; top-level `usage`
     /// remains the preferred ACP-standard location.
-    static func contextUsageFromPromptResult(_ result: [String: Any]) -> ContextUsageWireSnapshot? {
+    public static func contextUsageFromPromptResult(_ result: [String: Any]) -> ContextUsageWireSnapshot? {
         let usage = (result["usage"] as? [String: Any])
             ?? ((result["_meta"] as? [String: Any])?["usage"] as? [String: Any])
         let inputTokens = intValue(usage?["inputTokens"])
@@ -119,7 +119,7 @@ enum HeadlessACPSessionUpdateNormalizer {
         return adapted
     }
 
-    static func normalizedToolName(from payload: [String: Any]) -> String {
+    public static func normalizedToolName(from payload: [String: Any]) -> String {
         if let parenthesized = repoPromptToolName(fromTitle: firstString(in: payload, keys: ["title"])) {
             return parenthesized
         }

@@ -1,0 +1,112 @@
+name: Server Runtime
+
+on:
+  pull_request:
+    paths:
+      - "Packages/RepoPromptServer/**"
+      - "Packages/RepoPromptPortableRuntime/**"
+      - "Dockerfile.server"
+      - "Package.swift"
+      - "Package.resolved"
+      - "Makefile"
+      - "Scripts/conductor.py"
+      - "Scripts/source_layout_guardrails.sh"
+      - "Scripts/package_app.sh"
+      - "Scripts/build_swiftpm_release_products.sh"
+      - "Scripts/validate_private_headless_helper.sh"
+      - "Scripts/test_conductor_lifecycle.py"
+      - ".github/workflows/server-runtime.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Packages/RepoPromptServer/**"
+      - "Packages/RepoPromptPortableRuntime/**"
+      - "Dockerfile.server"
+      - "Package.swift"
+      - "Package.resolved"
+      - "Makefile"
+      - "Scripts/conductor.py"
+      - "Scripts/source_layout_guardrails.sh"
+      - "Scripts/package_app.sh"
+      - "Scripts/build_swiftpm_release_products.sh"
+      - "Scripts/validate_private_headless_helper.sh"
+      - "Scripts/test_conductor_lifecycle.py"
+      - ".github/workflows/server-runtime.yml"
+
+concurrency:
+  group: server-runtime-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Server package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Restore Server SwiftPM cache
+        uses: actions/cache@v6
+        with:
+          path: Packages/RepoPromptServer/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-server-${{ hashFiles('Packages/RepoPromptServer/Package.swift', 'Packages/RepoPromptServer/Package.resolved', 'Packages/RepoPromptPortableRuntime/Package.swift', 'Packages/RepoPromptPortableRuntime/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-server-
+
+      - name: Validate Server package boundaries
+        run: Scripts/source_layout_guardrails.sh server-imports
+
+      - name: Build Server product
+        working-directory: Packages/RepoPromptServer
+        run: swift build --product RepoPromptServer --disable-automatic-resolution
+
+      - name: Build private headless helper
+        working-directory: Packages/RepoPromptServer
+        run: swift build --product repoprompt-mcp-headless-runtime --disable-automatic-resolution
+
+      - name: Test Server package
+        working-directory: Packages/RepoPromptServer
+        run: swift test --disable-automatic-resolution
+
+  root-isolation:
+    name: Root graph isolation
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Materialize root dependency graph
+        run: swift package show-dependencies --format json > /tmp/root-dependencies.json
+
+      - name: Reject Server-only root dependencies
+        run: Scripts/source_layout_guardrails.sh root-dependencies /tmp/root-dependencies.json
+
+      - name: Build root products
+        run: |
+          swift build --product RepoPrompt --disable-automatic-resolution
+          swift build --product repoprompt-mcp --disable-automatic-resolution
+
+  container:
+    name: Server container build
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build non-publishing Server container
+        run: docker build -f Dockerfile.server .

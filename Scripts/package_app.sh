@@ -268,9 +268,20 @@ else
     phase "Building repoprompt-mcp ($CONF, host-native)"
     run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
 
+    phase "Building private headless runtime helper ($CONF, host-native)"
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build \
+        --package-path "$ROOT_DIR/Packages/RepoPromptServer" \
+        "${SWIFT_BUILD_ARGS[@]}" \
+        --product repoprompt-mcp-headless-runtime \
+        --disable-automatic-resolution
+
     phase "Resolving build artifact paths"
     echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path
     BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path)"
+    HELPER_BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build --package-path "$ROOT_DIR/Packages/RepoPromptServer" -c "$CONF" --show-bin-path)"
+fi
+if (( PUBLIC_UNIVERSAL_RELEASE )); then
+    HELPER_BUILD_DIR="$BUILD_DIR"
 fi
 if (( PUBLIC_UNIVERSAL_RELEASE )); then
     APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
@@ -281,21 +292,25 @@ else
 fi
 COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
 CLI_PATH="$BUILD_DIR/repoprompt-mcp"
+HEADLESS_HELPER_PATH="$HELPER_BUILD_DIR/repoprompt-mcp-headless-runtime"
 printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
 
-generate_sentry_debug_symbols(){
-    sentry_linking_enabled || return 0
-    phase "Generating Sentry debug symbols"
+generate_debug_symbols(){
+    phase "Generating debug symbols"
     command -v xcrun >/dev/null 2>&1 || fail "xcrun is required to generate dSYMs."
     run rm -rf "$SENTRY_SYMBOLS_DIR"
     run mkdir -p "$SENTRY_SYMBOLS_DIR"
-    for exe in "$APP_NAME" repoprompt-mcp; do
-        [[ -f "$BUILD_DIR/$exe" ]] || fail "Missing built executable for dSYM generation: $BUILD_DIR/$exe"
-        run xcrun dsymutil "$BUILD_DIR/$exe" -o "$SENTRY_SYMBOLS_DIR/$exe.dSYM"
-    done
+    if sentry_linking_enabled; then
+        for exe in "$APP_NAME" repoprompt-mcp; do
+            [[ -f "$BUILD_DIR/$exe" ]] || fail "Missing built executable for dSYM generation: $BUILD_DIR/$exe"
+            run xcrun dsymutil "$BUILD_DIR/$exe" -o "$SENTRY_SYMBOLS_DIR/$exe.dSYM"
+        done
+    fi
+    [[ -f "$HEADLESS_HELPER_PATH" ]] || fail "Missing private helper for dSYM generation: $HEADLESS_HELPER_PATH"
+    run xcrun dsymutil "$HEADLESS_HELPER_PATH" -o "$SENTRY_SYMBOLS_DIR/repoprompt-mcp-headless-runtime.dSYM"
     printf 'Sentry debug symbols: %s\n' "$SENTRY_SYMBOLS_DIR"
 }
-generate_sentry_debug_symbols
+generate_debug_symbols
 
 phase "Creating app bundle layout"
 run rm -rf "$APP_BUNDLE"
@@ -303,12 +318,16 @@ APP_BUNDLE_MATCHES_COMPAT="$(paths_same "$APP_BUNDLE" "$COMPAT_APP_BUNDLE")"
 if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
     run rm -rf "$COMPAT_APP_BUNDLE"
 fi
-run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
+run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Helpers" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
 for exe in "$APP_NAME" repoprompt-mcp; do
     [[ -x "$BUILD_DIR/$exe" ]] || fail "Missing built executable: $BUILD_DIR/$exe"
     run cp "$BUILD_DIR/$exe" "$APP_BUNDLE/Contents/MacOS/$exe"
     run chmod +x "$APP_BUNDLE/Contents/MacOS/$exe"
 done
+[[ -x "$HEADLESS_HELPER_PATH" ]] || fail "Missing built private headless runtime helper: $HEADLESS_HELPER_PATH"
+run cp "$HEADLESS_HELPER_PATH" "$APP_BUNDLE/Contents/Helpers/repoprompt-mcp-headless-runtime"
+run chmod +x "$APP_BUNDLE/Contents/Helpers/repoprompt-mcp-headless-runtime"
+run bash "$CONTROL_PLANE_SCRIPTS_DIR/validate_private_headless_helper.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" --skip-signature
 run ln -sf ../MacOS/repoprompt-mcp "$APP_BUNDLE/Contents/Resources/repoprompt-mcp"
 run ln -sf ../../MacOS/repoprompt-mcp "$APP_BUNDLE/Contents/Resources/bin/repoprompt-mcp"
 run mkdir -p "$APP_BUNDLE/Contents/Resources/Legal"
@@ -497,6 +516,7 @@ verify_signed_app_identity(){
     fi
 }
 if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
+sign_path "$APP_BUNDLE/Contents/Helpers/repoprompt-mcp-headless-runtime"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 APP_SIGN_ARGS=()
@@ -512,6 +532,7 @@ else
     sign_path "$APP_BUNDLE"
 fi
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+run bash "$CONTROL_PLANE_SCRIPTS_DIR/validate_private_headless_helper.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY"
 # The outer signature seals the resource tree but must not mutate or replace
 # OpenAI's nested Developer ID signatures. Re-run the byte/signature contract.
 run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" verify-bundle \

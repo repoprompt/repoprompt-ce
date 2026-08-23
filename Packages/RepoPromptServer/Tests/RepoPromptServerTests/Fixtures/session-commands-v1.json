@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "vectors": [
+    {"publicBody":{"type":"resumeSession","providerResumeMode":"resume"},"internalBody":{"operation":"resumeSession","providerResumeMode":"resume"}},
+    {"publicBody":{"type":"sendFollowup","text":"continue","expectedSessionRevision":2},"internalBody":{"operation":"sendFollowup","text":"continue","expectedSessionRevision":2}},
+    {"publicBody":{"type":"steerSession","text":"focus tests","targetTurnEpoch":1},"internalBody":{"operation":"steerSession","text":"focus tests","targetTurnEpoch":1}},
+    {"publicBody":{"type":"cancelSession","expectedGeneration":1},"internalBody":{"operation":"cancelSession","expectedGeneration":1}},
+    {"publicBody":{"type":"retrySession","sourceRunId":"11111111-1111-4111-8111-111111111111"},"internalBody":{"operation":"retrySession","sourceRunId":"11111111-1111-4111-8111-111111111111"}},
+    {"publicBody":{"type":"answerInteraction","interactionId":"22222222-2222-4222-8222-222222222222","expectedRevision":1,"payload":"e30="},"internalBody":{"operation":"answerInteraction","interactionId":"22222222-2222-4222-8222-222222222222","expectedRevision":1,"payload":"e30="}},
+    {"publicBody":{"type":"updateExecutionPermissions","expectedRevision":1,"executionMode":"workspaceWrite","providerSettings":{"approvalPolicy":"never"}},"internalBody":{"operation":"updateExecutionPermissions","expectedRevision":1,"executionMode":"workspaceWrite","providerSettings":{"approvalPolicy":"never"}}},
+    {"publicBody":{"type":"setSessionVisibility","expectedPolicyRevision":1,"visibility":"collaborative","collaborativeSteeringEnabled":true,"controllerUserId":"creator"},"internalBody":{"operation":"setSessionVisibility","expectedPolicyRevision":1,"visibility":"collaborative","collaborativeSteeringEnabled":true,"controllerUserId":"creator"}},
+    {"publicBody":{"type":"updateSelection","mode":"remove","expectedRevision":1,"operations":["Sources/App.swift"]},"internalBody":{"operation":"updateSelection","mode":"remove","expectedRevision":1,"operations":["Sources/App.swift"]}},
+    {"publicBody":{"type":"buildContext","expectedSelectionRevision":1,"include":["selection","code"]},"internalBody":{"operation":"buildContext","expectedSelectionRevision":1,"include":["selection","code"]}},
+    {"publicBody":{"type":"runContextBuilder","expectedSelectionRevision":1,"instructions":"summarize","budget":4096},"internalBody":{"operation":"runContextBuilder","expectedSelectionRevision":1,"instructions":"summarize","budget":4096}},
+    {"publicBody":{"type":"askOracle","prompt":"check","contextMode":"selection"},"internalBody":{"operation":"askOracle","prompt":"check","contextMode":"selection"}},
+    {"publicBody":{"type":"createWorktree","rootId":"33333333-3333-4333-8333-333333333333","baseRef":"HEAD","branchName":"contract-fixture"},"internalBody":{"operation":"createWorktree","rootId":"33333333-3333-4333-8333-333333333333","baseRef":"HEAD","branchName":"contract-fixture"}},
+    {"publicBody":{"type":"bindWorktree","bindingId":"44444444-4444-4444-8444-444444444444","expectedRevision":1},"internalBody":{"operation":"bindWorktree","bindingId":"44444444-4444-4444-8444-444444444444","expectedRevision":1}},
+    {"publicBody":{"type":"mergeWorktree","bindingId":"44444444-4444-4444-8444-444444444444","strategy":"merge","expectedRevision":1},"internalBody":{"operation":"mergeWorktree","bindingId":"44444444-4444-4444-8444-444444444444","strategy":"merge","expectedRevision":1}},
+    {"publicBody":{"type":"abortConflictedMerge","bindingId":"44444444-4444-4444-8444-444444444444","leaseId":"55555555-5555-4555-8555-555555555555","expectedRevision":2},"internalBody":{"operation":"abortConflictedMerge","bindingId":"44444444-4444-4444-8444-444444444444","leaseId":"55555555-5555-4555-8555-555555555555","expectedRevision":2}},
+    {"publicBody":{"type":"archiveSession","expectedRevision":3},"internalBody":{"operation":"archiveSession","expectedRevision":3}}
+  ]
+}

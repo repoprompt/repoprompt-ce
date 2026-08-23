@@ -509,7 +509,8 @@ def listening_unix_path(info: SocketFDInfo) -> Path | None:
         return None
     path = Path(os.fsdecode(path_bytes))
     if not path.is_absolute():
-        raise OwnershipError(f"macOS libproc returned a non-absolute UNIX socket path: {path}")
+        # Relative UNIX sockets cannot claim the canonical absolute release namespace.
+        return None
     return path
 
 

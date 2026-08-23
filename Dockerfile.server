@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.7
+FROM swift:6.2.4-noble AS build
+WORKDIR /src
+COPY Packages/RepoPromptPortableRuntime Packages/RepoPromptPortableRuntime
+COPY Packages/RepoPromptServer Packages/RepoPromptServer
+WORKDIR /src/Packages/RepoPromptServer
+RUN --mount=type=cache,target=/root/.cache/org.swift.swiftpm \
+    --mount=type=cache,target=/src/Packages/RepoPromptServer/.build \
+    swift build --disable-automatic-resolution -c release --product RepoPromptServer && \
+    bin_path="$(swift build -c release --show-bin-path)" && \
+    install -D -m 0755 "$bin_path/RepoPromptServer" /out/usr/local/bin/RepoPromptServer && \
+    find "$bin_path" -maxdepth 1 -type d -name '*.resources' -exec cp -a {} /out/usr/local/bin/ \;
+
+FROM swift:6.2.4-noble-slim
+ARG REPOPROMPT_COMMIT=unknown
+ARG REPOPROMPT_VERSION=0.1.0
+ARG SOURCE_DATE_EPOCH=1970-01-01T00:00:00Z
+LABEL org.opencontainers.image.title="RepoPromptServer" \
+      org.opencontainers.image.description="Durable internal RepoPrompt Agent and Workspace authority" \
+      org.opencontainers.image.source="https://github.com/RepoPrompt/repoprompt-ce" \
+      org.opencontainers.image.version="$REPOPROMPT_VERSION" \
+      org.opencontainers.image.revision="$REPOPROMPT_COMMIT" \
+      org.opencontainers.image.created="$SOURCE_DATE_EPOCH" \
+      io.repoprompt.protocol-version="1" \
+      io.repoprompt.schema-version="6" \
+      io.repoprompt.runtime-uid="65532" \
+      io.repoprompt.port.internal-api="9443/tcp;mtls" \
+      io.repoprompt.port.portal="9081/tcp;http-password" \
+      io.repoprompt.port.health="9080/tcp;loopback-only"
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tini util-linux && rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /var/lib/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \
+    install -d -o 65532 -g 65532 /var/lib/repoprompt/state /var/lib/repoprompt/artifacts /srv/repoprompt/projects /srv/repoprompt/worktrees /var/cache/repoprompt
+COPY --from=build /out/usr/local/bin/ /usr/local/bin/
+ENV REPOPROMPT_STATE_DB="/var/lib/repoprompt/state/repoprompt.sqlite" \
+    REPOPROMPT_ARTIFACT_DIR="/var/lib/repoprompt/artifacts" \
+    REPOPROMPT_PROJECT_DIR="/srv/repoprompt/projects" \
+    REPOPROMPT_WORKTREE_DIR="/srv/repoprompt/worktrees" \
+    REPOPROMPT_CACHE_DIR="/var/cache/repoprompt"
+USER 65532:65532
+EXPOSE 9443 9081 9080
+VOLUME ["/var/lib/repoprompt/state", "/var/lib/repoprompt/artifacts", "/srv/repoprompt/projects", "/srv/repoprompt/worktrees", "/var/cache/repoprompt"]
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=6 CMD ["curl", "-fsS", "--max-time", "3", "http://127.0.0.1:9080/health/ready"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/RepoPromptServer"]

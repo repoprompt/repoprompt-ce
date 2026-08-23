@@ -13,7 +13,7 @@ let sentryEnabled = environment["REPOPROMPT_ENABLE_SENTRY"] == "1"
 let benchmarkTestsEnabled = environment["RPCE_ENABLE_BENCHMARK_TESTS"] == "1"
 
 var packageDependencies: [Package.Dependency] = [
-    .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
+    .package(url: "https://github.com/apple/swift-log.git", exact: "1.14.0"),
     .package(url: "https://github.com/sindresorhus/KeyboardShortcuts.git", exact: "2.3.0"),
     .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", exact: "2.4.1"),
     .package(url: "https://github.com/swiftlang/swift-markdown", exact: "0.6.0"),
@@ -65,6 +65,7 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
+    "RepoPromptHeadlessLaunchBridge",
     .product(name: "RepoPromptRuntimeModel", package: "RepoPromptPortableRuntime"),
     .product(name: "RepoPromptAgentRuntimeCore", package: "RepoPromptPortableRuntime"),
     .product(name: "RepoPromptDomainRuntime", package: "RepoPromptPortableRuntime"),
@@ -109,6 +110,10 @@ let package = Package(
             path: "Sources/RepoPromptWorkspaceCore"
         ),
         .target(
+            name: "RepoPromptHeadlessLaunchBridge",
+            path: "Sources/RepoPromptHeadlessLaunchBridge"
+        ),
+        .target(
             name: "RepoPromptApp",
             dependencies: repoPromptAppDependencies,
             path: "Sources/RepoPrompt",
@@ -117,6 +122,7 @@ let package = Package(
         .executableTarget(
             name: "RepoPromptMCP",
             dependencies: [
+                "RepoPromptHeadlessLaunchBridge",
                 .product(name: "RepoPromptShared", package: "RepoPromptPortableRuntime"),
                 .product(name: "RepoPromptDomainRuntime", package: "RepoPromptPortableRuntime"),
                 .product(name: "RepoPromptCodeMapCore", package: "RepoPromptPortableRuntime"),

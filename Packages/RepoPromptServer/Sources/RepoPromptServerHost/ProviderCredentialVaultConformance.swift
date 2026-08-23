@@ -1,0 +1,4 @@
+import RepoPromptHeadlessRuntime
+import RepoPromptServicePersistence
+
+extension ProviderCredentialVault: ProviderCredentialVaulting {}

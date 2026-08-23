@@ -438,7 +438,7 @@ APP_SIGN_ARGS=(){app_signing_body}
         architecture_loop = source.split('for arch in arm64 x86_64; do', 1)[1]
         self.assertLess(source.index('run rm -rf "$SCRATCH_ROOT"'), source.index('for arch in arm64 x86_64; do'))
         self.assertLess(architecture_loop.index('"$KEYBOARD_SHORTCUTS_PATCH_HELPER"'), architecture_loop.index("swift build"))
-        self.assertEqual(source.count('"$LIPO" -create'), 2)
+        self.assertEqual(source.count('"$LIPO" -create'), 3)
         self.assertNotIn("codesign", source)
 
     def test_universal_builder_cleans_stale_resources_by_default_and_patches_each_fresh_scratch(self) -> None:
@@ -479,6 +479,7 @@ bin="$scratch/release"
 mkdir -p "$bin/Current.bundle"
 printf '%s\\n' "$arch" > "$bin/RepoPrompt"
 printf '%s\\n' "$arch" > "$bin/repoprompt-mcp"
+printf '%s\\n' "$arch" > "$bin/repoprompt-mcp-headless-runtime"
 printf 'current\\n' > "$bin/Current.bundle/value.txt"
 if (( show )); then printf '%s\\n' "$bin"; fi
 """,
@@ -986,12 +987,17 @@ esac
             for line in codesign_capture.read_text(encoding="utf-8").splitlines()
             if any(argument.startswith("--extract-certificates=") for argument in line.split("\t"))
         ]
-        self.assertEqual(len(extraction_calls), 3)
+        self.assertEqual(len(extraction_calls), 4)
         for arguments in extraction_calls:
             self.assertEqual(arguments[:2], ["-d", next(item for item in arguments if item.startswith("--extract-certificates="))])
             self.assertNotIn("--extract-certificates", arguments)
 
-        covered_paths = [app / "Contents" / "MacOS" / "RepoPrompt", app / "Contents" / "MacOS" / "repoprompt-mcp", app]
+        covered_paths = [
+            app / "Contents" / "MacOS" / "RepoPrompt",
+            app / "Contents" / "MacOS" / "repoprompt-mcp",
+            app / "Contents" / "Helpers" / "repoprompt-mcp-headless-runtime",
+            app,
+        ]
         for index, covered_path in enumerate(covered_paths):
             with self.subTest(covered_path=covered_path):
                 failure_env = env | {"FAKE_MISSING_CERTIFICATE_FOR": str(covered_path)}
@@ -3926,7 +3932,7 @@ label_generated_tip_appcast""",
             package_script,
         )
         self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift build', universal_builder)
-        self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 4)
+        self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 6)
         self.assertIn(
             '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"',
             package_script,
@@ -4186,6 +4192,7 @@ label_generated_tip_appcast""",
         paths = [
             app / "Contents" / "MacOS" / "RepoPrompt",
             app / "Contents" / "MacOS" / "repoprompt-mcp",
+            app / "Contents" / "Helpers" / "repoprompt-mcp-headless-runtime",
             app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Sparkle",
             app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Autoupdate",
             app
@@ -4230,7 +4237,7 @@ label_generated_tip_appcast""",
             """#!/usr/bin/env bash
 set -euo pipefail
 path="${@: -1}"
-if [[ "${FAKE_THIN_HELPER:-0}" == "1" && "$path" == *repoprompt-mcp ]]; then
+if [[ "${FAKE_THIN_HELPER:-0}" == "1" && "$path" == *repoprompt-mcp-headless-runtime ]]; then
     printf 'arm64\n'
 else
     printf 'arm64 x86_64\n'
@@ -4431,6 +4438,7 @@ extension Data {
             approved / "ThirdPartyLicenses" / "fixture",
             staged / "ThirdPartyLicenses" / "fixture",
             app / "Contents" / "Frameworks" / "Sparkle.framework",
+            app / "Contents" / "Helpers",
             app / "Contents" / "MacOS",
             app / "Contents" / "Resources" / "bin",
             app / "Contents" / "Resources" / "Legal" / "ThirdPartyLicenses" / "fixture",
@@ -4442,6 +4450,7 @@ extension Data {
         for name in (
             "load_release_metadata.sh",
             "validate_embedded_mcp_helper_layout.sh",
+            "validate_private_headless_helper.sh",
             "validate_app_architectures.sh",
             "write_app_artifact_manifest.py",
             "validate_packaged_legal.sh",
@@ -4492,6 +4501,14 @@ SIGNING_TEAM_ID=648A27MST5
             content = "RepoPromptKeyboardShortcutsResourceLookupV1\n" if name == "RepoPrompt" else name
             executable.write_text(content, encoding="utf-8")
             executable.chmod(0o755)
+        headless_helper = app / "Contents" / "Helpers" / "repoprompt-mcp-headless-runtime"
+        headless_helper.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"${1:-}\" == \"--print-launcher-contract-version\" ]]; then printf '1\\n'; exit 0; fi\n"
+            "exit 64\n",
+            encoding="utf-8",
+        )
+        headless_helper.chmod(0o755)
         sparkle_executables = [
             app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Sparkle",
             app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Autoupdate",

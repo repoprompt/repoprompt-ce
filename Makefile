@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-portable-build dev-portable-test dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-portable-build dev-portable-test dev-server-build dev-server-test dev-server-container-test dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 CODEX_ARCH ?= all
@@ -20,6 +20,9 @@ help:
 	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name'
 	@printf '  %-30s %s\n' 'dev-portable-build' 'Build the portable runtime package through conductor'
 	@printf '  %-30s %s\n' 'dev-portable-test' 'Test the portable runtime package; override with FILTER=name'
+	@printf '  %-30s %s\n' 'dev-server-build' 'Build an allowlisted nested Server product; override PRODUCT=name'
+	@printf '  %-30s %s\n' 'dev-server-test' 'Test the nested Server package; override FILTER=name'
+	@printf '  %-30s %s\n' 'dev-server-container-test' 'Build the canonical Server container through conductor'
 	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
 	@printf '  %-30s %s\n' 'dev-launch-existing' 'Launch existing coordinated debug app without building'
 	@printf '  %-30s %s\n' 'dev-codex-schema-check' 'Coordinated Codex app-server schema validation'
@@ -206,6 +209,15 @@ dev-portable-build:
 
 dev-portable-test:
 	./conductor portable-test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
+
+dev-server-build:
+	./conductor server-build --product $(if $(filter all,$(PRODUCT)),RepoPromptServer,$(PRODUCT))
+
+dev-server-test:
+	./conductor server-test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
+
+dev-server-container-test:
+	./conductor server-container-test
 
 dev-run:
 	./conductor run

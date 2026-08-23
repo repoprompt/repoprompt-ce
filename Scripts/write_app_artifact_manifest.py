@@ -166,11 +166,17 @@ def collect_manifest(app: Path, expected_architectures: list[str] | None) -> dic
             "Contents/MacOS/repoprompt-mcp",
             allow_adhoc_without_requirement=allow_adhoc_without_requirement,
             require_leaf_certificate=require_leaf_certificate,
+            ),
+        executable_entry(
+            app,
+            "Contents/Helpers/repoprompt-mcp-headless-runtime",
+            allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+            require_leaf_certificate=require_leaf_certificate,
         ),
     ]
     architecture_sets = {tuple(entry["architectures"]) for entry in entries}
     if len(architecture_sets) != 1:
-        fail("app and helper architecture sets differ while writing artifact manifest")
+        fail("app, public launcher, and private helper architecture sets differ while writing artifact manifest")
     actual_architectures = list(next(iter(architecture_sets)))
     if expected_architectures is not None and actual_architectures != expected_architectures:
         fail(

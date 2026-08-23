@@ -163,10 +163,12 @@ while IFS=$'\t' read -r relative_path entitlement_profile; do
         ;;
     esac
 done <<< "$codex_signing_plan"
+sign_path "$APP_BUNDLE/Contents/Helpers/repoprompt-mcp-headless-runtime"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+bash "$SCRIPT_DIR/validate_private_headless_helper.sh" "$APP_BUNDLE" "arm64,x86_64"
 python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --manifest "$CODEX_MANIFEST" verify-bundle \
     --arch all \
