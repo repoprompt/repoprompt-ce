@@ -29,17 +29,29 @@ public struct VerifiedMigrationBackup: Sendable {
     public let archiveSHA256: String
     public let manifestSHA256: String
     public let verifierFingerprint: String
+    public let recipientFingerprints: [String]
+    public let sidecarSHA256: String
+    public let toolVersion: String
+    public let toolDigest: String
 
     public init(
         source: MigrationSourceEvidence,
         archiveSHA256: String,
         manifestSHA256: String,
-        verifierFingerprint: String
+        verifierFingerprint: String,
+        recipientFingerprints: [String],
+        sidecarSHA256: String,
+        toolVersion: String,
+        toolDigest: String
     ) {
         self.source = source
         self.archiveSHA256 = archiveSHA256
         self.manifestSHA256 = manifestSHA256
         self.verifierFingerprint = verifierFingerprint
+        self.recipientFingerprints = recipientFingerprints
+        self.sidecarSHA256 = sidecarSHA256
+        self.toolVersion = toolVersion
+        self.toolDigest = toolDigest
     }
 }
 

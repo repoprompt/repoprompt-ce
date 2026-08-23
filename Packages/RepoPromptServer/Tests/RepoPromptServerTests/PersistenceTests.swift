@@ -299,7 +299,15 @@ final class PersistenceTests: XCTestCase {
             digest: "digest",
             activationToken: activationToken
         )
-        _ = try await store.activateRestoredStore(activationToken: activationToken, instanceID: UUID())
+        _ = try await store.activateRestoredStore(
+            activationToken: activationToken,
+            instanceID: UUID(),
+            maintenanceReceipt: makeTestMaintenanceReceipt(
+                storeID: prior,
+                backupSequence: 1,
+                manifestSHA256: "digest"
+            )
+        )
         let restoredIdempotency = try await store.idempotencyResult(idempotency)
         XCTAssertNil(restoredIdempotency)
         XCTAssertNotEqual(prior, fresh)

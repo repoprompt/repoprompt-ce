@@ -25,11 +25,11 @@ final class ProviderSettingsPortalTests: XCTestCase {
             serviceTier: "fast",
             revision: 1
         )
-        try await store.upsertProviderSettings(initial, expectedRevision: 0)
+        _ = try await store.upsertProviderSettings(initial, expectedRevision: 0)
         let persisted = try await store.providerSettings()
         let metadata = try await store.metadata()
         XCTAssertEqual(persisted, [initial])
-        XCTAssertEqual(metadata.schemaVersion, SchemaV7.version)
+        XCTAssertEqual(metadata.schemaVersion, SchemaV9.version)
 
         do {
             _ = try await store.upsertProviderSettings(initial, expectedRevision: 0)
@@ -320,21 +320,21 @@ final class ProviderSettingsPortalTests: XCTestCase {
     func testPortalMutationProtectionRequiresSameOriginJSONAndCustomHeader() throws {
         XCTAssertNoThrow(try RepoPromptPortalRequestProtection.validateMutation(
             origin: "https://server.example:9443",
-            host: "server.example:9443",
+            expectedOrigin: "https://server.example:9443",
             fetchSite: "same-origin",
             contentType: "application/json; charset=utf-8",
             csrfHeader: "1"
         ))
         XCTAssertThrowsError(try RepoPromptPortalRequestProtection.validateMutation(
             origin: "https://attacker.example",
-            host: "server.example:9443",
+            expectedOrigin: "https://server.example:9443",
             fetchSite: "cross-site",
             contentType: "application/json",
             csrfHeader: "1"
         ))
         XCTAssertThrowsError(try RepoPromptPortalRequestProtection.validateMutation(
             origin: "https://server.example:9443",
-            host: "server.example:9443",
+            expectedOrigin: "https://server.example:9443",
             fetchSite: nil,
             contentType: "application/x-www-form-urlencoded",
             csrfHeader: nil

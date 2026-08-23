@@ -99,7 +99,7 @@ jobs:
           swift build --product repoprompt-mcp --disable-automatic-resolution
 
   container:
-    name: Server container build
+    name: Non-publishing Server container build
     needs: package
     runs-on: ubuntu-24.04
     steps:
@@ -109,4 +109,7 @@ jobs:
           persist-credentials: false
 
       - name: Build non-publishing Server container
-        run: docker build -f Dockerfile.server .
+        run: docker build --tag repoprompt-server-private-pilot:test -f Dockerfile.server .
+
+      - name: Assert private-pilot distribution remains disabled
+        run: test "$(docker image inspect --format '{{ index .Config.Labels "io.repoprompt.distribution" }}' repoprompt-server-private-pilot:test)" = "private-pilot-non-publishing"

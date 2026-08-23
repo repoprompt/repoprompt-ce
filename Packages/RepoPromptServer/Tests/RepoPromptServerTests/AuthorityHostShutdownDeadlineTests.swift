@@ -49,7 +49,7 @@ final class AuthorityHostShutdownDeadlineTests: XCTestCase {
                 },
                 operationOverride: { phase in
                     switch phase {
-                    case .providerQuiesce, .directRuntimeDrain, .durabilityStop, .durabilitySweep:
+                    case .providerQuiesce, .directRuntimeDrain, .durabilityStop, .durabilitySweep, .eventOutboxDrain:
                         { @Sendable in }
                     default:
                         nil

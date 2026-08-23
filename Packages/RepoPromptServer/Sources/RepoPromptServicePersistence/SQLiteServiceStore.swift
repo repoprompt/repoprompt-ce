@@ -438,7 +438,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 message: "Authority store metadata is missing or ambiguous"
             )
         }
-        if metadataVersion > SchemaV8.version {
+        if metadataVersion > SchemaV9.version {
             throw ServiceAPIError(
                 code: .forwardSchemaUnsupported,
                 message: "Authority store schema is newer than this binary",
@@ -446,7 +446,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             )
         }
         try await validateMigrationLedger(metadataVersion: metadataVersion)
-        guard metadataVersion == SchemaV8.version else {
+        guard metadataVersion == SchemaV9.version else {
             throw ServiceAPIError(
                 code: .migrationRequired,
                 message: "Authority store requires offline migration before serving",
@@ -465,6 +465,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             allowDatabaseRebind: allowPendingRestoreRebind && restoreRequestExists
         )
         try await SchemaV8.validate(using: database)
+        try await SchemaV9.validate(using: database)
     }
 
     private enum ExistingStorePreflight {
@@ -2070,22 +2071,50 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         return fresh
     }
 
-    public func activateRestoredStore(activationToken: Data, instanceID: UUID) async throws -> UUID {
-        try await transaction(.interactive(estimatedEncodedBytes: activationToken.count)) {
-            let row = try await requireRow(database.query("SELECT store_id,activation_state,activation_token_digest FROM service_metadata WHERE fixed_id=1"))
-            guard row.column("activation_state")?.string == "restore_prepared",
-                  row.column("activation_token_digest")?.string == PersistenceCryptography.bodyDigest(activationToken)
-            else {
-                throw ServiceAPIError(code: .quiescing, message: "Restored store activation is fenced")
+    public func activateRestoredStore(
+        activationToken: Data,
+        instanceID: UUID,
+        maintenanceReceipt: MaintenanceReceiptEvidence,
+        correlationID: UUID = UUID(),
+        now: Date = Date(),
+        faultInjector: (@Sendable (String) throws -> Void)? = nil
+    ) async throws -> UUID {
+        do {
+            return try await transaction(.interactive(estimatedEncodedBytes: activationToken.count)) {
+                let row = try await requireRow(database.query("SELECT store_id,restored_from_store_id,restore_backup_sequence,restore_digest,activation_state,activation_token_digest FROM service_metadata WHERE fixed_id=1"))
+                guard row.column("activation_state")?.string == "restore_prepared",
+                      row.column("activation_token_digest")?.string == PersistenceCryptography.bodyDigest(activationToken),
+                      row.column("restored_from_store_id")?.string == maintenanceReceipt.source.storeID.uuidString,
+                      row.column("restore_backup_sequence")?.integer == Int(maintenanceReceipt.source.nextGlobalSequence),
+                      row.column("restore_digest")?.string == maintenanceReceipt.manifestSHA256
+                else {
+                    throw ServiceAPIError(code: .quiescing, message: "Restored store activation is fenced")
+                }
+                let storeID = try requireUUID(row.column("store_id")?.string)
+                _ = try await database.query(
+                    "UPDATE service_metadata SET activation_state='active',activation_token_digest=NULL,activation_instance_id=?,last_clean_shutdown=0 WHERE fixed_id=1 AND activation_state='restore_prepared'",
+                    [.text(instanceID.uuidString)]
+                )
+                try faultInjector?("after-activation-before-receipt")
+                try await insertMaintenanceReceipt(
+                    operation: "restorePrepare",
+                    outcome: "success",
+                    evidence: maintenanceReceipt,
+                    correlationID: correlationID,
+                    now: now
+                )
+                let payload = try encodeText(["storeId": storeID.uuidString, "instanceId": instanceID.uuidString])
+                _ = try await database.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_activated',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(payload)])
+                return storeID
             }
-            let storeID = try requireUUID(row.column("store_id")?.string)
-            _ = try await database.query(
-                "UPDATE service_metadata SET activation_state='active',activation_token_digest=NULL,activation_instance_id=?,last_clean_shutdown=0 WHERE fixed_id=1 AND activation_state='restore_prepared'",
-                [.text(instanceID.uuidString)]
+        } catch {
+            try? await appendOperatorSecurityAudit(
+                operation: "restorePrepare", outcome: "failure",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "restoreActivationRolledBack", now: now
             )
-            let payload = try encodeText(["storeId": storeID.uuidString, "instanceId": instanceID.uuidString])
-            _ = try await database.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_activated',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(payload)])
-            return storeID
+            throw error
         }
     }
 
@@ -2102,12 +2131,25 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         targetDatabaseIdentityDigest: String,
         missingExternalOptionalAssetIDs: [String] = [],
         activationToken: Data,
-        instanceID: UUID
+        instanceID: UUID,
+        maintenanceReceipt: MaintenanceReceiptEvidence,
+        correlationID: UUID = UUID(),
+        now: Date = Date(),
+        faultInjector: (@Sendable (String) throws -> Void)? = nil
     ) async throws -> UUID {
         guard !activationToken.isEmpty,
               sourceNamespaceKind == targetNamespaceKind,
-              sourceDatabaseIdentityDigest != targetDatabaseIdentityDigest
+              sourceDatabaseIdentityDigest != targetDatabaseIdentityDigest,
+              maintenanceReceipt.source.storeID == priorStoreID,
+              maintenanceReceipt.source.nextGlobalSequence == backupSequence,
+              maintenanceReceipt.manifestSHA256 == manifestDigest
         else {
+            try? await appendOperatorSecurityAudit(
+                operation: "restorePrepare", outcome: "failure",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "restoreRequestRejected", now: now
+            )
             throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Restore namespace rebind request is invalid")
         }
         let current = try await metadata()
@@ -2118,10 +2160,24 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             let restoredFrom = try await database.query(
                 "SELECT restored_from_store_id FROM service_metadata WHERE fixed_id=1"
             ).first?.column("restored_from_store_id")?.string.flatMap(UUID.init(uuidString:))
+            let receiptExists = try await database.query(
+                "SELECT 1 FROM maintenance_receipts WHERE operation='restorePrepare' AND archive_sha256=? AND manifest_sha256=? AND source_store_id=? LIMIT 1",
+                [
+                    .text(maintenanceReceipt.archiveSHA256), .text(maintenanceReceipt.manifestSHA256),
+                    .text(priorStoreID.uuidString.lowercased()),
+                ]
+            ).first != nil
             guard restoredFrom == priorStoreID,
                   namespaceRow.column("namespace_kind")?.string == targetNamespaceKind,
-                  namespaceRow.column("database_identity_digest")?.string == targetDatabaseIdentityDigest
+                  namespaceRow.column("database_identity_digest")?.string == targetDatabaseIdentityDigest,
+                  receiptExists
             else {
+                try? await appendOperatorSecurityAudit(
+                    operation: "restorePrepare", outcome: "failure",
+                    actor: "operator-maintenance", channel: "offline",
+                    clientIdentityDigest: nil, correlationID: correlationID,
+                    detailCode: "restoreReplayProvenanceRejected", now: now
+                )
                 throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Restore activation provenance does not match")
             }
             return current.storeID
@@ -2130,6 +2186,12 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
               namespaceRow.column("namespace_kind")?.string == sourceNamespaceKind,
               namespaceRow.column("database_identity_digest")?.string == sourceDatabaseIdentityDigest
         else {
+            try? await appendOperatorSecurityAudit(
+                operation: "restorePrepare", outcome: "failure",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "restoreNamespaceIdentityRejected", now: now
+            )
             throw ServiceAPIError(code: .namespacePurposeMismatch, message: "Archived namespace identity does not match the restored store")
         }
 
@@ -2161,7 +2223,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             projects,
             additional: additionalRetainedBytes
         )
-        return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
+        do {
+            return try await transaction(.bulk(estimatedEncodedBytes: retainedBytes)) {
             _ = try await database.query(
                 "UPDATE service_metadata SET restored_from_store_id=store_id,store_id=?,restore_backup_sequence=?,restore_digest=?,replay_floor=?,next_global_sequence=?,last_clean_shutdown=0,activation_state='active',activation_generation=activation_generation+1,activation_token_digest=NULL,activation_instance_id=? WHERE fixed_id=1 AND store_id=?",
                 [.text(fresh.uuidString), .integer(Int(backupSequence)), .text(manifestDigest), .integer(Int(restoredFloor)), .integer(Int(restoredFloor + 1)), .text(instanceID.uuidString), .text(priorStoreID.uuidString)]
@@ -2169,6 +2232,14 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             _ = try await database.query(
                 "UPDATE authority_namespace_identity SET database_identity_digest=? WHERE fixed_id=1 AND namespace_kind=? AND database_identity_digest=?",
                 [.text(targetDatabaseIdentityDigest), .text(targetNamespaceKind), .text(sourceDatabaseIdentityDigest)]
+            )
+            try faultInjector?("after-activation-before-receipt")
+            try await insertMaintenanceReceipt(
+                operation: "restorePrepare",
+                outcome: "success",
+                evidence: maintenanceReceipt,
+                correlationID: correlationID,
+                now: now
             )
             _ = try await database.query(
                 "UPDATE idempotency_records SET idempotency_key=? || idempotency_key",
@@ -2201,15 +2272,38 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             ])
             try await saveCheckpoint(scope: "store:\(fresh.uuidString):restore", sequence: restoredFloor, snapshot: Data(provenance.utf8), retentionClass: "restore")
             _ = try await database.query("INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'store.restore_activated',?,CURRENT_TIMESTAMP)", [.text(UUID().uuidString), .text(provenance)])
-            return fresh
+                return fresh
+            }
+        } catch {
+            try? await appendOperatorSecurityAudit(
+                operation: "restorePrepare", outcome: "failure",
+                actor: "operator-maintenance", channel: "offline",
+                clientIdentityDigest: nil, correlationID: correlationID,
+                detailCode: "restoreActivationRolledBack", now: now
+            )
+            throw error
         }
     }
 
     @available(*, deprecated, message: "Use prepareRestoredStore and activateRestoredStore for operator-acknowledged activation")
-    public func markRestored(from priorStoreID: UUID, backupSequence: Int64, digest: String) async throws -> UUID {
+    public func markRestored(
+        from priorStoreID: UUID,
+        backupSequence: Int64,
+        digest: String,
+        maintenanceReceipt: MaintenanceReceiptEvidence
+    ) async throws -> UUID {
         let token = Data(UUID().uuidString.utf8)
-        let fresh = try await prepareRestoredStore(from: priorStoreID, backupSequence: backupSequence, digest: digest, activationToken: token)
-        _ = try await activateRestoredStore(activationToken: token, instanceID: UUID())
+        let fresh = try await prepareRestoredStore(
+            from: priorStoreID,
+            backupSequence: backupSequence,
+            digest: digest,
+            activationToken: token
+        )
+        _ = try await activateRestoredStore(
+            activationToken: token,
+            instanceID: UUID(),
+            maintenanceReceipt: maintenanceReceipt
+        )
         return fresh
     }
 
@@ -2779,6 +2873,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             databaseIdentityDigest: databaseIdentityDigest
         )
         try await applySchemaV8()
+        try await applySchemaV9(verifiedBackup: nil)
     }
 
     public func migrateToLatest(
@@ -2794,9 +2889,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 retryable: false
             )
         }
-        guard !verifiedBackup.archiveSHA256.isEmpty,
-              !verifiedBackup.manifestSHA256.isEmpty,
-              !verifiedBackup.verifierFingerprint.isEmpty
+        guard verifiedBackup.archiveSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              verifiedBackup.manifestSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              verifiedBackup.sidecarSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              verifiedBackup.toolDigest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+              !verifiedBackup.verifierFingerprint.isEmpty,
+              !verifiedBackup.recipientFingerprints.isEmpty,
+              !verifiedBackup.toolVersion.isEmpty
         else {
             throw ServiceAPIError(
                 code: .invalidRequest,
@@ -2806,13 +2905,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
         do {
             var version = before.schemaVersion
-            if version > SchemaV8.version {
+            if version > SchemaV9.version {
                 throw ServiceAPIError(
                     code: .forwardSchemaUnsupported,
                     message: "Authority store schema is newer than this maintenance tool"
                 )
             }
-            if version == SchemaV8.version {
+            if version == SchemaV9.version {
                 try await validateNamespaceIdentity(
                     requestedKind: namespaceKind,
                     requestedDatabaseIdentityDigest: databaseIdentityDigest,
@@ -2832,7 +2931,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 )
                 version = SchemaV7.version
             }
-            if version < SchemaV8.version { try await applySchemaV8() }
+            if version < SchemaV8.version {
+                try await applySchemaV8()
+                version = SchemaV8.version
+            }
+            if version < SchemaV9.version {
+                try await applySchemaV9(verifiedBackup: verifiedBackup)
+            }
         } catch let error as SQLiteError {
             switch error.reason {
             case .busy, .busyInRecovery, .busyInSnapshot, .busyTimeout, .locked,
@@ -2903,7 +3008,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         ).first?.column("schema_version")?.integer else {
             throw ServiceAPIError(code: .authorityPurposeMismatch, message: "Authority metadata is missing")
         }
-        if version > SchemaV8.version {
+        if version > SchemaV9.version {
             throw ServiceAPIError(
                 code: .forwardSchemaUnsupported,
                 message: "Authority store schema is newer than this maintenance tool"
@@ -3117,6 +3222,90 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             )
         }
         try await SchemaV8.validate(using: database)
+    }
+
+    private func applySchemaV9(verifiedBackup: VerifiedMigrationBackup?) async throws {
+        let correlationID = UUID()
+        do {
+            try await transaction(.bulk(estimatedEncodedBytes: 0)) {
+                try await executeMigrationStatements(SchemaV9.statements)
+                let priorFailures = try await database.query(
+                    "SELECT event_id FROM audit_events WHERE event_type='security.schema_v9_failed' ORDER BY created_at,event_id"
+                )
+                for priorFailure in priorFailures {
+                    try await appendOperatorSecurityAudit(
+                        operation: "schemaMigrationV9", outcome: "failure",
+                        actor: "persistence-migrator", channel: "offline",
+                        clientIdentityDigest: nil,
+                        correlationID: priorFailure.column("event_id")?.string
+                            .flatMap(UUID.init(uuidString:)) ?? correlationID,
+                        detailCode: "priorMigrationTransactionRolledBack"
+                    )
+                }
+                try await appendOperatorSecurityAudit(
+                    operation: "schemaMigrationV9", outcome: "started",
+                    actor: "persistence-migrator", channel: "offline",
+                    clientIdentityDigest: nil, correlationID: correlationID,
+                    detailCode: "immutableSchemaV9"
+                )
+            _ = try await database.query(
+                "INSERT INTO operator_session_metadata(session_id,username,issued_at,last_seen_at,correlation_id) SELECT session_id,username,CASE WHEN typeof(created_at) IN ('real','integer') THEN CAST(created_at AS REAL) ELSE CAST(strftime('%s',created_at) AS REAL) END,CASE WHEN typeof(created_at) IN ('real','integer') THEN CAST(created_at AS REAL) ELSE CAST(strftime('%s',created_at) AS REAL) END,? FROM operator_sessions",
+                [.text(UUID().uuidString.lowercased())]
+            )
+            try await hitFault(.afterMigrationStatement)
+            if let verifiedBackup {
+                try await insertMaintenanceReceipt(
+                    operation: "migrationVerify",
+                    outcome: "success",
+                    evidence: MaintenanceReceiptEvidence(
+                        archiveSHA256: verifiedBackup.archiveSHA256,
+                        manifestSHA256: verifiedBackup.manifestSHA256,
+                        source: verifiedBackup.source,
+                        verifierFingerprint: verifiedBackup.verifierFingerprint,
+                        recipientFingerprints: verifiedBackup.recipientFingerprints,
+                        sidecarSHA256: verifiedBackup.sidecarSHA256,
+                        toolVersion: verifiedBackup.toolVersion,
+                        toolDigest: verifiedBackup.toolDigest
+                    ),
+                    correlationID: correlationID,
+                    now: Date()
+                )
+                try await hitFault(.afterMigrationStatement)
+            }
+            _ = try await database.query("UPDATE service_metadata SET schema_version=9 WHERE fixed_id=1")
+            try await hitFault(.afterMigrationStatement)
+                try await insertMigration(
+                    version: 9,
+                    description: "operator authentication throttling, security audit, session metadata, and maintenance receipts",
+                    digest: SchemaV9.canonicalDigest
+                )
+                try await appendOperatorSecurityAudit(
+                    operation: "schemaMigrationV9", outcome: "success",
+                    actor: "persistence-migrator", channel: "offline",
+                    clientIdentityDigest: nil, correlationID: correlationID,
+                    detailCode: "immutableSchemaV9"
+                )
+            }
+        } catch {
+            do {
+                try await appendOperatorSecurityAudit(
+                    operation: "schemaMigrationV9", outcome: "failure",
+                    actor: "persistence-migrator", channel: "offline",
+                    clientIdentityDigest: nil, correlationID: correlationID,
+                    detailCode: "migrationTransactionRolledBack"
+                )
+            } catch {
+                _ = try? await database.query(
+                    "INSERT INTO audit_events(event_id,schema_version,event_type,payload_json,created_at) VALUES(?,2,'security.schema_v9_failed',?,CURRENT_TIMESTAMP)",
+                    [
+                        .text(correlationID.uuidString.lowercased()),
+                        .text("{\"detailCode\":\"migrationTransactionRolledBack\"}"),
+                    ]
+                )
+            }
+            throw error
+        }
+        try await SchemaV9.validate(using: database)
     }
 
     private func executeMigrationStatements(_ statements: [String]) async throws {

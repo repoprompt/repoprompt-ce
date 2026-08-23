@@ -99,7 +99,11 @@ public struct VerifiedBackupArchive: Sendable {
             source: manifest.source,
             archiveSHA256: sidecar.archiveSHA256,
             manifestSHA256: sidecar.manifestSHA256,
-            verifierFingerprint: sidecar.verification?.verifierFingerprint ?? ""
+            verifierFingerprint: sidecar.verification?.verifierFingerprint ?? "",
+            recipientFingerprints: sidecar.recipientFingerprints,
+            sidecarSHA256: BackupRestoreService.sidecarDigest(sidecar),
+            toolVersion: sidecar.verification?.maintenanceToolVersion ?? sidecar.toolVersion,
+            toolDigest: sidecar.verification?.maintenanceToolDigest ?? sidecar.toolDigest
         )
     }
 }
@@ -700,7 +704,17 @@ public actor BackupRestoreService {
             backupSequence: verified.manifest.source.nextGlobalSequence,
             backupCreatedAt: Self.formatDate(verified.manifest.createdAt),
             backupManifestSHA256: verified.sidecar.manifestSHA256,
-            missingExternalOptionalAssetIDs: missingOptionalAssetIDs.sorted()
+            missingExternalOptionalAssetIDs: missingOptionalAssetIDs.sorted(),
+            maintenanceReceipt: RestoreMaintenanceReceiptV1(
+                source: verified.sidecar.source,
+                archiveSHA256: verified.sidecar.archiveSHA256,
+                manifestSHA256: verified.sidecar.manifestSHA256,
+                verifierFingerprint: verified.sidecar.verification?.verifierFingerprint,
+                recipientFingerprints: verified.sidecar.recipientFingerprints,
+                sidecarSHA256: Self.sidecarDigest(verified.sidecar),
+                toolVersion: verified.sidecar.verification?.maintenanceToolVersion ?? verified.sidecar.toolVersion,
+                toolDigest: verified.sidecar.verification?.maintenanceToolDigest ?? verified.sidecar.toolDigest
+            )
         )
         try BackupFileSafety.writeAtomic(
             try Self.encoder.encode(restoreRequest),
@@ -753,6 +767,10 @@ public actor BackupRestoreService {
 
     public static func sidecarURL(for archiveURL: URL) -> URL {
         URL(fileURLWithPath: archiveURL.path + sidecarSuffix)
+    }
+
+    public static func sidecarDigest(_ sidecar: BackupSidecarV1) -> String {
+        BackupCryptography.sha256((try? encoder.encode(sidecar)) ?? Data())
     }
 
     private static let encoder: JSONEncoder = {
@@ -891,6 +909,17 @@ public actor BackupRestoreService {
     }
 }
 
+public struct RestoreMaintenanceReceiptV1: Codable, Equatable, Sendable {
+    public let source: MigrationSourceEvidence
+    public let archiveSHA256: String
+    public let manifestSHA256: String
+    public let verifierFingerprint: String?
+    public let recipientFingerprints: [String]
+    public let sidecarSHA256: String
+    public let toolVersion: String
+    public let toolDigest: String
+}
+
 public struct RestoreNamespaceRequestV1: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let acknowledged: Bool
@@ -903,6 +932,7 @@ public struct RestoreNamespaceRequestV1: Codable, Equatable, Sendable {
     public let backupCreatedAt: String
     public let backupManifestSHA256: String
     public let missingExternalOptionalAssetIDs: [String]
+    public let maintenanceReceipt: RestoreMaintenanceReceiptV1
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
@@ -916,6 +946,7 @@ public struct RestoreNamespaceRequestV1: Codable, Equatable, Sendable {
         case backupCreatedAt
         case backupManifestSHA256 = "backupManifestSha256"
         case missingExternalOptionalAssetIDs
+        case maintenanceReceipt
     }
 }
 
@@ -930,7 +961,7 @@ private enum BackupRecipientFingerprint {
     }
 }
 
-private enum BackupCryptography {
+enum BackupCryptography {
     static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }

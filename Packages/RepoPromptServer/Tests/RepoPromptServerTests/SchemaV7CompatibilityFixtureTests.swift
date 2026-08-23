@@ -64,7 +64,11 @@ final class SchemaV7CompatibilityFixtureTests: XCTestCase {
                     source: source,
                     archiveSHA256: String(repeating: "a", count: 64),
                     manifestSHA256: String(repeating: "b", count: 64),
-                    verifierFingerprint: String(repeating: "c", count: 64)
+                    verifierFingerprint: String(repeating: "c", count: 64),
+                    recipientFingerprints: ["age:x25519:test"],
+                    sidecarSHA256: String(repeating: "d", count: 64),
+                    toolVersion: "test-tool",
+                    toolDigest: String(repeating: "e", count: 64)
                 ),
                 namespaceKind: "server",
                 databaseIdentityDigest: String(repeating: "d", count: 64)
@@ -109,7 +113,7 @@ final class SchemaV7CompatibilityFixtureTests: XCTestCase {
                 XCTAssertFalse(columns.contains("goblin_acknowledgement_json"))
             }
             let metadata = try await store.metadata()
-            XCTAssertEqual(metadata.schemaVersion, 7)
+            XCTAssertEqual(metadata.schemaVersion, SchemaV9.version)
             try await store.close(clean: false)
         }
     }

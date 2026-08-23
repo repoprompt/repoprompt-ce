@@ -32,6 +32,11 @@ public struct StoreOperationalSnapshot: Codable, Sendable {
     public let eventOutboxMaximumAttemptCount: Int
     public let nonfinalAuthorityTransitionCount: Int
     public let providerEventReceiptCount: Int
+    public let activeOperatorSessionCount: Int
+    public let blockedAuthenticationBucketCount: Int
+    public let securityAuditCount: Int
+    public let maintenanceReceiptCount: Int
+    public let lastSuccessfulBackupAt: Date?
     public let databaseBytes: Int64
     public let walBytes: Int64
     public let ownedResources: OwnedResourceHealthSnapshot
@@ -43,6 +48,8 @@ public struct StoreOperationalSnapshot: Codable, Sendable {
         case checkpointCounts, activeProcessFamilyCount, databaseBytes, walBytes
         case eventOutboxPendingCount, eventOutboxOldestPendingAgeSeconds, eventOutboxMaximumAttemptCount
         case nonfinalAuthorityTransitionCount, providerEventReceiptCount
+        case activeOperatorSessionCount, blockedAuthenticationBucketCount, securityAuditCount
+        case maintenanceReceiptCount, lastSuccessfulBackupAt
         case ownedResources, observedAt
     }
 }
@@ -58,9 +65,9 @@ public extension SQLiteServiceStore {
             return (version, digest)
         })
         let metadata = try await metadata()
-        let migrationsValid = metadata.schemaVersion == SchemaV8.version
-            && migrationMap.count == SchemaV8.version
-            && (1 ... SchemaV8.version).allSatisfy { version in
+        let migrationsValid = metadata.schemaVersion == SchemaV9.version
+            && migrationMap.count == SchemaV9.version
+            && (1 ... SchemaV9.version).allSatisfy { version in
                 migrationMap[version].map { MigrationLedgerPolicy.accepts(version: version, digest: $0) } == true
             }
         let liveEventCount = try await scalarInt("SELECT COUNT(*) AS value FROM events")
@@ -91,6 +98,13 @@ public extension SQLiteServiceStore {
             eventOutboxMaximumAttemptCount: Int(outbox.maximumAttemptCount),
             nonfinalAuthorityTransitionCount: try await scalarInt("SELECT COUNT(*) AS value FROM authority_transitions WHERE state<>'finalized'"),
             providerEventReceiptCount: try await scalarInt("SELECT COUNT(*) AS value FROM provider_event_receipts"),
+            activeOperatorSessionCount: try await scalarInt("SELECT COUNT(*) AS value FROM operator_sessions WHERE expires_at > unixepoch()"),
+            blockedAuthenticationBucketCount: try await scalarInt("SELECT COUNT(*) AS value FROM operator_auth_throttle_buckets WHERE blocked_until > unixepoch()"),
+            securityAuditCount: try await scalarInt("SELECT COUNT(*) AS value FROM operator_security_audit"),
+            maintenanceReceiptCount: try await scalarInt("SELECT COUNT(*) AS value FROM maintenance_receipts"),
+            lastSuccessfulBackupAt: try await database.query(
+                "SELECT MAX(created_at) AS value FROM maintenance_receipts WHERE operation='backupCreate' AND outcome='success'"
+            ).first?.column("value")?.double.map(Date.init(timeIntervalSince1970:)),
             databaseBytes: fileBytes(storagePath),
             walBytes: fileBytes(storagePath.map { "\($0)-wal" }),
             ownedResources: ownedResourceHealth(now: now),

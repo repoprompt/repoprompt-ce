@@ -163,7 +163,7 @@ final class SchemaV8MigrationTests: XCTestCase {
         defer { Task { try? await store.close() } }
 
         let metadata = try await store.metadata()
-        XCTAssertEqual(metadata.schemaVersion, 8)
+        XCTAssertEqual(metadata.schemaVersion, 9)
         let names = try await store.database.query(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('authority_transitions','provider_event_receipts','event_outbox','idempotency_tombstones') ORDER BY name"
         ).compactMap { $0.column("name")?.string }

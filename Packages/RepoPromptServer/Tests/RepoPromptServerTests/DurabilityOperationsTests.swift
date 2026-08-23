@@ -471,20 +471,37 @@ final class DurabilityOperationsTests: XCTestCase {
         )
         let preparedMetadata = try await store.metadata()
         XCTAssertEqual(preparedMetadata.activationState, "restore_prepared")
+        let receipt = makeTestMaintenanceReceipt(
+            storeID: prior,
+            backupSequence: 0,
+            manifestSHA256: "backup-digest"
+        )
         do {
-            _ = try await store.activateRestoredStore(activationToken: Data("wrong".utf8), instanceID: UUID())
+            _ = try await store.activateRestoredStore(
+                activationToken: Data("wrong".utf8),
+                instanceID: UUID(),
+                maintenanceReceipt: receipt
+            )
             XCTFail("expected activation fence")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .quiescing)
         }
         let instanceID = UUID()
-        let activated = try await store.activateRestoredStore(activationToken: token, instanceID: instanceID)
+        let activated = try await store.activateRestoredStore(
+            activationToken: token,
+            instanceID: instanceID,
+            maintenanceReceipt: receipt
+        )
         XCTAssertEqual(activated, fresh)
         let metadata = try await store.metadata()
         XCTAssertEqual(metadata.activationState, "active")
         XCTAssertEqual(metadata.activationInstanceID, instanceID)
         do {
-            _ = try await store.activateRestoredStore(activationToken: token, instanceID: UUID())
+            _ = try await store.activateRestoredStore(
+                activationToken: token,
+                instanceID: UUID(),
+                maintenanceReceipt: receipt
+            )
             XCTFail("expected token to be single use")
         } catch let error as ServiceAPIError {
             XCTAssertEqual(error.code, .quiescing)

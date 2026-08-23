@@ -43,6 +43,11 @@ jobs:
         with:
           node-version: 24
 
+      - name: Validate private-pilot portal behavior
+        run: |
+          node --check Packages/RepoPromptServer/Sources/RepoPromptServiceHTTP/Resources/Portal/portal.js
+          node --test Packages/RepoPromptServer/Tests/PortalDOMTests/portal-logout.test.js
+
       - name: Install pinned Codex CLI
         run: npm install --global @openai/codex@0.149.0
 

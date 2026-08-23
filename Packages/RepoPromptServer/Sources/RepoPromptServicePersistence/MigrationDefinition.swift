@@ -43,6 +43,7 @@ enum MigrationLedgerPolicy {
                 SchemaV7.canonicalDigest,
             ],
             SchemaV8.version: [SchemaV8.canonicalDigest],
+            SchemaV9.version: [SchemaV9.canonicalDigest],
         ]
     }
 

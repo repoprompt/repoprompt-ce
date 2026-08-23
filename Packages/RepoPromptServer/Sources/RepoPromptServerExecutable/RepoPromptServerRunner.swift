@@ -25,6 +25,7 @@ public struct RepoPromptServerConfiguration: Sendable {
     public let healthPort: Int
     public let portalHost: String
     public let portalPort: Int?
+    public let portalTopology: PortalNetworkTopology
     public let certificatePath: String
     public let privateKeyPath: String
     public let clientCAPath: String?
@@ -271,7 +272,7 @@ public struct RepoPromptServerConfiguration: Sendable {
         }
         let bindHost = environment["REPOPROMPT_BIND_HOST"] ?? "0.0.0.0"
         let bindPort = Int(environment["REPOPROMPT_BIND_PORT"] ?? "9443") ?? 9443
-        let portalHost = environment["REPOPROMPT_PORTAL_HOST"] ?? bindHost
+        let portalHost = environment["REPOPROMPT_PORTAL_HOST"] ?? "127.0.0.1"
         let portalPort: Int?
         if let raw = environment["REPOPROMPT_PORTAL_PORT"] {
             if raw.isEmpty || raw == "off" {
@@ -279,11 +280,39 @@ public struct RepoPromptServerConfiguration: Sendable {
             } else {
                 portalPort = Int(raw) ?? 9081
             }
-        } else if clientCAPath != nil {
-            portalPort = 9081
         } else {
             portalPort = nil
         }
+        let publicOrigin = environment["REPOPROMPT_PUBLIC_ORIGIN"].flatMap { $0.isEmpty ? nil : $0 }
+        let trustedProxyCIDRs = environment["REPOPROMPT_TRUSTED_PROXY_CIDRS"]?
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        let portalTopology: PortalNetworkTopology
+        if let publicOrigin {
+            guard portalPort != nil else {
+                throw ConfigurationError.invalid("Trusted-proxy topology requires REPOPROMPT_PORTAL_PORT")
+            }
+            guard isLoopbackBindHost(portalHost) else {
+                throw ConfigurationError.invalid("Plaintext trusted-proxy portal backend must bind to loopback")
+            }
+            guard !trustedProxyCIDRs.isEmpty else {
+                throw ConfigurationError.invalid("Trusted-proxy topology requires REPOPROMPT_TRUSTED_PROXY_CIDRS")
+            }
+            portalTopology = .trustedProxy(publicOrigin: publicOrigin, trustedProxyCIDRs: trustedProxyCIDRs)
+        } else {
+            guard portalPort == nil else {
+                throw ConfigurationError.invalid("Plaintext portal listener requires REPOPROMPT_PUBLIC_ORIGIN and trusted proxy CIDRs")
+            }
+            guard trustedProxyCIDRs.isEmpty else {
+                throw ConfigurationError.invalid("REPOPROMPT_TRUSTED_PROXY_CIDRS requires REPOPROMPT_PUBLIC_ORIGIN")
+            }
+            guard clientCAPath == nil else {
+                throw ConfigurationError.invalid("Browser portal behind mTLS requires the trusted-proxy topology")
+            }
+            portalTopology = .directTLS
+        }
+        _ = try PortalNetworkPolicy(portalTopology)
         return Self(
             profileIdentifier: environment["REPOPROMPT_PROFILE"] ?? "default",
             stateDatabasePath: stateDatabase,
@@ -296,6 +325,7 @@ public struct RepoPromptServerConfiguration: Sendable {
             healthHost: "127.0.0.1", healthPort: Int(environment["REPOPROMPT_HEALTH_PORT"] ?? "9080") ?? 9080,
             portalHost: portalHost,
             portalPort: portalPort,
+            portalTopology: portalTopology,
             certificatePath: tlsCert ?? trustDirectory.appendingPathComponent("server.crt").path,
             privateKeyPath: tlsKey ?? trustDirectory.appendingPathComponent("server.key").path,
             clientCAPath: clientCAPath,
@@ -335,28 +365,23 @@ public enum ConfigurationError: Error, CustomStringConvertible { case missing(St
 private func operatorOnboardingBanner(
     bindHost: String,
     bindPort: Int,
-    portalHost: String,
-    portalPort: Int?,
-    usesMutualTLS: Bool,
-    needsSetup: Bool,
-    setupToken: String?
+    portalTopology: PortalNetworkTopology,
+    needsSetup: Bool
 ) -> String {
     let httpsHost = bindHost == "0.0.0.0" || bindHost == "::" ? "127.0.0.1" : bindHost
-    let httpHost = portalHost == "0.0.0.0" || portalHost == "::" ? "127.0.0.1" : portalHost
     var lines = [
         "",
         "RepoPrompt Server is ready."
     ]
-    if let portalPort {
-        lines.append("Open http://\(httpHost):\(portalPort)/portal/")
-    } else if !usesMutualTLS {
+    switch portalTopology {
+    case .directTLS:
         lines.append("Open https://\(httpsHost):\(bindPort)/portal/")
-    } else {
-        lines.append("Open /portal/ and create or enter the operator password.")
+    case let .trustedProxy(publicOrigin, _):
+        lines.append("Open \(publicOrigin.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/portal/")
     }
-    if needsSetup, let setupToken {
+    if needsSetup {
         lines.append("Create the operator password on first visit.")
-        lines.append("Setup token (required unless you are on this machine): \(setupToken)")
+        lines.append("Read the setup token from the owner-only file in the configured state directory.")
     } else {
         lines.append("Sign in with the operator password.")
     }
@@ -371,6 +396,10 @@ private func randomHMACSecret() -> Data {
         bytes[index] = UInt8.random(in: .min ... .max, using: &generator)
     }
     return Data(bytes)
+}
+
+private func isLoopbackBindHost(_ value: String) -> Bool {
+    value == "127.0.0.1" || value == "::1" || value == "localhost"
 }
 
 public enum RepoPromptServerRunner {
@@ -530,6 +559,8 @@ public enum RepoPromptServerRunner {
             providerSettings: providerSettings,
             eventOutboxDispatcher: runtime.eventOutboxDispatcher
         )
+        let setupTokenURL = URL(fileURLWithPath: stateDirectory, isDirectory: true)
+            .appendingPathComponent("operator-setup-token", isDirectory: false)
         let service = RepoPromptHTTPService(
             authority: authority,
             store: store,
@@ -546,6 +577,8 @@ public enum RepoPromptServerRunner {
             transcriptPresentation: transcriptPresentation,
             portalDesktopSettings: portalDesktopSettings,
             portalPasswordLoginEnabled: true,
+            portalNetworkPolicy: try PortalNetworkPolicy(configuration.portalTopology),
+            operatorSetupTokenURL: setupTokenURL,
             mutationGate: mutationGate
         )
         let internalApplication = try Application(
@@ -564,16 +597,33 @@ public enum RepoPromptServerRunner {
             )
         )
         let needsSetup = try await store.hasOperatorAccount() == false
-        let setupToken = needsSetup ? try await store.issueOperatorSetupToken() : nil
+        if needsSetup {
+            let token = try await store.issueOperatorSetupToken(channel: "startup")
+            try writeOwnerOnlySecret(Data((token + "\n").utf8), to: setupTokenURL)
+            ServerStructuredLogger.write(
+                event: "operator.setup-token",
+                outcome: "issued",
+                fields: ["storage": "owner-only-state-file"]
+            )
+        } else if FileManager.default.fileExists(atPath: setupTokenURL.path) {
+            try FileManager.default.removeItem(at: setupTokenURL)
+            ServerStructuredLogger.write(event: "operator.setup-token", outcome: "stale-file-removed")
+        }
         FileHandle.standardError.write(Data(operatorOnboardingBanner(
             bindHost: configuration.bindHost,
             bindPort: configuration.bindPort,
-            portalHost: configuration.portalHost,
-            portalPort: configuration.portalPort,
-            usesMutualTLS: configuration.usesMutualTLS,
-            needsSetup: needsSetup,
-            setupToken: setupToken
+            portalTopology: configuration.portalTopology,
+            needsSetup: needsSetup
         ).utf8))
+        ServerStructuredLogger.write(
+            event: "server.startup",
+            outcome: "ready",
+            fields: [
+                "operatorSetupRequired": needsSetup ? "true" : "false",
+                "portalTopology": configuration.portalPort == nil ? "direct-tls" : "trusted-proxy",
+                "schemaVersion": "9",
+            ]
+        )
         let mcpServing = try await host.makeMCPService(
             portalSettings: portalDesktopSettings
         )
@@ -637,6 +687,15 @@ public enum RepoPromptServerRunner {
             externalTransportDrainTimedOut: !transportsSettled
         )
         hostWasShutdown = true
+        ServerStructuredLogger.write(
+            level: shutdown.clean ? "info" : "error",
+            event: "server.shutdown",
+            outcome: shutdown.clean ? "clean" : "deadline-exceeded",
+            fields: [
+                "childDrainClean": childShutdown.clean ? "true" : "false",
+                "transportsSettled": transportsSettled ? "true" : "false",
+            ]
+        )
         if !shutdown.clean, serviceError == nil {
             serviceError = ServiceAPIError(code: .dependencyUnavailable, message: "Authority host shutdown exceeded its drain deadline")
         }
@@ -644,6 +703,12 @@ public enum RepoPromptServerRunner {
         } catch {
             if !hostWasShutdown {
                 _ = await host.shutdown(reason: "startup-or-composition-failed")
+                ServerStructuredLogger.write(
+                    level: "error",
+                    event: "server.startup",
+                    outcome: "failure",
+                    fields: ["errorType": String(reflecting: type(of: error))]
+                )
             }
             throw error
         }

@@ -41,10 +41,11 @@ LABEL org.opencontainers.image.title="RepoPromptServer" \
       org.opencontainers.image.revision="$REPOPROMPT_COMMIT" \
       org.opencontainers.image.created="$SOURCE_DATE_EPOCH" \
       io.repoprompt.protocol-version="1" \
-      io.repoprompt.schema-version="7" \
+      io.repoprompt.schema-version="9" \
       io.repoprompt.runtime-uid="65532" \
       io.repoprompt.port.internal-api="9443/tcp;mtls" \
-      io.repoprompt.port.portal="9081/tcp;http-password" \
+      io.repoprompt.port.portal="9443/tcp;direct-tls-password-or-9081/tcp;trusted-proxy-only" \
+      io.repoprompt.distribution="private-pilot-non-publishing" \
       io.repoprompt.port.health="9080/tcp;loopback-only"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tini util-linux && rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 65532 repoprompt && useradd --uid 65532 --gid 65532 --home-dir /var/lib/repoprompt --create-home --shell /usr/sbin/nologin repoprompt && \

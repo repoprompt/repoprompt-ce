@@ -65,13 +65,13 @@ public enum RepoPromptPortalAssets {
 public enum RepoPromptPortalRequestProtection {
     public static func validateMutation(
         origin: String?,
-        host: String?,
+        expectedOrigin: String,
         fetchSite: String?,
         contentType: String?,
         csrfHeader: String?
     ) throws {
-        guard let host, !host.isEmpty,
-              origin == "https://\(host)"
+        guard !expectedOrigin.isEmpty,
+              origin?.lowercased() == expectedOrigin.lowercased()
         else {
             throw ServiceAPIError(code: .authorizationDecisionRejected, message: "Portal mutation origin is not allowed")
         }

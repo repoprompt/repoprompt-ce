@@ -147,6 +147,13 @@ final class AuthorityNamespaceLeaseTests: XCTestCase {
         let observation = await host.startupObservation()
         XCTAssertEqual(observation.diagnosticCodes, ["stale_owner_recovered"])
         XCTAssertEqual(observation.staleOwnerRecoveries, 1)
+        let store = try await host.storeForRecovery()
+        let audit = try await store.operatorSecurityAudit()
+        XCTAssertTrue(audit.contains {
+            $0.operation == "staleOwnerRecovery"
+                && $0.outcome == "success"
+                && $0.detailCode == "leaseOwnerRecovered"
+        })
         let report = await host.shutdown(reason: "test")
         XCTAssertTrue(report.clean)
     }

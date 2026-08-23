@@ -13,6 +13,47 @@ import XCTest
 @testable import RepoPromptServerExecutable
 @testable import RepoPromptHeadlessRuntime
 final class PortalOperatorOnboardingTests: XCTestCase {
+    func testSetupRequiresTokenAndDeletesOwnerOnlyTokenFileBeforeSuccess() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tokenURL = root.appendingPathComponent("operator-setup-token")
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let token = try await store.issueOperatorSetupToken()
+        try Data("\(token)\n".utf8).write(to: tokenURL)
+        let service = try await Self.service(store: store, setupTokenURL: tokenURL)
+        let app = Application(router: service.internalRouter())
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/portal/api/v1/setup",
+                method: .post,
+                headers: Self.portalMutationHeaders(),
+                body: ByteBuffer(string: #"{"password":"operator-password","passwordConfirmation":"operator-password"}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: tokenURL.path))
+            let accountExists = try await store.hasOperatorAccount()
+            XCTAssertFalse(accountExists)
+
+            try await client.execute(
+                uri: "/portal/api/v1/setup",
+                method: .post,
+                headers: Self.portalMutationHeaders(),
+                body: ByteBuffer(data: try JSONEncoder.serviceEncoder.encode(SetupBody(
+                    password: "operator-password",
+                    passwordConfirmation: "operator-password",
+                    setupToken: token
+                )))
+            ) { response in
+                XCTAssertEqual(response.status, .created)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: tokenURL.path))
+            }
+        }
+    }
+
     func testFirstRunSetupThenLoginIssuesSessionCookie() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -66,6 +107,95 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         }
     }
 
+    func testPortalLogoutCommitsTokenMetadataAndAuditBeforeClearingCookie() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let setupToken = try await store.issueOperatorSetupToken()
+        try await store.createOperatorAccount(password: "logout-http-password", setupToken: setupToken)
+        let token = try await store.createOperatorSession()
+        let issuedSessions = try await store.operatorSessions(currentToken: token)
+        let target = try XCTUnwrap(issuedSessions.first(where: \.current))
+        let service = try await Self.service(store: store)
+        let app = Application(router: service.internalRouter())
+
+        try await app.test(.router) { client in
+            var headers = Self.portalMutationHeaders()
+            headers[.cookie] = "rpce_operator_session=\(token)"
+            try await client.execute(
+                uri: "/portal/api/v1/logout",
+                method: .post,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertTrue((response.headers[.setCookie] ?? "").contains("Max-Age=0"))
+            }
+            try await client.execute(
+                uri: "/portal/api/v1/bootstrap",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+
+        let authenticatedAfterLogout = try await store.operatorSessionUsername(token: token)
+        XCTAssertNil(authenticatedAfterLogout)
+        let sessionsAfterLogout = try await store.operatorSessions(currentToken: token)
+        let record = try XCTUnwrap(sessionsAfterLogout.first { $0.sessionID == target.sessionID })
+        XCTAssertNotNil(record.revokedAt)
+        XCTAssertEqual(record.revocationReason, "logout")
+        let securityAudit = try await store.operatorSecurityAudit(limit: 100)
+        let logoutAudit = try XCTUnwrap(securityAudit.first {
+            $0.operation == "logout" && $0.outcome == "success" && $0.detailCode == "sessionRevoked"
+        })
+        XCTAssertEqual(logoutAudit.actor, "operator:\(SQLiteServiceStore.defaultOperatorUsername)")
+        XCTAssertNotNil(logoutAudit.clientIdentityDigest)
+        XCTAssertFalse(String(describing: logoutAudit).contains(token))
+    }
+
+    func testLogoutRejectsPasswordReplacementCookieHeldPastCommittedLogout() async throws {
+        let store = try await SQLiteServiceStore.open(storage: .memory)
+        defer { Task { try? await store.close() } }
+        let setupToken = try await store.issueOperatorSetupToken()
+        try await store.createOperatorAccount(password: "initial-http-password", setupToken: setupToken)
+        let originalToken = try await store.createOperatorSession()
+        let service = try await Self.service(store: store)
+        let app = Application(router: service.internalRouter())
+
+        try await app.test(.router) { client in
+            var originalHeaders = Self.portalMutationHeaders()
+            originalHeaders[.cookie] = "rpce_operator_session=\(originalToken)"
+            var lateReplacementCookie = ""
+            try await client.execute(
+                uri: "/portal/api/v1/account/password",
+                method: .post,
+                headers: originalHeaders,
+                body: ByteBuffer(string: #"{"currentPassword":"initial-http-password","newPassword":"replacement-http-password","passwordConfirmation":"replacement-http-password"}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                lateReplacementCookie = try XCTUnwrap(response.headers[.setCookie])
+                XCTAssertFalse(lateReplacementCookie.contains("Max-Age=0"))
+            }
+            try await client.execute(
+                uri: "/portal/api/v1/logout",
+                method: .post,
+                headers: originalHeaders
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertTrue((response.headers[.setCookie] ?? "").contains("Max-Age=0"))
+            }
+            var replacementHeaders = HTTPFields()
+            replacementHeaders[.cookie] = lateReplacementCookie.split(separator: ";").first.map(String.init)
+            try await client.execute(
+                uri: "/portal/api/v1/bootstrap",
+                method: .get,
+                headers: replacementHeaders
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
     func testSetupRejectsMismatchedPasswordAndInvalidToken() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         defer { Task { try? await store.close() } }
@@ -114,18 +244,24 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         XCTAssertNil(configuration.portalPort)
     }
 
-    func testMutualTLSKeepsPasswordLoginAndBindsHttpPortal() throws {
+    func testMutualTLSBrowserPortalRequiresExplicitTrustedProxyTopology() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let configuration = try RepoPromptServerConfiguration.environment([
+        var environment = [
             "REPOPROMPT_STATE_DB": directory.appendingPathComponent("repoprompt.sqlite").path,
             "REPOPROMPT_ENABLED_PROVIDERS": "",
             "REPOPROMPT_TLS_CERT_FILE": directory.appendingPathComponent("server.crt").path,
             "REPOPROMPT_TLS_KEY_FILE": directory.appendingPathComponent("server.key").path,
             "REPOPROMPT_TLS_CLIENT_CA_FILE": directory.appendingPathComponent("ca.crt").path,
-            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal"
-        ])
+            "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+        ]
+        XCTAssertThrowsError(try RepoPromptServerConfiguration.environment(environment))
+
+        environment["REPOPROMPT_PORTAL_PORT"] = "9081"
+        environment["REPOPROMPT_PUBLIC_ORIGIN"] = "https://pilot.example.test"
+        environment["REPOPROMPT_TRUSTED_PROXY_CIDRS"] = "127.0.0.0/8"
+        let configuration = try RepoPromptServerConfiguration.environment(environment)
         XCTAssertTrue(configuration.usesMutualTLS)
         XCTAssertEqual(configuration.portalPort, 9081)
     }
@@ -171,14 +307,18 @@ final class PortalOperatorOnboardingTests: XCTestCase {
         }
     }
 
-    private static func service(store: SQLiteServiceStore) async throws -> RepoPromptHTTPService {
+    private static func service(
+        store: SQLiteServiceStore,
+        setupTokenURL: URL? = nil
+    ) async throws -> RepoPromptHTTPService {
         let authority = RepoPromptHeadlessAuthority(store: store)
         return RepoPromptHTTPService(
             authority: authority,
             store: store,
             authenticator: InternalRequestAuthenticator(keys: [], store: store),
             eventSigningKey: InternalSigningKey(keyID: "response", role: .sync, direction: InternalHMACDirection.repoPromptToClient, secret: Data("response-secret-32-bytes-long!!".utf8)),
-            portalPasswordLoginEnabled: true
+            portalPasswordLoginEnabled: true,
+            operatorSetupTokenURL: setupTokenURL
         , mutationGate: AuthorityMutationGate()
         )
     }

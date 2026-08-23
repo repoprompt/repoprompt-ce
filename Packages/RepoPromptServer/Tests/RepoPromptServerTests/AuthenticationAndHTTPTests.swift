@@ -27,6 +27,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         var environment = try [
             "REPOPROMPT_TLS_CERT_FILE": "/cert", "REPOPROMPT_TLS_KEY_FILE": "/key", "REPOPROMPT_TLS_CLIENT_CA_FILE": "/ca",
             "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+            "REPOPROMPT_PORTAL_PORT": "9081", "REPOPROMPT_PUBLIC_ORIGIN": "https://pilot.example.test", "REPOPROMPT_TRUSTED_PROXY_CIDRS": "127.0.0.0/8",
             "REPOPROMPT_APP_HMAC_FILE": secret("app"), "REPOPROMPT_SYNC_HMAC_FILE": secret("sync"),
             "REPOPROMPT_OPERATOR_HMAC_FILE": secret("operator"), "REPOPROMPT_EVENT_HMAC_FILE": secret("event"),
             "REPOPROMPT_APP_PREVIOUS_KEY_ID": "app-v0", "REPOPROMPT_APP_PREVIOUS_HMAC_FILE": secret("app-v0")
@@ -70,6 +71,9 @@ final class AuthenticationAndHTTPTests: XCTestCase {
             "REPOPROMPT_TLS_KEY_FILE": "/key",
             "REPOPROMPT_TLS_CLIENT_CA_FILE": "/ca",
             "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+            "REPOPROMPT_PORTAL_PORT": "9081",
+            "REPOPROMPT_PUBLIC_ORIGIN": "https://pilot.example.test",
+            "REPOPROMPT_TRUSTED_PROXY_CIDRS": "127.0.0.0/8",
             "REPOPROMPT_STATE_DB": directory.appendingPathComponent("repoprompt.sqlite").path
         ]
         let configuration = try RepoPromptServerConfiguration.environment(environment)
@@ -100,6 +104,7 @@ final class AuthenticationAndHTTPTests: XCTestCase {
             "REPOPROMPT_TLS_KEY_FILE": "/key",
             "REPOPROMPT_TLS_CLIENT_CA_FILE": "/ca",
             "REPOPROMPT_OPERATOR_CERT_IDENTITY": "operator.internal",
+            "REPOPROMPT_PORTAL_PORT": "9081", "REPOPROMPT_PUBLIC_ORIGIN": "https://pilot.example.test", "REPOPROMPT_TRUSTED_PROXY_CIDRS": "127.0.0.0/8",
             "REPOPROMPT_APP_HMAC_FILE": secret("app"),
             "REPOPROMPT_SYNC_HMAC_FILE": secret("sync"),
             "REPOPROMPT_EVENT_HMAC_FILE": secret("event")

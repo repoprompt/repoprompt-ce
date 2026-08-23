@@ -17,7 +17,7 @@ final class SchemaMigrationTests: XCTestCase {
         let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
         let store = try await SQLiteServiceStore.open(storage: .file(databaseURL.path))
         _ = try await store.database.query(
-            "UPDATE service_metadata SET schema_version=\(SchemaV8.version + 1) WHERE fixed_id=1"
+            "UPDATE service_metadata SET schema_version=\(SchemaV9.version + 1) WHERE fixed_id=1"
         )
         try await store.close(clean: false)
         let before = try Data(contentsOf: databaseURL)
@@ -95,7 +95,11 @@ final class SchemaMigrationTests: XCTestCase {
                     source: source,
                     archiveSHA256: String(repeating: "a", count: 64),
                     manifestSHA256: String(repeating: "b", count: 64),
-                    verifierFingerprint: String(repeating: "c", count: 64)
+                    verifierFingerprint: String(repeating: "c", count: 64),
+                    recipientFingerprints: ["age:x25519:test"],
+                    sidecarSHA256: String(repeating: "d", count: 64),
+                    toolVersion: "test-tool",
+                    toolDigest: String(repeating: "e", count: 64)
                 ),
                 namespaceKind: "server",
                 databaseIdentityDigest: String(repeating: "D", count: 1_048_576)
@@ -128,7 +132,11 @@ final class SchemaMigrationTests: XCTestCase {
                     source: source,
                     archiveSHA256: String(repeating: "a", count: 64),
                     manifestSHA256: String(repeating: "b", count: 64),
-                    verifierFingerprint: String(repeating: "c", count: 64)
+                    verifierFingerprint: String(repeating: "c", count: 64),
+                    recipientFingerprints: ["age:x25519:test"],
+                    sidecarSHA256: String(repeating: "d", count: 64),
+                    toolVersion: "test-tool",
+                    toolDigest: String(repeating: "e", count: 64)
                 ),
                 namespaceKind: "server",
                 databaseIdentityDigest: String(repeating: "d", count: 64)
@@ -193,8 +201,9 @@ final class SchemaMigrationTests: XCTestCase {
             (SchemaV6.version, SchemaV6.canonicalDigest, SchemaV6.definition.computedDigest),
             (SchemaV7.version, SchemaV7.canonicalDigest, SchemaV7.definition.computedDigest),
             (SchemaV8.version, SchemaV8.canonicalDigest, SchemaV8.definition.computedDigest),
+            (SchemaV9.version, SchemaV9.canonicalDigest, SchemaV9.definition.computedDigest),
         ]
-        XCTAssertEqual(migrations.map(\.version), Array(1 ... 8))
+        XCTAssertEqual(migrations.map(\.version), Array(1 ... 9))
         for migration in migrations {
             XCTAssertEqual(
                 migration.computed,
@@ -223,26 +232,80 @@ final class SchemaMigrationTests: XCTestCase {
 }
 
 final class SQLiteTransactionFaultInjectionTests: XCTestCase {
-    func testEveryV7AndV8StatementInterruptionBoundaryPreservesLastCommittedVersion() async throws {
+    func testV9RetryImportsPriorAtomicMigrationFailureIntoSecurityAudit() async throws {
+        let root = try StoreMigrationTestSupport.temporaryDirectory("v9-failure-audit")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
+        try await StoreMigrationTestSupport.makeV6Store(
+            at: databaseURL,
+            digest: StoreMigrationTestSupport.knownV6Digests[4]
+        )
+        let counter = MigrationFaultCounter(
+            target: .beforeTransactionCommit,
+            occurrence: 3,
+            cancellation: false
+        )
+        var store = try await SQLiteServiceStore.openForMaintenance(
+            storage: .file(databaseURL.path),
+            faultInjector: PersistenceFaultInjector { point in try counter.hit(point) }
+        )
+        let source = try await store.migrationSourceEvidence()
+        do {
+            _ = try await store.migrateToLatest(
+                verifiedBackup: verifiedBackup(source),
+                namespaceKind: "server",
+                databaseIdentityDigest: String(repeating: "d", count: 64)
+            )
+            XCTFail("expected V9 transaction fault")
+        } catch is InjectedMigrationFailure {}
+        let metadataAfterFailure = try await store.metadata()
+        XCTAssertEqual(metadataAfterFailure.schemaVersion, 8)
+        let marker = try await store.database.query(
+            "SELECT payload_json FROM audit_events WHERE event_type='security.schema_v9_failed'"
+        ).first?.column("payload_json")?.string
+        XCTAssertEqual(marker, #"{"detailCode":"migrationTransactionRolledBack"}"#)
+        try await store.close(clean: false)
+
+        store = try await SQLiteServiceStore.openForMaintenance(storage: .file(databaseURL.path))
+        let retrySource = try await store.migrationSourceEvidence()
+        _ = try await store.migrateToLatest(
+            verifiedBackup: verifiedBackup(retrySource),
+            namespaceKind: "server",
+            databaseIdentityDigest: String(repeating: "d", count: 64)
+        )
+        let audit = try await store.operatorSecurityAudit(limit: 100)
+        XCTAssertTrue(audit.contains {
+            $0.operation == "schemaMigrationV9"
+                && $0.outcome == "failure"
+                && $0.detailCode == "priorMigrationTransactionRolledBack"
+        })
+        try await store.close(clean: false)
+    }
+
+    func testEveryV7ThroughV9StatementInterruptionBoundaryPreservesLastCommittedVersion() async throws {
         let statementCount = try await countHistoricalV7StatementBoundaries()
         let v8StatementCount = SchemaV8.statements.count + 2
-        let v7StatementCount = statementCount - v8StatementCount
+        let v9StatementCount = SchemaV9.statements.count + 3
+        let v7StatementCount = statementCount - v8StatementCount - v9StatementCount
         XCTAssertGreaterThan(v7StatementCount, SchemaV6.statements.count)
-        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2)]
+        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2), (.afterTransactionBegin, 3)]
             + (1 ... statementCount).map { (PersistenceFaultPoint.afterMigrationStatement, $0) }
             + [
                 (PersistenceFaultPoint.beforeMigrationLedgerInsert, 1),
                 (.beforeMigrationLedgerInsert, 2),
+                (.beforeMigrationLedgerInsert, 3),
                 (PersistenceFaultPoint.afterMigrationLedgerInsert, 1),
                 (.afterMigrationLedgerInsert, 2),
+                (.afterMigrationLedgerInsert, 3),
                 (PersistenceFaultPoint.beforeTransactionCommit, 1),
                 (.beforeTransactionCommit, 2),
+                (.beforeTransactionCommit, 3),
             ]
 
         for (point, occurrence) in boundaries {
             let expectedVersion = point == .afterMigrationStatement
-                ? (occurrence > v7StatementCount ? 7 : 6)
-                : (occurrence == 2 ? 7 : 6)
+                ? (occurrence > v7StatementCount + v8StatementCount ? 8 : (occurrence > v7StatementCount ? 7 : 6))
+                : (occurrence == 3 ? 8 : (occurrence == 2 ? 7 : 6))
             try await assertFailedMigrationPreservesV6(
                 point: point,
                 occurrence: occurrence,
@@ -251,23 +314,28 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
         }
     }
 
-    func testActualTaskCancellationAtEveryV7AndV8BoundaryPreservesLastCommittedVersion() async throws {
+    func testActualTaskCancellationAtEveryV7ThroughV9BoundaryPreservesLastCommittedVersion() async throws {
         let statementCount = try await countHistoricalV7StatementBoundaries()
-        let v7StatementCount = statementCount - (SchemaV8.statements.count + 2)
-        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2)]
+        let v8StatementCount = SchemaV8.statements.count + 2
+        let v9StatementCount = SchemaV9.statements.count + 3
+        let v7StatementCount = statementCount - v8StatementCount - v9StatementCount
+        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2), (.afterTransactionBegin, 3)]
             + (1 ... statementCount).map { (PersistenceFaultPoint.afterMigrationStatement, $0) }
             + [
                 (PersistenceFaultPoint.beforeMigrationLedgerInsert, 1),
                 (.beforeMigrationLedgerInsert, 2),
+                (.beforeMigrationLedgerInsert, 3),
                 (PersistenceFaultPoint.afterMigrationLedgerInsert, 1),
                 (.afterMigrationLedgerInsert, 2),
+                (.afterMigrationLedgerInsert, 3),
                 (PersistenceFaultPoint.beforeTransactionCommit, 1),
                 (.beforeTransactionCommit, 2),
+                (.beforeTransactionCommit, 3),
             ]
         for (point, occurrence) in boundaries {
             let expectedVersion = point == .afterMigrationStatement
-                ? (occurrence > v7StatementCount ? 7 : 6)
-                : (occurrence == 2 ? 7 : 6)
+                ? (occurrence > v7StatementCount + v8StatementCount ? 8 : (occurrence > v7StatementCount ? 7 : 6))
+                : (occurrence == 3 ? 8 : (occurrence == 2 ? 7 : 6))
             try await assertCancelledMigrationPreservesV6(
                 point: point,
                 occurrence: occurrence,
@@ -338,6 +406,7 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
         let metadataAfter = try await store.metadata()
         let v7Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=7").first
         let v8Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=8").first
+        let v9Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=9").first
         let v7Tables = try await database.query(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('schema_compatibility_audit','authority_namespace_identity')"
         )
@@ -345,14 +414,22 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
             XCTAssertEqual(bytesAfter, bytesBefore)
             XCTAssertEqual(ledgerAfter, ledgerBefore)
             XCTAssertNil(v7Ledger)
+            XCTAssertNil(v8Ledger)
+            XCTAssertNil(v9Ledger)
             XCTAssertTrue(v7Tables.isEmpty)
-        } else {
+        } else if expectedVersion == 7 {
             // WAL-backed commits need not rewrite the main database file bytes,
             // so the ledger/schema assertions below are authoritative for V7.
             XCTAssertNotEqual(ledgerAfter, ledgerBefore)
             XCTAssertNotNil(v7Ledger)
             XCTAssertFalse(v7Tables.isEmpty)
             XCTAssertNil(v8Ledger)
+            XCTAssertNil(v9Ledger)
+        } else {
+            XCTAssertNotEqual(ledgerAfter, ledgerBefore)
+            XCTAssertNotNil(v7Ledger)
+            XCTAssertNotNil(v8Ledger)
+            XCTAssertNil(v9Ledger)
         }
         XCTAssertEqual(metadataAfter.schemaVersion, expectedVersion)
         try await store.close(clean: false)
@@ -408,16 +485,25 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
         let metadataAfter = try await store.metadata()
         let v7Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=7").first
         let v8Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=8").first
+        let v9Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=9").first
         if expectedVersion == 6 {
             XCTAssertEqual(bytesAfter, bytesBefore)
             XCTAssertEqual(ledgerAfter, ledgerBefore)
             XCTAssertNil(v7Ledger)
-        } else {
+            XCTAssertNil(v8Ledger)
+            XCTAssertNil(v9Ledger)
+        } else if expectedVersion == 7 {
             // WAL-backed commits need not rewrite the main database file bytes,
             // so the ledger/schema assertions below are authoritative for V7.
             XCTAssertNotEqual(ledgerAfter, ledgerBefore)
             XCTAssertNotNil(v7Ledger)
             XCTAssertNil(v8Ledger)
+            XCTAssertNil(v9Ledger)
+        } else {
+            XCTAssertNotEqual(ledgerAfter, ledgerBefore)
+            XCTAssertNotNil(v7Ledger)
+            XCTAssertNotNil(v8Ledger)
+            XCTAssertNil(v9Ledger)
         }
         XCTAssertEqual(metadataAfter.schemaVersion, expectedVersion)
         try await store.close(clean: false)
@@ -453,7 +539,11 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
             source: source,
             archiveSHA256: String(repeating: "a", count: 64),
             manifestSHA256: String(repeating: "b", count: 64),
-            verifierFingerprint: String(repeating: "c", count: 64)
+            verifierFingerprint: String(repeating: "c", count: 64),
+            recipientFingerprints: ["age:x25519:test"],
+            sidecarSHA256: String(repeating: "d", count: 64),
+            toolVersion: "test-tool",
+            toolDigest: String(repeating: "e", count: 64)
         )
     }
 
@@ -473,22 +563,27 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
                 throw XCTSkip("parent-only migration crash test")
             }
             let statementCount = try await countStatementBoundaries()
-            let v7StatementCount = statementCount - (SchemaV8.statements.count + 2)
-            let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2)]
+            let v8StatementCount = SchemaV8.statements.count + 2
+            let v9StatementCount = SchemaV9.statements.count + 3
+            let v7StatementCount = statementCount - v8StatementCount - v9StatementCount
+            let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2), (.afterTransactionBegin, 3)]
                 + (1 ... statementCount).map { (PersistenceFaultPoint.afterMigrationStatement, $0) }
                 + [
                     (PersistenceFaultPoint.beforeMigrationLedgerInsert, 1),
                     (.beforeMigrationLedgerInsert, 2),
+                    (.beforeMigrationLedgerInsert, 3),
                     (PersistenceFaultPoint.afterMigrationLedgerInsert, 1),
                     (.afterMigrationLedgerInsert, 2),
+                    (.afterMigrationLedgerInsert, 3),
                     (PersistenceFaultPoint.beforeTransactionCommit, 1),
                     (.beforeTransactionCommit, 2),
+                    (.beforeTransactionCommit, 3),
                 ]
 
             for (point, occurrence) in boundaries {
                 let expectedVersion = point == .afterMigrationStatement
-                    ? (occurrence > v7StatementCount ? 7 : 6)
-                    : (occurrence == 2 ? 7 : 6)
+                    ? (occurrence > v7StatementCount + v8StatementCount ? 8 : (occurrence > v7StatementCount ? 7 : 6))
+                    : (occurrence == 3 ? 8 : (occurrence == 2 ? 7 : 6))
                 FileHandle.standardError.write(
                     Data("SIGKILL migration boundary \(point.rawValue)#\(occurrence)\n".utf8)
                 )
@@ -579,14 +674,23 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
                 let v8Ledger = try await reopenedDatabase.query(
                     "SELECT version FROM schema_migrations WHERE version=8"
                 ).first
+                let v9Ledger = try await reopenedDatabase.query(
+                    "SELECT version FROM schema_migrations WHERE version=9"
+                ).first
                 XCTAssertEqual(reopenedMetadata.schemaVersion, expectedVersion)
-                XCTAssertNil(v8Ledger)
+                XCTAssertNil(v9Ledger)
                 if expectedVersion == 6 {
                     XCTAssertEqual(reopenedLedger, ledgerBefore)
                     XCTAssertNil(v7Ledger)
+                    XCTAssertNil(v8Ledger)
+                } else if expectedVersion == 7 {
+                    XCTAssertNotEqual(reopenedLedger, ledgerBefore)
+                    XCTAssertNotNil(v7Ledger)
+                    XCTAssertNil(v8Ledger)
                 } else {
                     XCTAssertNotEqual(reopenedLedger, ledgerBefore)
                     XCTAssertNotNil(v7Ledger)
+                    XCTAssertNotNil(v8Ledger)
                 }
                 try await reopened.close(clean: false)
                 if expectedVersion == 6 {
@@ -633,7 +737,11 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
                     source: source,
                     archiveSHA256: String(repeating: "a", count: 64),
                     manifestSHA256: String(repeating: "b", count: 64),
-                    verifierFingerprint: String(repeating: "c", count: 64)
+                    verifierFingerprint: String(repeating: "c", count: 64),
+                    recipientFingerprints: ["age:x25519:test"],
+                    sidecarSHA256: String(repeating: "d", count: 64),
+                    toolVersion: "test-tool",
+                    toolDigest: String(repeating: "e", count: 64)
                 ),
                 namespaceKind: "server",
                 databaseIdentityDigest: String(repeating: "d", count: 64)
@@ -660,7 +768,11 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
                     source: source,
                     archiveSHA256: String(repeating: "a", count: 64),
                     manifestSHA256: String(repeating: "b", count: 64),
-                    verifierFingerprint: String(repeating: "c", count: 64)
+                    verifierFingerprint: String(repeating: "c", count: 64),
+                    recipientFingerprints: ["age:x25519:test"],
+                    sidecarSHA256: String(repeating: "d", count: 64),
+                    toolVersion: "test-tool",
+                    toolDigest: String(repeating: "e", count: 64)
                 ),
                 namespaceKind: "server",
                 databaseIdentityDigest: String(repeating: "d", count: 64)

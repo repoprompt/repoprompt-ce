@@ -1,6 +1,400 @@
 "use strict";
 
-(() => {
+function authenticatedPortalResponseGeneration(state) {
+  return state.operatorAuthenticated
+    ? Number(state.authenticationGeneration) || 0
+    : null;
+}
+
+function authenticatedPortalResponseIsCurrent(state, generation) {
+  return (
+    generation === null ||
+    (state.operatorAuthenticated &&
+      generation === (Number(state.authenticationGeneration) || 0))
+  );
+}
+
+async function fenceAuthenticatedPortalResponse(state, generation, operation) {
+  try {
+    const result = await operation();
+    if (authenticatedPortalResponseIsCurrent(state, generation)) return result;
+  } catch (error) {
+    if (authenticatedPortalResponseIsCurrent(state, generation)) throw error;
+  }
+  return await new Promise(() => {});
+}
+
+class PortalError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = "PortalError";
+    this.status = options.status || 0;
+    this.code = options.code || null;
+    this.retryable = options.retryable === true;
+    this.network = options.network === true;
+  }
+}
+
+function invalidatePortalLoadState(state) {
+  state.loadGeneration = (Number(state.loadGeneration) || 0) + 1;
+  state.loadOperation = null;
+  state.loadPromise = null;
+  state.loading = false;
+}
+
+function runPortalLoad(
+  state,
+  authenticationGeneration,
+  setLoading,
+  operation,
+) {
+  const loadGeneration = Number(state.loadGeneration) || 0;
+  const current = state.loadOperation;
+  if (
+    current &&
+    current.authenticationGeneration === authenticationGeneration &&
+    current.loadGeneration === loadGeneration
+  ) {
+    return current.promise;
+  }
+
+  const load = {
+    authenticationGeneration,
+    loadGeneration,
+    promise: null,
+  };
+  state.loadOperation = load;
+  setLoading(true);
+  load.promise = (async () => {
+    try {
+      return await operation();
+    } finally {
+      if (state.loadOperation === load) {
+        state.loadOperation = null;
+        state.loadPromise = null;
+        setLoading(false);
+      }
+    }
+  })();
+  state.loadPromise = load.promise;
+  return load.promise;
+}
+
+async function executePortalAPIRequest(
+  state,
+  path,
+  options,
+  {
+    fetchImpl,
+    reportsSettingsFeedback = false,
+    beginSettingsMutation = () => {},
+    finishSettingsMutation = () => {},
+  },
+) {
+  const method = (options.method || "GET").toUpperCase();
+  const mutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+  const authenticationGeneration = authenticatedPortalResponseGeneration(state);
+  if (reportsSettingsFeedback) beginSettingsMutation();
+  try {
+    const body = await fenceAuthenticatedPortalResponse(
+      state,
+      authenticationGeneration,
+      async () => {
+        let response;
+        try {
+          response = await fetchImpl(path, {
+            cache: "no-store",
+            credentials: "same-origin",
+            ...options,
+            method,
+            headers: {
+              Accept: "application/json",
+              ...(options.body ? { "Content-Type": "application/json" } : {}),
+              ...(mutation ? { "X-RepoPrompt-Portal-CSRF": "1" } : {}),
+              ...(options.headers || {}),
+            },
+          });
+        } catch (_error) {
+          throw new PortalError(
+            "Cannot reach the RepoPrompt server. Check the connection and try again.",
+            {
+              network: true,
+              retryable: true,
+            },
+          );
+        }
+
+        const contentType = response.headers.get("content-type") || "";
+        const text = response.status === 204 ? "" : await response.text();
+        let responseBody = null;
+        if (text && contentType.includes("application/json")) {
+          try {
+            responseBody = JSON.parse(text);
+          } catch (_error) {
+            throw new PortalError("The server returned an unreadable response.", {
+              status: response.status,
+            });
+          }
+        }
+        if (!response.ok) {
+          throw new PortalError(
+            responseBody?.message || `Request failed (${response.status}).`,
+            {
+              status: response.status,
+              code: responseBody?.code,
+              retryable: responseBody?.retryable,
+            },
+          );
+        }
+        return responseBody;
+      },
+    );
+    if (reportsSettingsFeedback) finishSettingsMutation();
+    return body;
+  } catch (error) {
+    if (reportsSettingsFeedback) finishSettingsMutation(error);
+    throw error;
+  }
+}
+
+function presentPortalAuthenticationMode(state, document, status) {
+  const passwordLoginEnabled = status.passwordLoginEnabled !== false;
+  const mode = !passwordLoginEnabled
+    ? "certificate"
+    : status.needsSetup
+      ? "setup"
+      : "login";
+  state.authenticationMode = mode;
+  state.passwordLoginEnabled = passwordLoginEnabled;
+
+  const form = document.getElementById("auth-form");
+  form.hidden = !passwordLoginEnabled;
+  document.getElementById("auth-title").textContent =
+    mode === "setup"
+      ? "Create the operator password"
+      : mode === "login"
+        ? "Sign in"
+        : "Operator certificate required";
+  document.getElementById("auth-copy").textContent =
+    mode === "setup"
+      ? "This is the first launch. Choose a password for the operator account and paste the setup token from the owner-only operator-setup-token file in the server state directory. The token is never written to server logs."
+      : mode === "login"
+        ? "Enter the operator password to open the portal."
+        : "This server uses mutual TLS. Import the operator client certificate in your browser, then reload.";
+  document.getElementById("auth-token-field").hidden = mode !== "setup";
+  document.getElementById("auth-confirm-field").hidden = mode !== "setup";
+  document.getElementById("auth-password").autocomplete =
+    mode === "setup" ? "new-password" : "current-password";
+  document.getElementById("auth-submit").textContent =
+    mode === "setup" ? "Create password" : "Sign in";
+  return mode;
+}
+
+function installPortalAuthenticationSubmission(
+  state,
+  document,
+  { request, activate, afterAuthenticated, clearSecrets },
+) {
+  if (state.authenticationSubmitInstalled) return false;
+  const form = document.getElementById("auth-form");
+  const error = document.getElementById("auth-error");
+  state.authenticationSubmitInstalled = true;
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (state.authenticationSubmission) return;
+    const mode = state.authenticationMode;
+    if (mode !== "setup" && mode !== "login") return;
+    error.hidden = true;
+    const password = document.getElementById("auth-password").value;
+    const submission = { promise: null };
+    state.authenticationSubmission = submission;
+    submission.promise = (async () => {
+      try {
+        if (mode === "setup") {
+          await request("api/v1/setup", {
+            method: "POST",
+            body: JSON.stringify({
+              password,
+              passwordConfirmation: document.getElementById(
+                "auth-password-confirm",
+              ).value,
+              setupToken: document.getElementById("auth-token").value.trim(),
+            }),
+          });
+        } else {
+          await request("api/v1/login", {
+            method: "POST",
+            body: JSON.stringify({ password }),
+          });
+        }
+        activate({ passwordLoginEnabled: state.passwordLoginEnabled });
+        void afterAuthenticated();
+      } catch (failure) {
+        error.hidden = false;
+        error.textContent = failure.message;
+      } finally {
+        clearSecrets();
+        if (state.authenticationSubmission === submission) {
+          state.authenticationSubmission = null;
+        }
+      }
+    })();
+  });
+  return true;
+}
+
+function resetAuthenticatedPortalState(
+  state,
+  document,
+  location,
+  {
+    passwordLoginEnabled = true,
+    title = "Sign in",
+    copy = "Enter the operator password to open the portal.",
+    errorMessage = "",
+  } = {},
+) {
+  document.querySelectorAll("input[data-sensitive]").forEach((input) => {
+    input.value = "";
+    input.removeAttribute("value");
+  });
+
+  state.authenticationGeneration =
+    (Number(state.authenticationGeneration) || 0) + 1;
+  invalidatePortalLoadState(state);
+  state.operatorAuthenticated = false;
+  state.authenticationMode = passwordLoginEnabled ? "login" : "unavailable";
+  state.passwordLoginEnabled = passwordLoginEnabled;
+  state.providers = [];
+  state.bootstrap = null;
+  state.desktopSettings = null;
+  state.settingsMutation = null;
+  state.domainMutations = {};
+  state.settingsFeedback = {
+    activeCount: 0,
+    outcome: null,
+    message: "No changes saved yet",
+  };
+  state.typedSettings = {
+    agentModels: null,
+    directAgentPermissions: null,
+    subagentPermissions: null,
+    contextBuilder: null,
+    modelPresets: null,
+    advanced: null,
+    workspaceApprovals: null,
+    mcpDisabledTools: null,
+    showModelPresets: null,
+    selectionPresets: null,
+    workflows: null,
+    selections: {},
+    directConfigurations: {},
+  };
+  state.generatedAt = null;
+  state.operatorSessions = [];
+  state.operations = null;
+  state.activeFlow = null;
+  state.pollTimer = null;
+  state.pollPromise = null;
+  state.confirmResolver = null;
+  state.confirmReturnFocus = null;
+  state.settingsDrawerReturnFocus = null;
+  state.focusAfterRoute = false;
+  state.agent = {
+    selectedProjectID: null,
+    selectedSessionID: null,
+    newSessionMode: false,
+    searchText: "",
+    transcriptItems: [],
+    transcriptPage: null,
+    transcriptPromise: null,
+    transcriptPromiseSessionID: null,
+    mutationPromise: null,
+    pollTimer: null,
+    selectionGeneration:
+      (Number(state.agent?.selectionGeneration) || 0) + 1,
+    retryOperation: null,
+  };
+
+  [
+    "project-list",
+    "session-list",
+    "transcript-list",
+    "settings-content",
+    "toast-region",
+  ].forEach((id) => document.getElementById(id)?.replaceChildren());
+  const composer = document.getElementById("composer-text");
+  if (composer) composer.value = "";
+  const search = document.getElementById("session-search");
+  if (search) search.value = "";
+  const metadata = document.getElementById("session-metadata");
+  if (metadata) metadata.textContent = "";
+  const sessionTitle = document.getElementById("active-session-title");
+  if (sessionTitle) sessionTitle.textContent = "Select a session";
+  const workspaceName = document.getElementById("active-workspace-name");
+  if (workspaceName) workspaceName.textContent = "RepoPrompt Server";
+  const caption = document.getElementById("service-caption");
+  if (caption) caption.textContent = "Authentication required";
+
+  const app = document.getElementById("app");
+  if (app) {
+    app.hidden = true;
+    app.inert = true;
+    app.setAttribute("aria-hidden", "true");
+  }
+  const gate = document.getElementById("auth-gate");
+  if (gate) gate.hidden = false;
+  const form = document.getElementById("auth-form");
+  if (form) form.hidden = !passwordLoginEnabled;
+  const tokenField = document.getElementById("auth-token-field");
+  if (tokenField) tokenField.hidden = true;
+  const confirmField = document.getElementById("auth-confirm-field");
+  if (confirmField) confirmField.hidden = true;
+  const authTitle = document.getElementById("auth-title");
+  if (authTitle) authTitle.textContent = title;
+  const authCopy = document.getElementById("auth-copy");
+  if (authCopy) authCopy.textContent = copy;
+  const authSubmit = document.getElementById("auth-submit");
+  if (authSubmit) authSubmit.textContent = "Sign in";
+  const authPassword = document.getElementById("auth-password");
+  if (authPassword) authPassword.autocomplete = "current-password";
+  const authError = document.getElementById("auth-error");
+  if (authError) {
+    authError.textContent = errorMessage;
+    authError.hidden = !errorMessage;
+  }
+  if (location && location.hash !== "#home") location.hash = "#home";
+}
+
+async function terminatePortalSession(request, reset) {
+  let failure = null;
+  try {
+    await request();
+  } catch (error) {
+    failure = error;
+  } finally {
+    reset(failure);
+  }
+  return failure === null;
+}
+
+if (typeof module === "object" && module.exports) {
+  module.exports = {
+    PortalError,
+    authenticatedPortalResponseGeneration,
+    executePortalAPIRequest,
+    fenceAuthenticatedPortalResponse,
+    installPortalAuthenticationSubmission,
+    invalidatePortalLoadState,
+    presentPortalAuthenticationMode,
+    resetAuthenticatedPortalState,
+    runPortalLoad,
+    terminatePortalSession,
+  };
+}
+
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  (() => {
   const providerOrder = [
     "codex",
     "claudeCompatible",
@@ -32,6 +426,8 @@
     "context-builder",
     "portal-appearance",
     "advanced",
+    "operator-account",
+    "operations",
     "mcp-server",
     "mcp-tools",
     "workspace-approvals",
@@ -91,8 +487,12 @@
       directConfigurations: {},
     },
     generatedAt: null,
+    operatorSessions: [],
+    operations: null,
     route: "home",
     loading: false,
+    loadGeneration: 0,
+    loadOperation: null,
     loadPromise: null,
     online: navigator.onLine !== false,
     activeFlow: null,
@@ -103,6 +503,13 @@
     settingsDrawerReturnFocus: null,
     focusAfterRoute: false,
     initialized: false,
+    operatorAuthenticated: false,
+    passwordLoginEnabled: true,
+    authenticationGeneration: 0,
+    authenticationMode: "checking",
+    authenticationSubmitInstalled: false,
+    authenticationSubmission: null,
+    logoutPromise: null,
     agent: {
       selectedProjectID: null,
       selectedSessionID: null,
@@ -214,17 +621,6 @@
     link: '<path d="M6.5 9.5 9.5 6.5M5 11H3.5a2.5 2.5 0 0 1 0-5H6M10 5h2.5a2.5 2.5 0 0 1 0 5H10"/>',
     send: '<path d="M1.5 8 14.5 2 10 14l-2-5zM8 9l6.5-7"/>',
   };
-
-  class PortalError extends Error {
-    constructor(message, options = {}) {
-      super(message);
-      this.name = "PortalError";
-      this.status = options.status || 0;
-      this.code = options.code || null;
-      this.retryable = options.retryable === true;
-      this.network = options.network === true;
-    }
-  }
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -354,6 +750,7 @@
     return (
       path === "api/v1/desktop-settings" ||
       /^api\/v1\/settings\//.test(path) ||
+      /^api\/v1\/account(?:\/|$)/.test(path) ||
       /^api\/v1\/projects\/[^/]+\/settings\//.test(path) ||
       /^api\/v1\/provider-settings\//.test(path) ||
       /^api\/v1\/provider-auth-flows\//.test(path) ||
@@ -364,62 +761,12 @@
 
   async function api(path, options = {}) {
     const method = (options.method || "GET").toUpperCase();
-    const mutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
-    const reportsSettingsFeedback = isSettingsMutationPath(path, method);
-    if (reportsSettingsFeedback) beginSettingsMutation();
-    try {
-      let response;
-      try {
-        response = await fetch(path, {
-          cache: "no-store",
-          credentials: "same-origin",
-          ...options,
-          method,
-          headers: {
-            Accept: "application/json",
-            ...(options.body ? { "Content-Type": "application/json" } : {}),
-            ...(mutation ? { "X-RepoPrompt-Portal-CSRF": "1" } : {}),
-            ...(options.headers || {}),
-          },
-        });
-      } catch (_error) {
-        throw new PortalError(
-          "Cannot reach the RepoPrompt server. Check the connection and try again.",
-          {
-            network: true,
-            retryable: true,
-          },
-        );
-      }
-
-      const contentType = response.headers.get("content-type") || "";
-      const text = response.status === 204 ? "" : await response.text();
-      let body = null;
-      if (text && contentType.includes("application/json")) {
-        try {
-          body = JSON.parse(text);
-        } catch (_error) {
-          throw new PortalError("The server returned an unreadable response.", {
-            status: response.status,
-          });
-        }
-      }
-      if (!response.ok) {
-        throw new PortalError(
-          body?.message || `Request failed (${response.status}).`,
-          {
-            status: response.status,
-            code: body?.code,
-            retryable: body?.retryable,
-          },
-        );
-      }
-      if (reportsSettingsFeedback) finishSettingsMutation();
-      return body;
-    } catch (error) {
-      if (reportsSettingsFeedback) finishSettingsMutation(error);
-      throw error;
-    }
+    return executePortalAPIRequest(state, path, options, {
+      fetchImpl: fetch,
+      reportsSettingsFeedback: isSettingsMutationPath(path, method),
+      beginSettingsMutation,
+      finishSettingsMutation,
+    });
   }
 
   function orderedProviders() {
@@ -700,14 +1047,25 @@
 
   async function mutateDomain(domain, control, operation, applyResult) {
     if (state.domainMutations[domain]) return state.domainMutations[domain];
+    const authenticationGeneration = state.authenticationGeneration;
     if (control) setDisabledReason(control, true, "Saving…");
     state.domainMutations[domain] = (async () => {
       try {
         const result = await operation();
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        )
+          return null;
         applyResult(result);
         renderRoute();
         return result;
       } catch (error) {
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        )
+          return null;
         toast(error.message, true);
         if (error.code === "staleRevision") {
           await loadSettingsDomain(domain);
@@ -722,17 +1080,27 @@
   }
 
   async function loadAll(refresh = false) {
-    if (state.loadPromise) return state.loadPromise;
-    setLoading(true);
-    state.loadPromise = (async () => {
+    const authenticationGeneration = state.authenticationGeneration;
+    return runPortalLoad(state, authenticationGeneration, setLoading, async () => {
       try {
-        const [bootstrap, providerCatalog, desktopSettings] = await Promise.all(
-          [
-            api("api/v1/bootstrap"),
-            api(`api/v1/provider-settings${refresh ? "?refresh=true" : ""}`),
-            api("api/v1/desktop-settings"),
-          ],
-        );
+        const [
+          bootstrap,
+          providerCatalog,
+          desktopSettings,
+          operatorSessions,
+          operations,
+        ] = await Promise.all([
+          api("api/v1/bootstrap"),
+          api(`api/v1/provider-settings${refresh ? "?refresh=true" : ""}`),
+          api("api/v1/desktop-settings"),
+          api("api/v1/account/sessions"),
+          api("api/v1/operations"),
+        ]);
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        )
+          return;
         if (!providerCatalog || !Array.isArray(providerCatalog.providers)) {
           throw new PortalError("The provider catalog response is incomplete.");
         }
@@ -746,8 +1114,27 @@
         state.bootstrap.workflows ||= [];
         state.providers = providerCatalog.providers;
         state.desktopSettings = desktopSettings;
+        state.operatorSessions = Array.isArray(operatorSessions)
+          ? operatorSessions
+          : [];
+        state.operations = operations;
         reconcileAgentSelection();
         await loadTypedSettings();
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        ) {
+          if (!state.operatorAuthenticated) {
+            const authError = document.getElementById("auth-error");
+            resetAuthenticatedPortalState(state, document, location, {
+              passwordLoginEnabled: state.passwordLoginEnabled,
+              title: document.getElementById("auth-title").textContent,
+              copy: document.getElementById("auth-copy").textContent,
+              errorMessage: authError.hidden ? "" : authError.textContent,
+            });
+          }
+          return;
+        }
         state.generatedAt =
           providerCatalog.generatedAt || new Date().toISOString();
         document.getElementById("service-caption").textContent =
@@ -764,6 +1151,11 @@
           announce("Server state refreshed");
         }
       } catch (error) {
+        if (
+          !state.operatorAuthenticated ||
+          authenticationGeneration !== state.authenticationGeneration
+        )
+          return;
         const offline = error.network || navigator.onLine === false;
         document.getElementById("service-caption").textContent = offline
           ? "Server connection unavailable"
@@ -779,12 +1171,8 @@
         }
         toast(error.message, true);
         announce(error.message);
-      } finally {
-        setLoading(false);
-        state.loadPromise = null;
       }
-    })();
-    return state.loadPromise;
+    });
   }
 
   function updateShell() {
@@ -1501,9 +1889,31 @@
     });
   }
 
+  function clearAuthenticationSecrets() {
+    const form = document.getElementById("auth-form");
+    if (form) disposeSensitiveInputs(form);
+  }
+
+  function activateAuthenticatedPortal(status) {
+    clearAuthenticationSecrets();
+    state.authenticationGeneration += 1;
+    invalidatePortalLoadState(state);
+    state.operatorAuthenticated = true;
+    state.authenticationMode = "authenticated";
+    state.passwordLoginEnabled = status?.passwordLoginEnabled !== false;
+    const app = document.getElementById("app");
+    app.hidden = false;
+    app.inert = false;
+    app.removeAttribute("aria-hidden");
+    document.getElementById("auth-gate").hidden = true;
+  }
+
   function renderRoute() {
     const route = normalizedRoute();
-    state.route = route.surface === "home" ? "home" : `settings/${route.page}`;
+    const nextRoute =
+      route.surface === "home" ? "home" : `settings/${route.page}`;
+    if (state.route !== nextRoute) disposeSensitiveInputs();
+    state.route = nextRoute;
     const home = document.getElementById("home-shell");
     const settings = document.getElementById("settings-shell");
     home.hidden = route.surface !== "home";
@@ -1538,6 +1948,8 @@
         "context-builder": "Context Builder",
         "portal-appearance": "Portal Appearance",
         advanced: "Advanced",
+        "operator-account": "Operator Account",
+        operations: "Operations",
         "mcp-server": "MCP Server",
         "mcp-tools": "Tools",
         "workspace-approvals": "Workspace Approvals",
@@ -1560,6 +1972,8 @@
         "context-builder": renderTypedContextBuilder,
         "portal-appearance": renderPortalAppearance,
         advanced: renderAdvanced,
+        "operator-account": renderOperatorAccount,
+        operations: renderOperations,
         "mcp-server": renderMCPServer,
         "mcp-tools": renderMCPTools,
         "workspace-approvals": renderWorkspaceApprovals,
@@ -4167,6 +4581,299 @@
       "Choose browser-native theme and text density without copying macOS preference keys.",
       "appearance",
       [card, boundaries],
+    );
+  }
+
+  async function refreshPrivatePilotState() {
+    const authenticationGeneration = state.authenticationGeneration;
+    const [operatorSessions, operations] = await Promise.all([
+      api("api/v1/account/sessions"),
+      api("api/v1/operations"),
+    ]);
+    if (
+      !state.operatorAuthenticated ||
+      authenticationGeneration !== state.authenticationGeneration
+    )
+      return;
+    state.operatorSessions = Array.isArray(operatorSessions)
+      ? operatorSessions
+      : [];
+    state.operations = operations;
+    renderRoute();
+  }
+
+  async function logoutOperator(control) {
+    if (state.logoutPromise) return state.logoutPromise;
+    const passwordLoginEnabled = state.passwordLoginEnabled;
+    setDisabledReason(control, true, "Logout is in progress.");
+    state.logoutPromise = terminatePortalSession(
+      () => api("api/v1/logout", { method: "POST" }),
+      (failure) => {
+        clearPollTimer();
+        clearAgentPoll();
+        resetAuthenticatedPortalState(state, document, location, {
+          passwordLoginEnabled,
+          title: failure ? "Sign in again" : "Signed out",
+          copy: failure
+            ? passwordLoginEnabled
+              ? "Local portal state was cleared because the server response could not be confirmed. Sign in again before continuing."
+              : "Local portal state was cleared because the server response could not be confirmed. Restore the connection and reload to verify the operator certificate."
+            : passwordLoginEnabled
+              ? "The portal session has ended. Sign in to continue."
+              : "The portal session has ended. Reload to verify the operator certificate and continue.",
+          errorMessage: failure
+            ? "Logout could not be confirmed. No authenticated portal state remains in this page."
+            : "",
+        });
+        state.logoutPromise = null;
+      },
+    );
+    return state.logoutPromise;
+  }
+
+  function privatePilotPasswordInput(label, autocomplete) {
+    const input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = autocomplete;
+    input.dataset.sensitive = "true";
+    input.setAttribute("aria-label", label);
+    return input;
+  }
+
+  function renderOperatorAccount() {
+    const passwordCard = desktopCard(
+      "Change Operator Password",
+      "A successful change revokes every existing session and issues exactly one replacement session to this browser.",
+    );
+    const currentPassword = privatePilotPasswordInput(
+      "Current password",
+      "current-password",
+    );
+    const newPassword = privatePilotPasswordInput("New password", "new-password");
+    const confirmation = privatePilotPasswordInput(
+      "Confirm new password",
+      "new-password",
+    );
+    const save = element("button", "primary-button", "Change Password");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      if (!currentPassword.value || !newPassword.value) {
+        toast("Enter the current and new passwords.", true);
+        disposeSensitiveInputs(passwordCard);
+        return;
+      }
+      if (newPassword.value !== confirmation.value) {
+        toast("Password confirmation does not match.", true);
+        disposeSensitiveInputs(passwordCard);
+        return;
+      }
+      setDisabledReason(save, true, "Password change is in progress.");
+      try {
+        await api("api/v1/account/password", {
+          method: "POST",
+          body: JSON.stringify({
+            currentPassword: currentPassword.value,
+            newPassword: newPassword.value,
+            passwordConfirmation: confirmation.value,
+          }),
+        });
+        await refreshPrivatePilotState();
+        toast("Operator password changed and prior sessions revoked.");
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        disposeSensitiveInputs(passwordCard);
+        setDisabledReason(save, false);
+      }
+    });
+    passwordCard.append(
+      desktopRow(
+        "Current Password",
+        "Required to authorize an online password change.",
+        currentPassword,
+      ),
+      desktopRow(
+        "New Password",
+        "Use a unique password held only by approved pilot operators.",
+        newPassword,
+      ),
+      desktopRow(
+        "Confirm Password",
+        "Re-enter the new password exactly.",
+        confirmation,
+      ),
+      save,
+    );
+
+    const sessions = desktopCard(
+      "Operator Sessions",
+      "Session inventory is durable across restarts. Expired and revoked rows remain visible for operator review.",
+    );
+    if (!state.operatorSessions.length) {
+      sessions.append(element("p", "card-subtitle", "No sessions are recorded."));
+    } else {
+      state.operatorSessions.forEach((session) => {
+        const status = session.current
+          ? "Current"
+          : session.revokedAt
+            ? `Revoked ${formatDate(session.revokedAt)}`
+            : "Active";
+        sessions.append(
+          desktopRow(
+            `${session.username}${session.current ? " · this browser" : ""}`,
+            `Issued ${formatDate(session.issuedAt)} · Last seen ${formatDate(session.lastSeenAt)} · Expires ${formatDate(session.expiresAt)}`,
+            element("span", "read-only-value", status),
+          ),
+        );
+      });
+    }
+    const revoke = element(
+      "button",
+      "danger-button",
+      "Revoke Other Sessions",
+    );
+    revoke.type = "button";
+    revoke.addEventListener("click", async () => {
+      const accepted = await confirmAction({
+        title: "Revoke other operator sessions?",
+        message:
+          "Every operator session except this browser will be revoked immediately. This action is recorded in the security audit.",
+        label: "Revoke Sessions",
+        returnFocus: revoke,
+      });
+      if (!accepted) return;
+      setDisabledReason(revoke, true, "Session revocation is in progress.");
+      try {
+        const result = await api("api/v1/account/sessions/revoke-all", {
+          method: "POST",
+        });
+        await refreshPrivatePilotState();
+        toast(`Revoked ${result?.revoked ?? 0} other session(s).`);
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        setDisabledReason(revoke, false);
+      }
+    });
+    sessions.append(revoke);
+
+    const portalSession = desktopCard(
+      "Portal Session",
+      "End this browser session and remove all authenticated portal state from this page.",
+    );
+    const logout = element("button", "danger-button", "Logout");
+    logout.type = "button";
+    logout.addEventListener("click", () => logoutOperator(logout));
+    portalSession.append(logout);
+
+    settingsPage(
+      "Operator Account",
+      "Manage the single private-pilot operator credential and durable browser sessions.",
+      "key",
+      [passwordCard, sessions, portalSession],
+      recommendation(
+        "shield",
+        "Offline recovery is intentionally not exposed in the browser",
+        "Use the maintenance-lease-protected operator reset-password CLI with password input over a file descriptor.",
+      ),
+    );
+  }
+
+  function renderOperations() {
+    const snapshot = state.operations;
+    if (!snapshot) {
+      settingsPage(
+        "Operations",
+        "Loading private-pilot readiness and audit evidence…",
+        "server",
+        [],
+      );
+      return;
+    }
+    const readiness = snapshot.readiness || {};
+    const operational = readiness.operational || {};
+    const checks = desktopCard(
+      "Readiness",
+      `Observed ${formatDate(readiness.observedAt)} · ${readiness.ready ? "Ready" : "Not ready"}`,
+    );
+    (readiness.checks || []).forEach((check) =>
+      checks.append(
+        desktopRow(
+          humanize(check.name),
+          check.detail,
+          element(
+            "span",
+            "read-only-value",
+            check.ready ? "Ready" : "Blocked",
+          ),
+        ),
+      ),
+    );
+
+    const durability = informationalCard(
+      "Durability & Capacity",
+      "Low-cardinality operational state from the SQLite authority and bounded maintenance loop.",
+      [
+        ["Schema", operational.migrationsValid ? "V9 verified" : "Migration check failed"],
+        ["Store integrity", operational.integrityValid ? "Valid" : "Check failed"],
+        ["Activation", operational.activationState || "Unknown"],
+        ["Agent sessions", `${readiness.activeSessionCount ?? 0} / ${readiness.maximumActiveSessions ?? 0}`],
+        ["Operator sessions", String(operational.activeOperatorSessionCount ?? 0)],
+        ["Blocked auth buckets", String(operational.blockedAuthenticationBucketCount ?? 0)],
+        ["Pending outbox", String(operational.eventOutboxPendingCount ?? 0)],
+        ["Nonfinal transitions", String(operational.nonfinalAuthorityTransitionCount ?? 0)],
+        ["Last successful backup", formatDate(operational.lastSuccessfulBackupAt)],
+        ["Maintenance", snapshot.maintenance?.lastErrorCode ? `Error: ${snapshot.maintenance.lastErrorCode}` : "Healthy"],
+      ],
+    );
+
+    const receipts = desktopCard(
+      "Maintenance Receipts",
+      "Backup and migration evidence stored in the authority database. Digests and fingerprints are evidence, not credentials.",
+    );
+    if (!(snapshot.receipts || []).length) {
+      receipts.append(element("p", "card-subtitle", "No maintenance receipts have been recorded."));
+    }
+    (snapshot.receipts || []).forEach((receipt) =>
+      receipts.append(
+        desktopRow(
+          `${humanize(receipt.operation)} · ${receipt.outcome}`,
+          `Schema ${receipt.sourceSchemaVersion} · Sequence ${receipt.sourceGlobalSequence} · ${formatDate(receipt.createdAt)}`,
+          element(
+            "span",
+            "read-only-value digest-value",
+            (receipt.archiveSHA256 || "").slice(0, 16),
+          ),
+        ),
+      ),
+    );
+
+    const audit = desktopCard(
+      "Security Audit",
+      "Secret-free operator security outcomes, newest first. Correlation IDs support incident review without exposing credentials.",
+    );
+    if (!(snapshot.securityAudit || []).length) {
+      audit.append(element("p", "card-subtitle", "No security events have been recorded."));
+    }
+    (snapshot.securityAudit || []).forEach((entry) =>
+      audit.append(
+        desktopRow(
+          `${humanize(entry.operation)} · ${entry.outcome}`,
+          `${entry.actor} via ${entry.channel} · ${formatDate(entry.createdAt)}${entry.detailCode ? ` · ${entry.detailCode}` : ""}`,
+          element(
+            "span",
+            "read-only-value digest-value",
+            (entry.correlationID || "").slice(0, 8),
+          ),
+        ),
+      ),
+    );
+
+    settingsPage(
+      "Operations",
+      "Review readiness, durability, backup receipts, and secret-free security audit evidence.",
+      "server",
+      [checks, durability, receipts, audit],
     );
   }
 
@@ -7445,6 +8152,12 @@
   function start() {
     if (state.initialized) return;
     state.initialized = true;
+    installPortalAuthenticationSubmission(state, document, {
+      request: api,
+      activate: activateAuthenticatedPortal,
+      afterAuthenticated: () => loadAll(false),
+      clearSecrets: clearAuthenticationSecrets,
+    });
     applyPortalAppearance();
     installIcons();
     renderInitialLoading();
@@ -7544,76 +8257,31 @@
   }
 
   async function ensureOperatorSession() {
+    clearAuthenticationSecrets();
     const gate = document.getElementById("auth-gate");
-    const form = document.getElementById("auth-form");
-    const error = document.getElementById("auth-error");
     let status;
     try {
       status = await api("api/v1/auth/status");
     } catch (failure) {
-      gate.hidden = true;
-      return true;
-    }
-    if (status.authenticated) {
-      gate.hidden = true;
-      return true;
-    }
-    gate.hidden = false;
-    if (!status.passwordLoginEnabled) {
-      document.getElementById("auth-title").textContent = "Operator certificate required";
-      document.getElementById("auth-copy").textContent =
-        "This server uses mutual TLS. Import the operator client certificate in your browser, then reload.";
-      form.hidden = true;
+      resetAuthenticatedPortalState(state, document, location, {
+        passwordLoginEnabled: false,
+        title: "Operator access unavailable",
+        copy: "The portal could not verify operator access. Restore the server connection and reload.",
+        errorMessage: failure.message,
+      });
       return false;
     }
-    form.hidden = false;
-    const setup = !!status.needsSetup;
-    document.getElementById("auth-title").textContent = setup
-      ? "Create the operator password"
-      : "Sign in";
-    document.getElementById("auth-copy").textContent = setup
-      ? "This is the first launch. Choose a password for the operator account. If you are not on this machine, paste the setup token printed in the server log."
-      : "Enter the operator password to open the portal.";
-    document.getElementById("auth-token-field").hidden = !setup;
-    document.getElementById("auth-confirm-field").hidden = !setup;
-    document.getElementById("auth-password").autocomplete = setup
-      ? "new-password"
-      : "current-password";
-    document.getElementById("auth-submit").textContent = setup
-      ? "Create password"
-      : "Sign in";
-    return await new Promise((resolve) => {
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        error.hidden = true;
-        const password = document.getElementById("auth-password").value;
-        try {
-          if (setup) {
-            const confirmation = document.getElementById(
-              "auth-password-confirm",
-            ).value;
-            await api("api/v1/setup", {
-              method: "POST",
-              body: JSON.stringify({
-                password,
-                passwordConfirmation: confirmation,
-                setupToken: document.getElementById("auth-token").value.trim(),
-              }),
-            });
-          } else {
-            await api("api/v1/login", {
-              method: "POST",
-              body: JSON.stringify({ password }),
-            });
-          }
-          gate.hidden = true;
-          resolve(true);
-        } catch (failure) {
-          error.hidden = false;
-          error.textContent = failure.message;
-        }
-      });
+    state.passwordLoginEnabled = status.passwordLoginEnabled !== false;
+    if (status.authenticated) {
+      activateAuthenticatedPortal(status);
+      return true;
+    }
+    resetAuthenticatedPortalState(state, document, location, {
+      passwordLoginEnabled: status.passwordLoginEnabled,
     });
+    gate.hidden = false;
+    presentPortalAuthenticationMode(state, document, status);
+    return false;
   }
 
   if (window.__REPOPROMPT_PORTAL_TEST_HOOK__) {
@@ -7627,16 +8295,22 @@
       selectSession,
       beginNewSession,
       submitComposer,
+      logoutOperator,
       disposeSensitiveInputs,
+      resetAuthenticatedPortalState: (options) =>
+        resetAuthenticatedPortalState(state, document, location, options),
       whenIdle: async () => {
+        await state.authenticationSubmission?.promise;
         await state.loadPromise;
         await state.settingsMutation;
         await Promise.all(Object.values(state.domainMutations).filter(Boolean));
         await state.agent.transcriptPromise;
         await state.agent.mutationPromise;
+        await state.logoutPromise;
       },
     });
   }
 
-  start();
-})();
+  if (!window.__REPOPROMPT_PORTAL_TEST_HOOK__?.deferStart) start();
+  })();
+}

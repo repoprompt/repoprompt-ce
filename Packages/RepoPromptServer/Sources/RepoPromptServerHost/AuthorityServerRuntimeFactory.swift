@@ -94,14 +94,30 @@ private struct RestoreActivationRequest: Decodable {
     let targetNamespaceKind: String
     let targetDatabaseIdentityDigest: String
     let missingExternalOptionalAssetIDs: [String]?
+    let maintenanceReceipt: RestoreMaintenanceReceiptV1
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, acknowledged, backupSequence, backupCreatedAt
         case sourceNamespaceKind, sourceDatabaseIdentityDigest
         case targetNamespaceKind, targetDatabaseIdentityDigest
-        case missingExternalOptionalAssetIDs
+        case missingExternalOptionalAssetIDs, maintenanceReceipt
         case restoredFromStoreID = "restoredFromStoreId"
         case backupManifestSHA256 = "backupManifestSha256"
+    }
+}
+
+private extension RestoreMaintenanceReceiptV1 {
+    var persistenceEvidence: MaintenanceReceiptEvidence {
+        MaintenanceReceiptEvidence(
+            archiveSHA256: archiveSHA256,
+            manifestSHA256: manifestSHA256,
+            source: source,
+            verifierFingerprint: verifierFingerprint,
+            recipientFingerprints: recipientFingerprints,
+            sidecarSHA256: sidecarSHA256,
+            toolVersion: toolVersion,
+            toolDigest: toolDigest
+        )
     }
 }
 
@@ -137,11 +153,27 @@ public extension RepoPromptAuthorityHostFactory {
                     )
                 }
                 var metadata = try await store.metadata()
-                if metadata.activationState == "active", FileManager.default.fileExists(atPath: requestURL.path) {
-                    let request = try JSONDecoder.serviceDecoder.decode(
-                        RestoreActivationRequest.self,
-                        from: Data(contentsOf: requestURL)
+                let request: RestoreActivationRequest?
+                do {
+                    request = if FileManager.default.fileExists(atPath: requestURL.path) {
+                        try JSONDecoder.serviceDecoder.decode(
+                            RestoreActivationRequest.self,
+                            from: Data(contentsOf: requestURL)
+                        )
+                    } else {
+                        nil
+                    }
+                } catch {
+                    try? await store.appendOperatorSecurityAudit(
+                        operation: "restorePrepare", outcome: "failure",
+                        actor: "operator-maintenance", channel: "offline",
+                        clientIdentityDigest: nil, correlationID: UUID(),
+                        detailCode: "restoreRequestDecodeRejected"
                     )
+                    throw error
+                }
+                if let request {
+                    let receipt = request.maintenanceReceipt
                     guard request.schemaVersion == 1,
                           request.acknowledged,
                           request.sourceNamespaceKind == request.targetNamespaceKind,
@@ -153,13 +185,28 @@ public extension RepoPromptAuthorityHostFactory {
                           request.backupManifestSHA256.range(
                               of: "^[a-f0-9]{64}$",
                               options: .regularExpression
-                          ) != nil
+                          ) != nil,
+                          receipt.source.storeID == request.restoredFromStoreID,
+                          receipt.source.nextGlobalSequence == request.backupSequence,
+                          receipt.manifestSHA256 == request.backupManifestSHA256,
+                          receipt.archiveSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                          receipt.sidecarSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                          receipt.verifierFingerprint?.isEmpty == false
                     else {
+                        try? await store.appendOperatorSecurityAudit(
+                            operation: "restorePrepare", outcome: "failure",
+                            actor: "operator-maintenance", channel: "offline",
+                            clientIdentityDigest: nil, correlationID: UUID(),
+                            detailCode: "restoreRequestValidationRejected"
+                        )
                         throw ServiceAPIError(
                             code: .invalidRequest,
-                            message: "Restore activation request is invalid or does not match this store"
+                            message: "Restore activation request or required maintenance receipt is invalid"
                         )
                     }
+                }
+                if metadata.activationState == "active", let request {
+                    let correlationID = UUID()
                     _ = try await store.activateRestoredNamespace(
                         from: request.restoredFromStoreID,
                         backupSequence: request.backupSequence,
@@ -170,15 +217,32 @@ public extension RepoPromptAuthorityHostFactory {
                         targetDatabaseIdentityDigest: request.targetDatabaseIdentityDigest,
                         missingExternalOptionalAssetIDs: request.missingExternalOptionalAssetIDs ?? [],
                         activationToken: token,
-                        instanceID: instanceID
+                        instanceID: instanceID,
+                        maintenanceReceipt: request.maintenanceReceipt.persistenceEvidence,
+                        correlationID: correlationID
                     )
                     metadata = try await store.metadata()
                     try FileManager.default.removeItem(at: requestURL)
                 }
                 if metadata.activationState == "restore_prepared" {
+                    guard let request else {
+                        try? await store.appendOperatorSecurityAudit(
+                            operation: "restorePrepare", outcome: "failure",
+                            actor: "operator-maintenance", channel: "offline",
+                            clientIdentityDigest: nil, correlationID: UUID(),
+                            detailCode: "restoreReceiptMissing"
+                        )
+                        throw ServiceAPIError(
+                            code: .invalidRequest,
+                            message: "Prepared restore is missing its required maintenance receipt"
+                        )
+                    }
+                    let correlationID = UUID()
                     _ = try await store.activateRestoredStore(
                         activationToken: token,
-                        instanceID: instanceID
+                        instanceID: instanceID,
+                        maintenanceReceipt: request.maintenanceReceipt.persistenceEvidence,
+                        correlationID: correlationID
                     )
                     if FileManager.default.fileExists(atPath: requestURL.path) {
                         try FileManager.default.removeItem(at: requestURL)

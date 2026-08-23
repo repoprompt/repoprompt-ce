@@ -14,7 +14,7 @@
     <link rel="stylesheet" href="assets/portal.css" />
   </head>
   <body>
-    <div id="auth-gate" class="auth-gate" hidden>
+    <div id="auth-gate" class="auth-gate">
       <div class="auth-card native-material">
         <img class="app-icon" src="assets/repoprompt-icon.png" alt="" />
         <h1 id="auth-title">RepoPrompt Server</h1>
@@ -22,7 +22,7 @@
         <form id="auth-form" hidden>
           <label id="auth-token-field" hidden>
             Setup token
-            <input id="auth-token" name="setupToken" autocomplete="off" spellcheck="false" />
+            <input id="auth-token" name="setupToken" type="password" autocomplete="off" spellcheck="false" data-sensitive="true" />
           </label>
           <label>
             Password
@@ -31,6 +31,7 @@
               type="password"
               name="password"
               autocomplete="current-password"
+              data-sensitive="true"
               required
             />
           </label>
@@ -41,6 +42,7 @@
               type="password"
               name="passwordConfirmation"
               autocomplete="new-password"
+              data-sensitive="true"
             />
           </label>
           <p id="auth-error" class="auth-error" role="alert" hidden></p>
@@ -53,7 +55,7 @@
     <button class="skip-link" type="button" data-action="skip-content">
       Skip to content
     </button>
-    <div id="app" class="app-frame">
+    <div id="app" class="app-frame" hidden>
       <header class="titlebar">
         <a
           class="titlebar-leading"
@@ -385,6 +387,23 @@
                 data-route-link
                 data-icon="sliders"
                 >Advanced</a
+              >
+            </section>
+            <section data-settings-section>
+              <h2>Private Pilot</h2>
+              <a
+                href="#settings/operator-account"
+                data-route="operator-account"
+                data-route-link
+                data-icon="key"
+                >Operator Account</a
+              >
+              <a
+                href="#settings/operations"
+                data-route="operations"
+                data-route-link
+                data-icon="server"
+                >Operations</a
               >
             </section>
             <section data-settings-section>

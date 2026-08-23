@@ -119,7 +119,7 @@ public actor RepoPromptReadinessService {
             let snapshot = try await store.operationalSnapshot()
             operational = snapshot
             checks.append(.init(name: "sqlite-integrity", ready: snapshot.integrityValid, detail: snapshot.integrityValid ? "ok" : "failed"))
-            checks.append(.init(name: "migrations", ready: snapshot.migrationsValid, detail: snapshot.migrationsValid ? "schema-v8" : "mismatch"))
+            checks.append(.init(name: "migrations", ready: snapshot.migrationsValid, detail: snapshot.migrationsValid ? "schema-v9" : "mismatch"))
             checks.append(.init(name: "activation", ready: snapshot.activationState == "active", detail: snapshot.activationState))
             // Startup reconstruction is completed by authority.recover() before this
             // service exists. Families observed here are verified live work, not an

@@ -1025,7 +1025,7 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
     func testMigrationIsAdditiveAndDetectsLegacyLedgerGap() async throws {
         let store = try await SQLiteServiceStore.open(storage: .memory)
         let metadata = try await store.metadata()
-        XCTAssertEqual(metadata.schemaVersion, SchemaV7.version)
+        XCTAssertEqual(metadata.schemaVersion, SchemaV9.version)
         let tables = try await store.database.query("SELECT name FROM sqlite_master WHERE type='table'").compactMap { $0.column("name")?.string }
         XCTAssertTrue(Set(["projects", "sessions", "transcript_entries", "semantic_turns", "semantic_activities", "semantic_tools", "agent_submissions"]).isSubset(of: Set(tables)))
         let sessionID = UUID()
@@ -1061,7 +1061,11 @@ final class SQLiteServiceStoreV6CompatibilityTests: XCTestCase {
                 source: source,
                 archiveSHA256: String(repeating: "a", count: 64),
                 manifestSHA256: String(repeating: "b", count: 64),
-                verifierFingerprint: String(repeating: "c", count: 64)
+                verifierFingerprint: String(repeating: "c", count: 64),
+                recipientFingerprints: ["age:x25519:test"],
+                sidecarSHA256: String(repeating: "d", count: 64),
+                toolVersion: "test-tool",
+                toolDigest: String(repeating: "e", count: 64)
             ),
             namespaceKind: "server",
             databaseIdentityDigest: String(repeating: "d", count: 64)

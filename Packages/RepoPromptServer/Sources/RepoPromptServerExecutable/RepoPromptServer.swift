@@ -31,13 +31,22 @@ struct RepoPromptServer {
                 try await restore(arguments: Array(CommandLine.arguments.dropFirst(2)))
                 return
             }
+            if CommandLine.arguments.dropFirst().first == "operator" {
+                try await operatorRecovery(arguments: Array(CommandLine.arguments.dropFirst(2)))
+                return
+            }
             if CommandLine.arguments.dropFirst().first == "process-family-smoke" {
                 try await processFamilySmoke()
                 return
             }
             try await RepoPromptServerRunner.run(configuration: .environment())
         } catch {
-            FileHandle.standardError.write(Data("RepoPromptServer failed: \(error)\n".utf8))
+            ServerStructuredLogger.write(
+                level: "error",
+                event: "server.command",
+                outcome: "failure",
+                fields: ["errorType": String(reflecting: type(of: error))]
+            )
             throw error
         }
     }
@@ -154,13 +163,68 @@ struct RepoPromptServer {
             else {
                 throw ConfigurationError.missing("backup verify <archive> --identity-file")
             }
-            let verified = try await service.verify(
-                archiveURL: URL(fileURLWithPath: archive),
-                identityFileURL: URL(fileURLWithPath: identity)
-            )
-            try writeJSON(verified.sidecar)
+            let archiveURL = URL(fileURLWithPath: archive)
+            let identityURL = URL(fileURLWithPath: identity)
+            if options.contains("--database") {
+                let namespace = try authorityNamespace(arguments: options)
+                let session = try await AuthorityMaintenanceSession.open(configuration: .init(namespace: namespace))
+                do {
+                    let verified = try await session.verifyBackup(
+                        service: service,
+                        archiveURL: archiveURL,
+                        identityFileURL: identityURL
+                    )
+                    try await session.close(clean: true)
+                    try writeJSON(verified.sidecar)
+                } catch {
+                    try? await session.close(clean: false)
+                    throw error
+                }
+            } else {
+                let verified = try await service.verify(
+                    archiveURL: archiveURL,
+                    identityFileURL: identityURL
+                )
+                try writeJSON(verified.sidecar)
+            }
         default:
             throw ConfigurationError.invalid("backup operation must be create or verify")
+        }
+    }
+
+    private static func operatorRecovery(arguments: [String]) async throws {
+        guard let operation = arguments.first else {
+            throw ConfigurationError.missing("operator reset-password|issue-setup-token|revoke-all-sessions")
+        }
+        let options = Array(arguments.dropFirst())
+        let namespace = try authorityNamespace(arguments: options)
+        let session = try await AuthorityMaintenanceSession.open(configuration: .init(namespace: namespace))
+        do {
+            switch operation {
+            case "reset-password":
+                let descriptor = Int32(value(after: "--password-fd", in: options) ?? "0") ?? 0
+                guard descriptor >= 0 else { throw ConfigurationError.invalid("--password-fd must be nonnegative") }
+                let data = try FileHandle(fileDescriptor: descriptor, closeOnDealloc: false).readToEnd() ?? Data()
+                let password = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .newlines)
+                try await session.resetOperatorPassword(password)
+                try writeJSON(["ok": true])
+            case "issue-setup-token":
+                guard let output = value(after: "--output", in: options) else {
+                    throw ConfigurationError.missing("operator issue-setup-token --output <owner-only-file>")
+                }
+                let token = try await session.issueOperatorSetupToken()
+                let url = URL(fileURLWithPath: output)
+                try writeOwnerOnlySecret(Data((token + "\n").utf8), to: url)
+                try writeJSON(["output": url.path])
+            case "revoke-all-sessions":
+                try writeJSON(["revoked": try await session.revokeAllOperatorSessions()])
+            default:
+                throw ConfigurationError.invalid("operator operation must be reset-password, issue-setup-token, or revoke-all-sessions")
+            }
+            try await session.close(clean: true)
+        } catch {
+            try? await session.close(clean: false)
+            throw error
         }
     }
 
