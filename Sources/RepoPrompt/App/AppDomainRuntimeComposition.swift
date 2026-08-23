@@ -1,5 +1,8 @@
 import Foundation
+import Logging
 import RepoPromptDomainRuntime
+
+private let appDomainRuntimeLog = Logger(label: "com.repoprompt.app.domain-runtime")
 
 private enum AppDomainRuntimeMetrics {
     static let editFlowSink = DomainRuntimeMetricsSink { metric in
@@ -36,6 +39,33 @@ final class AppDomainRuntimeComposition: Sendable {
 
     let runtime: MCPDomainRuntime
 
+    static func prototypeAuthorityDatabaseURL(applicationSupportRoot: URL) -> URL {
+        applicationSupportRoot
+            .appendingPathComponent("AgentAuthority", isDirectory: true)
+            .appendingPathComponent("repoprompt.sqlite", isDirectory: false)
+    }
+
+    /// Reports the intentionally orphaned Desktop authority prototype without opening,
+    /// migrating, moving, or deleting it. Production calls this once from the process-wide
+    /// composition initializer; the return value keeps the preservation contract testable.
+    @discardableResult
+    static func reportUnusedPrototypeAuthorityStoreIfPresent(
+        applicationSupportRoot: URL,
+        fileManager: FileManager = .default,
+        log: (String) -> Void
+    ) -> Bool {
+        let databaseURL = prototypeAuthorityDatabaseURL(applicationSupportRoot: applicationSupportRoot)
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: databaseURL.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            return false
+        }
+
+        log("Unused Desktop AgentAuthority prototype store preserved at \(databaseURL.path); it will not be opened or migrated.")
+        return true
+    }
+
     static func collectLegacyRuntimeDefaults(from defaults: UserDefaults) -> [String: Data] {
         var collected: [String: Data] = [:]
         for key in legacyRuntimeDefaultKeys {
@@ -60,6 +90,9 @@ final class AppDomainRuntimeComposition: Sendable {
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         let root = applicationSupport.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        Self.reportUnusedPrototypeAuthorityStoreIfPresent(applicationSupportRoot: root) { message in
+            appDomainRuntimeLog.notice("\(message)")
+        }
         let defaults = UserDefaults.standard
         let customStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
         var legacyRuntimeDefaults = Self.collectLegacyRuntimeDefaults(from: defaults)
