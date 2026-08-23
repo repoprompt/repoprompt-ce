@@ -12,6 +12,7 @@ import RepoPromptAuthorityAPI
 import RepoPromptDomainRuntime
 import RepoPromptHeadlessRuntime
 import RepoPromptRuntimeModel
+import RepoPromptShared
 import RepoPromptWorkspaceRuntimeCore
 
 private let directHeadlessCLIVersion = "1.3.0"
@@ -266,24 +267,47 @@ actor DirectHeadlessMCPService {
                     arguments: params.arguments ?? [:]
                 )
                 let encoded = try JSONEncoder().encode(arguments)
-                let result = try await serving.invoke(
-                    toolName: params.name,
-                    argumentsJSON: encoded,
-                    binding: .init(
-                        sessionID: prepared.scopeID.rawValue,
-                        actor: .init(
-                            userID: connection.principal.stableKey
-                                ?? "headless-\(connection.connectionID.uuidString)",
-                            username: connection.principal.displayName,
-                            displayName: connection.principal.displayName
+                let requestIdentity = try Self.requestTimelineIdentity(
+                    metadataAppInvocationID: params._meta?[MCPRequestTimelineTransportMetadata.appInvocationIDKey]?.stringValue,
+                    inherited: MCPRequestTimelineContext.current
+                )
+                let result = try await MCPRequestTimelineContext.$current.withValue(requestIdentity) {
+                    try await serving.invoke(
+                        toolName: params.name,
+                        argumentsJSON: encoded,
+                        binding: .init(
+                            sessionID: prepared.scopeID.rawValue,
+                            actor: .init(
+                                userID: connection.principal.stableKey
+                                    ?? "headless-\(connection.connectionID.uuidString)",
+                                username: connection.principal.displayName,
+                                displayName: connection.principal.displayName
+                            ),
+                            appInvocationID: requestIdentity?.appInvocationID
                         )
                     )
-                )
+                }
                 return Self.successResult(try JSONDecoder().decode(Value.self, from: result))
             } catch {
                 return Self.errorResult(String(describing: error))
             }
         }
+    }
+
+    package static func requestTimelineIdentity(
+        metadataAppInvocationID: String?,
+        inherited: MCPRequestTimelineIdentity?
+    ) throws -> MCPRequestTimelineIdentity? {
+        guard let metadataAppInvocationID else { return inherited }
+        guard let appInvocationID = MCPRequestTimelineTransportMetadata.normalizedAppInvocationID(
+            metadataAppInvocationID
+        ) else {
+            throw MCPError.invalidParams("Invalid host-issued MCP application invocation identity")
+        }
+        return MCPRequestTimelineTransportMetadata.identity(
+            appInvocationID: appInvocationID,
+            inheriting: inherited
+        )
     }
 
     fileprivate static func visibleToolNames(_ connection: ConnectionContext) -> Set<String> {
@@ -573,6 +597,7 @@ actor DirectHeadlessMCPService {
 private actor DirectHeadlessAdapterServing: RepoPromptMCPServing {
     private let prepared: DirectHeadlessMCPService.PreparedRuntime
     private let connection: DirectHeadlessMCPService.ConnectionContext
+    private var localInvocationOrdinal: UInt64 = 0
 
     init(
         prepared: DirectHeadlessMCPService.PreparedRuntime,
@@ -603,7 +628,7 @@ private actor DirectHeadlessAdapterServing: RepoPromptMCPServing {
     func invoke(
         toolName: String,
         argumentsJSON: Data,
-        binding _: AuthorityMCPBinding
+        binding: AuthorityMCPBinding
     ) async throws -> Data {
         guard DirectHeadlessMCPService.visibleToolNames(connection).contains(toolName) else {
             throw ServiceAPIError(code: .capabilityMissing, message: "Tool is unavailable for this client policy")
@@ -631,10 +656,36 @@ private actor DirectHeadlessAdapterServing: RepoPromptMCPServing {
         else {
             throw MCPDomainHostError.connectionRegistrationInvalid
         }
+        let inheritedAppInvocationID = binding.appInvocationID
+            ?? MCPRequestTimelineContext.current?.appInvocationID
+        let invocationID: UUID
+        if let inheritedAppInvocationID {
+            guard let durableInvocationID = UUID(uuidString: inheritedAppInvocationID) else {
+                throw ServiceAPIError(
+                    code: .idempotencyRequired,
+                    message: "The host-issued application invocation identity is invalid",
+                    retryable: false
+                )
+            }
+            invocationID = durableInvocationID
+        } else if resolved.binding.definition.annotations.readOnlyHint == true {
+            localInvocationOrdinal &+= 1
+            invocationID = Self.localCorrelationID(
+                connectionID: connection.connectionID,
+                generation: connection.connectionGeneration,
+                ordinal: localInvocationOrdinal
+            )
+        } else {
+            throw ServiceAPIError(
+                code: .idempotencyRequired,
+                message: "A host-issued application invocation identity is required before direct-headless mutation reservation",
+                retryable: false
+            )
+        }
         let security = await DirectHeadlessMCPService.securityContext(
             prepared: prepared,
             connection: connection,
-            invocationID: UUID()
+            invocationID: invocationID
         )
         let value = try await prepared.mutationCapability.perform {
             try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
@@ -644,6 +695,23 @@ private actor DirectHeadlessAdapterServing: RepoPromptMCPServing {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return try encoder.encode(value)
+    }
+
+    private nonisolated static func localCorrelationID(
+        connectionID: UUID,
+        generation: UInt64,
+        ordinal: UInt64
+    ) -> UUID {
+        let digest = Array(SHA256.hash(data: Data(
+            "\(connectionID.uuidString.lowercased()):\(generation):\(ordinal)".utf8
+        )))
+        let raw: uuid_t = (
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5], digest[6], digest[7],
+            digest[8], digest[9], digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15]
+        )
+        return UUID(uuid: raw)
     }
 }
 

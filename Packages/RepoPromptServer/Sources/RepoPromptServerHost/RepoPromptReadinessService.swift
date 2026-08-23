@@ -69,6 +69,7 @@ public actor RepoPromptReadinessService {
     private let mutationGate: AuthorityMutationGate
     private let trustConfigurationValid: Bool
     private let providerSettings: ProviderSettingsService?
+    private let eventOutboxDispatcher: OrderedEventOutboxDispatcher?
     private var cached: RepoPromptReadinessSnapshot?
 
     public init(
@@ -83,7 +84,8 @@ public actor RepoPromptReadinessService {
         cacheDuration: TimeInterval = 15,
         mutationGate: AuthorityMutationGate = AuthorityMutationGate(),
         trustConfigurationValid: Bool = true,
-        providerSettings: ProviderSettingsService? = nil
+        providerSettings: ProviderSettingsService? = nil,
+        eventOutboxDispatcher: OrderedEventOutboxDispatcher? = nil
     ) {
         self.authority = authority
         self.store = store
@@ -97,6 +99,7 @@ public actor RepoPromptReadinessService {
         self.mutationGate = mutationGate
         self.trustConfigurationValid = trustConfigurationValid
         self.providerSettings = providerSettings
+        self.eventOutboxDispatcher = eventOutboxDispatcher
     }
 
     public func snapshot(forceRefresh: Bool = false) async -> RepoPromptReadinessSnapshot {
@@ -112,22 +115,44 @@ public actor RepoPromptReadinessService {
         var checks = [ReadinessCheck]()
         var operational: StoreOperationalSnapshot?
         do {
+            try await authority.reconcileActionableTransitions()
             let snapshot = try await store.operationalSnapshot()
             operational = snapshot
             checks.append(.init(name: "sqlite-integrity", ready: snapshot.integrityValid, detail: snapshot.integrityValid ? "ok" : "failed"))
-            checks.append(.init(name: "migrations", ready: snapshot.migrationsValid, detail: snapshot.migrationsValid ? "schema-v7" : "mismatch"))
+            checks.append(.init(name: "migrations", ready: snapshot.migrationsValid, detail: snapshot.migrationsValid ? "schema-v8" : "mismatch"))
             checks.append(.init(name: "activation", ready: snapshot.activationState == "active", detail: snapshot.activationState))
             // Startup reconstruction is completed by authority.recover() before this
             // service exists. Families observed here are verified live work, not an
             // unreconciled startup condition, and remain visible in metrics.
             checks.append(.init(name: "supervisor-recovery", ready: true, detail: "active-families=\(snapshot.activeProcessFamilyCount)"))
             checks.append(.init(name: "owned-resources", ready: snapshot.ownedResources.ready, detail: snapshot.ownedResources.ready ? "reconciled" : "degraded"))
+            let transitions = try await store.nonfinalAuthorityTransitions()
+            checks.append(.init(
+                name: "authority-transitions",
+                ready: transitions.isEmpty,
+                detail: transitions.isEmpty
+                    ? "reconciled"
+                    : "blocking=\(transitions.count),actionable=\(transitions.count(where: { $0.state == .reconciliationRequired }))"
+            ))
         } catch {
             checks.append(.init(name: "sqlite-integrity", ready: false, detail: "unavailable"))
             checks.append(.init(name: "migrations", ready: false, detail: "unavailable"))
             checks.append(.init(name: "activation", ready: false, detail: "unavailable"))
             checks.append(.init(name: "supervisor-recovery", ready: false, detail: "unavailable"))
             checks.append(.init(name: "owned-resources", ready: false, detail: "unavailable"))
+            checks.append(.init(name: "authority-transitions", ready: false, detail: "unavailable"))
+        }
+
+        if let eventOutboxDispatcher {
+            let dispatcher = await eventOutboxDispatcher.snapshot()
+            let dispatcherReady = dispatcher.running && dispatcher.consecutiveFailures == 0
+            checks.append(.init(
+                name: "event-outbox-dispatcher",
+                ready: dispatcherReady,
+                detail: dispatcherReady
+                    ? "pending=\(dispatcher.pendingCount)"
+                    : "pending=\(dispatcher.pendingCount),failures=\(dispatcher.consecutiveFailures),diagnostic=\(dispatcher.lastDiagnosticCode ?? "none")"
+            ))
         }
 
         checks.append(.init(name: "trust", ready: trustConfigurationValid, detail: trustConfigurationValid ? "validated" : "invalid"))

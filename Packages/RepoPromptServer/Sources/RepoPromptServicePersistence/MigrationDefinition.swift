@@ -42,6 +42,7 @@ enum MigrationLedgerPolicy {
                 SchemaV7.preCollaborationRebuildCanonicalDigest,
                 SchemaV7.canonicalDigest,
             ],
+            SchemaV8.version: [SchemaV8.canonicalDigest],
         ]
     }
 

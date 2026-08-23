@@ -74,6 +74,30 @@ public struct ValidatedProviderHTTPResponse: Sendable {
 public protocol ValidatedProviderEgressTransporting: Sendable {
     func validateEndpoint(_ baseURL: String) async throws -> DirectProviderEndpoint
     func execute(_ request: ValidatedProviderHTTPRequest) async throws -> ValidatedProviderHTTPResponse
+    func execute(
+        _ request: ValidatedProviderHTTPRequest,
+        onRequestSent: @escaping @Sendable () async throws -> Void
+    ) async throws -> ValidatedProviderHTTPResponse
+}
+
+public extension ValidatedProviderEgressTransporting {
+    func execute(
+        _: ValidatedProviderHTTPRequest,
+        onRequestSent _: @escaping @Sendable () async throws -> Void
+    ) async throws -> ValidatedProviderHTTPResponse {
+        throw ServiceAPIError(
+            code: .capabilityMissing,
+            message: "Direct provider transport must expose an observable request-sent boundary",
+            retryable: false
+        )
+    }
+}
+
+private actor ProviderHTTPRequestLaunchState {
+    private var sent = false
+
+    func observeRequestSent() { sent = true }
+    func requestWasSent() -> Bool { sent }
 }
 
 struct ResolvedProviderAddress: Sendable, Hashable {
@@ -380,12 +404,27 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
     }
 
     public func execute(_ request: ValidatedProviderHTTPRequest) async throws -> ValidatedProviderHTTPResponse {
+        try await execute(request, onRequestSent: {})
+    }
+
+    public func execute(
+        _ request: ValidatedProviderHTTPRequest,
+        onRequestSent: @escaping @Sendable () async throws -> Void
+    ) async throws -> ValidatedProviderHTTPResponse {
         try validateRequest(request)
         let addresses = try await validatedAddresses(for: request.endpoint)
+        let launchState = ProviderHTTPRequestLaunchState()
         var lastError: Error = ValidatedProviderEgressError.transportUnavailable
         for address in addresses {
             do {
-                return try await execute(request, address: address.socketAddress)
+                return try await execute(
+                    request,
+                    address: address.socketAddress,
+                    onRequestSent: {
+                        await launchState.observeRequestSent()
+                        try await onRequestSent()
+                    }
+                )
             } catch is CancellationError {
                 throw ValidatedProviderEgressError.cancelled
             } catch let error as ValidatedProviderEgressError where error == .redirectRejected
@@ -396,6 +435,7 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
             {
                 throw error
             } catch {
+                if await launchState.requestWasSent() { throw error }
                 lastError = error
             }
         }
@@ -454,7 +494,11 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
         }
     }
 
-    private func execute(_ request: ValidatedProviderHTTPRequest, address: SocketAddress) async throws -> ValidatedProviderHTTPResponse {
+    private func execute(
+        _ request: ValidatedProviderHTTPRequest,
+        address: SocketAddress,
+        onRequestSent: @escaping @Sendable () async throws -> Void
+    ) async throws -> ValidatedProviderHTTPResponse {
         let useTLS = request.endpoint.scheme == "https"
         let connectionPlan = useTLS ? try ProviderPinnedTLSConnectionPlan(endpoint: request.endpoint, address: address) : nil
         if !useTLS {
@@ -515,6 +559,7 @@ public final class ValidatedProviderEgressTransport: ValidatedProviderEgressTran
             try await channel.write(HTTPClientRequestPart.body(.byteBuffer(buffer))).get()
         }
         try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
+        try await onRequestSent()
 
         let timeoutTask = channel.eventLoop.scheduleTask(in: .nanoseconds(request.totalTimeout.nanosecondsClamped)) {
             handler.abort(.timedOut, channel: channel)

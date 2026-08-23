@@ -96,5 +96,19 @@ private actor RecordingPlanningProvider: AgentProviderDispatcher {
         return .init(output: "ok", providerSessionID: "plan")
     }
 
+    func executeStreaming(
+        _ request: ProviderExecutionRequest,
+        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        try request.validateLaunch()
+        try await request.acknowledgeLaunch()
+        prompt = request.prompt
+        let result = ProviderExecutionResult(output: "ok", providerSessionID: "plan")
+        await onEvent(.providerIdentity("plan"))
+        await onEvent(.assistantFinal(result.output))
+        await onEvent(.completed(providerSessionID: result.providerSessionID))
+        return result
+    }
+
     func lastPrompt() -> String? { prompt }
 }

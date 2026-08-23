@@ -2,6 +2,7 @@ import Foundation
 import Logging
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 /// Canonical stdio presentation for a host-issued MCP serving capability.
 ///
@@ -73,11 +74,21 @@ public enum RepoPromptMCPStdioExecution {
                 }
                 let arguments = params.arguments ?? [:]
                 let data = try JSONEncoder().encode(arguments)
-                let result = try await adapter.invoke(
-                    toolName: params.name,
-                    argumentsJSON: data,
-                    binding: binding
+                let requestIdentity = try Self.requestTimelineIdentity(
+                    metadataAppInvocationID: params._meta?[MCPRequestTimelineTransportMetadata.appInvocationIDKey]?.stringValue,
+                    inherited: MCPRequestTimelineContext.current
                 )
+                let invocationBinding = Self.invocationBinding(
+                    binding,
+                    timelineIdentity: requestIdentity
+                )
+                let result = try await MCPRequestTimelineContext.$current.withValue(requestIdentity) {
+                    try await adapter.invoke(
+                        toolName: params.name,
+                        argumentsJSON: data,
+                        binding: invocationBinding
+                    )
+                }
                 return CallTool.Result(
                     content: [.text(text: String(decoding: result, as: UTF8.self), annotations: nil, _meta: nil)],
                     isError: false
@@ -91,6 +102,29 @@ public enum RepoPromptMCPStdioExecution {
         try await server.start(transport: transport)
         await server.waitUntilCompleted()
         await server.stop()
+    }
+
+    package static func requestTimelineIdentity(
+        metadataAppInvocationID: String?,
+        inherited: MCPRequestTimelineIdentity?
+    ) throws -> MCPRequestTimelineIdentity? {
+        guard let metadataAppInvocationID else { return inherited }
+        guard let appInvocationID = MCPRequestTimelineTransportMetadata.normalizedAppInvocationID(
+            metadataAppInvocationID
+        ) else {
+            throw MCPError.invalidParams("Invalid host-issued MCP application invocation identity")
+        }
+        return MCPRequestTimelineTransportMetadata.identity(
+            appInvocationID: appInvocationID,
+            inheriting: inherited
+        )
+    }
+
+    package static func invocationBinding(
+        _ binding: RepoPromptMCPBinding,
+        timelineIdentity: MCPRequestTimelineIdentity?
+    ) -> RepoPromptMCPBinding {
+        binding.withAppInvocationID(timelineIdentity?.appInvocationID)
     }
 
     private static func errorResult(_ message: String) -> CallTool.Result {

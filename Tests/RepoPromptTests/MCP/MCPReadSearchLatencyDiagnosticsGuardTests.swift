@@ -247,6 +247,7 @@
                 jsonRPCRequestID: .number(77),
                 connectionID: childConnectionID.uuidString,
                 connectionGeneration: 4,
+                appInvocationID: UUID().uuidString.lowercased(),
                 requestOrdinal: 9
             )
             MCPApplyEditsRebaseProbeRecorder.recordApplyEditsInvocation(
@@ -373,6 +374,7 @@
                     jsonRPCRequestID: .number(78),
                     connectionID: target.connectionID.uuidString,
                     connectionGeneration: 4,
+                    appInvocationID: UUID().uuidString.lowercased(),
                     requestOrdinal: 10
                 )
             )
@@ -407,6 +409,7 @@
                 jsonRPCRequestID: .number(79),
                 connectionID: childConnectionID.uuidString,
                 connectionGeneration: 4,
+                appInvocationID: UUID().uuidString.lowercased(),
                 requestOrdinal: 11
             )
             MCPApplyEditsRebaseProbeRecorder.recordApplyEditsInvocation(
@@ -811,26 +814,20 @@
 
         func testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices() throws {
             let connectionID = UUID().uuidString
+            let invocationID = UUID().uuidString.lowercased()
             let identity = MCPRequestTimelineIdentity(
                 jsonRPCRequestID: .string("request-7"),
                 connectionID: connectionID,
                 connectionGeneration: 2,
+                appInvocationID: invocationID,
                 requestOrdinal: 11
             )
-            let invocationID = try XCTUnwrap(identity.appInvocationID)
-            XCTAssertEqual(
-                invocationID,
-                MCPRequestTimelineIdentity.deterministicAppInvocationID(
-                    jsonRPCRequestID: .string("request-7"),
-                    connectionID: connectionID,
-                    connectionGeneration: 2,
-                    requestOrdinal: 11
-                )
-            )
+            XCTAssertEqual(identity.appInvocationID, invocationID)
             let otherConnectionIdentity = MCPRequestTimelineIdentity(
                 jsonRPCRequestID: .string("request-7"),
                 connectionID: UUID().uuidString,
                 connectionGeneration: 2,
+                appInvocationID: UUID().uuidString.lowercased(),
                 requestOrdinal: 11
             )
             XCTAssertNotEqual(invocationID, otherConnectionIdentity.appInvocationID)
@@ -2075,6 +2072,7 @@
                 jsonRPCRequestID: .string("wi8"),
                 connectionID: UUID().uuidString,
                 connectionGeneration: 1,
+                appInvocationID: UUID().uuidString.lowercased(),
                 requestOrdinal: 1
             )
             let correlation = try XCTUnwrap(

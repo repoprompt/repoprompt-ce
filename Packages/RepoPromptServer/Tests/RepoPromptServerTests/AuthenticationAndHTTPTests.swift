@@ -726,6 +726,11 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project-sse", requestDigest: "project-sse")
         let metadata = try await store.metadata()
+        let dispatcher = OrderedEventOutboxDispatcher(store: store, hub: ServiceEventHub())
+        try await dispatcher.drainStartupWatermark(.init(
+            storeID: metadata.storeID,
+            globalSequence: metadata.nextGlobalSequence - 1
+        ))
         _ = try await store.archiveEvents(through: 1)
 
         let instant = Date(timeIntervalSince1970: 1000)
@@ -776,6 +781,11 @@ final class AuthenticationAndHTTPTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try await authority.createProject(input: .init(name: "P", roots: [.init(logicalName: "source", path: root.path, writable: true)]), externalActor: actor, idempotencyKey: "project-rest-expired", requestDigest: "project-rest-expired")
         let metadata = try await store.metadata()
+        let dispatcher = OrderedEventOutboxDispatcher(store: store, hub: ServiceEventHub())
+        try await dispatcher.drainStartupWatermark(.init(
+            storeID: metadata.storeID,
+            globalSequence: metadata.nextGlobalSequence - 1
+        ))
         _ = try await store.archiveEvents(through: 1)
         let instant = Date(timeIntervalSince1970: 1000)
         let key = InternalSigningKey(keyID: "sync-v1", role: .sync, direction: InternalHMACDirection.syncToRepoPrompt, secret: Data("secret".utf8))

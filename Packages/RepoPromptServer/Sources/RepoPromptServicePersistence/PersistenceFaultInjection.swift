@@ -2,7 +2,24 @@ import Foundation
 
 enum PersistenceFaultPoint: String, Sendable {
     case afterIdempotencyPreflightMiss
+    case afterAuthorityStateCAS
+    case afterAuthorityRunWrite
+    case afterAuthorityTransitionWrite
+    case afterAuthorityPresentationWrite
+    case afterAuthoritySessionWrite
+    case afterAuthorityAgentWrite
+    case afterProviderEventReceiptInsert
+    case afterProviderRunWrite
+    case afterProviderPresentationWrite
+    case afterProviderSemanticWrite
+    case afterProviderAgentWrite
+    case afterProviderSessionWrite
+    case afterProviderToolWrite
+    case afterProviderInteractionWrite
+    case afterProviderContextUsageWrite
     case afterTransactionBegin
+    case afterEventInsertBeforeOutboxInsert
+    case afterOutboxInsertBeforeSequenceAdvance
     case afterEventInsertBeforeSequenceAdvance
     case afterMigrationStatement
     case beforeMigrationLedgerInsert

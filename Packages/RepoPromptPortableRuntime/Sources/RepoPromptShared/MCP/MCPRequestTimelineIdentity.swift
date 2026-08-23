@@ -1,8 +1,3 @@
-#if canImport(CryptoKit)
-    import CryptoKit
-#else
-    import Crypto
-#endif
 import Foundation
 
 /// Correlation identity shared by the app, transport, bridge ledger, and CLI proxy.
@@ -26,29 +21,10 @@ public struct MCPRequestTimelineIdentity: Equatable, Sendable {
         self.jsonRPCRequestID = jsonRPCRequestID
         self.connectionID = connectionID
         self.connectionGeneration = connectionGeneration
-        self.appInvocationID = appInvocationID ?? Self.deterministicAppInvocationID(
-            jsonRPCRequestID: jsonRPCRequestID,
-            connectionID: connectionID,
-            connectionGeneration: connectionGeneration,
-            requestOrdinal: requestOrdinal
-        )
+        // Durable identity is minted by the application host. JSON-RPC ids are
+        // client-controlled correlation values and must never become replay keys.
+        self.appInvocationID = appInvocationID
         self.requestOrdinal = requestOrdinal
-    }
-
-    public static func deterministicAppInvocationID(
-        jsonRPCRequestID: JSONRPCBridgeID?,
-        connectionID: String?,
-        connectionGeneration: UInt64?,
-        requestOrdinal: UInt64?
-    ) -> String? {
-        guard let jsonRPCRequestID, let connectionID, let connectionGeneration, let requestOrdinal else { return nil }
-        let seed = "\(connectionID)|\(jsonRPCRequestID.description)|\(connectionGeneration)|\(requestOrdinal)"
-        let digest = Array(SHA256.hash(data: Data(seed.utf8)).prefix(16))
-        var bytes = digest
-        bytes[6] = (bytes[6] & 0x0F) | 0x50
-        bytes[8] = (bytes[8] & 0x3F) | 0x80
-        let hex = bytes.map { String(format: "%02x", $0) }.joined()
-        return "\(hex.prefix(8))-\(hex.dropFirst(8).prefix(4))-\(hex.dropFirst(12).prefix(4))-\(hex.dropFirst(16).prefix(4))-\(hex.dropFirst(20).prefix(12))"
     }
 
     public func fillingMissingFields(from fallback: MCPRequestTimelineIdentity?) -> MCPRequestTimelineIdentity {
@@ -58,6 +34,33 @@ public struct MCPRequestTimelineIdentity: Equatable, Sendable {
             connectionGeneration: connectionGeneration ?? fallback?.connectionGeneration,
             appInvocationID: appInvocationID ?? fallback?.appInvocationID,
             requestOrdinal: requestOrdinal ?? fallback?.requestOrdinal
+        )
+    }
+}
+
+/// Internal MCP transport metadata used to carry host-owned request identity without
+/// extending any canonical tool argument schema. The host must mint this UUID before
+/// dispatch and preserve it when replaying a request after an ambiguous response.
+public enum MCPRequestTimelineTransportMetadata {
+    public static let appInvocationIDKey = "com.repoprompt/appInvocationID"
+
+    public static func normalizedAppInvocationID(_ rawValue: String?) -> String? {
+        guard let rawValue,
+              let value = UUID(uuidString: rawValue)
+        else { return nil }
+        return value.uuidString.lowercased()
+    }
+
+    public static func identity(
+        appInvocationID: String,
+        inheriting inherited: MCPRequestTimelineIdentity?
+    ) -> MCPRequestTimelineIdentity {
+        MCPRequestTimelineIdentity(
+            jsonRPCRequestID: inherited?.jsonRPCRequestID,
+            connectionID: inherited?.connectionID,
+            connectionGeneration: inherited?.connectionGeneration,
+            appInvocationID: appInvocationID,
+            requestOrdinal: inherited?.requestOrdinal
         )
     }
 }

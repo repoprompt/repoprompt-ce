@@ -387,6 +387,7 @@ final class DirectProviderRuntimeTests: XCTestCase {
             credentials: StaticDirectCredentialAccessor(),
             transport: transport
         )
+        let launchAcknowledgement = ProviderLaunchAcknowledgementRecorder()
         let result = try await runtime.execute(.init(
             kind: .headlessAdapter,
             model: nil,
@@ -395,13 +396,66 @@ final class DirectProviderRuntimeTests: XCTestCase {
             runID: UUID(),
             policy: .init(providerSettings: [
                 "provider.settingsID": ProviderSettingsID.customOpenAICompatible.rawValue
-            ])
+            ]),
+            launchAcknowledgement: { await launchAcknowledgement.record() }
         )) { _ in }
         XCTAssertEqual(result.output, "direct response")
+        let launchAcknowledgementCount = await launchAcknowledgement.count()
+        XCTAssertEqual(launchAcknowledgementCount, 1)
         let recordedBody = await transport.lastPostedBody()
         let postedBody = try XCTUnwrap(recordedBody)
         let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: postedBody) as? [String: Any])
         XCTAssertEqual(payload["model"] as? String, "preferred-custom-model")
+    }
+
+    func testDirectTransportDroppedResponseAcknowledgesSentRequestBeforeFailure() async throws {
+        let configuration = configuration(
+            .customOpenAICompatible,
+            maximumTokens: 1024,
+            baseURL: "https://example.com/gateway/v1"
+        )
+        let preferred = DirectProviderConfiguration(
+            providerID: configuration.providerID,
+            baseURL: configuration.baseURL,
+            preferredModel: "custom-model",
+            maximumOutputTokens: configuration.maximumOutputTokens,
+            customHeaders: configuration.customHeaders,
+            contentTypePolicy: configuration.contentTypePolicy,
+            revision: configuration.revision,
+            updatedAt: configuration.updatedAt
+        )
+        let registry = StaticDirectProviderRegistry(
+            configuration: preferred,
+            endpoint: .init(scheme: "https", host: "example.com", port: 443, basePath: "/gateway/v1")
+        )
+        let transport = RecordingDirectTransport(throwAfterRequestSent: true)
+        let runtime = DirectAPIProviderRuntime(
+            providerID: .customOpenAICompatible,
+            registry: registry,
+            credentials: StaticDirectCredentialAccessor(),
+            transport: transport
+        )
+        let acknowledgement = ProviderLaunchAcknowledgementRecorder()
+        do {
+            _ = try await runtime.execute(.init(
+                kind: .headlessAdapter,
+                model: "custom-model",
+                prompt: "hello",
+                workingDirectory: "/tmp",
+                runID: UUID(),
+                policy: .init(providerSettings: [
+                    "provider.settingsID": ProviderSettingsID.customOpenAICompatible.rawValue
+                ]),
+                launchAcknowledgement: { await acknowledgement.record() }
+            )) { _ in }
+            XCTFail("Expected dropped response")
+        } catch let error as ServiceAPIError {
+            XCTAssertEqual(error.code, .dependencyUnavailable)
+        }
+        let acknowledgementCount = await acknowledgement.count()
+        let postCount = await transport.postCount()
+        XCTAssertEqual(acknowledgementCount, 1)
+        XCTAssertEqual(postCount, 1)
     }
 
     func testOpenAIAndAnthropicStreamMappingIsBoundedAndSanitized() async throws {
@@ -713,6 +767,13 @@ final class DirectProviderRuntimeTests: XCTestCase {
     }
 }
 
+private actor ProviderLaunchAcknowledgementRecorder {
+    private var acknowledgements = 0
+
+    func record() { acknowledgements += 1 }
+    func count() -> Int { acknowledgements }
+}
+
 private actor ProviderRuntimeEventRecorder {
     private var events: [ProviderRuntimeEvent] = []
     func append(_ event: ProviderRuntimeEvent) { events.append(event) }
@@ -816,16 +877,36 @@ private actor ConflictingDirectCredentialTester: ProviderCredentialTesting {
 
 private actor RecordingDirectTransport: ValidatedProviderEgressTransporting {
     private let validationStatus: Int
+    private let throwAfterRequestSent: Bool
     private var posts = 0
     private var postedBody: Data?
 
-    init(validationStatus: Int = 200) { self.validationStatus = validationStatus }
+    init(validationStatus: Int = 200, throwAfterRequestSent: Bool = false) {
+        self.validationStatus = validationStatus
+        self.throwAfterRequestSent = throwAfterRequestSent
+    }
 
     func validateEndpoint(_ baseURL: String) async throws -> DirectProviderEndpoint {
         try ProviderEndpointPolicy.parseCustomBaseURL(baseURL)
     }
 
     func execute(_ request: ValidatedProviderHTTPRequest) async throws -> ValidatedProviderHTTPResponse {
+        try response(for: request)
+    }
+
+    func execute(
+        _ request: ValidatedProviderHTTPRequest,
+        onRequestSent: @escaping @Sendable () async throws -> Void
+    ) async throws -> ValidatedProviderHTTPResponse {
+        try await onRequestSent()
+        if throwAfterRequestSent {
+            posts += 1
+            throw ServiceAPIError(code: .dependencyUnavailable, message: "response dropped", retryable: true)
+        }
+        return try response(for: request)
+    }
+
+    private func response(for request: ValidatedProviderHTTPRequest) throws -> ValidatedProviderHTTPResponse {
         if request.method == "GET" {
             let body = try JSONSerialization.data(withJSONObject: ["data": [["id": "gpt-direct-test", "name": "GPT Direct Test"]]])
             return .init(statusCode: validationStatus, contentType: "application/json", body: body)

@@ -61,6 +61,7 @@ public enum AuthorityHostShutdownPhase: String, Codable, CaseIterable, Sendable 
     case directRuntimeDrain
     case durabilityStop
     case durabilitySweep
+    case eventOutboxDrain
     case processFencing
     case checkpoint
     case storeClose
@@ -75,6 +76,7 @@ public enum AuthorityHostShutdownAction: String, Codable, Sendable {
     case directRuntimeDrainFinished
     case durabilityStopped
     case durabilitySweepFinished
+    case eventOutboxDrained
     case processFencingPersisted
     case checkpointFinished
     case storeClosed
@@ -171,6 +173,8 @@ public struct AuthorityHostCapabilities: Sendable {
     public let authority: RepoPromptHeadlessAuthority
     public let store: SQLiteServiceStore
     public let mutationGate: AuthorityMutationGate
+    public let eventHub: ServiceEventHub
+    public let eventOutboxDispatcher: OrderedEventOutboxDispatcher
 }
 
 /// Lifecycle owner shared by the network Server and private direct-headless
@@ -186,6 +190,8 @@ public actor RepoPromptAuthorityHost {
     private var authorityValue: RepoPromptHeadlessAuthority?
     private var directRuntimeValue: MCPDomainRuntime?
     private var durabilityOperationsValue: DurabilityOperationsService?
+    private var eventHubValue: ServiceEventHub?
+    private var eventOutboxDispatcherValue: OrderedEventOutboxDispatcher?
     private var startupDiagnosticCodes: [String] = []
     private var staleOwnerRecoveries = 0
     private var shutdownBudget: AuthorityHostShutdownBudget?
@@ -264,10 +270,14 @@ public actor RepoPromptAuthorityHost {
 
     public func installRecoveredAuthority(
         _ authority: RepoPromptHeadlessAuthority,
-        durabilityOperations: DurabilityOperationsService? = nil
+        durabilityOperations: DurabilityOperationsService? = nil,
+        eventHub: ServiceEventHub,
+        eventOutboxDispatcher: OrderedEventOutboxDispatcher
     ) {
         authorityValue = authority
         durabilityOperationsValue = durabilityOperations
+        eventHubValue = eventHub
+        eventOutboxDispatcherValue = eventOutboxDispatcher
         stateValue = .ready
     }
 
@@ -286,10 +296,21 @@ public actor RepoPromptAuthorityHost {
     }
 
     public func capabilities() throws -> AuthorityHostCapabilities {
-        guard stateValue == .ready, let authorityValue, let storeValue else {
+        guard stateValue == .ready,
+              let authorityValue,
+              let storeValue,
+              let eventHubValue,
+              let eventOutboxDispatcherValue
+        else {
             throw ServiceAPIError(code: .dependencyUnavailable, message: "Authority host is not ready")
         }
-        return .init(authority: authorityValue, store: storeValue, mutationGate: mutationGate)
+        return .init(
+            authority: authorityValue,
+            store: storeValue,
+            mutationGate: mutationGate,
+            eventHub: eventHubValue,
+            eventOutboxDispatcher: eventOutboxDispatcherValue
+        )
     }
 
     public func lifecycleState() -> AuthorityHostLifecycleState { stateValue }
@@ -415,6 +436,16 @@ public actor RepoPromptAuthorityHost {
             if swept == .completed { recordShutdownAction(.durabilitySweepFinished) }
         }
 
+        if let eventOutboxDispatcherValue {
+            let drained = await runShutdownPhase(.eventOutboxDrain, budget: budget) {
+                await eventOutboxDispatcherValue.stop(drain: true)
+            }
+            workSettled = workSettled && drained == .completed
+            clean = clean && drained == .completed
+            if drained == .completed { recordShutdownAction(.eventOutboxDrained) }
+            await eventHubValue?.finish()
+        }
+
         if childDrainTimedOut || externalTransportDrainTimedOut || !providerSettled {
             let fenced = await runShutdownPhase(.processFencing, budget: budget) { [storeValue] in
                 guard let storeValue else { return }
@@ -460,6 +491,8 @@ public actor RepoPromptAuthorityHost {
             authorityValue = nil
             directRuntimeValue = nil
             durabilityOperationsValue = nil
+            eventHubValue = nil
+            eventOutboxDispatcherValue = nil
 
             // The namespace lease is deliberately the final owned resource released.
             lease?.release()

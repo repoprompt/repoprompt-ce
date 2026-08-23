@@ -49,13 +49,14 @@ final class DurabilityOperationsTests: XCTestCase {
                 revision: Int64(revision),
                 cursor: cursor
             )
-            _ = try await store.persistProject(
+            let event = try await store.persistProject(
                 project,
                 eventType: revision == 1 ? .projectCreated : .projectUpdated,
                 actor: actor,
                 correlationID: UUID(),
                 idempotency: nil
             )
+            try await store.markEventOutboxDispatched(event.cursor)
             roots = project.roots
         }
         let old = Date().addingTimeInterval(-31 * 24 * 60 * 60).timeIntervalSince1970
@@ -78,12 +79,13 @@ final class DurabilityOperationsTests: XCTestCase {
         let projectID = UUID()
         let payloadText = String(repeating: "retention-payload", count: 16)
         for index in 0 ..< 513 {
-            _ = try await store.persistServiceDiagnostic(
+            let event = try await store.persistServiceDiagnostic(
                 projectID: projectID,
                 actor: nil,
                 correlationID: UUID(),
                 payload: Data("{\"data\":\"\(payloadText)\",\"index\":\(index)}".utf8)
             )
+            try await store.markEventOutboxDispatched(event.cursor)
         }
 
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -171,12 +173,13 @@ final class DurabilityOperationsTests: XCTestCase {
         let projectID = UUID()
         let seedPayload = Data(("{\"data\":\"" + String(repeating: "s", count: 8 * 1_024) + "\"}").utf8)
         for _ in 0 ..< 96 {
-            _ = try await store.persistServiceDiagnostic(
+            let event = try await store.persistServiceDiagnostic(
                 projectID: projectID,
                 actor: nil,
                 correlationID: UUID(),
                 payload: seedPayload
             )
+            try await store.markEventOutboxDispatched(event.cursor)
         }
 
         let recorder = RetentionCompletionRecorder()
@@ -283,12 +286,13 @@ final class DurabilityOperationsTests: XCTestCase {
         addTeardownBlock { try? await store.close() }
         let projectID = UUID()
         for index in 0 ..< 8 {
-            _ = try await store.persistServiceDiagnostic(
+            let event = try await store.persistServiceDiagnostic(
                 projectID: projectID,
                 actor: nil,
                 correlationID: UUID(),
                 payload: Data("{\"index\":\(index)}".utf8)
             )
+            try await store.markEventOutboxDispatched(event.cursor)
         }
         let beforeRows = try await store.database.query(
             "SELECT global_sequence,envelope_json FROM events ORDER BY global_sequence",
@@ -351,12 +355,13 @@ final class DurabilityOperationsTests: XCTestCase {
         addTeardownBlock { try? await store.close() }
         let projectID = UUID()
         for index in 0 ..< 8 {
-            _ = try await store.persistServiceDiagnostic(
+            let event = try await store.persistServiceDiagnostic(
                 projectID: projectID,
                 actor: nil,
                 correlationID: UUID(),
                 payload: Data("{\"index\":\(index)}".utf8)
             )
+            try await store.markEventOutboxDispatched(event.cursor)
         }
         let database = await store.database
         await database.suspendWorkerForTesting()
@@ -429,7 +434,14 @@ final class DurabilityOperationsTests: XCTestCase {
             revision: 1,
             cursor: cursor
         )
-        _ = try await store.persistProject(project, eventType: .projectCreated, actor: actor, correlationID: UUID(), idempotency: nil)
+        let event = try await store.persistProject(
+            project,
+            eventType: .projectCreated,
+            actor: actor,
+            correlationID: UUID(),
+            idempotency: nil
+        )
+        try await store.markEventOutboxDispatched(event.cursor)
         let optionalArchiveID = try await store.archiveEvents(through: 1)
         let archiveID = try XCTUnwrap(optionalArchiveID)
         let archived = try await store.archivedEvents(archiveID: archiveID)

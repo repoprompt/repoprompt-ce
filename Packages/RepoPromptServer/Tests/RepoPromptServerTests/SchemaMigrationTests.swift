@@ -16,7 +16,9 @@ final class SchemaMigrationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let databaseURL = root.appendingPathComponent("repoprompt.sqlite")
         let store = try await SQLiteServiceStore.open(storage: .file(databaseURL.path))
-        _ = try await store.database.query("UPDATE service_metadata SET schema_version=8 WHERE fixed_id=1")
+        _ = try await store.database.query(
+            "UPDATE service_metadata SET schema_version=\(SchemaV8.version + 1) WHERE fixed_id=1"
+        )
         try await store.close(clean: false)
         let before = try Data(contentsOf: databaseURL)
         do {
@@ -181,6 +183,27 @@ final class SchemaMigrationTests: XCTestCase {
         try await activationOpen.close(clean: false)
     }
 
+    func testCanonicalMigrationDigestsMatchCheckedInPrograms() {
+        let migrations: [(version: Int, frozen: String, computed: String)] = [
+            (SchemaV1.version, SchemaV1.canonicalDigest, SchemaV1.definition.computedDigest),
+            (SchemaV2.version, SchemaV2.canonicalDigest, SchemaV2.definition.computedDigest),
+            (SchemaV3.version, SchemaV3.canonicalDigest, SchemaV3.definition.computedDigest),
+            (SchemaV4.version, SchemaV4.canonicalDigest, SchemaV4.definition.computedDigest),
+            (SchemaV5.version, SchemaV5.canonicalDigest, SchemaV5.definition.computedDigest),
+            (SchemaV6.version, SchemaV6.canonicalDigest, SchemaV6.definition.computedDigest),
+            (SchemaV7.version, SchemaV7.canonicalDigest, SchemaV7.definition.computedDigest),
+            (SchemaV8.version, SchemaV8.canonicalDigest, SchemaV8.definition.computedDigest),
+        ]
+        XCTAssertEqual(migrations.map(\.version), Array(1 ... 8))
+        for migration in migrations {
+            XCTAssertEqual(
+                migration.computed,
+                migration.frozen,
+                "migration V\(migration.version) is immutable; append a new version instead of changing its program"
+            )
+        }
+    }
+
     private func ledgerEvidence(_ database: SQLiteDatabaseExecutor) async throws -> [String] {
         try await database.query("SELECT version,digest FROM schema_migrations ORDER BY version").map {
             "\($0.column("version")?.integer ?? -1):\($0.column("digest")?.string ?? "")"
@@ -200,36 +223,56 @@ final class SchemaMigrationTests: XCTestCase {
 }
 
 final class SQLiteTransactionFaultInjectionTests: XCTestCase {
-    func testEveryV7StatementInterruptionAndCancellationBoundaryPreservesBytesAndLedger() async throws {
+    func testEveryV7AndV8StatementInterruptionBoundaryPreservesLastCommittedVersion() async throws {
         let statementCount = try await countHistoricalV7StatementBoundaries()
-        XCTAssertGreaterThan(statementCount, SchemaV6.statements.count)
-        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1)]
+        let v8StatementCount = SchemaV8.statements.count + 2
+        let v7StatementCount = statementCount - v8StatementCount
+        XCTAssertGreaterThan(v7StatementCount, SchemaV6.statements.count)
+        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2)]
             + (1 ... statementCount).map { (PersistenceFaultPoint.afterMigrationStatement, $0) }
             + [
                 (PersistenceFaultPoint.beforeMigrationLedgerInsert, 1),
+                (.beforeMigrationLedgerInsert, 2),
                 (PersistenceFaultPoint.afterMigrationLedgerInsert, 1),
+                (.afterMigrationLedgerInsert, 2),
                 (PersistenceFaultPoint.beforeTransactionCommit, 1),
+                (.beforeTransactionCommit, 2),
             ]
 
         for (point, occurrence) in boundaries {
+            let expectedVersion = point == .afterMigrationStatement
+                ? (occurrence > v7StatementCount ? 7 : 6)
+                : (occurrence == 2 ? 7 : 6)
             try await assertFailedMigrationPreservesV6(
                 point: point,
-                occurrence: occurrence
+                occurrence: occurrence,
+                expectedVersion: expectedVersion
             )
         }
     }
 
-    func testActualTaskCancellationAtEveryV7BoundaryPreservesBytesAndLedger() async throws {
+    func testActualTaskCancellationAtEveryV7AndV8BoundaryPreservesLastCommittedVersion() async throws {
         let statementCount = try await countHistoricalV7StatementBoundaries()
-        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1)]
+        let v7StatementCount = statementCount - (SchemaV8.statements.count + 2)
+        let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2)]
             + (1 ... statementCount).map { (PersistenceFaultPoint.afterMigrationStatement, $0) }
             + [
                 (PersistenceFaultPoint.beforeMigrationLedgerInsert, 1),
+                (.beforeMigrationLedgerInsert, 2),
                 (PersistenceFaultPoint.afterMigrationLedgerInsert, 1),
+                (.afterMigrationLedgerInsert, 2),
                 (PersistenceFaultPoint.beforeTransactionCommit, 1),
+                (.beforeTransactionCommit, 2),
             ]
         for (point, occurrence) in boundaries {
-            try await assertCancelledMigrationPreservesV6(point: point, occurrence: occurrence)
+            let expectedVersion = point == .afterMigrationStatement
+                ? (occurrence > v7StatementCount ? 7 : 6)
+                : (occurrence == 2 ? 7 : 6)
+            try await assertCancelledMigrationPreservesV6(
+                point: point,
+                occurrence: occurrence,
+                expectedVersion: expectedVersion
+            )
         }
     }
 
@@ -259,7 +302,8 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
 
     private func assertFailedMigrationPreservesV6(
         point: PersistenceFaultPoint,
-        occurrence: Int
+        occurrence: Int,
+        expectedVersion: Int
     ) async throws {
         let root = try StoreMigrationTestSupport.temporaryDirectory("\(point.rawValue)-\(occurrence)-failure")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -293,28 +337,39 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
         let ledgerAfter = try await ledgerEvidence(database)
         let metadataAfter = try await store.metadata()
         let v7Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=7").first
+        let v8Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=8").first
         let v7Tables = try await database.query(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('schema_compatibility_audit','authority_namespace_identity')"
         )
-        XCTAssertEqual(bytesAfter, bytesBefore)
-        XCTAssertEqual(ledgerAfter, ledgerBefore)
-        XCTAssertEqual(metadataAfter.schemaVersion, 6)
-        XCTAssertNil(v7Ledger)
-        XCTAssertTrue(v7Tables.isEmpty)
+        if expectedVersion == 6 {
+            XCTAssertEqual(bytesAfter, bytesBefore)
+            XCTAssertEqual(ledgerAfter, ledgerBefore)
+            XCTAssertNil(v7Ledger)
+            XCTAssertTrue(v7Tables.isEmpty)
+        } else {
+            // WAL-backed commits need not rewrite the main database file bytes,
+            // so the ledger/schema assertions below are authoritative for V7.
+            XCTAssertNotEqual(ledgerAfter, ledgerBefore)
+            XCTAssertNotNil(v7Ledger)
+            XCTAssertFalse(v7Tables.isEmpty)
+            XCTAssertNil(v8Ledger)
+        }
+        XCTAssertEqual(metadataAfter.schemaVersion, expectedVersion)
         try await store.close(clean: false)
 
         store = try await SQLiteServiceStore.openForMaintenance(storage: .file(databaseURL.path))
         let reopenedMetadata = try await store.metadata()
         let reopenedDatabase = await store.database
         let reopenedLedger = try await ledgerEvidence(reopenedDatabase)
-        XCTAssertEqual(reopenedMetadata.schemaVersion, 6)
-        XCTAssertEqual(reopenedLedger, ledgerBefore)
+        XCTAssertEqual(reopenedMetadata.schemaVersion, expectedVersion)
+        XCTAssertEqual(reopenedLedger, ledgerAfter)
         try await store.close(clean: false)
     }
 
     private func assertCancelledMigrationPreservesV6(
         point: PersistenceFaultPoint,
-        occurrence: Int
+        occurrence: Int,
+        expectedVersion: Int
     ) async throws {
         let root = try StoreMigrationTestSupport.temporaryDirectory("\(point.rawValue)-\(occurrence)-task-cancel")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -348,21 +403,31 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
             XCTFail("migration should observe real task cancellation at \(point.rawValue)#\(occurrence)")
         } catch is CancellationError {}
 
-        XCTAssertEqual(try Data(contentsOf: databaseURL), bytesBefore)
+        let bytesAfter = try Data(contentsOf: databaseURL)
         let ledgerAfter = try await ledgerEvidence(database)
         let metadataAfter = try await store.metadata()
         let v7Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=7").first
-        XCTAssertEqual(ledgerAfter, ledgerBefore)
-        XCTAssertEqual(metadataAfter.schemaVersion, 6)
-        XCTAssertNil(v7Ledger)
+        let v8Ledger = try await database.query("SELECT version FROM schema_migrations WHERE version=8").first
+        if expectedVersion == 6 {
+            XCTAssertEqual(bytesAfter, bytesBefore)
+            XCTAssertEqual(ledgerAfter, ledgerBefore)
+            XCTAssertNil(v7Ledger)
+        } else {
+            // WAL-backed commits need not rewrite the main database file bytes,
+            // so the ledger/schema assertions below are authoritative for V7.
+            XCTAssertNotEqual(ledgerAfter, ledgerBefore)
+            XCTAssertNotNil(v7Ledger)
+            XCTAssertNil(v8Ledger)
+        }
+        XCTAssertEqual(metadataAfter.schemaVersion, expectedVersion)
         try await store.close(clean: false)
 
         let reopened = try await SQLiteServiceStore.openForMaintenance(storage: .file(databaseURL.path))
         let reopenedMetadata = try await reopened.metadata()
         let reopenedDatabase = await reopened.database
         let reopenedLedger = try await ledgerEvidence(reopenedDatabase)
-        XCTAssertEqual(reopenedMetadata.schemaVersion, 6)
-        XCTAssertEqual(reopenedLedger, ledgerBefore)
+        XCTAssertEqual(reopenedMetadata.schemaVersion, expectedVersion)
+        XCTAssertEqual(reopenedLedger, ledgerAfter)
         try await reopened.close(clean: false)
     }
 
@@ -392,25 +457,6 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
         )
     }
 
-    func testCanonicalMigrationDigestsMatchCheckedInPrograms() {
-        let migrations: [(version: Int, frozen: String, computed: String)] = [
-            (SchemaV1.version, SchemaV1.canonicalDigest, SchemaV1.definition.computedDigest),
-            (SchemaV2.version, SchemaV2.canonicalDigest, SchemaV2.definition.computedDigest),
-            (SchemaV3.version, SchemaV3.canonicalDigest, SchemaV3.definition.computedDigest),
-            (SchemaV4.version, SchemaV4.canonicalDigest, SchemaV4.definition.computedDigest),
-            (SchemaV5.version, SchemaV5.canonicalDigest, SchemaV5.definition.computedDigest),
-            (SchemaV6.version, SchemaV6.canonicalDigest, SchemaV6.definition.computedDigest),
-            (SchemaV7.version, SchemaV7.canonicalDigest, SchemaV7.definition.computedDigest),
-        ]
-        XCTAssertEqual(migrations.map(\.version), Array(1 ... 7))
-        for migration in migrations {
-            XCTAssertEqual(
-                migration.computed,
-                migration.frozen,
-                "migration V\(migration.version) is immutable; append a new version instead of changing its program"
-            )
-        }
-    }
 }
 
 #if canImport(Darwin) || canImport(Glibc)
@@ -427,15 +473,22 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
                 throw XCTSkip("parent-only migration crash test")
             }
             let statementCount = try await countStatementBoundaries()
-            let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1)]
+            let v7StatementCount = statementCount - (SchemaV8.statements.count + 2)
+            let boundaries = [(PersistenceFaultPoint.afterTransactionBegin, 1), (.afterTransactionBegin, 2)]
                 + (1 ... statementCount).map { (PersistenceFaultPoint.afterMigrationStatement, $0) }
                 + [
                     (PersistenceFaultPoint.beforeMigrationLedgerInsert, 1),
+                    (.beforeMigrationLedgerInsert, 2),
                     (PersistenceFaultPoint.afterMigrationLedgerInsert, 1),
+                    (.afterMigrationLedgerInsert, 2),
                     (PersistenceFaultPoint.beforeTransactionCommit, 1),
+                    (.beforeTransactionCommit, 2),
                 ]
 
             for (point, occurrence) in boundaries {
+                let expectedVersion = point == .afterMigrationStatement
+                    ? (occurrence > v7StatementCount ? 7 : 6)
+                    : (occurrence == 2 ? 7 : 6)
                 FileHandle.standardError.write(
                     Data("SIGKILL migration boundary \(point.rawValue)#\(occurrence)\n".utf8)
                 )
@@ -523,15 +576,26 @@ final class SQLiteTransactionFaultInjectionTests: XCTestCase {
                 let v7Ledger = try await reopenedDatabase.query(
                     "SELECT version FROM schema_migrations WHERE version=7"
                 ).first
-                XCTAssertEqual(reopenedMetadata.schemaVersion, 6)
-                XCTAssertEqual(reopenedLedger, ledgerBefore)
-                XCTAssertNil(v7Ledger)
+                let v8Ledger = try await reopenedDatabase.query(
+                    "SELECT version FROM schema_migrations WHERE version=8"
+                ).first
+                XCTAssertEqual(reopenedMetadata.schemaVersion, expectedVersion)
+                XCTAssertNil(v8Ledger)
+                if expectedVersion == 6 {
+                    XCTAssertEqual(reopenedLedger, ledgerBefore)
+                    XCTAssertNil(v7Ledger)
+                } else {
+                    XCTAssertNotEqual(reopenedLedger, ledgerBefore)
+                    XCTAssertNotNil(v7Ledger)
+                }
                 try await reopened.close(clean: false)
-                XCTAssertEqual(
-                    try Data(contentsOf: databaseURL),
-                    bytesBefore,
-                    "hot-journal recovery must restore the exact pre-migration main-database bytes"
-                )
+                if expectedVersion == 6 {
+                    XCTAssertEqual(
+                        try Data(contentsOf: databaseURL),
+                        bytesBefore,
+                        "hot-journal recovery must restore the exact pre-migration main-database bytes"
+                    )
+                }
             }
         }
 

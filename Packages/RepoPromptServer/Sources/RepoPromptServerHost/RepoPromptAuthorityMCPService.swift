@@ -156,6 +156,17 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
         }
         let arguments = try JSONDecoder().decode([String: Value].self, from: argumentsJSON)
         try enforceInvocationPolicy(toolName: toolName, arguments: arguments)
+        if Self.isProviderLifecycleMutation(toolName: toolName, arguments: arguments),
+           binding.appInvocationID?.isEmpty != false
+        {
+            // Reject before even the tool-invocation reservation. A JSON-RPC
+            // request id or request-body digest is not a durable identity.
+            throw ServiceAPIError(
+                code: .idempotencyRequired,
+                message: "Provider lifecycle mutation requires a host-issued application invocation identity",
+                retryable: false
+            )
+        }
         let invocation = try await authority.beginToolInvocation(sessionID: binding.sessionID, toolName: toolName, argumentDigest: CanonicalSigning.bodyDigest(argumentsJSON), actor: binding.actor)
         do {
             let backend = AuthorityToolBackend(
@@ -190,6 +201,20 @@ public actor RepoPromptAuthorityMCPService: RepoPromptMCPServing {
                 message: "Direct headless invocation requires an explicit mutation grant"
             )
         }
+    }
+
+    private static func isProviderLifecycleMutation(
+        toolName: String,
+        arguments: [String: Value]
+    ) -> Bool {
+        let operation = arguments["op"]?.stringValue
+        if toolName == MCPWindowToolName.agentRun {
+            return operation == nil || operation == "start" || operation == "cancel"
+        }
+        if toolName == MCPWindowToolName.agentManage {
+            return operation == "cancel"
+        }
+        return false
     }
 
     package func install(
@@ -234,7 +259,11 @@ private struct AuthorityDomainBackend: DomainGlobalControlBackend, DomainWorkspa
     let binding: AuthorityMCPBinding
 
     private func call(_ toolName: String, _ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        try await DomainPhysicalToolResult(json: adapter.invoke(toolName: toolName, argumentsJSON: request.argumentsJSON, binding: binding))
+        return try await DomainPhysicalToolResult(json: adapter.invoke(
+            toolName: toolName,
+            argumentsJSON: request.argumentsJSON,
+            binding: binding
+        ))
     }
 
     private func call(_ toolName: String, _ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
@@ -370,6 +399,17 @@ private actor AuthorityToolBackend {
         self.authority = authority
         self.portalSettings = portalSettings
         self.binding = binding
+    }
+
+    private func requiredAppInvocationID() throws -> String {
+        guard let appInvocationID = binding.appInvocationID, !appInvocationID.isEmpty else {
+            throw ServiceAPIError(
+                code: .idempotencyRequired,
+                message: "A host-issued application invocation identity is required before provider lifecycle mutation",
+                retryable: false
+            )
+        }
+        return appInvocationID
     }
 
     func invoke(toolName: String, arguments: [String: Value]) async throws -> Value {
@@ -1868,14 +1908,18 @@ private actor AuthorityToolBackend {
                 model: start.model,
                 initialPrompt: message,
                 role: start.role,
-                label: arguments["session_name"]?.stringValue
+                label: arguments["session_name"]?.stringValue,
+                appInvocationID: try requiredAppInvocationID()
             )
             // Desktop copies the parent's worktree bindings onto the child
             // session before provider start. Linux keeps a single root-owned
             // binding and exposes it through `effectiveWorktreeBindings` /
             // `authoritySessionSnapshot.worktrees`, so MCP path resolution and
             // session-scoped file tools inherit the same workspace.
-            _ = try await authority.startChildAgentRun(sessionID: child.sessionID)
+            _ = try await authority.startChildAgentRun(
+                sessionID: child.sessionID,
+                appInvocationID: try requiredAppInvocationID()
+            )
             return try await value(authority.sessionSnapshot(sessionID: child.sessionID))
         case "poll":
             return try await agentSnapshotOrExpired(sessionID: agentSessionID(arguments))
@@ -1891,7 +1935,10 @@ private actor AuthorityToolBackend {
             }
         case "cancel":
             let sessionID = try agentSessionID(arguments)
-            _ = try await authority.cancelChildAgentRun(sessionID: sessionID)
+            _ = try await authority.cancelChildAgentRun(
+                sessionID: sessionID,
+                appInvocationID: try requiredAppInvocationID()
+            )
             return try await value(authority.sessionSnapshot(sessionID: sessionID))
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported agent operation")
@@ -1917,7 +1964,10 @@ private actor AuthorityToolBackend {
             ))
         case "cancel":
             let sessionID = try agentSessionID(arguments)
-            _ = try await authority.cancelChildAgentRun(sessionID: sessionID)
+            _ = try await authority.cancelChildAgentRun(
+                sessionID: sessionID,
+                appInvocationID: try requiredAppInvocationID()
+            )
             return try await value(authority.sessionSnapshot(sessionID: sessionID))
         default:
             throw ServiceAPIError(code: .invalidRequest, message: "Unsupported agent_manage operation")

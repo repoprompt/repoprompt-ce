@@ -56,6 +56,9 @@ public struct ProviderInteractionPayload: Codable, Hashable, Sendable {
 /// Native frame identifiers are retained only as opaque delivery tokens; the
 /// authority owns durable interaction IDs, transcript revisions, and events.
 public enum ProviderRuntimeEvent: Sendable, Equatable {
+    /// Adapter-owned durable delivery identity. Native adapters should preserve
+    /// this token/sequence when replaying a frame after an ambiguous outcome.
+    indirect case framed(providerEventID: String, providerSequence: Int64, event: ProviderRuntimeEvent)
     case providerIdentity(String)
     case assistantDelta(String)
     case assistantFinal(String)
@@ -154,8 +157,9 @@ public struct ProviderExecutionRequest: Sendable {
     public let resumeFallbackPrompt: String?
     public let policy: ProviderExecutionPolicy
     private let launchValidation: @Sendable () throws -> Void
+    private let launchAcknowledgement: @Sendable () async throws -> Void
 
-    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, resumeFallbackPrompt: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}) {
+    public init(kind: ProviderKind, model: String?, prompt: String, structuredInput: CompiledProviderTurnInput? = nil, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID, resumeProviderSessionID: String? = nil, resumeFallbackPrompt: String? = nil, policy: ProviderExecutionPolicy = .init(), launchValidation: @escaping @Sendable () throws -> Void = {}, launchAcknowledgement: @escaping @Sendable () async throws -> Void = {}) {
         self.kind = kind
         self.model = model
         self.prompt = structuredInput?.prompt ?? prompt
@@ -167,10 +171,17 @@ public struct ProviderExecutionRequest: Sendable {
         self.resumeFallbackPrompt = resumeFallbackPrompt
         self.policy = policy
         self.launchValidation = launchValidation
+        self.launchAcknowledgement = launchAcknowledgement
     }
 
     public func validateLaunch() throws {
         try launchValidation()
+    }
+
+    /// Called by a provider runtime only after its process/session family is
+    /// reserved and observable, but before it can emit provider frames.
+    public func acknowledgeLaunch() async throws {
+        try await launchAcknowledgement()
     }
 
     public func applying(defaults: ProviderRuntimeDefaults) -> ProviderExecutionRequest {
@@ -190,7 +201,8 @@ public struct ProviderExecutionRequest: Sendable {
             resumeProviderSessionID: resumeProviderSessionID,
             resumeFallbackPrompt: resumeFallbackPrompt,
             policy: ProviderExecutionPolicy(mode: policy.mode, writableRoots: policy.writableRoots, providerSettings: settings),
-            launchValidation: launchValidation
+            launchValidation: launchValidation,
+            launchAcknowledgement: launchAcknowledgement
         )
     }
 }
@@ -213,6 +225,7 @@ public protocol AgentProviderDispatcher: Sendable {
         onProviderSessionIdentity: @escaping @Sendable (String) async -> Void
     ) async throws -> ProviderExecutionResult
     func cancel(runID: UUID) async throws
+    func hasActiveRun(_ runID: UUID) async -> Bool
     func executeStreaming(
         _ request: ProviderExecutionRequest,
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
@@ -226,6 +239,10 @@ public protocol AgentProviderDispatcher: Sendable {
 public extension AgentProviderDispatcher {
     func prepareRun(kind _: ProviderKind, runID _: UUID) async {}
     func forgetRun(runID _: UUID) async {}
+    func hasActiveRun(_: UUID) async -> Bool {
+        false
+    }
+
     func complete(kind: ProviderKind, model: String?, prompt: String, workingDirectory: String, maximumBytes: Int = 8_388_608, runID: UUID? = nil) async throws -> String {
         try await execute(kind: kind, model: model, prompt: prompt, workingDirectory: workingDirectory, maximumBytes: maximumBytes, runID: runID).output
     }
@@ -244,23 +261,14 @@ public extension AgentProviderDispatcher {
 
     func executeStreaming(
         _ request: ProviderExecutionRequest,
-        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+        onEvent _: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
         try request.validateLaunch()
-        let result = try await execute(
-            kind: request.kind,
-            model: request.model,
-            prompt: request.prompt,
-            workingDirectory: request.workingDirectory,
-            maximumBytes: request.maximumBytes,
-            runID: request.runID,
-            resumeProviderSessionID: request.resumeProviderSessionID
-        ) { identity in
-            await onEvent(.providerIdentity(identity))
-        }
-        await onEvent(.assistantFinal(result.output))
-        await onEvent(.completed(providerSessionID: result.providerSessionID))
-        return result
+        throw ServiceAPIError(
+            code: .capabilityMissing,
+            message: "Provider dispatcher must implement an observable launch-acknowledgement boundary",
+            retryable: false
+        )
     }
 
     func steer(runID _: UUID, text _: String, targetTurnEpoch _: Int64) async throws {

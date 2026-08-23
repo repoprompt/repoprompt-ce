@@ -47,6 +47,40 @@ struct EventRetentionObservation: Sendable, Equatable {
     var totalMaterializedEnvelopeBytes = 0
 }
 
+public struct PendingEventOutboxRecord: Sendable, Equatable {
+    public let event: EventEnvelope
+    public let dispatchAttemptCount: Int64
+    public let createdAt: Date
+
+    public init(event: EventEnvelope, dispatchAttemptCount: Int64, createdAt: Date) {
+        self.event = event
+        self.dispatchAttemptCount = dispatchAttemptCount
+        self.createdAt = createdAt
+    }
+}
+
+public struct EventOutboxOperationalSnapshot: Sendable, Equatable {
+    public let pendingCount: Int64
+    public let oldestPendingSequence: Int64?
+    public let oldestPendingAgeSeconds: Double?
+    public let maximumAttemptCount: Int64
+    public let lastDispatchedSequence: Int64?
+
+    public init(
+        pendingCount: Int64,
+        oldestPendingSequence: Int64?,
+        oldestPendingAgeSeconds: Double?,
+        maximumAttemptCount: Int64,
+        lastDispatchedSequence: Int64?
+    ) {
+        self.pendingCount = pendingCount
+        self.oldestPendingSequence = oldestPendingSequence
+        self.oldestPendingAgeSeconds = oldestPendingAgeSeconds
+        self.maximumAttemptCount = maximumAttemptCount
+        self.lastDispatchedSequence = lastDispatchedSequence
+    }
+}
+
 public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     public typealias Metadata = AuthorityStoreMetadata
 
@@ -404,7 +438,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 message: "Authority store metadata is missing or ambiguous"
             )
         }
-        if metadataVersion > SchemaV7.version {
+        if metadataVersion > SchemaV8.version {
             throw ServiceAPIError(
                 code: .forwardSchemaUnsupported,
                 message: "Authority store schema is newer than this binary",
@@ -412,7 +446,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             )
         }
         try await validateMigrationLedger(metadataVersion: metadataVersion)
-        guard metadataVersion == SchemaV7.version else {
+        guard metadataVersion == SchemaV8.version else {
             throw ServiceAPIError(
                 code: .migrationRequired,
                 message: "Authority store requires offline migration before serving",
@@ -430,7 +464,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest,
             allowDatabaseRebind: allowPendingRestoreRebind && restoreRequestExists
         )
-        try await SchemaV7.validateFinalV6Shape(using: database)
+        try await SchemaV8.validate(using: database)
     }
 
     private enum ExistingStorePreflight {
@@ -990,6 +1024,81 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             return try canonicalEventForPublication(decoded)
         }
         return EventPage(storeID: meta.storeID, events: events, nextCursor: events.last?.cursor ?? ServiceCursor(storeID: meta.storeID, globalSequence: after), replayFloor: meta.replayFloor)
+    }
+
+    public func nextPendingEventOutboxRecord(
+        maximumGlobalSequence: Int64? = nil
+    ) async throws -> PendingEventOutboxRecord? {
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            let query: String
+            let parameters: [SQLiteData]
+            if let maximumGlobalSequence {
+                query = "SELECT global_sequence,envelope_json,dispatch_attempt_count,created_at FROM event_outbox WHERE state='pending' AND global_sequence<=? ORDER BY global_sequence LIMIT 1"
+                parameters = [.integer(Int(maximumGlobalSequence))]
+            } else {
+                query = "SELECT global_sequence,envelope_json,dispatch_attempt_count,created_at FROM event_outbox WHERE state='pending' ORDER BY global_sequence LIMIT 1"
+                parameters = []
+            }
+            guard let row = try await database.query(query, parameters).first,
+                let sequence = row.column("global_sequence")?.integer,
+                let envelopeJSON = row.column("envelope_json")?.string
+            else { return nil }
+            _ = try await database.query(
+                "UPDATE event_outbox SET dispatch_attempt_count=dispatch_attempt_count+1,last_diagnostic_code=NULL WHERE global_sequence=? AND state='pending'",
+                [.integer(sequence)]
+            )
+            let decoded = try decoder.decode(EventEnvelope.self, from: Data(envelopeJSON.utf8))
+            let event = try canonicalEventForPublication(decoded)
+            guard event.globalSequence == Int64(sequence) else {
+                throw ServiceAPIError(code: .persistenceUnavailable, message: "Event outbox sequence does not match its envelope", retryable: false)
+            }
+            return PendingEventOutboxRecord(
+                event: event,
+                dispatchAttemptCount: Int64(row.column("dispatch_attempt_count")?.integer ?? 0) + 1,
+                createdAt: Date(timeIntervalSince1970: row.column("created_at")?.double ?? 0)
+            )
+        }
+    }
+
+    public func markEventOutboxDispatched(_ cursor: ServiceCursor, at date: Date = Date()) async throws {
+        let metadata = try await metadata()
+        guard cursor.storeID == metadata.storeID else {
+            throw ServiceAPIError(code: .cursorExpired, message: "Outbox dispatch store identity changed", cursor: ServiceCursor(storeID: metadata.storeID, globalSequence: metadata.replayFloor))
+        }
+        try await transaction(.interactive(estimatedEncodedBytes: 0)) {
+            _ = try await database.query(
+                "UPDATE event_outbox SET state='dispatched',dispatched_at=?,last_diagnostic_code=NULL WHERE global_sequence=? AND state='pending'",
+                [.float(date.timeIntervalSince1970), .integer(Int(cursor.globalSequence))]
+            )
+        }
+    }
+
+    public func recordEventOutboxDispatchFailure(
+        _ cursor: ServiceCursor,
+        diagnosticCode: String
+    ) async throws {
+        let boundedCode = String(diagnosticCode.prefix(128))
+        _ = try await database.query(
+            "UPDATE event_outbox SET last_diagnostic_code=? WHERE store_id=? AND global_sequence=? AND state='pending'",
+            [.text(boundedCode), .text(cursor.storeID.uuidString), .integer(Int(cursor.globalSequence))]
+        )
+    }
+
+    public func eventOutboxOperationalSnapshot(now: Date = Date()) async throws -> EventOutboxOperationalSnapshot {
+        let row = try await database.query(
+            "SELECT COUNT(*) AS pending_count,MIN(global_sequence) AS oldest_sequence,MIN(created_at) AS oldest_created,MAX(dispatch_attempt_count) AS maximum_attempts FROM event_outbox WHERE state='pending'"
+        ).first
+        let lastDispatched = try await database.query(
+            "SELECT MAX(global_sequence) AS value FROM event_outbox WHERE state='dispatched'"
+        ).first?.column("value")?.integer
+        let oldestCreated = row?.column("oldest_created")?.double
+        return EventOutboxOperationalSnapshot(
+            pendingCount: Int64(row?.column("pending_count")?.integer ?? 0),
+            oldestPendingSequence: row?.column("oldest_sequence")?.integer.map(Int64.init),
+            oldestPendingAgeSeconds: oldestCreated.map { max(0, now.timeIntervalSince1970 - $0) },
+            maximumAttemptCount: Int64(row?.column("maximum_attempts")?.integer ?? 0),
+            lastDispatchedSequence: lastDispatched.map(Int64.init)
+        )
     }
 
     public func authorityStore_idempotencyResult(_ input: IdempotencyInput) async throws -> (response: Data, status: Int)? {
@@ -1610,7 +1719,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         }
         let rowLimit = min(maximumBatch, SQLiteDatabaseExecutor.maximumBulkRows)
         let rows = try await database.query(
-            "SELECT global_sequence,timestamp,LENGTH(CAST(envelope_json AS BLOB)) AS envelope_bytes FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence LIMIT ?",
+            "SELECT e.global_sequence,e.timestamp,LENGTH(CAST(e.envelope_json AS BLOB)) AS envelope_bytes,o.state AS outbox_state FROM events e LEFT JOIN event_outbox o ON o.global_sequence=e.global_sequence WHERE e.global_sequence>? AND e.global_sequence<=? ORDER BY e.global_sequence LIMIT ?",
             [.integer(Int(metadata.replayFloor)), .integer(Int(bounded)), .integer(rowLimit)],
             operationClass: .bulk,
             estimatedEncodedBytes: rowLimit * 3 * MemoryLayout<UInt64>.size
@@ -1670,6 +1779,10 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                     retryable: false
                 )
             }
+            // A pending (or missing) outbox row is a hard retention floor. The
+            // ordered dispatcher must retain both the envelope and its source
+            // event until publication has been durably acknowledged.
+            guard row.column("outbox_state")?.string == "dispatched" else { break }
             guard ageBoundary.map({ timestamp < $0 }) != false else { break }
             let (nextRawBytes, rawOverflow) = rawEnvelopeBytes.addingReportingOverflow(envelopeByteCount)
             let (canonicalEstimate, canonicalOverflow) = nextRawBytes.addingReportingOverflow(candidates.count + 2)
@@ -1717,7 +1830,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                   meta.nextGlobalSequence >= plan.nextGlobalSequence
             else { throw EventArchivePlanError.stale }
             let rows = try await database.query(
-                "SELECT global_sequence,timestamp,envelope_json FROM events WHERE global_sequence>? AND global_sequence<=? ORDER BY global_sequence LIMIT ?",
+                "SELECT e.global_sequence,e.timestamp,e.envelope_json,o.state AS outbox_state FROM events e LEFT JOIN event_outbox o ON o.global_sequence=e.global_sequence WHERE e.global_sequence>? AND e.global_sequence<=? ORDER BY e.global_sequence LIMIT ?",
                 [.integer(Int(plan.replayFloor)), .integer(Int(plan.throughSequence)), .integer(plan.candidates.count)],
                 operationClass: .bulk,
                 estimatedEncodedBytes: plan.rawEnvelopeBytes
@@ -1759,7 +1872,8 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                 guard Int64(row.column("global_sequence")?.integer ?? -1) == candidate.globalSequence,
                       row.column("timestamp")?.double?.bitPattern == candidate.timestampBitPattern,
                       let text = row.column("envelope_json")?.string,
-                      text.utf8.count == candidate.envelopeBytes
+                      text.utf8.count == candidate.envelopeBytes,
+                      row.column("outbox_state")?.string == "dispatched"
                 else {
                     throw ServiceAPIError(
                         code: .persistenceUnavailable,
@@ -1842,6 +1956,10 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             )
             _ = try await database.query(
                 "DELETE FROM events WHERE global_sequence>=? AND global_sequence<=?",
+                [.integer(Int(first.globalSequence)), .integer(Int(last.globalSequence))]
+            )
+            _ = try await database.query(
+                "DELETE FROM event_outbox WHERE global_sequence>=? AND global_sequence<=? AND state='dispatched'",
                 [.integer(Int(first.globalSequence)), .integer(Int(last.globalSequence))]
             )
             _ = try await database.query(
@@ -2103,7 +2221,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         return unsigned.replacingIntegrity(keyID: keyID, digest: digest, signature: signature)
     }
 
-    private func appendEvent(projectID: UUID, sessionID: UUID?, agentID: UUID? = nil, parentAgentID: UUID? = nil, rootSessionID: UUID?, runID: UUID?, sessionSequence: Int64?, type: EventType, generation: Int64?, turnEpoch: Int64?, actor: ExternalActor?, correlationID: UUID, payload: Data) async throws -> EventEnvelope {
+    func appendEvent(projectID: UUID, sessionID: UUID?, agentID: UUID? = nil, parentAgentID: UUID? = nil, rootSessionID: UUID?, runID: UUID?, sessionSequence: Int64?, type: EventType, generation: Int64?, turnEpoch: Int64?, actor: ExternalActor?, correlationID: UUID, payload: Data) async throws -> EventEnvelope {
         let meta = try await metadata()
         let sequence = meta.nextGlobalSequence
         let keyID = eventSigningKey?.keyID ?? "unsigned-local"
@@ -2124,6 +2242,17 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             .text(digest), .float(envelope.timestamp.timeIntervalSince1970), .text(encodeText(envelope))
         ]
         _ = try await database.query("INSERT INTO events(global_sequence,event_id,project_id,session_id,agent_id,parent_agent_id,root_session_id,run_id,session_sequence,event_type,payload_version,generation,turn_epoch,actor_json,payload_json,digest,timestamp,envelope_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", bindings)
+        try await hitFault(.afterEventInsertBeforeOutboxInsert)
+        _ = try await database.query(
+            "INSERT INTO event_outbox(store_id,global_sequence,envelope_json,state,dispatch_attempt_count,created_at) VALUES(?,?,?,'pending',0,?)",
+            [
+                .text(meta.storeID.uuidString),
+                .integer(Int(sequence)),
+                .text(encodeText(envelope)),
+                .float(eventTimestamp.timeIntervalSince1970),
+            ]
+        )
+        try await hitFault(.afterOutboxInsertBeforeSequenceAdvance)
         try await hitFault(.afterEventInsertBeforeSequenceAdvance)
         _ = try await database.query(
             "UPDATE service_metadata SET next_global_sequence=next_global_sequence+1,last_clean_shutdown=0,last_event_timestamp=? WHERE fixed_id=1",
@@ -2172,7 +2301,11 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         initialSelection: SelectionSnapshot?,
         eventPayload: Data? = nil
     ) async throws -> EventEnvelope {
-        try await validateExpectedCursor(snapshot.cursor)
+        // `nextCursor()` is an observational convenience, not a reservation.
+        // Allocate/rebase at the transaction boundary so unrelated projects
+        // cannot race on the same global sequence.
+        try await validateExpectedCursorNamespace(snapshot.cursor)
+        let snapshot = snapshot.replacing(cursor: try await nextCursor())
         if let idempotency, let existing = try await existingIdempotency(idempotency) { throw ExistingIdempotency(existing) }
         try await persistTranscriptEntriesInBulk(snapshot)
         let snapshotJSON = try encodeText(snapshot)
@@ -2203,7 +2336,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         return event
     }
 
-    private func persistAgentInTransaction(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
+    func persistAgentInTransaction(_ snapshot: AgentSnapshot, projectID: UUID, actor: ExternalActor?, correlationID: UUID, eventType: EventType) async throws -> EventEnvelope {
         _ = try await database.query(
             "INSERT INTO agents(agent_id,session_id,root_session_id,parent_agent_id,schema_version,provider_native_identity,role,label,lifecycle_state,revision,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(agent_id) DO UPDATE SET provider_native_identity=excluded.provider_native_identity,role=excluded.role,label=excluded.label,lifecycle_state=excluded.lifecycle_state,revision=excluded.revision,updated_at=CURRENT_TIMESTAMP",
             [.text(snapshot.agentID.uuidString), .text(snapshot.sessionID.uuidString), .text(snapshot.rootSessionID.uuidString), snapshot.parentAgentID.map { .text($0.uuidString) } ?? .null, snapshot.providerNativeIdentity.map(SQLiteData.text) ?? .null, .text(snapshot.role), snapshot.label.map(SQLiteData.text) ?? .null, .text(snapshot.state.rawValue), .integer(Int(snapshot.revision))]
@@ -2645,6 +2778,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             namespaceKind: namespaceKind,
             databaseIdentityDigest: databaseIdentityDigest
         )
+        try await applySchemaV8()
     }
 
     public func migrateToLatest(
@@ -2672,13 +2806,13 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
 
         do {
             var version = before.schemaVersion
-            if version > SchemaV7.version {
+            if version > SchemaV8.version {
                 throw ServiceAPIError(
                     code: .forwardSchemaUnsupported,
                     message: "Authority store schema is newer than this maintenance tool"
                 )
             }
-            if version == SchemaV7.version {
+            if version == SchemaV8.version {
                 try await validateNamespaceIdentity(
                     requestedKind: namespaceKind,
                     requestedDatabaseIdentityDigest: databaseIdentityDigest,
@@ -2696,7 +2830,9 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
                     namespaceKind: namespaceKind,
                     databaseIdentityDigest: databaseIdentityDigest
                 )
+                version = SchemaV7.version
             }
+            if version < SchemaV8.version { try await applySchemaV8() }
         } catch let error as SQLiteError {
             switch error.reason {
             case .busy, .busyInRecovery, .busyInSnapshot, .busyTimeout, .locked,
@@ -2767,7 +2903,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         ).first?.column("schema_version")?.integer else {
             throw ServiceAPIError(code: .authorityPurposeMismatch, message: "Authority metadata is missing")
         }
-        if version > SchemaV7.version {
+        if version > SchemaV8.version {
             throw ServiceAPIError(
                 code: .forwardSchemaUnsupported,
                 message: "Authority store schema is newer than this maintenance tool"
@@ -2777,7 +2913,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
             throw ServiceAPIError(code: .authorityPurposeMismatch, message: "Authority schema version is invalid")
         }
         try await validateMigrationLedger(metadataVersion: version)
-        if version == SchemaV7.version {
+        if version >= SchemaV7.version {
             try await validateNamespaceIdentity(
                 requestedKind: requestedKind,
                 requestedDatabaseIdentityDigest: requestedDatabaseIdentityDigest,
@@ -2965,6 +3101,24 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         }
     }
 
+    private func applySchemaV8() async throws {
+        try await transaction(.bulk(estimatedEncodedBytes: 0)) {
+            try await executeMigrationStatements(SchemaV8.statements)
+            _ = try await database.query(
+                "INSERT INTO event_outbox(store_id,global_sequence,envelope_json,state,dispatch_attempt_count,created_at,dispatched_at) SELECT m.store_id,e.global_sequence,e.envelope_json,'dispatched',0,e.timestamp,e.timestamp FROM events e CROSS JOIN service_metadata m WHERE m.fixed_id=1"
+            )
+            try await hitFault(.afterMigrationStatement)
+            _ = try await database.query("UPDATE service_metadata SET schema_version=8 WHERE fixed_id=1")
+            try await hitFault(.afterMigrationStatement)
+            try await insertMigration(
+                version: 8,
+                description: "durable authority transitions, provider event deduplication, and ordered event outbox",
+                digest: SchemaV8.canonicalDigest
+            )
+        }
+        try await SchemaV8.validate(using: database)
+    }
+
     private func executeMigrationStatements(_ statements: [String]) async throws {
         for statement in statements {
             _ = try await database.query(statement, operationClass: .bulk)
@@ -3056,7 +3210,7 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         faultInjectionEnabled = true
     }
 
-    private func hitFault(_ point: PersistenceFaultPoint) async throws {
+    func hitFault(_ point: PersistenceFaultPoint) async throws {
         guard faultInjectionEnabled else { return }
         try await faultInjector.hit(point)
     }
@@ -3272,6 +3426,17 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
         guard cursor.storeID == meta.storeID, cursor.globalSequence == meta.nextGlobalSequence else { throw ServiceAPIError(code: .staleRevision, message: "Publication cursor is stale", cursor: ServiceCursor(storeID: meta.storeID, globalSequence: meta.nextGlobalSequence)) }
     }
 
+    private func validateExpectedCursorNamespace(_ cursor: ServiceCursor) async throws {
+        let meta = try await metadata()
+        guard cursor.storeID == meta.storeID else {
+            throw ServiceAPIError(
+                code: .staleRevision,
+                message: "Publication cursor belongs to a different store",
+                cursor: ServiceCursor(storeID: meta.storeID, globalSequence: meta.nextGlobalSequence)
+            )
+        }
+    }
+
     private func decodeRows<T: Decodable>(_ sql: String, as: T.Type) async throws -> [T] {
         try await database.query(sql).compactMap { row in guard let text = row.column("snapshot_json")?.string else { return nil }
             return try decoder.decode(T.self, from: Data(text.utf8))
@@ -3381,15 +3546,39 @@ public actor SQLiteServiceStore: RepoPromptAuthorityStore {
     }
 }
 
-private extension SQLiteServiceStore {
+extension SQLiteServiceStore {
     func existingIdempotency(_ input: IdempotencyInput) async throws -> (Data, Int)? {
-        guard let row = try await database.query("SELECT request_digest,response_body,status FROM idempotency_records WHERE actor_id=? AND operation=? AND idempotency_key=?", [.text(input.actorID), .text(input.operation), .text(input.key)]).first else { return nil }
-        guard row.column("request_digest")?.string == input.requestDigest else { throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was used with a different request") }
-        let response = Data(base64Encoded: row.column("response_body")?.string ?? "") ?? Data()
-        return (response, row.column("status")?.integer ?? 200)
+        let bindings: [SQLiteData] = [.text(input.actorID), .text(input.operation), .text(input.key)]
+        if let row = try await database.query("SELECT request_digest,response_body,status FROM idempotency_records WHERE actor_id=? AND operation=? AND idempotency_key=?", bindings).first {
+            guard row.column("request_digest")?.string == input.requestDigest else { throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency key was used with a different request") }
+            let response = Data(base64Encoded: row.column("response_body")?.string ?? "") ?? Data()
+            return (response, row.column("status")?.integer ?? 200)
+        }
+        if let row = try await database.query("SELECT request_digest,response_body,response_status FROM authority_transitions WHERE actor_id=? AND operation=? AND idempotency_key=?", bindings).first {
+            guard row.column("request_digest")?.string == input.requestDigest else { throw ServiceAPIError(code: .idempotencyConflict, message: "Transition idempotency key was used with a different request", retryable: false) }
+            if let encoded = row.column("response_body")?.string, let response = Data(base64Encoded: encoded) {
+                return (response, row.column("response_status")?.integer ?? 202)
+            }
+            throw ServiceAPIError(code: .operationReconciling, message: "The durable operation identity exists but its cached response expired; resnapshot the session and run state", retryable: false)
+        }
+        if let row = try await database.query("SELECT request_digest,terminal_identity FROM idempotency_tombstones WHERE actor_id=? AND operation=? AND idempotency_key=?", bindings).first {
+            guard row.column("request_digest")?.string == input.requestDigest else { throw ServiceAPIError(code: .idempotencyConflict, message: "Idempotency tombstone was used with a different request", retryable: false) }
+            let identity = row.column("terminal_identity")?.string ?? "unknown"
+            throw ServiceAPIError(code: .operationReconciling, message: "The durable operation response expired; resnapshot terminal identity \(identity)", retryable: false)
+        }
+        return nil
     }
 
     func saveIdempotency(_ input: IdempotencyInput, status: Int, response: Data) async throws {
-        _ = try await database.query("INSERT INTO idempotency_records(actor_id,operation,idempotency_key,request_digest,response_body,status,created_at,expires_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,datetime('now','+30 days'))", [.text(input.actorID), .text(input.operation), .text(input.key), .text(input.requestDigest), .text(response.base64EncodedString()), .integer(status)])
+        _ = try await database.query("INSERT INTO idempotency_records(actor_id,operation,idempotency_key,request_digest,response_body,status,created_at,expires_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,datetime('now','+30 days')) ON CONFLICT(actor_id,operation,idempotency_key) DO UPDATE SET response_body=excluded.response_body,status=excluded.status,expires_at=excluded.expires_at WHERE idempotency_records.request_digest=excluded.request_digest", [.text(input.actorID), .text(input.operation), .text(input.key), .text(input.requestDigest), .text(response.base64EncodedString()), .integer(status)])
+        let changed = try await requireRow(database.query("SELECT changes() AS changed"))
+            .column("changed")?.integer
+        guard changed == 1 else {
+            throw ServiceAPIError(
+                code: .idempotencyConflict,
+                message: "Idempotency key was used with a different request",
+                retryable: false
+            )
+        }
     }
 }

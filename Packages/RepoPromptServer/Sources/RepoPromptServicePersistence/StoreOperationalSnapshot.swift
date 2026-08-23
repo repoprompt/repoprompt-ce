@@ -27,6 +27,11 @@ public struct StoreOperationalSnapshot: Codable, Sendable {
     public let compressedArchiveBytes: Int64
     public let checkpointCounts: [CheckpointRetentionCount]
     public let activeProcessFamilyCount: Int
+    public let eventOutboxPendingCount: Int
+    public let eventOutboxOldestPendingAgeSeconds: Double?
+    public let eventOutboxMaximumAttemptCount: Int
+    public let nonfinalAuthorityTransitionCount: Int
+    public let providerEventReceiptCount: Int
     public let databaseBytes: Int64
     public let walBytes: Int64
     public let ownedResources: OwnedResourceHealthSnapshot
@@ -36,6 +41,8 @@ public struct StoreOperationalSnapshot: Codable, Sendable {
         case integrityValid, migrationsValid, activationState, activationGeneration
         case liveEventCount, archiveSegmentCount, archivedEventCount, compressedArchiveBytes
         case checkpointCounts, activeProcessFamilyCount, databaseBytes, walBytes
+        case eventOutboxPendingCount, eventOutboxOldestPendingAgeSeconds, eventOutboxMaximumAttemptCount
+        case nonfinalAuthorityTransitionCount, providerEventReceiptCount
         case ownedResources, observedAt
     }
 }
@@ -51,9 +58,9 @@ public extension SQLiteServiceStore {
             return (version, digest)
         })
         let metadata = try await metadata()
-        let migrationsValid = metadata.schemaVersion == SchemaV7.version
-            && migrationMap.count == SchemaV7.version
-            && (1 ... SchemaV7.version).allSatisfy { version in
+        let migrationsValid = metadata.schemaVersion == SchemaV8.version
+            && migrationMap.count == SchemaV8.version
+            && (1 ... SchemaV8.version).allSatisfy { version in
                 migrationMap[version].map { MigrationLedgerPolicy.accepts(version: version, digest: $0) } == true
             }
         let liveEventCount = try await scalarInt("SELECT COUNT(*) AS value FROM events")
@@ -67,6 +74,7 @@ public extension SQLiteServiceStore {
             )
         }
         let activeProcessFamilyCount = try await scalarInt("SELECT COUNT(*) AS value FROM process_families WHERE state IN ('running','terminating')")
+        let outbox = try await eventOutboxOperationalSnapshot(now: now)
         return try await StoreOperationalSnapshot(
             integrityValid: integrity,
             migrationsValid: migrationsValid,
@@ -78,6 +86,11 @@ public extension SQLiteServiceStore {
             compressedArchiveBytes: compressedArchiveBytes,
             checkpointCounts: checkpointCounts,
             activeProcessFamilyCount: activeProcessFamilyCount,
+            eventOutboxPendingCount: Int(outbox.pendingCount),
+            eventOutboxOldestPendingAgeSeconds: outbox.oldestPendingAgeSeconds,
+            eventOutboxMaximumAttemptCount: Int(outbox.maximumAttemptCount),
+            nonfinalAuthorityTransitionCount: try await scalarInt("SELECT COUNT(*) AS value FROM authority_transitions WHERE state<>'finalized'"),
+            providerEventReceiptCount: try await scalarInt("SELECT COUNT(*) AS value FROM provider_event_receipts"),
             databaseBytes: fileBytes(storagePath),
             walBytes: fileBytes(storagePath.map { "\($0)-wal" }),
             ownedResources: ownedResourceHealth(now: now),

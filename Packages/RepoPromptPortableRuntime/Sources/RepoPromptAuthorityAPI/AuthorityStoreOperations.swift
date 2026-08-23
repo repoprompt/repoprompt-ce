@@ -85,6 +85,12 @@ public protocol RepoPromptAuthorityStore:
         receipt: SubmissionReceipt,
         newSession: PreparedNewAgentSession?
     ) async throws -> NewAgentSessionAcceptanceEvents?
+    /// SQLiteServiceStore.swift — SchemaV8 lifecycle transaction.
+    func authorityStore_commitRunTransition(_ mutation: RunTransitionMutation) async throws -> RunTransitionCommitResult
+    /// SQLiteServiceStore.swift — SchemaV8 recovery inventory.
+    func authorityStore_nonfinalAuthorityTransitions() async throws -> [AuthorityTransitionSnapshot]
+    /// SQLiteServiceStore.swift — SchemaV8 atomic provider-frame application.
+    func authorityStore_applyProviderEvent(_ mutation: ProviderEventMutation) async throws -> ProviderEventCommitResult
     /// ComposerAttachmentRepository.swift
     func authorityStore_composerAttachment(attachmentID: UUID) async throws -> StoredComposerAttachment?
     /// ComposerAttachmentRepository.swift
@@ -465,6 +471,18 @@ public extension RepoPromptAuthorityStore {
         newSession: PreparedNewAgentSession? = nil
     ) async throws -> NewAgentSessionAcceptanceEvents? {
         try await authorityStore_commitAgentSubmission(record: record, turn: turn, nextDefaults: nextDefaults, runPresentation: runPresentation, receipt: receipt, newSession: newSession)
+    }
+
+    func commitRunTransition(_ mutation: RunTransitionMutation) async throws -> RunTransitionCommitResult {
+        try await authorityStore_commitRunTransition(mutation)
+    }
+
+    func nonfinalAuthorityTransitions() async throws -> [AuthorityTransitionSnapshot] {
+        try await authorityStore_nonfinalAuthorityTransitions()
+    }
+
+    func applyProviderEvent(_ mutation: ProviderEventMutation) async throws -> ProviderEventCommitResult {
+        try await authorityStore_applyProviderEvent(mutation)
     }
 
     func composerAttachment(attachmentID: UUID) async throws -> StoredComposerAttachment? {

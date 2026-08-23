@@ -6,11 +6,29 @@ public struct AuthorityMCPBinding: Sendable {
     public let sessionID: UUID
     public let actor: ExternalActor
     public let mcpClientID: String
+    /// Host-issued application invocation identity. This is internal transport
+    /// context, never a public MCP argument and never a bare JSON-RPC id.
+    public let appInvocationID: String?
 
-    public init(sessionID: UUID, actor: ExternalActor, mcpClientID: String = untrustedClientID) {
+    public init(
+        sessionID: UUID,
+        actor: ExternalActor,
+        mcpClientID: String = untrustedClientID,
+        appInvocationID: String? = nil
+    ) {
         self.sessionID = sessionID
         self.actor = actor
         self.mcpClientID = mcpClientID
+        self.appInvocationID = appInvocationID
+    }
+
+    public func withAppInvocationID(_ appInvocationID: String?) -> Self {
+        Self(
+            sessionID: sessionID,
+            actor: actor,
+            mcpClientID: mcpClientID,
+            appInvocationID: appInvocationID
+        )
     }
 }
 

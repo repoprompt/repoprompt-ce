@@ -70,14 +70,15 @@ public struct EventDeliveryCursorGate: Sendable {
             greatestDelivered = cursor
             return true
         }
-        guard greatestDelivered.storeID == cursor.storeID else {
-            self.greatestDelivered = cursor
-            return true
-        }
+        guard greatestDelivered.storeID == cursor.storeID else { return false }
         guard cursor.globalSequence > greatestDelivered.globalSequence else {
             return false
         }
         self.greatestDelivered = cursor
         return true
+    }
+
+    public mutating func resetForNewStore(_ cursor: ServiceCursor?) {
+        greatestDelivered = cursor
     }
 }

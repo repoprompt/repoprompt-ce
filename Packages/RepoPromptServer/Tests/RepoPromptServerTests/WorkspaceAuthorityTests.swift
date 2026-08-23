@@ -913,6 +913,7 @@ private actor LaunchBoundaryWorkspaceProvider: AgentProviderDispatcher {
         receivedRequest = true
         await withCheckedContinuation { launchContinuation = $0 }
         try request.validateLaunch()
+        try await request.acknowledgeLaunch()
         launched = true
         return ProviderExecutionResult(output: "launched", providerSessionID: nil)
     }
@@ -955,6 +956,7 @@ private actor BlockingWorkspaceProvider: AgentProviderDispatcher {
         onEvent _: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
         try request.validateLaunch()
+        try await request.acknowledgeLaunch()
         started = true
         while !Task.isCancelled {
             try await Task.sleep(for: .milliseconds(10))
@@ -999,6 +1001,7 @@ private actor MultiRootWorkspaceProvider: AgentProviderDispatcher {
         onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
     ) async throws -> ProviderExecutionResult {
         try request.validateLaunch()
+        try await request.acknowledgeLaunch()
         captured.append(.init(workingDirectory: request.workingDirectory, writableRoots: request.policy.writableRoots))
         let routes = URL(fileURLWithPath: request.workingDirectory).appendingPathComponent("roots", isDirectory: true)
         let roots = try FileManager.default.contentsOfDirectory(at: routes, includingPropertiesForKeys: nil).sorted { $0.lastPathComponent < $1.lastPathComponent }
@@ -1066,6 +1069,24 @@ private actor WorkflowWorkspaceRunner: WorkspaceCommandRunning {
         return "provider 1.0"
     }
 
+    func run(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String,
+        maximumBytes: Int,
+        launchValidation: @escaping @Sendable () throws -> Void,
+        launchAcknowledgement: @escaping @Sendable () async throws -> Void
+    ) async throws -> String {
+        try launchValidation()
+        try await launchAcknowledgement()
+        return try await run(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes
+        )
+    }
+
     func oraclePrompts() -> [String] {
         recordedOraclePrompts
     }
@@ -1084,6 +1105,24 @@ private actor QuestionWorkspaceRunner: WorkspaceCommandRunning {
             return #"{"tool":"finish","args":{}}"#
         }
         throw ServiceAPIError(code: .dependencyUnavailable, message: "unexpected Context Builder prompt")
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String,
+        maximumBytes: Int,
+        launchValidation: @escaping @Sendable () throws -> Void,
+        launchAcknowledgement: @escaping @Sendable () async throws -> Void
+    ) async throws -> String {
+        try launchValidation()
+        try await launchAcknowledgement()
+        return try await run(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes
+        )
     }
 }
 

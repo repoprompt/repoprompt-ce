@@ -808,6 +808,11 @@ public struct RepoPromptHTTPService: Sendable {
                 "repoprompt_event_archive_segments \(operational?.archiveSegmentCount ?? 0)",
                 "repoprompt_event_archive_events \(operational?.archivedEventCount ?? 0)",
                 "repoprompt_event_archive_compressed_bytes \(operational?.compressedArchiveBytes ?? 0)",
+                "repoprompt_event_outbox_pending \(operational?.eventOutboxPendingCount ?? 0)",
+                "repoprompt_event_outbox_oldest_pending_age_seconds \(operational?.eventOutboxOldestPendingAgeSeconds ?? 0)",
+                "repoprompt_event_outbox_max_attempts \(operational?.eventOutboxMaximumAttemptCount ?? 0)",
+                "repoprompt_authority_transitions_nonfinal \(operational?.nonfinalAuthorityTransitionCount ?? 0)",
+                "repoprompt_provider_event_receipts \(operational?.providerEventReceiptCount ?? 0)",
                 "repoprompt_active_sessions \(currentReadiness.activeSessionCount)",
                 "repoprompt_degraded_projects \(currentReadiness.degradedProjectIDs.count)",
                 "repoprompt_mutations_in_flight \(currentReadiness.drain.inFlightMutations)",
@@ -1284,7 +1289,7 @@ public struct RepoPromptHTTPService: Sendable {
         router.get("/internal/v1/events/stream") { request, context in await respond(request, readAdmission: .subscription) { _ = try await authenticate(request, context: context, body: Data(), roles: [.sync], operation: "eventStream")
             let stream: AsyncThrowingStream<EventEnvelope, Error>
             do {
-                stream = try await authority.subscribe(after: parseCursor(request))
+                stream = try await authority.subscribe(consumer: .sse, after: parseCursor(request))
             } catch let error as ServiceAPIError where error.code == .cursorExpired {
                 return try cursorExpiredStream(error)
             }

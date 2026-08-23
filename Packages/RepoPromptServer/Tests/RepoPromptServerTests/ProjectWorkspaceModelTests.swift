@@ -282,6 +282,19 @@ private actor WorkspaceModelProvider: AgentProviderDispatcher {
         return ProviderExecutionResult(output: "Workspace ready", providerSessionID: nil)
     }
 
+    func executeStreaming(
+        _ request: ProviderExecutionRequest,
+        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        try request.validateLaunch()
+        try await request.acknowledgeLaunch()
+        directories.append(request.workingDirectory)
+        let result = ProviderExecutionResult(output: "Workspace ready", providerSessionID: nil)
+        await onEvent(.assistantFinal(result.output))
+        await onEvent(.completed(providerSessionID: nil))
+        return result
+    }
+
     func workingDirectories() -> [String] { directories }
 }
 
@@ -310,6 +323,27 @@ private actor WorkspaceBlockingProvider: AgentProviderDispatcher {
         started = true
         await withCheckedContinuation { continuation = $0 }
         return ProviderExecutionResult(output: "Done", providerSessionID: nil)
+    }
+
+    func executeStreaming(
+        _ request: ProviderExecutionRequest,
+        onEvent: @escaping @Sendable (ProviderRuntimeEvent) async -> Void
+    ) async throws -> ProviderExecutionResult {
+        try request.validateLaunch()
+        try await request.acknowledgeLaunch()
+        let result = try await execute(
+            kind: request.kind,
+            model: request.model,
+            prompt: request.prompt,
+            workingDirectory: request.workingDirectory,
+            maximumBytes: request.maximumBytes,
+            runID: request.runID,
+            resumeProviderSessionID: request.resumeProviderSessionID,
+            onProviderSessionIdentity: { _ in }
+        )
+        await onEvent(.assistantFinal(result.output))
+        await onEvent(.completed(providerSessionID: result.providerSessionID))
+        return result
     }
 
     func waitUntilStarted() async {

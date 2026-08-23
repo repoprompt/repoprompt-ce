@@ -527,7 +527,8 @@ public enum RepoPromptServerRunner {
             maximumActiveSessions: configuration.maximumActiveSessions,
             mutationGate: mutationGate,
             trustConfigurationValid: true,
-            providerSettings: providerSettings
+            providerSettings: providerSettings,
+            eventOutboxDispatcher: runtime.eventOutboxDispatcher
         )
         let service = RepoPromptHTTPService(
             authority: authority,

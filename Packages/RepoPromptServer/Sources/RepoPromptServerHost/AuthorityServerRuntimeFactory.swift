@@ -78,6 +78,8 @@ public struct AuthorityServerRuntime: Sendable {
     public let providerSettings: ProviderSettingsService
     public let serverSettings: ServerSettingsService
     public let portalDesktopSettings: PortalDesktopSettingsService
+    public let eventHub: ServiceEventHub
+    public let eventOutboxDispatcher: OrderedEventOutboxDispatcher
 }
 
 private struct RestoreActivationRequest: Decodable {
@@ -346,6 +348,7 @@ public extension RepoPromptAuthorityHostFactory {
                 providerCatalog: providerSettings,
                 projectCatalog: store
             )
+            let eventHub = ServiceEventHub()
             let authority = RepoPromptHeadlessAuthority(
                 store: store,
                 codeMapBuilder: ServerWorkspaceCodeMapBuilder(),
@@ -356,13 +359,27 @@ public extension RepoPromptAuthorityHostFactory {
                 serverSettings: serverSettings,
                 providerSettings: providerSettings,
                 directProviderRegistry: directProviderRegistry,
-                directProviderDefaults: portalDesktopSettings
+                directProviderDefaults: portalDesktopSettings,
+                eventHub: eventHub
             )
             await host.markRecoveringAuthority()
             try await authority.recover()
+            let metadata = try await store.metadata()
+            let startupWatermark = ServiceCursor(
+                storeID: metadata.storeID,
+                globalSequence: metadata.nextGlobalSequence - 1
+            )
+            let eventOutboxDispatcher = OrderedEventOutboxDispatcher(
+                store: store,
+                hub: eventHub
+            )
+            try await eventOutboxDispatcher.drainStartupWatermark(startupWatermark)
+            await eventOutboxDispatcher.start()
             await host.installRecoveredAuthority(
                 authority,
-                durabilityOperations: durabilityOperations
+                durabilityOperations: durabilityOperations,
+                eventHub: eventHub,
+                eventOutboxDispatcher: eventOutboxDispatcher
             )
             await durabilityOperations.start()
             return AuthorityServerRuntime(
@@ -372,7 +389,9 @@ public extension RepoPromptAuthorityHostFactory {
                 durabilityOperations: durabilityOperations,
                 providerSettings: providerSettings,
                 serverSettings: serverSettings,
-                portalDesktopSettings: portalDesktopSettings
+                portalDesktopSettings: portalDesktopSettings,
+                eventHub: eventHub,
+                eventOutboxDispatcher: eventOutboxDispatcher
             )
         } catch {
             _ = await host.shutdown(reason: "server-recovery-failed")

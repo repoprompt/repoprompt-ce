@@ -220,6 +220,11 @@ public actor PortableAgentProviderDispatcher: AgentProviderDispatcher, Interacti
         try await runtime.interrupt(runID: runID)
     }
 
+    public func hasActiveRun(_ runID: UUID) async -> Bool {
+        guard let runtime = await runtime(containing: runID) else { return false }
+        return await runtime.hasActiveRun(runID)
+    }
+
     public func deliverInteraction(runID: UUID, providerRequestID: String, answer: Data) async throws {
         guard let runtime = await runtime(containing: runID) else {
             throw ServiceAPIError(code: .notFound, message: "Active provider run was not found")
@@ -427,7 +432,8 @@ private actor CommandCompatibilityProviderRuntime: AgentProviderRuntime {
             arguments: arguments,
             workingDirectory: request.workingDirectory,
             maximumBytes: request.maximumBytes,
-            launchValidation: { try request.validateLaunch() }
+            launchValidation: { try request.validateLaunch() },
+            launchAcknowledgement: { try await request.acknowledgeLaunch() }
         )
         let parsed = Self.parse(raw, kind: kind)
         if let identity = parsed.providerSessionID { await onEvent(.providerIdentity(identity)) }

@@ -288,9 +288,20 @@ final class RepoPromptMCPAdapterTests: XCTestCase {
             configuration: .init(namespace: descriptor)
         )
         let store = try await host.storeForRecovery()
-        let authority = RepoPromptHeadlessAuthority(store: store)
+        let eventHub = ServiceEventHub()
+        let authority = RepoPromptHeadlessAuthority(store: store, eventHub: eventHub)
         try await authority.recover()
-        await host.installRecoveredAuthority(authority)
+        let metadata = try await store.metadata()
+        let dispatcher = OrderedEventOutboxDispatcher(store: store, hub: eventHub)
+        try await dispatcher.drainStartupWatermark(
+            .init(storeID: metadata.storeID, globalSequence: metadata.nextGlobalSequence - 1)
+        )
+        await dispatcher.start()
+        await host.installRecoveredAuthority(
+            authority,
+            eventHub: eventHub,
+            eventOutboxDispatcher: dispatcher
+        )
         let serving = try await host.makeMCPService(
             portalSettings: PortalDesktopSettingsService(store: store)
         )
@@ -327,6 +338,24 @@ private actor NativeOracleRunner: WorkspaceCommandRunning {
         {"type":"thread.started","thread_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
         {"type":"item.completed","item":{"type":"agent_message","text":"oracle response"}}
         """
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String,
+        maximumBytes: Int,
+        launchValidation: @escaping @Sendable () throws -> Void,
+        launchAcknowledgement: @escaping @Sendable () async throws -> Void
+    ) async throws -> String {
+        try launchValidation()
+        try await launchAcknowledgement()
+        return try await run(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            maximumBytes: maximumBytes
+        )
     }
 
     func calls() -> [[String]] {

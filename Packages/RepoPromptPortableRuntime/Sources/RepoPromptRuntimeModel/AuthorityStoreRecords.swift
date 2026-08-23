@@ -314,6 +314,292 @@ public struct IdempotencyInput: Sendable {
     }
 }
 
+public enum AuthorityTransitionKind: String, Codable, Hashable, Sendable {
+    case start, cancel, complete, fail, interrupt
+}
+
+public enum AuthorityTransitionState: String, Codable, Hashable, Sendable {
+    case prepared
+    case effectAcknowledged
+    case finalized
+    case reconciliationRequired
+}
+
+public struct AuthorityTransitionSnapshot: Codable, Hashable, Sendable {
+    public let transitionID: UUID
+    public let actorID: String
+    public let operation: String
+    public let idempotencyKey: String
+    public let requestDigest: String
+    public let kind: AuthorityTransitionKind
+    public let sessionID: UUID
+    public let runID: UUID
+    public let expectedSessionRevision: Int64
+    public let expectedGeneration: Int64
+    public let expectedTurnEpoch: Int64
+    public let state: AuthorityTransitionState
+    public let requestedTerminalState: String?
+    public let sideEffectEvidenceJSON: Data?
+    public let diagnosticCode: String?
+    public let createdAt: Date
+    public let updatedAt: Date
+    public let finalizedAt: Date?
+
+    public init(
+        transitionID: UUID,
+        actorID: String,
+        operation: String,
+        idempotencyKey: String,
+        requestDigest: String,
+        kind: AuthorityTransitionKind,
+        sessionID: UUID,
+        runID: UUID,
+        expectedSessionRevision: Int64,
+        expectedGeneration: Int64,
+        expectedTurnEpoch: Int64,
+        state: AuthorityTransitionState,
+        requestedTerminalState: String? = nil,
+        sideEffectEvidenceJSON: Data? = nil,
+        diagnosticCode: String? = nil,
+        createdAt: Date,
+        updatedAt: Date,
+        finalizedAt: Date? = nil
+    ) {
+        self.transitionID = transitionID
+        self.actorID = actorID
+        self.operation = operation
+        self.idempotencyKey = idempotencyKey
+        self.requestDigest = requestDigest
+        self.kind = kind
+        self.sessionID = sessionID
+        self.runID = runID
+        self.expectedSessionRevision = expectedSessionRevision
+        self.expectedGeneration = expectedGeneration
+        self.expectedTurnEpoch = expectedTurnEpoch
+        self.state = state
+        self.requestedTerminalState = requestedTerminalState
+        self.sideEffectEvidenceJSON = sideEffectEvidenceJSON
+        self.diagnosticCode = diagnosticCode
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.finalizedAt = finalizedAt
+    }
+
+    public func replacing(
+        state: AuthorityTransitionState,
+        sideEffectEvidenceJSON: Data? = nil,
+        diagnosticCode: String? = nil,
+        updatedAt: Date,
+        finalizedAt: Date? = nil
+    ) -> Self {
+        .init(
+            transitionID: transitionID,
+            actorID: actorID,
+            operation: operation,
+            idempotencyKey: idempotencyKey,
+            requestDigest: requestDigest,
+            kind: kind,
+            sessionID: sessionID,
+            runID: runID,
+            expectedSessionRevision: expectedSessionRevision,
+            expectedGeneration: expectedGeneration,
+            expectedTurnEpoch: expectedTurnEpoch,
+            state: state,
+            requestedTerminalState: requestedTerminalState,
+            sideEffectEvidenceJSON: sideEffectEvidenceJSON ?? self.sideEffectEvidenceJSON,
+            diagnosticCode: diagnosticCode ?? self.diagnosticCode,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            finalizedAt: finalizedAt
+        )
+    }
+}
+
+public struct RunTransitionMutation: Sendable {
+    public let transition: AuthorityTransitionSnapshot
+    public let session: SessionSnapshot
+    public let agent: AgentSnapshot
+    public let run: ProviderRunSnapshot
+    public let presentation: RunPresentationSnapshot
+    public let sessionEventType: EventType
+    public let agentEventType: EventType
+    public let actor: ExternalActor?
+    public let sessionCorrelationID: UUID
+    public let agentCorrelationID: UUID
+    public let idempotency: IdempotencyInput?
+    public let idempotencyResponse: Data?
+    public let semanticTerminalState: String?
+
+    public init(
+        transition: AuthorityTransitionSnapshot,
+        session: SessionSnapshot,
+        agent: AgentSnapshot,
+        run: ProviderRunSnapshot,
+        presentation: RunPresentationSnapshot,
+        sessionEventType: EventType,
+        agentEventType: EventType,
+        actor: ExternalActor?,
+        sessionCorrelationID: UUID,
+        agentCorrelationID: UUID,
+        idempotency: IdempotencyInput? = nil,
+        idempotencyResponse: Data? = nil,
+        semanticTerminalState: String? = nil
+    ) {
+        self.transition = transition
+        self.session = session
+        self.agent = agent
+        self.run = run
+        self.presentation = presentation
+        self.sessionEventType = sessionEventType
+        self.agentEventType = agentEventType
+        self.actor = actor
+        self.sessionCorrelationID = sessionCorrelationID
+        self.agentCorrelationID = agentCorrelationID
+        self.idempotency = idempotency
+        self.idempotencyResponse = idempotencyResponse
+        self.semanticTerminalState = semanticTerminalState
+    }
+}
+
+public struct RunTransitionCommitResult: Sendable {
+    public let transition: AuthorityTransitionSnapshot
+    public let session: SessionSnapshot
+    public let agent: AgentSnapshot
+    public let run: ProviderRunSnapshot
+    public let presentation: RunPresentationSnapshot
+    public let events: [EventEnvelope]
+    public let replayed: Bool
+
+    public init(
+        transition: AuthorityTransitionSnapshot,
+        session: SessionSnapshot,
+        agent: AgentSnapshot,
+        run: ProviderRunSnapshot,
+        presentation: RunPresentationSnapshot,
+        events: [EventEnvelope],
+        replayed: Bool
+    ) {
+        self.transition = transition
+        self.session = session
+        self.agent = agent
+        self.run = run
+        self.presentation = presentation
+        self.events = events
+        self.replayed = replayed
+    }
+}
+
+public struct ProviderEventIdentity: Codable, Hashable, Sendable {
+    public let runID: UUID
+    public let providerEventID: String
+    public let payloadDigest: String
+    public let generation: Int64
+    public let turnEpoch: Int64
+    public let eventKind: String
+    public let connectionGeneration: Int64
+    public let providerSequence: Int64
+
+    public init(runID: UUID, providerEventID: String, payloadDigest: String, generation: Int64, turnEpoch: Int64, eventKind: String, connectionGeneration: Int64 = 0, providerSequence: Int64 = 1) {
+        self.runID = runID
+        self.providerEventID = providerEventID
+        self.payloadDigest = payloadDigest
+        self.generation = generation
+        self.turnEpoch = turnEpoch
+        self.eventKind = eventKind
+        self.connectionGeneration = connectionGeneration
+        self.providerSequence = providerSequence
+    }
+}
+
+public struct ProviderSessionEventMutation: Sendable {
+    public let snapshot: SessionSnapshot
+    public let eventType: EventType
+    public let correlationID: UUID
+    public init(snapshot: SessionSnapshot, eventType: EventType, correlationID: UUID) {
+        self.snapshot = snapshot
+        self.eventType = eventType
+        self.correlationID = correlationID
+    }
+}
+
+public struct ProviderAgentEventMutation: Sendable {
+    public let snapshot: AgentSnapshot
+    public let projectID: UUID
+    public let eventType: EventType
+    public let correlationID: UUID
+    public init(snapshot: AgentSnapshot, projectID: UUID, eventType: EventType, correlationID: UUID) {
+        self.snapshot = snapshot
+        self.projectID = projectID
+        self.eventType = eventType
+        self.correlationID = correlationID
+    }
+}
+
+public struct ProviderToolEventMutation: Sendable {
+    public let snapshot: ToolInvocationSnapshot
+    public let session: SessionSnapshot
+    public let eventType: EventType
+    public let correlationID: UUID
+    public init(snapshot: ToolInvocationSnapshot, session: SessionSnapshot, eventType: EventType, correlationID: UUID) {
+        self.snapshot = snapshot
+        self.session = session
+        self.eventType = eventType
+        self.correlationID = correlationID
+    }
+}
+
+public struct ProviderInteractionEventMutation: Sendable {
+    public let snapshot: InteractionSnapshot
+    public let session: SessionSnapshot
+    public let correlationID: UUID
+    public init(snapshot: InteractionSnapshot, session: SessionSnapshot, correlationID: UUID) {
+        self.snapshot = snapshot
+        self.session = session
+        self.correlationID = correlationID
+    }
+}
+
+/// Closed persistence command for one normalized provider frame. Every populated
+/// projection and its service event/outbox row commits with the frame receipt.
+public struct ProviderEventMutation: Sendable {
+    public let identity: ProviderEventIdentity
+    public let run: ProviderRunSnapshot?
+    public let presentation: RunPresentationSnapshot?
+    public let semanticActivities: [SemanticActivityRecord]
+    public let semanticTools: [SemanticToolRecord]
+    public let sessionEvent: ProviderSessionEventMutation?
+    public let agentEvent: ProviderAgentEventMutation?
+    public let toolEvent: ProviderToolEventMutation?
+    public let interactionEvent: ProviderInteractionEventMutation?
+    public let contextUsage: ContextUsageWireSnapshot?
+    public let contextUsageSessionID: UUID?
+
+    public init(identity: ProviderEventIdentity, run: ProviderRunSnapshot? = nil, presentation: RunPresentationSnapshot? = nil, semanticActivities: [SemanticActivityRecord] = [], semanticTools: [SemanticToolRecord] = [], sessionEvent: ProviderSessionEventMutation? = nil, agentEvent: ProviderAgentEventMutation? = nil, toolEvent: ProviderToolEventMutation? = nil, interactionEvent: ProviderInteractionEventMutation? = nil, contextUsage: ContextUsageWireSnapshot? = nil, contextUsageSessionID: UUID? = nil) {
+        self.identity = identity
+        self.run = run
+        self.presentation = presentation
+        self.semanticActivities = semanticActivities
+        self.semanticTools = semanticTools
+        self.sessionEvent = sessionEvent
+        self.agentEvent = agentEvent
+        self.toolEvent = toolEvent
+        self.interactionEvent = interactionEvent
+        self.contextUsage = contextUsage
+        self.contextUsageSessionID = contextUsageSessionID
+    }
+}
+
+public struct ProviderEventCommitResult: Sendable {
+    public let applied: Bool
+    public let events: [EventEnvelope]
+    public let session: SessionSnapshot?
+    public init(applied: Bool, events: [EventEnvelope], session: SessionSnapshot?) {
+        self.applied = applied
+        self.events = events
+        self.session = session
+    }
+}
+
 public struct ExistingIdempotency: Error, Sendable { public let response: Data
     public let status: Int
     public init(_ value: (Data, Int)) {

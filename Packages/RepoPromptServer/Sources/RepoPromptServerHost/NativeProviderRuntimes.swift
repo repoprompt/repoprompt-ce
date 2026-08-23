@@ -600,6 +600,7 @@ actor CodexAppServerProviderRuntime: AgentProviderRuntime {
             turnIDs[request.runID] = nil
         }
         do {
+            try await request.acknowledgeLaunch()
             _ = try await process.request(method: "initialize", params: ["clientInfo": ["name": "repoprompt-server", "title": "RepoPrompt Server", "version": "1"], "capabilities": ["experimentalApi": true]], onFrame: { _ in })
             try await process.notify(method: "initialized")
             let policy = Self.codexPolicy(request.policy, workingDirectory: request.workingDirectory)
@@ -1315,6 +1316,7 @@ private actor ACPProviderRuntime: AgentProviderRuntime {
             promptRequestIDs[request.runID] = nil
         }
         do {
+            try await request.acknowledgeLaunch()
             let initialize = try await process.request(method: "initialize", params: ["protocolVersion": 1, "clientInfo": ["name": "RepoPrompt", "version": "1"], "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false], "terminal": false]], onFrame: { line in try await Self.forward(line, output: onEvent) })
             let capabilities = try CodexAppServerProviderRuntime.object(initialize)["agentCapabilities"] as? [String: Any] ?? [:]
             let sessionID: String
@@ -1579,6 +1581,7 @@ actor ClaudeNativeProviderRuntime: AgentProviderRuntime {
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
         do {
+            try await request.acknowledgeLaunch()
             var content: [[String: Any]] = [["type": "text", "text": launch.userMessage]]
             for image in request.structuredInput?.nativeImages ?? [] {
                 let bytes = try Data(contentsOf: URL(fileURLWithPath: image.filePath), options: [.mappedIfSafe])
@@ -1718,6 +1721,12 @@ private actor NormalizedHeadlessProviderRuntime: AgentProviderRuntime {
         let process = try await support.makeSession(runID: request.runID, arguments: ["--headless-provider-json"], workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
+        do {
+            try await request.acknowledgeLaunch()
+        } catch {
+            await process.interrupt { _ in }
+            throw error
+        }
         try await process.sendRaw(JSONSerialization.data(withJSONObject: [
             "operation": "start",
             "runID": request.runID.uuidString,
@@ -1839,6 +1848,12 @@ private actor MCPStdioProviderRuntime: AgentProviderRuntime {
         let process = try await support.makeSession(runID: request.runID, arguments: arguments, workingDirectory: request.workingDirectory, launchValidation: { try request.validateLaunch() })
         sessions[request.runID] = process
         defer { sessions[request.runID] = nil }
+        do {
+            try await request.acknowledgeLaunch()
+        } catch {
+            await process.interrupt { _ in }
+            throw error
+        }
         _ = try await process.request(method: "initialize", params: ["protocolVersion": "2025-03-26", "capabilities": [:], "clientInfo": ["name": "RepoPromptServer", "version": "1"]], onFrame: { _ in })
         try await process.notify(method: "notifications/initialized")
         let tools = try await process.request(method: "tools/list", params: [:], onFrame: { _ in })
