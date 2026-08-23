@@ -2,7 +2,7 @@
   "milestone": "M3",
   "stack_base": "feature/headless-runtime-m2-context-authority",
   "shared_provider": "MCPDomainReadToolProvider",
-  "shared_definition_source": "Sources/RepoPromptDomainRuntime/MCPDomainReadToolDefinitions.swift",
+  "shared_definition_source": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/MCPDomainReadToolDefinitions.swift",
   "tools": [
     "get_code_structure",
     "get_file_tree",

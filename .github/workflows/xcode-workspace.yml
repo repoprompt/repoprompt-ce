@@ -10,6 +10,8 @@ on:
     paths:
       - 'Package.swift'
       - 'Package.resolved'
+      - 'Packages/RepoPromptPortableRuntime/Package.swift'
+      - 'Packages/RepoPromptPortableRuntime/Package.resolved'
       - 'Makefile'
       - 'Scripts/generate_xcode_workspace.py'
       - 'Scripts/xcode_developer_workflow.sh'
@@ -20,6 +22,8 @@ on:
     paths:
       - 'Package.swift'
       - 'Package.resolved'
+      - 'Packages/RepoPromptPortableRuntime/Package.swift'
+      - 'Packages/RepoPromptPortableRuntime/Package.resolved'
       - 'Makefile'
       - 'Scripts/generate_xcode_workspace.py'
       - 'Scripts/xcode_developer_workflow.sh'

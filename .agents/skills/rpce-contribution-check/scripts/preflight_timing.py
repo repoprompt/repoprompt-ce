@@ -30,6 +30,7 @@ PHASE_IDS = [
     "swift_lint",
     "root_tests",
     "provider_tests",
+    "portable_tests",
     "repoprompt_build",
     "mcp_build",
     "xcode_generator_tests",

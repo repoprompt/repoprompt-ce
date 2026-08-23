@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
@@ -1067,13 +1072,14 @@ enum DirectProcess {
         environment: [String: String] = [:],
         currentDirectory: URL? = nil
     ) async throws -> String {
-        try await DirectProcessInvocation(
+        let invocation = try DirectProcessInvocation(
             executable: executable,
             arguments: arguments,
             input: input,
             environment: environment,
             currentDirectory: currentDirectory
-        ).run()
+        )
+        return try await invocation.run()
     }
 }
 
@@ -1081,13 +1087,25 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     private static let outputLimit = 8 * 1024 * 1024
 
     private let lock = NSLock()
-    private let process = Process()
-    private let pipe = Pipe()
     private let inputPipe: Pipe?
     private let input: Data?
-    private var output = Data()
-    private var truncated = false
     private var cancellationRequested = false
+
+    #if os(Linux)
+        private var childPID: pid_t = 0
+        private let linuxExecutable: String
+        private let linuxArguments: [String]
+        private let linuxEnvironment: [String: String]
+        private let linuxCurrentDirectory: URL?
+        private let outputReader: FileHandle
+        private let outputWriter: FileHandle
+    #else
+        private let process = Process()
+        private let outputQueue = DispatchQueue(label: "com.repoprompt.ce.direct-process-output")
+        private let pipe = Pipe()
+        private var output = Data()
+        private var truncated = false
+    #endif
 
     init(
         executable: String,
@@ -1095,83 +1113,393 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         input: Data?,
         environment overrides: [String: String],
         currentDirectory: URL?
-    ) {
+    ) throws {
         self.input = input
         inputPipe = input == nil ? nil : Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = DirectProcess.childEnvironment(overrides: overrides)
-        process.currentDirectoryURL = currentDirectory
-        process.standardOutput = pipe
-        process.standardError = pipe
-        if let inputPipe {
-            process.standardInput = inputPipe
-        }
+
+        #if os(Linux)
+            var template = Array(
+                FileManager.default.temporaryDirectory
+                    .appendingPathComponent("repoprompt-direct-process.XXXXXX")
+                    .path.utf8CString
+            )
+            let writerDescriptor: Int32 = template.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                guard let baseAddress = buffer.baseAddress else { return -1 }
+                return mkstemp(baseAddress)
+            }
+            guard writerDescriptor >= 0 else {
+                throw MCPError.internalError("Unable to create private process output capture")
+            }
+            let path = String(
+                decoding: template.dropLast().map { UInt8(bitPattern: $0) },
+                as: UTF8.self
+            )
+            guard fchmod(writerDescriptor, 0o600) == 0 else {
+                close(writerDescriptor)
+                unlink(path)
+                throw MCPError.internalError("Unable to secure private process output capture")
+            }
+            let readerDescriptor = open(path, O_RDONLY | O_CLOEXEC)
+            guard readerDescriptor >= 0 else {
+                close(writerDescriptor)
+                unlink(path)
+                throw MCPError.internalError("Unable to open private process output capture")
+            }
+            guard unlink(path) == 0 else {
+                close(readerDescriptor)
+                close(writerDescriptor)
+                throw MCPError.internalError("Unable to unlink private process output capture")
+            }
+            outputReader = FileHandle(fileDescriptor: readerDescriptor, closeOnDealloc: true)
+            outputWriter = FileHandle(fileDescriptor: writerDescriptor, closeOnDealloc: true)
+            linuxExecutable = executable
+            linuxArguments = arguments
+            linuxEnvironment = DirectProcess.childEnvironment(overrides: overrides)
+            linuxCurrentDirectory = currentDirectory
+        #else
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            process.environment = DirectProcess.childEnvironment(overrides: overrides)
+            process.currentDirectoryURL = currentDirectory
+            process.standardOutput = pipe.fileHandleForWriting
+            process.standardError = pipe.fileHandleForWriting
+            if let inputPipe {
+                process.standardInput = inputPipe
+            }
+        #endif
     }
 
     func run() async throws -> String {
-        try Task.checkCancellation()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                    self?.append(handle.availableData)
-                }
-                process.terminationHandler = { [weak self] process in
-                    guard let self else {
-                        continuation.resume(throwing: CancellationError())
-                        return
-                    }
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    append(pipe.fileHandleForReading.readDataToEndOfFile())
-                    let snapshot = takeSnapshot()
-                    if snapshot.cancelled {
-                        continuation.resume(throwing: CancellationError())
-                    } else {
-                        var text = String(decoding: snapshot.data, as: UTF8.self)
-                        if snapshot.truncated { text += "\n[output truncated at \(Self.outputLimit) bytes]" }
-                        if process.terminationStatus == 0 {
-                            continuation.resume(returning: text)
+        #if os(Linux)
+            return try await runLinux()
+        #else
+            try Task.checkCancellation()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    #if !os(Linux)
+                        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                            guard let self else { return }
+                            outputQueue.sync {
+                                self.append(handle.availableData)
+                            }
+                        }
+                    #endif
+                    process.terminationHandler = { [weak self] process in
+                        guard let self else {
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        #if os(Linux)
+                            let snapshot = takeFileSnapshot()
+                        #else
+                            pipe.fileHandleForReading.readabilityHandler = nil
+                            let snapshot = outputQueue.sync {
+                                self.drainAvailableOutputWithoutWaiting()
+                                return self.takeSnapshot()
+                            }
+                        #endif
+                        if snapshot.cancelled {
+                            continuation.resume(throwing: CancellationError())
                         } else {
-                            continuation.resume(throwing: MCPError.internalError(
-                                text.trimmingCharacters(in: .whitespacesAndNewlines)
-                            ))
+                            var text = String(decoding: snapshot.data, as: UTF8.self)
+                            if snapshot.truncated { text += "\n[output truncated at \(Self.outputLimit) bytes]" }
+                            if process.terminationStatus == 0 {
+                                continuation.resume(returning: text)
+                            } else {
+                                continuation.resume(throwing: MCPError.internalError(
+                                    text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                ))
+                            }
                         }
                     }
-                }
-                do {
-                    try process.run()
-                    if let inputPipe, let input {
-                        inputPipe.fileHandleForWriting.write(input)
-                        try? inputPipe.fileHandleForWriting.close()
+                    do {
+                        try process.run()
+                        #if os(Linux)
+                            try? outputWriter.close()
+                        #else
+                            try? pipe.fileHandleForWriting.close()
+                        #endif
+                        if let inputPipe, let input {
+                            inputPipe.fileHandleForWriting.write(input)
+                            try? inputPipe.fileHandleForWriting.close()
+                        }
+                        if isCancellationRequested() { cancelProcess() }
+                    } catch {
+                        #if os(Linux)
+                            try? outputWriter.close()
+                            try? outputReader.close()
+                        #else
+                            pipe.fileHandleForReading.readabilityHandler = nil
+                            try? pipe.fileHandleForWriting.close()
+                        #endif
+                        continuation.resume(throwing: error)
                     }
-                    if isCancellationRequested() { cancelProcess() }
-                } catch {
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    continuation.resume(throwing: error)
+                }
+            } onCancel: {
+                requestCancellation()
+            }
+        #endif
+    }
+
+    #if os(Linux)
+        private func runLinux() async throws -> String {
+            try Task.checkCancellation()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+                    do {
+                        let pid = try spawnLinux()
+                        lock.lock()
+                        childPID = pid
+                        let shouldCancel = cancellationRequested
+                        lock.unlock()
+
+                        try? outputWriter.close()
+                        if let inputPipe {
+                            try? inputPipe.fileHandleForReading.close()
+                            if let input {
+                                inputPipe.fileHandleForWriting.write(input)
+                            }
+                            try? inputPipe.fileHandleForWriting.close()
+                        }
+                        if shouldCancel {
+                            cancelLinuxProcess(pid)
+                        }
+
+                        DispatchQueue.global(qos: .utility).async { [self] in
+                            var status: Int32 = 0
+                            var waitedPID: pid_t = -1
+                            repeat {
+                                waitedPID = waitpid(pid, &status, 0)
+                            } while waitedPID < 0 && errno == EINTR
+
+                            lock.lock()
+                            if childPID == pid {
+                                childPID = 0
+                            }
+                            let cancelled = cancellationRequested
+                            lock.unlock()
+
+                            let snapshot = takeFileSnapshot()
+                            if cancelled {
+                                continuation.resume(throwing: CancellationError())
+                            } else if waitedPID < 0 {
+                                continuation.resume(throwing: MCPError.internalError(
+                                    "Unable to wait for direct process: \(String(cString: strerror(errno)))"
+                                ))
+                            } else {
+                                var text = String(decoding: snapshot.data, as: UTF8.self)
+                                if snapshot.truncated {
+                                    text += "\n[output truncated at \(Self.outputLimit) bytes]"
+                                }
+                                let exitedNormally = status & 0x7F == 0
+                                let exitStatus = (status >> 8) & 0xFF
+                                if exitedNormally, exitStatus == 0 {
+                                    continuation.resume(returning: text)
+                                } else {
+                                    continuation.resume(throwing: MCPError.internalError(
+                                        text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    ))
+                                }
+                            }
+                        }
+                    } catch {
+                        try? outputWriter.close()
+                        try? outputReader.close()
+                        if let inputPipe {
+                            try? inputPipe.fileHandleForReading.close()
+                            try? inputPipe.fileHandleForWriting.close()
+                        }
+                        continuation.resume(throwing: error)
+                    }
+                }
+            } onCancel: {
+                requestCancellation()
+            }
+        }
+
+        private func spawnLinux() throws -> pid_t {
+            let outputDescriptor = outputWriter.fileDescriptor
+            guard fcntl(outputDescriptor, F_SETFD, FD_CLOEXEC) == 0 else {
+                throw MCPError.internalError("Unable to secure direct process output descriptor")
+            }
+
+            var actions = posix_spawn_file_actions_t()
+            var result = posix_spawn_file_actions_init(&actions)
+            guard result == 0 else {
+                throw MCPError.internalError(
+                    "Unable to initialize direct process launch: \(String(cString: strerror(result)))"
+                )
+            }
+            defer { posix_spawn_file_actions_destroy(&actions) }
+
+            result = posix_spawn_file_actions_adddup2(&actions, outputDescriptor, STDOUT_FILENO)
+            guard result == 0 else { throw spawnConfigurationError(result) }
+            result = posix_spawn_file_actions_adddup2(&actions, outputDescriptor, STDERR_FILENO)
+            guard result == 0 else { throw spawnConfigurationError(result) }
+            result = posix_spawn_file_actions_addclose(&actions, outputDescriptor)
+            guard result == 0 else { throw spawnConfigurationError(result) }
+
+            if let inputPipe {
+                let reader = inputPipe.fileHandleForReading.fileDescriptor
+                let writer = inputPipe.fileHandleForWriting.fileDescriptor
+                result = posix_spawn_file_actions_adddup2(&actions, reader, STDIN_FILENO)
+                guard result == 0 else { throw spawnConfigurationError(result) }
+                result = posix_spawn_file_actions_addclose(&actions, reader)
+                guard result == 0 else { throw spawnConfigurationError(result) }
+                result = posix_spawn_file_actions_addclose(&actions, writer)
+                guard result == 0 else { throw spawnConfigurationError(result) }
+            }
+
+            let launchExecutable: String
+            let launchArguments: [String]
+            if let linuxCurrentDirectory {
+                launchExecutable = "/bin/sh"
+                launchArguments = [
+                    "/bin/sh",
+                    "-c",
+                    "cd -- \"$1\" && shift && exec \"$@\"",
+                    "repoprompt-direct-process",
+                    linuxCurrentDirectory.path,
+                    linuxExecutable
+                ] + linuxArguments
+            } else {
+                launchExecutable = linuxExecutable
+                launchArguments = [linuxExecutable] + linuxArguments
+            }
+            let environment = linuxEnvironment
+                .map { "\($0.key)=\($0.value)" }
+                .sorted()
+
+            var pid: pid_t = 0
+            result = try withCStringArray(launchArguments) { argumentPointers in
+                try withCStringArray(environment) { environmentPointers in
+                    launchExecutable.withCString { executablePointer in
+                        posix_spawn(
+                            &pid,
+                            executablePointer,
+                            &actions,
+                            nil,
+                            argumentPointers,
+                            environmentPointers
+                        )
+                    }
                 }
             }
-        } onCancel: {
-            requestCancellation()
+            guard result == 0 else {
+                throw MCPError.internalError(
+                    "Unable to launch direct process: \(String(cString: strerror(result)))"
+                )
+            }
+            return pid
         }
-    }
 
-    private func append(_ data: Data) {
-        guard !data.isEmpty else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        guard output.count < Self.outputLimit else { truncated = true
-            return
+        private func withCStringArray<Result>(
+            _ strings: [String],
+            body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) throws -> Result
+        ) rethrows -> Result {
+            let storage: [UnsafeMutablePointer<CChar>?] = strings.map { strdup($0) }
+            defer { storage.forEach { free($0) } }
+            var pointers = storage + [nil]
+            return try pointers.withUnsafeMutableBufferPointer { buffer in
+                try body(buffer.baseAddress!)
+            }
         }
-        let remaining = Self.outputLimit - output.count
-        output.append(data.prefix(remaining))
-        if data.count > remaining { truncated = true }
-    }
 
-    private func takeSnapshot() -> (data: Data, truncated: Bool, cancelled: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        return (output, truncated, cancellationRequested)
-    }
+        private func spawnConfigurationError(_ code: Int32) -> MCPError {
+            MCPError.internalError(
+                "Unable to configure direct process launch: \(String(cString: strerror(code)))"
+            )
+        }
+
+        /// Foundation's Linux `Process` waits for pipe EOF before publishing root
+        /// termination. Linux therefore uses `posix_spawn` plus exact `waitpid` and
+        /// captures into a private unlinked regular file, snapshotting only bytes
+        /// present when the root process terminates.
+        private func takeFileSnapshot() -> (data: Data, truncated: Bool, cancelled: Bool) {
+            let descriptor = outputReader.fileDescriptor
+            var metadata = stat()
+            guard fstat(descriptor, &metadata) == 0 else {
+                try? outputReader.close()
+                return (Data(), false, isCancellationRequested())
+            }
+
+            let snapshotSize = max(0, Int(metadata.st_size))
+            let readCount = min(snapshotSize, Self.outputLimit + 1)
+            var data = Data(count: readCount)
+            var offset = 0
+            while offset < readCount {
+                let count = data.withUnsafeMutableBytes { bytes -> Int in
+                    guard let baseAddress = bytes.baseAddress else { return -1 }
+                    return pread(
+                        descriptor,
+                        baseAddress.advanced(by: offset),
+                        readCount - offset,
+                        off_t(offset)
+                    )
+                }
+                if count > 0 {
+                    offset += count
+                } else if count < 0, errno == EINTR {
+                    continue
+                } else {
+                    break
+                }
+            }
+            if offset < data.count {
+                data.removeSubrange(offset ..< data.count)
+            }
+            try? outputReader.close()
+            return (
+                Data(data.prefix(Self.outputLimit)),
+                snapshotSize > Self.outputLimit,
+                isCancellationRequested()
+            )
+        }
+    #else
+        private func append(_ data: Data) {
+            guard !data.isEmpty else { return }
+            lock.lock()
+            defer { lock.unlock() }
+            guard output.count < Self.outputLimit else { truncated = true
+                return
+            }
+            let remaining = Self.outputLimit - output.count
+            output.append(data.prefix(remaining))
+            if data.count > remaining { truncated = true }
+        }
+
+        /// Drains bytes already present without waiting for EOF. A provider descendant
+        /// may legitimately outlive the root process while retaining the inherited pipe;
+        /// `readDataToEndOfFile()` would then keep the completed request suspended.
+        private func drainAvailableOutputWithoutWaiting() {
+            let descriptor = pipe.fileHandleForReading.fileDescriptor
+            let flags = fcntl(descriptor, F_GETFL)
+            guard flags >= 0,
+                  fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0
+            else { return }
+
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            while true {
+                let count = buffer.withUnsafeMutableBytes { bytes -> Int in
+                    guard let baseAddress = bytes.baseAddress else { return -1 }
+                    return read(descriptor, baseAddress, bytes.count)
+                }
+                if count > 0 {
+                    append(Data(buffer.prefix(count)))
+                } else if count < 0, errno == EINTR {
+                    continue
+                } else {
+                    return
+                }
+            }
+        }
+
+        private func takeSnapshot() -> (data: Data, truncated: Bool, cancelled: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (output, truncated, cancellationRequested)
+        }
+    #endif
 
     private func isCancellationRequested() -> Bool {
         lock.lock()
@@ -1182,20 +1510,42 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     private func requestCancellation() {
         lock.lock()
         cancellationRequested = true
-        let isRunning = process.isRunning
-        let pid = process.processIdentifier
+        #if os(Linux)
+            let pid = childPID
+        #else
+            let isRunning = process.isRunning
+            let pid = process.processIdentifier
+        #endif
         lock.unlock()
-        guard isRunning else { return }
-        cancelProcess()
-        if pid > 0 {
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak process] in
-                guard let process, process.isRunning, process.processIdentifier == pid else { return }
-                _ = kill(pid, SIGKILL)
+        #if os(Linux)
+            guard pid > 0 else { return }
+            cancelLinuxProcess(pid)
+        #else
+            guard isRunning else { return }
+            cancelProcess()
+            if pid > 0 {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak process] in
+                    guard let process, process.isRunning, process.processIdentifier == pid else { return }
+                    _ = kill(pid, SIGKILL)
+                }
             }
-        }
+        #endif
     }
 
-    private func cancelProcess() {
-        if process.isRunning { process.terminate() }
-    }
+    #if os(Linux)
+        private func cancelLinuxProcess(_ pid: pid_t) {
+            _ = kill(pid, SIGTERM)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self else { return }
+                lock.lock()
+                let isSameProcess = childPID == pid
+                lock.unlock()
+                if isSameProcess { _ = kill(pid, SIGKILL) }
+            }
+        }
+    #else
+        private func cancelProcess() {
+            if process.isRunning { process.terminate() }
+        }
+    #endif
 }

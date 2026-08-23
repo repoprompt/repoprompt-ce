@@ -648,7 +648,7 @@
                 ]
             )
 
-            let bridgeLedger = try source("Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift")
+            let bridgeLedger = try source("Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift")
             XCTAssertTrue(bridgeLedger.contains("#if DEBUG\n        /// Same-process monotonic timestamp"))
             XCTAssertTrue(bridgeLedger.contains("value[\"monotonic_uptime_ms\"] = monotonicUptimeMS"))
             let coordinator = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift")
@@ -908,7 +908,7 @@
             let sources = try [
                 source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift"),
                 source("Sources/RepoPrompt/Infrastructure/MCP/UnixSocketMCPTransport.swift"),
-                source("Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift"),
+                source("Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift"),
                 source("Sources/RepoPromptMCP/main.swift"),
                 source("Sources/RepoPrompt/Infrastructure/AI/Agents/AgentToolTracker.swift"),
                 source("Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift")

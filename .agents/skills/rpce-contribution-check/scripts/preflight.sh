@@ -201,18 +201,21 @@ run_pr_ready_path_validations() {
   local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/conductor_diagnostics\.py|Scripts/guardrails\.sh|Scripts/test_conductor_(lifecycle|output|diagnostics|high_output)\.py|Scripts/test_contribution_preflight\.py|\.agents/skills/rpce-contribution-check/scripts/preflight(_timing\.py|\.sh)|Makefile)$'
   local ci_app_test_runner_paths_pattern='^(Scripts/ci_app_test_runner\.py|Scripts/test_ci_app_test_runner\.py|\.github/workflows/ci\.yml)$'
   local swift_paths_pattern='\.swift$'
-  local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/)'
+  local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/|Packages/RepoPromptPortableRuntime/)'
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
-  local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
-  local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'
-  local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
-  local xcode_generator_test_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|Scripts/test_xcode_workspace_generator\.py|\.github/workflows/xcode-workspace\.yml)$'
+  local portable_package_paths_pattern='^Packages/RepoPromptPortableRuntime/'
+  local portable_mapping_owner_paths_pattern='^(Sources/RepoPrompt/Features/AgentMode/Models/AgentWorkflow\.swift|Sources/RepoPrompt/Features/Settings/Models/GlobalSettings(Document|Manager)\.swift|Sources/RepoPrompt/Infrastructure/MCP/Agent/Agent(ManageMCPToolService|RunSessionStore)\.swift|Scripts/source_layout_guardrails\.sh|Scripts/validate_portable_dependency_graph\.py|Scripts/test_contribution_preflight\.py|\.github/workflows/portable-runtime\.yml)'
+  local repoprompt_product_paths_pattern='^(Sources/RepoPrompt/|Packages/RepoPromptPortableRuntime/)'
+  local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Packages/RepoPromptPortableRuntime/)'
+  local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Packages/RepoPromptPortableRuntime/Package\.(swift|resolved)|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
+  local xcode_generator_test_paths_pattern='^(Package\.swift|Package\.resolved|Packages/RepoPromptPortableRuntime/Package\.(swift|resolved)|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|Scripts/test_xcode_workspace_generator\.py|\.github/workflows/xcode-workspace\.yml)$'
 
   local has_control_plane_changes=0
   local has_ci_app_test_runner_changes=0
   local has_swift_changes=0
   local has_root_test_changes=0
   local has_provider_package_changes=0
+  local has_portable_package_changes=0
   local has_repoprompt_product_changes=0
   local has_mcp_product_changes=0
   local has_xcode_generator_test_changes=0
@@ -227,6 +230,8 @@ run_pr_ready_path_validations() {
     [[ "$file" =~ $swift_paths_pattern ]] && has_swift_changes=1
     [[ "$file" =~ $root_test_paths_pattern ]] && has_root_test_changes=1
     [[ "$file" =~ $provider_package_paths_pattern ]] && has_provider_package_changes=1
+    [[ "$file" =~ $portable_package_paths_pattern ]] && has_portable_package_changes=1
+    [[ "$file" =~ $portable_mapping_owner_paths_pattern ]] && has_portable_package_changes=1
     [[ "$file" =~ $repoprompt_product_paths_pattern ]] && has_repoprompt_product_changes=1
     [[ "$file" =~ $mcp_product_paths_pattern ]] && has_mcp_product_changes=1
     [[ "$file" =~ $xcode_generator_test_paths_pattern ]] && has_xcode_generator_test_changes=1
@@ -239,6 +244,7 @@ run_pr_ready_path_validations() {
   (( has_swift_changes )) && selected_lane_ids+=(swift_lint)
   (( has_root_test_changes )) && selected_lane_ids+=(root_tests)
   (( has_provider_package_changes )) && selected_lane_ids+=(provider_tests)
+  (( has_portable_package_changes )) && selected_lane_ids+=(portable_tests)
   (( has_repoprompt_product_changes )) && selected_lane_ids+=(repoprompt_build)
   (( has_mcp_product_changes )) && selected_lane_ids+=(mcp_build)
   (( has_xcode_generator_test_changes )) && selected_lane_ids+=(xcode_generator_tests)
@@ -279,6 +285,12 @@ run_pr_ready_path_validations() {
     log "Run coordinated provider tests"
     make dev-provider-test
     timing_phase_pass provider_tests
+  fi
+  if (( has_portable_package_changes )); then
+    timing_phase_start portable_tests
+    log "Run coordinated portable runtime tests"
+    make dev-portable-test
+    timing_phase_pass portable_tests
   fi
   if (( has_repoprompt_product_changes )); then
     timing_phase_start repoprompt_build

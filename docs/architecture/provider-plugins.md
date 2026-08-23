@@ -296,7 +296,7 @@ Add the relevant focused suite before any catalog/codec change, and snapshot mod
 - `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift` — single package import point.
 - `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/` — Agent-Mode facade and adapter trio.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift` — provider-neutral runtime contract.
-- `Sources/RepoPromptShared/Workflows/` — provider-neutral RepoPrompt workflow IDs, catalog metadata, variants, and renderers shared by the app, installs, MCP prompt registration, and direct headless execution.
+- `Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/` — provider-neutral RepoPrompt workflow IDs, catalog metadata, variants, and renderers shared by the app, installs, MCP prompt registration, and direct headless execution.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` — `AgentProviderKind` and headless factory.
 - `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift` — `makeClaudeCompatibleNativeController(...)`.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift` — interactive Claude-compatible coordinator.

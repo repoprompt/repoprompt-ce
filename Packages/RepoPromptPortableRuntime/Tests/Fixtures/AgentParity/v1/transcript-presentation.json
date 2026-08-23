@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 2,
+  "prototypeCommit": "45c42d65e444884d1681f4504c10d25dcb7d858a",
+  "generatedFrom": "Packages/RepoPromptPortableRuntime/Sources/RepoPromptAgentRuntimeCore/AgentTranscriptPresentationCore.swift",
+  "suppressExactLegacyProgress": ["turn started", "Turn started."],
+  "retainMeaningfulProgress": ["Indexed 4 files", "Waiting for approval"],
+  "blockOrder": ["request", "activityCluster", "standaloneAssistant", "conclusion"],
+  "legacyRowsAreStandalone": true
+}

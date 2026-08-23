@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
@@ -5,6 +10,27 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
+    func testDirectProcessReturnsWhenDescendantRetainsOutputPipe() async throws {
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        let output = try await DirectProcess.run(
+            "/bin/sh",
+            arguments: ["-c", "sleep 5 & child=$!; printf '%s\\nready\\n' \"$child\""]
+        )
+        let lines = output.split(separator: "\n")
+        let childPID = try XCTUnwrap(lines.first.flatMap { Int32($0) })
+        defer {
+            _ = kill(childPID, SIGKILL)
+            #if os(Linux)
+                var status: Int32 = 0
+                while waitpid(childPID, &status, 0) < 0, errno == EINTR {}
+            #endif
+        }
+
+        XCTAssertEqual(lines.dropFirst().first, "ready")
+        XCTAssertLessThan(startedAt.duration(to: clock.now), .seconds(2))
+    }
+
     func testDirectHeadlessAgentLifecycleRequiresAdvertisedOperation() throws {
         let supportedOperations = [
             "agent_run": ["start", "poll", "wait", "cancel"],

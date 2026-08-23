@@ -71,7 +71,8 @@ jobs:
           path: |
             .build
             Packages/RepoPromptAgentProviders/.build
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+            Packages/RepoPromptPortableRuntime/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved', 'Packages/RepoPromptPortableRuntime/Package.swift', 'Packages/RepoPromptPortableRuntime/Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-swiftpm-
 
@@ -115,7 +116,7 @@ jobs:
           path: |
             .build
             Packages/RepoPromptAgentProviders/.build
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved', 'Packages/RepoPromptPortableRuntime/Package.swift', 'Packages/RepoPromptPortableRuntime/Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-swiftpm-
 

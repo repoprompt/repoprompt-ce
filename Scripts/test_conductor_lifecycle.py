@@ -2162,6 +2162,53 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(lanes, [])
         self.assertEqual(cwd, repo_root)
 
+    def test_portable_operations_use_nested_package_build_lane_and_heavy_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            registry = conductor.OperationRegistry(repo_root)
+            build_argv, build_lanes, build_cwd, _env, _timeout = registry.prepare(
+                {"operation": "portable-build", "args": {}}
+            )
+            test_argv, test_lanes, test_cwd, _env, _timeout = registry.prepare(
+                {
+                    "operation": "portable-test",
+                    "args": {"filter": "RuntimeModelTests", "testProduct": "RepoPromptRuntimeModelTests"},
+                }
+            )
+
+        portable_root = repo_root / "Packages" / "RepoPromptPortableRuntime"
+        self.assertEqual(build_argv, ["swift", "build", "--disable-automatic-resolution"])
+        self.assertEqual(build_lanes, ["build"])
+        self.assertEqual(build_cwd, portable_root)
+        self.assertEqual(
+            test_argv,
+            [
+                "swift", "test", "--disable-automatic-resolution",
+                "--test-product", "RepoPromptRuntimeModelTests",
+                "--filter", "RuntimeModelTests",
+            ],
+        )
+        self.assertEqual(test_lanes, ["build"])
+        self.assertEqual(test_cwd, portable_root)
+        self.assertTrue(conductor.operation_requires_global_heavy_slot("portable-build", {}))
+        self.assertTrue(conductor.operation_requires_global_heavy_slot("portable-test", {}))
+
+    def test_portable_test_cli_forwards_focus_options(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(
+                state.paths,
+                "portable-test",
+                ["--test-product", "RepoPromptRuntimeModelTests", "--filter", "RuntimeModelTests"],
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            enqueue.call_args.args[2],
+            {"filter": "RuntimeModelTests", "testProduct": "RepoPromptRuntimeModelTests"},
+        )
+
     def test_codex_schema_check_delegates_bounded_gate_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)

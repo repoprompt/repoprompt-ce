@@ -1,0 +1,109 @@
+name: Portable Runtime
+
+on:
+  pull_request:
+    paths:
+      - "Packages/RepoPromptPortableRuntime/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "Makefile"
+      - "Scripts/conductor.py"
+      - "Scripts/source_layout_guardrails.sh"
+      - "Scripts/validate_portable_dependency_graph.py"
+      - "Scripts/test_contribution_preflight.py"
+      - "Scripts/test_conductor_lifecycle.py"
+      - ".agents/skills/rpce-contribution-check/scripts/preflight.sh"
+      - "Sources/RepoPrompt/Features/AgentMode/Models/AgentWorkflow.swift"
+      - "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsDocument.swift"
+      - "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsManager.swift"
+      - "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentManageMCPToolService.swift"
+      - "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunSessionStore.swift"
+      - "docs/architecture/portable-runtime-semantic-owners.md"
+      - "docs/architecture/portable-runtime-prototype-extraction.md"
+      - ".github/workflows/portable-runtime.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Packages/RepoPromptPortableRuntime/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "Makefile"
+      - "Scripts/conductor.py"
+      - "Scripts/source_layout_guardrails.sh"
+      - "Scripts/validate_portable_dependency_graph.py"
+      - "Scripts/test_contribution_preflight.py"
+      - "Scripts/test_conductor_lifecycle.py"
+      - ".agents/skills/rpce-contribution-check/scripts/preflight.sh"
+      - "Sources/RepoPrompt/Features/AgentMode/Models/AgentWorkflow.swift"
+      - "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsDocument.swift"
+      - "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsManager.swift"
+      - "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentManageMCPToolService.swift"
+      - "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunSessionStore.swift"
+      - "docs/architecture/portable-runtime-semantic-owners.md"
+      - "docs/architecture/portable-runtime-prototype-extraction.md"
+      - ".github/workflows/portable-runtime.yml"
+
+concurrency:
+  group: portable-runtime-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Restore portable SwiftPM cache
+        uses: actions/cache@v6
+        with:
+          path: Packages/RepoPromptPortableRuntime/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-portable-${{ hashFiles('Packages/RepoPromptPortableRuntime/Package.swift', 'Packages/RepoPromptPortableRuntime/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-portable-
+
+      - name: Validate portable imports and exact dependency graph
+        run: Scripts/source_layout_guardrails.sh portable-imports
+
+      - name: Build portable package
+        working-directory: Packages/RepoPromptPortableRuntime
+        run: swift build --disable-automatic-resolution
+
+      - name: Test portable package
+        working-directory: Packages/RepoPromptPortableRuntime
+        run: swift test --disable-automatic-resolution
+
+  root-compatibility:
+    name: Root product compatibility
+    needs: package
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Restore root SwiftPM cache
+        uses: actions/cache@v6
+        with:
+          path: .build
+          key: ${{ runner.os }}-${{ runner.arch }}-root-portable-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptPortableRuntime/Package.swift', 'Packages/RepoPromptPortableRuntime/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-root-portable-
+
+      - name: Build RepoPrompt root product
+        run: swift build --product RepoPrompt --disable-automatic-resolution
+
+      - name: Build public MCP root product
+        run: swift build --product repoprompt-mcp --disable-automatic-resolution

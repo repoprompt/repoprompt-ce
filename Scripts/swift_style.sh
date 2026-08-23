@@ -29,8 +29,10 @@ STYLE_PATHS=(
     "Sources/RepoPrompt"
     "Sources/RepoPromptExecutable"
     "Sources/RepoPromptMCP"
-    "Sources/RepoPromptShared"
     "Tests/RepoPromptTests"
+    "Packages/RepoPromptPortableRuntime/Package.swift"
+    "Packages/RepoPromptPortableRuntime/Sources"
+    "Packages/RepoPromptPortableRuntime/Tests"
     "Packages/RepoPromptAgentProviders/Package.swift"
     "Packages/RepoPromptAgentProviders/Sources"
     "Packages/RepoPromptAgentProviders/Tests"
@@ -39,19 +41,28 @@ STYLE_PATHS=(
 EXCLUDED_SWIFT_PREFIXES=(
     "Sources/RepoPrompt/ThirdParty/SwiftPCRE2/"
     "Packages/RepoPromptAgentProviders/.build/"
+    "Packages/RepoPromptPortableRuntime/.build/"
+    # Preserve the formatting baseline of modules moved byte-for-byte into the
+    # portable package. New runtime/model/API modules remain in the format scope.
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptCodeMapCore/"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptDomainRuntime/"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptRegexCore/"
+    "Packages/RepoPromptPortableRuntime/Tests/RepoPromptCodeMapCoreTests/"
+    "Packages/RepoPromptPortableRuntime/Tests/RepoPromptDomainRuntimeTests/"
+    "Packages/RepoPromptPortableRuntime/Tests/RepoPromptRegexCoreTests/"
 )
 
 EXCLUDED_SWIFT_FILES=(
-    "Sources/RepoPromptShared/Workflows/WorkflowPromptSharedFragments.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Build.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+DeepPlan.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Investigate.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Optimize.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+OracleExport.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Orchestrate.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Refactor.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Reminder.swift"
-    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Review.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPromptSharedFragments.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+Build.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+DeepPlan.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+Investigate.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+Optimize.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+OracleExport.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+Orchestrate.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+Refactor.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+Reminder.swift"
+    "Packages/RepoPromptPortableRuntime/Sources/RepoPromptShared/Workflows/WorkflowPrompt+Review.swift"
 )
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }

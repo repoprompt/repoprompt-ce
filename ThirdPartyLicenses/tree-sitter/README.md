@@ -33,16 +33,16 @@ The JavaScript and Python package manifests list `scanner.c` conditionally, but
 their manifest-time `FileManager` source probes evaluate false in this root
 package graph. A clean coordinated link without the shim fails on their
 external-scanner ABI symbols. RepoPrompt CE therefore retains a narrow internal
-`Sources/TreeSitterScannerSupport` C target with byte-for-byte copies of only
+`Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport` C target with byte-for-byte copies of only
 the missing scanner implementations and required helper headers.
 
 | CE source path | Exact upstream snapshot source | Applicable license copy |
 | --- | --- | --- |
-| `Sources/TreeSitterScannerSupport/src/javascript/scanner.c` | `tree-sitter-javascript/src/scanner.c` at `44c892e0be055ac465d5eeddae6d3e194424e7de` | [`LICENSE-tree-sitter-max-brunsfeld-2014.txt`](LICENSE-tree-sitter-max-brunsfeld-2014.txt) |
-| `Sources/TreeSitterScannerSupport/src/python/scanner.c` | `tree-sitter-python/src/scanner.c` at `293fdc02038ee2bf0e2e206711b69c90ac0d413f` | [`LICENSE-tree-sitter-python.txt`](LICENSE-tree-sitter-python.txt) |
-| `Sources/TreeSitterScannerSupport/include/tree_sitter/parser.h` | Byte-identical in both exact snapshots above | Same grammar license copies above |
-| `Sources/TreeSitterScannerSupport/include/tree_sitter/array.h` | `tree-sitter-python/src/tree_sitter/array.h` at `293fdc02038ee2bf0e2e206711b69c90ac0d413f` | [`LICENSE-tree-sitter-python.txt`](LICENSE-tree-sitter-python.txt) |
-| `Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h` | `tree-sitter-python/src/tree_sitter/alloc.h` at `293fdc02038ee2bf0e2e206711b69c90ac0d413f` | [`LICENSE-tree-sitter-python.txt`](LICENSE-tree-sitter-python.txt) |
+| `Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/src/javascript/scanner.c` | `tree-sitter-javascript/src/scanner.c` at `44c892e0be055ac465d5eeddae6d3e194424e7de` | [`LICENSE-tree-sitter-max-brunsfeld-2014.txt`](LICENSE-tree-sitter-max-brunsfeld-2014.txt) |
+| `Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/src/python/scanner.c` | `tree-sitter-python/src/scanner.c` at `293fdc02038ee2bf0e2e206711b69c90ac0d413f` | [`LICENSE-tree-sitter-python.txt`](LICENSE-tree-sitter-python.txt) |
+| `Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/parser.h` | Byte-identical in both exact snapshots above | Same grammar license copies above |
+| `Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/array.h` | `tree-sitter-python/src/tree_sitter/array.h` at `293fdc02038ee2bf0e2e206711b69c90ac0d413f` | [`LICENSE-tree-sitter-python.txt`](LICENSE-tree-sitter-python.txt) |
+| `Packages/RepoPromptPortableRuntime/Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h` | `tree-sitter-python/src/tree_sitter/alloc.h` at `293fdc02038ee2bf0e2e206711b69c90ac0d413f` | [`LICENSE-tree-sitter-python.txt`](LICENSE-tree-sitter-python.txt) |
 
 [`scanner-support.sha256`](scanner-support.sha256) records the copied-file
 checksums. Remove this compatibility target, its checksum file, guardrails, and
