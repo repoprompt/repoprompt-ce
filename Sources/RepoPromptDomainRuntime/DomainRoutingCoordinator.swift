@@ -87,6 +87,10 @@ package struct DomainRunLaunchToken {
 
 package struct DomainRunLaunchReservationRequest {
     package let runID: UUID
+    package let launchID: UUID
+    package let oracleGroupID: OracleGroupID?
+    package let oracleLaneID: OracleLaneID?
+    package let oracleGroupClaimID: UUID?
     package let context: DomainContextIdentity
     package let expectedContextRevision: UInt64
     package let windowID: Int?
@@ -100,6 +104,10 @@ package struct DomainRunLaunchReservationRequest {
 
     package init(
         runID: UUID,
+        launchID: UUID = UUID(),
+        oracleGroupID: OracleGroupID? = nil,
+        oracleLaneID: OracleLaneID? = nil,
+        oracleGroupClaimID: UUID? = nil,
         context: DomainContextIdentity,
         expectedContextRevision: UInt64,
         windowID: Int?,
@@ -112,6 +120,10 @@ package struct DomainRunLaunchReservationRequest {
         lifetime: Duration = .seconds(60)
     ) {
         self.runID = runID
+        self.launchID = launchID
+        self.oracleGroupID = oracleGroupID
+        self.oracleLaneID = oracleLaneID
+        self.oracleGroupClaimID = oracleGroupClaimID
         self.context = context
         self.expectedContextRevision = expectedContextRevision
         self.windowID = windowID
@@ -127,15 +139,27 @@ package struct DomainRunLaunchReservationRequest {
 
 package struct DomainRunLaunchRedemption: Equatable, Sendable {
     package let binding: DomainConnectionBindingSnapshot
+    package let launchID: UUID
+    package let oracleGroupID: OracleGroupID?
+    package let oracleLaneID: OracleLaneID?
+    package let oracleGroupClaimID: UUID?
     package let restrictedTools: Set<String>
     package let additionalTools: Set<String>
 
     package init(
         binding: DomainConnectionBindingSnapshot,
+        launchID: UUID,
+        oracleGroupID: OracleGroupID? = nil,
+        oracleLaneID: OracleLaneID? = nil,
+        oracleGroupClaimID: UUID? = nil,
         restrictedTools: Set<String>,
         additionalTools: Set<String>
     ) {
         self.binding = binding
+        self.launchID = launchID
+        self.oracleGroupID = oracleGroupID
+        self.oracleLaneID = oracleLaneID
+        self.oracleGroupClaimID = oracleGroupClaimID
         self.restrictedTools = restrictedTools
         self.additionalTools = additionalTools
     }
@@ -155,6 +179,8 @@ package enum DomainRunLaunchTokenError: Error, Equatable {
     case runtimeStopped
     case contextUnavailable
     case staleContextRevision(expected: UInt64, actual: UInt64)
+    case runContextConflict
+    case incompleteOracleIdentity
     case randomGenerationFailed
 }
 
@@ -188,6 +214,7 @@ package actor DomainRoutingCoordinator {
     private var connections: [UUID: DomainConnectionBindingSnapshot] = [:]
     private var nextConnectionGeneration: [UUID: UInt64] = [:]
     private var pendingRunContexts: [UUID: DomainContextIdentity] = [:]
+    private var pendingLaunchCountsByRunID: [UUID: Int] = [:]
     private var tokenRecords: [String: TokenRecord] = [:]
     private var tokenDigestsByID: [UUID: String] = [:]
     private var tokenIssueOrder: [String] = []
@@ -495,6 +522,14 @@ package actor DomainRoutingCoordinator {
         _ request: DomainRunLaunchReservationRequest
     ) async throws -> DomainRunLaunchToken {
         guard !isStopped else { throw DomainRunLaunchTokenError.runtimeStopped }
+        let oracleIdentityCount = [
+            request.oracleGroupID != nil,
+            request.oracleLaneID != nil,
+            request.oracleGroupClaimID != nil,
+        ].count(where: { $0 })
+        guard oracleIdentityCount == 0 || oracleIdentityCount == 3 else {
+            throw DomainRunLaunchTokenError.incompleteOracleIdentity
+        }
         guard let context = await contextStore.snapshot(request.context) else {
             throw DomainRunLaunchTokenError.contextUnavailable
         }
@@ -505,6 +540,13 @@ package actor DomainRoutingCoordinator {
                 actual: context.revisions.workingRevision
             )
         }
+        let now = clock.now
+        sweepExpiredTokens(now: now)
+        if pendingLaunchCountsByRunID[request.runID, default: 0] > 0,
+           pendingRunContexts[request.runID] != request.context
+        {
+            throw DomainRunLaunchTokenError.runContextConflict
+        }
         var bytes = [UInt8](repeating: 0, count: 32)
         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
             throw DomainRunLaunchTokenError.randomGenerationFailed
@@ -514,9 +556,7 @@ package actor DomainRoutingCoordinator {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
         let digest = DomainContentDigest.sha256(Data(material.utf8))
-        let now = clock.now
         let tokenID = UUID()
-        sweepExpiredTokens(now: now)
         tokenRecords[digest] = TokenRecord(
             tokenID: tokenID,
             digest: digest,
@@ -529,6 +569,7 @@ package actor DomainRoutingCoordinator {
         tokenIssueOrder.append(digest)
         enforceTokenCapacity()
         pendingRunContexts[request.runID] = request.context
+        pendingLaunchCountsByRunID[request.runID, default: 0] += 1
         revision &+= 1
         metrics.record(DomainRuntimeMetric(
             phase: .backend,
@@ -537,7 +578,9 @@ package actor DomainRoutingCoordinator {
                 "runtime_id": identity.runtimeID.uuidString,
                 "runtime_generation": "\(identity.lifecycleGeneration)",
                 "routing_revision": "\(revision)",
-                "run_id": request.runID.uuidString
+                "run_id": request.runID.uuidString,
+                "launch_id": request.launchID.uuidString,
+                "oracle_lane": request.oracleLaneID.map { "\($0.index)" } ?? "none"
             ]
         ))
         return DomainRunLaunchToken(tokenID: tokenID, material: material)
@@ -564,7 +607,7 @@ package actor DomainRoutingCoordinator {
         }
         guard clock.now < record.expiresAt else {
             record.state = .revoked
-            pendingRunContexts.removeValue(forKey: record.request.runID)
+            releasePendingLaunch(for: record.request.runID)
             tokenRecords[digest] = record
             return .expired
         }
@@ -595,10 +638,14 @@ package actor DomainRoutingCoordinator {
         connections[connectionID] = binding
         record.state = .consumed
         tokenRecords[digest] = record
-        pendingRunContexts.removeValue(forKey: record.request.runID)
+        releasePendingLaunch(for: record.request.runID)
         revision &+= 1
         return .accepted(DomainRunLaunchRedemption(
             binding: binding,
+            launchID: record.request.launchID,
+            oracleGroupID: record.request.oracleGroupID,
+            oracleLaneID: record.request.oracleLaneID,
+            oracleGroupClaimID: record.request.oracleGroupClaimID,
             restrictedTools: record.request.restrictedTools,
             additionalTools: record.request.additionalTools
         ))
@@ -606,9 +653,9 @@ package actor DomainRoutingCoordinator {
 
     package func revokeLaunchToken(_ tokenID: UUID) {
         guard !isStopped else { return }
-        if let digest = tokenDigestsByID[tokenID], var record = tokenRecords[digest] {
+        if let digest = tokenDigestsByID[tokenID], var record = tokenRecords[digest], record.state == .active {
             record.state = .revoked
-            pendingRunContexts.removeValue(forKey: record.request.runID)
+            releasePendingLaunch(for: record.request.runID)
             tokenRecords[digest] = record
         }
         revision &+= 1
@@ -620,7 +667,7 @@ package actor DomainRoutingCoordinator {
         guard !tokenRecords.isEmpty else { return }
         for (digest, record) in tokenRecords where now >= record.expiresAt {
             if record.state == .active {
-                pendingRunContexts.removeValue(forKey: record.request.runID)
+                releasePendingLaunch(for: record.request.runID)
             }
             removeTokenRecord(digest: digest)
         }
@@ -633,7 +680,7 @@ package actor DomainRoutingCoordinator {
             tokenIssueOrderHead += 1
             guard let record = tokenRecords[digest] else { continue }
             if record.state == .active {
-                pendingRunContexts.removeValue(forKey: record.request.runID)
+                releasePendingLaunch(for: record.request.runID)
             }
             removeTokenRecord(digest: digest)
         }
@@ -656,6 +703,16 @@ package actor DomainRoutingCoordinator {
         (tokenRecords.count, tokenIssueOrder.count, pendingRunContexts.count)
     }
 
+    private func releasePendingLaunch(for runID: UUID) {
+        guard let count = pendingLaunchCountsByRunID[runID] else { return }
+        if count <= 1 {
+            pendingLaunchCountsByRunID.removeValue(forKey: runID)
+            pendingRunContexts.removeValue(forKey: runID)
+        } else {
+            pendingLaunchCountsByRunID[runID] = count - 1
+        }
+    }
+
     private func removeTokenRecord(digest: String) {
         guard let record = tokenRecords.removeValue(forKey: digest) else { return }
         tokenDigestsByID.removeValue(forKey: record.tokenID)
@@ -671,6 +728,7 @@ package actor DomainRoutingCoordinator {
             }
         }
         pendingRunContexts.removeAll()
+        pendingLaunchCountsByRunID.removeAll()
         windows.removeAll()
         connections.removeAll()
         revision &+= 1

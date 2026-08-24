@@ -20,6 +20,11 @@ extension OracleViewModel {
         let chatPresetID: UUID? // The chat preset to use for this mode (always resolved now)
     }
 
+    enum OracleSendActivationPolicy: Equatable {
+        case foregroundWhenActive
+        case background
+    }
+
     enum OracleSendPackagingProvenance: Equatable {
         case direct
         case delegated(delegationID: UUID)
@@ -37,6 +42,7 @@ extension OracleViewModel {
         let selection: StoredSelection
         let lookupContext: WorkspaceLookupContext?
         let reviewGitContext: FrozenPromptGitReviewContext
+        let prebuiltAIMessage: AIMessage?
         let provenance: OracleSendPackagingProvenance
 
         init(
@@ -49,6 +55,7 @@ extension OracleViewModel {
             selection: StoredSelection,
             lookupContext: WorkspaceLookupContext?,
             reviewGitContext: FrozenPromptGitReviewContext,
+            prebuiltAIMessage: AIMessage? = nil,
             provenance: OracleSendPackagingProvenance
         ) {
             self.sourceTabID = sourceTabID
@@ -60,6 +67,7 @@ extension OracleViewModel {
             self.selection = selection
             self.lookupContext = lookupContext
             self.reviewGitContext = reviewGitContext
+            self.prebuiltAIMessage = prebuiltAIMessage
             self.provenance = provenance
         }
 
@@ -119,6 +127,7 @@ extension OracleViewModel {
         let origin: OracleSendOrigin
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
+        let activationPolicy: OracleSendActivationPolicy
         let packaging: OracleSendPackagingContext
 
         init(
@@ -127,6 +136,7 @@ extension OracleViewModel {
             origin: OracleSendOrigin = .compatibility,
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil,
+            activationPolicy: OracleSendActivationPolicy = .foregroundWhenActive,
             packaging: OracleSendPackagingContext
         ) {
             self.tabID = tabID
@@ -134,6 +144,7 @@ extension OracleViewModel {
             self.origin = origin
             self.agentModeSessionID = agentModeSessionID
             self.agentModeRunID = agentModeRunID
+            self.activationPolicy = activationPolicy
             self.packaging = packaging
         }
     }
@@ -909,6 +920,76 @@ extension OracleViewModel {
         }
     }
 
+    @MainActor
+    func shouldActivateOracleSendSession(
+        tabContext: OracleSendTabContext?,
+        promptVM: PromptViewModel
+    ) -> Bool {
+        guard let tabContext else { return true }
+        let isFocusedTab = (promptVM.activeComposeTabID == tabContext.tabID) &&
+            tabContext.activationPolicy == .foregroundWhenActive
+        let activeSessionID = workspaceManager.activeChatSessionID(forTabID: tabContext.tabID)
+            ?? currentSessionID.flatMap { currentID in
+                sessions.first(where: { $0.id == currentID && $0.composeTabID == tabContext.tabID })?.id
+            }
+        return isFocusedTab && !isSessionStreaming(activeSessionID)
+    }
+
+    @MainActor
+    func resolveImplicitOracleContinuationCandidate(
+        tabID: UUID? = nil,
+        activateInUI: Bool,
+        agentModeSessionID: UUID? = nil,
+        agentModeRunID: UUID? = nil
+    ) -> ChatSession? {
+        let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
+
+        func eligible(_ session: ChatSession, allowUnownedLegacy: Bool = true) -> Bool {
+            Self.sessionBelongsToResolvedTab(session, tabID: resolvedTabID) &&
+                Self.sessionMatchesOracleOwner(
+                    session,
+                    agentModeSessionID: agentModeSessionID,
+                    agentModeRunID: agentModeRunID,
+                    allowUnownedLegacy: allowUnownedLegacy
+                )
+        }
+
+        let hasOwner = agentModeSessionID != nil || agentModeRunID != nil
+        let scopedSessions: [ChatSession]
+        let activeForTab: UUID?
+        if let resolvedTabID {
+            scopedSessions = sessions(forTabID: resolvedTabID)
+            activeForTab = workspaceManager.activeChatSessionID(forTabID: resolvedTabID)
+        } else {
+            scopedSessions = sessions
+            activeForTab = nil
+        }
+
+        let candidates: [ChatSession] = if hasOwner {
+            Self.strongestOracleOwnerBucket(
+                scopedSessions.filter { Self.sessionBelongsToResolvedTab($0, tabID: resolvedTabID) },
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID,
+                allowUnownedLegacy: false
+            )
+        } else {
+            scopedSessions.filter { eligible($0) }
+        }
+
+        if let activeForTab,
+           let activeCandidate = candidates.first(where: { $0.id == activeForTab })
+        {
+            return activeCandidate
+        }
+        if activateInUI,
+           let currentSessionID,
+           let currentCandidate = candidates.first(where: { $0.id == currentSessionID })
+        {
+            return currentCandidate
+        }
+        return candidates.max(by: { $0.savedAt < $1.savedAt })
+    }
+
     /// Ensure the requested chat exists (or create one) and make it active.
     /// Defaults to resuming the most recent chat scoped to the resolved tab/owner.
     @discardableResult
@@ -920,7 +1001,8 @@ extension OracleViewModel {
         tabID: UUID? = nil,
         activateInUI: Bool = true,
         agentModeSessionID: UUID? = nil,
-        agentModeRunID: UUID? = nil
+        agentModeRunID: UUID? = nil,
+        implicitSessionID: UUID? = nil
     ) async throws -> UUID {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
@@ -971,58 +1053,22 @@ extension OracleViewModel {
             return existing.id
         }
 
-        func eligible(_ session: ChatSession, allowUnownedLegacy: Bool = true) -> Bool {
-            Self.sessionBelongsToResolvedTab(session, tabID: resolvedTabID) &&
-                Self.sessionMatchesOracleOwner(
-                    session,
-                    agentModeSessionID: agentModeSessionID,
-                    agentModeRunID: agentModeRunID,
-                    allowUnownedLegacy: allowUnownedLegacy
-                )
+        let implicitCandidate: ChatSession?
+        if let implicitSessionID {
+            guard let selected = sessions.first(where: { $0.id == implicitSessionID }) else {
+                throw ChatToolError.invalidParams("The selected Oracle chat is no longer available")
+            }
+            implicitCandidate = selected
+        } else {
+            implicitCandidate = resolveImplicitOracleContinuationCandidate(
+                tabID: resolvedTabID,
+                activateInUI: activateInUI,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID
+            )
         }
 
-        let hasOwner = agentModeSessionID != nil || agentModeRunID != nil
-        func findCandidate(allowUnownedLegacy: Bool) -> ChatSession? {
-            let scopedSessions: [ChatSession]
-            let activeForTab: UUID?
-            if let resolvedTabID {
-                scopedSessions = sessions(forTabID: resolvedTabID)
-                activeForTab = workspaceManager.activeChatSessionID(forTabID: resolvedTabID)
-            } else {
-                scopedSessions = sessions
-                activeForTab = nil
-            }
-
-            let candidates: [ChatSession] = if hasOwner {
-                Self.strongestOracleOwnerBucket(
-                    scopedSessions.filter { Self.sessionBelongsToResolvedTab($0, tabID: resolvedTabID) },
-                    agentModeSessionID: agentModeSessionID,
-                    agentModeRunID: agentModeRunID,
-                    allowUnownedLegacy: allowUnownedLegacy
-                )
-            } else {
-                scopedSessions.filter { eligible($0, allowUnownedLegacy: allowUnownedLegacy) }
-            }
-
-            if let activeForTab,
-               let activeCandidate = candidates.first(where: { $0.id == activeForTab })
-            {
-                return activeCandidate
-            }
-            if activateInUI,
-               let currentSessionID,
-               let currentCandidate = candidates.first(where: { $0.id == currentSessionID })
-            {
-                return currentCandidate
-            }
-            return candidates.sorted(by: { $0.savedAt > $1.savedAt }).first
-        }
-
-        let candidate = hasOwner
-            ? findCandidate(allowUnownedLegacy: false)
-            : findCandidate(allowUnownedLegacy: true)
-
-        if let candidate {
+        if let candidate = implicitCandidate {
             await applyOracleOwnerIfNeeded(
                 sessionID: candidate.id,
                 tabID: resolvedTabID,
@@ -1055,7 +1101,10 @@ extension OracleViewModel {
     func tool_chatSend(
         args: [String: Value],
         promptVM: PromptViewModel,
-        tabContext: OracleSendTabContext? = nil
+        tabContext: OracleSendTabContext? = nil,
+        resolvedModel: AIModel? = nil,
+        implicitSessionID: UUID? = nil,
+        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws
         -> [String: Value]
     {
@@ -1103,12 +1152,21 @@ extension OracleViewModel {
         let presetsManager = ModelPresetsManager.shared
         let allPresets = presetsManager.allPresets()
 
-        let modelSelection = try await selectModel(
-            modelParam: modelParam,
-            mode: mode,
-            allPresets: allPresets,
-            promptVM: promptVM
-        )
+        let modelSelection: ModelSelectionResult = if let resolvedModel {
+            ModelSelectionResult(
+                model: resolvedModel,
+                mcpControlInfo: "Oracle group • \(resolvedModel.displayName)",
+                isAutoSelected: false,
+                chatPresetID: findBuiltInPreset(for: mode)?.id
+            )
+        } else {
+            try await selectModel(
+                modelParam: modelParam,
+                mode: mode,
+                allPresets: allPresets,
+                promptVM: promptVM
+            )
+        }
 
         let selectedModel = modelSelection.model
         let mcpControlledModel = modelSelection.mcpControlInfo
@@ -1128,18 +1186,7 @@ extension OracleViewModel {
 
         // ────────── 3. Resolve chat session ──────────
         let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
-        let shouldActivate: Bool
-        if let tabContext {
-            let isFocusedTab = (promptVM.activeComposeTabID == tabContext.tabID)
-            let activeSessionID = workspaceManager.activeChatSessionID(forTabID: tabContext.tabID)
-                ?? currentSessionID.flatMap { currentID in
-                    sessions.first(where: { $0.id == currentID && $0.composeTabID == tabContext.tabID })?.id
-                }
-            let isUserStreaming = isSessionStreaming(activeSessionID)
-            shouldActivate = isFocusedTab && !isUserStreaming
-        } else {
-            shouldActivate = true
-        }
+        let shouldActivate = shouldActivateOracleSendSession(tabContext: tabContext, promptVM: promptVM)
         let chatID = try await locateOrCreateChat(
             chatIdIn,
             desiredName: chatName,
@@ -1147,7 +1194,8 @@ extension OracleViewModel {
             tabID: tabID,
             activateInUI: shouldActivate,
             agentModeSessionID: tabContext?.agentModeSessionID,
-            agentModeRunID: tabContext?.agentModeRunID
+            agentModeRunID: tabContext?.agentModeRunID,
+            implicitSessionID: implicitSessionID
         )
         pinSession(chatID)
         defer { unpinSession(chatID) }
@@ -1182,7 +1230,9 @@ extension OracleViewModel {
                 gitBaseOverride: nil,
                 selectionOverride: selectionOverride,
                 lookupContextOverride: lookupContextOverride,
-                reviewGitContextOverride: reviewGitContextOverride
+                reviewGitContextOverride: reviewGitContextOverride,
+                overrideAIMessage: tabContext?.packaging.prebuiltAIMessage,
+                onProgress: onProgress
             )
         }
         let queryId: UUID?

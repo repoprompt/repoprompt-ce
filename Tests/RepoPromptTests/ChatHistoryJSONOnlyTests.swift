@@ -24,6 +24,34 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertEqual(loaded.messages[0].rawText, "assistant reply")
     }
 
+    func testOracleGroupProjectionMetadataRoundTripsAndRemainsOptionalForLegacySessions() throws {
+        let groupID = UUID()
+        let projection = ChatSession(
+            oracleGroupID: groupID,
+            oracleLaneIndex: 2,
+            oracleGroupSize: 4,
+            oracleModelRaw: "model-c",
+            name: "Grouped Oracle"
+        )
+
+        let decoded = try JSONDecoder().decode(
+            ChatSession.self,
+            from: JSONEncoder().encode(projection)
+        )
+        XCTAssertEqual(decoded.oracleGroupID, groupID)
+        XCTAssertEqual(decoded.oracleLaneIndex, 2)
+        XCTAssertEqual(decoded.oracleGroupSize, 4)
+        XCTAssertEqual(decoded.oracleModelRaw, "model-c")
+
+        let legacy = try JSONDecoder().decode(
+            ChatSession.self,
+            from: Data(#"{"id":"00000000-0000-0000-0000-000000000001","name":"Legacy","savedAt":0,"messages":[]}"#.utf8)
+        )
+        XCTAssertNil(legacy.oracleGroupID)
+        XCTAssertNil(legacy.oracleLaneIndex)
+        XCTAssertNil(legacy.oracleGroupSize)
+    }
+
     func testStoredMessageOmitsLegacyDelegateAndCombinedTextFields() throws {
         let original = StoredMessage(
             isUser: false,

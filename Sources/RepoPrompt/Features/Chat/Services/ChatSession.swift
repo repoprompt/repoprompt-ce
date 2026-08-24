@@ -26,6 +26,10 @@ struct ChatSession: Codable, Identifiable {
     var composeTabID: UUID?
     var agentModeSessionID: UUID?
     var agentModeRunID: UUID?
+    var oracleGroupID: UUID?
+    var oracleLaneIndex: Int?
+    var oracleGroupSize: Int?
+    var oracleModelRaw: String?
     var name: String
     var savedAt: Date
     var fileURL: URL?
@@ -58,6 +62,10 @@ struct ChatSession: Codable, Identifiable {
         composeTabID: UUID? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
+        oracleGroupID: UUID? = nil,
+        oracleLaneIndex: Int? = nil,
+        oracleGroupSize: Int? = nil,
+        oracleModelRaw: String? = nil,
         name: String = "Untitled",
         savedAt: Date = Date(),
         fileURL: URL? = nil,
@@ -75,6 +83,10 @@ struct ChatSession: Codable, Identifiable {
         self.composeTabID = composeTabID
         self.agentModeSessionID = agentModeSessionID
         self.agentModeRunID = agentModeRunID
+        self.oracleGroupID = oracleGroupID
+        self.oracleLaneIndex = oracleLaneIndex
+        self.oracleGroupSize = oracleGroupSize
+        self.oracleModelRaw = oracleModelRaw
         self.name = name
         self.savedAt = savedAt
         self.fileURL = fileURL
@@ -93,6 +105,10 @@ struct ChatSession: Codable, Identifiable {
         case composeTabID
         case agentModeSessionID
         case agentModeRunID
+        case oracleGroupID
+        case oracleLaneIndex
+        case oracleGroupSize
+        case oracleModelRaw
         case name
         case savedAt
         case fileURL
@@ -113,6 +129,10 @@ struct ChatSession: Codable, Identifiable {
         composeTabID = try container.decodeIfPresent(UUID.self, forKey: .composeTabID)
         agentModeSessionID = try container.decodeIfPresent(UUID.self, forKey: .agentModeSessionID)
         agentModeRunID = try container.decodeIfPresent(UUID.self, forKey: .agentModeRunID)
+        oracleGroupID = try container.decodeIfPresent(UUID.self, forKey: .oracleGroupID)
+        oracleLaneIndex = try container.decodeIfPresent(Int.self, forKey: .oracleLaneIndex)
+        oracleGroupSize = try container.decodeIfPresent(Int.self, forKey: .oracleGroupSize)
+        oracleModelRaw = try container.decodeIfPresent(String.self, forKey: .oracleModelRaw)
         name = try container.decode(String.self, forKey: .name)
         savedAt = try container.decode(Date.self, forKey: .savedAt)
         fileURL = try container.decodeIfPresent(URL.self, forKey: .fileURL)

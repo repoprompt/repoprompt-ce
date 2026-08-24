@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 extension Value {
     /// Decode this Value into a Decodable type by going through JSON.
@@ -2415,8 +2416,8 @@ extension ToolOutputFormatter {
             break
         }
 
-        // Build main section using our existing helper
-        let text = chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: "## Chat Send ✅")
+            ?? chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -2500,7 +2501,8 @@ extension ToolOutputFormatter {
             break
         }
 
-        let text = askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: "## Ask Oracle ✅")
+            ?? askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -4338,17 +4340,25 @@ extension ToolOutputFormatter {
                     "## Generated Response"
                 }
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                blocks.append(.text("\(separator)\(heading)\n"))
-                let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
-                blocks.append(contentsOf: planBlocks)
+                if let groupBlock = formatOracleGroup(value: planObj, heading: heading) {
+                    blocks.append(.text(separator + groupBlock))
+                } else {
+                    blocks.append(.text("\(separator)\(heading)\n"))
+                    let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
+                    blocks.append(contentsOf: planBlocks)
+                }
             }
 
             // If review was generated, format it using oracle_send formatter
             if let reviewObj = obj["review"], case .object = reviewObj {
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                blocks.append(.text("\(separator)## Code Review\n"))
-                let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
-                blocks.append(contentsOf: reviewBlocks)
+                if let groupBlock = formatOracleGroup(value: reviewObj, heading: "## Code Review") {
+                    blocks.append(.text(separator + groupBlock))
+                } else {
+                    blocks.append(.text("\(separator)## Code Review\n"))
+                    let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
+                    blocks.append(contentsOf: reviewBlocks)
+                }
             }
 
             // Follow-up hint
@@ -4370,6 +4380,62 @@ extension ToolOutputFormatter {
             return blocks
         }
         return formatGeneric(value: value)
+    }
+
+    private static func formatOracleGroup(
+        value: Value,
+        heading: String
+    ) -> String? {
+        guard let dto = value.decode(ToolResultDTOs.ChatSendDTO.self),
+              let count = dto.oracleCount,
+              let results = dto.oracleResults,
+              count == results.count,
+              count > 1
+        else { return nil }
+
+        let ordered = results.sorted { $0.laneIndex < $1.laneIndex }
+        guard ordered.enumerated().allSatisfy({ offset, lane in
+            lane.laneIndex == offset && lane.role == (offset == 0 ? "primary" : "additional")
+        }) else { return nil }
+
+        var lines = [heading]
+        if let status = dto.status {
+            lines.append("- Oracle group status: \(status)")
+        }
+        if let groupID = dto.oracleGroupID {
+            lines.append("- Oracle group: `\(groupID)`")
+        }
+        let payload = OracleLaneMarkdownPayload(lanes: ordered.map { lane in
+            let status: OracleLaneMarkdownPayload.Status = switch OracleLaneResultStatus(rawValue: lane.status) {
+            case .completed: .completed
+            case .failed, .cancelled: .failed
+            case nil: .unavailable
+            }
+            return OracleLaneMarkdownPayload.Lane(
+                laneIndex: lane.laneIndex,
+                chatID: lane.chatID,
+                providerID: lane.executionProfile?.providerID ?? lane.providerID,
+                modelID: lane.executionProfile?.modelID ?? lane.modelID,
+                effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
+                status: status,
+                response: lane.response,
+                partialResponse: lane.error?.partialResponse,
+                errorCode: lane.error?.code,
+                errorMessage: lane.error?.message
+            )
+        })
+        let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
+        if !laneMarkdown.isEmpty {
+            lines.append("")
+            lines.append(laneMarkdown)
+        }
+        if let warnings = dto.warnings {
+            for warning in warnings {
+                lines.append("")
+                lines.append("Warning [\(warning.code)]: \(warning.message)")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     static func formatFileAction(value: Value) -> [MCP.Tool.Content] {

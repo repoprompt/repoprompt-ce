@@ -1,11 +1,41 @@
 import Foundation
+import MCP
 
 package enum DomainSettingValue: Codable, Equatable, Sendable {
     case bool(Bool)
     case integer(Int)
     case number(Double)
     case string(String)
+    case stringArray([String])
     case null
+
+    package init?(mcpValue: Value) {
+        switch mcpValue {
+        case let .bool(value): self = .bool(value)
+        case let .int(value): self = .integer(value)
+        case let .double(value): self = .number(value)
+        case let .string(value): self = .string(value)
+        case let .array(values):
+            guard values.allSatisfy({ if case .string = $0 { true } else { false } }) else { return nil }
+            self = .stringArray(values.compactMap { value in
+                guard case let .string(string) = value else { return nil }
+                return string
+            })
+        case .null: self = .null
+        default: return nil
+        }
+    }
+
+    package var mcpValue: Value {
+        switch self {
+        case let .bool(value): .bool(value)
+        case let .integer(value): .int(value)
+        case let .number(value): .double(value)
+        case let .string(value): .string(value)
+        case let .stringArray(values): .array(values.map(Value.string))
+        case .null: .null
+        }
+    }
 }
 
 package enum DomainSettingValueKind: String, Codable, Sendable {
@@ -13,6 +43,7 @@ package enum DomainSettingValueKind: String, Codable, Sendable {
     case integer
     case number
     case string
+    case stringArray = "string[]"
 }
 
 package struct DomainSettingDescriptor: Codable, Equatable, Sendable {
@@ -23,6 +54,9 @@ package struct DomainSettingDescriptor: Codable, Equatable, Sendable {
     package let description: String
     package let allowedValues: [DomainSettingValue]?
     package let optionsAvailable: Bool
+    package let allowsNull: Bool
+    package let maximumArrayCount: Int?
+    package let maximumStringLength: Int?
 
     package init(
         key: String,
@@ -31,7 +65,10 @@ package struct DomainSettingDescriptor: Codable, Equatable, Sendable {
         defaultValue: DomainSettingValue,
         description: String,
         allowedValues: [DomainSettingValue]? = nil,
-        optionsAvailable: Bool = false
+        optionsAvailable: Bool = false,
+        allowsNull: Bool? = nil,
+        maximumArrayCount: Int? = nil,
+        maximumStringLength: Int? = nil
     ) {
         self.key = key
         self.group = group
@@ -40,6 +77,9 @@ package struct DomainSettingDescriptor: Codable, Equatable, Sendable {
         self.description = description
         self.allowedValues = allowedValues
         self.optionsAvailable = optionsAvailable || allowedValues != nil
+        self.allowsNull = allowsNull ?? self.optionsAvailable
+        self.maximumArrayCount = maximumArrayCount
+        self.maximumStringLength = maximumStringLength
     }
 }
 
@@ -60,7 +100,8 @@ package enum DomainAppSettingsCatalog {
         enumString("prompt_packaging.selected_files_sort_method", "prompt_packaging", "nameAscending", ["nameAscending", "nameDescending", "tokenAscending", "tokenDescending"], "Sort method for selected files."),
         bool("prompt_packaging.include_datetime_in_user_instructions", "prompt_packaging", false, "Whether packaged user instructions include the current date/time."),
         model("models.preferred_compose_model", "Preferred Built-in Chat model raw identifier, if set."),
-        model("models.planning_model", "Preferred Oracle model raw identifier, if set."),
+        OracleRosterSettingsDescriptor.primary,
+        OracleRosterSettingsDescriptor.additional,
         bool("models.sync_chat_model_with_oracle", "models", false, "Whether the Built-in Chat model is kept in sync with the Oracle model."),
         DomainSettingDescriptor(key: "models.temperature", group: "models", valueKind: .number, defaultValue: .number(1), description: "Global default model temperature."),
         bool("models.temperature_enabled", "models", false, "Whether the global temperature is sent with model requests."),
@@ -92,26 +133,72 @@ package enum DomainAppSettingsCatalog {
     }
 
     package static func validate(_ value: DomainSettingValue, for descriptor: DomainSettingDescriptor) throws {
+        _ = try normalize(value, for: descriptor)
+    }
+
+    package static func normalize(
+        _ value: DomainSettingValue,
+        for descriptor: DomainSettingDescriptor
+    ) throws -> DomainSettingValue {
         if case .null = value {
-            guard descriptor.optionsAvailable else { throw DomainDirectSettingsError.invalidValue(descriptor.key) }
-            return
+            guard descriptor.allowsNull else { throw DomainDirectSettingsError.invalidValue(descriptor.key) }
+            return .null
         }
         let kindMatches = switch (descriptor.valueKind, value) {
-        case (.boolean, .bool), (.integer, .integer), (.number, .number), (.number, .integer), (.string, .string): true
+        case (.boolean, .bool), (.integer, .integer), (.number, .number), (.number, .integer),
+             (.string, .string), (.stringArray, .stringArray): true
         default: false
         }
         guard kindMatches else { throw DomainDirectSettingsError.invalidValue(descriptor.key) }
-        if let allowed = descriptor.allowedValues, !allowed.contains(value) {
+
+        let normalized: DomainSettingValue
+        switch value {
+        case let .string(value):
+            if descriptor.maximumStringLength != nil {
+                normalized = .string(
+                    try normalizeString(value, descriptor: descriptor, rejectsEmpty: true)
+                )
+            } else {
+                normalized = .string(value)
+            }
+        case let .stringArray(values):
+            if let maximum = descriptor.maximumArrayCount, values.count > maximum {
+                throw DomainDirectSettingsError.invalidValue(descriptor.key)
+            }
+            normalized = .stringArray(
+                try values.map { try normalizeString($0, descriptor: descriptor, rejectsEmpty: true) }
+            )
+        default:
+            normalized = value
+        }
+
+        if let allowed = descriptor.allowedValues, !allowed.contains(normalized) {
             throw DomainDirectSettingsError.invalidValue(descriptor.key)
         }
         if descriptor.key == "models.temperature" {
-            let number: Double = switch value {
+            let number: Double = switch normalized {
             case let .number(value): value
             case let .integer(value): Double(value)
             default: -1
             }
             guard (0 ... 2).contains(number) else { throw DomainDirectSettingsError.invalidValue(descriptor.key) }
         }
+        return normalized
+    }
+
+    private static func normalizeString(
+        _ value: String,
+        descriptor: DomainSettingDescriptor,
+        rejectsEmpty: Bool = false
+    ) throws -> String {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if rejectsEmpty, normalized.isEmpty {
+            throw DomainDirectSettingsError.invalidValue(descriptor.key)
+        }
+        if let maximum = descriptor.maximumStringLength, normalized.count > maximum {
+            throw DomainDirectSettingsError.invalidValue(descriptor.key)
+        }
+        return normalized
     }
 
     private static func bool(_ key: String, _ group: String, _ value: Bool, _ description: String) -> DomainSettingDescriptor {
@@ -123,7 +210,15 @@ package enum DomainAppSettingsCatalog {
     }
 
     private static func model(_ key: String, _ description: String) -> DomainSettingDescriptor {
-        DomainSettingDescriptor(key: key, group: key.hasPrefix("context_builder") ? "context_builder" : "models", valueKind: .string, defaultValue: .null, description: description, optionsAvailable: true)
+        DomainSettingDescriptor(
+            key: key,
+            group: key.hasPrefix("context_builder") ? "context_builder" : "models",
+            valueKind: .string,
+            defaultValue: .null,
+            description: description,
+            optionsAvailable: true,
+            maximumStringLength: OracleRosterContract.maximumModelIdentifierLength
+        )
     }
 }
 
@@ -152,7 +247,7 @@ package enum DomainDirectSettingsError: Error, LocalizedError, Equatable, Sendab
 }
 
 private struct DomainDirectSettingsDocument: Codable, Sendable {
-    static let version = 1
+    static let version = 2
     let version: Int
     let profileIdentifier: String
     let revision: UInt64
@@ -204,11 +299,18 @@ package actor DomainDirectSettingsStore {
                 let document = try JSONDecoder().decode(DomainDirectSettingsDocument.self, from: data)
                 guard document.version <= DomainDirectSettingsDocument.version else { throw DomainDirectSettingsError.futureDocument }
                 guard document.profileIdentifier == profileIdentifier else { throw DomainDirectSettingsError.wrongProfile }
+                var loadedValues: [String: DomainSettingValue] = [:]
                 for (key, value) in document.values {
                     guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else { continue }
-                    try DomainAppSettingsCatalog.validate(value, for: descriptor)
-                    values[key] = value
+                    if key == OracleRosterContract.additionalSettingKey,
+                       case let .stringArray(raws) = value
+                    {
+                        loadedValues[key] = .stringArray(OracleRosterContract.sanitizedAdditionalModelIDs(raws))
+                    } else {
+                        loadedValues[key] = try DomainAppSettingsCatalog.normalize(value, for: descriptor)
+                    }
                 }
+                values = loadedValues
                 revision = document.revision
             }
         } catch let error as DomainDirectSettingsError {
@@ -232,13 +334,14 @@ package actor DomainDirectSettingsStore {
     }
 
     package func set(key: String, value: DomainSettingValue) async throws -> UInt64 {
+        await bootstrap()
         if let healthReason { throw DomainDirectSettingsError.readOnlyDegraded(healthReason) }
         guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else {
             throw DomainDirectSettingsError.unknownKey(key)
         }
-        try DomainAppSettingsCatalog.validate(value, for: descriptor)
+        let normalized = try DomainAppSettingsCatalog.normalize(value, for: descriptor)
         var next = values
-        if case .null = value { next.removeValue(forKey: key) } else { next[key] = value }
+        if case .null = normalized { next.removeValue(forKey: key) } else { next[key] = normalized }
         let nextRevision = revision &+ 1
         let document = DomainDirectSettingsDocument(
             version: DomainDirectSettingsDocument.version,

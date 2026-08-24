@@ -1,3 +1,5 @@
+import RepoPromptDomainRuntime
+import RepoPromptShared
 import SwiftUI
 
 struct ContextBuilderCallCard: View {
@@ -43,7 +45,7 @@ struct ContextBuilderCallCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
+        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, dto: nil)
     }
 
     private var summary: String {
@@ -188,7 +190,7 @@ struct ContextBuilderResultCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
+        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, dto: dto)
     }
 
     private var summary: String {
@@ -205,17 +207,21 @@ struct ContextBuilderResultCard: View {
     private var status: ToolCardStatus {
         if phase == .running || phase == .generatingPlan { return .running }
         if item.toolIsError == true { return .failure }
+
         if let dto {
             switch dto.status?.lowercased() {
             case "error": return .failure
             case "partial", "warning": return .warning
-            case "running", "in_progress", "pending":
+            case "running", "in_progress", "pending", "success", "completed":
                 return .success
-            case "success", "completed": return .success
             default: break
             }
         }
-        return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
+        return ToolResultStatusResolver.resolve(
+            toolIsError: item.toolIsError,
+            raw: item.toolResultJSON,
+            fallback: .neutral
+        )
     }
 
     private var isExpandable: Bool {
@@ -496,6 +502,10 @@ private struct ContextBuilderCompletedSummaryView: View {
         return selection
     }
 
+    private var oracleLanes: [ContextBuilderOracleLaneSummary] {
+        contextBuilderOracleLaneSummaries(for: dto)
+    }
+
     private func openOraclePreview() {
         guard let userInfo = contextBuilderOraclePopoverUserInfo(
             openContext: oracleOpenContext,
@@ -523,7 +533,9 @@ private struct ContextBuilderCompletedSummaryView: View {
                     .lineLimit(3)
             }
 
-            if let followUpChatID, !followUpChatID.isEmpty {
+            if !oracleLanes.isEmpty {
+                ContextBuilderOracleLaneRows(lanes: oracleLanes)
+            } else if let followUpChatID, !followUpChatID.isEmpty {
                 Text("Oracle chat: \(followUpChatID)")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
@@ -557,10 +569,77 @@ func contextBuilderOraclePopoverUserInfo(
     )
 }
 
+struct ContextBuilderOracleLaneSummary: Equatable {
+    let laneIndex: Int
+    let label: String
+    let chatID: String?
+    let modelID: String
+    let effectiveReasoningEffort: String?
+    let status: String
+}
+
+private struct ContextBuilderOracleLaneRows: View {
+    let lanes: [ContextBuilderOracleLaneSummary]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(lanes, id: \.laneIndex) { lane in
+                let effortSuffix = lane.effectiveReasoningEffort.map { " • effort \($0)" } ?? ""
+                let chatSuffix = lane.chatID.map { " • \($0)" } ?? ""
+                Text("\(lane.label): \(lane.status) • \(lane.modelID)\(effortSuffix)\(chatSuffix)")
+                    .font(.system(size: 10, weight: lane.laneIndex == 0 ? .medium : .regular))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(
+                        "\(lane.label), \(lane.status), model \(lane.modelID)"
+                            + (lane.effectiveReasoningEffort.map { ", effort \($0)" } ?? "")
+                            + (lane.chatID.map { ", chat \($0)" } ?? "")
+                    )
+            }
+        }
+    }
+}
+
+func contextBuilderOracleLaneSummaries(
+    for dto: ToolResultDTOs.ContextBuilderDTO?
+) -> [ContextBuilderOracleLaneSummary] {
+    guard let dto,
+          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
+    else { return [] }
+    let reply = switch branch {
+    case .review: dto.review
+    case .plan: dto.plan
+    }
+    guard let results = reply?.oracleResults,
+          reply?.oracleCount == results.count,
+          results.count > 1
+    else { return [] }
+
+    let ordered = results.sorted { $0.laneIndex < $1.laneIndex }
+    guard ordered.enumerated().allSatisfy({ offset, lane in
+        lane.laneIndex == offset && lane.role == (offset == 0 ? "primary" : "additional")
+    }) else { return [] }
+
+    return ordered.map { lane in
+        ContextBuilderOracleLaneSummary(
+            laneIndex: lane.laneIndex,
+            label: OracleRosterContract.displayLabel(laneIndex: lane.laneIndex),
+            chatID: lane.chatID,
+            modelID: lane.executionProfile?.modelID ?? lane.modelID,
+            effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
+            status: lane.status == OracleLaneResultStatus.completed.rawValue ? "done" : "failed"
+        )
+    }
+}
+
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {
     guard let dto,
           let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
     else { return nil }
+    if let primaryChatID = contextBuilderOracleLaneSummaries(for: dto).first?.chatID {
+        return nonEmptyContextBuilderValue(primaryChatID)
+    }
     switch branch {
     case .review:
         return nonEmptyContextBuilderValue(dto.review?.chatID)
@@ -595,11 +674,47 @@ private func cancelContextBuilderRun(
     }
 }
 
+func contextBuilderJoinedFollowUpModelLine(
+    primaryDisplayName: String?,
+    additionalModelRaws: [String]
+) -> String? {
+    var names: [String] = []
+    if let primary = primaryDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines), !primary.isEmpty {
+        names.append(primary)
+    }
+    for raw in additionalModelRaws {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        names.append(AIModel.fromModelName(trimmed)?.displayName ?? trimmed)
+    }
+    guard !names.isEmpty else { return nil }
+    return names.joined(separator: " + ")
+}
+
+func contextBuilderFollowUpModelLine(
+    dto: ToolResultDTOs.ContextBuilderDTO?,
+    fallback: String?
+) -> String? {
+    let summaries = contextBuilderOracleLaneSummaries(for: dto)
+    if !summaries.isEmpty {
+        return summaries
+            .map { AIModel.fromModelName($0.modelID)?.displayName ?? $0.modelID }
+            .joined(separator: " + ")
+    }
+    return nonEmptyContextBuilderValue(fallback)
+}
+
 @MainActor
-private func contextBuilderCardDetailLine(contextBuilderAgentVM: ContextBuilderAgentViewModel) -> String? {
+private func contextBuilderCardDetailLine(
+    contextBuilderAgentVM: ContextBuilderAgentViewModel,
+    dto: ToolResultDTOs.ContextBuilderDTO?
+) -> String? {
     var detail = "Context Builder: \(contextBuilderAgentVM.runModelDisplayName)"
     if let followUpType = nonEmptyContextBuilderValue(contextBuilderAgentVM.mcpResponseType) {
-        if let followUpModel = nonEmptyContextBuilderValue(contextBuilderAgentVM.mcpPlanModel) {
+        if let followUpModel = contextBuilderFollowUpModelLine(
+            dto: dto,
+            fallback: contextBuilderAgentVM.mcpPlanModel
+        ) {
             detail += " → \(followUpType): \(followUpModel)"
         } else {
             detail += " → \(followUpType)"

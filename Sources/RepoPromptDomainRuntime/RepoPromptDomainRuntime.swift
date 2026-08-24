@@ -139,7 +139,10 @@ package actor MCPDomainRuntime {
         processID: Int32 = ProcessInfo.processInfo.processIdentifier,
         createdAt: Date = Date(),
         registryID: UUID = UUID(),
-        prepareChildLaunch: @escaping MCPDomainLongRunningToolProvider.PrepareChildLaunch = { _, _, _ in nil }
+        prepareChildLaunch: @escaping MCPDomainLongRunningToolProvider.PrepareChildLaunch = { _, _, _ in nil },
+        resolveChildLaunchPlan: MCPDomainLongRunningToolProvider.ResolveChildLaunchPlan? = nil,
+        prepareChildLaunches: MCPDomainLongRunningToolProvider.PrepareChildLaunches? = nil,
+        revokeChildLaunches: MCPDomainLongRunningToolProvider.RevokeChildLaunches? = nil
     ) {
         self.configuration = configuration
         let runtimeIdentity = DomainRuntimeIdentity(
@@ -218,13 +221,25 @@ package actor MCPDomainRuntime {
         self.interactionBroker = interactionBroker
         self.activityCenter = activityCenter
         self.credentialEnvelopeStore = credentialEnvelopeStore
-        longRunningToolProvider = MCPDomainLongRunningToolProvider(
-            identity: runtimeIdentity,
-            policyStore: mutationPolicyStore,
-            interactionBroker: interactionBroker,
-            activityCenter: activityCenter,
-            prepareChildLaunch: prepareChildLaunch
-        )
+        if let resolveChildLaunchPlan, let prepareChildLaunches, let revokeChildLaunches {
+            longRunningToolProvider = MCPDomainLongRunningToolProvider(
+                identity: runtimeIdentity,
+                policyStore: mutationPolicyStore,
+                interactionBroker: interactionBroker,
+                activityCenter: activityCenter,
+                resolveChildLaunchPlan: resolveChildLaunchPlan,
+                prepareChildLaunches: prepareChildLaunches,
+                revokeChildLaunches: revokeChildLaunches
+            )
+        } else {
+            longRunningToolProvider = MCPDomainLongRunningToolProvider(
+                identity: runtimeIdentity,
+                policyStore: mutationPolicyStore,
+                interactionBroker: interactionBroker,
+                activityCenter: activityCenter,
+                prepareChildLaunch: prepareChildLaunch
+            )
+        }
     }
 
     package func start() async throws {
