@@ -41,7 +41,16 @@ enum DirectHeadlessChildBridge {
             launchToken: launchToken,
             clientPrincipal: principal,
             providerIdentifier: provider,
-            runID: runID
+            runID: runID,
+            launchID: environment[DomainChildLaunchCarrier.launchIDEnvironmentKey].flatMap(UUID.init(uuidString:)),
+            oracleGroupID: environment[DomainChildLaunchCarrier.oracleGroupIDEnvironmentKey]
+                .flatMap(UUID.init(uuidString:))
+                .map(OracleGroupID.init(rawValue:)),
+            oracleLaneID: environment[DomainChildLaunchCarrier.oracleLaneIDEnvironmentKey]
+                .flatMap(Int.init)
+                .flatMap { try? OracleLaneID(index: $0) },
+            oracleGroupClaimID: environment[DomainChildLaunchCarrier.oracleGroupClaimIDEnvironmentKey]
+                .flatMap(UUID.init(uuidString:))
         )
         var bytes = try JSONEncoder().encode(handshake)
         bytes.append(0x0A)

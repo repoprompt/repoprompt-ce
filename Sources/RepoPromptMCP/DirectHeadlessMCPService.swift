@@ -17,6 +17,9 @@ actor DirectHeadlessMCPService {
         let childEndpoint: DirectHeadlessChildEndpoint
         let childLaunchCoordinator: DirectHeadlessChildLaunchCoordinator
         let providerCoordinator: DirectHeadlessProviderCoordinator
+        let oracleAdapter: DirectHeadlessOracleAdapter
+        let oracleStore: DomainOracleConversationStore
+        let settingsStore: DomainDirectSettingsStore
     }
 
     struct ConnectionContext {
@@ -143,12 +146,21 @@ actor DirectHeadlessMCPService {
             eventDirectory: locations.eventDirectory,
             temporaryDirectory: locations.temporaryDirectory,
             hostDrainTimeout: .seconds(5)
-        ), prepareChildLaunch: { toolName, arguments, securityContext in
-            try await childLaunchCoordinator.prepare(
+        ), resolveChildLaunchPlan: { toolName, arguments, securityContext in
+            try await childLaunchCoordinator.resolvePlan(
                 toolName: toolName,
                 arguments: arguments,
                 securityContext: securityContext
             )
+        }, prepareChildLaunches: { plan, toolName, arguments, securityContext in
+            try await childLaunchCoordinator.prepare(
+                plan: plan,
+                toolName: toolName,
+                arguments: arguments,
+                securityContext: securityContext
+            )
+        }, revokeChildLaunches: { plan, bundle in
+            await childLaunchCoordinator.revoke(plan: plan, bundle: bundle)
         })
         try await runtime.start()
         do {
@@ -193,11 +205,28 @@ actor DirectHeadlessMCPService {
                 settingsStore: settingsStore,
                 environment: environment
             )
+            let oracleStore = DomainOracleConversationStore(
+                persistence: runtime.persistenceCoordinator,
+                identity: runtime.identity
+            )
+            let oracleAdapter = try DirectHeadlessOracleAdapter(
+                profileIdentifier: runtime.configuration.profileIdentifier,
+                rosterResolver: DirectHeadlessOracleRosterResolver(settingsStore: settingsStore),
+                store: oracleStore,
+                claimManager: OracleGroupClaimManager(
+                    persistence: runtime.persistenceCoordinator,
+                    identity: runtime.identity
+                ),
+                provider: providerCoordinator
+            )
             let backends = MCPDomainStandaloneCapabilityBackends(
                 global: global,
                 workspace: workspace,
                 filesystem: DirectHeadlessFilesystemBackend(context: context),
-                conversation: DirectHeadlessConversationBackend(coordinator: providerCoordinator),
+                conversation: DirectHeadlessConversationBackend(
+                    providerCoordinator: providerCoordinator,
+                    oracleAdapter: oracleAdapter
+                ),
                 versionControl: DirectHeadlessVersionControlBackend(runtime: runtime, context: context),
                 agent: DirectHeadlessAgentBackend(coordinator: providerCoordinator),
                 history: DirectHeadlessHistoryBackend(runtime: runtime)
@@ -217,7 +246,8 @@ actor DirectHeadlessMCPService {
             )
             await childLaunchCoordinator.configure(
                 runtime: runtime,
-                endpointDescriptor: childEndpoint.socketURL.path
+                endpointDescriptor: childEndpoint.socketURL.path,
+                oracleAdapter: oracleAdapter
             )
             let parentProcessID = getppid()
             let verifiedFingerprint = Self.verifiedExecutableFingerprint(processID: parentProcessID)
@@ -243,7 +273,10 @@ actor DirectHeadlessMCPService {
                 principal: principal,
                 childEndpoint: childEndpoint,
                 childLaunchCoordinator: childLaunchCoordinator,
-                providerCoordinator: providerCoordinator
+                providerCoordinator: providerCoordinator,
+                oracleAdapter: oracleAdapter,
+                oracleStore: oracleStore,
+                settingsStore: settingsStore
             )
         } catch {
             _ = await runtime.shutdown()
@@ -351,7 +384,11 @@ actor DirectHeadlessMCPService {
         )
         guard case let .accepted(accepted) = redemption,
               case let .runScoped(runID, _) = accepted.binding.binding,
-              runID == handshake.runID
+              runID == handshake.runID,
+              handshake.launchID == accepted.launchID,
+              handshake.oracleGroupID == accepted.oracleGroupID,
+              handshake.oracleLaneID == accepted.oracleLaneID,
+              handshake.oracleGroupClaimID == accepted.oracleGroupClaimID
         else {
             logger.warning("Rejected private child launch token", metadata: ["result": "\(redemption)"])
             Darwin.shutdown(fd, SHUT_RDWR)
@@ -474,12 +511,16 @@ actor DirectHeadlessMCPService {
     }
 
     func teardown(_ prepared: PreparedRuntime) async {
-        await prepared.childEndpoint.stop()
-        await prepared.providerCoordinator.shutdown()
         await prepared.runtime.domainHost.cancelInvocations(
             connectionID: prepared.connectionID,
             connectionGeneration: prepared.connectionGeneration
         )
+        _ = await prepared.runtime.domainHost.drain(
+            timeout: prepared.runtime.configuration.hostDrainTimeout
+        )
+        await prepared.oracleAdapter.shutdown()
+        await prepared.providerCoordinator.shutdown()
+        await prepared.childEndpoint.stop()
         await prepared.runtime.standaloneScopeCoordinator.unregister(scopeID: prepared.scopeID)
         await prepared.runtime.domainHost.releaseConnection(
             connectionID: prepared.connectionID,

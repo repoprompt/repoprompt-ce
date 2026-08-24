@@ -1,5 +1,7 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -398,6 +400,387 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertNil(wrongWorkspace)
     }
 
+    func testAggregateOraclePillCountAndLabelsUseConfiguredOrLatestProjectedGroup() {
+        let historical = ChatSession(
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 5,
+            name: "Historical",
+            savedAt: Date(timeIntervalSince1970: 100)
+        )
+        let latestSingle = ChatSession(
+            name: "Latest Single",
+            savedAt: Date(timeIntervalSince1970: 200)
+        )
+        let latestGroupID = UUID()
+        let latestProjected = ChatSession(
+            oracleGroupID: latestGroupID,
+            oracleLaneIndex: 0,
+            oracleGroupSize: 4,
+            name: "Latest Group",
+            savedAt: Date(timeIntervalSince1970: 300)
+        )
+        let invalidProjected = ChatSession(
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 99,
+            name: "Invalid Projection",
+            savedAt: Date(timeIntervalSince1970: 400)
+        )
+
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(
+                configuredAdditionalCount: 0,
+                sessions: [historical, latestSingle]
+            ),
+            1
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(
+                configuredAdditionalCount: 0,
+                sessions: [historical, latestProjected]
+            ),
+            4
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 2, sessions: []),
+            3
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 0, sessions: [invalidProjected]),
+            5
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 99, sessions: []),
+            5
+        )
+        XCTAssertEqual(
+            (0 ... 4).map(OracleViewModel.oracleLabel(laneIndex:)),
+            ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(isStreaming: true, lastAssistantContent: "Error: stale"),
+            .streaming
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "partial answer\n\n--\nError:\nstatus code 502"
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "Error: status code 502 Gemini response stalled"
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            AgentOraclePillLogic.laneDotState(
+                isStreaming: false,
+                lastAssistantContent: "Review looks correct. Mention error handling."
+            ),
+            .completed
+        )
+    }
+
+    func testGroupedDeleteFallsBackToProjectionCleanupWhenCanonicalDocumentIsMissing() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        var projection = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 2,
+            name: "Missing Canonical Group",
+            messages: [StoredMessage(isUser: false, rawText: "preserve me", sequenceIndex: 0)]
+        )
+        projection.fileURL = try await fixture.oracleViewModel.chatData.saveChatSession(
+            projection,
+            for: fixture.workspace
+        )
+        fixture.oracleViewModel.sessions = [projection]
+
+        let handledAsGroup = try await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: projection)
+        XCTAssertFalse(handledAsGroup)
+        await fixture.oracleViewModel.deleteSession(projection)
+        XCTAssertTrue(fixture.oracleViewModel.sessions.isEmpty)
+        XCTAssertFalse(try FileManager.default.fileExists(atPath: XCTUnwrap(projection.fileURL).path))
+    }
+
+    func testLegacyMessageOnlySelectionPrefersTabActiveThenMostRecentEligibleSession() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let active = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Active",
+            savedAt: Date(timeIntervalSince1970: 100)
+        )
+        let recentGroupProjection = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 2,
+            name: "Recent Group Projection",
+            savedAt: Date(timeIntervalSince1970: 200)
+        )
+        fixture.oracleViewModel.sessions = [active, recentGroupProjection]
+        fixture.composition.workspaceManager.setActiveChatSessionID(active.id, forTabID: fixture.tabID)
+
+        let selectedActive = try await fixture.oracleViewModel.locateOrCreateChat(
+            nil,
+            tabID: fixture.tabID,
+            activateInUI: false
+        )
+        XCTAssertEqual(selectedActive, active.id)
+
+        fixture.composition.workspaceManager.setActiveChatSessionID(nil, forTabID: fixture.tabID)
+        XCTAssertEqual(
+            fixture.oracleViewModel.resolveImplicitOracleContinuationCandidate(
+                tabID: fixture.tabID,
+                activateInUI: false
+            )?.id,
+            recentGroupProjection.id
+        )
+        let selectedRecent = try await fixture.oracleViewModel.locateOrCreateChat(
+            nil,
+            tabID: fixture.tabID,
+            activateInUI: false
+        )
+        XCTAssertEqual(selectedRecent, recentGroupProjection.id)
+        XCTAssertEqual(fixture.oracleViewModel.sessions.count, 2)
+    }
+
+    func testFrozenImplicitSessionIdentitySurvivesShortIDCollision() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let sharedShortID = "collision-shared"
+        let first = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "First",
+            savedAt: Date(timeIntervalSince1970: 200),
+            shortID: sharedShortID
+        )
+        let selected = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Selected",
+            savedAt: Date(timeIntervalSince1970: 100),
+            shortID: sharedShortID
+        )
+        fixture.oracleViewModel.sessions = [first, selected]
+        fixture.composition.workspaceManager.setActiveChatSessionID(selected.id, forTabID: fixture.tabID)
+
+        let candidate = try XCTUnwrap(fixture.oracleViewModel.resolveImplicitOracleContinuationCandidate(
+            tabID: fixture.tabID,
+            activateInUI: false
+        ))
+        XCTAssertEqual(candidate.id, selected.id)
+        XCTAssertEqual(fixture.oracleViewModel.resolveSession(id: sharedShortID)?.id, first.id)
+
+        let resumed = try await fixture.oracleViewModel.locateOrCreateChat(
+            nil,
+            tabID: fixture.tabID,
+            activateInUI: false,
+            implicitSessionID: candidate.id
+        )
+        XCTAssertEqual(resumed, selected.id)
+    }
+
+    func testFrozenImplicitSessionIdentityPreservesSessionOwnerMatchWithoutExplicitRejection() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let agentSessionID = UUID()
+        let session = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            agentModeSessionID: agentSessionID,
+            agentModeRunID: UUID(),
+            name: "Session-Owned Legacy Run"
+        )
+        fixture.oracleViewModel.sessions = [session]
+
+        let candidate = try XCTUnwrap(fixture.oracleViewModel.resolveImplicitOracleContinuationCandidate(
+            tabID: fixture.tabID,
+            activateInUI: false,
+            agentModeSessionID: agentSessionID,
+            agentModeRunID: nil
+        ))
+        XCTAssertEqual(candidate.id, session.id)
+        XCTAssertFalse(OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
+            session,
+            agentModeSessionID: agentSessionID,
+            agentModeRunID: nil
+        ))
+
+        let resumed = try await fixture.oracleViewModel.locateOrCreateChat(
+            nil,
+            tabID: fixture.tabID,
+            activateInUI: false,
+            agentModeSessionID: agentSessionID,
+            agentModeRunID: nil,
+            implicitSessionID: candidate.id
+        )
+        XCTAssertEqual(resumed, session.id)
+    }
+
+    func testOnlyExplicitStartUsesConfiguredAdditionalModelsToCreateGroup() throws {
+        let explicitStart = try OracleConversationRoute.resolve(
+            chatID: nil,
+            newChat: true,
+            modelOverride: nil,
+            whenMissingChatID: .continueCurrent
+        )
+        let implicitContinuation = try OracleConversationRoute.resolve(
+            chatID: nil,
+            newChat: false,
+            modelOverride: nil,
+            whenMissingChatID: .continueCurrent
+        )
+        let exactContinuation = try OracleConversationRoute.resolve(
+            chatID: "single-chat",
+            newChat: false,
+            modelOverride: nil,
+            whenMissingChatID: .continueCurrent
+        )
+
+        XCTAssertTrue(AppOracleGroupRouting.startsConfiguredGroup(
+            route: explicitStart,
+            additionalModelRaws: ["model-b"]
+        ))
+        XCTAssertFalse(AppOracleGroupRouting.startsConfiguredGroup(
+            route: implicitContinuation,
+            additionalModelRaws: ["model-b"]
+        ))
+        XCTAssertFalse(AppOracleGroupRouting.startsConfiguredGroup(
+            route: exactContinuation,
+            additionalModelRaws: ["model-b"]
+        ))
+    }
+
+    func testClaimedGroupContinuationUsesFreshAdvancedRevision() throws {
+        let models = try ["model-a", "model-b"].map {
+            try OracleModelReference(providerID: "fixture", modelID: $0)
+        }
+        let roster = try OracleRoster(primary: models[0], additional: Array(models.dropFirst()))
+        let descriptor = try OracleGroupDescriptor(size: models.count)
+        let owner = try OracleConversationOwner(kind: "app-tab", identifier: "fresh-claimed-group")
+        let members = try models.enumerated().map { index, model in
+            try OracleGroupMember(
+                laneID: OracleLaneID(index: index),
+                publicChatID: "fresh-claimed-\(index)",
+                model: model
+            )
+        }
+        let timestamp = Date(timeIntervalSince1970: 1000)
+        let observed = try OracleGroupDocument(
+            group: descriptor,
+            owner: owner,
+            name: "Observed",
+            revision: 1,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            roster: roster,
+            members: members
+        )
+        let advanced = try OracleGroupDocument(
+            group: descriptor,
+            owner: owner,
+            name: "Observed",
+            revision: 3,
+            createdAt: timestamp,
+            updatedAt: timestamp.addingTimeInterval(1),
+            roster: roster,
+            members: members
+        )
+
+        XCTAssertEqual(
+            AppOracleGroupRouting.claimedContinuationDocument(
+                observed: observed,
+                current: advanced
+            ),
+            advanced
+        )
+        XCTAssertNil(
+            AppOracleGroupRouting.claimedContinuationDocument(
+                observed: advanced,
+                current: observed
+            )
+        )
+    }
+
+    func testGroupedDeleteRejectsProjectionThatIsNotACanonicalMember() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let owner = try OracleConversationOwner(
+            kind: "app-tab",
+            identifier: "workspace:\(fixture.workspace.id.uuidString):tab:\(fixture.tabID.uuidString)"
+        )
+        let models = try ["model-a", "model-b"].map {
+            try OracleModelReference(providerID: "fixture", modelID: $0)
+        }
+        let descriptor = try OracleGroupDescriptor(size: models.count)
+        let members = try models.enumerated().map { index, model in
+            try OracleGroupMember(
+                laneID: OracleLaneID(index: index),
+                publicChatID: "canonical-\(index)",
+                model: model
+            )
+        }
+        let timestamp = Date(timeIntervalSince1970: 1000)
+        let group = try OracleGroupDocument(
+            group: descriptor,
+            owner: owner,
+            name: "Canonical Group",
+            revision: 1,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            roster: OracleRoster(primary: models[0], additional: Array(models.dropFirst())),
+            members: members,
+            turns: [OracleTurnRecord(
+                input: OracleInput(mode: .chat, userMessage: "test"),
+                state: .prepared,
+                startedAt: timestamp
+            )]
+        )
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        try await store.create(group)
+        var mismatchedProjection = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            oracleGroupID: descriptor.id.rawValue,
+            oracleLaneIndex: 0,
+            oracleGroupSize: 2,
+            name: "Forged Projection",
+            messages: [StoredMessage(isUser: false, rawText: "preserve me", sequenceIndex: 0)]
+        )
+        mismatchedProjection.fileURL = try await fixture.oracleViewModel.chatData.saveChatSession(
+            mismatchedProjection,
+            for: fixture.workspace
+        )
+        fixture.oracleViewModel.sessions = [mismatchedProjection]
+
+        let handledAsGroup = try await fixture.oracleViewModel.deleteOracleGroupIfNeeded(containing: mismatchedProjection)
+        let retained = try await store.load(groupID: descriptor.id, owner: owner)
+        if let retained {
+            try await store.delete(
+                groupID: retained.group.id,
+                owner: owner,
+                expectedRevision: retained.revision
+            )
+        }
+
+        XCTAssertFalse(handledAsGroup)
+        XCTAssertNotNil(retained)
+        XCTAssertEqual(fixture.oracleViewModel.sessions.map(\.id), [mismatchedProjection.id])
+        XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(mismatchedProjection.fileURL).path))
+    }
+
     private static var nextFixtureWindowID = -1200
 
     private static func allocateFixtureWindowID() -> Int {
@@ -411,7 +794,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
         let composition = WindowStateCompositionFactory.make(
             windowID: Self.allocateFixtureWindowID(),
-            deferredInitialAgentSystemWorkspaceRefresh: true,
+            deferredInitialAgentSystemWorkspaceRefresh: false,
             sharedMCPService: MCPService()
         )
         await composition.workspaceManager.awaitInitialized()
