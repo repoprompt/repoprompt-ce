@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 struct OracleExportFile: Equatable {
@@ -37,6 +38,7 @@ struct OracleExportRequest {
     let message: String
     let chatID: String?
     let response: String?
+    let groupResult: OracleGroupResult?
     let destination: OracleExportDestination?
 
     init(
@@ -45,6 +47,7 @@ struct OracleExportRequest {
         message: String,
         chatID: String?,
         response: String?,
+        groupResult: OracleGroupResult? = nil,
         destination: OracleExportDestination? = nil
     ) {
         self.sourceTool = sourceTool
@@ -52,6 +55,7 @@ struct OracleExportRequest {
         self.message = message
         self.chatID = chatID
         self.response = response
+        self.groupResult = groupResult
         self.destination = destination
     }
 }
@@ -82,6 +86,9 @@ enum AgentOracleExport {
         default:
             "# Oracle Response"
         }
+        if let groupResult = request.groupResult {
+            return "\(title)\n\n\(groupMarkdown(groupResult))"
+        }
         let response: String = if let responseText = request.response,
                                   !responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
@@ -90,6 +97,71 @@ enum AgentOracleExport {
             "_No response text was returned._"
         }
         return "\(title)\n\n\(response)"
+    }
+
+    private static func groupMarkdown(_ result: OracleGroupResult) -> String {
+        var sections = [
+            """
+            ## Oracle group
+            - Group ID: `\(result.groupID.rawValue.uuidString)`
+            - Status: `\(result.status.rawValue)`
+            - Oracle count: \(result.oracleCount)
+            """
+        ]
+        if !result.warnings.isEmpty {
+            sections.append(
+                (["## Warnings"] + result.warnings.map { "- `\($0.code)`: \($0.message)" })
+                    .joined(separator: "\n")
+            )
+        }
+        sections.append("## Oracle results")
+        sections.append(contentsOf: result.oracleResults.map(laneMarkdown))
+        return sections.joined(separator: "\n\n")
+    }
+
+    private static func laneMarkdown(_ lane: OracleLaneResult) -> String {
+        let label = OracleRosterContract.displayLabel(laneIndex: lane.laneIndex)
+        let heading = lane.role == .primary ? "### \(label) (Primary)" : "### \(label)"
+        var lines = [
+            heading,
+            "- Lane index: \(lane.laneIndex)",
+            "- Role: `\(lane.role.rawValue)`",
+            "- Chat ID: `\(lane.chatID)`",
+            "- Provider: \(metadata(lane.providerID))",
+            "- Model: \(metadata(lane.modelID))",
+            "- Status: `\(lane.status.rawValue)`"
+        ]
+        if let profile = lane.executionProfile {
+            lines.append("- Execution provider: `\(profile.providerID)`")
+            lines.append("- Execution model: `\(profile.modelID)`")
+            if let effort = profile.effectiveReasoningEffort {
+                lines.append("- Effective reasoning effort: `\(effort)`")
+            }
+        }
+        if let response = lane.response {
+            lines.append("")
+            lines.append("#### Response")
+            lines.append("")
+            lines.append(response)
+        }
+        if let error = lane.error {
+            if let partialResponse = error.partialResponse {
+                lines.append("")
+                lines.append("#### Partial response")
+                lines.append("")
+                lines.append(partialResponse)
+            }
+            lines.append("")
+            lines.append("#### Error")
+            lines.append("- Code: `\(error.code)`")
+            lines.append("- Message: \(error.message)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func metadata(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "_Not specified._" }
+        return "`\(value)`"
     }
 }
 

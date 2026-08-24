@@ -527,6 +527,7 @@ class OracleViewModel: ObservableObject {
     }
 
     @Published private(set) var visibleSessions: [ChatSession] = []
+    @Published private(set) var sessionOperationError: String?
 
     struct MCPSessionUIState: Equatable {
         var modelInfo: String
@@ -983,7 +984,7 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    private func purgeSessionStorage(_ sessionID: UUID) {
+    func purgeSessionStorage(_ sessionID: UUID) {
         let messageIDs: [UUID]
         if let stored = messageStore.removeValue(forKey: sessionID) {
             messageStoreRevision &+= 1
@@ -1696,6 +1697,13 @@ class OracleViewModel: ObservableObject {
     /// 3) If this was the current session, switch to another or create a new one.
     @MainActor
     func deleteSession(_ session: ChatSession) async {
+        do {
+            if try await deleteOracleGroupIfNeeded(containing: session) { return }
+        } catch {
+            sessionOperationError = error.asFriendlyString()
+            return
+        }
+        sessionOperationError = nil
         sessionSwitchGeneration += 1
         if isSessionStreaming(session.id) {
             await cancelAIResponse(in: session.id, skipPartialParseAndSave: true)
@@ -1749,13 +1757,20 @@ class OracleViewModel: ObservableObject {
 
         // 2) Delete chat JSON files only for this workspace
         do {
+            let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+            try await store.deleteAllGroups(
+                ownerKind: "app-tab",
+                identifierPrefix: "workspace:\(activeWS.id.uuidString):tab:"
+            )
             let files = try await chatData.listChatSessions(for: activeWS)
             for file in files {
                 try await chatData.deleteChatSessionFile(file)
             }
         } catch {
-            print("Error clearing chats for workspace \(activeWS.name): \(error)")
+            sessionOperationError = error.asFriendlyString()
+            return
         }
+        sessionOperationError = nil
 
         // 3) Remove from memory all sessions belonging to the active workspace
         sessions.removeAll()
@@ -2101,17 +2116,24 @@ class OracleViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func startNewChatSession(
+        id: UUID = UUID(),
         name: String = "New Chat",
+        workspaceID: UUID? = nil,
         tabID: UUID? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
+        oracleGroupID: UUID? = nil,
+        oracleLaneIndex: Int? = nil,
+        oracleGroupSize: Int? = nil,
+        oracleModelRaw: String? = nil,
         activateInUI: Bool = true,
-        setActiveForTab: Bool = true
+        setActiveForTab: Bool = true,
+        reuseBlankSession: Bool = true
     ) async -> UUID? {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         // If there's already a blank session with that name, just switch to it
-        if let existingIndex = sessions.firstIndex(where: {
+        if reuseBlankSession, let existingIndex = sessions.firstIndex(where: {
             $0.name == name &&
                 $0.effectiveMessageCount == 0 &&
                 $0.composeTabID == resolvedTabID &&
@@ -2161,10 +2183,15 @@ class OracleViewModel: ObservableObject {
         let selectedChatPresetId = promptViewModel.selectedChatPresetID
 
         let newSession = ChatSession(
-            workspaceID: workspaceManager.activeWorkspace?.id,
+            id: id,
+            workspaceID: workspaceID ?? workspaceManager.activeWorkspace?.id,
             composeTabID: resolvedTabID,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
+            oracleGroupID: oracleGroupID,
+            oracleLaneIndex: oracleLaneIndex,
+            oracleGroupSize: oracleGroupSize,
+            oracleModelRaw: oracleModelRaw,
             name: name,
             selectedFilePaths: currentSelectedPaths,
             selectedPromptIDs: currentSelectedPrompts,
@@ -2715,12 +2742,20 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    func autosaveChatHistory(for sessionID: UUID, force: Bool = false) {
+    func autosaveChatHistory(
+        for sessionID: UUID,
+        force: Bool = false,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         // ------------------------------------------------------------------
         // 0️⃣  Preconditions
         // ------------------------------------------------------------------
-        guard let session = sessions.first(where: { $0.id == sessionID }) else { return }
+        guard let session = sessions.first(where: { $0.id == sessionID }) else {
+            completion?(false)
+            return
+        }
         guard let liveMessages = messageStore[sessionID] ?? (sessionID == currentSessionID ? messages : nil) else {
+            completion?(false)
             return
         }
 
@@ -2794,6 +2829,7 @@ class OracleViewModel: ObservableObject {
 
         if !force && !shouldSkipChangeCheck && nothingChanged {
             oracleViewModelDebugLog("autosaveChatHistory -> skipped (no meaningful changes)")
+            completion?(true)
             return
         }
 
@@ -2857,9 +2893,11 @@ class OracleViewModel: ObservableObject {
                     }
                     unloadNonCurrentSessions()
                     workspaceManager.pollAndSaveState()
+                    completion?(true)
                 }
             } catch {
                 print("Autosave failed: \(error)")
+                completion?(false)
             }
         }
     }
@@ -3627,9 +3665,7 @@ class OracleViewModel: ObservableObject {
     private func handleComposeTabsWillClose(_ tabIDs: Set<UUID>) async {
         for tabID in tabIDs {
             // 1. Cancel headless stream (plan/question generation) for this tab
-            if headlessRuntime.hasActiveStream(for: tabID) {
-                await cancelHeadlessStream(forTabID: tabID)
-            }
+            await cancelHeadlessStream(forTabID: tabID)
 
             // 2. Cancel normal chat streaming sessions associated with this tab
             let sessionsForTab = sessions.filter { $0.composeTabID == tabID }
@@ -3816,6 +3852,18 @@ class OracleViewModel: ObservableObject {
         }
         guard let index = sessions.firstIndex(where: { $0.id == id }) else {
             print("Session \(id) not found for renaming.")
+            return
+        }
+        if sessions[index].oracleGroupID != nil {
+            let session = sessions[index]
+            Task { [weak self] in
+                do {
+                    try await self?.renameOracleGroup(containing: session, newName: newName)
+                    self?.sessionOperationError = nil
+                } catch {
+                    self?.sessionOperationError = error.asFriendlyString()
+                }
+            }
             return
         }
 

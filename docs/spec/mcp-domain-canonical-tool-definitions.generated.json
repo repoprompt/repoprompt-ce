@@ -13,7 +13,7 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Read/update allowlisted RepoPrompt app-wide preferences. Settings outside the allowlist are not exposed.\n\n**Operations**: `list` (catalog), `get` (read), `set` (write one key), `options` (candidate values for keys with `options_available: true`).\n\n**Selectors**: `get` accepts exactly one of `key`, `keys`, or `group`. `set` and `options` take one `key`.\n\n**Groups**: `ui` · `prompt_packaging` · `models` · `context_builder` · `mcp` · `code_maps` · `file_system` · `agent_mode`\n\n**Examples**:\n- `{\"op\":\"list\",\"group\":\"ui\"}`\n- `{\"op\":\"get\",\"keys\":[\"ui.appearance_mode\",\"ui.show_tooltips\"]}`\n- `{\"op\":\"get\",\"group\":\"file_system\"}`\n- `{\"op\":\"set\",\"key\":\"models.planning_model\",\"value\":null}`\n- `{\"op\":\"set\",\"key\":\"file_system.global_ignore_defaults\",\"value\":\"**/node_modules/\\n\"}`\n- `{\"op\":\"options\",\"key\":\"models.planning_model\",\"agent\":\"codexExec\"}`\n\nInvalid or out-of-range values are rejected with no partial apply. Model-raw settings accept custom identifiers beyond what `options` returns.",
+      "description" : "Read/update allowlisted RepoPrompt app-wide preferences. Settings outside the allowlist are not exposed.\n\n**Operations**: `list` (catalog), `get` (read), `set` (write one key), `options` (candidate values for keys with `options_available: true`).\n\n**Selectors**: `get` accepts exactly one of `key`, `keys`, or `group`. `set` and `options` take one `key`. `models.additional_oracle_models` is an ordered string array with at most four entries.\n\n**Groups**: `ui` · `prompt_packaging` · `models` · `context_builder` · `mcp` · `code_maps` · `file_system` · `agent_mode`\n\n**Examples**:\n- `{\"op\":\"list\",\"group\":\"ui\"}`\n- `{\"op\":\"get\",\"keys\":[\"ui.appearance_mode\",\"ui.show_tooltips\"]}`\n- `{\"op\":\"get\",\"group\":\"file_system\"}`\n- `{\"op\":\"set\",\"key\":\"models.planning_model\",\"value\":null}`\n- `{\"op\":\"set\",\"key\":\"models.additional_oracle_models\",\"value\":[\"openai/gpt-5.2\",\"anthropic/claude-opus-4-6\"]}`\n- `{\"op\":\"set\",\"key\":\"file_system.global_ignore_defaults\",\"value\":\"**/node_modules/\\n\"}`\n- `{\"op\":\"options\",\"key\":\"models.planning_model\",\"agent\":\"codexExec\"}`\n\nInvalid or out-of-range values are rejected with no partial apply. Model-raw settings accept custom identifiers beyond what `options` returns.",
       "inputSchema" : {
         "properties" : {
           "agent" : {
@@ -76,6 +76,15 @@
               },
               {
                 "type" : "string"
+              },
+              {
+                "description" : "Ordered Oracle roster additions (maximum four model identifiers).",
+                "items" : {
+                  "maxLength" : 512,
+                  "type" : "string"
+                },
+                "maxItems" : 4,
+                "type" : "array"
               },
               {
                 "type" : "null"
@@ -827,7 +836,7 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Agent-mode oracle send/continue tool.\n\nUse this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab.\n\nPass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.\n\nUse `oracle_chat_log` after compaction to recover recent oracle messages.",
+      "description" : "Agent-mode oracle send/continue tool.\n\nUse this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab.\n\nPass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.\n\nUse `oracle_chat_log` after compaction to recover recent oracle messages. Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
       "inputSchema" : {
         "properties" : {
           "chat_id" : {
@@ -853,8 +862,13 @@
             ],
             "type" : "string"
           },
+          "model" : {
+            "description" : "Optional model override for a new conversation. Changes the primary model only and is rejected on continuation.",
+            "maxLength" : 512,
+            "type" : "string"
+          },
           "new_chat" : {
-            "description" : "Start a new chat session (default: false; discouraged)",
+            "description" : "Start a new conversation. Omitted chat_id also selects the start route; false with chat_id continues that conversation.",
             "type" : "boolean"
           }
         },
@@ -872,11 +886,11 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Consult a second AI for planning, review, or questions.\n\nUse this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode.\nUse `oracle_utils` for passive helpers like models and sessions.\n\nPass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.\n\nBuild context first with file reads, `manage_selection`, or `workspace_context`.",
+      "description" : "Consult a second AI for planning, review, or questions.\n\nUse this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode. When `chat_id` and `new_chat` are omitted, the resolved tab resumes its selected eligible conversation, falling back to the most recent eligible conversation. Set `new_chat=true` to force a new conversation; `model` is valid only for that explicit start.\nUse `oracle_utils` for passive helpers like models and sessions.\n\nPass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.\n\nBuild context first with file reads, `manage_selection`, or `workspace_context`.",
       "inputSchema" : {
         "properties" : {
           "chat_id" : {
-            "description" : "Continue a specific chat in the current tab or current context",
+            "description" : "Continue a specific chat in the current tab or context. Omit to resume the selected or most recent eligible conversation.",
             "type" : "string"
           },
           "export_response" : {
@@ -899,11 +913,12 @@
             "type" : "string"
           },
           "model" : {
-            "description" : "Model preset ID or name override",
+            "description" : "Optional primary-model override for an explicit new_chat=true start; rejected on continuation.",
+            "maxLength" : 512,
             "type" : "string"
           },
           "new_chat" : {
-            "description" : "Start a new chat session (default: false; discouraged)",
+            "description" : "Set true to force a new conversation. When false or omitted without chat_id, resume the selected or most recent eligible conversation.",
             "type" : "boolean"
           }
         },
@@ -1241,9 +1256,14 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Intelligently explore the codebase and build optimal file context for a task.\n\nA Context Builder agent analyzes your codebase, selects relevant files within a token budget, and rewrites your instructions into a clarified prompt. Describe **what** you need, not **where** to look — the agent discovers the right files autonomously. Mention what you know and what you're unsure about; being too prescriptive narrows discovery.\n\n**response_type** (what happens after context building):\n| Type | Behavior |\n|------|----------|\n| (omit) or `clarify` | Context only — returns selection and prompt for you to use |\n| `question` | Answers a question about the codebase using built context |\n| `plan` | Generates implementation plan for the task |\n| `review` | Generates code review with git diff context |\n\n**Structuring instructions** (XML tags):\n- `<task>`: Main goal\n- `<context>`: Background, constraints, known file references\n- `<discovery_agent-guidelines>`: Optional starting hints for the agent (not passed to follow-up model). The agent explores beyond these freely — omit if you don't have specific leads.\n\n**Example**:\n```\n<task>Add user authentication using JWT</task>\n<context>The app has an existing session system. See docs/auth-spec.md for requirements.</context>\n<discovery_agent-guidelines>There may be auth-related code in src/auth/ already</discovery_agent-guidelines>\n```\n\n**Exporting**: Pass `export_response: true` (requires a `response_type` that generates a response) to write the result to a file and get back `oracle_export_path` plus `oracle_export_instruction`. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.\n\n**Workflow**: Continue with `ask_oracle(chat_id: \"<returned_id>\", new_chat: false)`. Refine with `manage_selection`.\n\n**Agent mode behavior**: If this tool is invoked during an Agent Mode run, it reuses the current agent tab instead of creating a new tab.\n\n**Timing**: 30s-5min depending on codebase size and task complexity.",
+      "description" : "Intelligently explore the codebase and build optimal file context for a task.\n\nA Context Builder agent analyzes your codebase, selects relevant files within a token budget, and rewrites your instructions into a clarified prompt. Describe **what** you need, not **where** to look — the agent discovers the right files autonomously. Mention what you know and what you're unsure about; being too prescriptive narrows discovery.\n\n**response_type** (what happens after context building):\n| Type | Behavior |\n|------|----------|\n| (omit) or `clarify` | Context only — returns selection and prompt for you to use |\n| `question` | Answers a question about the codebase using built context |\n| `plan` | Generates implementation plan for the task |\n| `review` | Generates code review with git diff context |\n\n**Structuring instructions** (XML tags):\n- `<task>`: Main goal\n- `<context>`: Background, constraints, known file references\n- `<discovery_agent-guidelines>`: Optional starting hints for the agent (not passed to follow-up model). The agent explores beyond these freely — omit if you don't have specific leads.\n\n**Example**:\n```\n<task>Add user authentication using JWT</task>\n<context>The app has an existing session system. See docs/auth-spec.md for requirements.</context>\n<discovery_agent-guidelines>There may be auth-related code in src/auth/ already</discovery_agent-guidelines>\n```\n\n**Exporting**: Pass `export_response: true` (requires a `response_type` that generates a response) to write the result to a file and get back `oracle_export_path` plus `oracle_export_instruction`. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.\n\n**Workflow**: Continue with `ask_oracle(chat_id: \"<returned_id>\", new_chat: false)`. Refine with `manage_selection`.\n\n**Agent mode behavior**: If this tool is invoked during an Agent Mode run, it reuses the current agent tab instead of creating a new tab.\n\n**Timing**: 30s-5min depending on codebase size and task complexity. Direct grouped execution accepts only a canonical resolvable context_pack_ref; raw multi-Oracle instructions still require a frozen package.",
       "inputSchema" : {
         "properties" : {
+          "context_pack_ref" : {
+            "description" : "Direct-headless only: canonical reference to a resolvable persisted frozen Context Builder package. Raw multi-Oracle instructions remain rejected with context_pack_required.",
+            "pattern" : "^oracle-pack:sha256:[0-9a-f]{64}$",
+            "type" : "string"
+          },
           "export_response" : {
             "description" : "When true, export the generated response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Requires a response_type that generates a response. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt.",
             "type" : "boolean"
