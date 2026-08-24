@@ -4,7 +4,7 @@ import Foundation
 /// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented
 /// one-shot JSON CLI and preserves the existing trusted Grok executable preflight.
 final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
-    typealias APIKeyProvider = @Sendable () async -> String?
+    typealias APIKeyProvider = @Sendable () async throws -> String?
 
     private let config: GrokBuildAgentConfig
     private let launchResolver: GrokBuildACPLaunchResolver
@@ -17,7 +17,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         launchResolver: GrokBuildACPLaunchResolver = GrokBuildACPLaunchResolver(),
         requestTimeout: TimeInterval = 6000,
         apiKeyProvider: @escaping APIKeyProvider = {
-            try? await KeyManager().getAPIKey(for: .grok)
+            try await KeyManager().getAPIKey(for: .grok)
         }
     ) {
         self.config = config
@@ -125,7 +125,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         var additionalEnvironment: [String: String] = [:]
         var apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
         if apiKey?.isEmpty != false {
-            apiKey = await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
+            apiKey = try await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         if let apiKey, !apiKey.isEmpty {
             additionalEnvironment["XAI_API_KEY"] = apiKey

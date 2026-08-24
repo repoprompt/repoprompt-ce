@@ -17,7 +17,7 @@ final class GrokBuildCLIProviderProcessTests: XCTestCase {
     func testOneShotUsesTrustedPathPrivatePromptAndNoToolPolicy() async throws {
         let harness = try makeHarness(scenario: "ok")
         defer { harness.cleanup() }
-        let provider = makeProvider(harness: harness, apiKey: "test-grok-key")
+        let provider = makeProvider(harness: harness, apiKeyProvider: { "test-grok-key" })
         defer { Task { await provider.dispose() } }
 
         let results = try await collect(
@@ -106,6 +106,24 @@ final class GrokBuildCLIProviderProcessTests: XCTestCase {
             XCTFail("unknown model should fail")
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("not in the discovered model set"), "\(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.recordURL.path))
+    }
+
+    func testKeyProviderFailurePropagatesBeforeProcessLaunch() async throws {
+        let harness = try makeHarness(scenario: "ok")
+        defer { harness.cleanup() }
+        let expectedError = NSError(domain: "GrokBuildKeyProvider", code: 1)
+        let provider = makeProvider(harness: harness, apiKeyProvider: { throw expectedError })
+        defer { Task { await provider.dispose() } }
+
+        do {
+            _ = try await collect(provider: provider)
+            XCTFail("key-provider failure should propagate")
+        } catch {
+            let error = error as NSError
+            XCTAssertEqual(error.domain, expectedError.domain)
+            XCTAssertEqual(error.code, expectedError.code)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: harness.recordURL.path))
     }
@@ -226,7 +244,7 @@ final class GrokBuildCLIProviderProcessTests: XCTestCase {
         harness: Harness,
         modelString: String = "grok-4.6",
         requestTimeout: TimeInterval = 5,
-        apiKey: String? = nil
+        apiKeyProvider: @escaping GrokBuildOneShotHeadlessAgentProvider.APIKeyProvider = { nil }
     ) -> GrokBuildOneShotHeadlessAgentProvider {
         GrokBuildOneShotHeadlessAgentProvider(
             config: GrokBuildAgentConfig(
@@ -240,7 +258,7 @@ final class GrokBuildCLIProviderProcessTests: XCTestCase {
                 ProcessInfo.processInfo.environment
             }),
             requestTimeout: requestTimeout,
-            apiKeyProvider: { apiKey }
+            apiKeyProvider: apiKeyProvider
         )
     }
 
