@@ -14,6 +14,7 @@ protocol CodexManagedAuthRPCClient: Sendable {
 
 protocol CodexManagedAuthRecovering: Sendable {
     func refreshManagedAccount() async -> CodexManagedAuthRefreshResult
+    func checkManagedAccount() async -> CodexManagedAuthRefreshResult
     func managedAccountSnapshot() async -> CodexManagedAccount?
     func startManagedChatgptLogin(
         openURL: @MainActor @escaping @Sendable (URL) -> Void
@@ -249,6 +250,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
     private let sleep: @Sendable (TimeInterval) async throws -> Void
     private let retirementSleep: @Sendable (TimeInterval) async throws -> Void
     private var inFlightRefresh: InFlightRefresh?
+    private var inFlightCheck: InFlightRefresh?
     private var inFlightLogin: InFlightLogin?
     private var inFlightLogout: InFlightLogout?
     private var latestManagedAccount: CodexManagedAccount?
@@ -321,7 +323,78 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
             return result
         }
 
-        let task = Task<CodexManagedAuthRefreshResult, Never> { [clientFactory, refreshRequestTimeout] in
+        let task = makeAccountReadTask(refreshToken: true)
+        let refreshID = UUID()
+        inFlightRefresh = InFlightRefresh(id: refreshID, task: task)
+        let result = await task.value
+        if inFlightRefresh?.id == refreshID {
+            inFlightRefresh = nil
+        }
+        guard operationGeneration == authMutationGeneration else {
+            return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+        }
+        applyRefreshResult(result)
+        return result
+    }
+
+    /// Checks the currently projected account without attempting token refresh. This is
+    /// appropriate for passive Settings/status probes; recovery paths keep using the
+    /// force-refreshing `refreshManagedAccount` entry point above.
+    func checkManagedAccount() async -> CodexManagedAuthRefreshResult {
+        if let inFlightLogout {
+            switch await inFlightLogout.task.value {
+            case .signedOut:
+                latestManagedAccount = nil
+                return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+            case .failed, .executableUnavailable:
+                break
+            }
+        }
+        let operationGeneration = authMutationGeneration
+        if let inFlightLogin {
+            let result = await inFlightLogin.task.value
+            guard operationGeneration == authMutationGeneration else {
+                return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+            }
+            switch result {
+            case let .authenticated(account):
+                latestManagedAccount = account
+                return .recovered(account: account)
+            case .authenticatedWithoutManagedAccount:
+                latestManagedAccount = nil
+                return .recovered(account: nil)
+            case let .executableUnavailable(message):
+                latestManagedAccount = nil
+                return .executableUnavailable(message: message)
+            case .failed:
+                return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+            }
+        }
+        if let inFlightCheck {
+            let result = await inFlightCheck.task.value
+            guard operationGeneration == authMutationGeneration else {
+                return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+            }
+            applyRefreshResult(result)
+            return result
+        }
+
+        let checkID = UUID()
+        let task = makeAccountReadTask(refreshToken: false)
+        inFlightCheck = InFlightRefresh(id: checkID, task: task)
+        let result = await task.value
+        if inFlightCheck?.id == checkID {
+            inFlightCheck = nil
+        }
+        guard operationGeneration == authMutationGeneration else {
+            return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+        }
+        applyRefreshResult(result)
+        return result
+    }
+
+    private func makeAccountReadTask(refreshToken: Bool) -> Task<CodexManagedAuthRefreshResult, Never> {
+        Task { [clientFactory, refreshRequestTimeout] in
             let client = clientFactory()
             let result: CodexManagedAuthRefreshResult
             do {
@@ -329,7 +402,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 try await client.startIfNeeded()
                 let response = try await client.request(
                     method: "account/read",
-                    params: ["refreshToken": true],
+                    params: ["refreshToken": refreshToken],
                     timeout: refreshRequestTimeout
                 )
                 if Self.isValidAccountReadResult(response) {
@@ -347,17 +420,6 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
             await client.stop()
             return result
         }
-        let refreshID = UUID()
-        inFlightRefresh = InFlightRefresh(id: refreshID, task: task)
-        let result = await task.value
-        if inFlightRefresh?.id == refreshID {
-            inFlightRefresh = nil
-        }
-        guard operationGeneration == authMutationGeneration else {
-            return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
-        }
-        applyRefreshResult(result)
-        return result
     }
 
     func managedAccountSnapshot() -> CodexManagedAccount? {
@@ -526,6 +588,9 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         let refreshTask = inFlightRefresh?.task
         refreshTask?.cancel()
         inFlightRefresh = nil
+        let checkTask = inFlightCheck?.task
+        checkTask?.cancel()
+        inFlightCheck = nil
         currentDeviceCode = nil
 
         var retirementTasks: [Task<Void, Never>] = []
@@ -534,6 +599,9 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         }
         if let refreshTask {
             retirementTasks.append(Task { _ = await refreshTask.value })
+        }
+        if let checkTask {
+            retirementTasks.append(Task { _ = await checkTask.value })
         }
 
         let id = UUID()
@@ -842,15 +910,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         timeout: TimeInterval
     ) async throws -> ManagedChatgptLoginStartResponse {
         let type = flow == .browser ? "chatgpt" : "chatgptDeviceCode"
-        do {
-            return try await requestLoginStart(client: client, type: type, timeout: timeout)
-        } catch {
-            if error.localizedDescription.localizedCaseInsensitiveContains("external auth is active") {
-                _ = try? await client.request(method: "account/logout", params: nil, timeout: timeout)
-                return try await requestLoginStart(client: client, type: type, timeout: timeout)
-            }
-            throw error
-        }
+        return try await requestLoginStart(client: client, type: type, timeout: timeout)
     }
 
     private static func requestLoginStart(
