@@ -47,10 +47,16 @@ enum AgentSidebarBulkActionKind: String, Equatable {
     case unpin
 }
 
+enum AgentSidebarBulkActionOrigin: Equatable {
+    case selection
+    case command
+}
+
 struct AgentSidebarBulkActionOperation: Equatable {
     let token: UUID
     let workspaceID: UUID
     let kind: AgentSidebarBulkActionKind
+    let origin: AgentSidebarBulkActionOrigin
     let targetCount: Int
 }
 
@@ -74,8 +80,17 @@ struct AgentSidebarSelectionState: Equatable {
     var notice: AgentSidebarBulkActionNotice?
     var revision = 0
 
-    var isSelectionMode: Bool {
-        !selectedIdentities.isEmpty || inFlightAction != nil
+    var showsSelectionPresentation: Bool {
+        !selectedIdentities.isEmpty || inFlightAction?.origin == .selection
+    }
+
+    var isMutationInFlight: Bool {
+        inFlightAction != nil
+    }
+
+    var commandProgressOperation: AgentSidebarBulkActionOperation? {
+        guard inFlightAction?.origin == .command else { return nil }
+        return inFlightAction
     }
 
     mutating func handle(
@@ -91,7 +106,7 @@ struct AgentSidebarSelectionState: Equatable {
 
         switch gesture {
         case .primary:
-            guard isSelectionMode else { return .activate }
+            guard !selectedIdentities.isEmpty else { return .activate }
             selectedIdentities = [identity]
             anchor = identity
         case .toggle:

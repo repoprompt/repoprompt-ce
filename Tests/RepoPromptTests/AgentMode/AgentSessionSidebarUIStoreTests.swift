@@ -72,19 +72,108 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertNil(store.selectionState.anchor)
     }
 
-    func testBulkActionFreezesSelectionAndRejectsReentry() throws {
+    func testCommandOriginWithoutSelectionUsesCommandProgressPolicy() throws {
         let store = AgentSessionSidebarUIStore()
-        let first = AgentSidebarSelectionIdentity.active(tabID: id(1))
-        _ = store.handleSelectionGesture(.toggle, identity: first, renderedOrder: [first], workspaceID: id(99))
-        let token = store.beginBulkAction(kind: .delete, targetCount: 1, workspaceID: id(99))
-        XCTAssertNotNil(token)
-        XCTAssertNil(store.beginBulkAction(kind: .delete, targetCount: 1, workspaceID: id(99)))
-        XCTAssertEqual(store.handleSelectionGesture(.toggle, identity: first, renderedOrder: [first], workspaceID: id(99)), .ignored)
+        let workspaceID = id(99)
+        let token = try XCTUnwrap(store.beginBulkAction(
+            kind: .delete,
+            origin: .command,
+            targetCount: 1,
+            workspaceID: workspaceID
+        ))
 
-        store.reconcileSelection(renderedOrder: [], workspaceID: id(99))
+        XCTAssertEqual(store.selectionState.inFlightAction, AgentSidebarBulkActionOperation(
+            token: token,
+            workspaceID: workspaceID,
+            kind: .delete,
+            origin: .command,
+            targetCount: 1
+        ))
+        XCTAssertTrue(store.selectionState.isMutationInFlight)
+        XCTAssertFalse(store.selectionState.showsSelectionPresentation)
+        XCTAssertEqual(store.selectionState.commandProgressOperation, store.selectionState.inFlightAction)
+
+        store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
+
+        XCTAssertFalse(store.selectionState.isMutationInFlight)
+        XCTAssertFalse(store.selectionState.showsSelectionPresentation)
+        XCTAssertNil(store.selectionState.commandProgressOperation)
+    }
+
+    func testSelectionOriginSurvivesEmptyReconciliationUntilFinish() throws {
+        let store = AgentSessionSidebarUIStore()
+        let workspaceID = id(99)
+        let first = AgentSidebarSelectionIdentity.active(tabID: id(1))
+        _ = store.handleSelectionGesture(.toggle, identity: first, renderedOrder: [first], workspaceID: workspaceID)
+        let token = try XCTUnwrap(store.beginBulkAction(
+            kind: .stash,
+            origin: .selection,
+            targetCount: 1,
+            workspaceID: workspaceID
+        ))
+
+        XCTAssertTrue(store.selectionState.isMutationInFlight)
+        XCTAssertTrue(store.selectionState.showsSelectionPresentation)
+        XCTAssertNil(store.selectionState.commandProgressOperation)
+
+        store.reconcileSelection(renderedOrder: [], workspaceID: workspaceID)
+
         XCTAssertTrue(store.selectionState.selectedIdentities.isEmpty)
-        try store.finishBulkAction(token: XCTUnwrap(token), workspaceID: id(99), notice: nil)
-        XCTAssertTrue(store.selectionState.selectedIdentities.isEmpty)
+        XCTAssertTrue(store.selectionState.showsSelectionPresentation)
+        XCTAssertEqual(store.selectionState.inFlightAction, .init(
+            token: token,
+            workspaceID: workspaceID,
+            kind: .stash,
+            origin: .selection,
+            targetCount: 1
+        ))
+
+        store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
+
+        XCTAssertFalse(store.selectionState.isMutationInFlight)
+        XCTAssertFalse(store.selectionState.showsSelectionPresentation)
+    }
+
+    func testBulkActionLocksSelectionMutationsAndRejectsReentryForBothOrigins() throws {
+        for origin in [AgentSidebarBulkActionOrigin.selection, .command] {
+            let store = AgentSessionSidebarUIStore()
+            let workspaceID = id(99)
+            let first = AgentSidebarSelectionIdentity.active(tabID: id(1))
+            let second = AgentSidebarSelectionIdentity.active(tabID: id(2))
+            if origin == .selection {
+                _ = store.handleSelectionGesture(
+                    .toggle,
+                    identity: first,
+                    renderedOrder: [first, second],
+                    workspaceID: workspaceID
+                )
+            }
+            let token = try XCTUnwrap(store.beginBulkAction(
+                kind: .delete,
+                origin: origin,
+                targetCount: 1,
+                workspaceID: workspaceID
+            ))
+            let frozenState = store.selectionState
+
+            XCTAssertNil(store.beginBulkAction(
+                kind: .stash,
+                origin: origin,
+                targetCount: 1,
+                workspaceID: workspaceID
+            ))
+            XCTAssertEqual(store.handleSelectionGesture(
+                .toggle,
+                identity: second,
+                renderedOrder: [first, second],
+                workspaceID: workspaceID
+            ), .ignored)
+            store.selectAll(renderedOrder: [first, second], workspaceID: workspaceID)
+            store.clearSelection()
+
+            XCTAssertEqual(store.selectionState, frozenState)
+            store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
+        }
     }
 
     func testDirectBulkActionRetainsWorkspaceOwnerWithoutSelection() throws {
@@ -92,6 +181,7 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         let workspaceID = id(99)
         let token = try XCTUnwrap(store.beginBulkAction(
             kind: .delete,
+            origin: .command,
             targetCount: 1,
             workspaceID: workspaceID
         ))
@@ -102,35 +192,58 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertTrue(store.isCurrentBulkAction(token: token, workspaceID: workspaceID))
     }
 
-    func testWorkspaceMismatchReconciliationInvalidatesBulkAction() throws {
-        let store = AgentSessionSidebarUIStore()
-        let firstWorkspaceID = id(98)
-        let token = try XCTUnwrap(store.beginBulkAction(
-            kind: .delete,
-            targetCount: 1,
-            workspaceID: firstWorkspaceID
-        ))
+    func testWorkspaceInvalidationClearsBothOriginsAndRejectsStaleFinish() throws {
+        for origin in [AgentSidebarBulkActionOrigin.selection, .command] {
+            let store = AgentSessionSidebarUIStore()
+            let workspaceID = id(99)
+            let first = AgentSidebarSelectionIdentity.active(tabID: id(1))
+            if origin == .selection {
+                _ = store.handleSelectionGesture(
+                    .toggle,
+                    identity: first,
+                    renderedOrder: [first],
+                    workspaceID: workspaceID
+                )
+            }
+            let token = try XCTUnwrap(store.beginBulkAction(
+                kind: .delete,
+                origin: origin,
+                targetCount: 1,
+                workspaceID: workspaceID
+            ))
 
-        store.reconcileSelection(renderedOrder: [], workspaceID: id(99))
-        store.finishBulkAction(
-            token: token,
-            workspaceID: firstWorkspaceID,
-            notice: .init(severity: .error, title: "Stale", message: "Stale")
-        )
+            store.invalidateSelectionForWorkspaceChange()
+            store.finishBulkAction(
+                token: token,
+                workspaceID: workspaceID,
+                notice: .init(severity: .error, title: "Stale", message: "Stale")
+            )
 
-        XCTAssertNil(store.selectionState.inFlightAction)
-        XCTAssertNil(store.selectionState.notice)
-        XCTAssertNil(store.selectionState.workspaceID)
+            XCTAssertNil(store.selectionState.inFlightAction)
+            XCTAssertNil(store.selectionState.commandProgressOperation)
+            XCTAssertFalse(store.selectionState.isMutationInFlight)
+            XCTAssertFalse(store.selectionState.showsSelectionPresentation)
+            XCTAssertNil(store.selectionState.notice)
+            XCTAssertNil(store.selectionState.workspaceID)
+            XCTAssertTrue(store.selectionState.selectedIdentities.isEmpty)
+        }
     }
 
-    func testStaleBulkCompletionCannotMutateNewWorkspaceState() throws {
+    func testCommandOriginWithSelectionKeepsBothPresentationPoliciesRepresentable() throws {
         let store = AgentSessionSidebarUIStore()
+        let workspaceID = id(99)
         let first = AgentSidebarSelectionIdentity.active(tabID: id(1))
-        _ = store.handleSelectionGesture(.toggle, identity: first, renderedOrder: [first], workspaceID: id(99))
-        let token = try XCTUnwrap(store.beginBulkAction(kind: .stash, targetCount: 1, workspaceID: id(99)))
-        store.invalidateSelectionForWorkspaceChange()
-        store.finishBulkAction(token: token, workspaceID: id(99), notice: .init(severity: .error, title: "Old", message: "Old"))
-        XCTAssertEqual(store.selectionState, AgentSidebarSelectionState(revision: store.selectionState.revision))
+        _ = store.handleSelectionGesture(.toggle, identity: first, renderedOrder: [first], workspaceID: workspaceID)
+
+        let token = try XCTUnwrap(store.beginBulkAction(
+            kind: .delete,
+            origin: .command,
+            targetCount: 1,
+            workspaceID: workspaceID
+        ))
+
+        XCTAssertTrue(store.selectionState.showsSelectionPresentation)
+        XCTAssertEqual(store.selectionState.commandProgressOperation?.token, token)
     }
 
     func testModifierMappingGivesShiftPrecedence() {

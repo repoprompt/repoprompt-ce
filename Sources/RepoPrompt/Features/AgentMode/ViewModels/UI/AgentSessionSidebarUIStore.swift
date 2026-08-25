@@ -81,7 +81,12 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         publishSelection(next, eventName: "sessionSidebar.selection.reconcile")
     }
 
-    func beginBulkAction(kind: AgentSidebarBulkActionKind, targetCount: Int, workspaceID: UUID) -> UUID? {
+    func beginBulkAction(
+        kind: AgentSidebarBulkActionKind,
+        origin: AgentSidebarBulkActionOrigin,
+        targetCount: Int,
+        workspaceID: UUID
+    ) -> UUID? {
         guard selectionState.inFlightAction == nil, targetCount > 0 else { return nil }
         let token = UUID()
         var next = selectionState
@@ -91,6 +96,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             token: token,
             workspaceID: workspaceID,
             kind: kind,
+            origin: origin,
             targetCount: targetCount
         )
         next.revision &+= 1
@@ -253,7 +259,13 @@ final class AgentSessionSidebarUIStore: ObservableObject {
                     "revision": String(next.revision),
                     "selectedCount": String(next.selectedIdentities.count),
                     "hasAnchor": String(next.anchor != nil),
-                    "inFlightKind": next.inFlightAction?.kind.rawValue ?? "none"
+                    "inFlightKind": next.inFlightAction?.kind.rawValue ?? "none",
+                    "inFlightOrigin": next.inFlightAction.map {
+                        switch $0.origin {
+                        case .selection: "selection"
+                        case .command: "command"
+                        }
+                    } ?? "none"
                 ]
             )
         #endif

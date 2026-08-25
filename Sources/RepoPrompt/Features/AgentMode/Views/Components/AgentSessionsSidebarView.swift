@@ -421,9 +421,16 @@ struct AgentModeSessionsListView: View {
         let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
         let firstActiveSectionID = activeSections.first?.id
         let selectionState = sidebarUI.selectionState
+        let showsSelectionPresentation = selectionState.showsSelectionPresentation
+        let isInteractionEnabled = !selectionState.isMutationInFlight
+        let allowsDirectMutations = !showsSelectionPresentation && isInteractionEnabled
         VStack(spacing: 4) {
-            if selectionState.isSelectionMode {
-                if let bulkTargets = agentModeVM.sidebarBulkMutationTargets(
+            if let operation = selectionState.commandProgressOperation {
+                commandProgress(operation)
+            } else if showsSelectionPresentation {
+                if let operation = selectionState.inFlightAction {
+                    inFlightBulkActionBar(selectionState: selectionState, operation: operation)
+                } else if let bulkTargets = agentModeVM.sidebarBulkMutationTargets(
                     selection: selectionState.selectedIdentities,
                     selectionWorkspaceID: selectionState.workspaceID,
                     projection: snapshot,
@@ -487,8 +494,8 @@ struct AgentModeSessionsListView: View {
                                     hiddenThreadDescendantAttentionCount: session.hiddenThreadDescendantAttentionCount,
                                     onToggleThreadCollapse: toggleThreadAction,
                                     isSelected: selectionState.selectedIdentities.contains(.active(tabID: session.tabID)),
-                                    isSelectionMode: selectionState.isSelectionMode,
-                                    isSelectionEnabled: selectionState.inFlightAction == nil,
+                                    showsSelectionPresentation: showsSelectionPresentation,
+                                    isInteractionEnabled: isInteractionEnabled,
                                     onSelectionGesture: { gesture in
                                         agentModeVM.handleSidebarSelectionGesture(
                                             gesture,
@@ -512,6 +519,9 @@ struct AgentModeSessionsListView: View {
                                     },
                                     onStash: stashAction,
                                     onDelete: {
+                                        guard let workspaceID = snapshot.workspaceID,
+                                              agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+                                        else { return }
                                         #if DEBUG
                                             agentModeVM.debugBeginSidebarDeleteRequest(
                                                 tabID: session.tabID,
@@ -519,10 +529,12 @@ struct AgentModeSessionsListView: View {
                                                 reason: "row_delete_confirmation"
                                             )
                                         #endif
-                                        performSingleActiveBulkAction(.delete, tabID: session.tabID, workspaceID: snapshot.workspaceID)
+                                        performSingleActiveBulkAction(.delete, tabID: session.tabID, workspaceID: workspaceID)
                                     },
                                     onRename: { newName in
-                                        guard agentModeVM.workspaceManager?.activeWorkspaceID == snapshot.workspaceID else { return }
+                                        guard let workspaceID = snapshot.workspaceID,
+                                              agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+                                        else { return }
                                         agentModeVM.renameSession(tabID: session.tabID, to: newName)
                                     },
                                     onDismissAttention: dismissAttentionAction,
@@ -584,7 +596,7 @@ struct AgentModeSessionsListView: View {
                                 .buttonStyle(.plain)
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                                 .foregroundStyle(.tertiary)
-                                .disabled(selectionState.isSelectionMode)
+                                .disabled(!allowsDirectMutations)
                                 .popover(isPresented: $showingClearArchivedConfirmation, arrowEdge: .bottom) {
                                     VStack(alignment: .leading, spacing: 12) {
                                         Text("Clear archived sessions?")
@@ -599,14 +611,17 @@ struct AgentModeSessionsListView: View {
                                             }
                                             Button("Clear") {
                                                 showingClearArchivedConfirmation = false
-                                                guard let workspaceID = snapshot.workspaceID else { return }
+                                                guard let workspaceID = snapshot.workspaceID,
+                                                      agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+                                                else { return }
                                                 let archivedTargets = Set(snapshot.archivedSessionTabsForHeader.map {
                                                     PromptViewModel.ArchivedTabMutationTarget(
                                                         stashedTabID: $0.id,
                                                         tabID: $0.tab.id
                                                     )
                                                 })
-                                                performBulkAction(.delete, targets: .init(
+                                                guard !archivedTargets.isEmpty else { return }
+                                                performBulkAction(.delete, origin: .command, targets: .init(
                                                     workspaceID: workspaceID,
                                                     activeDeleteTabIDs: [],
                                                     archivedDeleteTargets: archivedTargets,
@@ -616,6 +631,7 @@ struct AgentModeSessionsListView: View {
                                                 ))
                                             }
                                             .keyboardShortcut(.defaultAction)
+                                            .disabled(!allowsDirectMutations)
                                         }
                                     }
                                     .padding()
@@ -650,6 +666,11 @@ struct AgentModeSessionsListView: View {
             showingClearArchivedConfirmation = false
             showingBulkDeleteConfirmation = false
         }
+        .task(id: selectionState.inFlightAction?.token) {
+            guard selectionState.inFlightAction != nil else { return }
+            showingClearArchivedConfirmation = false
+            showingBulkDeleteConfirmation = false
+        }
         .task(id: defaultCollapseSeedKeys) {
             agentModeVM.seedDefaultCollapsedSidebarThreads(defaultCollapseSeedKeys)
         }
@@ -662,6 +683,65 @@ struct AgentModeSessionsListView: View {
         }
     }
 
+    private func commandProgress(_ operation: AgentSidebarBulkActionOperation) -> some View {
+        let verb = switch operation.kind {
+        case .delete: "Deleting"
+        case .stash: "Stashing"
+        case .pin: "Pinning"
+        case .unpin: "Unpinning"
+        }
+        let message = operation.targetCount == 1
+            ? "\(verb) chat…"
+            : "\(verb) \(operation.targetCount) chats…"
+        let accessibilityLabel = operation.targetCount == 1
+            ? "\(verb) chat"
+            : "\(verb) \(operation.targetCount) chats"
+        return HStack(spacing: 6) {
+            ProgressView().controlSize(.small)
+            Text(message)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, listHorizontalPadding)
+        .padding(.top, 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func inFlightBulkActionBar(
+        selectionState: AgentSidebarSelectionState,
+        operation: AgentSidebarBulkActionOperation
+    ) -> some View {
+        let selectedCount = selectionState.selectedIdentities.count
+        return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
+            Text("\(selectedCount) selected")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("\(operation.kind.rawValue.capitalized) \(operation.targetCount) \(operation.targetCount == 1 ? "chat" : "chats")…")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, bulkBarInnerHorizontalPadding)
+        .padding(.vertical, bulkBarInnerVerticalPadding)
+        .background(
+            RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                .fill(Color(NSColor.systemGray).opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                        .stroke(Color(NSColor.systemGray).opacity(0.3), lineWidth: 0.5)
+                )
+        )
+        .padding(.horizontal, listHorizontalPadding)
+        .padding(.top, 4)
+    }
+
     private func bulkActionBar(
         selectionState: AgentSidebarSelectionState,
         targets: AgentModeViewModel.SidebarBulkMutationTargets,
@@ -669,8 +749,7 @@ struct AgentModeSessionsListView: View {
     ) -> some View {
         let selectedCount = selectionState.selectedIdentities.count
         let deleteCount = targets.activeDeleteTabIDs.count + targets.archivedDeleteTargets.count
-        let isBusy = selectionState.inFlightAction != nil
-        let canSelectAll = !isBusy && selectedCount != renderedOrder.count
+        let canSelectAll = selectedCount != renderedOrder.count
         return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
             HStack(spacing: 8) {
                 Text("\(selectedCount) selected")
@@ -688,52 +767,41 @@ struct AgentModeSessionsListView: View {
                 Button("Cancel") { sidebarUI.clearSelection() }
                     .buttonStyle(.plain)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                    .foregroundStyle(isBusy ? Color.secondary.opacity(0.5) : .secondary)
+                    .foregroundStyle(.secondary)
                     .keyboardShortcut(.cancelAction)
-                    .disabled(isBusy)
             }
 
-            if let operation = selectionState.inFlightAction {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("\(operation.kind.rawValue.capitalized) \(operation.targetCount) chats…")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
+            HStack(spacing: bulkChipSpacing) {
+                if !targets.pinTabIDs.isEmpty {
+                    BulkActionChip(systemImage: "pin", verb: "Pin", count: targets.pinTabIDs.count) {
+                        performBulkAction(.pin, origin: .selection, targets: targets)
+                    }
                 }
-            } else {
-                HStack(spacing: bulkChipSpacing) {
-                    if !targets.pinTabIDs.isEmpty {
-                        BulkActionChip(systemImage: "pin", verb: "Pin", count: targets.pinTabIDs.count) {
-                            performBulkAction(.pin, targets: targets)
-                        }
+                if !targets.unpinTabIDs.isEmpty {
+                    BulkActionChip(systemImage: "pin.slash", verb: "Unpin", count: targets.unpinTabIDs.count) {
+                        performBulkAction(.unpin, origin: .selection, targets: targets)
                     }
-                    if !targets.unpinTabIDs.isEmpty {
-                        BulkActionChip(systemImage: "pin.slash", verb: "Unpin", count: targets.unpinTabIDs.count) {
-                            performBulkAction(.unpin, targets: targets)
-                        }
-                    }
-                    if !targets.stashTabIDs.isEmpty {
-                        BulkActionChip(
-                            systemImage: "tray.and.arrow.down",
-                            verb: "Stash",
-                            count: targets.stashTabIDs.count,
-                            tooltip: "Stash — related sub-agent chats may also be stashed"
-                        ) {
-                            performBulkAction(.stash, targets: targets)
-                        }
-                    }
+                }
+                if !targets.stashTabIDs.isEmpty {
                     BulkActionChip(
-                        systemImage: "trash",
-                        verb: "Delete",
-                        count: deleteCount,
-                        isDestructive: true
+                        systemImage: "tray.and.arrow.down",
+                        verb: "Stash",
+                        count: targets.stashTabIDs.count,
+                        tooltip: "Stash — related sub-agent chats may also be stashed"
                     ) {
-                        showingBulkDeleteConfirmation = true
+                        performBulkAction(.stash, origin: .selection, targets: targets)
                     }
-                    .popover(isPresented: $showingBulkDeleteConfirmation, arrowEdge: .bottom) {
-                        bulkDeleteConfirmation(targets: targets)
-                    }
+                }
+                BulkActionChip(
+                    systemImage: "trash",
+                    verb: "Delete",
+                    count: deleteCount,
+                    isDestructive: true
+                ) {
+                    showingBulkDeleteConfirmation = true
+                }
+                .popover(isPresented: $showingBulkDeleteConfirmation, arrowEdge: .bottom) {
+                    bulkDeleteConfirmation(targets: targets)
                 }
             }
 
@@ -767,7 +835,7 @@ struct AgentModeSessionsListView: View {
                     .keyboardShortcut(.cancelAction)
                 Button("Delete", role: .destructive) {
                     showingBulkDeleteConfirmation = false
-                    performBulkAction(.delete, targets: targets)
+                    performBulkAction(.delete, origin: .selection, targets: targets)
                 }
             }
         }
@@ -798,7 +866,7 @@ struct AgentModeSessionsListView: View {
             Button { sidebarUI.dismissBulkActionNotice() } label: { Image(systemName: "xmark") }
                 .buttonStyle(.plain)
                 .font(.system(size: fontPreset.scaledClamped(10, max: 13)))
-                .accessibilityLabel("Dismiss bulk action notice")
+                .accessibilityLabel("Dismiss action notice")
         }
         .foregroundStyle(presentation.color)
     }
@@ -809,7 +877,7 @@ struct AgentModeSessionsListView: View {
         workspaceID: UUID?
     ) {
         guard let workspaceID else { return }
-        performBulkAction(action, targets: .init(
+        performBulkAction(action, origin: .command, targets: .init(
             workspaceID: workspaceID,
             activeDeleteTabIDs: action == .delete ? [tabID] : [],
             archivedDeleteTargets: [],
@@ -821,11 +889,13 @@ struct AgentModeSessionsListView: View {
 
     private func performBulkAction(
         _ action: AgentSidebarBulkActionKind,
+        origin: AgentSidebarBulkActionOrigin,
         targets: AgentModeViewModel.SidebarBulkMutationTargets
     ) {
         Task {
             await agentModeVM.performSidebarBulkAction(
                 action,
+                origin: origin,
                 targets: targets,
                 promptManager: promptManager
             )
@@ -1099,7 +1169,9 @@ struct ArchivedSessionsList: View {
     }
 
     private func deleteArchived(_ stashed: StashedTab) {
-        guard let workspaceID else { return }
+        guard let workspaceID,
+              agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+        else { return }
         let target = PromptViewModel.ArchivedTabMutationTarget(
             stashedTabID: stashed.id,
             tabID: stashed.tab.id
@@ -1113,7 +1185,12 @@ struct ArchivedSessionsList: View {
             unpinTabIDs: []
         )
         Task {
-            await agentModeVM.performSidebarBulkAction(.delete, targets: targets, promptManager: promptManager)
+            await agentModeVM.performSidebarBulkAction(
+                .delete,
+                origin: .command,
+                targets: targets,
+                promptManager: promptManager
+            )
         }
     }
 
@@ -1135,8 +1212,8 @@ struct ArchivedSessionsList: View {
                     AgentStashedSessionRow(
                         stashed: stashed,
                         isSelected: selectionState.selectedIdentities.contains(identity),
-                        isSelectionMode: selectionState.isSelectionMode,
-                        isSelectionEnabled: selectionState.inFlightAction == nil,
+                        showsSelectionPresentation: selectionState.showsSelectionPresentation,
+                        isInteractionEnabled: !selectionState.isMutationInFlight,
                         onSelectionGesture: { gesture in
                             agentModeVM.handleSidebarSelectionGesture(
                                 gesture,
@@ -1147,7 +1224,9 @@ struct ArchivedSessionsList: View {
                         },
                         onRestore: {
                             Task {
-                                guard agentModeVM.workspaceManager?.activeWorkspaceID == workspaceID else { return }
+                                guard let workspaceID,
+                                      agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID)
+                                else { return }
                                 await promptManager.unstashTab(stashed.id)
                             }
                         },

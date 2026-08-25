@@ -137,8 +137,16 @@ extension AgentModeViewModel {
         )
     }
 
+    func canPerformDirectSidebarCommand(workspaceID: UUID) -> Bool {
+        let selectionState = ui.sessionSidebar.selectionState
+        return workspaceManager?.activeWorkspaceID == workspaceID
+            && !selectionState.isMutationInFlight
+            && !selectionState.showsSelectionPresentation
+    }
+
     func performSidebarBulkAction(
         _ action: AgentSidebarBulkActionKind,
+        origin: AgentSidebarBulkActionOrigin,
         targets: SidebarBulkMutationTargets,
         promptManager: PromptViewModel
     ) async {
@@ -148,13 +156,14 @@ extension AgentModeViewModel {
         case .pin: targets.pinTabIDs.count
         case .unpin: targets.unpinTabIDs.count
         }
-        guard workspaceManager?.activeWorkspaceID == targets.workspaceID,
-              let token = ui.sessionSidebar.beginBulkAction(
-                  kind: action,
-                  targetCount: targetCount,
-                  workspaceID: targets.workspaceID
-              )
-        else { return }
+        guard workspaceManager?.activeWorkspaceID == targets.workspaceID else { return }
+        if origin == .command, ui.sessionSidebar.selectionState.showsSelectionPresentation { return }
+        guard let token = ui.sessionSidebar.beginBulkAction(
+            kind: action,
+            origin: origin,
+            targetCount: targetCount,
+            workspaceID: targets.workspaceID
+        ) else { return }
 
         let workspaceID = targets.workspaceID
         let contextIsCurrent: @MainActor () -> Bool = { [weak self] in
@@ -180,13 +189,13 @@ extension AgentModeViewModel {
                 archivedTargets: targets.archivedDeleteTargets,
                 isMutationContextCurrent: contextIsCurrent
             )
-            notice = sidebarBulkActionNotice(for: report, action: action)
+            notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
         case .stash:
             let report = await promptManager.stashComposeTabs(
                 withIDs: targets.stashTabIDs,
                 isMutationContextCurrent: contextIsCurrent
             )
-            notice = sidebarBulkActionNotice(for: report, action: action)
+            notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
         case .pin:
             let report = promptManager.setComposeTabsPinned(
                 true,
@@ -197,7 +206,9 @@ extension AgentModeViewModel {
                 notice = AgentSidebarBulkActionNotice(
                     severity: .warning,
                     title: "Chats were not pinned",
-                    message: "The workspace or selected chats changed before the action could be applied."
+                    message: origin == .selection
+                        ? "The workspace or selected chats changed before the action could be applied."
+                        : "The workspace or requested chats changed before the action could be applied."
                 )
             }
         case .unpin:
@@ -210,7 +221,9 @@ extension AgentModeViewModel {
                 notice = AgentSidebarBulkActionNotice(
                     severity: .warning,
                     title: "Chats were not unpinned",
-                    message: "The workspace or selected chats changed before the action could be applied."
+                    message: origin == .selection
+                        ? "The workspace or selected chats changed before the action could be applied."
+                        : "The workspace or requested chats changed before the action could be applied."
                 )
             }
         }
@@ -223,13 +236,18 @@ extension AgentModeViewModel {
 
     func sidebarBulkActionNotice(
         for report: PromptViewModel.ComposeTabMutationReport,
-        action: AgentSidebarBulkActionKind
+        action: AgentSidebarBulkActionKind,
+        origin: AgentSidebarBulkActionOrigin
     ) -> AgentSidebarBulkActionNotice? {
+        let partialTitle = origin == .selection
+            ? "Bulk action partially completed"
+            : "Action partially completed"
+        let targetDescription = origin == .selection ? "selected" : "requested"
         if let cleanupIssue = report.cleanupIssues.first, !report.rejections.isEmpty {
             return AgentSidebarBulkActionNotice(
                 severity: .error,
-                title: "Bulk action partially completed",
-                message: "Some chats changed, cleanup failed for \(report.cleanupIssues.count) chat(s), and some selected or related chats were not changed. \(cleanupIssue.message)"
+                title: partialTitle,
+                message: "Some chats changed, cleanup failed for \(report.cleanupIssues.count) chat(s), and some \(targetDescription) or related chats were not changed. \(cleanupIssue.message)"
             )
         }
         if let cleanupIssue = report.cleanupIssues.first {
@@ -242,8 +260,8 @@ extension AgentModeViewModel {
         if report.didMutateProjection, !report.rejections.isEmpty {
             return AgentSidebarBulkActionNotice(
                 severity: .warning,
-                title: "Bulk action partially completed",
-                message: "Some chats changed, but some selected or related chats were rejected before mutation."
+                title: partialTitle,
+                message: "Some chats changed, but some \(targetDescription) or related chats were rejected before mutation."
             )
         }
         if let rejection = report.rejections.first {
@@ -257,7 +275,7 @@ extension AgentModeViewModel {
             return AgentSidebarBulkActionNotice(
                 severity: .information,
                 title: "No chats were changed",
-                message: "The selected chats no longer matched the \(action.rawValue) action."
+                message: "The \(targetDescription) chats no longer matched the \(action.rawValue) action."
             )
         }
         return nil
