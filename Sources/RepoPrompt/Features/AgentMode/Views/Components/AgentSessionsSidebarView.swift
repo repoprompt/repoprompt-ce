@@ -515,7 +515,10 @@ struct AgentModeSessionsListView: View {
                                     isSelected: selectionState.selectedIdentities.contains(identity),
                                     showsSelectionPresentation: showsSelectionPresentation,
                                     isInteractionEnabled: isInteractionEnabled,
-                                    commandProgressKind: selectionState.commandRowProgressOperation(for: identity)?.kind,
+                                    commandProgressKind: selectionState.commandRowProgressOperation(
+                                        for: identity,
+                                        workspaceID: snapshot.workspaceID
+                                    )?.kind,
                                     onSelectionGesture: { gesture in
                                         agentModeVM.handleSidebarSelectionGesture(
                                             gesture,
@@ -727,31 +730,35 @@ struct AgentModeSessionsListView: View {
         operation: AgentSidebarBulkActionOperation
     ) -> some View {
         let selectedCount = selectionState.selectedIdentities.count
-        return ZStack(alignment: .topLeading) {
-            VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
-                HStack(spacing: 8) {
-                    Text("1 selected")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                    Spacer(minLength: 8)
-                    Text("Select All")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                    Text("Cancel")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                }
-                HStack(spacing: bulkChipSpacing) {
-                    BulkActionChipLabel(systemImage: "trash", count: operation.targetCount)
-                }
+        return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
+            HStack(spacing: 8) {
+                Text("1 selected")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                Spacer(minLength: 8)
+                Text("Select All")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                Text("Cancel")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
             }
-            .hidden()
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-
+            HStack(spacing: bulkChipSpacing) {
+                BulkActionChipLabel(systemImage: "trash", count: operation.targetCount)
+            }
+        }
+        .hidden()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+        .overlay(alignment: .topLeading) {
             VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
                 if selectedCount > 0 {
                     Text("\(selectedCount) selected")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
                         .foregroundStyle(.secondary)
                         .accessibilityAddTraits(.isHeader)
+                } else {
+                    Text("1 selected")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                        .hidden()
+                        .accessibilityHidden(true)
                 }
 
                 HStack(spacing: 6) {
@@ -759,6 +766,8 @@ struct AgentModeSessionsListView: View {
                     Text("\(operation.kind.rawValue.capitalized) \(operation.targetCount) \(operation.targetCount == 1 ? "chat" : "chats")…")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                     Spacer(minLength: 0)
                 }
             }
@@ -1253,7 +1262,10 @@ struct ArchivedSessionsList: View {
                         isSelected: selectionState.selectedIdentities.contains(identity),
                         showsSelectionPresentation: selectionState.showsSelectionPresentation,
                         isInteractionEnabled: !selectionState.isMutationInFlight,
-                        commandProgressKind: selectionState.commandRowProgressOperation(for: identity)?.kind,
+                        commandProgressKind: selectionState.commandRowProgressOperation(
+                            for: identity,
+                            workspaceID: workspaceID
+                        )?.kind,
                         onSelectionGesture: { gesture in
                             agentModeVM.handleSidebarSelectionGesture(
                                 gesture,

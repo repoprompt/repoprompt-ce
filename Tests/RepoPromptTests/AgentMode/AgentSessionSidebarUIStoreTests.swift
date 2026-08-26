@@ -94,15 +94,22 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         ))
         XCTAssertTrue(store.selectionState.isMutationInFlight)
         XCTAssertFalse(store.selectionState.showsSelectionPresentation)
-        XCTAssertEqual(store.selectionState.commandRowProgressOperation(for: target), store.selectionState.inFlightAction)
-        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: .active(tabID: id(2))))
+        XCTAssertEqual(
+            store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID),
+            store.selectionState.inFlightAction
+        )
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(
+            for: .active(tabID: id(2)),
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: id(98)))
         XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
 
         store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
 
         XCTAssertFalse(store.selectionState.isMutationInFlight)
         XCTAssertFalse(store.selectionState.showsSelectionPresentation)
-        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target))
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID))
     }
 
     func testSelectionOriginSurvivesEmptyReconciliationUntilFinish() throws {
@@ -120,7 +127,7 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
 
         XCTAssertTrue(store.selectionState.isMutationInFlight)
         XCTAssertTrue(store.selectionState.showsSelectionPresentation)
-        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first))
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first, workspaceID: workspaceID))
         XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
 
         store.reconcileSelection(renderedOrder: [], workspaceID: workspaceID)
@@ -233,7 +240,7 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             )
 
             XCTAssertNil(store.selectionState.inFlightAction)
-            XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first))
+            XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first, workspaceID: workspaceID))
             XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
             XCTAssertFalse(store.selectionState.isMutationInFlight)
             XCTAssertFalse(store.selectionState.showsSelectionPresentation)
@@ -273,7 +280,7 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             )
 
             XCTAssertNil(store.selectionState.inFlightAction)
-            XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first))
+            XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first, workspaceID: originalWorkspaceID))
             XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
             XCTAssertFalse(store.selectionState.isMutationInFlight)
             XCTAssertFalse(store.selectionState.showsSelectionPresentation)
@@ -366,7 +373,7 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertEqual(operation.token, token)
         XCTAssertEqual(operation.targetCount, 2)
         XCTAssertEqual(operation.presentationTargets, [first, second])
-        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first))
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first, workspaceID: workspaceID))
     }
 
     func testBulkActionRejectsInvalidOriginAndProgressPlacementCombinations() {

@@ -99,10 +99,12 @@ struct AgentSidebarSelectionState: Equatable {
     }
 
     func commandRowProgressOperation(
-        for identity: AgentSidebarSelectionIdentity
+        for identity: AgentSidebarSelectionIdentity,
+        workspaceID: UUID?
     ) -> AgentSidebarBulkActionOperation? {
         guard let operation = inFlightAction,
               operation.origin == .command,
+              operation.workspaceID == workspaceID,
               operation.commandProgressPlacement == .row,
               operation.presentationTargets.contains(identity)
         else { return nil }

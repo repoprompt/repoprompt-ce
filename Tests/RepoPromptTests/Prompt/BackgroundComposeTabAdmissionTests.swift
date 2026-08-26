@@ -621,11 +621,17 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertTrue(viewModel.ui.sessionSidebar.selectionState.isMutationInFlight)
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.showsSelectionPresentation)
         XCTAssertEqual(
-            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: .active(tabID: tabID)),
+            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
+                for: .active(tabID: tabID),
+                workspaceID: workspaceID
+            ),
             operation
         )
         XCTAssertNil(
-            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: .active(tabID: UUID()))
+            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
+                for: .active(tabID: UUID()),
+                workspaceID: workspaceID
+            )
         )
 
         await viewModel.performSidebarBulkAction(
@@ -647,7 +653,10 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.isMutationInFlight)
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.showsSelectionPresentation)
         XCTAssertNil(
-            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: .active(tabID: tabID))
+            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
+                for: .active(tabID: tabID),
+                workspaceID: workspaceID
+            )
         )
     }
 
@@ -697,7 +706,10 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertNil(operation.commandProgressPlacement)
         XCTAssertTrue(viewModel.ui.sessionSidebar.selectionState.isMutationInFlight)
         XCTAssertTrue(viewModel.ui.sessionSidebar.selectionState.showsSelectionPresentation)
-        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: identity))
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
+            for: identity,
+            workspaceID: workspaceID
+        ))
         XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.archivedHeaderCommandProgressOperation)
 
         viewModel.ui.sessionSidebar.reconcileSelection(renderedOrder: [], workspaceID: workspaceID)
@@ -712,7 +724,10 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertFalse(fixture.prompt.currentComposeTabs.contains(where: { $0.id == tabID }))
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.isMutationInFlight)
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.showsSelectionPresentation)
-        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: identity))
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
+            for: identity,
+            workspaceID: workspaceID
+        ))
     }
 
     func testMixedDeleteDoesNotRetryArchivedTargetRejectedDuringActiveCascade() async throws {
