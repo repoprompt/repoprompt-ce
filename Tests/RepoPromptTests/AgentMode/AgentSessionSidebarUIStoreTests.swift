@@ -229,21 +229,102 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         }
     }
 
-    func testCommandOriginWithSelectionKeepsBothPresentationPoliciesRepresentable() throws {
+    func testWorkspaceMismatchReconciliationClearsBothOriginsAndRejectsStaleFinish() throws {
+        for origin in [AgentSidebarBulkActionOrigin.selection, .command] {
+            let store = AgentSessionSidebarUIStore()
+            let originalWorkspaceID = id(98)
+            let nextWorkspaceID = id(99)
+            let first = AgentSidebarSelectionIdentity.active(tabID: id(1))
+            if origin == .selection {
+                _ = store.handleSelectionGesture(
+                    .toggle,
+                    identity: first,
+                    renderedOrder: [first],
+                    workspaceID: originalWorkspaceID
+                )
+            }
+            let token = try XCTUnwrap(store.beginBulkAction(
+                kind: .delete,
+                origin: origin,
+                targetCount: 1,
+                workspaceID: originalWorkspaceID
+            ))
+
+            store.reconcileSelection(renderedOrder: [], workspaceID: nextWorkspaceID)
+            store.finishBulkAction(
+                token: token,
+                workspaceID: originalWorkspaceID,
+                notice: .init(severity: .error, title: "Stale", message: "Stale")
+            )
+
+            XCTAssertNil(store.selectionState.inFlightAction)
+            XCTAssertNil(store.selectionState.commandProgressOperation)
+            XCTAssertFalse(store.selectionState.isMutationInFlight)
+            XCTAssertFalse(store.selectionState.showsSelectionPresentation)
+            XCTAssertNil(store.selectionState.notice)
+            XCTAssertNil(store.selectionState.workspaceID)
+            XCTAssertTrue(store.selectionState.selectedIdentities.isEmpty)
+        }
+    }
+
+    func testCommandBulkActionRequiresEmptySelection() {
         let store = AgentSessionSidebarUIStore()
         let workspaceID = id(99)
         let first = AgentSidebarSelectionIdentity.active(tabID: id(1))
         _ = store.handleSelectionGesture(.toggle, identity: first, renderedOrder: [first], workspaceID: workspaceID)
+        let selectedState = store.selectionState
 
-        let token = try XCTUnwrap(store.beginBulkAction(
+        XCTAssertNil(store.beginBulkAction(
             kind: .delete,
             origin: .command,
             targetCount: 1,
             workspaceID: workspaceID
         ))
+        XCTAssertEqual(store.selectionState, selectedState)
 
-        XCTAssertTrue(store.selectionState.showsSelectionPresentation)
-        XCTAssertEqual(store.selectionState.commandProgressOperation?.token, token)
+        store.clearSelection()
+        XCTAssertNotNil(store.beginBulkAction(
+            kind: .delete,
+            origin: .command,
+            targetCount: 1,
+            workspaceID: workspaceID
+        ))
+    }
+
+    func testSelectionBulkActionRequiresNonemptySelectionOwnedByWorkspace() {
+        let store = AgentSessionSidebarUIStore()
+        let selectionWorkspaceID = id(98)
+        let otherWorkspaceID = id(99)
+        let first = AgentSidebarSelectionIdentity.active(tabID: id(1))
+
+        XCTAssertNil(store.beginBulkAction(
+            kind: .delete,
+            origin: .selection,
+            targetCount: 1,
+            workspaceID: selectionWorkspaceID
+        ))
+
+        _ = store.handleSelectionGesture(
+            .toggle,
+            identity: first,
+            renderedOrder: [first],
+            workspaceID: selectionWorkspaceID
+        )
+        let selectedState = store.selectionState
+
+        XCTAssertNil(store.beginBulkAction(
+            kind: .delete,
+            origin: .selection,
+            targetCount: 1,
+            workspaceID: otherWorkspaceID
+        ))
+        XCTAssertEqual(store.selectionState, selectedState)
+        XCTAssertNotNil(store.beginBulkAction(
+            kind: .delete,
+            origin: .selection,
+            targetCount: 1,
+            workspaceID: selectionWorkspaceID
+        ))
     }
 
     func testModifierMappingGivesShiftPrecedence() {

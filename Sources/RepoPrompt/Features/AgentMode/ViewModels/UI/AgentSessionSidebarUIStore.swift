@@ -88,6 +88,15 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         workspaceID: UUID
     ) -> UUID? {
         guard selectionState.inFlightAction == nil, targetCount > 0 else { return nil }
+        switch origin {
+        case .selection:
+            guard selectionState.workspaceID == workspaceID,
+                  !selectionState.selectedIdentities.isEmpty
+            else { return nil }
+        case .command:
+            guard selectionState.selectedIdentities.isEmpty else { return nil }
+        }
+
         let token = UUID()
         var next = selectionState
         next.workspaceID = workspaceID

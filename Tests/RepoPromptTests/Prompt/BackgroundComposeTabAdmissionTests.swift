@@ -539,13 +539,21 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
 
     func testBulkCoordinatorAppliesExactMixedDeleteTargets() async throws {
         let fixture = makeFixture(initialTabCount: 2)
+        let workspaceID = try XCTUnwrap(fixture.manager.activeWorkspace?.id)
         let activeTabID = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs.first?.id)
         let stashed = try XCTUnwrap(fixture.manager.activeWorkspace?.stashedTabs.first)
         let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
         let didRemoveToken = installDidRemoveListener(prompt: fixture.prompt, viewModel: viewModel)
         defer { fixture.prompt.removeComposeTabsDidRemoveListener(didRemoveToken) }
-        let targets = try AgentModeViewModel.SidebarBulkMutationTargets(
-            workspaceID: XCTUnwrap(fixture.manager.activeWorkspace?.id),
+        viewModel.ui.sessionSidebar.selectAll(
+            renderedOrder: [
+                .active(tabID: activeTabID),
+                .archived(stashedTabID: stashed.id, tabID: stashed.tab.id)
+            ],
+            workspaceID: workspaceID
+        )
+        let targets = AgentModeViewModel.SidebarBulkMutationTargets(
+            workspaceID: workspaceID,
             activeDeleteTabIDs: [activeTabID],
             archivedDeleteTargets: [.init(stashedTabID: stashed.id, tabID: stashed.tab.id)],
             stashTabIDs: [],

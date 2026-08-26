@@ -715,10 +715,12 @@ struct AgentModeSessionsListView: View {
     ) -> some View {
         let selectedCount = selectionState.selectedIdentities.count
         return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
-            Text("\(selectedCount) selected")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .accessibilityAddTraits(.isHeader)
+            if selectedCount > 0 {
+                Text("\(selectedCount) selected")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityAddTraits(.isHeader)
+            }
 
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
