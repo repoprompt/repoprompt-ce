@@ -249,7 +249,10 @@ derive_sparkle_public_key() {
 generate_tip_rollout_appcast() {
     local predecessor_dir="$TMP_DIR/predecessors"
     mkdir -p "$predecessor_dir"
-    local predecessor_args=()
+    # macOS still ships Bash 3.2, where expanding an empty array under
+    # `set -u` aborts the script. Keep this argument vector non-empty for the
+    # preparer role, whose rollout intentionally has no predecessors.
+    local rollout_generate_args=(--declaration "$ROLLOUT_DECLARATION")
     local position=0 role tag digest path actual_digest
     while IFS=$'\t' read -r role tag digest; do
         [[ -n "$role" ]] || continue
@@ -261,7 +264,7 @@ generate_tip_rollout_appcast() {
         actual_digest="$(shasum -a 256 "$path" | awk '{print $1}')"
         [[ "$actual_digest" == "$digest" ]] ||
             fail "Tip predecessor $role manifest digest mismatch for $tag"
-        predecessor_args+=(--predecessor-manifest "$path")
+        rollout_generate_args+=(--predecessor-manifest "$path")
     done < <(python3 "$ROLLOUT_TOOL" predecessor-values --declaration "$ROLLOUT_DECLARATION")
 
     local enclosure_signature
@@ -271,7 +274,7 @@ generate_tip_rollout_appcast() {
     [[ -n "$enclosure_signature" ]] || fail "Unable to sign Tip rollout enclosure"
 
     python3 "$ROLLOUT_TOOL" generate \
-        --declaration "$ROLLOUT_DECLARATION" \
+        "${rollout_generate_args[@]}" \
         --policy "$APPLE_IDENTITY_POLICY" \
         --version-env "$ROOT_DIR/version.env" \
         --release-tag "$TIP_TAG" \
@@ -282,7 +285,6 @@ generate_tip_rollout_appcast() {
         --enclosure-basename "$ARCHIVE_BASENAME" \
         --enclosure-signature "$enclosure_signature" \
         --app-artifact-manifest "$FINAL_ARTIFACT_MANIFEST" \
-        "${predecessor_args[@]}" \
         --appcast-output "$APPCAST" \
         --manifest-output "$ROLLOUT_MANIFEST"
 

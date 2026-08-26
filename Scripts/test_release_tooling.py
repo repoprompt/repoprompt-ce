@@ -3830,6 +3830,110 @@ sys.stdout.write(str(status))
         self.assertNotIn("label_generated_tip_appcast", tip_script)
         self.assertNotIn("generate_appcast", generator)
 
+    def test_tip_appcast_generation_supports_zero_predecessors_on_macos_bash(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root = temp_dir / "source"
+        scripts = root / "Scripts"
+        sign_update = root / "Vendor" / "Sparkle" / "bin" / "sign_update"
+        dist = root / "dist"
+        scripts.mkdir(parents=True)
+        sign_update.parent.mkdir(parents=True)
+        dist.mkdir()
+
+        shutil.copy2(SCRIPT_DIR / "main_tip_release.sh", scripts / "main_tip_release.sh")
+        (scripts / "load_release_metadata.sh").write_text(
+            """\
+load_release_metadata() {
+    APP_NAME=RepoPrompt
+    DISPLAY_NAME="RepoPrompt CE"
+    MARKETING_VERSION=1.3.0
+    BUILD_NUMBER=35
+    BUNDLE_ID=com.pvncher.repoprompt.ce
+    SIGNING_TEAM_ID=648A27MST5
+}
+""",
+            encoding="utf-8",
+        )
+        (scripts / "release_sentry_symbols.sh").write_text("\n", encoding="utf-8")
+        rollout_capture = temp_dir / "rollout-arguments.json"
+        (scripts / "stable_rollout.py").write_text(
+            """\
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+command = sys.argv[1]
+if command == "packaging-context":
+    print("ROLLOUT_CHANNEL=tip")
+    print("ROLLOUT_ROLE=preparer")
+    print("ROLLOUT_IDENTITY=legacy")
+    print("ROLLOUT_INSTALLATION_TYPE=application")
+    print("ROLLOUT_UPDATE_REPOSITORY=repoprompt/repoprompt-ce-tip-updates")
+    print("REPOPROMPT_IDENTITY_MIGRATION_PHASE=legacy-preparer")
+elif command == "predecessor-values":
+    pass
+elif command == "generate":
+    arguments = sys.argv[2:]
+    Path(os.environ["FAKE_ROLLOUT_CAPTURE"]).write_text(json.dumps(arguments), encoding="utf-8")
+    for flag, content in (("--appcast-output", "<rss/>\\n"), ("--manifest-output", "{}\\n")):
+        output = Path(arguments[arguments.index(flag) + 1])
+        output.write_text(content, encoding="utf-8")
+else:
+    raise SystemExit(f"unexpected command: {command}")
+""",
+            encoding="utf-8",
+        )
+        (scripts / "apple_identity_policy.json").write_text("{}\n", encoding="utf-8")
+        (root / "tip-rollout.json").write_text('{"predecessors": []}\n', encoding="utf-8")
+        (root / "version.env").write_text("BUILD_NUMBER=35\n", encoding="utf-8")
+        sign_update.write_text("#!/usr/bin/env bash\nprintf 'fixture-signature\\n'\n", encoding="utf-8")
+        sign_update.chmod(0o755)
+        enclosure = dist / "RepoPrompt-tip-0123456789ab-35.15.17.zip"
+        enclosure.write_text("fixture enclosure\n", encoding="utf-8")
+        (dist / "RepoPrompt-tip-0123456789ab-35.15.17-artifact-manifest.json").write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "FAKE_ROLLOUT_CAPTURE": str(rollout_capture),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts),
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "SPARKLE_PRIVATE_KEY": "fixture-private-key",
+                "TIP_BUILD_NUMBER": "35.15.17",
+                "TIP_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+                "TIP_SHORT_SHA": "0123456789ab",
+            }
+        )
+        result = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                'source "$1"; TMP_DIR="$(mktemp -d)"; '
+                "derive_sparkle_public_key() { printf 'fixture-public-key\\n'; }; "
+                "plutil() { printf 'fixture-public-key\\n'; }; "
+                "xcrun() { return 0; }; "
+                "generate_tip_rollout_appcast",
+                "bash",
+                str(scripts / "main_tip_release.sh"),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((dist / "appcast.xml").is_file())
+        self.assertTrue((dist / "identity-rollout.json").is_file())
+        rollout_arguments = json.loads(rollout_capture.read_text(encoding="utf-8"))
+        self.assertEqual(rollout_arguments.count("--declaration"), 1)
+        self.assertNotIn("--predecessor-manifest", rollout_arguments)
+
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
         package_manifest = (root / "Package.swift").read_text(encoding="utf-8")
