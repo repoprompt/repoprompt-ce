@@ -444,8 +444,13 @@ struct AgentModeSessionsListView: View {
         let archivedHeaderProgressOperation = selectionState.archivedHeaderCommandProgressOperation.flatMap {
             $0.workspaceID == snapshot.workspaceID ? $0 : nil
         }
+        let renderedProgressRowIdentities = snapshot.pagedSessions.map {
+            AgentSidebarSelectionIdentity.active(tabID: $0.tabID)
+        } + (archivedSessionsExpanded ? snapshot.pagedArchivedSessionTabsForRows.map {
+            AgentSidebarSelectionIdentity.archived(stashedTabID: $0.id, tabID: $0.tab.id)
+        } : [])
         let fallbackProgressOperation = selectionState.commandFallbackProgressOperation(
-            renderedOrder: snapshot.renderedSelectionOrder,
+            renderedOrder: renderedProgressRowIdentities,
             workspaceID: snapshot.workspaceID
         )
         VStack(spacing: 4) {

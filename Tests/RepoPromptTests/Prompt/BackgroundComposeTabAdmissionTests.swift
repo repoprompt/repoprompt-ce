@@ -696,6 +696,17 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertTrue(cleanupEntered)
 
         XCTAssertFalse(fixture.prompt.currentComposeTabs.contains(where: { $0.id == tabID }))
+        let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let projection = viewModel.sidebarListProjection(
+            workspaceID: workspace.id,
+            composeTabs: workspace.composeTabs,
+            stashedTabs: workspace.stashedTabs,
+            currentTabID: fixture.prompt.activeComposeTabID,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: true
+        )
+        XCTAssertFalse(projection.renderedSelectionOrder.contains(identity))
         let operation = try XCTUnwrap(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
         XCTAssertTrue(operation.commandRowProgressRetired)
         XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
@@ -704,7 +715,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         ))
         XCTAssertEqual(
             viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
-                renderedOrder: [],
+                renderedOrder: projection.renderedSelectionOrder,
                 workspaceID: workspaceID
             ),
             operation
@@ -772,6 +783,17 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertTrue(fixture.manager.activeWorkspace?.composeTabs.contains(where: { $0.id == tabID }) == true)
         XCTAssertFalse(viewModel.sessions[tabID] === removedSession)
         XCTAssertTrue(viewModel.sessions[tabID] === replacementSession)
+        let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let projection = viewModel.sidebarListProjection(
+            workspaceID: workspace.id,
+            composeTabs: workspace.composeTabs,
+            stashedTabs: workspace.stashedTabs,
+            currentTabID: fixture.prompt.activeComposeTabID,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: true
+        )
+        XCTAssertTrue(projection.renderedSelectionOrder.contains(identity))
         let operation = try XCTUnwrap(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
         XCTAssertTrue(operation.commandRowProgressRetired)
         XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
@@ -780,7 +802,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         ))
         XCTAssertEqual(
             viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
-                renderedOrder: [identity],
+                renderedOrder: projection.renderedSelectionOrder,
                 workspaceID: workspaceID
             ),
             operation
