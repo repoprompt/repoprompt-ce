@@ -337,6 +337,9 @@ actor DirectHeadlessChildLaunchCoordinator {
         } catch {
             for carrier in carriers {
                 await runtime.routingCoordinator.revokeLaunchToken(carrier.launchTokenID)
+                if let envelopeID = carrier.credentialEnvelope?.envelopeID {
+                    await runtime.credentialEnvelopeStore.revoke(envelopeID)
+                }
             }
             throw error
         }
