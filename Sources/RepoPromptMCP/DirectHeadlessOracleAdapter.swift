@@ -58,9 +58,8 @@ actor DirectHeadlessOracleAdapter {
     private let owner: OracleConversationOwner
     private let rosterResolver: DirectHeadlessOracleRosterResolver
     private let store: any DirectHeadlessOracleStore
-    private let claimManager: OracleGroupClaimManager
     private let provider: DirectHeadlessProviderCoordinator
-    private let coordinator = OracleGroupCoordinator()
+    private let groupRuntime: OracleGroupRuntime
     private var plansByInvocationID: [UUID: InvocationPlan] = [:]
     private var isShuttingDown = false
 
@@ -74,8 +73,8 @@ actor DirectHeadlessOracleAdapter {
         owner = try OracleConversationOwner(kind: "direct-headless", identifier: profileIdentifier)
         self.rosterResolver = rosterResolver
         self.store = store
-        self.claimManager = claimManager
         self.provider = provider
+        groupRuntime = OracleGroupRuntime(store: store, claimManager: claimManager)
     }
 
     func resolveChildLaunchPlan(
@@ -90,6 +89,7 @@ actor DirectHeadlessOracleAdapter {
             invocationID: securityContext.invocationID,
             runID: securityContext.principal.runID ?? UUID()
         )
+        guard !isShuttingDown else { throw CancellationError() }
         plansByInvocationID[plan.invocationID] = plan
         return plan.childLaunchPlan
     }
@@ -180,12 +180,14 @@ actor DirectHeadlessOracleAdapter {
             return plan
         }
         guard request.securityContext == nil else { throw AdapterError.missingPreparedInvocation }
-        return try await makeInvocationPlan(
+        let plan = try await makeInvocationPlan(
             toolName: toolName,
             arguments: arguments,
             invocationID: UUID(),
             runID: UUID()
         )
+        guard !isShuttingDown else { throw CancellationError() }
+        return plan
     }
 
     private func makeInvocationPlan(
@@ -399,203 +401,100 @@ actor DirectHeadlessOracleAdapter {
         case .direct:
             throw AdapterError.missingPreparedInvocation
         case let .startGroup(group, roster, members):
-            try await executeGroupStart(
-                plan: plan,
-                group: group,
-                roster: roster,
-                members: members,
-                request: request
-            )
-        case let .continueGroup(groupID, expectedRevision, roster):
-            try await executeGroupContinuation(
-                plan: plan,
-                groupID: groupID,
-                expectedRevision: expectedRevision,
-                roster: roster,
-                request: request
-            )
-        }
-    }
-
-    private func executeGroupStart(
-        plan: InvocationPlan,
-        group: OracleGroupDescriptor,
-        roster: OracleRoster,
-        members: [OracleGroupMember],
-        request: DomainPhysicalToolRequest
-    ) async throws -> Value {
-        let now = Date()
-        let prepared = try OracleGroupDocument(
-            group: group,
-            owner: owner,
-            name: String(plan.input.userMessage.prefix(80)),
-            revision: 1,
-            createdAt: now,
-            updatedAt: now,
-            roster: roster,
-            members: members,
-            turns: [OracleTurnRecord(input: plan.input, state: .prepared, startedAt: now)]
-        )
-        guard let claimID = plan.claimID else { throw AdapterError.childCarrierMismatch }
-        let bundle = try groupCarrierBundle(for: plan, group: group)
-        let claim = try await claimManager.acquire(
-            group: prepared,
-            owner: owner,
-            invocationID: plan.invocationID,
-            runID: plan.runID,
-            claimID: claimID
-        )
-        defer { claim.release() }
-        try await store.create(prepared)
-        return try await executeGroup(
-            plan: plan,
-            prepared: prepared,
-            request: request,
-            bundle: bundle
-        )
-    }
-
-    private func executeGroupContinuation(
-        plan: InvocationPlan,
-        groupID: OracleGroupID,
-        expectedRevision: UInt64,
-        roster: OracleRoster,
-        request: DomainPhysicalToolRequest
-    ) async throws -> Value {
-        guard let observed = try await store.load(groupID: groupID, owner: owner),
-              observed.revision >= expectedRevision,
-              observed.roster == roster,
-              let claimID = plan.claimID
-        else {
-            throw AdapterError.rosterConflict
-        }
-        let bundle = try groupCarrierBundle(for: plan, group: observed.group)
-        let claim = try await claimManager.acquire(
-            group: observed,
-            owner: owner,
-            invocationID: plan.invocationID,
-            runID: plan.runID,
-            claimID: claimID
-        )
-        defer { claim.release() }
-        guard var current = try await store.load(groupID: groupID, owner: owner),
-              current.group == observed.group,
-              current.revision >= observed.revision,
-              current.roster == roster
-        else {
-            throw AdapterError.rosterConflict
-        }
-        if current.turns.last?.state == .prepared {
-            current = try await settleInterruptedGroup(current)
-        }
-        guard current.turns.last?.state == .terminal else { throw AdapterError.rosterConflict }
-        let now = Date()
-        let prepared = try OracleGroupDocument(
-            schemaVersion: current.schemaVersion,
-            group: current.group,
-            owner: current.owner,
-            name: current.name,
-            revision: current.revision &+ 1,
-            createdAt: current.createdAt,
-            updatedAt: now,
-            roster: current.roster,
-            members: current.members,
-            turns: current.turns + [OracleTurnRecord(input: plan.input, state: .prepared, startedAt: now)]
-        )
-        try await store.save(prepared, expectedRevision: current.revision)
-        return try await executeGroup(
-            plan: plan,
-            prepared: prepared,
-            request: request,
-            bundle: bundle
-        )
-    }
-
-    private func executeGroup(
-        plan: InvocationPlan,
-        prepared: OracleGroupDocument,
-        request: DomainPhysicalToolRequest,
-        bundle: DomainChildLaunchCarrierBundle
-    ) async throws -> Value {
-        let result: OracleGroupResult
-        do {
-            let priorTurns = Array(prepared.turns.dropLast())
-            let plans = try prepared.members.map { member in
-                let lane = try OracleLaneDescriptor(
-                    group: prepared.group,
-                    laneID: member.laneID,
-                    model: member.model
-                )
-                guard let carrier = bundle.carrier(for: member.laneID) else {
-                    throw AdapterError.childCarrierMismatch
-                }
-                let prompt = Self.prompt(
-                    turns: priorTurns,
-                    laneIndex: member.laneID.index,
-                    next: plan.input.userMessage
-                )
-                return try OracleLanePlan(lane: lane, publicChatID: member.publicChatID) { [provider] _ in
-                    let response = try await provider.runProviderOnce(
-                        message: prompt,
-                        providerID: member.model.providerID,
-                        model: member.model.modelID,
-                        request: request,
-                        purpose: .oracle,
-                        carrierEnvironment: carrier.environment
+            guard !isShuttingDown else { throw CancellationError() }
+            guard let claimID = plan.claimID else { throw AdapterError.childCarrierMismatch }
+            let bundle = try groupCarrierBundle(for: plan, group: group)
+            let completion = try await executeGrouped(
+                OracleGroupRuntime.Request(
+                    invocationID: plan.invocationID,
+                    runID: plan.runID,
+                    claimID: claimID,
+                    input: plan.input,
+                    intent: .start(
+                        .init(
+                            group: group,
+                            owner: owner,
+                            name: String(plan.input.userMessage.prefix(80)),
+                            roster: roster,
+                            members: members
+                        )
                     )
-                    return OracleLaneExecutionResponse(response: response)
-                }
-            }
-            guard let turnID = prepared.turns.last?.id else {
-                throw OraclePersistenceError.invalidDocument("missing_prepared_turn")
-            }
-            result = try await coordinator.execute(
-                group: prepared.group,
-                turnID: turnID,
-                input: plan.input,
-                plans: plans
+                ),
+                bundle: bundle,
+                request: request
             )
-        } catch {
-            try await settlePreparedGroupIfNeeded(prepared, error: error)
-            throw error
+            return Self.groupValue(completion.result)
+        case let .continueGroup(groupID, expectedRevision, roster):
+            guard !isShuttingDown else { throw CancellationError() }
+            guard let claimID = plan.claimID else { throw AdapterError.childCarrierMismatch }
+            let group = try OracleGroupDescriptor(id: groupID, size: roster.count)
+            let bundle = try groupCarrierBundle(for: plan, group: group)
+            let completion = try await executeGrouped(
+                OracleGroupRuntime.Request(
+                    invocationID: plan.invocationID,
+                    runID: plan.runID,
+                    claimID: claimID,
+                    input: plan.input,
+                    intent: .continuation(
+                        .init(
+                            group: group,
+                            owner: owner,
+                            observedRevision: expectedRevision,
+                            expectedRoster: roster
+                        )
+                    )
+                ),
+                bundle: bundle,
+                request: request
+            )
+            return Self.groupValue(completion.result)
         }
-        let terminal = try prepared.settling(result)
-        _ = try await OracleGroupTerminalPublisher.publish(
-            terminal: terminal,
-            expectedRevision: prepared.revision,
-            store: store
-        )
-        return Self.groupValue(result)
     }
 
-    private func settlePreparedGroupIfNeeded(
-        _ prepared: OracleGroupDocument,
-        error: Error
-    ) async throws {
-        let store = store
-        let status: OracleLaneResultStatus = error is CancellationError ? .cancelled : .failed
-        let code = error is CancellationError ? "cancelled" : "execution_failed"
-        let message = error is CancellationError
-            ? "Oracle provider was cancelled."
-            : String(String(describing: error).prefix(512))
-        try await Task.detached(priority: Task.currentPriority) {
-            guard let current = try await store.load(groupID: prepared.group.id, owner: prepared.owner),
-                  current.revision == prepared.revision,
-                  current.turns.last?.state == .prepared
-            else { return }
-            let terminal = try current.settlingInterrupted(status: status, code: code, message: message)
-            try await store.save(terminal, expectedRevision: current.revision)
-        }.value
+    private func executeGrouped(
+        _ request: OracleGroupRuntime.Request,
+        bundle: DomainChildLaunchCarrierBundle,
+        request physicalRequest: DomainPhysicalToolRequest
+    ) async throws -> OracleGroupRuntime.Completion {
+        let provider = provider
+        do {
+            return try await groupRuntime.execute(
+                request,
+                callbacks: .init(
+                    executeLane: { invocation in
+                        guard let carrier = bundle.carrier(for: invocation.member.laneID) else {
+                            throw AdapterError.childCarrierMismatch
+                        }
+                        let prompt = Self.prompt(
+                            turns: invocation.priorTerminalTurns,
+                            laneIndex: invocation.member.laneID.index,
+                            next: invocation.context.input.userMessage
+                        )
+                        let response = try await provider.runProviderOnce(
+                            message: prompt,
+                            providerID: invocation.member.model.providerID,
+                            model: invocation.member.model.modelID,
+                            request: physicalRequest,
+                            purpose: .oracle,
+                            carrierEnvironment: carrier.environment
+                        )
+                        return OracleLaneExecutionResponse(response: response)
+                    }
+                )
+            )
+        } catch let error as OracleGroupRuntime.RuntimeError {
+            throw mapRuntimeError(error)
+        }
     }
 
-    private func settleInterruptedGroup(_ prepared: OracleGroupDocument) async throws -> OracleGroupDocument {
-        let terminal = try prepared.settlingInterrupted(
-            status: .failed,
-            code: "interrupted",
-            message: "The previous Oracle execution was interrupted before completion."
-        )
-        try await store.save(terminal, expectedRevision: prepared.revision)
-        return terminal
+    private func mapRuntimeError(_ error: OracleGroupRuntime.RuntimeError) -> Error {
+        switch error {
+        case .settlementFailed:
+            error
+        case .singleLaneBypassRequired, .continuationMissing, .continuationChanged, .rosterConflict,
+             .invalidPreparedTurn:
+            AdapterError.rosterConflict
+        }
     }
 
     private func groupCarrierBundle(

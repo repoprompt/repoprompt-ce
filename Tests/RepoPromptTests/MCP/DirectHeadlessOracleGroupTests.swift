@@ -47,6 +47,29 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertTrue(calls.allSatisfy { $0.groupID != nil && $0.claimID != nil && $0.launchID != nil })
     }
 
+    func testGroupedResponseWhitespaceSurvivesMCPEncoding() async throws {
+        let fixture = try Fixture(name: "exact-whitespace")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "exact", additional: ["lane-1"])
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+
+        let result = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("preserve exact output")]
+        )
+        XCTAssertEqual(result["response"] as? String, "  exact response  ")
+        let lanes = try XCTUnwrap(result["oracle_results"] as? [[String: Any]])
+        XCTAssertEqual(lanes[0]["response"] as? String, "  exact response  ")
+    }
+
     func testSingleOracleUsesDirectConversationWithoutDurableGroup() async throws {
         let fixture = try Fixture(name: "single-direct")
         defer { fixture.cleanup() }
@@ -104,6 +127,93 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             arguments: ["instructions": .string("raw context instructions")]
         )
         XCTAssertEqual(context["response"] as? String, "response-0-default")
+    }
+
+    func testShutdownClearsPreparedDirectPlanWithoutChangingMissingPlanError() async throws {
+        let fixture = try Fixture(name: "shutdown-direct-sentinel")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        let arguments: [String: Value] = ["message": .string("direct turn")]
+        let security = try await securityContext(prepared)
+        let plan = try await prepared.oracleAdapter.resolveChildLaunchPlan(
+            toolName: "ask_oracle",
+            arguments: arguments,
+            securityContext: security
+        )
+
+        await prepared.oracleAdapter.shutdown()
+        do {
+            _ = try await executePrepared(
+                backend: backend,
+                toolName: "ask_oracle",
+                arguments: arguments,
+                security: security,
+                plan: plan
+            )
+            XCTFail("Expected the cleared plan to be missing")
+        } catch {
+            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .missingPreparedInvocation)
+        }
+    }
+
+    func testDeletedContinuationAfterPlanningRetainsRosterConflictError() async throws {
+        let fixture = try Fixture(name: "deleted-after-planning")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        let started = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("first turn")]
+        )
+        let chatID = try XCTUnwrap(started["chat_id"] as? String)
+        let groupID = try OracleGroupID(
+            rawValue: XCTUnwrap(UUID(uuidString: XCTUnwrap(started["oracle_group_id"] as? String)))
+        )
+        let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
+        let loadedGroup = try await prepared.oracleStore.load(groupID: groupID, owner: owner)
+        let group = try XCTUnwrap(loadedGroup)
+        let arguments: [String: Value] = [
+            "chat_id": .string(chatID),
+            "message": .string("second turn")
+        ]
+        let security = try await securityContext(prepared)
+        let plan = try await prepared.oracleAdapter.resolveChildLaunchPlan(
+            toolName: "oracle_send",
+            arguments: arguments,
+            securityContext: security
+        )
+        try await prepared.oracleStore.delete(
+            groupID: groupID,
+            owner: owner,
+            expectedRevision: group.revision
+        )
+
+        do {
+            _ = try await executePrepared(
+                backend: backend,
+                toolName: "oracle_send",
+                arguments: arguments,
+                security: security,
+                plan: plan
+            )
+            XCTFail("Expected deleted continuation to fail")
+        } catch {
+            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .rosterConflict)
+        }
     }
 
     func testMessageOnlyOracleSendUsesPrimaryDirectFallbackAndContinuesMostRecent() async throws {
@@ -1506,6 +1616,7 @@ private struct Fixture {
         case "$model" in
           cancel-*) trap 'exit 0' TERM INT; /bin/sleep 30 ;;
           fail) /usr/bin/printf '%s\\n' 'fake provider failure' >&2; exit 7 ;;
+          exact) /usr/bin/printf '%s\\n' '{"type":"message","text":"  exact response  "}'; exit 0 ;;
         esac
         case "$lane" in
           0) /bin/sleep 0.15 ;;
