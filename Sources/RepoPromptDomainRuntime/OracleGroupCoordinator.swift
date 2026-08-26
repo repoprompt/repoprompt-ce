@@ -232,7 +232,7 @@ package struct OracleGroupCoordinator: Sendable {
                 modelID: plan.lane.model.modelID,
                 status: .failed,
                 executionProfile: failure.executionProfile,
-                error: OracleLaneError(
+                error: Self.structuralLaneError(
                     code: failure.code,
                     message: failure.message,
                     partialResponse: failure.partialResponse
@@ -245,7 +245,7 @@ package struct OracleGroupCoordinator: Sendable {
                 providerID: plan.lane.model.providerID,
                 modelID: plan.lane.model.modelID,
                 status: .failed,
-                error: OracleLaneError(
+                error: Self.structuralLaneError(
                     code: "provider_error",
                     message: String(String(describing: error).prefix(512))
                 )
@@ -274,6 +274,20 @@ package struct OracleGroupCoordinator: Sendable {
             status: .completed,
             executionProfile: response.executionProfile,
             response: response.response
+        )
+    }
+
+    private static func structuralLaneError(
+        code: String,
+        message: String,
+        partialResponse: String? = nil
+    ) -> OracleLaneError {
+        let codeIsBlank = code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let messageIsBlank = message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return OracleLaneError(
+            code: codeIsBlank ? "provider_error" : code,
+            message: messageIsBlank ? "Oracle lane failed." : message,
+            partialResponse: partialResponse
         )
     }
 }
