@@ -7,7 +7,7 @@ struct AppOracleGroupExecutionCallbacks {
         _ groupID: OracleGroupID,
         _ turnID: OracleTurnID,
         _ members: [OracleGroupMember]
-    ) async -> Void
+    ) async throws -> Void
     let progress: @MainActor @Sendable (OracleProgressEvent) async -> Void
     let laneProgress: @MainActor @Sendable (
         _ laneID: OracleLaneID,
@@ -34,18 +34,6 @@ enum AppOracleGroupRouting {
     ) -> Bool {
         guard case .start = route else { return false }
         return usesGroup(additionalModelRaws: additionalModelRaws)
-    }
-
-    static func claimedContinuationDocument(
-        observed: OracleGroupDocument,
-        current: OracleGroupDocument
-    ) -> OracleGroupDocument? {
-        guard current.group == observed.group,
-              current.revision >= observed.revision
-        else {
-            return nil
-        }
-        return current
     }
 
     static func executionProfile(for model: AIModel) -> OracleExecutionProfile? {
@@ -164,16 +152,18 @@ extension OracleViewModel {
                 agentModeRunID: tabContext?.agentModeRunID
             )
             guard let candidate else { return .none }
-            guard let rawGroupID = candidate.oracleGroupID,
-                  let group = try await store.load(
-                      groupID: OracleGroupID(rawValue: rawGroupID),
-                      owner: owner
-                  ),
-                  group.members.contains(where: { $0.memberID.rawValue == candidate.id })
-            else {
-                return AppOracleConfiguredRosterSelection(group: nil, singleSessionID: candidate.id)
+            if let rawGroupID = candidate.oracleGroupID {
+                guard let group = try await store.load(
+                    groupID: OracleGroupID(rawValue: rawGroupID),
+                    owner: owner
+                ),
+                    group.members.contains(where: { $0.memberID.rawValue == candidate.id })
+                else {
+                    throw ChatToolError.internalError("Canonical Oracle group was not found.")
+                }
+                return AppOracleConfiguredRosterSelection(group: group, singleSessionID: nil)
             }
-            return AppOracleConfiguredRosterSelection(group: group, singleSessionID: nil)
+            return AppOracleConfiguredRosterSelection(group: nil, singleSessionID: candidate.id)
         }
     }
 
@@ -212,7 +202,7 @@ extension OracleViewModel {
             throw ChatToolError.invalidParams("A tab context is required for multiple Oracles.")
         }
         let owner = try Self.oracleGroupOwner(workspaceID: workspaceID, tabID: tabID)
-        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        let runtime = AppDomainRuntimeComposition.shared.oracleGroupRuntime
 
         let roster = try Self.oracleRoster(
             primaryRaw: args["model"]?.stringValue ?? profile.planningModelRaw,
@@ -224,119 +214,95 @@ extension OracleViewModel {
         }
         let invocationID = UUID()
         let runID = tabContext?.agentModeRunID ?? invocationID
-
-        let prepared: OracleGroupDocument
-        if let observed = existingGroup {
-            let claim = try await AppDomainRuntimeComposition.shared.oracleGroupClaimManager.acquire(
-                group: observed,
-                owner: owner,
-                invocationID: invocationID,
-                runID: runID
-            )
-            defer { claim.release() }
-            guard let loaded = try await store.load(groupID: observed.group.id, owner: owner),
-                  var current = AppOracleGroupRouting.claimedContinuationDocument(
-                      observed: observed,
-                      current: loaded
-                  )
-            else {
-                throw ChatToolError.internalError("Oracle group changed before continuation ownership was acquired.")
-            }
-            if current.turns.last?.state == .prepared {
-                current = try await settleInterruptedOracleGroup(current, store: store)
-            }
-            guard current.roster == roster, current.turns.last?.state == .terminal else {
-                throw ChatToolError.invalidParams(
-                    "The configured Oracle roster differs from this conversation. Restore its roster or set new_chat=true."
-                )
-            }
-            let now = Date()
-            prepared = try OracleGroupDocument(
-                schemaVersion: current.schemaVersion,
-                group: current.group,
-                owner: current.owner,
-                name: current.name,
-                revision: current.revision &+ 1,
-                createdAt: current.createdAt,
-                updatedAt: now,
-                roster: current.roster,
-                members: current.members,
-                turns: current.turns + [OracleTurnRecord(input: input, state: .prepared, startedAt: now)]
-            )
-            try await store.save(prepared, expectedRevision: current.revision)
-            do {
+        let runtimeCallbacks = OracleGroupRuntime.Callbacks(
+            prepared: { [weak self] document in
+                guard let self else { throw CancellationError() }
                 try await restoreOracleGroupProjectionsIfNeeded(
-                    prepared,
+                    document,
                     workspaceID: workspaceID,
                     tabID: tabID,
                     tabContext: tabContext
                 )
-            } catch {
-                try await settlePreparedOracleGroupIfNeeded(prepared, error: error, store: store)
-                throw error
+                if let turn = document.turns.last {
+                    try await callbacks?.prepared(document.group.id, turn.id, document.members)
+                }
+            },
+            executeLane: { [weak self] invocation in
+                guard let self else { throw CancellationError() }
+                return try await executeOracleLane(
+                    member: invocation.member,
+                    args: args,
+                    promptVM: promptVM,
+                    tabContext: tabContext,
+                    executionContext: invocation.context,
+                    callbacks: callbacks
+                )
+            },
+            progress: { event in
+                await callbacks?.progress(event)
             }
-            return try await executeOracleGroup(
-                prepared,
-                args: args,
-                promptVM: promptVM,
-                tabContext: tabContext,
-                store: store,
-                callbacks: callbacks
-            )
-        }
+        )
 
-        let descriptor = try OracleGroupDescriptor(size: roster.count)
-        let baseName = ChatSession.validatedName(args["chat_name"]?.stringValue ?? "New Chat")
-        let sessionIDs = roster.orderedModels.map { _ in UUID() }
-        let members = try roster.orderedModels.enumerated().map { index, model in
-            let sessionName = Self.oracleProjectionName(base: baseName, laneIndex: index)
-            return try OracleGroupMember(
-                laneID: OracleLaneID(index: index),
-                memberID: OracleMemberID(rawValue: sessionIDs[index]),
-                publicChatID: ChatSession.makeShortID(name: sessionName, uuid: sessionIDs[index]),
-                model: model
-            )
-        }
-        let now = Date()
-        prepared = try OracleGroupDocument(
-            group: descriptor,
-            owner: owner,
-            name: baseName,
-            revision: 1,
-            createdAt: now,
-            updatedAt: now,
-            roster: roster,
-            members: members,
-            turns: [OracleTurnRecord(input: input, state: .prepared, startedAt: now)]
-        )
-        let claim = try await AppDomainRuntimeComposition.shared.oracleGroupClaimManager.acquire(
-            group: prepared,
-            owner: owner,
-            invocationID: invocationID,
-            runID: runID
-        )
-        defer { claim.release() }
-        // The canonical prepared group exists before any app projection becomes visible.
-        try await store.create(prepared)
         do {
-            try await restoreOracleGroupProjectionsIfNeeded(
-                prepared,
-                workspaceID: workspaceID,
-                tabID: tabID,
+            let completion: OracleGroupRuntime.Completion
+            if let observed = existingGroup {
+                completion = try await runtime.execute(
+                    OracleGroupRuntime.Request(
+                        invocationID: invocationID,
+                        runID: runID,
+                        claimID: UUID(),
+                        input: input,
+                        intent: .continuation(
+                            .init(
+                                group: observed.group,
+                                owner: owner,
+                                observedRevision: observed.revision,
+                                expectedRoster: roster
+                            )
+                        )
+                    ),
+                    callbacks: runtimeCallbacks
+                )
+            } else {
+                let descriptor = try OracleGroupDescriptor(size: roster.count)
+                let baseName = ChatSession.validatedName(args["chat_name"]?.stringValue ?? "New Chat")
+                let sessionIDs = roster.orderedModels.map { _ in UUID() }
+                let members = try roster.orderedModels.enumerated().map { index, model in
+                    let sessionName = Self.oracleProjectionName(base: baseName, laneIndex: index)
+                    return try OracleGroupMember(
+                        laneID: OracleLaneID(index: index),
+                        memberID: OracleMemberID(rawValue: sessionIDs[index]),
+                        publicChatID: ChatSession.makeShortID(name: sessionName, uuid: sessionIDs[index]),
+                        model: model
+                    )
+                }
+                completion = try await runtime.execute(
+                    OracleGroupRuntime.Request(
+                        invocationID: invocationID,
+                        runID: runID,
+                        claimID: UUID(),
+                        input: input,
+                        intent: .start(
+                            .init(
+                                group: descriptor,
+                                owner: owner,
+                                name: baseName,
+                                roster: roster,
+                                members: members
+                            )
+                        )
+                    ),
+                    callbacks: runtimeCallbacks
+                )
+            }
+            return Self.oracleGroupValue(
+                completion.result,
+                mode: input.mode.rawValue,
                 tabContext: tabContext
             )
-        } catch {
-            try await settlePreparedOracleGroupIfNeeded(prepared, error: error, store: store)
-            throw error
+        } catch let error as OracleGroupRuntime.RuntimeError {
+            throw mapOracleGroupRuntimeError(error)
         }
-        return try await executeOracleGroup(
-            prepared,
-            args: args,
-            promptVM: promptVM,
-            tabContext: tabContext,
-            store: store,
-            callbacks: callbacks
-        )
     }
 
     @MainActor
@@ -348,9 +314,21 @@ extension OracleViewModel {
     ) async throws {
         for member in group.members {
             let expectedName = Self.oracleProjectionName(base: group.name, laneIndex: member.laneID.index)
-            if let index = sessions.firstIndex(where: { $0.shortID == member.publicChatID }) {
-                guard sessions[index].name != expectedName else { continue }
+            if let index = sessions.firstIndex(where: { $0.id == member.memberID.rawValue }) {
+                if let existingGroupID = sessions[index].oracleGroupID,
+                   existingGroupID != group.group.id.rawValue
+                {
+                    throw ChatToolError.internalError("Oracle group projection identity conflict.")
+                }
+                let needsSave = sessions[index].name != expectedName
+                    || sessions[index].oracleGroupID != group.group.id.rawValue
+                    || sessions[index].oracleLaneIndex != member.laneID.index
+                    || sessions[index].oracleGroupSize != group.group.size
+                guard needsSave else { continue }
                 sessions[index].name = expectedName
+                sessions[index].oracleGroupID = group.group.id.rawValue
+                sessions[index].oracleLaneIndex = member.laneID.index
+                sessions[index].oracleGroupSize = group.group.size
                 let savedURL = try await autosaveSession(sessions[index])
                 if let refreshed = sessions.firstIndex(where: { $0.id == member.memberID.rawValue }) {
                     sessions[refreshed].fileURL = savedURL
@@ -377,67 +355,6 @@ extension OracleViewModel {
                 throw ChatToolError.internalError("failed to restore Oracle group projection")
             }
         }
-    }
-
-    @MainActor
-    private func executeOracleGroup(
-        _ prepared: OracleGroupDocument,
-        args: [String: Value],
-        promptVM: PromptViewModel,
-        tabContext: OracleSendTabContext?,
-        store: DomainOracleConversationStore,
-        callbacks: AppOracleGroupExecutionCallbacks?
-    ) async throws -> [String: Value] {
-        guard let turn = prepared.turns.last, turn.state == .prepared else {
-            throw ChatToolError.internalError("Oracle group is not prepared")
-        }
-        await callbacks?.prepared(prepared.group.id, turn.id, prepared.members)
-        let result: OracleGroupResult
-        do {
-            let plans = try prepared.members.map { member in
-                let lane = try OracleLaneDescriptor(
-                    group: prepared.group,
-                    laneID: member.laneID,
-                    model: member.model
-                )
-                return try OracleLanePlan(
-                    lane: lane,
-                    publicChatID: member.publicChatID
-                ) { [weak self] context in
-                    guard let self else { throw CancellationError() }
-                    return try await executeOracleLane(
-                        member: member,
-                        args: args,
-                        promptVM: promptVM,
-                        tabContext: tabContext,
-                        executionContext: context,
-                        callbacks: callbacks
-                    )
-                }
-            }
-            result = try await OracleGroupCoordinator().execute(
-                group: prepared.group,
-                turnID: turn.id,
-                input: turn.input,
-                plans: plans,
-                progress: { event in
-                    await callbacks?.progress(event)
-                }
-            )
-        } catch {
-            try await settlePreparedOracleGroupIfNeeded(prepared, error: error, store: store)
-            throw error
-        }
-        if Task.isCancelled {
-            await cancelOracleGroupLaneStreams(prepared.members)
-        }
-        let terminal = try prepared.settling(result)
-        _ = try await OracleGroupTerminalPublisher.publish(
-            terminal: terminal,
-            expectedRevision: prepared.revision,
-            store: store
-        )
-        return Self.oracleGroupValue(result, mode: turn.input.mode.rawValue, tabContext: tabContext)
     }
 
     @MainActor
@@ -521,44 +438,19 @@ extension OracleViewModel {
         }
     }
 
-    @MainActor
-    private func cancelOracleGroupLaneStreams(_ members: [OracleGroupMember]) async {
-        for member in members {
-            await cancelAIResponse(in: member.memberID.rawValue, skipPartialParseAndSave: true)
+    private func mapOracleGroupRuntimeError(_ error: OracleGroupRuntime.RuntimeError) -> ChatToolError {
+        switch error {
+        case .rosterConflict, .singleLaneBypassRequired:
+            .invalidParams(
+                "The configured Oracle roster differs from this conversation. Restore its roster or set new_chat=true."
+            )
+        case .continuationMissing, .continuationChanged:
+            .internalError("Oracle group changed before continuation ownership was acquired.")
+        case .invalidPreparedTurn:
+            .internalError("Oracle group is not prepared")
+        case let .settlementFailed(execution, settlement):
+            .internalError("Oracle group settlement failed after \(execution): \(settlement)")
         }
-    }
-
-    private func settleInterruptedOracleGroup(
-        _ prepared: OracleGroupDocument,
-        store: DomainOracleConversationStore
-    ) async throws -> OracleGroupDocument {
-        let terminal = try prepared.settlingInterrupted(
-            status: .failed,
-            code: "interrupted",
-            message: "The previous Oracle execution was interrupted before completion."
-        )
-        try await store.save(terminal, expectedRevision: prepared.revision)
-        return terminal
-    }
-
-    private func settlePreparedOracleGroupIfNeeded(
-        _ prepared: OracleGroupDocument,
-        error: Error,
-        store: DomainOracleConversationStore
-    ) async throws {
-        let status: OracleLaneResultStatus = error is CancellationError ? .cancelled : .failed
-        let code = error is CancellationError ? "cancelled" : "execution_failed"
-        let message = error is CancellationError
-            ? "Oracle provider was cancelled."
-            : String(String(describing: error).prefix(512))
-        try await Task.detached(priority: Task.currentPriority) {
-            guard let current = try await store.load(groupID: prepared.group.id, owner: prepared.owner),
-                  current.revision == prepared.revision,
-                  current.turns.last?.state == .prepared
-            else { return }
-            let terminal = try current.settlingInterrupted(status: status, code: code, message: message)
-            try await store.save(terminal, expectedRevision: current.revision)
-        }.value
     }
 
     private static func oracleRoster(

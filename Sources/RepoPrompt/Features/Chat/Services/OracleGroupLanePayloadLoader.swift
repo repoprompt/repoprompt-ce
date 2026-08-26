@@ -60,15 +60,6 @@ enum OracleGroupLanePayloadLoader {
                 liveMessages: liveMessages(session.id),
                 turnStartedAt: turn.startedAt
             )
-            if let failure = splitFailure(content) {
-                return lane(
-                    member: member,
-                    status: .failed,
-                    partialResponse: failure.partialResponse,
-                    errorCode: "runtime_error",
-                    errorMessage: failure.message
-                )
-            }
             return lane(member: member, status: .running, partialResponse: content)
         })
     }
@@ -84,7 +75,7 @@ enum OracleGroupLanePayloadLoader {
             providerID: profile?.providerID ?? result.providerID ?? member.model.providerID,
             modelID: profile?.modelID ?? result.modelID,
             effectiveReasoningEffort: profile?.effectiveReasoningEffort,
-            status: result.status == .completed ? .completed : .failed,
+            status: markdownStatus(result.status),
             response: result.response,
             partialResponse: result.error?.partialResponse,
             errorCode: result.error?.code,
@@ -117,6 +108,14 @@ enum OracleGroupLanePayloadLoader {
         )
     }
 
+    private static func markdownStatus(_ status: OracleLaneResultStatus) -> OracleLaneMarkdownPayload.Status {
+        switch status {
+        case .completed: .completed
+        case .failed: .failed
+        case .cancelled: .cancelled
+        }
+    }
+
     private static func currentAssistantContent(
         session: ChatSession,
         liveMessages: [AIChatMessage],
@@ -146,21 +145,10 @@ enum OracleGroupLanePayloadLoader {
         return nil
     }
 
-    private static func splitFailure(_ content: String?) -> (partialResponse: String?, message: String)? {
-        guard let content = nonempty(content) else { return nil }
-        let separator = "\n\n--\nError:\n"
-        if let range = content.range(of: separator) {
-            let partial = nonempty(String(content[..<range.lowerBound]))
-            let message = nonempty(String(content[range.upperBound...])) ?? "Oracle lane failed."
-            return (partial, message)
-        }
-        guard content.hasPrefix("Error:") else { return nil }
-        let message = nonempty(String(content.dropFirst("Error:".count))) ?? "Oracle lane failed."
-        return (nil, message)
-    }
-
     private static func nonempty(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == false ? trimmed : nil
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return value
     }
 }

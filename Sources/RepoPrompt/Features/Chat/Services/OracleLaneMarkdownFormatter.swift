@@ -6,6 +6,7 @@ struct OracleLaneMarkdownPayload: Equatable {
         case running = "Running"
         case completed = "Completed"
         case failed = "Failed"
+        case cancelled = "Cancelled"
         case unavailable = "Unavailable"
     }
 
@@ -69,12 +70,15 @@ enum OracleLaneMarkdownFormatter {
     }
 
     private static func metadata(_ value: String?) -> String {
-        guard let value = nonempty(value) else { return unspecifiedMetadata }
+        let value = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value, !value.isEmpty else { return unspecifiedMetadata }
         return "`\(value)`"
     }
 
     private static func nonempty(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == false ? trimmed : nil
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return value
     }
 }

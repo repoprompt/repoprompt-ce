@@ -102,17 +102,54 @@ final class OracleLaneMarkdownFormatterTests: XCTestCase {
             sessions: [lane1, lane0],
             liveMessages: { messages[$0] ?? [] }
         )
-        XCTAssertEqual(payload.lanes.map(\.status), [.running, .failed, .unavailable])
+        XCTAssertEqual(payload.lanes.map(\.status), [.running, .running, .unavailable])
         XCTAssertEqual(payload.lanes[0].partialResponse, "current partial")
-        XCTAssertEqual(payload.lanes[1].partialResponse, "adviser partial")
-        XCTAssertEqual(payload.lanes[1].errorMessage, "provider exploded")
+        XCTAssertEqual(
+            payload.lanes[1].partialResponse,
+            "adviser partial\n\n--\nError:\nprovider exploded"
+        )
+        XCTAssertNil(payload.lanes[1].errorMessage)
 
         let markdown = OracleLaneMarkdownFormatter.format(payload)
         XCTAssertTrue(markdown.contains("- Status: Running"), markdown)
-        XCTAssertTrue(markdown.contains("- Status: Failed"), markdown)
         XCTAssertTrue(markdown.contains("- Status: Unavailable"), markdown)
         XCTAssertTrue(markdown.contains("Response unavailable."), markdown)
         XCTAssertFalse(markdown.contains("old answer"), markdown)
+        XCTAssertTrue(markdown.contains("adviser partial\n\n--\nError:\nprovider exploded"), markdown)
+    }
+
+    func testTerminalCancelledStatusAndResponseWhitespaceArePreserved() throws {
+        let startedAt = Date(timeIntervalSince1970: 1000)
+        let fixture = try makeGroup(startedAt: startedAt, terminal: true)
+        let payload = OracleGroupLanePayloadLoader.payload(
+            group: fixture.group,
+            sessions: [],
+            liveMessages: { _ in [] }
+        )
+        XCTAssertEqual(payload.lanes.map(\.status), [.completed, .failed, .cancelled])
+        XCTAssertEqual(payload.lanes[0].response, "durable primary answer")
+        XCTAssertEqual(payload.lanes[2].errorCode, "cancelled")
+
+        let whitespace = OracleLaneMarkdownPayload(lanes: [
+            .init(
+                laneIndex: 0,
+                chatID: "chat-0",
+                providerID: "  codex  ",
+                modelID: "  gpt-5.6-sol  ",
+                effectiveReasoningEffort: "  high  ",
+                status: .completed,
+                response: "  leading and trailing  ",
+                partialResponse: nil,
+                errorCode: nil,
+                errorMessage: nil
+            )
+        ])
+        let whitespaceMarkdown = OracleLaneMarkdownFormatter.format(whitespace)
+        XCTAssertTrue(whitespaceMarkdown.contains("  leading and trailing  "), whitespaceMarkdown)
+        XCTAssertTrue(whitespaceMarkdown.contains("- Provider: `codex`"), whitespaceMarkdown)
+        XCTAssertTrue(whitespaceMarkdown.contains("- Model: `gpt-5.6-sol`"), whitespaceMarkdown)
+        XCTAssertTrue(whitespaceMarkdown.contains("- Effective effort: `high`"), whitespaceMarkdown)
+        XCTAssertTrue(OracleLaneMarkdownFormatter.format(payload).contains("- Status: Cancelled"))
     }
 
     private func makeGroup(

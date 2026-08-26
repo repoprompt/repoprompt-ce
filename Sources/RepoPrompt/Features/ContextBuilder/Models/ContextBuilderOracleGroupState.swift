@@ -37,6 +37,9 @@ struct ContextBuilderOracleGroupState {
         generation expectedGeneration: UInt64
     ) -> Bool {
         guard generation == expectedGeneration,
+              self.groupID == nil,
+              self.turnID == nil,
+              self.members.isEmpty,
               members.count >= 2,
               members.map(\.laneID.index) == Array(members.indices),
               Set(members.map(\.sessionID)).count == members.count,
