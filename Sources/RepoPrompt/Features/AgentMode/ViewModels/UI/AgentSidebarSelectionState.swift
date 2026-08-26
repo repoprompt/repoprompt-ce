@@ -130,8 +130,8 @@ struct AgentSidebarSelectionState: Equatable {
               operation.origin == .command,
               operation.workspaceID == workspaceID,
               operation.commandProgressPlacement == .row,
-              operation.commandRowProgressRetired
-              || !renderedOrder.contains(where: operation.presentationTargets.contains)
+              !operation.commandRowProgressRetired,
+              !renderedOrder.contains(where: operation.presentationTargets.contains)
         else { return nil }
         return operation
     }

@@ -660,7 +660,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         )
     }
 
-    func testCommandCoordinatorShowsFallbackAfterProjectionRemovalUntilCleanupFinishes() async throws {
+    func testCommandCoordinatorRetiresAllCommandProgressAfterProjectionRemoval() async throws {
         let fixture = makeFixture(initialTabCount: 2)
         let workspaceID = try XCTUnwrap(fixture.manager.activeWorkspace?.id)
         let tabID = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs.first?.id)
@@ -713,13 +713,10 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             for: identity,
             workspaceID: workspaceID
         ))
-        XCTAssertEqual(
-            viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
-                renderedOrder: projection.renderedSelectionOrder,
-                workspaceID: workspaceID
-            ),
-            operation
-        )
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
+            renderedOrder: projection.renderedSelectionOrder,
+            workspaceID: workspaceID
+        ))
         XCTAssertFalse(viewModel.canPerformDirectSidebarCommand(workspaceID: workspaceID))
 
         fence.release()
@@ -800,13 +797,10 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             for: identity,
             workspaceID: workspaceID
         ))
-        XCTAssertEqual(
-            viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
-                renderedOrder: projection.renderedSelectionOrder,
-                workspaceID: workspaceID
-            ),
-            operation
-        )
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
+            renderedOrder: projection.renderedSelectionOrder,
+            workspaceID: workspaceID
+        ))
         XCTAssertFalse(viewModel.canPerformDirectSidebarCommand(workspaceID: workspaceID))
 
         fence.release()

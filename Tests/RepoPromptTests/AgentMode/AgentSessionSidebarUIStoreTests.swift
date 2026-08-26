@@ -147,13 +147,14 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertTrue(retiredOperation.commandRowProgressRetired)
         XCTAssertEqual(store.selectionState.revision, initialRevision + 1)
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID))
-        XCTAssertEqual(
-            store.selectionState.commandFallbackProgressOperation(
-                renderedOrder: [target],
-                workspaceID: workspaceID
-            ),
-            retiredOperation
-        )
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            renderedOrder: [target],
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            renderedOrder: [],
+            workspaceID: workspaceID
+        ))
 
         store.retireCommandRowProgress(forRemovedTabIDs: [id(1)], workspaceID: workspaceID)
         XCTAssertEqual(store.selectionState.revision, initialRevision + 1)
