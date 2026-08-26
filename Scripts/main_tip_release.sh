@@ -26,6 +26,7 @@ eval "$(python3 "$ROLLOUT_TOOL" packaging-context \
     --policy "$APPLE_IDENTITY_POLICY" \
     --version-env "$ROOT_DIR/version.env")"
 [[ "$ROLLOUT_CHANNEL" == "tip" ]] || fail "Tip release requires a Tip rollout declaration"
+TIP_PUBLISH_INSTALLATION_TYPE="${TIP_PUBLISH_INSTALLATION_TYPE:-$ROLLOUT_INSTALLATION_TYPE}"
 
 TIP_COMMIT="${TIP_COMMIT:-$(git rev-parse HEAD)}"
 TIP_SHORT_SHA="${TIP_SHORT_SHA:-${TIP_COMMIT:0:12}}"
@@ -405,6 +406,47 @@ sign_tip() {
     printf 'OK: signed and notarized Tip %s artifact %s.\n' "$ROLLOUT_ROLE" "$TIP_TAG"
 }
 
+tip_publish_assets() {
+    TIP_PUBLISH_ASSETS=("$APPCAST" "$CHECKSUMS" "$FINAL_ARTIFACT_MANIFEST" "$FINAL_METADATA" "$ROLLOUT_MANIFEST")
+    case "$TIP_PUBLISH_INSTALLATION_TYPE" in
+        package) TIP_PUBLISH_ASSETS+=("$TRANSITION_PKG") ;;
+        application) TIP_PUBLISH_ASSETS+=("$UPDATE_ZIP" "$DMG") ;;
+        *) fail "TIP_PUBLISH_INSTALLATION_TYPE must be application or package" ;;
+    esac
+}
+
+validate_tip_publish_assets() {
+    require_command python3
+    tip_publish_assets
+    local expected_basenames=()
+    local path
+    for path in "${TIP_PUBLISH_ASSETS[@]}"; do
+        expected_basenames+=("$(basename "$path")")
+    done
+    python3 - "$DIST_DIR" "${expected_basenames[@]}" <<'PYTHON'
+import sys
+from pathlib import Path
+
+dist = Path(sys.argv[1])
+expected = set(sys.argv[2:])
+if not dist.is_dir():
+    raise SystemExit(f"ERROR: Missing Tip publish directory: {dist}")
+actual = {entry.name for entry in dist.iterdir()}
+missing = sorted(expected - actual)
+extra = sorted(actual - expected)
+if missing or extra:
+    raise SystemExit(
+        "ERROR: Tip publish asset inventory mismatch: "
+        f"missing={missing or 'none'} extra={extra or 'none'}"
+    )
+for name in sorted(expected):
+    path = dist / name
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"ERROR: Tip publish asset must be a regular non-symlink file: {path}")
+print(f"OK: Tip publish asset inventory contains exactly {len(expected)} files.")
+PYTHON
+}
+
 publish_tip() {
     require_command gh
     require_env TIP_GH_TOKEN
@@ -413,17 +455,9 @@ publish_tip() {
             fail "TIP_UPDATE_REPOSITORY must not target the source or stable update repository"
             ;;
     esac
-    local role_assets=("$APPCAST" "$CHECKSUMS" "$FINAL_ARTIFACT_MANIFEST" "$FINAL_METADATA" "$ROLLOUT_MANIFEST")
-    if [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" ]]; then
-        role_assets+=("$TRANSITION_PKG")
-    else
-        role_assets+=("$UPDATE_ZIP" "$DMG")
-    fi
-    for path in "${role_assets[@]}"; do
-        [[ -f "$path" ]] || fail "Missing tip publish asset: $path"
-    done
+    validate_tip_publish_assets
     GH_TOKEN="$TIP_GH_TOKEN" gh release create "$TIP_TAG" \
-        "${role_assets[@]}" \
+        "${TIP_PUBLISH_ASSETS[@]}" \
         --repo "$TIP_UPDATE_REPOSITORY" \
         --target main \
         --latest \
@@ -436,7 +470,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "$MODE" in
         stage) stage_tip ;;
         sign) sign_tip ;;
+        validate-assets) validate_tip_publish_assets ;;
         publish-tip) publish_tip ;;
-        *) fail "Usage: $0 stage|sign|publish-tip" ;;
+        *) fail "Usage: $0 stage|sign|validate-assets|publish-tip" ;;
     esac
 fi

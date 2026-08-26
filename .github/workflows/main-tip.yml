@@ -656,19 +656,23 @@ jobs:
           rm -f "$RUNNER_TEMP/repoprompt-tip-successor.p12"
           rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"
 
+      - name: Validate signed Tip asset inventory
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          TIP_PUBLISH_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh validate-assets
+
       - name: Upload signed tip assets for smoke and publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: RepoPrompt-CE-signed-tip
-          path: |
-            tip-source/dist/*.zip
-            tip-source/dist/*.dmg
-            tip-source/dist/*.pkg
-            tip-source/dist/appcast.xml
-            tip-source/dist/SHA256SUMS
-            tip-source/dist/*-artifact-manifest.json
-            tip-source/dist/*-metadata.json
-            tip-source/dist/identity-rollout.json
+          path: tip-source/dist/
           if-no-files-found: error
           retention-days: 1
 
@@ -694,6 +698,19 @@ jobs:
         with:
           name: RepoPrompt-CE-signed-tip
           path: signed-tip
+
+      - name: Validate signed Tip asset inventory
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          TIP_PUBLISH_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/trusted-control-plane
+          DIST_DIR: ${{ github.workspace }}/signed-tip
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh validate-assets
 
       - name: Verify and smoke signed tip
         env:
@@ -776,6 +793,7 @@ jobs:
           TIP_TAG: ${{ needs.setup.outputs.tag }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
           TIP_GH_TOKEN: ${{ secrets.TIP_UPDATE_REPOSITORY_TOKEN }}
+          TIP_PUBLISH_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/trusted-control-plane
           DIST_DIR: ${{ github.workspace }}/tip-assets

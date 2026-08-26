@@ -3344,7 +3344,16 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn("RELEASE_COMMIT: ${{ needs.setup.outputs.commit }}", tip_workflow)
         self.assertIn("REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source", tip_workflow)
         self.assertIn("REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}", tip_workflow)
-        self.assertIn("tip-source/dist/*-metadata.json", tip_workflow)
+        self.assertIn("path: tip-source/dist/", tip_workflow)
+        self.assertEqual(tip_workflow.count("main_tip_release.sh validate-assets"), 2)
+        self.assertIn("path: signed-tip", tip_workflow)
+        self.assertIn("DIST_DIR: ${{ github.workspace }}/signed-tip", tip_workflow)
+        self.assertIn("path: tip-assets", tip_workflow)
+        self.assertIn("DIST_DIR: ${{ github.workspace }}/tip-assets", tip_workflow)
+        self.assertEqual(
+            tip_workflow.count("TIP_PUBLISH_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}"),
+            3,
+        )
         self.assertNotIn("stable-release-channel", tip_workflow)
         self.assertNotIn("release-draft-creation", tip_workflow)
         self.assertNotIn("PUBLIC_UPDATE_REPOSITORY_TOKEN", tip_workflow)
@@ -3415,7 +3424,7 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn('REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER"', tip_script)
         self.assertEqual(tip_script.count('REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER"'), 3)
         self.assertNotIn('BUILD_NUMBER="$TIP_BUILD_NUMBER"', tip_script)
-        self.assertIn("stage|sign|publish-tip", tip_script)
+        self.assertIn("stage|sign|validate-assets|publish-tip", tip_script)
         self.assertIn('source "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"', tip_script)
         self.assertIn("stage_release_sentry_symbols", tip_script)
         self.assertIn("require_tip_sentry_configuration", tip_script)
@@ -3459,6 +3468,105 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn(
             'fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"',
             package_script,
+        )
+
+    def test_tip_publish_asset_inventory_is_exact(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        short_sha = "0123456789ab"
+        build_number = "35.15.16"
+        archive_basename = f"RepoPrompt-tip-{short_sha}-{build_number}"
+        expected = {
+            f"{archive_basename}.zip",
+            f"{archive_basename}.dmg",
+            "appcast.xml",
+            "SHA256SUMS",
+            f"{archive_basename}-artifact-manifest.json",
+            f"{archive_basename}-metadata.json",
+            "identity-rollout.json",
+        }
+        for name in expected:
+            (temp_dir / name).write_text(f"{name}\n", encoding="utf-8")
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "TIP_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+                "TIP_SHORT_SHA": short_sha,
+                "TIP_BUILD_NUMBER": build_number,
+                "DIST_DIR": str(temp_dir),
+            }
+        )
+
+        accepted = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("contains exactly 7 files", accepted.stdout)
+
+        (temp_dir / "appcast.xml").unlink()
+        missing = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("missing=['appcast.xml']", missing.stderr)
+
+        (temp_dir / "appcast.xml").write_text("appcast\n", encoding="utf-8")
+        (temp_dir / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+        extra = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(extra.returncode, 0)
+        self.assertIn("extra=['unexpected.txt']", extra.stderr)
+
+        for path in temp_dir.iterdir():
+            path.unlink()
+        package_expected = {
+            f"{archive_basename}.pkg",
+            "appcast.xml",
+            "SHA256SUMS",
+            f"{archive_basename}-artifact-manifest.json",
+            f"{archive_basename}-metadata.json",
+            "identity-rollout.json",
+        }
+        for name in package_expected:
+            (temp_dir / name).write_text(f"{name}\n", encoding="utf-8")
+        package_env = env.copy()
+        package_env["TIP_PUBLISH_INSTALLATION_TYPE"] = "package"
+        package = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=package_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(package.returncode, 0, package.stderr)
+        self.assertIn("contains exactly 6 files", package.stdout)
+
+        package_env["TIP_PUBLISH_INSTALLATION_TYPE"] = "invalid"
+        invalid_type = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=package_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(invalid_type.returncode, 0)
+        self.assertIn(
+            "TIP_PUBLISH_INSTALLATION_TYPE must be application or package",
+            invalid_type.stderr,
         )
 
     def test_main_tip_setup_uses_read_only_github_token_for_release_lookup_helper(self) -> None:
