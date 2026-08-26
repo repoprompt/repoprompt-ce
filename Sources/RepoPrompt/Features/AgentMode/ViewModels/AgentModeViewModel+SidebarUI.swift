@@ -147,21 +147,18 @@ extension AgentModeViewModel {
     func performSidebarBulkAction(
         _ action: AgentSidebarBulkActionKind,
         origin: AgentSidebarBulkActionOrigin,
+        commandProgressPlacement: AgentSidebarCommandProgressPlacement?,
         targets: SidebarBulkMutationTargets,
         promptManager: PromptViewModel
     ) async {
-        let targetCount: Int = switch action {
-        case .delete: targets.activeDeleteTabIDs.count + targets.archivedDeleteTargets.count
-        case .stash: targets.stashTabIDs.count
-        case .pin: targets.pinTabIDs.count
-        case .unpin: targets.unpinTabIDs.count
-        }
+        let presentationTargets = targets.presentationTargets(for: action)
         guard workspaceManager?.activeWorkspaceID == targets.workspaceID else { return }
         if origin == .command, ui.sessionSidebar.selectionState.showsSelectionPresentation { return }
         guard let token = ui.sessionSidebar.beginBulkAction(
             kind: action,
             origin: origin,
-            targetCount: targetCount,
+            presentationTargets: presentationTargets,
+            commandProgressPlacement: commandProgressPlacement,
             workspaceID: targets.workspaceID
         ) else { return }
 

@@ -75,10 +75,12 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
     func testCommandOriginWithoutSelectionUsesCommandProgressPolicy() throws {
         let store = AgentSessionSidebarUIStore()
         let workspaceID = id(99)
+        let target = AgentSidebarSelectionIdentity.active(tabID: id(1))
         let token = try XCTUnwrap(store.beginBulkAction(
             kind: .delete,
             origin: .command,
-            targetCount: 1,
+            presentationTargets: [target],
+            commandProgressPlacement: .row,
             workspaceID: workspaceID
         ))
 
@@ -87,17 +89,20 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             workspaceID: workspaceID,
             kind: .delete,
             origin: .command,
-            targetCount: 1
+            presentationTargets: [target],
+            commandProgressPlacement: .row
         ))
         XCTAssertTrue(store.selectionState.isMutationInFlight)
         XCTAssertFalse(store.selectionState.showsSelectionPresentation)
-        XCTAssertEqual(store.selectionState.commandProgressOperation, store.selectionState.inFlightAction)
+        XCTAssertEqual(store.selectionState.commandRowProgressOperation(for: target), store.selectionState.inFlightAction)
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: .active(tabID: id(2))))
+        XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
 
         store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
 
         XCTAssertFalse(store.selectionState.isMutationInFlight)
         XCTAssertFalse(store.selectionState.showsSelectionPresentation)
-        XCTAssertNil(store.selectionState.commandProgressOperation)
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target))
     }
 
     func testSelectionOriginSurvivesEmptyReconciliationUntilFinish() throws {
@@ -108,13 +113,15 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         let token = try XCTUnwrap(store.beginBulkAction(
             kind: .stash,
             origin: .selection,
-            targetCount: 1,
+            presentationTargets: [first],
+            commandProgressPlacement: nil,
             workspaceID: workspaceID
         ))
 
         XCTAssertTrue(store.selectionState.isMutationInFlight)
         XCTAssertTrue(store.selectionState.showsSelectionPresentation)
-        XCTAssertNil(store.selectionState.commandProgressOperation)
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first))
+        XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
 
         store.reconcileSelection(renderedOrder: [], workspaceID: workspaceID)
 
@@ -125,7 +132,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             workspaceID: workspaceID,
             kind: .stash,
             origin: .selection,
-            targetCount: 1
+            presentationTargets: [first],
+            commandProgressPlacement: nil
         ))
 
         store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
@@ -151,7 +159,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             let token = try XCTUnwrap(store.beginBulkAction(
                 kind: .delete,
                 origin: origin,
-                targetCount: 1,
+                presentationTargets: [first],
+                commandProgressPlacement: origin == .command ? .row : nil,
                 workspaceID: workspaceID
             ))
             let frozenState = store.selectionState
@@ -159,7 +168,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             XCTAssertNil(store.beginBulkAction(
                 kind: .stash,
                 origin: origin,
-                targetCount: 1,
+                presentationTargets: [first],
+                commandProgressPlacement: origin == .command ? .row : nil,
                 workspaceID: workspaceID
             ))
             XCTAssertEqual(store.handleSelectionGesture(
@@ -179,10 +189,12 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
     func testDirectBulkActionRetainsWorkspaceOwnerWithoutSelection() throws {
         let store = AgentSessionSidebarUIStore()
         let workspaceID = id(99)
+        let target = AgentSidebarSelectionIdentity.active(tabID: id(1))
         let token = try XCTUnwrap(store.beginBulkAction(
             kind: .delete,
             origin: .command,
-            targetCount: 1,
+            presentationTargets: [target],
+            commandProgressPlacement: .row,
             workspaceID: workspaceID
         ))
 
@@ -208,7 +220,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             let token = try XCTUnwrap(store.beginBulkAction(
                 kind: .delete,
                 origin: origin,
-                targetCount: 1,
+                presentationTargets: [first],
+                commandProgressPlacement: origin == .command ? .row : nil,
                 workspaceID: workspaceID
             ))
 
@@ -220,7 +233,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             )
 
             XCTAssertNil(store.selectionState.inFlightAction)
-            XCTAssertNil(store.selectionState.commandProgressOperation)
+            XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first))
+            XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
             XCTAssertFalse(store.selectionState.isMutationInFlight)
             XCTAssertFalse(store.selectionState.showsSelectionPresentation)
             XCTAssertNil(store.selectionState.notice)
@@ -246,7 +260,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             let token = try XCTUnwrap(store.beginBulkAction(
                 kind: .delete,
                 origin: origin,
-                targetCount: 1,
+                presentationTargets: [first],
+                commandProgressPlacement: origin == .command ? .row : nil,
                 workspaceID: originalWorkspaceID
             ))
 
@@ -258,7 +273,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             )
 
             XCTAssertNil(store.selectionState.inFlightAction)
-            XCTAssertNil(store.selectionState.commandProgressOperation)
+            XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first))
+            XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
             XCTAssertFalse(store.selectionState.isMutationInFlight)
             XCTAssertFalse(store.selectionState.showsSelectionPresentation)
             XCTAssertNil(store.selectionState.notice)
@@ -277,7 +293,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertNil(store.beginBulkAction(
             kind: .delete,
             origin: .command,
-            targetCount: 1,
+            presentationTargets: [first],
+            commandProgressPlacement: .row,
             workspaceID: workspaceID
         ))
         XCTAssertEqual(store.selectionState, selectedState)
@@ -286,7 +303,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertNotNil(store.beginBulkAction(
             kind: .delete,
             origin: .command,
-            targetCount: 1,
+            presentationTargets: [first],
+            commandProgressPlacement: .row,
             workspaceID: workspaceID
         ))
     }
@@ -300,7 +318,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertNil(store.beginBulkAction(
             kind: .delete,
             origin: .selection,
-            targetCount: 1,
+            presentationTargets: [first],
+            commandProgressPlacement: nil,
             workspaceID: selectionWorkspaceID
         ))
 
@@ -315,16 +334,104 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertNil(store.beginBulkAction(
             kind: .delete,
             origin: .selection,
-            targetCount: 1,
+            presentationTargets: [first],
+            commandProgressPlacement: nil,
             workspaceID: otherWorkspaceID
         ))
         XCTAssertEqual(store.selectionState, selectedState)
         XCTAssertNotNil(store.beginBulkAction(
             kind: .delete,
             origin: .selection,
-            targetCount: 1,
+            presentationTargets: [first],
+            commandProgressPlacement: nil,
             workspaceID: selectionWorkspaceID
         ))
+    }
+
+    func testArchivedHeaderCommandFreezesTargetsWithoutRowProgress() throws {
+        let store = AgentSessionSidebarUIStore()
+        let workspaceID = id(99)
+        let first = AgentSidebarSelectionIdentity.archived(stashedTabID: id(10), tabID: id(1))
+        let second = AgentSidebarSelectionIdentity.archived(stashedTabID: id(20), tabID: id(2))
+
+        let token = try XCTUnwrap(store.beginBulkAction(
+            kind: .delete,
+            origin: .command,
+            presentationTargets: [first, second],
+            commandProgressPlacement: .archivedHeader,
+            workspaceID: workspaceID
+        ))
+
+        let operation = try XCTUnwrap(store.selectionState.archivedHeaderCommandProgressOperation)
+        XCTAssertEqual(operation.token, token)
+        XCTAssertEqual(operation.targetCount, 2)
+        XCTAssertEqual(operation.presentationTargets, [first, second])
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first))
+    }
+
+    func testBulkActionRejectsInvalidOriginAndProgressPlacementCombinations() {
+        let store = AgentSessionSidebarUIStore()
+        let workspaceID = id(99)
+        let active = AgentSidebarSelectionIdentity.active(tabID: id(1))
+        let otherActive = AgentSidebarSelectionIdentity.active(tabID: id(2))
+
+        XCTAssertNil(store.beginBulkAction(
+            kind: .delete,
+            origin: .command,
+            presentationTargets: [active, otherActive],
+            commandProgressPlacement: .row,
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(store.beginBulkAction(
+            kind: .delete,
+            origin: .command,
+            presentationTargets: [active],
+            commandProgressPlacement: .archivedHeader,
+            workspaceID: workspaceID
+        ))
+
+        _ = store.handleSelectionGesture(.toggle, identity: active, renderedOrder: [active], workspaceID: workspaceID)
+        XCTAssertNil(store.beginBulkAction(
+            kind: .delete,
+            origin: .selection,
+            presentationTargets: [active],
+            commandProgressPlacement: .row,
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(store.beginBulkAction(
+            kind: .delete,
+            origin: .selection,
+            presentationTargets: [otherActive],
+            commandProgressPlacement: nil,
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(store.selectionState.inFlightAction)
+    }
+
+    func testBulkMutationTargetsMapOnlyTheRequestedAction() {
+        let workspaceID = id(99)
+        let activeDelete = id(1)
+        let stashed = id(10)
+        let archivedTab = id(2)
+        let stash = id(3)
+        let pin = id(4)
+        let unpin = id(5)
+        let targets = AgentModeViewModel.SidebarBulkMutationTargets(
+            workspaceID: workspaceID,
+            activeDeleteTabIDs: [activeDelete],
+            archivedDeleteTargets: [.init(stashedTabID: stashed, tabID: archivedTab)],
+            stashTabIDs: [stash],
+            pinTabIDs: [pin],
+            unpinTabIDs: [unpin]
+        )
+
+        XCTAssertEqual(targets.presentationTargets(for: .delete), [
+            .active(tabID: activeDelete),
+            .archived(stashedTabID: stashed, tabID: archivedTab)
+        ])
+        XCTAssertEqual(targets.presentationTargets(for: .stash), [.active(tabID: stash)])
+        XCTAssertEqual(targets.presentationTargets(for: .pin), [.active(tabID: pin)])
+        XCTAssertEqual(targets.presentationTargets(for: .unpin), [.active(tabID: unpin)])
     }
 
     func testModifierMappingGivesShiftPrecedence() {

@@ -35,6 +35,7 @@ struct AgentSessionRow: View {
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
+    var commandProgressKind: AgentSidebarBulkActionKind?
     let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
     let onSelect: () -> Void
     let onTogglePin: () -> Void
@@ -237,8 +238,10 @@ struct AgentSessionRow: View {
 
             Spacer()
 
-            // Trailing indicator (checkmark or delete button)
-            if isHovered {
+            // Trailing command progress or hover actions.
+            if let commandProgressKind {
+                commandProgressIndicator(for: commandProgressKind)
+            } else if isHovered {
                 if !showsSelectionPresentation, attentionRunState != nil, let onDismissAttention {
                     Button(action: onDismissAttention) {
                         Image(systemName: "bell.slash")
@@ -755,6 +758,16 @@ struct AgentSessionRow: View {
         return isMCPControlledRoot ? "MCP controlled" : ""
     }
 
+    private func commandProgressIndicator(
+        for kind: AgentSidebarBulkActionKind
+    ) -> some View {
+        ProgressView()
+            .controlSize(.small)
+            .frame(width: 16, height: 16)
+            .allowsHitTesting(false)
+            .accessibilityLabel(kind.rowProgressAccessibilityLabel)
+    }
+
     private func waitingTooltip(
         for state: AgentSessionRunState,
         unseen: Bool
@@ -776,6 +789,7 @@ struct AgentStashedSessionRow: View {
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
+    var commandProgressKind: AgentSidebarBulkActionKind?
     let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
     let onRestore: () -> Void
     let onDelete: () -> Void
@@ -890,7 +904,13 @@ struct AgentStashedSessionRow: View {
 
             Spacer()
 
-            if isHovered, allowsDirectMutations {
+            if let commandProgressKind {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 16, height: 16)
+                    .allowsHitTesting(false)
+                    .accessibilityLabel(commandProgressKind.rowProgressAccessibilityLabel)
+            } else if isHovered, allowsDirectMutations {
                 Button(action: onRestore) {
                     Image(systemName: "tray.and.arrow.up")
                         .font(.system(size: 11))
@@ -952,6 +972,17 @@ struct AgentStashedSessionRow: View {
         .accessibilityLabel("\(stashed.tab.name), archived session")
         .accessibilityValue(isSelected ? "Selected" : "Not selected")
         .accessibilityAction(named: Text(isSelected ? "Deselect chat" : "Select chat"), toggleSelection)
+    }
+}
+
+private extension AgentSidebarBulkActionKind {
+    var rowProgressAccessibilityLabel: String {
+        switch self {
+        case .delete: "Deleting chat"
+        case .stash: "Stashing chat"
+        case .pin: "Pinning chat"
+        case .unpin: "Unpinning chat"
+        }
     }
 }
 

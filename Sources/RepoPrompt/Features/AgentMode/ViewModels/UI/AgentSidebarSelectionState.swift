@@ -52,12 +52,22 @@ enum AgentSidebarBulkActionOrigin: Equatable {
     case command
 }
 
+enum AgentSidebarCommandProgressPlacement: Equatable {
+    case row
+    case archivedHeader
+}
+
 struct AgentSidebarBulkActionOperation: Equatable {
     let token: UUID
     let workspaceID: UUID
     let kind: AgentSidebarBulkActionKind
     let origin: AgentSidebarBulkActionOrigin
-    let targetCount: Int
+    let presentationTargets: Set<AgentSidebarSelectionIdentity>
+    let commandProgressPlacement: AgentSidebarCommandProgressPlacement?
+
+    var targetCount: Int {
+        presentationTargets.count
+    }
 }
 
 struct AgentSidebarBulkActionNotice: Equatable {
@@ -88,9 +98,23 @@ struct AgentSidebarSelectionState: Equatable {
         inFlightAction != nil
     }
 
-    var commandProgressOperation: AgentSidebarBulkActionOperation? {
-        guard inFlightAction?.origin == .command else { return nil }
-        return inFlightAction
+    func commandRowProgressOperation(
+        for identity: AgentSidebarSelectionIdentity
+    ) -> AgentSidebarBulkActionOperation? {
+        guard let operation = inFlightAction,
+              operation.origin == .command,
+              operation.commandProgressPlacement == .row,
+              operation.presentationTargets.contains(identity)
+        else { return nil }
+        return operation
+    }
+
+    var archivedHeaderCommandProgressOperation: AgentSidebarBulkActionOperation? {
+        guard let operation = inFlightAction,
+              operation.origin == .command,
+              operation.commandProgressPlacement == .archivedHeader
+        else { return nil }
+        return operation
     }
 
     mutating func handle(

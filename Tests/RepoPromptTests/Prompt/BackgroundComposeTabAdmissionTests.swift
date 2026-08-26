@@ -564,6 +564,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         await viewModel.performSidebarBulkAction(
             .delete,
             origin: .selection,
+            commandProgressPlacement: nil,
             targets: targets,
             promptManager: fixture.prompt
         )
@@ -602,6 +603,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             await viewModel.performSidebarBulkAction(
                 .delete,
                 origin: .command,
+                commandProgressPlacement: .row,
                 targets: targets,
                 promptManager: fixture.prompt
             )
@@ -614,13 +616,22 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertEqual(operation.kind, .delete)
         XCTAssertEqual(operation.origin, .command)
         XCTAssertEqual(operation.targetCount, 1)
+        XCTAssertEqual(operation.presentationTargets, [.active(tabID: tabID)])
+        XCTAssertEqual(operation.commandProgressPlacement, .row)
         XCTAssertTrue(viewModel.ui.sessionSidebar.selectionState.isMutationInFlight)
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.showsSelectionPresentation)
-        XCTAssertEqual(viewModel.ui.sessionSidebar.selectionState.commandProgressOperation, operation)
+        XCTAssertEqual(
+            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: .active(tabID: tabID)),
+            operation
+        )
+        XCTAssertNil(
+            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: .active(tabID: UUID()))
+        )
 
         await viewModel.performSidebarBulkAction(
             .delete,
             origin: .command,
+            commandProgressPlacement: .row,
             targets: targets,
             promptManager: fixture.prompt
         )
@@ -635,7 +646,9 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertFalse(fixture.prompt.currentComposeTabs.contains(where: { $0.id == tabID }))
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.isMutationInFlight)
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.showsSelectionPresentation)
-        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandProgressOperation)
+        XCTAssertNil(
+            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: .active(tabID: tabID))
+        )
     }
 
     func testSelectionCoordinatorRetainsProgressAfterReconciliationWhileDeleteIsSuspended() async throws {
@@ -667,6 +680,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             await viewModel.performSidebarBulkAction(
                 .delete,
                 origin: .selection,
+                commandProgressPlacement: nil,
                 targets: targets,
                 promptManager: fixture.prompt
             )
@@ -679,9 +693,12 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertEqual(operation.kind, .delete)
         XCTAssertEqual(operation.origin, .selection)
         XCTAssertEqual(operation.targetCount, 1)
+        XCTAssertEqual(operation.presentationTargets, [identity])
+        XCTAssertNil(operation.commandProgressPlacement)
         XCTAssertTrue(viewModel.ui.sessionSidebar.selectionState.isMutationInFlight)
         XCTAssertTrue(viewModel.ui.sessionSidebar.selectionState.showsSelectionPresentation)
-        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandProgressOperation)
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: identity))
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.archivedHeaderCommandProgressOperation)
 
         viewModel.ui.sessionSidebar.reconcileSelection(renderedOrder: [], workspaceID: workspaceID)
 
@@ -695,7 +712,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         XCTAssertFalse(fixture.prompt.currentComposeTabs.contains(where: { $0.id == tabID }))
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.isMutationInFlight)
         XCTAssertFalse(viewModel.ui.sessionSidebar.selectionState.showsSelectionPresentation)
-        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandProgressOperation)
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(for: identity))
     }
 
     func testMixedDeleteDoesNotRetryArchivedTargetRejectedDuringActiveCascade() async throws {
@@ -876,6 +893,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         await viewModel.performSidebarBulkAction(
             .pin,
             origin: .command,
+            commandProgressPlacement: .row,
             targets: targets,
             promptManager: fixture.prompt
         )
@@ -979,7 +997,6 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         let fixture = makeFixture(initialTabCount: 2)
         let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
         let workspaceID = try XCTUnwrap(fixture.manager.activeWorkspace?.id)
-        let selectedTabID = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs.first?.id)
         let missingTabID = UUID()
         let pinTargets = AgentModeViewModel.SidebarBulkMutationTargets(
             workspaceID: workspaceID,
@@ -993,6 +1010,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         await viewModel.performSidebarBulkAction(
             .pin,
             origin: .command,
+            commandProgressPlacement: .row,
             targets: pinTargets,
             promptManager: fixture.prompt
         )
@@ -1005,7 +1023,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
 
         viewModel.ui.sessionSidebar.dismissBulkActionNotice()
         viewModel.ui.sessionSidebar.selectAll(
-            renderedOrder: [.active(tabID: selectedTabID)],
+            renderedOrder: [.active(tabID: missingTabID)],
             workspaceID: workspaceID
         )
         let unpinTargets = AgentModeViewModel.SidebarBulkMutationTargets(
@@ -1020,6 +1038,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         await viewModel.performSidebarBulkAction(
             .unpin,
             origin: .selection,
+            commandProgressPlacement: nil,
             targets: unpinTargets,
             promptManager: fixture.prompt
         )
@@ -1057,6 +1076,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         await viewModel.performSidebarBulkAction(
             .pin,
             origin: .command,
+            commandProgressPlacement: .row,
             targets: targets,
             promptManager: fixture.prompt
         )
@@ -1068,7 +1088,8 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         let token = try XCTUnwrap(viewModel.ui.sessionSidebar.beginBulkAction(
             kind: .delete,
             origin: .command,
-            targetCount: 1,
+            presentationTargets: [identity],
+            commandProgressPlacement: .row,
             workspaceID: workspaceID
         ))
         XCTAssertFalse(viewModel.canPerformDirectSidebarCommand(workspaceID: workspaceID))

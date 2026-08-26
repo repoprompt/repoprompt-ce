@@ -84,17 +84,33 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     func beginBulkAction(
         kind: AgentSidebarBulkActionKind,
         origin: AgentSidebarBulkActionOrigin,
-        targetCount: Int,
+        presentationTargets: Set<AgentSidebarSelectionIdentity>,
+        commandProgressPlacement: AgentSidebarCommandProgressPlacement?,
         workspaceID: UUID
     ) -> UUID? {
-        guard selectionState.inFlightAction == nil, targetCount > 0 else { return nil }
+        guard selectionState.inFlightAction == nil, !presentationTargets.isEmpty else { return nil }
         switch origin {
         case .selection:
-            guard selectionState.workspaceID == workspaceID,
-                  !selectionState.selectedIdentities.isEmpty
+            guard commandProgressPlacement == nil,
+                  selectionState.workspaceID == workspaceID,
+                  !selectionState.selectedIdentities.isEmpty,
+                  presentationTargets.isSubset(of: selectionState.selectedIdentities)
             else { return nil }
         case .command:
-            guard selectionState.selectedIdentities.isEmpty else { return nil }
+            guard selectionState.selectedIdentities.isEmpty,
+                  let commandProgressPlacement
+            else { return nil }
+            switch commandProgressPlacement {
+            case .row:
+                guard presentationTargets.count == 1 else { return nil }
+            case .archivedHeader:
+                guard kind == .delete,
+                      presentationTargets.allSatisfy({ identity in
+                          if case .archived = identity { return true }
+                          return false
+                      })
+                else { return nil }
+            }
         }
 
         let token = UUID()
@@ -106,7 +122,8 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             workspaceID: workspaceID,
             kind: kind,
             origin: origin,
-            targetCount: targetCount
+            presentationTargets: presentationTargets,
+            commandProgressPlacement: commandProgressPlacement
         )
         next.revision &+= 1
         publishSelection(next, eventName: "sessionSidebar.selection.bulkBegin")
@@ -269,6 +286,13 @@ final class AgentSessionSidebarUIStore: ObservableObject {
                     "selectedCount": String(next.selectedIdentities.count),
                     "hasAnchor": String(next.anchor != nil),
                     "inFlightKind": next.inFlightAction?.kind.rawValue ?? "none",
+                    "inFlightTargetCount": String(next.inFlightAction?.targetCount ?? 0),
+                    "inFlightPlacement": next.inFlightAction?.commandProgressPlacement.map {
+                        switch $0 {
+                        case .row: "row"
+                        case .archivedHeader: "archivedHeader"
+                        }
+                    } ?? "none",
                     "inFlightOrigin": next.inFlightAction.map {
                         switch $0.origin {
                         case .selection: "selection"
