@@ -4565,8 +4565,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
         let callbacks = AppOracleGroupExecutionCallbacks(
             prepared: { [weak self] groupID, turnID, members in
-                guard let self, let session = sessions[tabID] else { return }
-                await progressReporter?(.streaming)
+                guard let self, let session = sessions[tabID] else { throw CancellationError() }
                 let handles = members.map {
                     ContextBuilderOracleMemberHandle(
                         laneID: $0.laneID,
@@ -4579,7 +4578,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     turnID: turnID,
                     members: handles,
                     generation: generation
-                ), let primary = handles.first else { return }
+                ), let primary = handles.first else { throw CancellationError() }
+                await progressReporter?(.streaming)
+                guard let currentSession = sessions[tabID],
+                      currentSession === session,
+                      session.followUpOracleGroupState.generation == generation,
+                      session.followUpOracleGroupState.groupID == groupID,
+                      session.followUpOracleGroupState.turnID == turnID
+                else { throw CancellationError() }
                 session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
                     workspaceID: originWorkspaceID,
                     tabID: tabID,

@@ -227,6 +227,32 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
         ))
     }
 
+    func testBindIsOneShotWithinAGeneration() throws {
+        var fixture = try boundState(count: 2)
+        XCTAssertTrue(fixture.state.accept(
+            event(.groupPrepared, fixture: fixture),
+            generation: fixture.generation
+        ))
+        XCTAssertTrue(fixture.state.accept(
+            event(.laneStarted, laneID: fixture.members[0].laneID, sequence: 0, fixture: fixture),
+            generation: fixture.generation
+        ))
+
+        XCTAssertFalse(try fixture.state.bind(
+            groupID: OracleGroupID(),
+            turnID: OracleTurnID(),
+            members: members(count: 2, prefix: "other"),
+            generation: fixture.generation
+        ))
+        XCTAssertEqual(fixture.state.groupID, fixture.groupID)
+        XCTAssertEqual(fixture.state.turnID, fixture.turnID)
+        XCTAssertEqual(fixture.state.members, fixture.members)
+        XCTAssertTrue(fixture.state.acceptsLaneCallback(
+            fixture.members[0].laneID,
+            generation: fixture.generation
+        ))
+    }
+
     private typealias Fixture = (
         state: ContextBuilderOracleGroupState,
         generation: UInt64,
