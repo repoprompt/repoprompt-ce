@@ -660,6 +660,83 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         )
     }
 
+    func testCommandCoordinatorSuppressesFallbackAfterStashProjectionRemovalBeforeRetirement() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let workspaceID = try XCTUnwrap(fixture.manager.activeWorkspace?.id)
+        let tabID = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs.first?.id)
+        let activeIdentity = AgentSidebarSelectionIdentity.active(tabID: tabID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let didRemoveToken = installDidRemoveListener(prompt: fixture.prompt, viewModel: viewModel)
+        defer { fixture.prompt.removeComposeTabsDidRemoveListener(didRemoveToken) }
+        let fence = TestReleaseFence(name: "command sidebar stash will-close")
+        defer { fence.release() }
+        let willCloseToken = fixture.prompt.addComposeTabsWillCloseListener { tabIDs, reason in
+            guard reason == .stash, tabIDs.contains(tabID) else { return }
+            await fence.enterAndWait()
+        }
+        defer { fixture.prompt.removeComposeTabsWillCloseListener(willCloseToken) }
+        let targets = AgentModeViewModel.SidebarBulkMutationTargets(
+            workspaceID: workspaceID,
+            activeDeleteTabIDs: [],
+            archivedDeleteTargets: [],
+            stashTabIDs: [tabID],
+            pinTabIDs: [],
+            unpinTabIDs: []
+        )
+
+        let stashTask = Task {
+            await viewModel.performSidebarBulkAction(
+                .stash,
+                origin: .command,
+                commandProgressPlacement: .row,
+                targets: targets,
+                promptManager: fixture.prompt
+            )
+        }
+        let willCloseEntered = await fence.waitUntilEntered()
+        XCTAssertTrue(willCloseEntered)
+
+        let workspaceSnapshot = try XCTUnwrap(fixture.prompt.sidebarWorkspaceSnapshot)
+        XCTAssertEqual(workspaceSnapshot.workspaceID, workspaceID)
+        XCTAssertFalse(workspaceSnapshot.composeTabs.contains(where: { $0.id == tabID }))
+        let stashedTab = try XCTUnwrap(workspaceSnapshot.stashedTabs.first(where: { $0.tab.id == tabID }))
+        let archivedIdentity = AgentSidebarSelectionIdentity.archived(
+            stashedTabID: stashedTab.id,
+            tabID: tabID
+        )
+        let operation = try XCTUnwrap(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
+        XCTAssertFalse(operation.commandRowProgressRetired)
+        XCTAssertEqual(operation.presentationTargets, [activeIdentity])
+
+        let projection = viewModel.sidebarListProjection(
+            workspaceID: workspaceSnapshot.workspaceID,
+            composeTabs: workspaceSnapshot.composeTabs,
+            stashedTabs: workspaceSnapshot.stashedTabs,
+            currentTabID: fixture.prompt.activeComposeTabID,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: false,
+            showComposeTabsWithoutAgentSessions: true
+        )
+        let renderedIdentities = Set(projection.pagedSessions.map {
+            AgentSidebarSelectionIdentity.active(tabID: $0.tabID)
+        })
+        XCTAssertFalse(projection.existingSelectionIdentities.contains(activeIdentity))
+        XCTAssertTrue(projection.existingSelectionIdentities.contains(archivedIdentity))
+        XCTAssertFalse(projection.existingSelectionIdentities.contains(
+            .archived(stashedTabID: UUID(), tabID: tabID)
+        ))
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
+            existingIdentities: projection.existingSelectionIdentities,
+            renderedIdentities: renderedIdentities,
+            workspaceID: workspaceID
+        ))
+
+        fence.release()
+        await stashTask.value
+
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
+    }
+
     func testCommandCoordinatorRetiresAllCommandProgressAfterProjectionRemoval() async throws {
         let fixture = makeFixture(initialTabCount: 2)
         let workspaceID = try XCTUnwrap(fixture.manager.activeWorkspace?.id)
@@ -714,7 +791,8 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             workspaceID: workspaceID
         ))
         XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
-            renderedOrder: projection.renderedSelectionOrder,
+            existingIdentities: projection.existingSelectionIdentities,
+            renderedIdentities: Set(projection.renderedSelectionOrder),
             workspaceID: workspaceID
         ))
         XCTAssertFalse(viewModel.canPerformDirectSidebarCommand(workspaceID: workspaceID))
@@ -724,7 +802,8 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
 
         XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
         XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [],
+            existingIdentities: [],
+            renderedIdentities: [],
             workspaceID: workspaceID
         ))
     }
@@ -798,7 +877,8 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             workspaceID: workspaceID
         ))
         XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
-            renderedOrder: projection.renderedSelectionOrder,
+            existingIdentities: projection.existingSelectionIdentities,
+            renderedIdentities: Set(projection.renderedSelectionOrder),
             workspaceID: workspaceID
         ))
         XCTAssertFalse(viewModel.canPerformDirectSidebarCommand(workspaceID: workspaceID))

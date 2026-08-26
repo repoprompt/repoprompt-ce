@@ -821,6 +821,77 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(searched.renderedSelectionOrder.count, 25)
     }
 
+    func testSidebarProjectionTracksExistingIdentitiesIndependentlyFromRenderedRows() {
+        let viewModel = makeViewModel()
+        let visibleTab = ComposeTabState(id: UUID(), name: "Visible", activeAgentSessionID: UUID())
+        let sessionlessTab = ComposeTabState(id: UUID(), name: "Hidden")
+        let archivedSessionID = UUID()
+        let stashedTab = StashedTab(tab: ComposeTabState(
+            id: UUID(),
+            name: "Archived",
+            activeAgentSessionID: archivedSessionID
+        ))
+        let composeTabs = [visibleTab, sessionlessTab]
+        var workspace = makeWorkspace(
+            name: "Existing sidebar identities",
+            tabs: composeTabs,
+            activeTabID: visibleTab.id
+        )
+        workspace.stashedTabs = [stashedTab]
+        let manager = makeWorkspaceManager(workspaces: [workspace])
+        manager.activeWorkspace = workspace
+        viewModel.workspaceManager = manager
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        let archivedEntry = makeIndexEntry(
+            id: archivedSessionID,
+            tabID: stashedTab.tab.id,
+            lastUserMessageAt: Date(timeIntervalSince1970: 1)
+        )
+        viewModel.test_installSessionIndexSnapshot(
+            [archivedSessionID: archivedEntry],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+        let expectedExisting: Set<AgentSidebarSelectionIdentity> = [
+            .active(tabID: visibleTab.id),
+            .active(tabID: sessionlessTab.id),
+            .archived(stashedTabID: stashedTab.id, tabID: stashedTab.tab.id)
+        ]
+
+        let collapsed = viewModel.sidebarListProjection(
+            workspaceID: workspace.id,
+            composeTabs: composeTabs,
+            stashedTabs: [stashedTab],
+            currentTabID: visibleTab.id,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: false,
+            showComposeTabsWithoutAgentSessions: false
+        )
+
+        XCTAssertEqual(collapsed.existingSelectionIdentities, expectedExisting)
+        XCTAssertEqual(collapsed.renderedSelectionOrder, [.active(tabID: visibleTab.id)])
+        XCTAssertFalse(collapsed.existingSelectionIdentities.contains(
+            .archived(stashedTabID: UUID(), tabID: stashedTab.tab.id)
+        ))
+
+        let expanded = viewModel.sidebarListProjection(
+            workspaceID: workspace.id,
+            composeTabs: composeTabs,
+            stashedTabs: [stashedTab],
+            currentTabID: visibleTab.id,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: true,
+            showComposeTabsWithoutAgentSessions: false
+        )
+
+        XCTAssertEqual(expanded.existingSelectionIdentities, expectedExisting)
+        XCTAssertTrue(expanded.renderedSelectionOrder.contains(
+            .archived(stashedTabID: stashedTab.id, tabID: stashedTab.tab.id)
+        ))
+        XCTAssertFalse(expanded.renderedSelectionOrder.contains(.active(tabID: sessionlessTab.id)))
+    }
+
     func testArchivedCopyUsesIndexSessionIDWhenStoredBindingIsMissing() {
         let viewModel = makeViewModel()
         let activeTab = ComposeTabState(id: UUID(), name: "Active")

@@ -209,6 +209,7 @@ extension AgentModeViewModel {
         let archivedDateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
         let archivedSessionIDByStashedTabID: [UUID: UUID]
         let defaultCollapseSeedKeys: [AgentSidebarThreadKey]
+        let existingSelectionIdentities: Set<AgentSidebarSelectionIdentity>
         let renderedSelectionOrder: [AgentSidebarSelectionIdentity]
 
         var hasMoreSessions: Bool {

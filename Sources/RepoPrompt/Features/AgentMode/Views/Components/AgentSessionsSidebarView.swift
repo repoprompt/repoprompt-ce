@@ -450,7 +450,8 @@ struct AgentModeSessionsListView: View {
             AgentSidebarSelectionIdentity.archived(stashedTabID: $0.id, tabID: $0.tab.id)
         } : [])
         let fallbackProgressOperation = selectionState.commandFallbackProgressOperation(
-            renderedOrder: renderedProgressRowIdentities,
+            existingIdentities: snapshot.existingSelectionIdentities,
+            renderedIdentities: Set(renderedProgressRowIdentities),
             workspaceID: snapshot.workspaceID
         )
         VStack(spacing: 4) {

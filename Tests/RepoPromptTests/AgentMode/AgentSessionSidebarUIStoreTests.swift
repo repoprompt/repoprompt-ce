@@ -104,13 +104,33 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         ))
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: id(98)))
         XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [target],
+            existingIdentities: [target],
+            renderedIdentities: [target],
             workspaceID: workspaceID
         ))
         XCTAssertEqual(
-            store.selectionState.commandFallbackProgressOperation(renderedOrder: [], workspaceID: workspaceID),
+            store.selectionState.commandFallbackProgressOperation(
+                existingIdentities: [target],
+                renderedIdentities: [],
+                workspaceID: workspaceID
+            ),
             store.selectionState.inFlightAction
         )
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            existingIdentities: [],
+            renderedIdentities: [],
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            existingIdentities: [.active(tabID: id(2))],
+            renderedIdentities: [],
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            existingIdentities: [target],
+            renderedIdentities: [],
+            workspaceID: id(98)
+        ))
         XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
 
         store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
@@ -119,7 +139,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertFalse(store.selectionState.showsSelectionPresentation)
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID))
         XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [],
+            existingIdentities: [target],
+            renderedIdentities: [],
             workspaceID: workspaceID
         ))
     }
@@ -148,11 +169,13 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertEqual(store.selectionState.revision, initialRevision + 1)
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID))
         XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [target],
+            existingIdentities: [target],
+            renderedIdentities: [target],
             workspaceID: workspaceID
         ))
         XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [],
+            existingIdentities: [target],
+            renderedIdentities: [],
             workspaceID: workspaceID
         ))
 
@@ -161,7 +184,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
 
         store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
         XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [target],
+            existingIdentities: [target],
+            renderedIdentities: [target],
             workspaceID: workspaceID
         ))
     }
@@ -180,11 +204,18 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
 
         XCTAssertNotNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID))
         XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [target],
+            existingIdentities: [target],
+            renderedIdentities: [target],
             workspaceID: workspaceID
         ))
         XCTAssertNotNil(store.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [],
+            existingIdentities: [target],
+            renderedIdentities: [],
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            existingIdentities: [.archived(stashedTabID: id(11), tabID: target.tabID)],
+            renderedIdentities: [],
             workspaceID: workspaceID
         ))
     }
@@ -205,6 +236,11 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertTrue(store.selectionState.isMutationInFlight)
         XCTAssertTrue(store.selectionState.showsSelectionPresentation)
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first, workspaceID: workspaceID))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            existingIdentities: [first],
+            renderedIdentities: [],
+            workspaceID: workspaceID
+        ))
         XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
 
         store.reconcileSelection(renderedOrder: [], workspaceID: workspaceID)
@@ -452,7 +488,8 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertEqual(operation.presentationTargets, [first, second])
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first, workspaceID: workspaceID))
         XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
-            renderedOrder: [],
+            existingIdentities: [first, second],
+            renderedIdentities: [],
             workspaceID: workspaceID
         ))
 

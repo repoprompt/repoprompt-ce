@@ -123,7 +123,8 @@ struct AgentSidebarSelectionState: Equatable {
     }
 
     func commandFallbackProgressOperation(
-        renderedOrder: [AgentSidebarSelectionIdentity],
+        existingIdentities: Set<AgentSidebarSelectionIdentity>,
+        renderedIdentities: Set<AgentSidebarSelectionIdentity>,
         workspaceID: UUID?
     ) -> AgentSidebarBulkActionOperation? {
         guard let operation = inFlightAction,
@@ -131,7 +132,8 @@ struct AgentSidebarSelectionState: Equatable {
               operation.workspaceID == workspaceID,
               operation.commandProgressPlacement == .row,
               !operation.commandRowProgressRetired,
-              !renderedOrder.contains(where: operation.presentationTargets.contains)
+              !operation.presentationTargets.isDisjoint(with: existingIdentities),
+              operation.presentationTargets.isDisjoint(with: renderedIdentities)
         else { return nil }
         return operation
     }
