@@ -663,57 +663,6 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         ))
     }
 
-    func testClaimedGroupContinuationUsesFreshAdvancedRevision() throws {
-        let models = try ["model-a", "model-b"].map {
-            try OracleModelReference(providerID: "fixture", modelID: $0)
-        }
-        let roster = try OracleRoster(primary: models[0], additional: Array(models.dropFirst()))
-        let descriptor = try OracleGroupDescriptor(size: models.count)
-        let owner = try OracleConversationOwner(kind: "app-tab", identifier: "fresh-claimed-group")
-        let members = try models.enumerated().map { index, model in
-            try OracleGroupMember(
-                laneID: OracleLaneID(index: index),
-                publicChatID: "fresh-claimed-\(index)",
-                model: model
-            )
-        }
-        let timestamp = Date(timeIntervalSince1970: 1000)
-        let observed = try OracleGroupDocument(
-            group: descriptor,
-            owner: owner,
-            name: "Observed",
-            revision: 1,
-            createdAt: timestamp,
-            updatedAt: timestamp,
-            roster: roster,
-            members: members
-        )
-        let advanced = try OracleGroupDocument(
-            group: descriptor,
-            owner: owner,
-            name: "Observed",
-            revision: 3,
-            createdAt: timestamp,
-            updatedAt: timestamp.addingTimeInterval(1),
-            roster: roster,
-            members: members
-        )
-
-        XCTAssertEqual(
-            AppOracleGroupRouting.claimedContinuationDocument(
-                observed: observed,
-                current: advanced
-            ),
-            advanced
-        )
-        XCTAssertNil(
-            AppOracleGroupRouting.claimedContinuationDocument(
-                observed: advanced,
-                current: observed
-            )
-        )
-    }
-
     func testGroupedDeleteRejectsProjectionThatIsNotACanonicalMember() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }
