@@ -36,6 +36,18 @@ final class OracleGroupContractTests: XCTestCase {
         XCTAssertEqual(try DomainAppSettingsCatalog.normalize(value, for: descriptor), value)
     }
 
+    func testGenericModelSettingsDoNotInheritOracleRosterLengthLimit() throws {
+        let longIdentifier = String(repeating: "m", count: OracleRosterContract.maximumModelIdentifierLength + 1)
+        for key in ["models.preferred_compose_model", "context_builder.model"] {
+            let descriptor = try XCTUnwrap(DomainAppSettingsCatalog.descriptor(for: key))
+            XCTAssertNil(descriptor.maximumStringLength)
+            XCTAssertEqual(
+                try DomainAppSettingsCatalog.normalize(.string(longIdentifier), for: descriptor),
+                .string(longIdentifier)
+            )
+        }
+    }
+
     func testRosterDescriptorRejectsInvalidArrays() throws {
         let descriptor = OracleRosterSettingsDescriptor.additional
         XCTAssertThrowsError(

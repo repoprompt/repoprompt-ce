@@ -216,8 +216,7 @@ package enum DomainAppSettingsCatalog {
             valueKind: .string,
             defaultValue: .null,
             description: description,
-            optionsAvailable: true,
-            maximumStringLength: OracleRosterContract.maximumModelIdentifierLength
+            optionsAvailable: true
         )
     }
 }

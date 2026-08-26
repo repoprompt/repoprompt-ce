@@ -190,12 +190,51 @@ final class OracleGroupPersistenceTests: XCTestCase {
         }
     }
 
-    func testSchemaVersionOneGroupIsRejectedWithoutMigration() async throws {
+    func testSchemaVersionOneGroupLoadsAsCurrentAndUpgradesOnMutation() async throws {
         let fixture = makeStore(profile: "schema-version")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let current = try makeGroup(count: 2, seed: "schema")
-        let versionOne = try OracleGroupDocument(
-            schemaVersion: 1,
+        let prepared = try makeGroup(count: 2, seed: "schema")
+        try await fixture.store.create(prepared)
+        let terminal = try terminalDocument(from: prepared)
+        try await fixture.store.save(terminal, expectedRevision: prepared.revision)
+
+        let groupURL = fixture.persistence.oracleStorageRoot
+            .appendingPathComponent("groups", isDirectory: true)
+            .appendingPathComponent("\(prepared.group.id.rawValue.uuidString).json")
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: groupURL)) as? [String: Any]
+        )
+        object["schemaVersion"] = 1
+        var turns = try XCTUnwrap(object["turns"] as? [[String: Any]])
+        for index in turns.indices {
+            turns[index].removeValue(forKey: "status")
+            turns[index].removeValue(forKey: "warnings")
+        }
+        object["turns"] = turns
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: groupURL)
+
+        let loadedDocument = try await fixture.store.load(groupID: prepared.group.id, owner: prepared.owner)
+        let loaded = try XCTUnwrap(loadedDocument)
+        XCTAssertEqual(loaded.schemaVersion, OracleGroupDocument.currentSchemaVersion)
+        XCTAssertEqual(loaded.turns.last?.status, .completed)
+
+        try await fixture.store.rename(
+            groupID: loaded.group.id,
+            owner: loaded.owner,
+            name: "Migrated",
+            expectedRevision: loaded.revision
+        )
+        let upgraded = try JSONDecoder().decode(OracleGroupDocument.self, from: Data(contentsOf: groupURL))
+        XCTAssertEqual(upgraded.schemaVersion, OracleGroupDocument.currentSchemaVersion)
+        XCTAssertEqual(upgraded.name, "Migrated")
+    }
+
+    func testFutureGroupSchemaIsRejected() async throws {
+        let fixture = makeStore(profile: "future-schema")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let current = try makeGroup(count: 2, seed: "future-schema")
+        let future = try OracleGroupDocument(
+            schemaVersion: OracleGroupDocument.currentSchemaVersion + 1,
             group: current.group,
             owner: current.owner,
             name: current.name,
@@ -208,9 +247,9 @@ final class OracleGroupPersistenceTests: XCTestCase {
         )
 
         await XCTAssertOraclePersistenceThrowsErrorAsync {
-            try await fixture.store.create(versionOne)
+            try await fixture.store.create(future)
         } verify: {
-            XCTAssertEqual($0 as? OraclePersistenceError, .futureSchema(1))
+            XCTAssertEqual($0 as? OraclePersistenceError, .futureSchema(3))
         }
     }
 
@@ -637,6 +676,82 @@ final class OracleGroupPersistenceTests: XCTestCase {
         try FileManager.default.removeItem(at: corruptURL)
         let validAfterFailure = try await fixture.store.load(groupID: valid.group.id, owner: valid.owner)
         XCTAssertNotNil(validAfterFailure)
+    }
+
+    func testMismatchedGroupFilenameFailsClosedBeforeMutation() async throws {
+        let fixture = makeStore(profile: "filename-identity")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let group = try makeGroup(count: 2, seed: "filename")
+        try await fixture.store.create(group)
+        let groupsDirectory = fixture.persistence.oracleStorageRoot
+            .appendingPathComponent("groups", isDirectory: true)
+        let canonical = groupsDirectory.appendingPathComponent("\(group.group.id.rawValue.uuidString).json")
+        let spoofed = groupsDirectory.appendingPathComponent("\(UUID().uuidString).json")
+        try FileManager.default.copyItem(at: canonical, to: spoofed)
+
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            _ = try await fixture.store.retainMostRecentGroups(0, owner: group.owner)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("group_filename_identity_mismatch"))
+        }
+        let loaded = try await fixture.store.load(groupID: group.group.id, owner: group.owner)
+        XCTAssertEqual(loaded, group)
+    }
+
+    func testMissingMemberIndexFailsClosedWhenGroupsExist() async throws {
+        let fixture = makeStore(profile: "missing-index")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let group = try makeGroup(count: 2, seed: "indexed")
+        try await fixture.store.create(group)
+        try FileManager.default.removeItem(
+            at: fixture.persistence.oracleStorageRoot.appendingPathComponent("index.json")
+        )
+
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await fixture.store.create(try makeGroup(count: 2, seed: "second"))
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("missing_member_index"))
+        }
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            _ = try await fixture.store.load(groupID: group.group.id, owner: group.owner)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("missing_member_index"))
+        }
+    }
+
+    func testOrphanIndexFailsClosedWhenGroupsDirectoryIsMissing() async throws {
+        let fixture = makeStore(profile: "orphan-index")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let group = try makeGroup(count: 2, seed: "orphaned")
+        try await fixture.store.create(group)
+        try FileManager.default.removeItem(
+            at: fixture.persistence.oracleStorageRoot.appendingPathComponent("groups", isDirectory: true)
+        )
+
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            _ = try await fixture.store.retainMostRecentGroups(0, owner: group.owner)
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("member_index_mismatch"))
+        }
+    }
+
+    func testGroupDirectoryEnumerationFailureIsNotTreatedAsEmptyStore() async throws {
+        let fixture = makeStore(profile: "enumeration-failure")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let group = try makeGroup(count: 2, seed: "enumeration")
+        try await fixture.store.create(group)
+        let storageRoot = fixture.persistence.oracleStorageRoot
+        let groupsDirectory = storageRoot.appendingPathComponent("groups", isDirectory: true)
+        try FileManager.default.removeItem(at: storageRoot.appendingPathComponent("index.json"))
+        try FileManager.default.removeItem(at: groupsDirectory)
+        try Data("not-a-directory".utf8).write(to: groupsDirectory)
+
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            _ = try await fixture.store.load(
+                member: OracleMemberLookup(publicChatID: group.members[0].publicChatID),
+                owner: group.owner
+            )
+        } verify: { _ in }
     }
 
     private func makeStore(

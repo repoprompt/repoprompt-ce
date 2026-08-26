@@ -93,6 +93,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleArtifactSto
     private let artifactReservations = OracleArtifactReservationRegistry()
     #if DEBUG
         private var remainingForcedSaveFailures = 0
+        private var remainingForcedTerminalStageFailures = 0
     #endif
 
     package init(
@@ -110,10 +111,20 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleArtifactSto
             remainingForcedSaveFailures = count
         }
 
+        package func failNextTerminalStages(_ count: Int) {
+            remainingForcedTerminalStageFailures = count
+        }
+
         private func consumeForcedSaveFailure() throws {
             guard remainingForcedSaveFailures > 0 else { return }
             remainingForcedSaveFailures -= 1
             throw OraclePersistenceError.invalidDocument("debug_forced_save_failure")
+        }
+
+        private func consumeForcedTerminalStageFailure() throws {
+            guard remainingForcedTerminalStageFailures > 0 else { return }
+            remainingForcedTerminalStageFailures -= 1
+            throw OraclePersistenceError.invalidDocument("debug_forced_terminal_stage_failure")
         }
     #endif
 
@@ -127,6 +138,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleArtifactSto
                 try files.validatePreparedCreate(group)
                 let groupURL = files.groupURL(group.group.id)
                 guard !files.exists(groupURL) else { throw OraclePersistenceError.alreadyExists }
+                _ = try files.loadAndValidateAllGroups()
                 var index = try files.loadIndex()
                 let newEntries = group.members.map {
                     OracleMemberIndexEntry(
@@ -169,11 +181,7 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleArtifactSto
                 }
                 guard group.owner == owner else { throw OraclePersistenceError.ownerMismatch }
                 try files.validate(group)
-                guard group.members.contains(where: {
-                    $0.laneID.index == match.laneIndex && $0.publicChatID == member.publicChatID
-                }) else {
-                    throw OraclePersistenceError.invalidDocument("member_index_mismatch")
-                }
+                try files.validateIndex(for: group)
                 return group
             }
         }
@@ -224,6 +232,9 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleArtifactSto
     }
 
     package func stageTerminalPublication(_ intent: OracleTerminalPublicationIntent) async throws {
+        #if DEBUG
+            try consumeForcedTerminalStageFailure()
+        #endif
         try await perform { files in
             try files.withMutationLock {
                 try files.recoverTransactions()
@@ -749,7 +760,12 @@ private struct OracleStorageFiles: @unchecked Sendable {
     }
 
     func loadIndex() throws -> OracleMemberIndexDocument {
-        guard exists(indexURL) else { return OracleMemberIndexDocument() }
+        guard exists(indexURL) else {
+            if try hasGroupFiles() {
+                throw OraclePersistenceError.invalidDocument("missing_member_index")
+            }
+            return OracleMemberIndexDocument()
+        }
         let index = try decode(OracleMemberIndexDocument.self, from: Data(contentsOf: indexURL))
         guard index.version == OracleMemberIndexDocument.currentVersion else {
             throw OraclePersistenceError.futureSchema(index.version)
@@ -760,23 +776,89 @@ private struct OracleStorageFiles: @unchecked Sendable {
     func loadGroup(_ id: OracleGroupID) throws -> OracleGroupDocument? {
         let url = groupURL(id)
         guard exists(url) else { return nil }
-        return try decode(OracleGroupDocument.self, from: Data(contentsOf: url))
+        return try decodeGroup(from: url)
     }
 
     func loadAndValidateAllGroups() throws -> [OracleGroupDocument] {
-        guard exists(groupsDirectory) else { return [] }
-        let urls = try FileManager.default.contentsOfDirectory(
-            at: groupsDirectory,
-            includingPropertiesForKeys: nil
-        ).filter { $0.pathExtension == "json" }
-        let groups = try urls.map {
-            try decode(OracleGroupDocument.self, from: Data(contentsOf: $0))
+        let urls: [URL] = if exists(groupsDirectory) {
+            try FileManager.default.contentsOfDirectory(
+                at: groupsDirectory,
+                includingPropertiesForKeys: nil
+            ).filter { $0.pathExtension == "json" }
+        } else {
+            []
         }
-        for group in groups {
+        var seen = Set<UUID>()
+        var groups: [OracleGroupDocument] = []
+        for url in urls {
+            let group = try decodeGroup(from: url)
+            guard seen.insert(group.group.id.rawValue).inserted else {
+                throw OraclePersistenceError.invalidDocument("duplicate_group_id")
+            }
             try validate(group)
             try validateIndex(for: group)
+            groups.append(group)
         }
+        try validateIndexHasNoExtraEntries(for: groups)
         return groups
+    }
+
+    func decodeGroup(from url: URL) throws -> OracleGroupDocument {
+        let stored = try decode(OracleGroupDocument.self, from: Data(contentsOf: url))
+        guard UUID(uuidString: url.deletingPathExtension().lastPathComponent) == stored.group.id.rawValue else {
+            throw OraclePersistenceError.invalidDocument("group_filename_identity_mismatch")
+        }
+        return try migrateGroupToCurrentSchema(stored)
+    }
+
+    func migrateGroupToCurrentSchema(_ stored: OracleGroupDocument) throws -> OracleGroupDocument {
+        if stored.schemaVersion == OracleGroupDocument.currentSchemaVersion { return stored }
+        guard stored.schemaVersion == 1 else {
+            if stored.schemaVersion > OracleGroupDocument.currentSchemaVersion {
+                throw OraclePersistenceError.futureSchema(stored.schemaVersion)
+            }
+            throw OraclePersistenceError.invalidDocument("unsupported_group_schema")
+        }
+
+        let turns = stored.turns.map { turn in
+            guard turn.state == .terminal, turn.status == nil else { return turn }
+            let status: OracleGroupStatus = if turn.results.first?.status != .completed {
+                .failed
+            } else if turn.results.allSatisfy({ $0.status == .completed }) && turn.warnings.isEmpty {
+                .completed
+            } else {
+                .partialFailure
+            }
+            return OracleTurnRecord(
+                id: turn.id,
+                input: turn.input,
+                state: turn.state,
+                startedAt: turn.startedAt,
+                finishedAt: turn.finishedAt,
+                status: status,
+                warnings: turn.warnings,
+                results: turn.results
+            )
+        }
+        return try OracleGroupDocument(
+            group: stored.group,
+            owner: stored.owner,
+            name: stored.name,
+            revision: stored.revision,
+            createdAt: stored.createdAt,
+            updatedAt: stored.updatedAt,
+            roster: stored.roster,
+            members: stored.members,
+            turns: turns
+        )
+    }
+
+    func hasGroupFiles() throws -> Bool {
+        guard exists(groupsDirectory) else { return false }
+        return try FileManager.default.contentsOfDirectory(
+            at: groupsDirectory,
+            includingPropertiesForKeys: nil
+        ).contains { $0.pathExtension == "json" }
     }
 
     func validatePreparedCreate(_ group: OracleGroupDocument) throws {
@@ -897,6 +979,14 @@ private struct OracleStorageFiles: @unchecked Sendable {
             else {
                 throw OraclePersistenceError.invalidDocument("member_index_mismatch")
             }
+        }
+    }
+
+    func validateIndexHasNoExtraEntries(for groups: [OracleGroupDocument]) throws {
+        let known = Set(groups.map(\.group.id))
+        let extras = try loadIndex().entries.contains { !known.contains($0.groupID) }
+        guard !extras else {
+            throw OraclePersistenceError.invalidDocument("member_index_mismatch")
         }
     }
 
