@@ -453,7 +453,8 @@ jobs:
           [[ "${checksums[0]}" == "${archives[0]}.sha256" ]] || { echo "Staged tip checksum name mismatch" >&2; exit 1; }
           (cd staged-tip && shasum -a 256 -c "$(basename "${checksums[0]}")")
           ./trusted-control-plane/Scripts/extract_staged_release.py "${archives[0]}" tip-source RepoPrompt
-          REPOPROMPT_RELEASE_SOURCE_ROOT=tip-source \
+          REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1 \
+            REPOPROMPT_RELEASE_SOURCE_ROOT=tip-source \
             REPOPROMPT_APPROVED_SOURCE_ROOT=approved-source \
             ./trusted-control-plane/Scripts/validate_staged_release.sh
 

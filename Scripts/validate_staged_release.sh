@@ -59,8 +59,14 @@ if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
 fi
 
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
+TIP_ROLLOUT_DECLARATION_NAME=""
+case "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" in
+    "") ;;
+    tip-rollout-v1) TIP_ROLLOUT_DECLARATION_NAME="tip-rollout.json" ;;
+    *) fail "Unsupported REPOPROMPT_TIP_ARCHIVE_CONTRACT: $REPOPROMPT_TIP_ARCHIVE_CONTRACT" ;;
+esac
 
-python3 - "$ROOT_DIR" "$APP_BUNDLE" <<'PYTHON'
+python3 - "$ROOT_DIR" "$APP_BUNDLE" "$TIP_ROLLOUT_DECLARATION_NAME" <<'PYTHON'
 import os
 import stat
 import sys
@@ -68,6 +74,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 app = Path(sys.argv[2])
+tip_rollout_declaration_name = sys.argv[3]
 
 def fail(message: str) -> None:
     raise SystemExit(f"ERROR: {message}")
@@ -113,9 +120,13 @@ for path in [
     app / "Contents" / "MacOS" / "repoprompt-mcp",
 ]:
     require_regular_file(path)
+if tip_rollout_declaration_name:
+    require_regular_file(root / tip_rollout_declaration_name)
 
 top_level = {path.name for path in root.iterdir()}
 expected_top_level = {".build", "LICENSE", "RELEASE_COMMIT", "THIRD_PARTY_NOTICES.md", "ThirdPartyLicenses", "version.env"}
+if tip_rollout_declaration_name:
+    expected_top_level.add(tip_rollout_declaration_name)
 if top_level != expected_top_level:
     fail(f"unexpected staged top-level entries: {sorted(top_level ^ expected_top_level)}")
 
@@ -139,6 +150,13 @@ for path in root.rglob("*"):
     elif not stat.S_ISDIR(mode) and not stat.S_ISREG(mode):
         fail(f"unsupported staged path type: {path}")
 PYTHON
+
+if [[ -n "$TIP_ROLLOUT_DECLARATION_NAME" ]]; then
+    [[ -f "$APPROVED_SOURCE_ROOT/$TIP_ROLLOUT_DECLARATION_NAME" ]] ||
+        fail "Missing approved Tip rollout declaration"
+    cmp "$ROOT_DIR/$TIP_ROLLOUT_DECLARATION_NAME" "$APPROVED_SOURCE_ROOT/$TIP_ROLLOUT_DECLARATION_NAME" ||
+        fail "Staged Tip rollout declaration does not match approved source"
+fi
 
 "$SCRIPT_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Staged app SwiftPM resource bundle layout"
 "$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Staged app MCP helper layout"

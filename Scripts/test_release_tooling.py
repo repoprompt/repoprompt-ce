@@ -2661,6 +2661,56 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: staged release payload matches approved source", result.stdout)
 
+    def test_tip_staged_release_carries_exact_rollout_authority(self) -> None:
+        tip_release = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+        tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('cp "$ROLLOUT_DECLARATION" "$stage_root/tip-rollout.json"', tip_release)
+        self.assertIn("REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1", tip_release)
+        self.assertIn("REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1", tip_workflow)
+
+        approved, staged, scripts = self.make_staged_release_fixture()
+        generic_override = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            release_build_number_override="1",
+        )
+        self.assertEqual(generic_override.returncode, 0, generic_override.stderr)
+
+        missing = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            release_build_number_override="1",
+            tip_archive_contract="tip-rollout-v1",
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("missing staged file", missing.stderr)
+        self.assertIn("tip-rollout.json", missing.stderr)
+
+        shutil.copy2(approved / "tip-rollout.json", staged / "tip-rollout.json")
+        accepted = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            release_build_number_override="1",
+            tip_archive_contract="tip-rollout-v1",
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        (staged / "tip-rollout.json").write_text("{}\n", encoding="utf-8")
+        changed = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            release_build_number_override="1",
+            tip_archive_contract="tip-rollout-v1",
+        )
+        self.assertNotEqual(changed.returncode, 0)
+        self.assertIn("Staged Tip rollout declaration does not match approved source", changed.stderr)
+
     def test_staged_release_validator_rejects_requested_preparer_for_historical_template(self) -> None:
         approved, staged, scripts = self.make_staged_release_fixture()
         template_path = approved / "AppBundle" / "Info.plist.template"
@@ -4406,6 +4456,7 @@ extension Data {
             encoding="utf-8",
         )
         (approved / "Vendor" / "Codex" / "manifest.json").write_text("{}\n", encoding="utf-8")
+        shutil.copy2(SCRIPT_DIR.parent / "tip-rollout.json", approved / "tip-rollout.json")
         metadata = """\
 APP_NAME=RepoPrompt
 DISPLAY_NAME="RepoPrompt CE"
@@ -4524,6 +4575,8 @@ esac
         staged: Path,
         scripts: Path,
         identity_migration_phase: str | None = None,
+        release_build_number_override: str | None = None,
+        tip_archive_contract: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
@@ -4538,6 +4591,10 @@ esac
         )
         if identity_migration_phase is not None:
             env["REPOPROMPT_IDENTITY_MIGRATION_PHASE"] = identity_migration_phase
+        if release_build_number_override is not None:
+            env["REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE"] = release_build_number_override
+        if tip_archive_contract is not None:
+            env["REPOPROMPT_TIP_ARCHIVE_CONTRACT"] = tip_archive_contract
         return subprocess.run(
             [str(scripts / "validate_staged_release.sh")],
             env=env,

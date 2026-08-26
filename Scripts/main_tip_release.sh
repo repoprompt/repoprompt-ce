@@ -221,6 +221,7 @@ stage_tip() {
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
         "repoprompt-mcp"
+    cp "$ROLLOUT_DECLARATION" "$stage_root/tip-rollout.json"
     write_tip_version_env "$stage_root/version.env"
     cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
@@ -335,6 +336,7 @@ sign_tip() {
     [[ -d "$APP_BUNDLE" ]] || fail "Missing staged tip app bundle: $APP_BUNDLE"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
+        REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1 \
         REPOPROMPT_IDENTITY_MIGRATION_PHASE="$REPOPROMPT_IDENTITY_MIGRATION_PHASE" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
     verify_release_sentry_symbol_uuids_before_signing \
@@ -346,6 +348,7 @@ sign_tip() {
         "repoprompt-mcp"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
+        REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1 \
         REPOPROMPT_IDENTITY_MIGRATION_PHASE="$REPOPROMPT_IDENTITY_MIGRATION_PHASE" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
     prepare_dist
