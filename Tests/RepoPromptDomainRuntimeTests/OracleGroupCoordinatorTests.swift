@@ -93,6 +93,44 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         )
     }
 
+    func testBlankTypedFailureIsNormalizedInsteadOfThrowingFromCatch() async throws {
+        let fixture = try makeFixture(count: 2) { lane in
+            if lane == 1 {
+                throw OracleLaneFailure(code: "  ", message: "   ")
+            }
+            return OracleLaneExecutionResponse(response: "primary")
+        }
+        let result = try await OracleGroupCoordinator().execute(
+            group: fixture.group,
+            turnID: OracleTurnID(),
+            input: fixture.input,
+            plans: fixture.plans
+        )
+
+        XCTAssertEqual(result.status, .partialFailure)
+        XCTAssertEqual(result.oracleResults[1].status, .failed)
+        XCTAssertEqual(result.oracleResults[1].error?.code, "provider_error")
+        XCTAssertEqual(result.oracleResults[1].error?.message, "Oracle lane failed.")
+    }
+
+    func testNonblankTypedFailurePreservesExactCodeAndMessage() async throws {
+        let fixture = try makeFixture(count: 2) { lane in
+            if lane == 1 {
+                throw OracleLaneFailure(code: "  padded_code  ", message: "  padded message  ")
+            }
+            return OracleLaneExecutionResponse(response: "primary")
+        }
+        let result = try await OracleGroupCoordinator().execute(
+            group: fixture.group,
+            turnID: OracleTurnID(),
+            input: fixture.input,
+            plans: fixture.plans
+        )
+
+        XCTAssertEqual(result.oracleResults[1].error?.code, "  padded_code  ")
+        XCTAssertEqual(result.oracleResults[1].error?.message, "  padded message  ")
+    }
+
     func testTypedCancellationPreservesResolvedExecutionProfile() async throws {
         let profile = try OracleExecutionProfile(providerID: "runtime", modelID: "resolved")
         let fixture = try makeFixture(count: 2) { lane in
