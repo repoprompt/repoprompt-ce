@@ -975,17 +975,6 @@ struct AgentStashedSessionRow: View {
     }
 }
 
-private extension AgentSidebarBulkActionKind {
-    var rowProgressAccessibilityLabel: String {
-        switch self {
-        case .delete: "Deleting chat"
-        case .stash: "Stashing chat"
-        case .pin: "Pinning chat"
-        case .unpin: "Unpinning chat"
-        }
-    }
-}
-
 // MARK: - Agent Row Activity Arc
 
 /// A compact, calm rotating arc used in place of the native `ProgressView`

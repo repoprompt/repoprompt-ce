@@ -135,6 +135,23 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             && selectionState.inFlightAction?.workspaceID == workspaceID
     }
 
+    func retireCommandRowProgress(forRemovedTabIDs tabIDs: Set<UUID>, workspaceID: UUID) {
+        guard !tabIDs.isEmpty,
+              var operation = selectionState.inFlightAction,
+              operation.origin == .command,
+              operation.commandProgressPlacement == .row,
+              operation.workspaceID == workspaceID,
+              !operation.commandRowProgressRetired,
+              operation.presentationTargets.contains(where: { tabIDs.contains($0.tabID) })
+        else { return }
+
+        operation.commandRowProgressRetired = true
+        var next = selectionState
+        next.inFlightAction = operation
+        next.revision &+= 1
+        publishSelection(next, eventName: "sessionSidebar.selection.commandRowProgressRetired")
+    }
+
     func finishBulkAction(token: UUID, workspaceID: UUID, notice: AgentSidebarBulkActionNotice?) {
         guard isCurrentBulkAction(token: token, workspaceID: workspaceID) else { return }
         var next = selectionState
@@ -287,6 +304,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
                     "hasAnchor": String(next.anchor != nil),
                     "inFlightKind": next.inFlightAction?.kind.rawValue ?? "none",
                     "inFlightTargetCount": String(next.inFlightAction?.targetCount ?? 0),
+                    "inFlightRowProgressRetired": String(next.inFlightAction?.commandRowProgressRetired ?? false),
                     "inFlightPlacement": next.inFlightAction?.commandProgressPlacement.map {
                         switch $0 {
                         case .row: "row"

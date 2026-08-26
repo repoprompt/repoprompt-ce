@@ -444,6 +444,10 @@ struct AgentModeSessionsListView: View {
         let archivedHeaderProgressOperation = selectionState.archivedHeaderCommandProgressOperation.flatMap {
             $0.workspaceID == snapshot.workspaceID ? $0 : nil
         }
+        let fallbackProgressOperation = selectionState.commandFallbackProgressOperation(
+            renderedOrder: snapshot.renderedSelectionOrder,
+            workspaceID: snapshot.workspaceID
+        )
         VStack(spacing: 4) {
             if showsSelectionPresentation {
                 if let operation = selectionState.inFlightAction {
@@ -701,6 +705,19 @@ struct AgentModeSessionsListView: View {
                     }
                 }
                 .padding(.horizontal, listHorizontalPadding)
+            }
+            .overlay(alignment: .topTrailing) {
+                if let fallbackProgressOperation {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 16, height: 16)
+                        .padding(6)
+                        .background(.regularMaterial, in: Circle())
+                        .padding(.top, 4)
+                        .padding(.trailing, listHorizontalPadding)
+                        .allowsHitTesting(false)
+                        .accessibilityLabel(fallbackProgressOperation.kind.rowProgressAccessibilityLabel)
+                }
             }
         }
         .id(snapshot.workspaceID)

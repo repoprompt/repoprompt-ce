@@ -103,6 +103,14 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             workspaceID: workspaceID
         ))
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: id(98)))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            renderedOrder: [target],
+            workspaceID: workspaceID
+        ))
+        XCTAssertEqual(
+            store.selectionState.commandFallbackProgressOperation(renderedOrder: [], workspaceID: workspaceID),
+            store.selectionState.inFlightAction
+        )
         XCTAssertNil(store.selectionState.archivedHeaderCommandProgressOperation)
 
         store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
@@ -110,6 +118,74 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertFalse(store.selectionState.isMutationInFlight)
         XCTAssertFalse(store.selectionState.showsSelectionPresentation)
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            renderedOrder: [],
+            workspaceID: workspaceID
+        ))
+    }
+
+    func testCommandRowProgressRetirementIsMonotonicAndPreventsSameIdentityReattachment() throws {
+        let store = AgentSessionSidebarUIStore()
+        let workspaceID = id(99)
+        let target = AgentSidebarSelectionIdentity.active(tabID: id(1))
+        let token = try XCTUnwrap(store.beginBulkAction(
+            kind: .stash,
+            origin: .command,
+            presentationTargets: [target],
+            commandProgressPlacement: .row,
+            workspaceID: workspaceID
+        ))
+
+        let initialRevision = store.selectionState.revision
+        store.retireCommandRowProgress(forRemovedTabIDs: [id(2)], workspaceID: workspaceID)
+        store.retireCommandRowProgress(forRemovedTabIDs: [id(1)], workspaceID: id(98))
+        XCTAssertEqual(store.selectionState.revision, initialRevision)
+
+        store.retireCommandRowProgress(forRemovedTabIDs: [id(1)], workspaceID: workspaceID)
+
+        let retiredOperation = try XCTUnwrap(store.selectionState.inFlightAction)
+        XCTAssertTrue(retiredOperation.commandRowProgressRetired)
+        XCTAssertEqual(store.selectionState.revision, initialRevision + 1)
+        XCTAssertNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID))
+        XCTAssertEqual(
+            store.selectionState.commandFallbackProgressOperation(
+                renderedOrder: [target],
+                workspaceID: workspaceID
+            ),
+            retiredOperation
+        )
+
+        store.retireCommandRowProgress(forRemovedTabIDs: [id(1)], workspaceID: workspaceID)
+        XCTAssertEqual(store.selectionState.revision, initialRevision + 1)
+
+        store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            renderedOrder: [target],
+            workspaceID: workspaceID
+        ))
+    }
+
+    func testArchivedRowUsesFallbackOnlyWhenItsRowIsAbsent() throws {
+        let store = AgentSessionSidebarUIStore()
+        let workspaceID = id(99)
+        let target = AgentSidebarSelectionIdentity.archived(stashedTabID: id(10), tabID: id(1))
+        _ = try XCTUnwrap(store.beginBulkAction(
+            kind: .delete,
+            origin: .command,
+            presentationTargets: [target],
+            commandProgressPlacement: .row,
+            workspaceID: workspaceID
+        ))
+
+        XCTAssertNotNil(store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            renderedOrder: [target],
+            workspaceID: workspaceID
+        ))
+        XCTAssertNotNil(store.selectionState.commandFallbackProgressOperation(
+            renderedOrder: [],
+            workspaceID: workspaceID
+        ))
     }
 
     func testSelectionOriginSurvivesEmptyReconciliationUntilFinish() throws {
@@ -374,6 +450,15 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertEqual(operation.targetCount, 2)
         XCTAssertEqual(operation.presentationTargets, [first, second])
         XCTAssertNil(store.selectionState.commandRowProgressOperation(for: first, workspaceID: workspaceID))
+        XCTAssertNil(store.selectionState.commandFallbackProgressOperation(
+            renderedOrder: [],
+            workspaceID: workspaceID
+        ))
+
+        let revision = store.selectionState.revision
+        store.retireCommandRowProgress(forRemovedTabIDs: [first.tabID], workspaceID: workspaceID)
+        XCTAssertEqual(store.selectionState.revision, revision)
+        XCTAssertEqual(store.selectionState.archivedHeaderCommandProgressOperation, operation)
     }
 
     func testBulkActionRejectsInvalidOriginAndProgressPlacementCombinations() {

@@ -45,6 +45,15 @@ enum AgentSidebarBulkActionKind: String, Equatable {
     case stash
     case pin
     case unpin
+
+    var rowProgressAccessibilityLabel: String {
+        switch self {
+        case .delete: "Deleting chat"
+        case .stash: "Stashing chat"
+        case .pin: "Pinning chat"
+        case .unpin: "Unpinning chat"
+        }
+    }
 }
 
 enum AgentSidebarBulkActionOrigin: Equatable {
@@ -64,6 +73,7 @@ struct AgentSidebarBulkActionOperation: Equatable {
     let origin: AgentSidebarBulkActionOrigin
     let presentationTargets: Set<AgentSidebarSelectionIdentity>
     let commandProgressPlacement: AgentSidebarCommandProgressPlacement?
+    var commandRowProgressRetired = false
 
     var targetCount: Int {
         presentationTargets.count
@@ -106,7 +116,22 @@ struct AgentSidebarSelectionState: Equatable {
               operation.origin == .command,
               operation.workspaceID == workspaceID,
               operation.commandProgressPlacement == .row,
+              !operation.commandRowProgressRetired,
               operation.presentationTargets.contains(identity)
+        else { return nil }
+        return operation
+    }
+
+    func commandFallbackProgressOperation(
+        renderedOrder: [AgentSidebarSelectionIdentity],
+        workspaceID: UUID?
+    ) -> AgentSidebarBulkActionOperation? {
+        guard let operation = inFlightAction,
+              operation.origin == .command,
+              operation.workspaceID == workspaceID,
+              operation.commandProgressPlacement == .row,
+              operation.commandRowProgressRetired
+              || !renderedOrder.contains(where: operation.presentationTargets.contains)
         else { return nil }
         return operation
     }
