@@ -111,10 +111,16 @@ retained `identity-rollout.json`, then update the declaration with P's exact man
 dispatching T. After T is verified, update the declaration with both exact predecessor digests before
 dispatching S. Never publish a nonlegacy role from an automatic `workflow_run` notification.
 
-The next operator action after this change is merged to protected `main`: dispatch **Publish Tip**
-with `commit` set to that exact main SHA and `confirm_identity_rollout_role=preparer`. Do not rely on
-the automatic CI notification for P. Subsequent T and S dispatches require the checked-in declaration
-and exact role confirmation to be advanced and reviewed first.
+P was published and independently verified at `tip-2f94412e6ab5`; its retained
+`identity-rollout.json` SHA-256 is
+`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. The checked-in Tip
+declaration now pins that immutable predecessor and selects T.
+
+The next operator action after this change is merged to protected `main` and exact-head CI succeeds:
+dispatch **Publish Tip** with `commit` set to that exact main SHA and
+`confirm_identity_rollout_role=transition`. Do not rely on the automatic CI notification for T. S
+still requires a later reviewed declaration change containing both T's and P's exact manifest
+digests.
 
 ## Required proof gate
 

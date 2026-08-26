@@ -11,6 +11,7 @@ Commands:
   successor roles, sibling predecessors, and the successor identity.
 - ``current-role``: print the declared role for shell callers.
 - ``packaging-context``: emit policy-derived bundle, team, application, and installer identity labels.
+- ``signing-mode``: map one reviewed bundle/team pair to its runtime signing marker.
 - ``generate``: assemble the accumulated appcast plus rollout manifest.
 - ``validate``: prove a reviewed appcast/manifest pair against the declaration,
   policy, version metadata, and enclosure/app-manifest digests.
@@ -63,6 +64,10 @@ ROLE_ENCLOSURE_SUFFIX = {
     "preparer": ".zip",
     "transition": ".pkg",
     "successor": ".zip",
+}
+SIGNING_MODE_BY_IDENTITY = {
+    "legacy": "developer-id",
+    "successor": "successor-developer-id",
 }
 # Newest-first role chains permitted in an accumulated appcast.
 ALLOWED_ROLE_CHAINS = (
@@ -212,6 +217,20 @@ def load_version_env(path: Path) -> dict[str, str]:
         if not values.get(key):
             raise RolloutError(f"version.env is missing {key}")
     return values
+
+
+def identity_name_for_bundle_and_team(policy: dict, bundle_id: str, team_id: str) -> str:
+    matches = [
+        identity_name
+        for identity_name, identity in policy["identities"].items()
+        if identity["bundleIdentifier"] == bundle_id and identity["teamIdentifier"] == team_id
+    ]
+    if len(matches) != 1:
+        raise RolloutError(
+            "bundle/team pair does not match exactly one reviewed Apple identity: "
+            f"{bundle_id} / {team_id}"
+        )
+    return matches[0]
 
 
 def expected_enclosure_name(
@@ -594,13 +613,15 @@ def run_packaging_context(args: argparse.Namespace) -> None:
     role = declaration["currentRole"]
     identity_name = ROLE_IDENTITY[role]
     identity = policy["identities"][identity_name]
-    if version["BUNDLE_ID"] != identity["bundleIdentifier"]:
+    version_identity_name = identity_name_for_bundle_and_team(
+        policy, version["BUNDLE_ID"], version["SIGNING_TEAM_ID"]
+    )
+    # Stable metadata remains pinned to the currently releasable identity. Tip
+    # T/S builds intentionally project the role-selected successor identity
+    # without changing the repository-wide Stable/debug defaults mid-rehearsal.
+    if declaration["channel"] == "stable" and version_identity_name != identity_name:
         raise RolloutError(
-            f"version.env BUNDLE_ID does not match the {identity_name} identity policy"
-        )
-    if version["SIGNING_TEAM_ID"] != identity["teamIdentifier"]:
-        raise RolloutError(
-            f"version.env SIGNING_TEAM_ID does not match the {identity_name} identity policy"
+            f"version.env identity does not match the {identity_name} Stable rollout identity"
         )
     successor = policy["identities"]["successor"]
     values = {
@@ -622,6 +643,12 @@ def run_packaging_context(args: argparse.Namespace) -> None:
     }
     for key, value in values.items():
         print(f"{key}={shlex.quote(value)}")
+
+
+def run_signing_mode(args: argparse.Namespace) -> None:
+    policy = load_policy(Path(args.policy))
+    identity_name = identity_name_for_bundle_and_team(policy, args.bundle_id, args.team_id)
+    print(SIGNING_MODE_BY_IDENTITY[identity_name])
 
 
 def run_predecessor_values(args: argparse.Namespace) -> None:
@@ -702,6 +729,12 @@ def build_parser() -> argparse.ArgumentParser:
     packaging_context.add_argument("--policy", required=True)
     packaging_context.add_argument("--version-env", required=True)
     packaging_context.set_defaults(func=run_packaging_context)
+
+    signing_mode = subparsers.add_parser("signing-mode")
+    signing_mode.add_argument("--policy", required=True)
+    signing_mode.add_argument("--bundle-id", required=True)
+    signing_mode.add_argument("--team-id", required=True)
+    signing_mode.set_defaults(func=run_signing_mode)
 
     predecessor_values = subparsers.add_parser("predecessor-values")
     predecessor_values.add_argument("--declaration", required=True)

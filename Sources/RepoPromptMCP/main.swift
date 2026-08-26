@@ -3424,7 +3424,7 @@ func printVersion() {
     print("\(cliDisplayCommand()) (repoprompt-mcp) \(CLI_VERSION)")
 }
 
-private let repoPromptCEReleaseBundleIdentifier = "com.pvncher.repoprompt.ce"
+private let repoPromptCEReleaseBundleIdentifier = "com.repoprompt.ce"
 private let repoPromptCEDebugBundleIdentifier = "com.pvncher.repoprompt.ce.debug"
 private let repoPromptCEBundleIdentifier: String = {
     #if DEBUG

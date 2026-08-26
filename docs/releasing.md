@@ -270,6 +270,11 @@ S. Each published role uses an immutable `tip-<shortsha>` tag and the tip-only r
 release; do not mark the release as a prerelease because GitHub excludes prereleases from
 `releases/latest`.
 
+Current checkpoint: verified P is `tip-2f94412e6ab5`, with rollout-manifest SHA-256
+`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. The reviewed declaration
+pins that predecessor and selects T; T still requires an exact-role manual dispatch after its
+declaration change reaches protected `main` and passes exact-head CI.
+
 Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow
 reads the currently published stable appcast and combines that stable build with
 the source commit count. For example, commit sequence `795` on stable build `28`

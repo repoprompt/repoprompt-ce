@@ -3461,10 +3461,16 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         capture_override = package_script.index(
             'RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"'
         )
+        capture_team_override = package_script.index('SIGNING_TEAM_ID_OVERRIDE="${SIGNING_TEAM_ID:-}"')
         load_metadata = package_script.index('load_release_metadata "$ROOT_DIR"')
         apply_override = package_script.index('BUILD_NUMBER="$RELEASE_BUILD_NUMBER_OVERRIDE"')
+        apply_team_override = package_script.index(
+            'SIGNING_TEAM_ID="${SIGNING_TEAM_ID_OVERRIDE:-$BASE_SIGNING_TEAM_ID}"'
+        )
         self.assertLess(capture_override, load_metadata)
+        self.assertLess(capture_team_override, load_metadata)
         self.assertLess(load_metadata, apply_override)
+        self.assertLess(load_metadata, apply_team_override)
         self.assertIn(
             'fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"',
             package_script,
@@ -3477,8 +3483,7 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         build_number = "35.15.16"
         archive_basename = f"RepoPrompt-tip-{short_sha}-{build_number}"
         expected = {
-            f"{archive_basename}.zip",
-            f"{archive_basename}.dmg",
+            f"{archive_basename}.pkg",
             "appcast.xml",
             "SHA256SUMS",
             f"{archive_basename}-artifact-manifest.json",
@@ -3494,6 +3499,7 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
                 "TIP_COMMIT": "0123456789abcdef0123456789abcdef01234567",
                 "TIP_SHORT_SHA": short_sha,
                 "TIP_BUILD_NUMBER": build_number,
+                "TIP_PUBLISH_INSTALLATION_TYPE": "package",
                 "DIST_DIR": str(temp_dir),
             }
         )
@@ -3506,7 +3512,7 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
             capture_output=True,
         )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
-        self.assertIn("contains exactly 7 files", accepted.stdout)
+        self.assertIn("contains exactly 6 files", accepted.stdout)
 
         (temp_dir / "appcast.xml").unlink()
         missing = subprocess.run(
@@ -4922,19 +4928,21 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             assignments[key] = value
         return assignments
 
-    def test_packaging_context_rejects_version_identity_mismatch_before_packaging(self) -> None:
+    def test_packaging_context_projects_tip_role_without_advancing_stable_metadata(self) -> None:
         root = SCRIPT_DIR.parent
-        legacy = self.rollout(
+        transition_context = self.rollout(
             "packaging-context",
             "--declaration", str(self.TIP_DECLARATION),
             "--policy", str(self.POLICY),
             "--version-env", str(root / "version.env"),
         )
-        self.assertEqual(legacy.returncode, 0, legacy.stderr)
-        context = self.shell_assignments(legacy.stdout)
+        self.assertEqual(transition_context.returncode, 0, transition_context.stderr)
+        context = self.shell_assignments(transition_context.stdout)
         policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
-        self.assertEqual(context["ROLLOUT_ROLE"], "preparer")
-        self.assertEqual(context["BUNDLE_ID"], "com.pvncher.repoprompt.ce")
+        self.assertEqual(context["ROLLOUT_ROLE"], "transition")
+        self.assertEqual(context["ROLLOUT_IDENTITY"], "successor")
+        self.assertEqual(context["ROLLOUT_INSTALLATION_TYPE"], "package")
+        self.assertEqual(context["BUNDLE_ID"], "com.repoprompt.ce")
         self.assertEqual(
             context["EXPECTED_SUCCESSOR_SIGN_IDENTITY"],
             policy["identities"]["successor"]["developerIDApplicationIdentityName"],
@@ -4942,26 +4950,51 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
 
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
-        transition = self.make_declaration(
+        stable_transition = self.make_declaration(
             temp_dir,
             "transition",
             [
                 {
                     "role": "preparer",
-                    "tag": "tip-preparer",
+                    "tag": "v0.1.0",
                     "rolloutManifestSha256": "0" * 64,
                 }
             ],
-            channel="tip",
         )
         mismatch = self.rollout(
             "packaging-context",
-            "--declaration", str(transition),
+            "--declaration", str(stable_transition),
             "--policy", str(self.POLICY),
             "--version-env", str(root / "version.env"),
         )
         self.assertNotEqual(mismatch.returncode, 0)
-        self.assertIn("version.env BUNDLE_ID does not match", mismatch.stderr)
+        self.assertIn("version.env identity does not match the successor Stable rollout identity", mismatch.stderr)
+
+    def test_signing_mode_is_derived_from_the_reviewed_bundle_team_pair(self) -> None:
+        policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
+        for identity_name, marker in (
+            ("legacy", "developer-id"),
+            ("successor", "successor-developer-id"),
+        ):
+            with self.subTest(identity=identity_name):
+                identity = policy["identities"][identity_name]
+                result = self.rollout(
+                    "signing-mode",
+                    "--policy", str(self.POLICY),
+                    "--bundle-id", identity["bundleIdentifier"],
+                    "--team-id", identity["teamIdentifier"],
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), marker)
+
+        rejected = self.rollout(
+            "signing-mode",
+            "--policy", str(self.POLICY),
+            "--bundle-id", policy["identities"]["successor"]["bundleIdentifier"],
+            "--team-id", policy["identities"]["legacy"]["teamIdentifier"],
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("does not match exactly one reviewed Apple identity", rejected.stderr)
 
     def chain_predecessors(self, role: str) -> list[dict]:
         placeholder = "0" * 64
@@ -5234,6 +5267,8 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         info_template = (SCRIPT_DIR.parent / "AppBundle/Info.plist.template").read_text(encoding="utf-8")
         sign_staged = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
         pkg_builder = (SCRIPT_DIR / "build_identity_transition_pkg.sh").read_text(encoding="utf-8")
+        package_app = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        mcp_source = (SCRIPT_DIR.parent / "Sources/RepoPromptMCP/main.swift").read_text(encoding="utf-8")
 
         legacy = policy["identities"]["legacy"]
         successor = policy["identities"]["successor"]
@@ -5259,6 +5294,12 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             f"IDENTITY_MIGRATION_TARGET_REQUIREMENT='{successor['developerIDRequirement']}'", sign_staged
         )
         self.assertIn(f"SUCCESSOR_APP_REQUIREMENT='{successor['developerIDRequirement']}'", pkg_builder)
+        self.assertIn('"$ROLLOUT_TOOL" signing-mode', sign_staged)
+        self.assertIn('stable_rollout.py" signing-mode', package_app)
+        self.assertIn(
+            f'repoPromptCEReleaseBundleIdentifier = "{successor["bundleIdentifier"]}"',
+            mcp_source,
+        )
 
         sparkle = policy["sparkle"]
         self.assertIn(f"<string>{sparkle['stableFeedURL']}</string>", info_template)
@@ -5294,10 +5335,19 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
 
         tip_declaration = json.loads(self.TIP_DECLARATION.read_text(encoding="utf-8"))
         self.assertEqual(tip_declaration["channel"], "tip")
-        self.assertEqual(tip_declaration["currentRole"], "preparer")
-        self.assertEqual(tip_declaration["predecessors"], [])
-        self.assertEqual(tip_declaration["expectedMigrationPhase"], "legacy-preparer")
-        self.assertEqual(tip_declaration["expectedSigningIdentity"], "legacy")
+        self.assertEqual(tip_declaration["currentRole"], "transition")
+        self.assertEqual(tip_declaration["expectedMigrationPhase"], "disabled")
+        self.assertEqual(tip_declaration["expectedSigningIdentity"], "successor")
+        self.assertEqual(
+            tip_declaration["predecessors"],
+            [
+                {
+                    "role": "preparer",
+                    "tag": "tip-2f94412e6ab5",
+                    "rolloutManifestSha256": "3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db",
+                }
+            ],
+        )
 
     def test_single_legacy_release_generates_one_deterministic_application_item(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())

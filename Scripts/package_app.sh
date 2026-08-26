@@ -82,6 +82,7 @@ finish(){
 trap 'finish $?' EXIT
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
+SIGNING_TEAM_ID_OVERRIDE="${SIGNING_TEAM_ID:-}"
 RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"
 # Invalidate public-release manifests before metadata parsing, checks, or builds
 # so failed non-public packaging cannot leave stale release metadata behind.
@@ -93,7 +94,7 @@ if [[ -n "$RELEASE_BUILD_NUMBER_OVERRIDE" ]]; then
         fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
     BUILD_NUMBER="$RELEASE_BUILD_NUMBER_OVERRIDE"
 fi
-APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"
+APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; BASE_SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID_OVERRIDE:-$BASE_SIGNING_TEAM_ID}"
 IDENTITY_MIGRATION_PHASE="${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}"
 case "$IDENTITY_MIGRATION_PHASE" in
 disabled | legacy-preparer) ;;
@@ -203,7 +204,11 @@ if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
     SIGNING_MODE_MARKER="local-self-signed"
 elif (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     DEBUG_STORAGE_BACKEND_MARKER="keychain"
-    SIGNING_MODE_MARKER="developer-id"
+    SIGNING_MODE_MARKER="$(python3 "$CONTROL_PLANE_SCRIPTS_DIR/stable_rollout.py" signing-mode \
+        --policy "$CONTROL_PLANE_SCRIPTS_DIR/apple_identity_policy.json" \
+        --bundle-id "$BUNDLE_ID" \
+        --team-id "$SIGNING_TEAM_ID")" ||
+        fail "Release bundle/team pair is not a reviewed Apple identity"
 elif (( IS_RELEASE )); then
     SIGNING_MODE_MARKER="release-candidate-adhoc"
 elif [[ -n "$DEBUG_SECURE_STORAGE_BACKEND" ]]; then

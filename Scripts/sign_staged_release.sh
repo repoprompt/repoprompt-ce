@@ -10,6 +10,8 @@ load_release_metadata "$METADATA_ROOT"
 
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+APPLE_IDENTITY_POLICY="$SCRIPT_DIR/apple_identity_policy.json"
+ROLLOUT_TOOL="$SCRIPT_DIR/stable_rollout.py"
 ENTITLEMENTS_TEMPLATE="$TRUSTED_ROOT/AppBundle/RepoPrompt.entitlements.template"
 CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"
 TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
@@ -77,7 +79,12 @@ PYTHON
 plutil -lint "$app_entitlements"
 plutil -lint "$CODEX_V8_ENTITLEMENTS"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
-plutil -replace RepoPromptSigningMode -string developer-id "$APP_BUNDLE/Contents/Info.plist"
+signing_mode_marker="$(python3 "$ROLLOUT_TOOL" signing-mode \
+    --policy "$APPLE_IDENTITY_POLICY" \
+    --bundle-id "$BUNDLE_ID" \
+    --team-id "$SIGNING_TEAM_ID")" ||
+    fail "Release bundle/team pair is not a reviewed Apple identity"
+plutil -replace RepoPromptSigningMode -string "$signing_mode_marker" "$APP_BUNDLE/Contents/Info.plist"
 
 identity_migration_phase="$(
     plutil -extract RepoPromptIdentityMigrationPhase raw "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null ||
