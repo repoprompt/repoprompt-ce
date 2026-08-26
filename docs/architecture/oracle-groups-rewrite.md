@@ -40,26 +40,19 @@ The first version has these non-goals:
 
 The coordinator handles rosters with two to five lanes. Callers bypass it for N=1.
 
+`OracleGroupRuntime` is the only mutating grouped-turn entry point. Both the app and `repoprompt-mcp --backend headless` call `execute` after they finish surface-specific routing. N=1 never enters the runtime.
+
 ## App execution
 
 `OracleViewModel+Groups.swift` is the app adapter. `tool_chatSendWithConfiguredRoster` reads the effective model profile and chooses the route.
 
 For N=1, the adapter calls the existing `tool_chatSend` implementation. It does not create a group document, acquire a group claim, or create lane projections.
 
-For N>1, the adapter:
-
-1. Resolves or creates the durable group.
-2. Acquires the group claim.
-3. Persists a prepared turn.
-4. Restores or creates one `ChatSession` projection per lane.
-5. Builds one `OracleLanePlan` per member.
-6. Calls `OracleGroupCoordinator`.
-7. Persists the terminal result with revision compare-and-swap.
-8. Returns the primary compatibility fields and the ordered group result.
+For N>1, the adapter allocates identities and calls `OracleGroupRuntime.execute`. The runtime owns claim lifetime, post-claim reload, interrupted-turn recovery, durable prepare, lane coordination, cancellation settlement, and exact terminal publication. The adapter's callbacks restore `ChatSession` projections by canonical `memberID`, reject conflicting group metadata, invoke the existing per-lane provider path, and forward coordinator progress. A projection that claims a group ID cannot fall back to N=1 when the canonical document is missing.
 
 A named single-chat continuation is never promoted into a group. A group continuation uses the roster stored in the group document and rejects a configured roster mismatch.
 
-`ContextBuilderAgentViewModel` uses the same app adapter for grouped follow-up requests. `ContextBuilderOracleGroupState` fences callbacks by generation, group, turn, lane, and sequence. The plan or review preview shows primary-lane progress, while the final reply retains every lane result.
+`ContextBuilderAgentViewModel` uses the same app adapter for grouped follow-up requests. `ContextBuilderOracleGroupState` fences callbacks by generation, group, turn, lane, and sequence. Bind is one-shot inside a generation, and the prepared callback records that fence before awaiting progress. The plan or review preview shows primary-lane progress, while the final reply retains every lane result.
 
 ## Direct headless execution
 
@@ -68,9 +61,11 @@ A named single-chat continuation is never promoted into a group. A group continu
 `DirectHeadlessOracleAdapter` resolves an immutable child launch plan before provider dispatch.
 
 - N=1 uses the existing direct conversation backend and writes no group document.
-- N>1 creates or continues a durable group and reserves one child launch carrier per lane.
+- N>1 creates or continues a durable group through `OracleGroupRuntime` after the frozen carrier bundle validates. The adapter keeps routing, invocation-plan storage, child launch planning, provider execution, and log projection.
 - A continuation may use any member chat ID. The returned root chat ID is the primary member.
 - A roster mismatch fails before provider dispatch.
+- A carrier mismatch fails before claim acquisition or group history mutation.
+- `resolveChildLaunchPlan` rechecks shutdown after planning returns, so a cleared plan cache cannot be reinserted. Partial carrier preparation revokes launch tokens and credential envelopes.
 
 Group ID, lane ID, and claim ID travel together through the credential scope, launch reservation, child environment, token redemption, and child handshake. Partial Oracle launch identity is invalid.
 
@@ -82,7 +77,7 @@ A direct grouped Context Builder request must use a persisted `context_pack_ref`
 
 ## Durability and claims
 
-`DomainOracleConversationStore` stores one document per group. `OracleGroupDocument.currentSchemaVersion` is `2`. The document contains immutable group topology, the ordered roster, member chat IDs, a revision, and ordered turns.
+`DomainOracleConversationStore` stores one document per group. `OracleGroupDocument.currentSchemaVersion` is `2`. The document contains immutable group topology, the ordered roster, member chat IDs, a revision, and ordered turns. Schema 1 documents are normalized on read by deriving the terminal group status from their lane outcomes; their next mutation writes schema 2. Unknown future schemas remain fail-closed.
 
 A turn is prepared before provider work starts. A terminal turn contains one structural result for every lane. The store uses:
 
@@ -90,11 +85,12 @@ A turn is prepared before provider work starts. A terminal turn contains one str
 - Revision compare-and-swap for save, rename, and delete.
 - A transaction journal for crash recovery.
 - A member-to-group index for continuation lookup.
+- Filename UUID equals the embedded group ID; a missing index is invalid when group files exist.
 - SHA-256 verification for frozen artifacts.
 
-`OracleGroupClaimManager` serializes continuation, rename, delete, retention, and recovery work. A claim binds the group owner, invocation, run, runtime, and claim ID. Claims release explicitly and on deinitialization.
+`OracleGroupClaimManager` serializes continuation, rename, delete, retention, and recovery work. A claim binds the group owner, invocation, run, runtime, and claim ID. `OracleGroupRuntime` acquires the caller-supplied claim ID, holds it across projection setup, lane execution, drain, and terminal publication, then releases it.
 
-If terminal persistence fails, the adapters retry the same canonical outcome. They do not invent a replacement result. Cancellation drains lane tasks and persists cancelled lane outcomes before the current wrapper returns cancellation where that contract applies.
+If terminal persistence fails, `OracleGroupTerminalPublisher` retries the same canonical outcome. It does not invent a replacement result. Cancellation drains lane callbacks and persists cancelled lane outcomes before the claim is released.
 
 ## Settings and schema authority
 
