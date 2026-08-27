@@ -10,8 +10,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
-  contents: write
+  actions: read
+  contents: read
 
 jobs:
   rewrite:
@@ -30,12 +30,25 @@ jobs:
           sed -i 's/"""Smoke-test the Linux headless MCP binary or final container\."""/# Smoke-test the Linux headless MCP binary or final container./' .github/bootstrap_linux_rework.py
           python3 .github/bootstrap_linux_rework.py
 
-      - name: Commit generated tree
+      - name: Package generated tree
+        env:
+          BASE_SHA: 0c1aa28f8179ff98c11f6dbb420101eeba944a26
         run: |
+          set -euo pipefail
           rm .github/bootstrap_linux_rework.py
           rm .github/workflows/bootstrap-linux-rework.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Rework Linux headless container from latest main"
-          git push origin HEAD:linux-headless-mcp-rework
+          git diff --name-status "$BASE_SHA" > /tmp/linux-headless-files.txt
+          git diff --name-only --diff-filter=ACMRTUXB -z "$BASE_SHA" -- \
+            | tar --null --files-from=- --create --gzip --file=/tmp/linux-headless-tree.tar.gz
+          test -s /tmp/linux-headless-tree.tar.gz
+          cat /tmp/linux-headless-files.txt
+
+      - name: Upload generated tree
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-headless-generated-tree
+          path: |
+            /tmp/linux-headless-tree.tar.gz
+            /tmp/linux-headless-files.txt
+          if-no-files-found: error
+          retention-days: 1
