@@ -15,15 +15,43 @@ fail() {
 [[ -n "${RELEASE_COMMIT:-}" ]] ||
     fail "Missing required environment variable: RELEASE_COMMIT"
 
-if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
-    [[ "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
-        fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
+TIP_ROLLOUT_DECLARATION_NAME=""
+case "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" in
+    "") ;;
+    tip-rollout-v1) TIP_ROLLOUT_DECLARATION_NAME="tip-rollout.json" ;;
+    *) fail "Unsupported REPOPROMPT_TIP_ARCHIVE_CONTRACT: $REPOPROMPT_TIP_ARCHIVE_CONTRACT" ;;
+esac
+
+PROJECTED_BUNDLE_ID=""
+PROJECTED_SIGNING_TEAM_ID=""
+if [[ -n "$TIP_ROLLOUT_DECLARATION_NAME" ]]; then
+    [[ -f "$APPROVED_SOURCE_ROOT/$TIP_ROLLOUT_DECLARATION_NAME" ]] ||
+        fail "Missing approved Tip rollout declaration"
+    [[ -f "$ROOT_DIR/$TIP_ROLLOUT_DECLARATION_NAME" ]] ||
+        fail "missing staged file: $ROOT_DIR/$TIP_ROLLOUT_DECLARATION_NAME"
+    rollout_context="$(
+        python3 "$SCRIPT_DIR/stable_rollout.py" packaging-context \
+            --declaration "$APPROVED_SOURCE_ROOT/$TIP_ROLLOUT_DECLARATION_NAME" \
+            --policy "$SCRIPT_DIR/apple_identity_policy.json" \
+            --version-env "$APPROVED_SOURCE_ROOT/version.env"
+    )" || fail "Unable to derive the reviewed Tip packaging context"
+    eval "$rollout_context"
+    PROJECTED_BUNDLE_ID="$BUNDLE_ID"
+    PROJECTED_SIGNING_TEAM_ID="$SIGNING_TEAM_ID"
+fi
+
+if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" || -n "$PROJECTED_BUNDLE_ID" ]]; then
+    if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
+        [[ "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
+            fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
+    fi
     python3 - "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" \
-        "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" <<'PYTHON'
+        "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" "$PROJECTED_BUNDLE_ID" \
+        "$PROJECTED_SIGNING_TEAM_ID" <<'PYTHON'
 import sys
 from pathlib import Path
 
-staged_path, approved_path, build_override = sys.argv[1:]
+staged_path, approved_path, build_override, bundle_id, signing_team_id = sys.argv[1:]
 
 def parse(path: str) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -40,13 +68,22 @@ def parse(path: str) -> dict[str, str]:
 staged = parse(staged_path)
 approved = parse(approved_path)
 expected = dict(approved)
-expected["BUILD_NUMBER"] = build_override
+for key, value in {
+    "BUILD_NUMBER": build_override,
+    "BUNDLE_ID": bundle_id,
+    "SIGNING_TEAM_ID": signing_team_id,
+}.items():
+    if value:
+        expected[key] = value
 if staged != expected:
     mismatches = sorted(set(staged) | set(expected))
     detail = ", ".join(
         key for key in mismatches if staged.get(key) != expected.get(key)
     )
-    raise SystemExit(f"ERROR: staged version.env does not match approved source plus build override: {detail}")
+    raise SystemExit(
+        "ERROR: staged version.env does not match approved source plus reviewed release projections: "
+        f"{detail}"
+    )
 PYTHON
 else
     cmp "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" ||
@@ -57,14 +94,12 @@ load_release_metadata "$APPROVED_SOURCE_ROOT"
 if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
     BUILD_NUMBER="$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE"
 fi
+if [[ -n "$PROJECTED_BUNDLE_ID" ]]; then
+    BUNDLE_ID="$PROJECTED_BUNDLE_ID"
+    SIGNING_TEAM_ID="$PROJECTED_SIGNING_TEAM_ID"
+fi
 
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
-TIP_ROLLOUT_DECLARATION_NAME=""
-case "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" in
-    "") ;;
-    tip-rollout-v1) TIP_ROLLOUT_DECLARATION_NAME="tip-rollout.json" ;;
-    *) fail "Unsupported REPOPROMPT_TIP_ARCHIVE_CONTRACT: $REPOPROMPT_TIP_ARCHIVE_CONTRACT" ;;
-esac
 
 python3 - "$ROOT_DIR" "$APP_BUNDLE" "$TIP_ROLLOUT_DECLARATION_NAME" <<'PYTHON'
 import os

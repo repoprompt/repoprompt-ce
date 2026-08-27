@@ -2691,6 +2691,17 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn("tip-rollout.json", missing.stderr)
 
         shutil.copy2(approved / "tip-rollout.json", staged / "tip-rollout.json")
+        legacy_identity = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            release_build_number_override="1",
+            tip_archive_contract="tip-rollout-v1",
+        )
+        self.assertNotEqual(legacy_identity.returncode, 0)
+        self.assertIn("BUNDLE_ID, SIGNING_TEAM_ID", legacy_identity.stderr)
+
+        self.project_staged_release_identity(staged, scripts, "com.repoprompt.ce", "69N6K965SF")
         accepted = self.run_staged_validation(
             approved,
             staged,
@@ -4785,6 +4796,48 @@ esac
                 app / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
             ),
         }
+
+    @classmethod
+    def project_staged_release_identity(
+        cls,
+        staged: Path,
+        scripts: Path,
+        bundle_id: str,
+        signing_team_id: str,
+    ) -> None:
+        version_path = staged / "version.env"
+        version = version_path.read_text(encoding="utf-8")
+        version = re.sub(r"(?m)^BUNDLE_ID=.*$", f"BUNDLE_ID={bundle_id}", version)
+        version = re.sub(r"(?m)^SIGNING_TEAM_ID=.*$", f"SIGNING_TEAM_ID={signing_team_id}", version)
+        version_path.write_text(version, encoding="utf-8")
+
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        info_path = app / "Contents" / "Info.plist"
+        info = plistlib.loads(info_path.read_bytes())
+        info["CFBundleIdentifier"] = bundle_id
+        info_path.write_bytes(plistlib.dumps(info))
+
+        manifest = staged / ".build" / "release" / "RepoPrompt-artifact-manifest.json"
+        manifest_env = os.environ.copy()
+        manifest_env.update(
+            {"LIPO": str(scripts / "fake-lipo"), "CODESIGN": str(scripts / "fake-codesign")}
+        )
+        subprocess.run(
+            [
+                str(scripts / "write_app_artifact_manifest.py"),
+                "write",
+                "--app",
+                str(app),
+                "--output",
+                str(manifest),
+                "--expected-architectures",
+                "arm64,x86_64",
+            ],
+            env=manifest_env,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
 
     @classmethod
     def run_staged_validation(
