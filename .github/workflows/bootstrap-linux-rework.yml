@@ -1,0 +1,38 @@
+name: Bootstrap Linux headless rework
+
+on:
+  push:
+    branches:
+      - linux-headless-mcp-rework
+    paths:
+      - ".github/bootstrap_linux_rework.py"
+      - ".github/workflows/bootstrap-linux-rework.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out fresh branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+
+      - name: Fetch legacy portability reference
+        run: git fetch origin linux-headless-mcp:refs/remotes/origin/legacy-linux-headless
+
+      - name: Generate focused implementation
+        run: python3 .github/bootstrap_linux_rework.py
+
+      - name: Commit generated tree
+        run: |
+          rm .github/bootstrap_linux_rework.py
+          rm .github/workflows/bootstrap-linux-rework.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Rework Linux headless container from latest main"
+          git push origin HEAD:linux-headless-mcp-rework
