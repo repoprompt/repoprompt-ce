@@ -25,6 +25,18 @@ private func isCustomOpenAICompatibleEndpoint(_ endpointBaseURL: URL?) -> Bool {
     return host != "api.openai.com" && !host.hasSuffix(".openai.com")
 }
 
+func openAICompletionEndpointBaseURL(
+    _ endpointBaseURL: URL?,
+    providerType: AIProviderType
+) -> URL? {
+    switch providerType {
+    case .openAI, .customProvider:
+        endpointBaseURL
+    default:
+        nil
+    }
+}
+
 class OpenAIProvider: AIProvider {
     // Instance-level cache
     private let cachedApiKey: String?
@@ -325,7 +337,10 @@ class OpenAIProvider: AIProvider {
 
         let service = getService()
         let stream = try await service.startStreamedChat(parameters: parameters)
-        let completionEndpointBaseURL = model.providerType == .openAI ? cachedBaseURL : nil
+        let completionEndpointBaseURL = openAICompletionEndpointBaseURL(
+            cachedBaseURL,
+            providerType: model.providerType
+        )
 
         return AsyncThrowingStream { continuation in
             let bridgeTask = Task {
@@ -536,7 +551,10 @@ class OpenAIProvider: AIProvider {
         let content = choice?.message?.content ?? ""
         let completionOutcome = openAIChatCompletionOutcome(
             choice?.finishReason,
-            endpointBaseURL: model.providerType == .openAI ? cachedBaseURL : nil
+            endpointBaseURL: openAICompletionEndpointBaseURL(
+                cachedBaseURL,
+                providerType: model.providerType
+            )
         ) ?? .incomplete(reason: "missing_finish_reason")
 
         // Return an AICompletionResult with content and token counts

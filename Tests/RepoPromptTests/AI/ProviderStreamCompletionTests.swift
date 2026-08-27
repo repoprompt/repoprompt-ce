@@ -37,9 +37,31 @@ final class ProviderStreamCompletionTests: XCTestCase {
         )
     }
 
-    func testCustomOpenAIModelUsesOpenAIProviderFamily() {
-        XCTAssertEqual(AIModel.openaiCustom(name: "fable").providerType, .openAI)
-        XCTAssertNotEqual(AIModel.geminiCustom(name: "gemini").providerType, .openAI)
+    func testOpenAIBackedCustomProviderEndTurnReportsSuccessfulCompletion() {
+        let customProviderModel = AIModel.customProvider(
+            name: "fable",
+            provider: "custom",
+            model: "fable"
+        )
+        let endpoint = openAICompletionEndpointBaseURL(
+            customEndpoint,
+            providerType: customProviderModel.providerType
+        )
+
+        XCTAssertEqual(endpoint, customEndpoint)
+        XCTAssertEqual(
+            openAIChatCompletionOutcome(.string("end_turn"), endpointBaseURL: endpoint),
+            .completed
+        )
+    }
+
+    func testNonOpenAIProviderDoesNotUseOpenAICompletionEndpointPolicy() {
+        XCTAssertNil(
+            openAICompletionEndpointBaseURL(
+                customEndpoint,
+                providerType: AIModel.geminiCustom(name: "gemini").providerType
+            )
+        )
     }
 
     func testAnthropicSuccessfulCompletionReasonsAreExplicit() {
