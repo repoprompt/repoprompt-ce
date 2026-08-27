@@ -251,10 +251,12 @@ struct AgentExploreMCPToolService {
         context: ExploreStartContext,
         worktreeRequest: AgentMCPStartWorktreeCoordinator.Request
     ) async throws -> [StartedExploreRun] {
+        let effectiveParentWorktreeInheritance = worktreeRequest.inheritParentWorktreeBindings
+            && !worktreeRequest.hasExplicitWorktreeArgs
         let targets = try await createFreshExploreTargets(
             count: messages.count,
             context: context,
-            inheritWorktreeBindings: worktreeRequest.inheritParentWorktreeBindings
+            inheritWorktreeBindings: effectiveParentWorktreeInheritance
         )
         var started: [StartedExploreRun] = []
         started.reserveCapacity(messages.count)

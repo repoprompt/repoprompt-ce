@@ -481,13 +481,188 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         }
     }
 
+    func testPrimaryExecutionBindingRequiresCurrentRootMembershipAndSelectsCanonicalPrimary() throws {
+        let primaryRoot = try makeTemporaryDirectory(named: "binding-primary-root")
+        let primaryAlias = primaryRoot.deletingLastPathComponent().appendingPathComponent("binding-primary-alias")
+        try FileManager.default.createSymbolicLink(at: primaryAlias, withDestinationURL: primaryRoot)
+        let primaryWorktree = try makeTemporaryDirectory(named: "binding-primary-worktree")
+        let secondaryRoot = try makeTemporaryDirectory(named: "binding-secondary-root")
+        let secondaryWorktree = try makeTemporaryDirectory(named: "binding-secondary-worktree")
+        let tertiaryRoot = try makeTemporaryDirectory(named: "binding-tertiary-root")
+        let tertiaryWorktree = try makeTemporaryDirectory(named: "binding-tertiary-worktree")
+        let primaryBinding = makeBinding(
+            logicalRoot: primaryAlias.path,
+            worktreeRoot: primaryWorktree.path,
+            worktreeID: "wt_primary"
+        )
+        let secondaryBinding = makeBinding(
+            logicalRoot: secondaryRoot.path,
+            worktreeRoot: secondaryWorktree.path,
+            worktreeID: "wt_secondary"
+        )
+        let tertiaryBinding = makeBinding(
+            logicalRoot: tertiaryRoot.path,
+            worktreeRoot: tertiaryWorktree.path,
+            worktreeID: "wt_tertiary"
+        )
+        let workspaceRoots = [primaryRoot.path, secondaryRoot.path, tertiaryRoot.path]
+
+        XCTAssertEqual(
+            try AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+                in: [secondaryBinding],
+                workspaceRootPaths: workspaceRoots
+            )?.worktreeID,
+            secondaryBinding.worktreeID
+        )
+        for bindings in [
+            [primaryBinding, secondaryBinding],
+            [secondaryBinding, primaryBinding]
+        ] {
+            XCTAssertEqual(
+                try AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+                    in: bindings,
+                    workspaceRootPaths: workspaceRoots
+                )?.worktreeID,
+                primaryBinding.worktreeID
+            )
+        }
+
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+                bindings: [secondaryBinding],
+                workspaceRootPaths: [primaryRoot.path]
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AgentWorktreeRuntimeWorkspaceResolutionError,
+                .logicalRootNotInActiveWorkspace(path: secondaryRoot.standardizedFileURL.path)
+            )
+        }
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+                in: [secondaryBinding, secondaryBinding],
+                workspaceRootPaths: workspaceRoots
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AgentWorktreeRuntimeWorkspaceResolutionError,
+                .duplicateLogicalRoot(path: secondaryRoot.standardizedFileURL.path)
+            )
+        }
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+                in: [secondaryBinding, tertiaryBinding],
+                workspaceRootPaths: workspaceRoots
+            )
+        ) { error in
+            XCTAssertEqual(error as? AgentWorktreeRuntimeWorkspaceResolutionError, .ambiguousExecutionBinding)
+        }
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+                in: [primaryBinding],
+                workspaceRootPaths: [primaryRoot.path, primaryAlias.path]
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AgentWorktreeRuntimeWorkspaceResolutionError,
+                .duplicateActiveWorkspaceRoot(path: primaryAlias.standardizedFileURL.path)
+            )
+        }
+    }
+
+    func testCreateBindAndReviewSteerProjectsExactSecondaryWorktree() async throws {
+        let primaryFixture = try makeGitFixture()
+        let secondaryFixture = try makeGitFixture()
+        let secondaryWorktree = secondaryFixture.sandbox.appendingPathComponent("review-secondary-worktree", isDirectory: true)
+        let branch = "feature/review-secondary-\(secondaryFixture.suffix)"
+        try runGit(["worktree", "add", "-b", branch, secondaryWorktree.path, "HEAD"], cwd: secondaryFixture.repo)
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: secondaryFixture.repo)
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: secondaryFixture.repo,
+            path: secondaryWorktree,
+            expectedBranch: branch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo) }
+        )
+
+        let otherWindow = try await makeWindow(root: makeTemporaryDirectory(named: "review-other-window"))
+        let targetWindow = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
+        XCTAssertNotEqual(targetWindow.windowID, otherWindow.windowID)
+
+        let agentManage = try await windowTool(named: MCPWindowToolName.agentManage, in: targetWindow)
+        let manageWorktree = try await windowTool(named: MCPWindowToolName.manageWorktree, in: targetWindow)
+        let created = try await agentManage([
+            "op": .string("create_session"),
+            "session_name": .string("Secondary review lifecycle")
+        ])
+        let sessionID = try XCTUnwrap(
+            created.objectValue?["session_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+        )
+
+        _ = try await manageWorktree([
+            "op": .string("bind"),
+            "repo_root": .string(secondaryFixture.repo.path),
+            "worktree_id": .string(descriptor.worktreeID),
+            "session_id": .string(sessionID.uuidString)
+        ])
+
+        var capturedWorkflowID: String?
+        var capturedMessage: String?
+        var capturedPaths: CodexRuntimeWorkspacePaths?
+        var capturedBindings: [AgentSessionWorktreeBinding] = []
+        var service = makeAgentRunStartService(window: targetWindow, sourceTabID: nil)
+        service.testDispatchSteerInstruction = { capturedSessionID, text, workflow, agentModeVM in
+            XCTAssertEqual(capturedSessionID, sessionID)
+            let session = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: capturedSessionID))
+            capturedWorkflowID = workflow?.id
+            capturedMessage = text
+            capturedPaths = try agentModeVM.codexRuntimeWorkspacePaths(for: session)
+            capturedBindings = session.worktreeBindings
+            session.runState = .running
+            agentModeVM.publishMCPStateChange(for: session)
+            return .startedRun
+        }
+
+        _ = try await service.execute(args: [
+            "op": .string("steer"),
+            "session_id": .string(sessionID.uuidString),
+            "message": .string("Review the bound secondary checkout."),
+            "workflow_id": .string("builtin-review"),
+            "wait": .bool(false)
+        ])
+
+        XCTAssertEqual(capturedWorkflowID, "builtin-review")
+        XCTAssertEqual(capturedMessage, "Review the bound secondary checkout.")
+        XCTAssertEqual(
+            capturedPaths,
+            .worktreeBound(
+                logicalRootPath: secondaryFixture.repo.standardizedFileURL.path,
+                validatedWorktreeRootPath: secondaryWorktree.standardizedFileURL.path
+            )
+        )
+        XCTAssertEqual(capturedBindings.count, 1)
+        XCTAssertEqual(capturedBindings.first?.worktreeID, descriptor.worktreeID)
+        XCTAssertEqual(capturedBindings.first?.logicalRootPath, secondaryFixture.repo.standardizedFileURL.path)
+
+        let session = try XCTUnwrap(targetWindow.agentModeViewModel.mcpControlledSession(sessionID: sessionID))
+        session.runState = .completed
+        targetWindow.agentModeViewModel.publishMCPStateChange(for: session)
+        await targetWindow.agentModeViewModel.mcpDeactivateControlContext(
+            sessionID: sessionID,
+            cleanupSessionStore: true
+        )
+    }
+
     func testCodexRuntimeWorkspacePathsProjectionCoversBoundUnboundSecondaryAndMissingWorktree() throws {
         let root = try makeTemporaryDirectory(named: "projection-root")
         let worktree = try makeTemporaryDirectory(named: "projection-worktree")
         let secondaryRoot = try makeTemporaryDirectory(named: "projection-secondary-root")
         let secondaryWorktree = try makeTemporaryDirectory(named: "projection-secondary-worktree")
         let missingWorktree = root.appendingPathComponent("missing-worktree")
-        let viewModel = makeViewModel(workspacePath: root.path)
+        let viewModel = makeViewModel(
+            workspacePath: root.path,
+            workspacePaths: [root.path, secondaryRoot.path]
+        )
 
         let unboundSession = AgentModeViewModel.TabSession(tabID: UUID())
         XCTAssertEqual(
@@ -503,20 +678,28 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         )
         XCTAssertEqual(try viewModel.codexRuntimeWorkspacePaths(for: boundSession), boundPair)
 
-        // Adding a secondary-root binding must not move either directory of the primary pair.
-        boundSession.worktreeBindings.append(
-            makeBinding(logicalRoot: secondaryRoot.path, worktreeRoot: secondaryWorktree.path)
+        // Adding a secondary-root binding must not move either directory of the primary pair,
+        // regardless of binding order.
+        let secondaryBinding = makeBinding(
+            logicalRoot: secondaryRoot.path,
+            worktreeRoot: secondaryWorktree.path
         )
+        boundSession.worktreeBindings.append(secondaryBinding)
+        XCTAssertEqual(try viewModel.codexRuntimeWorkspacePaths(for: boundSession), boundPair)
+        boundSession.worktreeBindings.reverse()
         XCTAssertEqual(try viewModel.codexRuntimeWorkspacePaths(for: boundSession), boundPair)
 
-        // A secondary-only binding leaves the session on the unbound fallback pair.
+        // A secondary-only binding is authoritative even when the workspace fallback is primary.
         let secondaryOnlySession = AgentModeViewModel.TabSession(tabID: UUID())
         secondaryOnlySession.worktreeBindings = [
             makeBinding(logicalRoot: secondaryRoot.path, worktreeRoot: secondaryWorktree.path)
         ]
         XCTAssertEqual(
             try viewModel.codexRuntimeWorkspacePaths(for: secondaryOnlySession),
-            .uniform(root.path)
+            .worktreeBound(
+                logicalRootPath: secondaryRoot.path,
+                validatedWorktreeRootPath: secondaryWorktree.path
+            )
         )
 
         // Unavailable worktrees keep the existing typed worktree failure.
@@ -536,16 +719,16 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertThrowsError(
             try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
                 bindings: [makeBinding(logicalRoot: "   ", worktreeRoot: worktree.path)],
-                fallbackWorkspacePath: nil
+                workspaceRootPaths: [worktree.path]
             )
         ) { error in
-            XCTAssertEqual(error as? CodexRuntimeWorkspacePathsError, .emptyLogicalRoot)
+            XCTAssertEqual(error as? AgentWorktreeRuntimeWorkspaceResolutionError, .emptyLogicalRoot)
         }
 
         XCTAssertThrowsError(
             try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
                 bindings: [makeBinding(logicalRoot: missingRoot.path, worktreeRoot: worktree.path)],
-                fallbackWorkspacePath: missingRoot.path
+                workspaceRootPaths: [missingRoot.path]
             )
         ) { error in
             XCTAssertEqual(
@@ -557,7 +740,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(
             try AgentWorktreeRuntimeWorkspaceResolver.codexRuntimeWorkspacePaths(
                 bindings: [],
-                fallbackWorkspacePath: nil
+                workspaceRootPaths: []
             ),
             .uniform(nil)
         )
@@ -569,7 +752,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
         var installedController: ReplacementIdentityFakeCodexController?
         let viewModel = AgentModeViewModel(
-            testWorkspacePath: nil,
+            testWorkspacePath: root.path,
             codexControllerFactory: { _, _, _, _, _, _ in
                 let controller = ReplacementIdentityFakeCodexController()
                 installedController = controller
@@ -728,7 +911,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let shutdownGate = AgentRunWorktreeStartAsyncGate()
         let controller = ReplacementIdentityFakeCodexController(shutdownGate: shutdownGate)
         let viewModel = AgentModeViewModel(
-            testWorkspacePath: nil,
+            testWorkspacePath: root.path,
             codexControllerFactory: { _, _, _, _, _, _ in controller }
         )
         viewModel.test_initializeRunService()
@@ -793,7 +976,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         var controllerCreationCountByTabID: [UUID: Int] = [:]
 
         let viewModel = AgentModeViewModel(
-            testWorkspacePath: nil,
+            testWorkspacePath: rootA.path,
+            testWorkspacePaths: [rootA.path, rootB.path],
             codexControllerFactory: { _, tabID, _, _, _, _ in
                 let creationIndex = controllerCreationCountByTabID[tabID, default: 0]
                 controllerCreationCountByTabID[tabID] = creationIndex + 1
@@ -923,7 +1107,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         var firstControllerByTabID: [UUID: ReplacementIdentityFakeCodexController] = [:]
 
         let viewModel = AgentModeViewModel(
-            testWorkspacePath: nil,
+            testWorkspacePath: rootA.path,
+            testWorkspacePaths: [rootA.path, rootB.path],
             codexControllerFactory: { _, tabID, _, workspacePaths, _, _ in
                 createdPathsByTabID[tabID, default: []].append(workspacePaths)
                 let controller = ReplacementIdentityFakeCodexController(
@@ -999,6 +1184,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         var createdPaths: [CodexRuntimeWorkspacePaths] = []
         let viewModel = AgentModeViewModel(
             testWorkspacePath: root.path,
+            testWorkspacePaths: [root.path, secondaryRoot.path],
             codexControllerFactory: { _, _, _, workspacePaths, _, _ in
                 createdPaths.append(workspacePaths)
                 return ReplacementIdentityFakeCodexController()
@@ -1057,10 +1243,9 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let worktree = try makeTemporaryDirectory(named: "launch-only-worktree")
 
         var createdPaths: [CodexRuntimeWorkspacePaths] = []
-        // No fallback workspace: the single binding is the selected primary regardless of its
-        // logical root, which lets the launch directory move while the execution directory stays.
         let viewModel = AgentModeViewModel(
-            testWorkspacePath: nil,
+            testWorkspacePath: rootA.path,
+            testWorkspacePaths: [rootA.path, rootB.path],
             codexControllerFactory: { _, _, _, workspacePaths, _, _ in
                 createdPaths.append(workspacePaths)
                 return ReplacementIdentityFakeCodexController()
@@ -2549,9 +2734,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             atomically: true,
             encoding: .utf8
         )
-        let window = try await makeWindow(root: primaryRoot)
-        _ = try await window.workspaceFileContextStore.loadRoot(path: missingSecondaryRoot.path)
-        _ = try await window.workspaceFileContextStore.loadRoot(path: validSecondaryRoot.path)
+        let window = try await makeWindow(roots: [primaryRoot, missingSecondaryRoot, validSecondaryRoot])
         let viewModel = window.agentModeViewModel
         let createdTabID = await viewModel.createAndActivateSessionTab()
         let tabID = try XCTUnwrap(createdTabID)
@@ -2688,6 +2871,48 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "queued ACP draft\nqueued shared draft")
         XCTAssertFalse(viewModel.retrieveDraftText(for: tabID).contains("in-flight prompt"))
         XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), ["in-flight prompt"])
+    }
+
+    func testInvalidActiveBindingRequiresStopConfirmationAndCanBeRepairedToLocal() async throws {
+        let currentRoot = try makeTemporaryDirectory(named: "invalid-active-current-root")
+        let staleRoot = try makeTemporaryDirectory(named: "invalid-active-stale-root")
+        let staleWorktree = try makeTemporaryDirectory(named: "invalid-active-stale-worktree")
+        let viewModel = makeViewModel(workspacePath: currentRoot.path)
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        session.hasLoadedPersistedState = true
+        session.hasSentFirstMessage = true
+        session.runState = .running
+        session.installRunID(UUID())
+        session.beginRunAttempt(source: "test")
+        session.providerSessionID = "provider-from-invalid-binding"
+        let staleBinding = makeBinding(
+            logicalRoot: staleRoot.path,
+            worktreeRoot: staleWorktree.path,
+            worktreeID: "wt_stale"
+        )
+        session.worktreeBindings = [staleBinding]
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let unconfirmed = await viewModel.selectExecutionLocation(.local, for: tabID)
+
+        XCTAssertEqual(unconfirmed, .confirmationRequired(.activeRunStop))
+        XCTAssertEqual(session.worktreeBindings, [staleBinding])
+        XCTAssertEqual(session.providerSessionID, "provider-from-invalid-binding")
+
+        let repaired = await viewModel.selectExecutionLocation(
+            .local,
+            for: tabID,
+            confirmedChange: .activeRunStop
+        )
+
+        XCTAssertEqual(repaired, .applied)
+        XCTAssertTrue(session.worktreeBindings.isEmpty)
+        XCTAssertNil(session.providerSessionID)
+        XCTAssertFalse(session.runState.isActive)
     }
 
     func testExternalPrimaryRebindRejectsDuringActiveRunWithoutDroppingOldIdentity() async throws {
@@ -3011,6 +3236,132 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(exploreChild.worktreeBindings, observation.bindings)
     }
 
+    func testAgentExploreExplicitSecondaryWorktreeSuppressesInheritedPrimaryAtProviderStart() async throws {
+        let primaryFixture = try makeGitFixture()
+        let secondaryFixture = try makeGitFixture()
+        let secondaryBranch = "feature/explore-secondary-\(secondaryFixture.suffix)"
+        let secondaryWorktree = secondaryFixture.sandbox.appendingPathComponent(
+            "explore-secondary-worktree",
+            isDirectory: true
+        )
+        try runGit(
+            ["worktree", "add", "-b", secondaryBranch, secondaryWorktree.path, "HEAD"],
+            cwd: secondaryFixture.repo
+        )
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: secondaryFixture.repo)
+        let secondaryDescriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: secondaryFixture.repo,
+            path: secondaryWorktree,
+            expectedBranch: secondaryBranch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo) }
+        )
+        let window = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let parentID = UUID()
+        let inheritedPrimaryBinding = makeBinding(
+            logicalRoot: primaryFixture.repo.path,
+            worktreeRoot: primaryFixture.repo.path,
+            worktreeID: "wt_inherited_primary"
+        )
+        installParentAgentSession(
+            parentID,
+            binding: inheritedPrimaryBinding,
+            sourceTabID: sourceTabID,
+            in: window
+        )
+        let recorder = ExploreStartRecorder(capturesRuntimePaths: true)
+        let service = makeAgentExploreStartService(
+            window: window,
+            sourceTabID: sourceTabID,
+            recorder: recorder
+        )
+
+        _ = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("inspect declared secondary repository"),
+            "worktree_id": .string(secondaryDescriptor.worktreeID),
+            "worktree_repo_root": .string(secondaryFixture.repo.path),
+            "detach": .bool(true),
+            "timeout": .int(0)
+        ])
+
+        let observation = try XCTUnwrap(recorder.observations.first)
+        XCTAssertEqual(recorder.observations.count, 1)
+        let binding = try XCTUnwrap(observation.bindings.first)
+        XCTAssertEqual(observation.bindings.count, 1)
+        XCTAssertEqual(binding.repositoryID, secondaryDescriptor.repository.repositoryID)
+        XCTAssertEqual(binding.worktreeID, secondaryDescriptor.worktreeID)
+        XCTAssertEqual(observation.effectiveWorkspacePath, secondaryDescriptor.path)
+        XCTAssertEqual(
+            observation.codexRuntimeWorkspacePaths,
+            .worktreeBound(
+                logicalRootPath: secondaryFixture.repo.path,
+                validatedWorktreeRootPath: secondaryDescriptor.path
+            )
+        )
+    }
+
+    func testCoordinatorCanonicallyReplacesAliasLogicalRootBinding() async throws {
+        let fixture = try makeGitFixture()
+        let branch = "feature/alias-replacement-\(fixture.suffix)"
+        let worktree = fixture.sandbox.appendingPathComponent("alias-replacement-worktree", isDirectory: true)
+        try runGit(["worktree", "add", "-b", branch, worktree.path, "HEAD"], cwd: fixture.repo)
+        let expectedHead = try runGitOutput(["rev-parse", "HEAD"], cwd: fixture.repo)
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: fixture.repo,
+            path: worktree,
+            expectedBranch: branch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await VCSService.shared.listGitWorktrees(at: fixture.repo) }
+        )
+        let alias = fixture.sandbox.appendingPathComponent("repo-alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.repo)
+        let window = try await makeWindow(root: alias)
+        let viewModel = window.agentModeViewModel
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: nil
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let session = viewModel.session(for: target.tabID)
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        let aliasBinding = makeBinding(
+            logicalRoot: alias.path,
+            worktreeRoot: fixture.repo.path,
+            worktreeID: "wt_alias"
+        )
+        session.worktreeBindings = [aliasBinding]
+        let coordinator = AgentMCPStartWorktreeCoordinator(
+            operationName: "agent_run.start",
+            vcsService: .shared,
+            gitTargetResolver: .init()
+        )
+        let request = try coordinator.parseRequest(args: [
+            "worktree_id": .string(descriptor.worktreeID),
+            "worktree_repo_root": .string(fixture.repo.path)
+        ])
+
+        try await coordinator.prepare(
+            request: request,
+            target: target,
+            targetWindow: window
+        )
+
+        let bindings = viewModel.worktreeBindings(forAgentSessionID: sessionID, tabID: target.tabID)
+        let binding = try XCTUnwrap(bindings.first)
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(binding.id, aliasBinding.id)
+        XCTAssertEqual(
+            GitRepoRootAuthorization.canonicalPath(binding.logicalRootPath),
+            GitRepoRootAuthorization.canonicalPath(fixture.repo.path)
+        )
+        XCTAssertEqual(binding.worktreeID, descriptor.worktreeID)
+        XCTAssertEqual(binding.worktreeRootPath, descriptor.path)
+    }
+
     func testAgentStartWorktreeSelectorsDefaultToWorkspacePrimaryRepoWhenRootsLoadedOutOfOrder() async throws {
         let primaryFixture = try makeGitFixture()
         let secondaryFixture = try makeGitFixture()
@@ -3192,7 +3543,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         }
     }
 
-    func testAgentStartWorktreeSelectorRejectsSecondaryGitRepoWhenPrimaryRootIsNonGit() async throws {
+    func testAgentStartWorktreeSelectorRequiresExplicitSecondaryRepoWhenPrimaryRootIsNonGit() async throws {
         let primaryRoot = try makeTemporaryDirectory(named: "non-git-primary-root")
         let secondaryFixture = try makeGitFixture()
         let branch = "feature/secondary-selector-\(secondaryFixture.suffix)"
@@ -3213,22 +3564,108 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             listDescriptors: { try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo) }
         )
         let window = try await makeWindow(roots: [primaryRoot, secondaryFixture.repo])
+        let viewModel = window.agentModeViewModel
         let initialTabCount = try XCTUnwrap(window.workspaceManager.activeWorkspace).composeTabs.count
+        let initialSessionCount = viewModel.sessions.count
 
-        let service = makeAgentRunStartService(window: window, sourceTabID: nil)
+        let implicitService = makeAgentRunStartService(window: window, sourceTabID: nil)
         do {
-            _ = try await service.execute(args: [
+            _ = try await implicitService.execute(args: [
                 "op": .string("start"),
-                "message": .string("reject secondary repository"),
+                "message": .string("do not drift into secondary repository"),
                 "detach": .bool(true),
                 "timeout": .int(0),
                 "worktree_id": .string(descriptor.worktreeID)
             ])
-            XCTFail("Expected a secondary-repository worktree to be rejected when the primary root is non-Git")
+            XCTFail("Expected implicit selection to reject a non-Git primary root")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("supports the primary workspace root only"))
+            XCTAssertTrue(error.localizedDescription.contains("primary workspace root is not a Git repository"))
         }
         XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.count, initialTabCount)
+        XCTAssertEqual(viewModel.sessions.count, initialSessionCount)
+
+        let explicitService = makeAgentRunStartService(window: window, sourceTabID: nil)
+        let value = try await explicitService.execute(args: [
+            "op": .string("start"),
+            "message": .string("select declared secondary repository"),
+            "detach": .bool(true),
+            "timeout": .int(0),
+            "worktree_id": .string(descriptor.worktreeID),
+            "worktree_repo_root": .string(secondaryFixture.repo.path)
+        ])
+        let object = try XCTUnwrap(value.objectValue)
+        let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue)
+        let binding = try XCTUnwrap(bindings.first?.objectValue)
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(binding["repository_id"]?.stringValue, descriptor.repository.repositoryID)
+        XCTAssertEqual(binding["logical_root_path"]?.stringValue, secondaryFixture.repo.path)
+        XCTAssertEqual(binding["worktree_id"]?.stringValue, descriptor.worktreeID)
+        XCTAssertEqual(binding["worktree_root_path"]?.stringValue, descriptor.path)
+
+        let sessionObject = try XCTUnwrap(object["session"]?.objectValue)
+        let tabID = try XCTUnwrap(try UUID(uuidString: XCTUnwrap(sessionObject["context_id"]?.stringValue)))
+        let session = viewModel.session(for: tabID)
+        let storedBinding = try XCTUnwrap(session.worktreeBindings.first)
+        XCTAssertEqual(session.worktreeBindings.count, 1)
+        XCTAssertEqual(binding["id"]?.stringValue, storedBinding.id)
+        XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.count, initialTabCount + 1)
+        XCTAssertEqual(viewModel.sessions.count, initialSessionCount + 1)
+    }
+
+    func testCoordinatorRejectsLoadedSecondaryRootRemovedFromSavedWorkspaceBeforeCreate() async throws {
+        let primaryFixture = try makeGitFixture()
+        let secondaryFixture = try makeGitFixture()
+        let branch = "feature/stale-secondary-\(secondaryFixture.suffix)"
+        let destination = secondaryFixture.sandbox.appendingPathComponent(
+            "stale-secondary-worktree",
+            isDirectory: true
+        )
+        defer {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try? runGit(["worktree", "remove", "--force", destination.path], cwd: secondaryFixture.repo)
+            }
+        }
+
+        let window = try await makeWindow(roots: [primaryFixture.repo, secondaryFixture.repo])
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspaceID })
+        window.workspaceManager.workspaces[workspaceIndex].repoPaths = [primaryFixture.repo.path]
+        let viewModel = window.agentModeViewModel
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: nil
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let coordinator = AgentMCPStartWorktreeCoordinator(
+            operationName: "agent_run.start",
+            vcsService: .shared,
+            gitTargetResolver: .init()
+        )
+        let request = try coordinator.parseRequest(args: [
+            "worktree_create": .bool(true),
+            "worktree_repo_root": .string(secondaryFixture.repo.path),
+            "worktree_branch": .string(branch),
+            "worktree_path": .string(destination.path),
+            "allow_external_worktree_path": .bool(true)
+        ])
+
+        do {
+            try await coordinator.prepare(
+                request: request,
+                target: target,
+                targetWindow: window
+            )
+            XCTFail("Expected a loaded root removed from the saved workspace to be rejected")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("saved workspace"), error.localizedDescription)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertTrue(viewModel.worktreeBindings(forAgentSessionID: sessionID).isEmpty)
+        let descriptors = try await VCSService.shared.listGitWorktrees(at: secondaryFixture.repo)
+        XCTAssertTrue(descriptors.allSatisfy(\.isMain))
     }
 
     func testSharedStartWorktreeCoordinatorHonorsPreCancelledCreateWithoutMutation() async throws {
@@ -4834,21 +5271,26 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             let taskLabelKind: AgentModelCatalog.TaskLabelKind?
             let workflow: AgentWorkflowDefinition?
             let bindings: [AgentSessionWorktreeBinding]
+            let effectiveWorkspacePath: String?
+            let codexRuntimeWorkspacePaths: CodexRuntimeWorkspacePaths?
         }
 
         let failureAtObservationIndex: Int?
         let failureKind: ExploreStartFailureKind
         let activatesControlContext: Bool
+        let capturesRuntimePaths: Bool
         var observations: [Observation] = []
 
         init(
             failureAtObservationIndex: Int? = nil,
             failureKind: ExploreStartFailureKind = .provider,
-            activatesControlContext: Bool = false
+            activatesControlContext: Bool = false,
+            capturesRuntimePaths: Bool = false
         ) {
             self.failureAtObservationIndex = failureAtObservationIndex
             self.failureKind = failureKind
             self.activatesControlContext = activatesControlContext
+            self.capturesRuntimePaths = capturesRuntimePaths
         }
     }
 
@@ -4885,6 +5327,12 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                         startPending: true
                     )
                 }
+                let effectiveWorkspacePath = recorder.capturesRuntimePaths
+                    ? try agentModeVM.effectiveWorkspacePath(for: session)
+                    : nil
+                let codexRuntimeWorkspacePaths = recorder.capturesRuntimePaths
+                    ? try agentModeVM.codexRuntimeWorkspacePaths(for: session)
+                    : nil
                 let observationIndex = recorder.observations.count
                 recorder.observations.append(
                     .init(
@@ -4893,7 +5341,9 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                         message: message,
                         taskLabelKind: taskLabelKind,
                         workflow: workflow,
-                        bindings: bindings
+                        bindings: bindings,
+                        effectiveWorkspacePath: effectiveWorkspacePath,
+                        codexRuntimeWorkspacePaths: codexRuntimeWorkspacePaths
                     )
                 )
                 if recorder.failureAtObservationIndex == observationIndex {
@@ -5125,9 +5575,67 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         try await lifecycleFixture.makeWindow(roots: roots)
     }
 
-    private func makeViewModel(workspacePath: String) -> AgentModeViewModel {
+    private func windowTool(named name: String, in window: WindowState) async throws -> RepoPromptApp.Tool {
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == name })
+        return RepoPromptApp.Tool(
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            annotations: tool.annotations,
+            isEnabledByDefault: tool.isEnabledByDefault,
+            returnsValue: { arguments in
+                if ServerNetworkManager.currentConnectionID != nil {
+                    return try await tool(arguments)
+                }
+
+                let connectionID = UUID()
+                let clientName = "Agent Worktree Lifecycle Test"
+                try await MainActor.run {
+                    let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                    let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+                    try window.mcpServer.bindTabForConnection(
+                        connectionID: connectionID,
+                        clientName: clientName,
+                        tabID: tabID,
+                        workspaceID: workspace.id,
+                        windowID: window.windowID,
+                        explicitlyBound: true
+                    )
+                }
+                do {
+                    let result = try await ServerNetworkManager.withConnectionID(connectionID) {
+                        try await tool(arguments)
+                    }
+                    await MainActor.run {
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: connectionID,
+                            clientName: clientName,
+                            windowID: window.windowID
+                        )
+                    }
+                    return result
+                } catch {
+                    await MainActor.run {
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: connectionID,
+                            clientName: clientName,
+                            windowID: window.windowID
+                        )
+                    }
+                    throw error
+                }
+            }
+        )
+    }
+
+    private func makeViewModel(
+        workspacePath: String,
+        workspacePaths: [String]? = nil
+    ) -> AgentModeViewModel {
         AgentModeViewModel(
             testWorkspacePath: workspacePath,
+            testWorkspacePaths: workspacePaths,
             codexControllerFactory: { _, _, _, _, _, _ in WorktreeStartFakeCodexController() }
         )
     }
