@@ -1,16 +1,90 @@
 import Foundation
 import SwiftOpenAI
 
-func openAIChatCompletionOutcome(_ finishReason: IntOrStringValue?) -> AIProviderCompletionOutcome? {
+func openAIChatCompletionOutcome(
+    _ finishReason: IntOrStringValue?,
+    endpointBaseURL: URL?
+) -> AIProviderCompletionOutcome? {
     guard let finishReason else { return nil }
     switch finishReason {
     case .string("stop"):
+        return .completed
+    case .string("end_turn") where isCustomOpenAICompatibleEndpoint(endpointBaseURL):
         return .completed
     case let .string(reason):
         return .incomplete(reason: reason)
     case let .int(reason):
         return .incomplete(reason: String(reason))
     }
+}
+
+func openAIChatCompletionTerminalResult(
+    finishReason: IntOrStringValue?,
+    endpointBaseURL: URL?,
+    promptTokens: Int?,
+    completionTokens: Int?
+) -> AIStreamResult? {
+    guard let completionOutcome = openAIChatCompletionOutcome(
+        finishReason,
+        endpointBaseURL: endpointBaseURL
+    ) else { return nil }
+
+    return openAIChatCompletionTerminalResult(
+        completionOutcome: completionOutcome,
+        promptTokens: promptTokens,
+        completionTokens: completionTokens
+    )
+}
+
+func openAIChatCompletionTerminalResult(
+    completionOutcome: AIProviderCompletionOutcome,
+    promptTokens: Int?,
+    completionTokens: Int?
+) -> AIStreamResult {
+    switch completionOutcome {
+    case .completed:
+        AIStreamResult(
+            type: "message_stop",
+            text: nil,
+            reasoning: nil,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens
+        )
+    case let .incomplete(reason):
+        AIStreamResult(
+            type: AIStreamResult.incompleteType,
+            text: nil,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            stopReason: reason
+        )
+    }
+}
+
+func openAIChatCompletionResult(
+    text: String,
+    promptTokens: Int?,
+    completionTokens: Int?,
+    finishReason: IntOrStringValue?,
+    endpointBaseURL: URL?
+) -> AICompletionResult {
+    AICompletionResult(
+        text: text,
+        promptTokens: promptTokens,
+        completionTokens: completionTokens,
+        completionOutcome: openAIChatCompletionOutcome(
+            finishReason,
+            endpointBaseURL: endpointBaseURL
+        ) ?? .incomplete(reason: "missing_finish_reason")
+    )
+}
+
+private func isCustomOpenAICompatibleEndpoint(_ endpointBaseURL: URL?) -> Bool {
+    guard let endpointBaseURL,
+          let host = endpointBaseURL.host,
+          !host.isEmpty
+    else { return false }
+    return !OpenAIURLHelper.isOpenAIOwnedEndpoint(endpointBaseURL)
 }
 
 class OpenAIProvider: AIProvider {
@@ -258,12 +332,13 @@ class OpenAIProvider: AIProvider {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: finalMaxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: result.completionTokens))
-                switch result.completionOutcome {
-                case .completed:
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
-                case let .incomplete(reason):
-                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
-                }
+                continuation.yield(
+                    openAIChatCompletionTerminalResult(
+                        completionOutcome: result.completionOutcome,
+                        promptTokens: result.promptTokens,
+                        completionTokens: result.completionTokens
+                    )
+                )
                 continuation.finish()
             }
         }
@@ -313,6 +388,7 @@ class OpenAIProvider: AIProvider {
 
         let service = getService()
         let stream = try await service.startStreamedChat(parameters: parameters)
+        let endpointBaseURL = cachedBaseURL
 
         return AsyncThrowingStream { continuation in
             let bridgeTask = Task {
@@ -348,17 +424,21 @@ class OpenAIProvider: AIProvider {
                                 AIStreamResult(type: "content", text: content, reasoning: reasoning, promptTokens: promptTokens, completionTokens: completionTokens)
                             )
                         }
-                        if let completionOutcome = openAIChatCompletionOutcome(finishReason) {
+                        if let completionOutcome = openAIChatCompletionOutcome(
+                            finishReason,
+                            endpointBaseURL: endpointBaseURL
+                        ) {
                             observedCompletionOutcome = completionOutcome
                         }
                     }
-                    switch observedCompletionOutcome {
-                    case .completed:
-                        continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
-                    case let .incomplete(reason):
-                        continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
-                    case nil:
-                        break
+                    if let observedCompletionOutcome {
+                        continuation.yield(
+                            openAIChatCompletionTerminalResult(
+                                completionOutcome: observedCompletionOutcome,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens
+                            )
+                        )
                     }
                     continuation.finish()
                 } catch {
@@ -518,15 +598,12 @@ class OpenAIProvider: AIProvider {
 
         let choice = response.choices?.first
         let content = choice?.message?.content ?? ""
-        let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
-            ?? .incomplete(reason: "missing_finish_reason")
-
-        // Return an AICompletionResult with content and token counts
-        return AICompletionResult(
+        return openAIChatCompletionResult(
             text: content,
             promptTokens: promptTokens,
             completionTokens: completionTokens,
-            completionOutcome: completionOutcome
+            finishReason: choice?.finishReason,
+            endpointBaseURL: cachedBaseURL
         )
     }
 

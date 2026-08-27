@@ -1700,10 +1700,10 @@ public class APISettingsViewModel: ObservableObject {
     private var shouldUseResponsesRoutingForOpenAICustomModel: Bool {
         let trimmedBaseURL = openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedBaseURL.isEmpty else { return true }
-        guard let host = OpenAIURLHelper.splitBaseURLAndVersion(trimmedBaseURL).base?.host?.lowercased() else {
+        guard let baseURL = OpenAIURLHelper.splitBaseURLAndVersion(trimmedBaseURL).base else {
             return false
         }
-        return host == "api.openai.com" || host.hasSuffix(".openai.com")
+        return OpenAIURLHelper.isOpenAIOwnedEndpoint(baseURL)
     }
 
     func updateAvailableModels() async {

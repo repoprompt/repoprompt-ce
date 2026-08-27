@@ -46,6 +46,17 @@ enum OpenAIURLHelper {
         return (URL(string: baseStr), detectedVersion)
     }
 
+    /// Returns whether an endpoint should be treated as OpenAI-owned.
+    ///
+    /// A nil base URL represents SwiftOpenAI's native/default OpenAI endpoint. The host rule
+    /// intentionally matches only api.openai.com and subdomains of openai.com, not the apex or
+    /// lookalike suffixes.
+    static func isOpenAIOwnedEndpoint(_ baseURL: URL?) -> Bool {
+        guard let baseURL else { return true }
+        guard let host = baseURL.host?.lowercased(), !host.isEmpty else { return false }
+        return host == "api.openai.com" || host.hasSuffix(".openai.com")
+    }
+
     /// Normalizes a custom OpenAI base URL by:
     /// 1. Adding https:// if no protocol specified
     /// 2. Removing a trailing /vN suffix (OpenAI-compatible endpoints)

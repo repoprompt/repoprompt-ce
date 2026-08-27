@@ -818,7 +818,10 @@ final class AzureOpenAIProvider: AIProvider {
                                 )
                             )
                         }
-                        if let completionOutcome = openAIChatCompletionOutcome(finishReason) {
+                        if let completionOutcome = openAIChatCompletionOutcome(
+                            finishReason,
+                            endpointBaseURL: nil
+                        ) {
                             observedCompletionOutcome = completionOutcome
                         }
                     }
@@ -898,8 +901,10 @@ final class AzureOpenAIProvider: AIProvider {
         let response = try await azureService.startChat(parameters: parameters)
         let choice = response.choices?.first
         let text = choice?.message?.content ?? ""
-        let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
-            ?? .incomplete(reason: "missing_finish_reason")
+        let completionOutcome = openAIChatCompletionOutcome(
+            choice?.finishReason,
+            endpointBaseURL: nil
+        ) ?? .incomplete(reason: "missing_finish_reason")
 
         return AICompletionResult(
             text: text,
