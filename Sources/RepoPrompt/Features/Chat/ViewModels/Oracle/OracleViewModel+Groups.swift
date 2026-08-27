@@ -23,6 +23,16 @@ private struct AppOracleConfiguredRosterSelection {
     static let none = AppOracleConfiguredRosterSelection(group: nil, singleSessionID: nil)
 }
 
+private enum AppOracleConfiguredRosterDispatch {
+    case singleMCPValue([String: Value])
+    case groupedCompletion(OracleGroupRuntime.Completion)
+}
+
+private enum AppOracleConfiguredRosterSingleFallback {
+    case executeSingleMCPValue
+    case rejectTypedCompletion
+}
+
 enum AppOracleGroupRouting {
     static func usesGroup(additionalModelRaws: [String]) -> Bool {
         !additionalModelRaws.isEmpty
@@ -85,6 +95,61 @@ extension OracleViewModel {
         callbacks: AppOracleGroupExecutionCallbacks? = nil,
         capturedProfile: AgentModelsSettingsProfile? = nil
     ) async throws -> [String: Value] {
+        switch try await executeConfiguredRosterDispatch(
+            args: args,
+            promptVM: promptVM,
+            tabContext: tabContext,
+            frozenInput: frozenInput,
+            callbacks: callbacks,
+            capturedProfile: capturedProfile,
+            singleFallback: .executeSingleMCPValue
+        ) {
+        case let .singleMCPValue(value):
+            value
+        case let .groupedCompletion(completion):
+            Self.oracleGroupValue(
+                completion.result,
+                mode: completion.terminalDocument.turns.last?.input.mode.rawValue ?? "chat",
+                tabContext: tabContext
+            )
+        }
+    }
+
+    @MainActor
+    func tool_chatSendWithConfiguredRosterCompletion(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext? = nil,
+        frozenInput: OracleInput? = nil,
+        callbacks: AppOracleGroupExecutionCallbacks? = nil,
+        capturedProfile: AgentModelsSettingsProfile? = nil
+    ) async throws -> OracleGroupRuntime.Completion {
+        switch try await executeConfiguredRosterDispatch(
+            args: args,
+            promptVM: promptVM,
+            tabContext: tabContext,
+            frozenInput: frozenInput,
+            callbacks: callbacks,
+            capturedProfile: capturedProfile,
+            singleFallback: .rejectTypedCompletion
+        ) {
+        case .singleMCPValue:
+            throw ChatToolError.internalError("Configured Oracle group dispatcher returned a single response.")
+        case let .groupedCompletion(completion):
+            return completion
+        }
+    }
+
+    @MainActor
+    private func executeConfiguredRosterDispatch(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext?,
+        frozenInput: OracleInput?,
+        callbacks: AppOracleGroupExecutionCallbacks?,
+        capturedProfile: AgentModelsSettingsProfile?,
+        singleFallback: AppOracleConfiguredRosterSingleFallback
+    ) async throws -> AppOracleConfiguredRosterDispatch {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
         let profile = capturedProfile
             ?? GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
@@ -105,14 +170,22 @@ extension OracleViewModel {
             additionalModelRaws: profile.additionalOracleModelRaws
         )
         guard startsConfiguredGroup || selection.group != nil else {
-            return try await tool_chatSend(
-                args: args,
-                promptVM: promptVM,
-                tabContext: tabContext,
-                implicitSessionID: selection.singleSessionID
-            )
+            switch singleFallback {
+            case .executeSingleMCPValue:
+                let value = try await tool_chatSend(
+                    args: args,
+                    promptVM: promptVM,
+                    tabContext: tabContext,
+                    implicitSessionID: selection.singleSessionID
+                )
+                return .singleMCPValue(value)
+            case .rejectTypedCompletion:
+                throw ChatToolError.invalidParams(
+                    "Configured Oracle group execution requires an additional Oracle roster or an existing Oracle group."
+                )
+            }
         }
-        return try await tool_chatSendGroup(
+        let completion = try await tool_chatSendGroupCompletion(
             args: args,
             promptVM: promptVM,
             tabContext: tabContext,
@@ -122,6 +195,7 @@ extension OracleViewModel {
             frozenInput: frozenInput,
             callbacks: callbacks
         )
+        return .groupedCompletion(completion)
     }
 
     @MainActor
@@ -143,6 +217,21 @@ extension OracleViewModel {
                 member: OracleMemberLookup(publicChatID: chatID),
                 owner: owner
             )
+            guard let group else {
+                if sessions.contains(where: { Self.isOracleProjection($0, addressedBy: chatID) }) {
+                    throw ChatToolError.internalError("Canonical Oracle group was not found.")
+                }
+                return AppOracleConfiguredRosterSelection(group: nil, singleSessionID: nil)
+            }
+            guard let member = group.members.first(where: { $0.publicChatID == chatID }) else {
+                throw ChatToolError.internalError("Canonical Oracle group member was not found.")
+            }
+            _ = try validatedOracleProjectionIndex(
+                member: member,
+                group: group,
+                workspaceID: workspaceID,
+                tabID: tabID
+            )
             return AppOracleConfiguredRosterSelection(group: group, singleSessionID: nil)
         case .implicitContinuation:
             let candidate = resolveImplicitOracleContinuationCandidate(
@@ -157,10 +246,16 @@ extension OracleViewModel {
                     groupID: OracleGroupID(rawValue: rawGroupID),
                     owner: owner
                 ),
-                    group.members.contains(where: { $0.memberID.rawValue == candidate.id })
+                    let member = group.members.first(where: { $0.memberID.rawValue == candidate.id })
                 else {
                     throw ChatToolError.internalError("Canonical Oracle group was not found.")
                 }
+                _ = try validatedOracleProjectionIndex(
+                    member: member,
+                    group: group,
+                    workspaceID: workspaceID,
+                    tabID: tabID
+                )
                 return AppOracleConfiguredRosterSelection(group: group, singleSessionID: nil)
             }
             return AppOracleConfiguredRosterSelection(group: nil, singleSessionID: candidate.id)
@@ -168,7 +263,7 @@ extension OracleViewModel {
     }
 
     @MainActor
-    private func tool_chatSendGroup(
+    private func tool_chatSendGroupCompletion(
         args: [String: Value],
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext?,
@@ -177,7 +272,7 @@ extension OracleViewModel {
         existingGroup: OracleGroupDocument?,
         frozenInput: OracleInput?,
         callbacks: AppOracleGroupExecutionCallbacks?
-    ) async throws -> [String: Value] {
+    ) async throws -> OracleGroupRuntime.Completion {
         let useTabPrompt = args["use_tab_prompt"]?.boolValue ?? false
         let rawMessage = args["message"]?.stringValue ?? ""
         let message: String
@@ -295,13 +390,70 @@ extension OracleViewModel {
                     callbacks: runtimeCallbacks
                 )
             }
-            return Self.oracleGroupValue(
-                completion.result,
-                mode: input.mode.rawValue,
-                tabContext: tabContext
-            )
+            return completion
         } catch let error as OracleGroupRuntime.RuntimeError {
             throw mapOracleGroupRuntimeError(error)
+        }
+    }
+
+    private static func isOracleProjection(_ session: ChatSession, addressedBy chatID: String) -> Bool {
+        guard session.oracleGroupID != nil else { return false }
+        return session.shortID == chatID
+            || session.id.uuidString.caseInsensitiveCompare(chatID) == .orderedSame
+    }
+
+    @MainActor
+    private func validatedOracleProjectionIndex(
+        member: OracleGroupMember,
+        group: OracleGroupDocument,
+        workspaceID: UUID?,
+        tabID: UUID
+    ) throws -> Int? {
+        let claims = sessions.indices.filter { index in
+            let projection = sessions[index]
+            if projection.id == member.memberID.rawValue {
+                return true
+            }
+            guard projection.workspaceID == workspaceID,
+                  projection.composeTabID == tabID,
+                  projection.oracleGroupID == group.group.id.rawValue
+            else {
+                return false
+            }
+            return projection.shortID == member.publicChatID
+                || projection.oracleLaneIndex == member.laneID.index
+        }
+        guard claims.count <= 1 else {
+            throw ChatToolError.internalError("Oracle group projection identity conflict.")
+        }
+        guard let index = claims.first else { return nil }
+        try Self.validateOracleProjectionIdentity(
+            sessions[index],
+            member: member,
+            group: group,
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        return index
+    }
+
+    private static func validateOracleProjectionIdentity(
+        _ session: ChatSession,
+        member: OracleGroupMember,
+        group: OracleGroupDocument,
+        workspaceID: UUID?,
+        tabID: UUID
+    ) throws {
+        guard session.id == member.memberID.rawValue,
+              session.shortID == member.publicChatID,
+              session.workspaceID == workspaceID,
+              session.composeTabID == tabID,
+              session.oracleGroupID == group.group.id.rawValue,
+              session.oracleLaneIndex == member.laneID.index,
+              session.oracleGroupSize == group.group.size,
+              session.oracleModelRaw == member.model.modelID
+        else {
+            throw ChatToolError.internalError("Oracle group projection identity conflict.")
         }
     }
 
@@ -314,21 +466,14 @@ extension OracleViewModel {
     ) async throws {
         for member in group.members {
             let expectedName = Self.oracleProjectionName(base: group.name, laneIndex: member.laneID.index)
-            if let index = sessions.firstIndex(where: { $0.id == member.memberID.rawValue }) {
-                if let existingGroupID = sessions[index].oracleGroupID,
-                   existingGroupID != group.group.id.rawValue
-                {
-                    throw ChatToolError.internalError("Oracle group projection identity conflict.")
-                }
-                let needsSave = sessions[index].name != expectedName
-                    || sessions[index].oracleGroupID != group.group.id.rawValue
-                    || sessions[index].oracleLaneIndex != member.laneID.index
-                    || sessions[index].oracleGroupSize != group.group.size
-                guard needsSave else { continue }
+            if let index = try validatedOracleProjectionIndex(
+                member: member,
+                group: group,
+                workspaceID: workspaceID,
+                tabID: tabID
+            ) {
+                guard sessions[index].name != expectedName else { continue }
                 sessions[index].name = expectedName
-                sessions[index].oracleGroupID = group.group.id.rawValue
-                sessions[index].oracleLaneIndex = member.laneID.index
-                sessions[index].oracleGroupSize = group.group.size
                 let savedURL = try await autosaveSession(sessions[index])
                 if let refreshed = sessions.firstIndex(where: { $0.id == member.memberID.rawValue }) {
                     sessions[refreshed].fileURL = savedURL
@@ -411,25 +556,35 @@ extension OracleViewModel {
                     await self?.cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
                 }
             }
+            if Task.isCancelled {
+                await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+                throw OracleLaneCancellation(executionProfile: executionProfile)
+            }
             guard let response = reply["response"]?.stringValue else {
                 throw OracleLaneFailure(code: "empty_response", message: "Oracle lane returned no response.")
             }
             await executionContext.emitDelta(response)
+            if Task.isCancelled {
+                await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+                throw OracleLaneCancellation(executionProfile: executionProfile)
+            }
             return OracleLaneExecutionResponse(
                 response: response,
                 executionProfile: executionProfile
             )
-        } catch let failure as OracleLaneFailure {
-            throw OracleLaneFailure(
-                code: failure.code,
-                message: failure.message,
-                partialResponse: failure.partialResponse ?? partialResponse,
-                executionProfile: failure.executionProfile ?? executionProfile
-            )
-        } catch is CancellationError {
-            await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
-            throw OracleLaneCancellation(executionProfile: executionProfile)
         } catch {
+            if Task.isCancelled || error is CancellationError {
+                await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+                throw OracleLaneCancellation(executionProfile: executionProfile)
+            }
+            if let failure = error as? OracleLaneFailure {
+                throw OracleLaneFailure(
+                    code: failure.code,
+                    message: failure.message,
+                    partialResponse: failure.partialResponse ?? partialResponse,
+                    executionProfile: failure.executionProfile ?? executionProfile
+                )
+            }
             throw OracleLaneFailure(
                 message: error.localizedDescription,
                 partialResponse: partialResponse,

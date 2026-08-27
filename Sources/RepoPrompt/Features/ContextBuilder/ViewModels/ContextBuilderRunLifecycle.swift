@@ -188,6 +188,7 @@ struct ContextBuilderMCPRunConfiguration {
     let runBehavior: ContextBuilderRunBehavior
     let responseType: String?
     let planningModelRaw: String?
+    let agentModelsProfile: AgentModelsSettingsProfile
     let isSystemWorkspace: Bool
 
     var effectiveTokenBudget: Int {

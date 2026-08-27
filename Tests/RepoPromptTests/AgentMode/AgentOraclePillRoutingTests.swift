@@ -510,6 +510,219 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertFalse(try FileManager.default.fileExists(atPath: XCTUnwrap(projection.fileURL).path))
     }
 
+    func testExplicitGroupedContinuationFailsClosedWhenProjectionCanonicalGroupIsMissing() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let projection = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 2,
+            oracleModelRaw: "model-a",
+            name: "Orphan Group Projection",
+            messages: [StoredMessage(isUser: false, rawText: "preserve me", sequenceIndex: 0)]
+        )
+        fixture.oracleViewModel.sessions = [projection]
+
+        await assertChatToolError(
+            code: .internalError,
+            message: "Canonical Oracle group was not found."
+        ) {
+            _ = try await fixture.oracleViewModel.tool_chatSendWithConfiguredRoster(
+                args: [
+                    "message": .string("continue"),
+                    "chat_id": .string(projection.id.uuidString.lowercased())
+                ],
+                promptVM: fixture.composition.promptManager,
+                tabContext: oracleTabContext(fixture),
+                capturedProfile: AgentModelsSettingsProfile(planningModelRaw: "model-a")
+            )
+        }
+        XCTAssertEqual(fixture.oracleViewModel.sessions.map(\.id), [projection.id])
+        XCTAssertEqual(fixture.oracleViewModel.sessions.first?.messages.map(\.rawText), ["preserve me"])
+    }
+
+    func testGroupedContinuationRejectsProjectionIdentityMismatches() async throws {
+        struct ProjectionMismatchCase {
+            let name: String
+            let mutate: (inout ChatSession, OracleGroupDocument, OracleGroupMember, Fixture) -> Void
+        }
+        let cases: [ProjectionMismatchCase] = [
+            ProjectionMismatchCase(name: "member ID") { projection, _, _, _ in
+                projection = ChatSession(
+                    id: UUID(),
+                    workspaceID: projection.workspaceID,
+                    composeTabID: projection.composeTabID,
+                    oracleGroupID: projection.oracleGroupID,
+                    oracleLaneIndex: projection.oracleLaneIndex,
+                    oracleGroupSize: projection.oracleGroupSize,
+                    oracleModelRaw: projection.oracleModelRaw,
+                    name: projection.name,
+                    shortID: projection.shortID
+                )
+            },
+            ProjectionMismatchCase(name: "short/public chat ID") { projection, _, _, _ in
+                projection.shortID = "wrong-public-chat"
+            },
+            ProjectionMismatchCase(name: "member and public chat IDs") { projection, _, _, _ in
+                projection = ChatSession(
+                    id: UUID(),
+                    workspaceID: projection.workspaceID,
+                    composeTabID: projection.composeTabID,
+                    oracleGroupID: projection.oracleGroupID,
+                    oracleLaneIndex: projection.oracleLaneIndex,
+                    oracleGroupSize: projection.oracleGroupSize,
+                    oracleModelRaw: projection.oracleModelRaw,
+                    name: projection.name,
+                    shortID: "wrong-public-chat"
+                )
+            },
+            ProjectionMismatchCase(name: "workspace") { projection, _, _, _ in
+                projection.workspaceID = UUID()
+            },
+            ProjectionMismatchCase(name: "tab") { projection, _, _, fixture in
+                projection.composeTabID = fixture.otherTabID
+            },
+            ProjectionMismatchCase(name: "group") { projection, _, _, _ in
+                projection.oracleGroupID = UUID()
+            },
+            ProjectionMismatchCase(name: "lane") { projection, _, _, _ in
+                projection.oracleLaneIndex = 1
+            },
+            ProjectionMismatchCase(name: "size") { projection, _, _, _ in
+                projection.oracleGroupSize = 3
+            },
+            ProjectionMismatchCase(name: "model") { projection, _, _, _ in
+                projection.oracleModelRaw = "different-model"
+            }
+        ]
+
+        for mismatch in cases {
+            let fixture = try await makeFixture()
+            let canonical = try makeCanonicalOracleGroup(fixture: fixture)
+            try await AppDomainRuntimeComposition.shared.oracleConversationStore.create(canonical.group)
+            addTeardownBlock { try? await self.deleteCanonicalOracleGroup(canonical.group) }
+            var projection = makeProjection(
+                member: canonical.group.members[0],
+                group: canonical.group,
+                fixture: fixture
+            )
+            mismatch.mutate(&projection, canonical.group, canonical.group.members[0], fixture)
+            let unchangedIdentity = ProjectionIdentitySnapshot(projection)
+            fixture.oracleViewModel.sessions = [projection]
+
+            await assertChatToolError(
+                code: .internalError,
+                message: "Oracle group projection identity conflict.",
+                mismatch.name
+            ) {
+                _ = try await fixture.oracleViewModel.tool_chatSendWithConfiguredRosterCompletion(
+                    args: [
+                        "message": .string("continue"),
+                        "chat_id": .string(canonical.group.members[0].publicChatID)
+                    ],
+                    promptVM: fixture.composition.promptManager,
+                    tabContext: oracleTabContext(fixture),
+                    callbacks: stopAfterPreparedCallbacks(),
+                    capturedProfile: AgentModelsSettingsProfile(
+                        planningModelRaw: "model-a",
+                        additionalOracleModelRaws: ["model-b"]
+                    )
+                )
+            }
+            XCTAssertEqual(
+                fixture.oracleViewModel.sessions.first.map(ProjectionIdentitySnapshot.init),
+                unchangedIdentity,
+                mismatch.name
+            )
+            try await deleteCanonicalOracleGroup(canonical.group)
+            fixture.cleanup()
+        }
+    }
+
+    func testGroupedContinuationRejectsDuplicateCanonicalLaneClaims() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let canonical = try makeCanonicalOracleGroup(fixture: fixture)
+        try await AppDomainRuntimeComposition.shared.oracleConversationStore.create(canonical.group)
+        addTeardownBlock { try? await self.deleteCanonicalOracleGroup(canonical.group) }
+        let member = canonical.group.members[0]
+        let projection = makeProjection(member: member, group: canonical.group, fixture: fixture)
+        let duplicate = ChatSession(
+            id: UUID(),
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            oracleGroupID: canonical.group.group.id.rawValue,
+            oracleLaneIndex: member.laneID.index,
+            oracleGroupSize: canonical.group.group.size,
+            oracleModelRaw: member.model.modelID,
+            name: projection.name,
+            shortID: "duplicate-canonical-lane"
+        )
+        fixture.oracleViewModel.sessions = [projection, duplicate]
+
+        await assertChatToolError(
+            code: .internalError,
+            message: "Oracle group projection identity conflict."
+        ) {
+            _ = try await fixture.oracleViewModel.tool_chatSendWithConfiguredRosterCompletion(
+                args: [
+                    "message": .string("continue"),
+                    "chat_id": .string(member.publicChatID)
+                ],
+                promptVM: fixture.composition.promptManager,
+                tabContext: oracleTabContext(fixture),
+                callbacks: stopAfterPreparedCallbacks(),
+                capturedProfile: AgentModelsSettingsProfile(
+                    planningModelRaw: "model-a",
+                    additionalOracleModelRaws: ["model-b"]
+                )
+            )
+        }
+        XCTAssertEqual(fixture.oracleViewModel.sessions.map(\.id), [projection.id, duplicate.id])
+    }
+
+    func testGroupedProjectionRestorationRepairsNameOnlyWhenIdentityMatches() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let canonical = try makeCanonicalOracleGroup(fixture: fixture)
+        try await AppDomainRuntimeComposition.shared.oracleConversationStore.create(canonical.group)
+        addTeardownBlock { try? await self.deleteCanonicalOracleGroup(canonical.group) }
+        var projection = makeProjection(
+            member: canonical.group.members[0],
+            group: canonical.group,
+            fixture: fixture
+        )
+        projection.name = "Mutable presentation name"
+        let beforeIdentity = ProjectionIdentitySnapshot(projection)
+        fixture.oracleViewModel.sessions = [projection]
+
+        do {
+            _ = try await fixture.oracleViewModel.tool_chatSendWithConfiguredRosterCompletion(
+                args: [
+                    "message": .string("continue"),
+                    "chat_id": .string(canonical.group.members[0].publicChatID)
+                ],
+                promptVM: fixture.composition.promptManager,
+                tabContext: oracleTabContext(fixture),
+                callbacks: stopAfterPreparedCallbacks(),
+                capturedProfile: AgentModelsSettingsProfile(
+                    planningModelRaw: "model-a",
+                    additionalOracleModelRaws: ["model-b"]
+                )
+            )
+            XCTFail("Expected prepared callback stop")
+        } catch OracleProjectionRoutingTestStop.afterPrepared {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let restored = try XCTUnwrap(fixture.oracleViewModel.sessions.first)
+        XCTAssertEqual(restored.name, OracleViewModel.oracleProjectionName(base: canonical.group.name, laneIndex: 0))
+        XCTAssertEqual(ProjectionIdentitySnapshot(restored), beforeIdentity)
+    }
+
     func testLegacyMessageOnlySelectionPrefersTabActiveThenMostRecentEligibleSession() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }
@@ -728,6 +941,144 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertNotNil(retained)
         XCTAssertEqual(fixture.oracleViewModel.sessions.map(\.id), [mismatchedProjection.id])
         XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(mismatchedProjection.fileURL).path))
+    }
+
+    private func assertChatToolError(
+        code: ChatToolErrorCode,
+        message: String,
+        _ context: String = "",
+        operation: () async throws -> Void
+    ) async {
+        do {
+            try await operation()
+            XCTFail("Expected ChatToolError \(context)")
+        } catch let error as ChatToolError {
+            XCTAssertEqual(error.code, code, context)
+            XCTAssertEqual(error.message, message, context)
+        } catch {
+            XCTFail("Unexpected error \(context): \(error)")
+        }
+    }
+
+    private func makeCanonicalOracleGroup(fixture: Fixture) throws -> (owner: OracleConversationOwner, group: OracleGroupDocument) {
+        let owner = try OracleViewModel.oracleGroupOwner(
+            workspaceID: fixture.workspace.id,
+            tabID: fixture.tabID
+        )
+        let models = try ["model-a", "model-b"].map {
+            try OracleModelReference(modelID: $0)
+        }
+        let descriptor = try OracleGroupDescriptor(size: models.count)
+        let memberIDs = [UUID(), UUID()]
+        let members = try models.enumerated().map { index, model in
+            let name = OracleViewModel.oracleProjectionName(base: "Canonical Group", laneIndex: index)
+            return try OracleGroupMember(
+                laneID: OracleLaneID(index: index),
+                memberID: OracleMemberID(rawValue: memberIDs[index]),
+                publicChatID: ChatSession.makeShortID(name: name, uuid: memberIDs[index]),
+                model: model
+            )
+        }
+        let timestamp = Date(timeIntervalSince1970: 1000)
+        let roster = try OracleRoster(primary: models[0], additional: Array(models.dropFirst()))
+        let group = try OracleGroupDocument(
+            group: descriptor,
+            owner: owner,
+            name: "Canonical Group",
+            revision: 1,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            roster: roster,
+            members: members,
+            turns: [OracleTurnRecord(
+                input: OracleInput(mode: .chat, userMessage: "test"),
+                state: .prepared,
+                startedAt: timestamp
+            )]
+        )
+        return (owner, group)
+    }
+
+    private func makeProjection(
+        member: OracleGroupMember,
+        group: OracleGroupDocument,
+        fixture: Fixture
+    ) -> ChatSession {
+        ChatSession(
+            id: member.memberID.rawValue,
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            oracleGroupID: group.group.id.rawValue,
+            oracleLaneIndex: member.laneID.index,
+            oracleGroupSize: group.group.size,
+            oracleModelRaw: member.model.modelID,
+            name: OracleViewModel.oracleProjectionName(base: group.name, laneIndex: member.laneID.index),
+            shortID: member.publicChatID
+        )
+    }
+
+    private func deleteCanonicalOracleGroup(_ group: OracleGroupDocument) async throws {
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        if let retained = try await store.load(groupID: group.group.id, owner: group.owner) {
+            try await store.delete(
+                groupID: retained.group.id,
+                owner: retained.owner,
+                expectedRevision: retained.revision
+            )
+        }
+    }
+
+    private func oracleTabContext(_ fixture: Fixture) -> OracleViewModel.OracleSendTabContext {
+        OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspace.id,
+            packaging: OracleViewModel.OracleSendPackagingContext(
+                sourceTabID: fixture.tabID,
+                sourceWorkspaceID: fixture.workspace.id,
+                sourceSelectionRevision: 0,
+                sourceAgentSessionID: nil,
+                sourceAgentRunID: nil,
+                promptText: "",
+                selection: StoredSelection(),
+                lookupContext: nil,
+                reviewGitContext: .automaticOnly(),
+                provenance: .direct
+            )
+        )
+    }
+
+    private func stopAfterPreparedCallbacks() -> AppOracleGroupExecutionCallbacks {
+        AppOracleGroupExecutionCallbacks(
+            prepared: { _, _, _ in throw OracleProjectionRoutingTestStop.afterPrepared },
+            progress: { _ in },
+            laneProgress: { _, _, _ in }
+        )
+    }
+
+    private struct ProjectionIdentitySnapshot: Equatable {
+        let id: UUID
+        let shortID: String
+        let workspaceID: UUID?
+        let composeTabID: UUID?
+        let oracleGroupID: UUID?
+        let oracleLaneIndex: Int?
+        let oracleGroupSize: Int?
+        let oracleModelRaw: String?
+
+        init(_ session: ChatSession) {
+            id = session.id
+            shortID = session.shortID
+            workspaceID = session.workspaceID
+            composeTabID = session.composeTabID
+            oracleGroupID = session.oracleGroupID
+            oracleLaneIndex = session.oracleLaneIndex
+            oracleGroupSize = session.oracleGroupSize
+            oracleModelRaw = session.oracleModelRaw
+        }
+    }
+
+    private enum OracleProjectionRoutingTestStop: Error {
+        case afterPrepared
     }
 
     private static var nextFixtureWindowID = -1200
