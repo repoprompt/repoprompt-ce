@@ -135,9 +135,14 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             && selectionState.inFlightAction?.workspaceID == workspaceID
     }
 
-    func retireCommandRowProgress(forRemovedTabIDs tabIDs: Set<UUID>, workspaceID: UUID) {
+    func retireCommandRowProgress(
+        token: UUID,
+        forRemovedTabIDs tabIDs: Set<UUID>,
+        workspaceID: UUID
+    ) {
         guard !tabIDs.isEmpty,
               var operation = selectionState.inFlightAction,
+              operation.token == token,
               operation.origin == .command,
               operation.commandProgressPlacement == .row,
               operation.workspaceID == workspaceID,

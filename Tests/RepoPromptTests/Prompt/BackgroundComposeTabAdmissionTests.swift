@@ -660,7 +660,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
         )
     }
 
-    func testCommandCoordinatorSuppressesFallbackAfterStashProjectionRemovalBeforeRetirement() async throws {
+    func testCommandCoordinatorRetiresProgressAfterStashProjectionRemovalBeforeCleanup() async throws {
         let fixture = makeFixture(initialTabCount: 2)
         let workspaceID = try XCTUnwrap(fixture.manager.activeWorkspace?.id)
         let tabID = try XCTUnwrap(fixture.manager.activeWorkspace?.composeTabs.first?.id)
@@ -705,7 +705,7 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
             tabID: tabID
         )
         let operation = try XCTUnwrap(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
-        XCTAssertFalse(operation.commandRowProgressRetired)
+        XCTAssertTrue(operation.commandRowProgressRetired)
         XCTAssertEqual(operation.presentationTargets, [activeIdentity])
 
         let projection = viewModel.sidebarListProjection(
@@ -888,6 +888,138 @@ final class BackgroundComposeTabAdmissionTests: XCTestCase {
 
         XCTAssertTrue(viewModel.sessions[tabID] === replacementSession)
         XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
+    }
+
+    func testStaleCommandCleanupCannotRetireSameIDReplacementOperation() async throws {
+        let fixture = makeFixture(initialTabCount: 2)
+        let sourceWorkspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let workspaceID = sourceWorkspace.id
+        let tabID = try XCTUnwrap(sourceWorkspace.composeTabs.first?.id)
+        let identity = AgentSidebarSelectionIdentity.active(tabID: tabID)
+        let viewModel = makeAgentModeViewModel(prompt: fixture.prompt, manager: fixture.manager)
+        let didRemoveToken = installDidRemoveListener(prompt: fixture.prompt, viewModel: viewModel)
+        defer { fixture.prompt.removeComposeTabsDidRemoveListener(didRemoveToken) }
+
+        let cleanupFenceA = TestReleaseFence(name: "stale command A post-projection cleanup")
+        defer { cleanupFenceA.release() }
+        viewModel.test_setComposeTabRemovalTeardownObserver { removedTabID in
+            guard removedTabID == tabID else { return }
+            await cleanupFenceA.enterAndWait()
+        }
+
+        let targets = AgentModeViewModel.SidebarBulkMutationTargets(
+            workspaceID: workspaceID,
+            activeDeleteTabIDs: [],
+            archivedDeleteTargets: [],
+            stashTabIDs: [tabID],
+            pinTabIDs: [],
+            unpinTabIDs: []
+        )
+        let stashTaskA = Task {
+            await viewModel.performSidebarBulkAction(
+                .stash,
+                origin: .command,
+                commandProgressPlacement: .row,
+                targets: targets,
+                promptManager: fixture.prompt
+            )
+        }
+        let cleanupAEntered = await cleanupFenceA.waitUntilEntered()
+        XCTAssertTrue(cleanupAEntered)
+
+        let snapshotAfterA = try XCTUnwrap(fixture.prompt.sidebarWorkspaceSnapshot)
+        XCTAssertEqual(snapshotAfterA.workspaceID, workspaceID)
+        XCTAssertFalse(snapshotAfterA.composeTabs.contains(where: { $0.id == tabID }))
+        XCTAssertTrue(snapshotAfterA.stashedTabs.contains(where: { $0.tab.id == tabID }))
+        let operationA = try XCTUnwrap(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
+        XCTAssertTrue(operationA.commandRowProgressRetired)
+
+        let destinationWorkspace = WorkspaceModel(
+            name: "Command retirement destination",
+            repoPaths: sourceWorkspace.repoPaths,
+            ephemeralFlag: true,
+            composeTabs: [ComposeTabState(name: "Destination tab", activeAgentSessionID: UUID())]
+        )
+        fixture.manager.workspaces.append(destinationWorkspace)
+        fixture.manager.activeWorkspace = destinationWorkspace
+        fixture.prompt.loadComposeTabsFromWorkspace(destinationWorkspace)
+        await viewModel.handleWorkspaceSwitch(destinationWorkspace)
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
+
+        let latestSourceWorkspace = try XCTUnwrap(
+            fixture.manager.workspaces.first(where: { $0.id == workspaceID })
+        )
+        fixture.manager.activeWorkspace = latestSourceWorkspace
+        fixture.prompt.loadComposeTabsFromWorkspace(latestSourceWorkspace)
+        await viewModel.handleWorkspaceSwitch(latestSourceWorkspace)
+
+        let restoredTabResult = await fixture.prompt.restoreStashedComposeTab(containingTabID: tabID)
+        let restoredTab = try XCTUnwrap(restoredTabResult)
+        XCTAssertEqual(restoredTab.id, tabID)
+        XCTAssertTrue(fixture.manager.activeWorkspace?.composeTabs.contains(where: { $0.id == tabID }) == true)
+
+        let preflightFenceB = TestReleaseFence(name: "replacement command B preflight")
+        defer { preflightFenceB.release() }
+        let preflightToken = fixture.prompt.setComposeTabsRemovalPreflight { tabIDs, reason, _ in
+            guard reason == .stash, tabIDs.contains(tabID) else { return .proceed }
+            await preflightFenceB.enterAndWait()
+            return .proceed
+        }
+        defer { fixture.prompt.removeComposeTabsRemovalPreflight(preflightToken) }
+
+        let stashTaskB = Task {
+            await viewModel.performSidebarBulkAction(
+                .stash,
+                origin: .command,
+                commandProgressPlacement: .row,
+                targets: targets,
+                promptManager: fixture.prompt
+            )
+        }
+        let preflightBEntered = await preflightFenceB.waitUntilEntered()
+        XCTAssertTrue(preflightBEntered)
+
+        let operationB = try XCTUnwrap(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
+        XCTAssertNotEqual(operationA.token, operationB.token)
+        XCTAssertFalse(operationB.commandRowProgressRetired)
+        XCTAssertEqual(
+            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
+                for: identity,
+                workspaceID: workspaceID
+            ),
+            operationB
+        )
+        XCTAssertFalse(viewModel.canPerformDirectSidebarCommand(workspaceID: workspaceID))
+
+        cleanupFenceA.release()
+        await stashTaskA.value
+
+        let operationBAfterA = try XCTUnwrap(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
+        XCTAssertEqual(operationBAfterA.token, operationB.token)
+        XCTAssertFalse(operationBAfterA.commandRowProgressRetired)
+        XCTAssertEqual(
+            viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
+                for: identity,
+                workspaceID: workspaceID
+            ),
+            operationBAfterA
+        )
+        XCTAssertFalse(viewModel.canPerformDirectSidebarCommand(workspaceID: workspaceID))
+
+        preflightFenceB.release()
+        await stashTaskB.value
+
+        XCTAssertTrue(fixture.manager.activeWorkspace?.stashedTabs.contains(where: { $0.tab.id == tabID }) == true)
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.inFlightAction)
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandRowProgressOperation(
+            for: identity,
+            workspaceID: workspaceID
+        ))
+        XCTAssertNil(viewModel.ui.sessionSidebar.selectionState.commandFallbackProgressOperation(
+            existingIdentities: [],
+            renderedIdentities: [],
+            workspaceID: workspaceID
+        ))
     }
 
     func testSelectionCoordinatorRetainsProgressAfterReconciliationWhileDeleteIsSuspended() async throws {

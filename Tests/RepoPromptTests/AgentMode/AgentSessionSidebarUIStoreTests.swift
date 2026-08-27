@@ -158,11 +158,11 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         ))
 
         let initialRevision = store.selectionState.revision
-        store.retireCommandRowProgress(forRemovedTabIDs: [id(2)], workspaceID: workspaceID)
-        store.retireCommandRowProgress(forRemovedTabIDs: [id(1)], workspaceID: id(98))
+        store.retireCommandRowProgress(token: token, forRemovedTabIDs: [id(2)], workspaceID: workspaceID)
+        store.retireCommandRowProgress(token: token, forRemovedTabIDs: [id(1)], workspaceID: id(98))
         XCTAssertEqual(store.selectionState.revision, initialRevision)
 
-        store.retireCommandRowProgress(forRemovedTabIDs: [id(1)], workspaceID: workspaceID)
+        store.retireCommandRowProgress(token: token, forRemovedTabIDs: [id(1)], workspaceID: workspaceID)
 
         let retiredOperation = try XCTUnwrap(store.selectionState.inFlightAction)
         XCTAssertTrue(retiredOperation.commandRowProgressRetired)
@@ -179,7 +179,7 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             workspaceID: workspaceID
         ))
 
-        store.retireCommandRowProgress(forRemovedTabIDs: [id(1)], workspaceID: workspaceID)
+        store.retireCommandRowProgress(token: token, forRemovedTabIDs: [id(1)], workspaceID: workspaceID)
         XCTAssertEqual(store.selectionState.revision, initialRevision + 1)
 
         store.finishBulkAction(token: token, workspaceID: workspaceID, notice: nil)
@@ -188,6 +188,52 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
             renderedIdentities: [target],
             workspaceID: workspaceID
         ))
+    }
+
+    func testStaleCommandRowRetirementCannotMutateNewOperationGeneration() throws {
+        let store = AgentSessionSidebarUIStore()
+        let workspaceID = id(99)
+        let target = AgentSidebarSelectionIdentity.active(tabID: id(1))
+        let tokenA = try XCTUnwrap(store.beginBulkAction(
+            kind: .stash,
+            origin: .command,
+            presentationTargets: [target],
+            commandProgressPlacement: .row,
+            workspaceID: workspaceID
+        ))
+
+        store.invalidateSelectionForWorkspaceChange()
+
+        let tokenB = try XCTUnwrap(store.beginBulkAction(
+            kind: .stash,
+            origin: .command,
+            presentationTargets: [target],
+            commandProgressPlacement: .row,
+            workspaceID: workspaceID
+        ))
+        XCTAssertNotEqual(tokenA, tokenB)
+        let revision = store.selectionState.revision
+
+        store.retireCommandRowProgress(token: tokenA, forRemovedTabIDs: [target.tabID], workspaceID: workspaceID)
+        store.finishBulkAction(token: tokenA, workspaceID: workspaceID, notice: nil)
+
+        let currentOperation = try XCTUnwrap(store.selectionState.inFlightAction)
+        XCTAssertEqual(currentOperation.token, tokenB)
+        XCTAssertFalse(currentOperation.commandRowProgressRetired)
+        XCTAssertEqual(store.selectionState.revision, revision)
+        XCTAssertEqual(
+            store.selectionState.commandRowProgressOperation(for: target, workspaceID: workspaceID),
+            currentOperation
+        )
+
+        store.retireCommandRowProgress(token: tokenB, forRemovedTabIDs: [target.tabID], workspaceID: workspaceID)
+        let retiredOperation = try XCTUnwrap(store.selectionState.inFlightAction)
+        XCTAssertEqual(retiredOperation.token, tokenB)
+        XCTAssertTrue(retiredOperation.commandRowProgressRetired)
+        XCTAssertEqual(store.selectionState.revision, revision + 1)
+
+        store.finishBulkAction(token: tokenB, workspaceID: workspaceID, notice: nil)
+        XCTAssertNil(store.selectionState.inFlightAction)
     }
 
     func testArchivedRowUsesFallbackOnlyWhenItsRowIsAbsent() throws {
@@ -494,7 +540,7 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         ))
 
         let revision = store.selectionState.revision
-        store.retireCommandRowProgress(forRemovedTabIDs: [first.tabID], workspaceID: workspaceID)
+        store.retireCommandRowProgress(token: token, forRemovedTabIDs: [first.tabID], workspaceID: workspaceID)
         XCTAssertEqual(store.selectionState.revision, revision)
         XCTAssertEqual(store.selectionState.archivedHeaderCommandProgressOperation, operation)
     }

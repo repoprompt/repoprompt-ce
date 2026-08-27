@@ -12376,7 +12376,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         reason: PromptViewModel.ComposeTabRemovalReason,
         workspaceID: UUID
     ) async -> [PromptViewModel.ComposeTabPostRemovalIssue] {
-        ui.sessionSidebar.retireCommandRowProgress(forRemovedTabIDs: tabIDs, workspaceID: workspaceID)
         let removalWorkspace = workspaceManager?.workspaces.first(where: { $0.id == workspaceID })
         var issues: [PromptViewModel.ComposeTabPostRemovalIssue] = []
         let orderedTabIDs = tabIDs.sorted(by: { $0.uuidString < $1.uuidString })

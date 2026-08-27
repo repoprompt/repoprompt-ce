@@ -168,6 +168,13 @@ extension AgentModeViewModel {
             return workspaceManager?.activeWorkspaceID == workspaceID
                 && ui.sessionSidebar.isCurrentBulkAction(token: token, workspaceID: targets.workspaceID)
         }
+        let onProjectionRemovalCommitted: PromptViewModel.ComposeTabsProjectionRemovalCallback = { [weak self] tabIDs in
+            self?.ui.sessionSidebar.retireCommandRowProgress(
+                token: token,
+                forRemovedTabIDs: tabIDs,
+                workspaceID: workspaceID
+            )
+        }
         var notice: AgentSidebarBulkActionNotice?
 
         switch action {
@@ -184,13 +191,15 @@ extension AgentModeViewModel {
             let report = await promptManager.deleteComposeAndStashedTabs(
                 composeTabIDs: targets.activeDeleteTabIDs,
                 archivedTargets: targets.archivedDeleteTargets,
-                isMutationContextCurrent: contextIsCurrent
+                isMutationContextCurrent: contextIsCurrent,
+                onProjectionRemovalCommitted: onProjectionRemovalCommitted
             )
             notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
         case .stash:
             let report = await promptManager.stashComposeTabs(
                 withIDs: targets.stashTabIDs,
-                isMutationContextCurrent: contextIsCurrent
+                isMutationContextCurrent: contextIsCurrent,
+                onProjectionRemovalCommitted: onProjectionRemovalCommitted
             )
             notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
         case .pin:
