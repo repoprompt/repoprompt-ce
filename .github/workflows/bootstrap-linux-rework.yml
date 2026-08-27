@@ -37,8 +37,14 @@ jobs:
           set -euo pipefail
           rm .github/bootstrap_linux_rework.py
           rm .github/workflows/bootstrap-linux-rework.yml
-          git diff --name-status "$BASE_SHA" > /tmp/linux-headless-files.txt
-          git diff --name-only --diff-filter=ACMRTUXB -z "$BASE_SHA" -- \
+          {
+            git diff --name-status "$BASE_SHA"
+            git ls-files --others --exclude-standard | sed 's/^/A\t/'
+          } | sort -u > /tmp/linux-headless-files.txt
+          {
+            git diff --name-only --diff-filter=ACMRTUXB -z "$BASE_SHA" --
+            git ls-files --others --exclude-standard -z
+          } | sort -zu \
             | tar --null --files-from=- --create --gzip --file=/tmp/linux-headless-tree.tar.gz
           test -s /tmp/linux-headless-tree.tar.gz
           cat /tmp/linux-headless-files.txt
