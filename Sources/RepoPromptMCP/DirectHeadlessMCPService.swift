@@ -291,7 +291,7 @@ actor DirectHeadlessMCPService {
                 )
                 return MCP.Tool(
                     name: definition.name,
-                    description: definition.description,
+                    description: Self.advertisedDescription(for: definition),
                     inputSchema: definition.inputSchema,
                     annotations: .init(
                         title: projected.title,
@@ -339,6 +339,20 @@ actor DirectHeadlessMCPService {
                 return Self.errorResult(String(describing: error))
             }
         }
+    }
+
+    private static func advertisedDescription(
+        for definition: MCPDomainToolDefinition
+    ) -> String {
+#if os(Linux)
+        guard definition.name == MCPWindowToolName.fileActions else {
+            return definition.description
+        }
+        return definition.description
+            + "\n\n**Linux limitation**: `delete` is unavailable because the canonical operation moves items to recoverable Trash."
+#else
+        return definition.description
+#endif
     }
 
     private func servePrivateChild(

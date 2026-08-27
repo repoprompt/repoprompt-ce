@@ -4,8 +4,15 @@ on:
   pull_request:
     paths:
       - "Package.swift"
+      - "Package.resolved"
       - "Dockerfile.headless"
+      - ".dockerignore"
+      - "version.env"
       - "Sources/RepoPromptCodeMapCore/**"
+      - "Sources/RepoPromptWorkspaceCore/**"
+      - "Sources/RepoPromptRegexCore/**"
+      - "Sources/RepoPromptC/**"
+      - "Sources/TreeSitterScannerSupport/**"
       - "Sources/RepoPromptDomainRuntime/**"
       - "Sources/RepoPromptMCP/**"
       - "Sources/RepoPromptShared/**"

@@ -12,7 +12,6 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
 
     func manageFiles(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
-        let snapshot = try await context.snapshot(for: request)
         guard let action = args["action"]?.stringValue,
               let rawPath = args["path"]?.stringValue
         else {
@@ -21,6 +20,14 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
         guard ["create", "move", "delete"].contains(action) else {
             throw MCPError.invalidParams("unknown file_actions action: \(action)")
         }
+#if os(Linux)
+        guard action != "delete" else {
+            throw MCPError.invalidRequest(
+                "file_actions delete is unavailable on Linux because the canonical operation is recoverable Trash"
+            )
+        }
+#endif
+        let snapshot = try await context.snapshot(for: request)
         let allowMissing = action == "create"
         let source = try context.resolvePath(rawPath, roots: snapshot.roots, allowMissingLeaf: allowMissing)
         var targets = [source.path]
@@ -67,7 +74,7 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
         case "delete":
             guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
 #if os(Linux)
-            try manager.removeItem(at: source)
+            preconditionFailure("unreachable: Linux file_actions delete was rejected before mutation")
 #else
             var resultingURL: NSURL?
             try manager.trashItem(at: source, resultingItemURL: &resultingURL)

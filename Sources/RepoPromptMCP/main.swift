@@ -7,11 +7,6 @@ import RepoPromptShared
 import ServiceLifecycle
 import SystemPackage
 
-// MARK: - Version Constants
-
-/// Update this when releasing new versions
-let CLI_VERSION = "1.3.0"
-
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
 

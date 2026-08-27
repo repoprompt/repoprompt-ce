@@ -4,7 +4,7 @@ set -euo pipefail
 MODE="${1:-sync}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-CLI_SOURCE="$ROOT_DIR/Sources/RepoPromptMCP/main.swift"
+CLI_SOURCE="$ROOT_DIR/Sources/RepoPromptMCP/CLIProductVersion.swift"
 
 source "$SCRIPT_DIR/load_release_metadata.sh"
 load_release_metadata "$ROOT_DIR"

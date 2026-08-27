@@ -54,11 +54,17 @@ The Linux artifact packages only the direct MCP backend:
 
 ```bash
 docker build -f Dockerfile.headless -t repoprompt-ce-headless .
+mkdir -p "$HOME/.local/share/repoprompt-ce"
 docker run --rm -i \
+  --user "$(id -u):$(id -g)" \
   -v "$PWD:/workspace" \
-  -v repoprompt-profile:/data \
+  -v "$HOME/.local/share/repoprompt-ce:/data" \
   repoprompt-ce-headless
 ```
+
+The direct Linux backend rejects `file_actions` `delete` because the canonical
+operation is a recoverable Trash move, which has no Linux implementation yet.
+Create and move remain available when the selected mutation policy grants them.
 
 The image entrypoint runs:
 

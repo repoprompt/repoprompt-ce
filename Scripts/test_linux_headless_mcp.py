@@ -40,6 +40,8 @@ def command(mode: str, target: str, workspace: Path, profile: Path) -> list[str]
             "--rm",
             "-i",
             "--network=none",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
             "--mount",
             f"type=bind,src={workspace},dst=/workspace",
             "--mount",
@@ -111,9 +113,11 @@ def main() -> None:
             "struct LinuxHeadlessFixture { let value: Int }\n",
             encoding="utf-8",
         )
-        if mode == "docker":
-            for directory in (workspace, profile, workspace / "Sources"):
-                directory.chmod(0o777)
+        read_path = (
+            Path("/workspace") / fixture.relative_to(workspace)
+            if mode == "docker"
+            else fixture
+        )
         environment = os.environ.copy()
         environment["REPOPROMPT_MCP_HEADLESS_PROFILE_DIR"] = str(profile)
         environment["REPOPROMPT_MCP_WORKING_DIRS"] = str(workspace)
@@ -147,6 +151,9 @@ def main() -> None:
             missing = REQUIRED_CORE_TOOLS - names
             if missing:
                 raise AssertionError(f"missing core tools: {sorted(missing)}")
+            file_actions = next(tool for tool in listed["tools"] if tool["name"] == "file_actions")
+            if "Linux limitation" not in file_actions.get("description", ""):
+                raise AssertionError("file_actions does not advertise the Linux delete limitation")
 
             tree = request(
                 process,
@@ -168,7 +175,7 @@ def main() -> None:
                 {
                     "name": "read_file",
                     "arguments": {
-                        "path": str(fixture),
+                        "path": str(read_path),
                         "start_line": 1,
                         "limit": 5,
                     },
@@ -192,6 +199,29 @@ def main() -> None:
             )
             if "LinuxHeadlessFixture" not in json.dumps(tool_value(search_result)):
                 raise AssertionError(f"file_search omitted fixture: {search_result}")
+
+            deletion_target = workspace / "Sources" / "DeleteMe.swift"
+            deletion_target.write_text("struct DeleteMe {}\n", encoding="utf-8")
+            delete_result = request(
+                process,
+                6,
+                "tools/call",
+                {
+                    "name": "file_actions",
+                    "arguments": {
+                        "action": "delete",
+                        "path": (
+                            f"/workspace/{deletion_target.relative_to(workspace)}"
+                            if mode == "docker"
+                            else str(deletion_target)
+                        ),
+                    },
+                },
+            )
+            if not delete_result.get("isError", False):
+                raise AssertionError(f"file_actions delete unexpectedly succeeded: {delete_result}")
+            if not deletion_target.exists():
+                raise AssertionError("file_actions delete removed the smoke-test target")
 
             process.stdin.close()
             process.wait(timeout=15)
