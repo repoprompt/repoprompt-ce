@@ -5,6 +5,19 @@ private func sanitizedAdditionalOracleModelRaws(_ raws: [String]) -> [String] {
     OracleRosterContract.sanitizedAdditionalModelIDs(raws)
 }
 
+private func strictAdditionalOracleModelRaws(_ raws: [String], codingPath: [CodingKey]) throws -> [String] {
+    do {
+        return try OracleRosterContract.normalizedAdditionalModelIDs(raws)
+    } catch {
+        throw DecodingError.dataCorrupted(
+            DecodingError.Context(
+                codingPath: codingPath,
+                debugDescription: "Invalid additional Oracle models: \(error.localizedDescription)"
+            )
+        )
+    }
+}
+
 /// Versioned JSON document stored at
 /// `~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json`.
 ///
@@ -230,19 +243,31 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let additional = try sanitizedAdditionalOracleModelRaws(
-            container.decodeIfPresent([String].self, forKey: .additionalOracleModelRaws) ?? []
+        let additional = try strictAdditionalOracleModelRaws(
+            container.decodeIfPresent([String].self, forKey: .additionalOracleModelRaws) ?? [],
+            codingPath: container.codingPath + [CodingKeys.additionalOracleModelRaws]
         )
-        try self.init(
-            planningModelRaw: container.decodeIfPresent(String.self, forKey: .planningModelRaw),
-            additionalOracleModelRaws: additional,
-            preferredComposeModelRaw: container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw),
-            syncChatModelWithOracle: container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle) ?? false,
-            contextBuilderAgentRaw: container.decodeIfPresent(String.self, forKey: .contextBuilderAgentRaw),
-            contextBuilderModelsByAgent: container.decodeIfPresent([String: String].self, forKey: .contextBuilderModelsByAgent),
-            mcpAgentRoleOverrides: container.decodeIfPresent([String: String].self, forKey: .mcpAgentRoleOverrides),
-            restrictMCPAgentDiscoveryToRoleLabels: container.decodeIfPresent(Bool.self, forKey: .restrictMCPAgentDiscoveryToRoleLabels) ?? false
+        planningModelRaw = try Self.normalizedChatModelRaw(
+            container.decodeIfPresent(String.self, forKey: .planningModelRaw)
         )
+        additionalOracleModelRaws = additional
+        preferredComposeModelRaw = try Self.normalizedChatModelRaw(
+            container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw)
+        )
+        syncChatModelWithOracle = try container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle) ?? false
+        contextBuilderAgentRaw = try Self.normalizedAgentRaw(
+            container.decodeIfPresent(String.self, forKey: .contextBuilderAgentRaw)
+        )
+        contextBuilderModelsByAgent = try Self.normalizedContextBuilderModelsByAgent(
+            container.decodeIfPresent([String: String].self, forKey: .contextBuilderModelsByAgent)
+        )
+        mcpAgentRoleOverrides = try Self.normalizedStringMap(
+            container.decodeIfPresent([String: String].self, forKey: .mcpAgentRoleOverrides)
+        )
+        restrictMCPAgentDiscoveryToRoleLabels = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .restrictMCPAgentDiscoveryToRoleLabels
+        ) ?? false
     }
 
     func replacingContextBuilderModel(_ modelRaw: String?, for agentRaw: String?) -> AgentModelsSettingsProfile {
@@ -510,7 +535,10 @@ struct GlobalScalarPreferences: Codable, Equatable {
             preferredComposeModel = try container.decodeIfPresent(String.self, forKey: .preferredComposeModel)
             planningModel = try container.decodeIfPresent(String.self, forKey: .planningModel)
             if let values = try container.decodeIfPresent([String].self, forKey: .additionalOracleModels) {
-                additionalOracleModels = sanitizedAdditionalOracleModelRaws(values)
+                additionalOracleModels = try strictAdditionalOracleModelRaws(
+                    values,
+                    codingPath: container.codingPath + [CodingKeys.additionalOracleModels]
+                )
             } else {
                 additionalOracleModels = nil
             }
