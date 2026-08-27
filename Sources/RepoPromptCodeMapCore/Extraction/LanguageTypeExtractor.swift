@@ -498,10 +498,10 @@ enum LanguageTypeExtractor {
         stats: CodeMapPerformanceCollector? = nil
     ) -> [String: String]? {
         stats?.lteMatchAnyVariableCalls += 1
-        let start = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let start = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         defer {
             if let stats, start != 0 {
-                stats.languageTypeExtractorVariableDuration += (CFAbsoluteTimeGetCurrent() - start)
+                stats.languageTypeExtractorVariableDuration += (ProcessInfo.processInfo.systemUptime - start)
             }
         }
         switch language {
@@ -1034,10 +1034,10 @@ enum LanguageTypeExtractor {
         stats: CodeMapPerformanceCollector? = nil
     ) -> FunctionLineMatch? {
         stats?.lteMatchAnyFunctionCalls += 1
-        let start = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let start = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         defer {
             if let stats, start != 0 {
-                stats.languageTypeExtractorFunctionDuration += (CFAbsoluteTimeGetCurrent() - start)
+                stats.languageTypeExtractorFunctionDuration += (ProcessInfo.processInfo.systemUptime - start)
             }
         }
         switch language {
@@ -1242,10 +1242,10 @@ enum LanguageTypeExtractor {
             stats?.lteMatchAnyFunctionCalls += 1
         }
         let shouldMeasure = stats != nil && !(language == .ts || language == .tsx)
-        let start = shouldMeasure ? CFAbsoluteTimeGetCurrent() : 0
+        let start = shouldMeasure ? ProcessInfo.processInfo.systemUptime : 0
         defer {
             if let stats, start != 0, shouldMeasure {
-                stats.languageTypeExtractorFunctionDuration += (CFAbsoluteTimeGetCurrent() - start)
+                stats.languageTypeExtractorFunctionDuration += (ProcessInfo.processInfo.systemUptime - start)
             }
         }
 

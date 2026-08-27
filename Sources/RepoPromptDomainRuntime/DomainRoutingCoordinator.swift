@@ -1,5 +1,4 @@
 import Foundation
-import Security
 
 package struct DomainWindowDescriptor: Codable, Equatable {
     package let windowID: Int
@@ -505,9 +504,10 @@ package actor DomainRoutingCoordinator {
                 actual: context.revisions.workingRevision
             )
         }
+        var generator = SystemRandomNumberGenerator()
         var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            throw DomainRunLaunchTokenError.randomGenerationFailed
+        for index in bytes.indices {
+            bytes[index] = generator.next()
         }
         let material = Data(bytes).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")

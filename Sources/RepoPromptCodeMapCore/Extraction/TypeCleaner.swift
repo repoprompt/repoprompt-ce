@@ -130,7 +130,7 @@ enum TypeCleaner {
             return cached
         }
         activeStats?.typeCleanerCacheMisses += 1
-        let languageStart = activeStats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let languageStart = activeStats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         let result: [String] = switch language {
         case .ts, .tsx:
             extractBaseTypesTSCached(rawType, language: language, cache: &cache, stats: activeStats)
@@ -138,7 +138,7 @@ enum TypeCleaner {
             extractBaseTypesNonTSCached(rawType, language: language, cache: &cache, stats: activeStats)
         }
         if let activeStats {
-            recordTypeCleanerLanguage(language, duration: CFAbsoluteTimeGetCurrent() - languageStart, stats: activeStats)
+            recordTypeCleanerLanguage(language, duration: ProcessInfo.processInfo.systemUptime - languageStart, stats: activeStats)
         }
         cache[key] = result
         return result
@@ -317,7 +317,7 @@ enum TypeCleaner {
         cache: inout [TypeCleanerCacheKey: [String]],
         stats: CodeMapPerformanceCollector?
     ) -> [String] {
-        let precleanStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let precleanStart = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         var type = rawType.trimmingCharacters(in: .whitespacesAndNewlines)
         type = removeComments(from: type, language: language)
         if language == .swift {
@@ -334,13 +334,13 @@ enum TypeCleaner {
         type = stripSurroundingParenPairs(type)
         type = stripTrailingBracesAndParens(type)
         if let stats {
-            recordTypeCleanerPhase(.preclean, duration: CFAbsoluteTimeGetCurrent() - precleanStart, stats: stats)
+            recordTypeCleanerPhase(.preclean, duration: ProcessInfo.processInfo.systemUptime - precleanStart, stats: stats)
         }
 
-        let logicStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let logicStart = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         defer {
             if let stats {
-                recordTypeCleanerPhase(.nonTSLogic, duration: CFAbsoluteTimeGetCurrent() - logicStart, stats: stats)
+                recordTypeCleanerPhase(.nonTSLogic, duration: ProcessInfo.processInfo.systemUptime - logicStart, stats: stats)
             }
         }
 
@@ -512,7 +512,7 @@ enum TypeCleaner {
         cache: inout [TypeCleanerCacheKey: [String]],
         stats: CodeMapPerformanceCollector?
     ) -> [String] {
-        let precleanStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let precleanStart = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         var trimmed = rawType.trimmingCharacters(in: .whitespacesAndNewlines)
         trimmed = removeComments(from: trimmed, language: language)
         trimmed = removeMethodCalls(trimmed)
@@ -526,13 +526,13 @@ enum TypeCleaner {
         trimmed = regexReplace(RegexCache.tsTypeof, in: trimmed)
         trimmed = regexReplace(RegexCache.tsReadonly, in: trimmed)
         if let stats {
-            recordTypeCleanerPhase(.preclean, duration: CFAbsoluteTimeGetCurrent() - precleanStart, stats: stats)
+            recordTypeCleanerPhase(.preclean, duration: ProcessInfo.processInfo.systemUptime - precleanStart, stats: stats)
         }
 
-        let logicStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let logicStart = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         defer {
             if let stats {
-                recordTypeCleanerPhase(.tsLogic, duration: CFAbsoluteTimeGetCurrent() - logicStart, stats: stats)
+                recordTypeCleanerPhase(.tsLogic, duration: ProcessInfo.processInfo.systemUptime - logicStart, stats: stats)
             }
         }
 
@@ -1038,10 +1038,10 @@ enum TypeCleaner {
         cache: inout [TypeCleanerCacheKey: [String]],
         stats: CodeMapPerformanceCollector?
     ) -> [String] {
-        let filterStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let filterStart = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         defer {
             if let stats {
-                recordTypeCleanerPhase(.filter, duration: CFAbsoluteTimeGetCurrent() - filterStart, stats: stats)
+                recordTypeCleanerPhase(.filter, duration: ProcessInfo.processInfo.systemUptime - filterStart, stats: stats)
             }
         }
         var results: [String] = []
@@ -1111,10 +1111,10 @@ enum TypeCleaner {
                 }
             }
         }
-        let dedupStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let dedupStart = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         let deduped = Array(Set(results))
         if let stats {
-            recordTypeCleanerPhase(.dedup, duration: CFAbsoluteTimeGetCurrent() - dedupStart, stats: stats)
+            recordTypeCleanerPhase(.dedup, duration: ProcessInfo.processInfo.systemUptime - dedupStart, stats: stats)
         }
         return deduped
     }
@@ -1267,10 +1267,10 @@ enum TypeCleaner {
         cache: inout [TypeCleanerCacheKey: [String]],
         stats: CodeMapPerformanceCollector?
     ) -> [String] {
-        let objectLiteralStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+        let objectLiteralStart = stats == nil ? 0 : ProcessInfo.processInfo.systemUptime
         defer {
             if let stats {
-                recordTypeCleanerPhase(.tsObjectLiteral, duration: CFAbsoluteTimeGetCurrent() - objectLiteralStart, stats: stats)
+                recordTypeCleanerPhase(.tsObjectLiteral, duration: ProcessInfo.processInfo.systemUptime - objectLiteralStart, stats: stats)
             }
         }
         var cleaned = typeName.trimmingCharacters(in: .whitespacesAndNewlines)

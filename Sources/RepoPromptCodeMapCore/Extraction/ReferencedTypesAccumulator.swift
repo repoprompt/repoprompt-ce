@@ -40,7 +40,7 @@ struct ReferencedTypesAccumulator {
             return
         }
         if language == .swift {
-            let dedupStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let dedupStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             if perfCollectCounters {
                 activeStats?.referencedTypesSwiftDedupEligibleCount += 1
             }
@@ -54,16 +54,16 @@ struct ReferencedTypesAccumulator {
                 }
             }
             if perfEnabled {
-                activeStats?.referencedTypesSwiftRawTypeDedupDuration += CFAbsoluteTimeGetCurrent() - dedupStart
+                activeStats?.referencedTypesSwiftRawTypeDedupDuration += ProcessInfo.processInfo.systemUptime - dedupStart
             }
             if !inserted {
                 return
             }
         }
-        let start = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        let start = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
         let extracted = TypeCleaner.extractBaseTypes(from: raw, language: language, cache: &cache, stats: activeStats)
         if perfEnabled {
-            activeStats?.typeCleanerDuration += (CFAbsoluteTimeGetCurrent() - start)
+            activeStats?.typeCleanerDuration += (ProcessInfo.processInfo.systemUptime - start)
         }
         if perfCollectCounters {
             if extracted.isEmpty {

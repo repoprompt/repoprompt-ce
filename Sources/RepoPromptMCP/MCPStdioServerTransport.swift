@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import Logging
 import MCP
@@ -62,6 +66,7 @@ actor MCPStdioServerTransport: Transport {
     func connect() throws {
         guard readTask == nil else { return }
         signal(SIGPIPE, SIG_IGN)
+#if canImport(Darwin)
         var noSigPipe: Int32 = 1
         guard setsockopt(
             stdoutFD,
@@ -72,6 +77,9 @@ actor MCPStdioServerTransport: Transport {
         ) == 0 || errno == ENOTSOCK else {
             throw TerminalError.stdoutWrite(errno: errno, bytesWritten: 0, totalBytes: 0)
         }
+#else
+        _ = rpConfigureNoSIGPIPE(stdoutFD)
+#endif
         let flags = fcntl(stdoutFD, F_GETFL)
         guard flags >= 0, fcntl(stdoutFD, F_SETFL, flags | O_NONBLOCK) == 0 else {
             throw TerminalError.stdoutWrite(errno: errno, bytesWritten: 0, totalBytes: 0)

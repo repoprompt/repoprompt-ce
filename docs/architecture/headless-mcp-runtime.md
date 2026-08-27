@@ -47,3 +47,41 @@ When every `REPOPROMPT_MCP_WORKING_DIRS` entry is an existing Git worktree of ex
 - Direct worktree-routing tests use real linked Git worktrees and a saved workspace fixture to prove automatic canonical binding, exact existing-worktree selection, coordinator-level detached lifecycle reconciliation, child and provider-conversation inheritance and opt-out, use-time identity revalidation for mappings that carry worktree identity, physical root fencing, stable repository/worktree identities, and zero workspace or worktree-binding persistence. End-to-end `orchestrate` dispatch remains owned by the direct-headless workflow/tool-policy integration boundary rather than this routing fixture.
 - Stdio and private-endpoint tests own terminal provenance, bounded broken-pipe behavior, half-close response drain, identity fencing, token redemption, replay, expiry, and foreign-runtime rejection.
 - `Scripts/headless_runtime_guardrails.sh` rejects duplicate schema/backend/workspace authorities, flat dependency-bag storage, retired registry/window-tool compatibility types, and MainActor/UI dependencies in the domain runtime.
+
+## Linux headless container
+
+The Linux artifact packages only the direct MCP backend:
+
+```bash
+docker build -f Dockerfile.headless -t repoprompt-ce-headless .
+docker run --rm -i \
+  -v "$PWD:/workspace" \
+  -v repoprompt-profile:/data \
+  repoprompt-ce-headless
+```
+
+The image entrypoint runs:
+
+```text
+repoprompt-mcp --backend headless
+```
+
+## Included core
+
+The acceptance contract covers MCP initialization, tool discovery,
+repository tree traversal, file reads, literal search, selection and
+prompt state, edits, Git/worktree access, workspace context, and code
+structure generation.
+
+## Deliberately deferred
+
+The Linux graph does not include RepoPromptApp, AppKit, SwiftUI,
+Sparkle, the app-proxy backend, interactive/exec CLI modes, bundled
+Node, or a bundled AI CLI. Provider-backed Oracle and agent calls
+report an explicit unavailable-provider error unless the operator
+supplies a compatible external command through the documented
+headless environment.
+
+“Dependency-free” here means free of macOS frameworks and app
+services. The final Ubuntu image still contains the small set of
+Linux runtime libraries reported by `ldd`, plus `git` and `tini`.

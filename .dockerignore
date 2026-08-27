@@ -1,0 +1,9 @@
+.build
+.git
+.github
+.swiftpm
+.DS_Store
+DerivedData
+build
+dist
+node_modules

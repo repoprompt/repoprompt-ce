@@ -361,13 +361,13 @@ struct CodeMapGenerator {
 
         // Build capture index for efficient lookups
         let indexToken = Signpost.begin("codemap.index")
-        let indexStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        let indexStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
         let captureIndex = CodeMapCaptureIndex(
             namedRanges,
             performanceCollector: perfEnabled ? activePerfStats : nil
         )
         if perfEnabled {
-            activePerfStats?.captureIndexDuration += (CFAbsoluteTimeGetCurrent() - indexStart)
+            activePerfStats?.captureIndexDuration += (ProcessInfo.processInfo.systemUptime - indexStart)
         }
         let sortedCaps = captureIndex.all
         Signpost.end("codemap.index", indexToken)
@@ -701,7 +701,7 @@ struct CodeMapGenerator {
                 print("\n🍎 [Phase 2.5] Swift-specific: Building range-based type boundaries via strategy")
             }
             let swiftToken = Signpost.begin("codemap.swift_context")
-            let swiftContextStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let swiftContextStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             swiftContext = SwiftCodeMapStrategy.buildContext(
                 index: captureIndex,
                 content: content,
@@ -709,7 +709,7 @@ struct CodeMapGenerator {
                 performanceCollector: activePerfStats
             )
             if perfEnabled {
-                activePerfStats?.swiftContextDuration += (CFAbsoluteTimeGetCurrent() - swiftContextStart)
+                activePerfStats?.swiftContextDuration += (ProcessInfo.processInfo.systemUptime - swiftContextStart)
             }
             Signpost.end("codemap.swift_context", swiftToken)
 
@@ -735,14 +735,14 @@ struct CodeMapGenerator {
                 print("\n📘 [Phase 2.6] TS/TSX-specific: Building range-based container boundaries via strategy")
             }
             let tsToken = Signpost.begin("codemap.ts_context")
-            let tsContextStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let tsContextStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             tsContext = TypeScriptCodeMapStrategy.buildContext(
                 index: captureIndex,
                 content: content,
                 boundaries: boundaries
             )
             if perfEnabled {
-                activePerfStats?.tsContextDuration += (CFAbsoluteTimeGetCurrent() - tsContextStart)
+                activePerfStats?.tsContextDuration += (ProcessInfo.processInfo.systemUptime - tsContextStart)
             }
             Signpost.end("codemap.ts_context", tsToken)
 
@@ -791,21 +791,21 @@ struct CodeMapGenerator {
         }
 
         let loopToken = Signpost.begin("codemap.capture_loop")
-        let loopStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        func recordCaptureAttribution(_ category: CaptureLoopAttributionCategory, since start: CFAbsoluteTime) {
+        let loopStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
+        func recordCaptureAttribution(_ category: CaptureLoopAttributionCategory, since start: TimeInterval) {
             guard perfEnabled else { return }
             Self.recordCaptureLoopAttribution(
                 category: category,
-                duration: CFAbsoluteTimeGetCurrent() - start,
+                duration: ProcessInfo.processInfo.systemUptime - start,
                 collectCounters: perfCollectCounters,
                 perfStats: activePerfStats
             )
         }
-        func recordFallbackFunctionAttribution(_ category: FallbackFunctionAttributionCategory, since start: CFAbsoluteTime) {
+        func recordFallbackFunctionAttribution(_ category: FallbackFunctionAttributionCategory, since start: TimeInterval) {
             guard perfEnabled else { return }
             Self.recordFallbackFunctionAttribution(
                 category: category,
-                duration: CFAbsoluteTimeGetCurrent() - start,
+                duration: ProcessInfo.processInfo.systemUptime - start,
                 collectCounters: perfCollectCounters,
                 perfStats: activePerfStats
             )
@@ -818,7 +818,7 @@ struct CodeMapGenerator {
             }
             var handledByStrategy = false
             let location = cap.range.location
-            let lineAdvanceStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let lineAdvanceStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             while currentLineIndex + 1 < lineCount,
                   boundaries[currentLineIndex + 1] <= location
             {
@@ -827,12 +827,12 @@ struct CodeMapGenerator {
             let lineNo = currentLineIndex + 1
             if perfEnabled {
                 Self.recordCaptureLoopLineAdvance(
-                    duration: CFAbsoluteTimeGetCurrent() - lineAdvanceStart,
+                    duration: ProcessInfo.processInfo.systemUptime - lineAdvanceStart,
                     collectCounters: perfCollectCounters,
                     perfStats: activePerfStats
                 )
             }
-            let attributionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let attributionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 
             if debugLogging {
                 let captured = substring(content: content, range: cap.range)
@@ -1121,7 +1121,7 @@ struct CodeMapGenerator {
                 // For other function types, the capture may be on a larger node
                 let capturedText = substring(content: content, range: cap.range)
                 let rawDecl: String
-                let declarationStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                let declarationStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                 if isJSTS {
                     rawDecl = captureDeclaration(
                         nsContent: nsContent,
@@ -1148,7 +1148,7 @@ struct CodeMapGenerator {
                 // BUG FIX #4: Use functionLike context for function declarations
                 var decl: String
                 if isJSTS {
-                    let jstsSignatureStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                    let jstsSignatureStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                     decl = extractionMemo.jstsSignature(
                         from: rawDecl,
                         context: .functionLike,
@@ -1157,7 +1157,7 @@ struct CodeMapGenerator {
                     )
                     recordFallbackFunctionAttribution(.jstsSignature, since: jstsSignatureStart)
                     let trimmedDecl = decl.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let tsFastPathStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                    let tsFastPathStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                     if trimmedDecl.hasSuffix(":"),
                        let rt = extractionMemo.tsReturnType(from: rawDecl, stats: activePerfStats),
                        !rt.isEmpty
@@ -1181,7 +1181,7 @@ struct CodeMapGenerator {
                     }
                     let rawLine = lineCache.line(for: cap.range.location)
                     // For TS/TSX, extract a clean function name using robust regex
-                    let nameExtractionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                    let nameExtractionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                     var fnName: String
                     if isJSTS {
                         fnName = extractJSTSFunctionName(captureText: capturedText, decl: decl)
@@ -1202,7 +1202,7 @@ struct CodeMapGenerator {
 
                     let lightweightMatch: [String: String]?
                     if isTSLike {
-                        let lteParseStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                        let lteParseStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                         lightweightMatch = extractionMemo.matchFunctionLine(decl, language: supportedLanguage, stats: activePerfStats)
                         recordFallbackFunctionAttribution(.lteParse, since: lteParseStart)
                     } else {
@@ -1212,7 +1212,7 @@ struct CodeMapGenerator {
                         if let n = match["name"], !n.isEmpty { fnName = n }
                         if let rt = match["returnType"], !rt.isEmpty {
                             returnType = rt
-                            let refsStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                            let refsStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                             referencedTypes.insert(rawType: rt)
                             recordFallbackFunctionAttribution(.referencedTypes, since: refsStart)
                         }
@@ -1227,24 +1227,24 @@ struct CodeMapGenerator {
                                     typeName: $0.element
                                 )
                             }
-                            let refsStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                            let refsStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                             referencedTypes.insertMany(rawTypes: types)
                             recordFallbackFunctionAttribution(.referencedTypes, since: refsStart)
                         }
                     }
                     if isTSLike, returnType == nil {
-                        let tsFastPathStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                        let tsFastPathStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                         let rawMatch = extractionMemo.matchFunctionLineParsed(rawLine, language: supportedLanguage, stats: activePerfStats)
                         recordFallbackFunctionAttribution(.tsFastPath, since: tsFastPathStart)
                         if let rawMatch, let rt = rawMatch.returnType, !rt.isEmpty {
                             returnType = rt
-                            let refsStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                            let refsStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                             referencedTypes.insert(rawType: rt)
                             recordFallbackFunctionAttribution(.referencedTypes, since: refsStart)
                         }
                     }
                     if isTSLike {
-                        let tsFastPathStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                        let tsFastPathStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                         let varMatch = extractionMemo.matchVariableLine(rawDecl, language: supportedLanguage, stats: activePerfStats)
                         recordFallbackFunctionAttribution(.tsFastPath, since: tsFastPathStart)
                         if let varMatch,
@@ -1253,13 +1253,13 @@ struct CodeMapGenerator {
                             if returnType == nil {
                                 returnType = vType
                             }
-                            let refsStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                            let refsStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                             referencedTypes.insert(rawType: vType)
                             recordFallbackFunctionAttribution(.referencedTypes, since: refsStart)
                         }
                     }
 
-                    let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                    let modelInsertionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                     let fnLine = lineNo
                     let fnInfo = FunctionInfo(
                         name: fnName,
@@ -1268,7 +1268,7 @@ struct CodeMapGenerator {
                         definitionLine: decl,
                         lineNumber: fnLine
                     )
-                    let routingStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                    let routingStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                     let ifaceBoundary = (!isTSLike && supportedLanguage != .swift)
                         ? enclosingInterface(for: cap.range, line: lineNo)
                         : nil
@@ -1291,7 +1291,7 @@ struct CodeMapGenerator {
                     // For JS/TS, only add to class if it's actually a method (not just any function after a class)
                     if isJSTS, cap.name == "method" {
                         // This is definitely a class method
-                        let routingStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                        let routingStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                         let boundary = enclosingBoundary(for: cap.range, line: lineNo)
                         recordFallbackFunctionAttribution(.routing, since: routingStart)
                         if let boundary {
@@ -1318,7 +1318,7 @@ struct CodeMapGenerator {
                         }
                     } else {
                         // Original logic for other languages
-                        let routingStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                        let routingStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                         let boundary = enclosingBoundary(for: cap.range, line: lineNo)
                         recordFallbackFunctionAttribution(.routing, since: routingStart)
                         if let boundary {
@@ -1360,14 +1360,14 @@ struct CodeMapGenerator {
                 var returnType: String? = nil
                 var paramTypes: [String] = []
 
-                let lteParseStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                let lteParseStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                 let heavyweightMatch = extractionMemo.matchFunctionLine(decl, language: supportedLanguage, stats: activePerfStats)
                 recordFallbackFunctionAttribution(.lteParse, since: lteParseStart)
                 if let match = heavyweightMatch {
                     if let n = match["name"], !n.isEmpty { fnName = n }
                     if let rt = match["returnType"], !rt.isEmpty {
                         returnType = rt
-                        let refsStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                        let refsStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                         referencedTypes.insert(rawType: rt)
                         recordFallbackFunctionAttribution(.referencedTypes, since: refsStart)
                     }
@@ -1376,7 +1376,7 @@ struct CodeMapGenerator {
                             .split(separator: ",")
                             .map { $0.trimmingCharacters(in: .whitespaces) }
                         paramTypes.append(contentsOf: types)
-                        let refsStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                        let refsStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                         referencedTypes.insertMany(rawTypes: types)
                         recordFallbackFunctionAttribution(.referencedTypes, since: refsStart)
                     }
@@ -1390,7 +1390,7 @@ struct CodeMapGenerator {
                     print("   ⚠️  Heavyweight regex parsing failed for: '\(decl)'")
                 }
 
-                let nameExtractionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                let nameExtractionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                 if fnName == decl {
                     let trimmedCaptured = capturedText.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !trimmedCaptured.isEmpty,
@@ -1401,7 +1401,7 @@ struct CodeMapGenerator {
                 }
                 recordFallbackFunctionAttribution(.nameExtraction, since: nameExtractionStart)
 
-                let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                let modelInsertionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                 let params = paramTypes.enumerated().map {
                     ParameterInfo(
                         externalName: nil,
@@ -1417,7 +1417,7 @@ struct CodeMapGenerator {
                     definitionLine: decl,
                     lineNumber: fnLine
                 )
-                let goRoutingStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                let goRoutingStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                 let goReceiver = supportedLanguage == .go ? goReceiverType(from: decl) : nil
                 recordFallbackFunctionAttribution(.routing, since: goRoutingStart)
                 if supportedLanguage == .go, let receiverType = goReceiver {
@@ -1435,7 +1435,7 @@ struct CodeMapGenerator {
                     recordCaptureAttribution(.function, since: attributionStart)
                     continue
                 }
-                let rustRoutingStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                let rustRoutingStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                 let rustImplBoundary = supportedLanguage == .rust ? enclosingRustImplBoundary(for: cap.range) : nil
                 recordFallbackFunctionAttribution(.routing, since: rustRoutingStart)
                 if supportedLanguage == .rust, let implBoundary = rustImplBoundary {
@@ -1456,7 +1456,7 @@ struct CodeMapGenerator {
                     recordCaptureAttribution(.function, since: attributionStart)
                     continue
                 }
-                let routingStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                let routingStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                 let ifaceBoundary = (!isTSLike && supportedLanguage != .swift)
                     ? enclosingInterface(for: cap.range, line: lineNo)
                     : nil
@@ -1479,7 +1479,7 @@ struct CodeMapGenerator {
                 // For JS/TS, use capture name to determine if it's a method
                 if isJSTS, cap.name == "method" {
                     // This is definitely a class method
-                    let routingStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                    let routingStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                     let boundary = enclosingBoundary(for: cap.range, line: lineNo)
                     recordFallbackFunctionAttribution(.routing, since: routingStart)
                     if let boundary {
@@ -1506,7 +1506,7 @@ struct CodeMapGenerator {
                     }
                 } else {
                     // Original logic for other languages
-                    let routingStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                    let routingStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
                     let boundary = enclosingBoundary(for: cap.range, line: lineNo)
                     recordFallbackFunctionAttribution(.routing, since: routingStart)
                     if let boundary {
@@ -1911,7 +1911,7 @@ struct CodeMapGenerator {
             }
         }
         if perfEnabled {
-            activePerfStats?.captureLoopDuration += (CFAbsoluteTimeGetCurrent() - loopStart)
+            activePerfStats?.captureLoopDuration += (ProcessInfo.processInfo.systemUptime - loopStart)
         }
         Signpost.end("codemap.capture_loop", loopToken)
         if let e = currentEnum {
@@ -1922,10 +1922,10 @@ struct CodeMapGenerator {
         }
 
         let typeFinalizeToken = Signpost.begin("codemap.referenced_types")
-        let typeFinalizeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        let typeFinalizeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
         let finalReferences = referencedTypes.finalizeSorted()
         if perfEnabled {
-            activePerfStats?.referencedTypesFinalizeDuration += (CFAbsoluteTimeGetCurrent() - typeFinalizeStart)
+            activePerfStats?.referencedTypesFinalizeDuration += (ProcessInfo.processInfo.systemUptime - typeFinalizeStart)
             activePerfStats?.referencedTypesUniqueCount += finalReferences.count
         }
         Signpost.end("codemap.referenced_types", typeFinalizeToken)
@@ -1949,17 +1949,17 @@ struct CodeMapGenerator {
         from output: GenerationOutput,
         performanceCollector: CodeMapPerformanceCollector?
     ) -> CodeMapSyntaxArtifact? {
-        let finalizationStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let finalizationStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         defer {
             if let finalizationStart {
                 performanceCollector?.artifactFinalizationDuration +=
-                    CFAbsoluteTimeGetCurrent() - finalizationStart
+                    ProcessInfo.processInfo.systemUptime - finalizationStart
             }
         }
 
         let classes = finalizedClasses(output.classesByLine)
         let interfaces = finalizedInterfaces(output.interfacesByLine)
-        let meaningfulStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let meaningfulStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         let meaningful = hasMeaningfulContent(
             output: output,
             classes: classes,
@@ -1969,11 +1969,11 @@ struct CodeMapGenerator {
         )
         if let meaningfulStart {
             performanceCollector?.artifactMeaningfulContentCheckDuration +=
-                CFAbsoluteTimeGetCurrent() - meaningfulStart
+                ProcessInfo.processInfo.systemUptime - meaningfulStart
         }
         guard meaningful else { return nil }
 
-        let artifactStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let artifactStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         let artifact = CodeMapSyntaxArtifact(
             imports: output.imports,
             exports: output.exports,
@@ -1988,7 +1988,7 @@ struct CodeMapGenerator {
             referencedTypes: output.referencedTypes
         )
         if let artifactStart {
-            performanceCollector?.fileAPIInitDuration += CFAbsoluteTimeGetCurrent() - artifactStart
+            performanceCollector?.fileAPIInitDuration += ProcessInfo.processInfo.systemUptime - artifactStart
             performanceCollector?.artifactFinalClassCount += classes.count
             performanceCollector?.artifactFinalInterfaceCount += interfaces.count
             performanceCollector?.artifactFinalFunctionCount += output.globalFunctions.count
@@ -2125,10 +2125,10 @@ struct CodeMapGenerator {
         if perfCollectCounters {
             activePerfStats?.captureDeclarationCalls += 1
         }
-        let start = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+        let start = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
         defer {
             if perfEnabled {
-                activePerfStats?.captureDeclarationDuration += (CFAbsoluteTimeGetCurrent() - start)
+                activePerfStats?.captureDeclarationDuration += (ProcessInfo.processInfo.systemUptime - start)
             }
         }
         let currentLineRange = lineRange

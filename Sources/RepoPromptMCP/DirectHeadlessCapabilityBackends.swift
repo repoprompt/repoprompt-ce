@@ -66,8 +66,12 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
             try manager.moveItem(at: source, to: destination)
         case "delete":
             guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
+#if os(Linux)
+            try manager.removeItem(at: source)
+#else
             var resultingURL: NSURL?
             try manager.trashItem(at: source, resultingItemURL: &resultingURL)
+#endif
         default:
             throw MCPError.invalidParams("unknown file_actions action: \(action)")
         }

@@ -42,7 +42,7 @@ enum JSTSSignatureExtractor {
                 perfStats?.jstsSignatureCallsStatementLike += 1
             }
         }
-        let start = perfOptions.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let start = perfOptions.enabled ? ProcessInfo.processInfo.systemUptime : 0
         let result: String = switch context {
         case .functionLike:
             extractFunctionSignature(line)
@@ -55,7 +55,7 @@ enum JSTSSignatureExtractor {
             perfOptions: perfOptions
         )
         if perfOptions.enabled {
-            perfStats?.jstsSignatureDuration += (CFAbsoluteTimeGetCurrent() - start)
+            perfStats?.jstsSignatureDuration += (ProcessInfo.processInfo.systemUptime - start)
         }
         return normalized
     }
@@ -435,7 +435,7 @@ enum JSTSSignatureExtractor {
         perfStats: CodeMapPerformanceCollector? = nil,
         perfOptions: CodeMapPerfOptions = .disabled
     ) -> String {
-        let asciiStart = perfOptions.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let asciiStart = perfOptions.enabled ? ProcessInfo.processInfo.systemUptime : 0
         var needsRewrite = false
         var previousWasWhitespace = true
         var asciiByteCount = 0
@@ -443,14 +443,14 @@ enum JSTSSignatureExtractor {
 
         for byte in line.utf8 {
             if byte >= 0x80 {
-                let legacyStart = perfOptions.enabled ? CFAbsoluteTimeGetCurrent() : 0
+                let legacyStart = perfOptions.enabled ? ProcessInfo.processInfo.systemUptime : 0
                 let normalized = normalizeSingleLineLegacy(line)
                 if perfOptions.collectCounters {
                     perfStats?.jstsNormalizationUnicodeFallbackCount += 1
                 }
                 if perfOptions.enabled {
                     perfStats?.jstsNormalizationLegacyFallbackDuration +=
-                        CFAbsoluteTimeGetCurrent() - legacyStart
+                        ProcessInfo.processInfo.systemUptime - legacyStart
                 }
                 return normalized
             }
@@ -481,7 +481,7 @@ enum JSTSSignatureExtractor {
             }
             if perfOptions.enabled {
                 perfStats?.jstsNormalizationASCIIFastPathDuration +=
-                    CFAbsoluteTimeGetCurrent() - asciiStart
+                    ProcessInfo.processInfo.systemUptime - asciiStart
             }
             return line
         }
@@ -516,7 +516,7 @@ enum JSTSSignatureExtractor {
         }
         if perfOptions.enabled {
             perfStats?.jstsNormalizationASCIIFastPathDuration +=
-                CFAbsoluteTimeGetCurrent() - asciiStart
+                ProcessInfo.processInfo.systemUptime - asciiStart
         }
         return normalized
     }

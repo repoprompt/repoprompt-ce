@@ -152,18 +152,18 @@ enum SwiftCodeMapStrategy {
         let typeDeclCaps = index.captures(named: "swift.type.decl")
         let typeNameCaps = index.captures(named: "swift.type.name")
         performanceCollector?.swiftTypeDeclarationCount += typeDeclCaps.count
-        let typeMappingStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let typeMappingStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         ctx.typeNamesByRange = mapNamesToSmallestContainingDecl(
             nameCaps: typeNameCaps,
             declCaps: typeDeclCaps
         )
         if let typeMappingStart {
             performanceCollector?.swiftTypeNameMappingDuration +=
-                CFAbsoluteTimeGetCurrent() - typeMappingStart
+                ProcessInfo.processInfo.systemUptime - typeMappingStart
         }
 
         // Second pass: build boundaries with full ranges
-        let typeBoundaryStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let typeBoundaryStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         for cap in typeDeclCaps {
             if let name = ctx.typeNamesByRange[cap.range] {
                 let declText = nsContent.substring(with: cap.range)
@@ -192,14 +192,14 @@ enum SwiftCodeMapStrategy {
 
         if let typeBoundaryStart {
             performanceCollector?.swiftBoundaryConstructionDuration +=
-                CFAbsoluteTimeGetCurrent() - typeBoundaryStart
+                ProcessInfo.processInfo.systemUptime - typeBoundaryStart
         }
 
         // Also collect protocols
         let protocolDeclCaps = index.captures(named: "swift.protocol.decl")
         let protocolNameCaps = index.captures(named: "swift.protocol.name")
         performanceCollector?.swiftProtocolDeclarationCount += protocolDeclCaps.count
-        let protocolMappingStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let protocolMappingStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         ctx.protocolNamesByRange = mapNamesToSmallestContainingDecl(
             nameCaps: protocolNameCaps,
             declCaps: protocolDeclCaps
@@ -207,10 +207,10 @@ enum SwiftCodeMapStrategy {
 
         if let protocolMappingStart {
             performanceCollector?.swiftProtocolNameMappingDuration +=
-                CFAbsoluteTimeGetCurrent() - protocolMappingStart
+                ProcessInfo.processInfo.systemUptime - protocolMappingStart
         }
 
-        let protocolBoundaryStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let protocolBoundaryStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         for cap in protocolDeclCaps {
             if let name = ctx.protocolNamesByRange[cap.range] {
                 let lineNo = lineNumber(for: cap.range.location, using: boundaries)
@@ -220,10 +220,10 @@ enum SwiftCodeMapStrategy {
 
         if let protocolBoundaryStart {
             performanceCollector?.swiftBoundaryConstructionDuration +=
-                CFAbsoluteTimeGetCurrent() - protocolBoundaryStart
+                ProcessInfo.processInfo.systemUptime - protocolBoundaryStart
         }
 
-        let functionAssemblyStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let functionAssemblyStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         let topLevelFunctionCaps = index.captures(named: "swift.function.toplevel")
         let methodFunctionCaps = index.captures(named: "swift.function.method")
         let protocolFunctionCaps = index.captures(named: "swift.protocol.method")
@@ -250,7 +250,7 @@ enum SwiftCodeMapStrategy {
         ctx.typeBoundaries.sort { $0.range.location < $1.range.location }
         if let functionAssemblyStart {
             performanceCollector?.swiftFunctionCaptureAssemblyDuration +=
-                CFAbsoluteTimeGetCurrent() - functionAssemblyStart
+                ProcessInfo.processInfo.systemUptime - functionAssemblyStart
             performanceCollector?.swiftTypeBoundaryCount += ctx.typeBoundaries.count
         }
 
@@ -337,7 +337,7 @@ enum SwiftCodeMapStrategy {
         boundaries: [Int],
         performanceCollector: CodeMapPerformanceCollector?
     ) -> SwiftFunctionSignature {
-        let scanStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let scanStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         let signatureEnd = signatureEndLocation(
             forFunctionRange: functionRange,
             nsContent: nsContent,
@@ -345,13 +345,13 @@ enum SwiftCodeMapStrategy {
         )
         if let scanStart {
             performanceCollector?.swiftSignatureEndScanDuration +=
-                CFAbsoluteTimeGetCurrent() - scanStart
+                ProcessInfo.processInfo.systemUptime - scanStart
         }
         let signatureLength = signatureEnd - functionRange.location
         let signatureRange = NSRange(location: functionRange.location, length: signatureLength)
 
         // Get the signature text
-        let normalizationStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+        let normalizationStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         let trimmedSignature = nsContent.substring(with: signatureRange)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -362,7 +362,7 @@ enum SwiftCodeMapStrategy {
         )
         if let normalizationStart {
             performanceCollector?.swiftSignatureNormalizationDuration +=
-                CFAbsoluteTimeGetCurrent() - normalizationStart
+                ProcessInfo.processInfo.systemUptime - normalizationStart
         }
 
         return SwiftFunctionSignature(definitionLine: signature, signatureEnd: signatureEnd)
@@ -396,7 +396,7 @@ enum SwiftCodeMapStrategy {
         case "swift.function.toplevel":
             // Top-level Swift functions go directly to globalFunctions
             // Use Swift-specific signature extraction to avoid semicolon heuristic issues
-            let signatureStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let signatureStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let signature = extractSwiftFunctionSignature(
 				from: cap.range,
 				nsContent: nsContent,
@@ -404,22 +404,22 @@ enum SwiftCodeMapStrategy {
 				performanceCollector: activePerfStats
 			)
             if perfEnabled {
-                record(.functionSignature, duration: CFAbsoluteTimeGetCurrent() - signatureStart, perfStats: activePerfStats)
+                record(.functionSignature, duration: ProcessInfo.processInfo.systemUptime - signatureStart, perfStats: activePerfStats)
             }
             let decl = signature.definitionLine
 
             // Find the function name from swift.function.name capture
-            let nameLookupStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let nameLookupStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             var fnName = decl
             if let nameCap = index.firstCapture(named: "swift.function.name", containedIn: cap.range) {
                 fnName = nsContent.substring(with: nameCap.range)
             }
             if perfEnabled {
-                record(.functionNameLookup, duration: CFAbsoluteTimeGetCurrent() - nameLookupStart, perfStats: activePerfStats)
+                record(.functionNameLookup, duration: ProcessInfo.processInfo.systemUptime - nameLookupStart, perfStats: activePerfStats)
             }
 
             // Build parameters from swift.param.* captures
-            let parameterStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let parameterStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let params = extractSwiftParameters(
                 from: cap.range,
                 signatureEnd: signature.signatureEnd,
@@ -430,18 +430,18 @@ enum SwiftCodeMapStrategy {
                 performanceCollector: activePerfStats
             )
             if perfEnabled {
-                record(.parameterExtraction, duration: CFAbsoluteTimeGetCurrent() - parameterStart, perfStats: activePerfStats)
+                record(.parameterExtraction, duration: ProcessInfo.processInfo.systemUptime - parameterStart, perfStats: activePerfStats)
             }
 
-            let returnTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let returnTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let returnType = extractSwiftReturnType(from: decl, perfStats: activePerfStats)
             if let typeName = returnType {
                 referencedTypes.insert(rawType: typeName)
             }
             if perfEnabled {
-                record(.returnTypeExtraction, duration: CFAbsoluteTimeGetCurrent() - returnTypeStart, perfStats: activePerfStats)
+                record(.returnTypeExtraction, duration: ProcessInfo.processInfo.systemUptime - returnTypeStart, perfStats: activePerfStats)
             }
-            let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let modelInsertionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let fnInfo = FunctionInfo(
                 name: fnName,
                 parameters: params,
@@ -458,7 +458,7 @@ enum SwiftCodeMapStrategy {
                 globalFunctions.append(fnInfo)
             }
             if perfEnabled {
-                record(.modelInsertion, duration: CFAbsoluteTimeGetCurrent() - modelInsertionStart, perfStats: activePerfStats)
+                record(.modelInsertion, duration: ProcessInfo.processInfo.systemUptime - modelInsertionStart, perfStats: activePerfStats)
             }
             if let activePerfStats {
                 activePerfStats.swiftStrategyHandledFunctionCount += 1
@@ -468,7 +468,7 @@ enum SwiftCodeMapStrategy {
         case "swift.function.method":
             // Swift methods - use range-based containment to find enclosing type
             // Use Swift-specific signature extraction to avoid semicolon heuristic issues
-            let signatureStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let signatureStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let signature = extractSwiftFunctionSignature(
 				from: cap.range,
 				nsContent: nsContent,
@@ -476,22 +476,22 @@ enum SwiftCodeMapStrategy {
 				performanceCollector: activePerfStats
 			)
             if perfEnabled {
-                record(.functionSignature, duration: CFAbsoluteTimeGetCurrent() - signatureStart, perfStats: activePerfStats)
+                record(.functionSignature, duration: ProcessInfo.processInfo.systemUptime - signatureStart, perfStats: activePerfStats)
             }
             let decl = signature.definitionLine
 
             // Find the function name
-            let nameLookupStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let nameLookupStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             var fnName = decl
             if let nameCap = index.firstCapture(named: "swift.function.name", containedIn: cap.range) {
                 fnName = nsContent.substring(with: nameCap.range)
             }
             if perfEnabled {
-                record(.functionNameLookup, duration: CFAbsoluteTimeGetCurrent() - nameLookupStart, perfStats: activePerfStats)
+                record(.functionNameLookup, duration: ProcessInfo.processInfo.systemUptime - nameLookupStart, perfStats: activePerfStats)
             }
 
             // Build parameters
-            let parameterStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let parameterStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let params = extractSwiftParameters(
                 from: cap.range,
                 signatureEnd: signature.signatureEnd,
@@ -502,28 +502,28 @@ enum SwiftCodeMapStrategy {
                 performanceCollector: activePerfStats
             )
             if perfEnabled {
-                record(.parameterExtraction, duration: CFAbsoluteTimeGetCurrent() - parameterStart, perfStats: activePerfStats)
+                record(.parameterExtraction, duration: ProcessInfo.processInfo.systemUptime - parameterStart, perfStats: activePerfStats)
             }
 
-            let returnTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let returnTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let returnType = extractSwiftReturnType(from: decl, perfStats: activePerfStats)
             if let typeName = returnType {
                 referencedTypes.insert(rawType: typeName)
             }
             if perfEnabled {
-                record(.returnTypeExtraction, duration: CFAbsoluteTimeGetCurrent() - returnTypeStart, perfStats: activePerfStats)
+                record(.returnTypeExtraction, duration: ProcessInfo.processInfo.systemUptime - returnTypeStart, perfStats: activePerfStats)
             }
             // Find enclosing type by range containment
-            let enclosingTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let enclosingTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let resolvedEnclosingType = enclosingType(
 				for: cap.range,
 				in: context.typeBoundaries,
 				performanceCollector: activePerfStats
 			)
             if perfEnabled {
-                record(.enclosingTypeLookup, duration: CFAbsoluteTimeGetCurrent() - enclosingTypeStart, perfStats: activePerfStats)
+                record(.enclosingTypeLookup, duration: ProcessInfo.processInfo.systemUptime - enclosingTypeStart, perfStats: activePerfStats)
             }
-            let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let modelInsertionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let fnInfo = FunctionInfo(
                 name: fnName,
                 parameters: params,
@@ -555,7 +555,7 @@ enum SwiftCodeMapStrategy {
                 }
             }
             if perfEnabled {
-                record(.modelInsertion, duration: CFAbsoluteTimeGetCurrent() - modelInsertionStart, perfStats: activePerfStats)
+                record(.modelInsertion, duration: ProcessInfo.processInfo.systemUptime - modelInsertionStart, perfStats: activePerfStats)
             }
             if let activePerfStats {
                 activePerfStats.swiftStrategyHandledFunctionCount += 1
@@ -565,7 +565,7 @@ enum SwiftCodeMapStrategy {
         case "swift.protocol.method":
             // Protocol methods go to interfaces
             // Use Swift-specific signature extraction to avoid semicolon heuristic issues
-            let signatureStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let signatureStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let signature = extractSwiftFunctionSignature(
 				from: cap.range,
 				nsContent: nsContent,
@@ -573,19 +573,19 @@ enum SwiftCodeMapStrategy {
 				performanceCollector: activePerfStats
 			)
             if perfEnabled {
-                record(.functionSignature, duration: CFAbsoluteTimeGetCurrent() - signatureStart, perfStats: activePerfStats)
+                record(.functionSignature, duration: ProcessInfo.processInfo.systemUptime - signatureStart, perfStats: activePerfStats)
             }
             let decl = signature.definitionLine
-            let nameLookupStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let nameLookupStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             var fnName = decl
             if let nameCap = index.firstCapture(named: "swift.function.name", containedIn: cap.range) {
                 fnName = nsContent.substring(with: nameCap.range)
             }
             if perfEnabled {
-                record(.functionNameLookup, duration: CFAbsoluteTimeGetCurrent() - nameLookupStart, perfStats: activePerfStats)
+                record(.functionNameLookup, duration: ProcessInfo.processInfo.systemUptime - nameLookupStart, perfStats: activePerfStats)
             }
 
-            let parameterStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let parameterStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let params = extractSwiftParameters(
                 from: cap.range,
                 signatureEnd: signature.signatureEnd,
@@ -596,27 +596,27 @@ enum SwiftCodeMapStrategy {
                 performanceCollector: activePerfStats
             )
             if perfEnabled {
-                record(.parameterExtraction, duration: CFAbsoluteTimeGetCurrent() - parameterStart, perfStats: activePerfStats)
+                record(.parameterExtraction, duration: ProcessInfo.processInfo.systemUptime - parameterStart, perfStats: activePerfStats)
             }
-            let returnTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let returnTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let returnType = extractSwiftReturnType(from: decl, perfStats: activePerfStats)
             if let typeName = returnType {
                 referencedTypes.insert(rawType: typeName)
             }
             if perfEnabled {
-                record(.returnTypeExtraction, duration: CFAbsoluteTimeGetCurrent() - returnTypeStart, perfStats: activePerfStats)
+                record(.returnTypeExtraction, duration: ProcessInfo.processInfo.systemUptime - returnTypeStart, perfStats: activePerfStats)
             }
             // Find enclosing protocol
-            let enclosingTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let enclosingTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let resolvedEnclosingProto = enclosingType(
 				for: cap.range,
 				in: context.typeBoundaries,
 				performanceCollector: activePerfStats
 			)
             if perfEnabled {
-                record(.enclosingTypeLookup, duration: CFAbsoluteTimeGetCurrent() - enclosingTypeStart, perfStats: activePerfStats)
+                record(.enclosingTypeLookup, duration: ProcessInfo.processInfo.systemUptime - enclosingTypeStart, perfStats: activePerfStats)
             }
-            let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let modelInsertionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let fnInfo = FunctionInfo(
                 name: fnName,
                 parameters: params,
@@ -633,7 +633,7 @@ enum SwiftCodeMapStrategy {
                 interfaceBoundaries[lineNo]?.methods.append(fnInfo)
             }
             if perfEnabled {
-                record(.modelInsertion, duration: CFAbsoluteTimeGetCurrent() - modelInsertionStart, perfStats: activePerfStats)
+                record(.modelInsertion, duration: ProcessInfo.processInfo.systemUptime - modelInsertionStart, perfStats: activePerfStats)
             }
             if let activePerfStats {
                 activePerfStats.swiftStrategyHandledFunctionCount += 1
@@ -644,7 +644,7 @@ enum SwiftCodeMapStrategy {
 
         case "swift.property.toplevel":
             // Top-level Swift properties go to globalVariables
-            let propertyDeclarationStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let propertyDeclarationStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let fullDecl = extractSwiftPropertyDeclaration(
 				from: cap.range,
 				index: index,
@@ -654,17 +654,17 @@ enum SwiftCodeMapStrategy {
                 captureDeclaration(cap.range, "{")
             })
             if perfEnabled {
-                record(.propertyDeclaration, duration: CFAbsoluteTimeGetCurrent() - propertyDeclarationStart, perfStats: activePerfStats)
+                record(.propertyDeclaration, duration: ProcessInfo.processInfo.systemUptime - propertyDeclarationStart, perfStats: activePerfStats)
             }
-            let propertyTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let propertyTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let propType = extractSwiftPropertyType(from: fullDecl, perfStats: activePerfStats)
             if let typeName = propType {
                 referencedTypes.insert(rawType: typeName)
             }
             if perfEnabled {
-                record(.propertyTypeExtraction, duration: CFAbsoluteTimeGetCurrent() - propertyTypeStart, perfStats: activePerfStats)
+                record(.propertyTypeExtraction, duration: ProcessInfo.processInfo.systemUptime - propertyTypeStart, perfStats: activePerfStats)
             }
-            let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let modelInsertionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let varInfo = VariableInfo(name: fullDecl, typeName: propType, definitionLine: fullDecl)
 
             if !containsVariable(
@@ -675,7 +675,7 @@ enum SwiftCodeMapStrategy {
                 globalVariables.append(varInfo)
             }
             if perfEnabled {
-                record(.modelInsertion, duration: CFAbsoluteTimeGetCurrent() - modelInsertionStart, perfStats: activePerfStats)
+                record(.modelInsertion, duration: ProcessInfo.processInfo.systemUptime - modelInsertionStart, perfStats: activePerfStats)
             }
             if let activePerfStats {
                 activePerfStats.swiftStrategyHandledPropertyCount += 1
@@ -684,7 +684,7 @@ enum SwiftCodeMapStrategy {
 
         case "swift.property.member":
             // Swift member properties - use range-based containment
-            let propertyDeclarationStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let propertyDeclarationStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let fullDecl = extractSwiftPropertyDeclaration(
 				from: cap.range,
 				index: index,
@@ -694,27 +694,27 @@ enum SwiftCodeMapStrategy {
                 captureDeclaration(cap.range, "{")
             })
             if perfEnabled {
-                record(.propertyDeclaration, duration: CFAbsoluteTimeGetCurrent() - propertyDeclarationStart, perfStats: activePerfStats)
+                record(.propertyDeclaration, duration: ProcessInfo.processInfo.systemUptime - propertyDeclarationStart, perfStats: activePerfStats)
             }
-            let propertyTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let propertyTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let propType = extractSwiftPropertyType(from: fullDecl, perfStats: activePerfStats)
             if let typeName = propType {
                 referencedTypes.insert(rawType: typeName)
             }
             if perfEnabled {
-                record(.propertyTypeExtraction, duration: CFAbsoluteTimeGetCurrent() - propertyTypeStart, perfStats: activePerfStats)
+                record(.propertyTypeExtraction, duration: ProcessInfo.processInfo.systemUptime - propertyTypeStart, perfStats: activePerfStats)
             }
 
-            let enclosingTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let enclosingTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let resolvedEnclosingType = enclosingType(
 				for: cap.range,
 				in: context.typeBoundaries,
 				performanceCollector: activePerfStats
 			)
             if perfEnabled {
-                record(.enclosingTypeLookup, duration: CFAbsoluteTimeGetCurrent() - enclosingTypeStart, perfStats: activePerfStats)
+                record(.enclosingTypeLookup, duration: ProcessInfo.processInfo.systemUptime - enclosingTypeStart, perfStats: activePerfStats)
             }
-            let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let modelInsertionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             if let enclosingType = resolvedEnclosingType {
                 let lineNo = enclosingType.startLine
                 if classesByLine[lineNo] == nil {
@@ -740,7 +740,7 @@ enum SwiftCodeMapStrategy {
                 }
             }
             if perfEnabled {
-                record(.modelInsertion, duration: CFAbsoluteTimeGetCurrent() - modelInsertionStart, perfStats: activePerfStats)
+                record(.modelInsertion, duration: ProcessInfo.processInfo.systemUptime - modelInsertionStart, perfStats: activePerfStats)
             }
             if let activePerfStats {
                 activePerfStats.swiftStrategyHandledPropertyCount += 1
@@ -749,7 +749,7 @@ enum SwiftCodeMapStrategy {
 
         case "swift.protocol.property":
             // Protocol properties go to interfaces
-            let propertyDeclarationStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let propertyDeclarationStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let fullDecl = extractSwiftPropertyDeclaration(
 				from: cap.range,
 				index: index,
@@ -759,27 +759,27 @@ enum SwiftCodeMapStrategy {
                 captureDeclaration(cap.range, "{")
             })
             if perfEnabled {
-                record(.propertyDeclaration, duration: CFAbsoluteTimeGetCurrent() - propertyDeclarationStart, perfStats: activePerfStats)
+                record(.propertyDeclaration, duration: ProcessInfo.processInfo.systemUptime - propertyDeclarationStart, perfStats: activePerfStats)
             }
-            let propertyTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let propertyTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             let propType = extractSwiftPropertyType(from: fullDecl, perfStats: activePerfStats)
             if let typeName = propType {
                 referencedTypes.insert(rawType: typeName)
             }
             if perfEnabled {
-                record(.propertyTypeExtraction, duration: CFAbsoluteTimeGetCurrent() - propertyTypeStart, perfStats: activePerfStats)
+                record(.propertyTypeExtraction, duration: ProcessInfo.processInfo.systemUptime - propertyTypeStart, perfStats: activePerfStats)
             }
 
-            let enclosingTypeStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let enclosingTypeStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
 			let resolvedEnclosingProto = enclosingType(
 				for: cap.range,
 				in: context.typeBoundaries,
 				performanceCollector: activePerfStats
 			)
             if perfEnabled {
-                record(.enclosingTypeLookup, duration: CFAbsoluteTimeGetCurrent() - enclosingTypeStart, perfStats: activePerfStats)
+                record(.enclosingTypeLookup, duration: ProcessInfo.processInfo.systemUptime - enclosingTypeStart, perfStats: activePerfStats)
             }
-            let modelInsertionStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let modelInsertionStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             if let enclosingProto = resolvedEnclosingProto, enclosingProto.isProtocol {
                 let lineNo = enclosingProto.startLine
                 if interfaceBoundaries[lineNo] == nil {
@@ -789,7 +789,7 @@ enum SwiftCodeMapStrategy {
                 interfaceBoundaries[lineNo]?.properties.append(propInfo)
             }
             if perfEnabled {
-                record(.modelInsertion, duration: CFAbsoluteTimeGetCurrent() - modelInsertionStart, perfStats: activePerfStats)
+                record(.modelInsertion, duration: ProcessInfo.processInfo.systemUptime - modelInsertionStart, perfStats: activePerfStats)
             }
             if let activePerfStats {
                 activePerfStats.swiftStrategyHandledPropertyCount += 1
@@ -801,9 +801,9 @@ enum SwiftCodeMapStrategy {
         case "swift.type.decl", "swift.type.name", "swift.protocol.decl", "swift.protocol.name",
              "swift.function.name", "swift.param.node", "swift.param.external", "swift.param.local", "swift.param.type":
             // These are handled during context building or parameter extraction
-            let contextOnlyStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
+            let contextOnlyStart = perfEnabled ? ProcessInfo.processInfo.systemUptime : 0
             if perfEnabled {
-                record(.contextOnly, duration: CFAbsoluteTimeGetCurrent() - contextOnlyStart, perfStats: activePerfStats)
+                record(.contextOnly, duration: ProcessInfo.processInfo.systemUptime - contextOnlyStart, perfStats: activePerfStats)
             }
             return true
 
@@ -904,7 +904,7 @@ enum SwiftCodeMapStrategy {
                 local = nsContent.substring(with: locCap.range)
             }
             let paramText = nsContent.substring(with: paramNode.range)
-            let parameterTypeResolutionStart = performanceCollector == nil ? 0 : CFAbsoluteTimeGetCurrent()
+            let parameterTypeResolutionStart = performanceCollector == nil ? 0 : ProcessInfo.processInfo.systemUptime
             if let typeCap = index.firstCapture(named: "swift.param.type", containedIn: paramNode.range) {
                 performanceCollector?.swiftParameterTypeDirectCaptureCount += 1
                 type = nsContent.substring(with: typeCap.range)
@@ -916,7 +916,7 @@ enum SwiftCodeMapStrategy {
             }
             if let performanceCollector {
                 performanceCollector.swiftParameterTypeResolutionDuration +=
-                    CFAbsoluteTimeGetCurrent() - parameterTypeResolutionStart
+                    ProcessInfo.processInfo.systemUptime - parameterTypeResolutionStart
             }
 
             if let localName = local {
@@ -1041,11 +1041,11 @@ enum SwiftCodeMapStrategy {
 
         if containsNonASCII {
             performanceCollector?.swiftParameterTypeUnicodeLegacyFallbackCount += 1
-            let legacyStart = performanceCollector == nil ? 0 : CFAbsoluteTimeGetCurrent()
+            let legacyStart = performanceCollector == nil ? 0 : ProcessInfo.processInfo.systemUptime
             let result = extractSwiftParamTypeLegacy(from: paramText)
             if let performanceCollector {
                 performanceCollector.swiftParameterTypeLegacyFallbackDuration +=
-                    CFAbsoluteTimeGetCurrent() - legacyStart
+                    ProcessInfo.processInfo.systemUptime - legacyStart
             }
             return result
         }
@@ -1287,12 +1287,12 @@ enum SwiftCodeMapStrategy {
 		from declaration: String,
 		perfStats: CodeMapPerformanceCollector? = nil
 	) -> String? {
-		let resolutionStart = perfStats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+		let resolutionStart = perfStats == nil ? 0 : ProcessInfo.processInfo.systemUptime
 		perfStats?.swiftPropertyTypeResolutionCount += 1
 		defer {
 			if let perfStats {
 				perfStats.swiftPropertyTypeResolutionDuration +=
-					CFAbsoluteTimeGetCurrent() - resolutionStart
+					ProcessInfo.processInfo.systemUptime - resolutionStart
 			}
 		}
 
@@ -1309,11 +1309,11 @@ enum SwiftCodeMapStrategy {
 		if containsNonASCII {
 			perfStats?.swiftPropertyTypeLegacyFallbackCount += 1
 			perfStats?.swiftPropertyTypeUnicodeLegacyFallbackCount += 1
-			let legacyStart = perfStats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+			let legacyStart = perfStats == nil ? 0 : ProcessInfo.processInfo.systemUptime
 			let result = extractSwiftPropertyTypeLegacy(from: declaration, perfStats: perfStats)
 			if let perfStats {
 				perfStats.swiftPropertyTypeLegacyFallbackDuration +=
-					CFAbsoluteTimeGetCurrent() - legacyStart
+					ProcessInfo.processInfo.systemUptime - legacyStart
 			}
 			return result
 		}
@@ -1322,7 +1322,7 @@ enum SwiftCodeMapStrategy {
 		let resolution = resolveSwiftASCIIPropertyType(in: declaration.utf8)
 		if let perfStats {
 			perfStats.swiftPropertyTypeASCIIFastPathDuration +=
-				CFAbsoluteTimeGetCurrent() - fastPathStart
+				ProcessInfo.processInfo.systemUptime - fastPathStart
 		}
 
 		switch resolution {
@@ -1335,11 +1335,11 @@ enum SwiftCodeMapStrategy {
 		case .fallback:
 			perfStats?.swiftPropertyTypeLegacyFallbackCount += 1
 			perfStats?.swiftPropertyTypeASCIIIneligibleFallbackCount += 1
-			let legacyStart = perfStats == nil ? 0 : CFAbsoluteTimeGetCurrent()
+			let legacyStart = perfStats == nil ? 0 : ProcessInfo.processInfo.systemUptime
 			let result = extractSwiftPropertyTypeLegacy(from: declaration, perfStats: perfStats)
 			if let perfStats {
 				perfStats.swiftPropertyTypeLegacyFallbackDuration +=
-					CFAbsoluteTimeGetCurrent() - legacyStart
+					ProcessInfo.processInfo.systemUptime - legacyStart
 			}
 			return result
 		}
@@ -1567,7 +1567,7 @@ enum SwiftCodeMapStrategy {
 		performanceCollector: CodeMapPerformanceCollector?,
         fallback: () -> String
     ) -> String {
-		let lookupStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+		let lookupStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
         let declCap = index.smallestCapture(
             named: "swift.property.decl",
             containing: identifierRange
@@ -1577,10 +1577,10 @@ enum SwiftCodeMapStrategy {
         )
 		if let lookupStart {
 			performanceCollector?.swiftPropertyDeclarationLookupDuration +=
-				CFAbsoluteTimeGetCurrent() - lookupStart
+				ProcessInfo.processInfo.systemUptime - lookupStart
 		}
         if let cap = declCap {
-			let substringStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+			let substringStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
             var decl = nsContent.substring(with: cap.range)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if let braceIndex = decl.firstIndex(of: "{") {
@@ -1588,13 +1588,13 @@ enum SwiftCodeMapStrategy {
             }
 			if let substringStart {
 				performanceCollector?.swiftPropertyDeclarationSubstringDuration +=
-					CFAbsoluteTimeGetCurrent() - substringStart
+					ProcessInfo.processInfo.systemUptime - substringStart
 			}
-			let initializerStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
+			let initializerStart = performanceCollector.map { _ in ProcessInfo.processInfo.systemUptime }
             decl = stripSwiftInitializer(decl)
 			if let initializerStart {
 				performanceCollector?.swiftPropertyInitializerStripDuration +=
-					CFAbsoluteTimeGetCurrent() - initializerStart
+					ProcessInfo.processInfo.systemUptime - initializerStart
 			}
             return decl
         }

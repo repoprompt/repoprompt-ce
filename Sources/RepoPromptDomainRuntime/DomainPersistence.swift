@@ -1,6 +1,9 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
-import os
 
 struct DomainPendingSave: Codable {
     let operationID: UUID
@@ -185,15 +188,21 @@ package struct DomainPersistenceDataSnapshot: Sendable {
     }
 }
 
-private final class DomainBlockingCancellation: Sendable {
-    private let state = OSAllocatedUnfairLock(initialState: false)
+private final class DomainBlockingCancellation: @unchecked Sendable {
+    private let state = NSLock()
+    private var isCancelled = false
 
     func cancel() {
-        state.withLock { $0 = true }
+        state.lock()
+        isCancelled = true
+        state.unlock()
     }
 
     func check() throws {
-        if state.withLock({ $0 }) {
+        state.lock()
+        let cancelled = isCancelled
+        state.unlock()
+        if cancelled {
             throw DomainPersistenceError.cancelled
         }
     }
@@ -2093,7 +2102,7 @@ private enum DomainPersistenceLock {
                 guard let baseAddress = rawBuffer.baseAddress else { return }
                 var written = 0
                 while written < rawBuffer.count {
-                    let count = Darwin.write(
+                    let count = write(
                         descriptor,
                         baseAddress.advanced(by: written),
                         rawBuffer.count - written
