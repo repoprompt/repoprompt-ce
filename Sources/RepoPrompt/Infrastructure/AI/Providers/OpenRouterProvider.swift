@@ -107,10 +107,7 @@ class OpenRouterProvider: AIProvider {
                         } else if let r = reasoning, !r.isEmpty {
                             continuation.yield(AIStreamResult(type: "content", text: nil, reasoning: r))
                         }
-                        if let completionOutcome = openAIChatCompletionOutcome(
-                            finishReason,
-                            endpointBaseURL: nil
-                        ) {
+                        if let completionOutcome = openAIChatCompletionOutcome(finishReason) {
                             observedCompletionOutcome = completionOutcome
                         }
                     }
@@ -158,10 +155,8 @@ class OpenRouterProvider: AIProvider {
 
         let choice = completion.choices?.first
         let content = choice?.message?.content ?? ""
-        let completionOutcome = openAIChatCompletionOutcome(
-            choice?.finishReason,
-            endpointBaseURL: nil
-        ) ?? .incomplete(reason: "missing_finish_reason")
+        let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
+            ?? .incomplete(reason: "missing_finish_reason")
 
         return AICompletionResult(
             text: content,
