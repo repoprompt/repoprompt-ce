@@ -6,19 +6,13 @@ ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 METADATA_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
 CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"
 source "$SCRIPT_DIR/load_release_metadata.sh"
-load_release_metadata "$METADATA_ROOT"
 
-APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APPLE_IDENTITY_POLICY="$SCRIPT_DIR/apple_identity_policy.json"
 ROLLOUT_TOOL="$SCRIPT_DIR/stable_rollout.py"
 ENTITLEMENTS_TEMPLATE="$TRUSTED_ROOT/AppBundle/RepoPrompt.entitlements.template"
 CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"
 TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
-STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
-CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
-ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
-IDENTITY_MIGRATION_ANCHOR_DESTINATION="$APP_BUNDLE/Contents/Resources/IdentityMigration/RepoPromptIdentityAnchor"
 IDENTITY_MIGRATION_TARGET_IDENTIFIER="com.repoprompt.ce"
 IDENTITY_MIGRATION_TARGET_TEAM_ID="69N6K965SF"
 IDENTITY_MIGRATION_TARGET_REQUIREMENT='anchor apple generic and identifier "com.repoprompt.ce" and certificate leaf[subject.OU] = "69N6K965SF" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
@@ -27,6 +21,18 @@ fail() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
+
+load_release_metadata_with_identity_projection \
+    "$METADATA_ROOT" \
+    "${REPOPROMPT_APPROVED_SOURCE_ROOT:-}" \
+    "$SCRIPT_DIR" \
+    "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" ||
+    fail "Unable to load the reviewed release identity context"
+APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
+STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
+ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+IDENTITY_MIGRATION_ANCHOR_DESTINATION="$APP_BUNDLE/Contents/Resources/IdentityMigration/RepoPromptIdentityAnchor"
 
 [[ -n "${SIGN_IDENTITY:-}" ]] || fail "Missing required environment variable: SIGN_IDENTITY"
 [[ -f "${REPOPROMPT_PROVISIONING_PROFILE:-}" ]] ||

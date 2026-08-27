@@ -4298,6 +4298,51 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "28.7.95\n")
 
+    def test_release_metadata_loader_projects_reviewed_tip_identity_in_child_process(self) -> None:
+        root = self.make_metadata_root()
+        shutil.copy2(SCRIPT_DIR.parent / "tip-rollout.json", root / "tip-rollout.json")
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "{SCRIPT_DIR / "load_release_metadata.sh"}"; '
+                f'load_release_metadata_with_identity_projection "{root}" "{root}" "{SCRIPT_DIR}" tip-rollout-v1; '
+                'printf "%s|%s|%s|%s\\n" "$BUNDLE_ID" "$SIGNING_TEAM_ID" "$ROLLOUT_ROLE" "$ROLLOUT_IDENTITY"',
+            ],
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "com.repoprompt.ce|69N6K965SF|transition|successor\n")
+
+    def test_release_metadata_loader_preserves_stable_identity_without_tip_contract(self) -> None:
+        root = self.make_metadata_root()
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "{SCRIPT_DIR / "load_release_metadata.sh"}"; '
+                f'load_release_metadata_with_identity_projection "{root}" "" "{SCRIPT_DIR}" ""; '
+                'printf "%s|%s\\n" "$BUNDLE_ID" "$SIGNING_TEAM_ID"',
+            ],
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "com.pvncher.repoprompt.ce|648A27MST5\n")
+
+    def test_staged_signer_uses_reviewed_identity_projection_before_profile_validation(self) -> None:
+        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+
+        projection = source.index("load_release_metadata_with_identity_projection")
+        profile_validation = source.index("profile_app_identifier=")
+        self.assertLess(projection, profile_validation)
+        self.assertIn('"${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}"', source)
+
     def test_release_metadata_parser_rejects_shell_execution(self) -> None:
         root = self.make_metadata_root()
         marker = root / "executed"

@@ -43,3 +43,41 @@ PYTHON
     )" || return
     eval "$assignments"
 }
+
+load_release_metadata_with_identity_projection() {
+    local metadata_root="$1"
+    local approved_source_root="$2"
+    local scripts_root="$3"
+    local archive_contract="${4:-}"
+    local assignments
+
+    load_release_metadata "$metadata_root" || return
+    case "$archive_contract" in
+    "") return 0 ;;
+    tip-rollout-v1)
+        [[ -n "$approved_source_root" ]] || {
+            printf 'ERROR: Tip release identity projection requires an approved source root\n' >&2
+            return 1
+        }
+        [[ -f "$approved_source_root/tip-rollout.json" ]] || {
+            printf 'ERROR: Missing approved Tip rollout declaration\n' >&2
+            return 1
+        }
+        assignments="$(
+            python3 "$scripts_root/stable_rollout.py" packaging-context \
+                --declaration "$approved_source_root/tip-rollout.json" \
+                --policy "$scripts_root/apple_identity_policy.json" \
+                --version-env "$approved_source_root/version.env"
+        )" || return
+        eval "$assignments"
+        [[ "$ROLLOUT_CHANNEL" == "tip" ]] || {
+            printf 'ERROR: Tip release identity projection requires a Tip rollout declaration\n' >&2
+            return 1
+        }
+        ;;
+    *)
+        printf 'ERROR: Unsupported REPOPROMPT_TIP_ARCHIVE_CONTRACT: %s\n' "$archive_contract" >&2
+        return 1
+        ;;
+    esac
+}
