@@ -28,7 +28,29 @@ jobs:
       - name: Generate focused implementation
         run: |
           set -euo pipefail
+          sed -i 's/"""Smoke-test the Linux headless MCP binary or final container\."""/# Smoke-test the Linux headless MCP binary or final container./' .github/bootstrap_linux_rework.py
           python3 .github/bootstrap_linux_rework.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Scripts/test_linux_headless_mcp.py")
+          lines = path.read_text(encoding="utf-8").splitlines()
+          if lines and lines[0] == "\\":
+              lines = lines[1:]
+          lines = [line[12:] if line.startswith("            ") else line for line in lines]
+          text = "\n".join(lines) + "\n"
+          needle = "        environment = os.environ.copy()\n"
+          replacement = (
+              "        if mode == \"docker\":\n"
+              "            for directory in (workspace, profile, workspace / \"Sources\"):\n"
+              "                directory.chmod(0o777)\n"
+              "        environment = os.environ.copy()\n"
+          )
+          if needle not in text:
+              raise SystemExit("smoke-test environment insertion point not found")
+          path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+          path.chmod(0o755)
+          PY
 
       - name: Set up Swift 6.2.1
         uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a

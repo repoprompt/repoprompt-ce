@@ -53,13 +53,6 @@ def replace_all(path: str, old: str, new: str) -> None:
     write(path, content.replace(old, new))
 
 
-def append_once(path: str, content: str) -> None:
-    existing = read(path)
-    if content in existing:
-        return
-    write(path, existing.rstrip() + "\n\n" + content.strip() + "\n")
-
-
 def replace_regex(path: str, pattern: str, replacement: str, *, count: int = 0) -> None:
     content = read(path)
     updated, substitutions = re.subn(pattern, replacement, content, count=count, flags=re.MULTILINE | re.DOTALL)
@@ -83,13 +76,6 @@ def install_linux_manifest() -> None:
     start = legacy_manifest.index("#if os(Linux)")
     end = legacy_manifest.index("#else\nlet packageRoot", start)
     linux_branch = legacy_manifest[start:end]
-    linux_branch = linux_branch.replace(
-        '    let linuxSwift6: [SwiftSetting] = [.swiftLanguageMode(.v6)]',
-        '    let linuxSwift6: [SwiftSetting] = [\n'
-        '        .swiftLanguageMode(.v6),\n'
-        '        .define("DEBUG", .when(configuration: .debug))\n'
-        '    ]',
-    )
 
     linux_branch = linux_branch.replace(
         '                    "DirectHeadlessOracleCoordinator.swift",\n',
@@ -275,7 +261,7 @@ def patch_service() -> None:
         path,
         r"    nonisolated static func verifiedExecutableFingerprint\(processID: Int32\) -> String\? \{\n.*?\n    \}\n\n"
         r"    private nonisolated static func childPolicyProfile",
-        r"""
+        """\
     nonisolated static func verifiedExecutableFingerprint(processID: Int32) -> String? {
         guard let executablePath = rpExecutablePath(processID: processID) else { return nil }
         let path = URL(fileURLWithPath: executablePath).standardizedFileURL.path
@@ -287,140 +273,8 @@ def patch_service() -> None:
             .joined()
     }
 
-    private nonisolated static func childPolicyProfile""".removeprefix("\n"),
+    private nonisolated static func childPolicyProfile""",
         count=1,
-    )
-
-
-def patch_worktree_routing() -> None:
-    path = "Sources/RepoPromptMCP/DirectHeadlessWorktreeRouting.swift"
-    replace_once(
-        path,
-        "import Darwin\n",
-        "#if canImport(Darwin)\n    import Darwin\n#elseif canImport(Glibc)\n    import Glibc\n#endif\n",
-    )
-
-
-def patch_domain_runtime_portability() -> None:
-    path = "Sources/RepoPromptDomainRuntime/DomainRoutingCoordinator.swift"
-    replace_once(path, "import Foundation\nimport Security\n", "import Foundation\n")
-    replace_once(
-        path,
-        "        var bytes = [UInt8](repeating: 0, count: 32)\n"
-        "        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {\n"
-        "            throw DomainRunLaunchTokenError.randomGenerationFailed\n"
-        "        }",
-        "        var generator = SystemRandomNumberGenerator()\n"
-        "        var bytes = [UInt8](repeating: 0, count: 32)\n"
-        "        for index in bytes.indices {\n"
-        "            bytes[index] = generator.next()\n"
-        "        }",
-    )
-
-    path = "Sources/RepoPromptDomainRuntime/DomainMutationPathFence.swift"
-    replace_once(
-        path,
-        "import Darwin\nimport Foundation\n",
-        "#if canImport(Darwin)\n    import Darwin\n#elseif canImport(Glibc)\n    import Glibc\n#endif\nimport Foundation\n",
-    )
-
-    path = "Sources/RepoPromptDomainRuntime/DomainPersistence.swift"
-    replace_once(
-        path,
-        "import Darwin\nimport Foundation\nimport os\n",
-        "#if canImport(Darwin)\n    import Darwin\n#elseif canImport(Glibc)\n    import Glibc\n#endif\nimport Foundation\n",
-    )
-    replace_all(path, "Darwin.write(", "write(")
-    replace_once(
-        path,
-        "private final class DomainBlockingCancellation: Sendable {\n"
-        "    private let state = OSAllocatedUnfairLock(initialState: false)\n\n"
-        "    func cancel() {\n"
-        "        state.withLock { $0 = true }\n"
-        "    }\n\n"
-        "    func check() throws {\n"
-        "        if state.withLock({ $0 }) {\n"
-        "            throw DomainPersistenceError.cancelled\n"
-        "        }\n"
-        "    }\n"
-        "}",
-        "private final class DomainBlockingCancellation: @unchecked Sendable {\n"
-        "    private let state = NSLock()\n"
-        "    private var isCancelled = false\n\n"
-        "    func cancel() {\n"
-        "        state.lock()\n"
-        "        isCancelled = true\n"
-        "        state.unlock()\n"
-        "    }\n\n"
-        "    func check() throws {\n"
-        "        state.lock()\n"
-        "        let cancelled = isCancelled\n"
-        "        state.unlock()\n"
-        "        if cancelled {\n"
-        "            throw DomainPersistenceError.cancelled\n"
-        "        }\n"
-        "    }\n"
-        "}",
-    )
-
-    path = "Sources/RepoPromptDomainRuntime/StringExtensions.swift"
-    replace_once(path, "import Darwin\n", "")
-
-
-def patch_foundation_portability() -> None:
-    path = "Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift"
-    replace_once(path, "import Foundation\n", "import CoreFoundation\nimport Foundation\n")
-    path = "Sources/RepoPromptDomainRuntime/MCPDomainResponseDeliveryTracker.swift"
-    replace_once(path, "import Foundation\n", "import CoreFoundation\nimport Foundation\n")
-
-    code_map_root = ROOT / "Sources/RepoPromptCodeMapCore"
-    for code_map_path in code_map_root.rglob("*.swift"):
-        content = code_map_path.read_text(encoding="utf-8")
-        updated = content.replace("CFAbsoluteTimeGetCurrent()", "ProcessInfo.processInfo.systemUptime")
-        updated = updated.replace("CFAbsoluteTime", "TimeInterval")
-        if updated != content:
-            code_map_path.write_text(updated, encoding="utf-8")
-
-
-def patch_headless_filesystem_portability() -> None:
-    path = "Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift"
-    replace_once(
-        path,
-        "            var resultingURL: NSURL?\n"
-        "            try manager.trashItem(at: source, resultingItemURL: &resultingURL)",
-        "#if os(Linux)\n"
-        "            try manager.removeItem(at: source)\n"
-        "#else\n"
-        "            var resultingURL: NSURL?\n"
-        "            try manager.trashItem(at: source, resultingItemURL: &resultingURL)\n"
-        "#endif",
-    )
-
-
-def patch_linux_test_portability() -> None:
-    for path in (
-        "Tests/RepoPromptCodeMapCoreTests/CodeMapArtifactKeyTests.swift",
-        "Tests/RepoPromptCodeMapCoreTests/CodeMapFixtureRunner.swift",
-        "Tests/RepoPromptCodeMapCoreTests/CodeMapSyntaxArtifactTests.swift",
-    ):
-        replace_once(
-            path,
-            "import CryptoKit\n",
-            "#if canImport(CryptoKit)\n    import CryptoKit\n#elseif canImport(Crypto)\n    import Crypto\n#endif\n",
-        )
-
-    replace_once(
-        "Tests/RepoPromptDomainRuntimeTests/DomainWorkspaceContextAuthorityTests.swift",
-        "import Darwin\n",
-        "#if canImport(Darwin)\n    import Darwin\n#elseif canImport(Glibc)\n    import Glibc\n#endif\n",
-    )
-
-
-def patch_edit_flow_perf_portability() -> None:
-    replace_all(
-        "Sources/RepoPromptDomainRuntime/Diffing/EditFlowPerf.swift",
-        "#if DEBUG || EDIT_FLOW_PERF",
-        "#if canImport(os) && (DEBUG || EDIT_FLOW_PERF)",
     )
 
 
@@ -428,7 +282,7 @@ def write_runtime_files() -> None:
     write(
         "Dockerfile.headless",
         textwrap.dedent(
-            r"""
+            """\
             FROM swift:6.2.1-noble AS build
 
             RUN apt-get update \
@@ -486,7 +340,7 @@ def write_runtime_files() -> None:
             ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/repoprompt-mcp"]
             CMD ["--backend", "headless"]
             """
-        ).lstrip(),
+        ),
     )
     write(
         ".dockerignore",
@@ -547,9 +401,9 @@ def write_runtime_files() -> None:
     write(
         "Scripts/test_linux_headless_mcp.py",
         textwrap.dedent(
-            r"""
+            r"""\
             #!/usr/bin/env python3
-            # Smoke-test the Linux headless MCP binary or final container.
+            """Smoke-test the Linux headless MCP binary or final container."""
 
             from __future__ import annotations
 
@@ -661,9 +515,6 @@ def write_runtime_files() -> None:
                         "struct LinuxHeadlessFixture { let value: Int }\n",
                         encoding="utf-8",
                     )
-                    if mode == "docker":
-                        for directory in (workspace, profile, workspace / "Sources"):
-                            directory.chmod(0o777)
                     environment = os.environ.copy()
                     environment["REPOPROMPT_MCP_HEADLESS_PROFILE_DIR"] = str(profile)
                     environment["REPOPROMPT_MCP_WORKING_DIRS"] = str(workspace)
@@ -735,7 +586,7 @@ def write_runtime_files() -> None:
                                 "name": "file_search",
                                 "arguments": {
                                     "pattern": "LinuxHeadlessFixture",
-                                    "path": str(fixture.relative_to(workspace)),
+                                    "path": str(fixture),
                                     "regex": False,
                                 },
                             },
@@ -757,7 +608,7 @@ def write_runtime_files() -> None:
             if __name__ == "__main__":
                 main()
             """
-        ).lstrip(),
+        ),
         executable=True,
     )
 
@@ -831,11 +682,11 @@ def write_runtime_files() -> None:
         ),
     )
 
-    append_once(
-        "docs/architecture/headless-mcp-runtime.md",
+    write(
+        "docs/linux-headless-container.md",
         textwrap.dedent(
-            r"""
-            ## Linux headless container
+            """\
+            # Linux headless container
 
             The Linux artifact packages only the direct MCP backend:
 
@@ -878,23 +729,12 @@ def write_runtime_files() -> None:
 
 
 def main() -> None:
-    if "#if os(Linux)" in read("Package.swift"):
-        # The generated tree is committed on the completed branch. The
-        # bootstrap workflow can still validate that tree without wrapping its
-        # manifest or applying the one-shot source patches a second time.
-        return
     install_linux_manifest()
     install_portability_helpers()
     patch_cryptokit_imports()
     patch_child_endpoint()
     patch_stdio_transport()
     patch_service()
-    patch_worktree_routing()
-    patch_domain_runtime_portability()
-    patch_foundation_portability()
-    patch_headless_filesystem_portability()
-    patch_linux_test_portability()
-    patch_edit_flow_perf_portability()
     write_runtime_files()
 
 
