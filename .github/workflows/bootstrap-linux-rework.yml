@@ -27,8 +27,55 @@ jobs:
 
       - name: Generate focused implementation
         run: |
+          set -euo pipefail
           sed -i 's/"""Smoke-test the Linux headless MCP binary or final container\."""/# Smoke-test the Linux headless MCP binary or final container./' .github/bootstrap_linux_rework.py
           python3 .github/bootstrap_linux_rework.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Scripts/test_linux_headless_mcp.py")
+          lines = path.read_text(encoding="utf-8").splitlines()
+          if lines and lines[0] == "\\":
+              lines = lines[1:]
+          lines = [line[12:] if line.startswith("            ") else line for line in lines]
+          text = "\n".join(lines) + "\n"
+          needle = "        environment = os.environ.copy()\n"
+          replacement = (
+              "        if mode == \"docker\":\n"
+              "            for directory in (workspace, profile, workspace / \"Sources\"):\n"
+              "                directory.chmod(0o777)\n"
+              "        environment = os.environ.copy()\n"
+          )
+          if needle not in text:
+              raise SystemExit("smoke-test environment insertion point not found")
+          path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+          path.chmod(0o755)
+          PY
+
+      - name: Set up Swift 6.2.1
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
+        with:
+          swift-version: "6.2.1"
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends g++ git libstdc++-14-dev pkg-config python3 python3-yaml
+
+      - name: Validate generated support files
+        run: |
+          set -euo pipefail
+          python3 -m py_compile Scripts/test_linux_headless_mcp.py
+          python3 -c 'import pathlib, yaml; yaml.safe_load(pathlib.Path(".github/workflows/linux-headless.yml").read_text())'
+          bash -n Scripts/test_linux_headless_native.sh Scripts/test_linux_headless_docker.sh
+
+      - name: Build and exercise native backend
+        env:
+          SWIFT_JOBS: "4"
+        run: bash Scripts/test_linux_headless_native.sh
+
+      - name: Build and exercise final image
+        run: bash Scripts/test_linux_headless_docker.sh "repoprompt-ce-headless:bootstrap-${GITHUB_SHA}"
 
       - name: Package generated tree
         env:
@@ -49,10 +96,10 @@ jobs:
           test -s /tmp/linux-headless-tree.tar.gz
           cat /tmp/linux-headless-files.txt
 
-      - name: Upload generated tree
+      - name: Upload validated tree
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-headless-generated-tree
+          name: linux-headless-validated-tree
           path: |
             /tmp/linux-headless-tree.tar.gz
             /tmp/linux-headless-files.txt
