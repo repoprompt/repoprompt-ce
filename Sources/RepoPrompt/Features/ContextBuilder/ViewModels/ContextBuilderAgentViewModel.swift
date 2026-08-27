@@ -254,6 +254,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Frozen workspace-scoped planning model for MCP follow-up generation.
         var mcpPlanningModelRaw: String?
 
+        /// Frozen workspace-scoped Agent Models profile for MCP follow-up generation.
+        var mcpAgentModelsProfile: AgentModelsSettingsProfile?
+
         /// MCP response_type requested (plan/question/review/clarify) - only set during MCP runs
         var mcpResponseType: String?
 
@@ -319,7 +322,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         /// Generic N>1 post-discovery state and the task that must drain before replacement.
         var followUpOracleGroupState = ContextBuilderOracleGroupState()
-        var followUpOracleGroupTask: Task<[String: Value], Error>?
+        var followUpOracleGroupTask: Task<OracleGroupRuntime.Completion, Error>?
 
         /// Per-tab auto-generate plan setting (loaded from tab config)
         var autoGeneratePlan: Bool = false
@@ -401,6 +404,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mcpControlToken = nil
             mcpWorkspaceID = nil
             mcpPlanningModelRaw = nil
+            mcpAgentModelsProfile = nil
             followUpOracleSessionID = nil
             followUpOracleGroupTask = nil
             pendingAskUser = nil
@@ -520,6 +524,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         func hasFollowUpOracleGroupTaskForTesting(tabID: UUID) -> Bool {
             sessions[tabID]?.followUpOracleGroupTask != nil
+        }
+
+        func setMCPAgentModelsProfileForTesting(tabID: UUID, profile: AgentModelsSettingsProfile) {
+            let session = session(for: tabID)
+            session.mcpAgentModelsProfile = profile
+            session.mcpPlanningModelRaw = profile.planningModelRaw
         }
 
         func retireStaleRunRecordForTesting(
@@ -1720,6 +1730,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             runBehavior: runBehavior,
             responseType: responseType,
             planningModelRaw: profile.planningModelRaw,
+            agentModelsProfile: profile,
             isSystemWorkspace: workspace.isSystemWorkspace
         )
         return ContextBuilderResolvedRunAuthority(
@@ -1786,12 +1797,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         session.mcpWorkspaceID = identity.workspaceID
         session.mcpPlanningModelRaw = configuration.planningModelRaw
+        session.mcpAgentModelsProfile = configuration.agentModelsProfile
         session.mcpResponseType = configuration.responseType
         session.mcpPlanModel = contextBuilderJoinedFollowUpModelLine(
             primaryDisplayName: planModelName,
-            additionalModelRaws: GlobalSettingsStore.shared
-                .effectiveAgentModelsProfile(workspaceID: identity.workspaceID)
-                .additionalOracleModelRaws
+            additionalModelRaws: configuration.agentModelsProfile.additionalOracleModelRaws
         )
         updateRuntimeBindings(from: session)
 
@@ -1966,6 +1976,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 runBehavior: runBehavior,
                 responseType: responseType,
                 planningModelRaw: base.planningModelRaw,
+                agentModelsProfile: base.agentModelsProfile,
                 isSystemWorkspace: base.isSystemWorkspace
             )
             return try await runContextBuilderForMCP(
@@ -2143,6 +2154,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             session.mcpControlToken = nil
             session.mcpWorkspaceID = nil
             session.mcpPlanningModelRaw = nil
+            session.mcpAgentModelsProfile = nil
             session.mcpResponseType = nil
             session.mcpPlanModel = nil
         }
@@ -4316,6 +4328,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.mcpControlToken = token
         session.mcpWorkspaceID = workspaceID ?? workspaceManager?.activeWorkspaceID
         session.mcpPlanningModelRaw = nil
+        session.mcpAgentModelsProfile = nil
         session.mcpResponseType = responseType
         session.mcpPlanModel = planModelName
         updateRuntimeBindings(from: session)
@@ -4329,6 +4342,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.mcpControlToken = nil
         session.mcpWorkspaceID = nil
         session.mcpPlanningModelRaw = nil
+        session.mcpAgentModelsProfile = nil
         session.mcpResponseType = nil
         session.mcpPlanModel = nil
         updateRuntimeBindings(from: session)
@@ -4489,6 +4503,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         agentModeRunID: UUID?,
         chatName: String,
         model: AIModel,
+        capturedProfile: AgentModelsSettingsProfile,
         gitScopeOverride: GitInclusion?,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)?,
         progressReporter: ContextBuilderMCPProgressReporter?,
@@ -4630,19 +4645,20 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             store: oracleStore
         )
         let task = Task { @MainActor in
-            try await oracleViewModel.tool_chatSendWithConfiguredRoster(
+            try await oracleViewModel.tool_chatSendWithConfiguredRosterCompletion(
                 args: args,
                 promptVM: promptManager,
                 tabContext: tabContext,
                 frozenInput: frozenPack.input,
-                callbacks: callbacks
+                callbacks: callbacks,
+                capturedProfile: capturedProfile
             )
         }
         session.followUpOracleGroupTask = task
 
         var artifactReservationReleased = false
         do {
-            let value = try await withTaskCancellationHandler {
+            let completion = try await withTaskCancellationHandler {
                 try await task.value
             } onCancel: {
                 task.cancel()
@@ -4657,7 +4673,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 }
             }
             try requireCurrentOracleRun(session: session, generation: generation)
-            let groupReply = try ContextBuilderOracleGroupReply.decode(value)
+            let groupReply = ContextBuilderOracleGroupReply(result: completion.result)
             guard session.followUpOracleGroupState.matchesFinalResult(
                 groupReply.result,
                 generation: generation
@@ -4789,13 +4805,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         model: AIModel,
         chatPresetID: UUID?,
         mcpSessionUIState: OracleViewModel.MCPSessionUIState? = nil,
+        capturedProfile: AgentModelsSettingsProfile? = nil,
         gitScopeOverride: GitInclusion? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
         activityReporter: ContextBuilderMCPActivityReporter? = nil
     ) async throws -> ChatSendReply {
         let session = session(for: tabID)
-        let profile = GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: originWorkspaceID)
+        let profile = capturedProfile ?? GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: originWorkspaceID)
         if AppOracleGroupRouting.usesGroup(additionalModelRaws: profile.additionalOracleModelRaws) {
             return try await runFollowUpOracleGroup(
                 for: tabID,
@@ -4811,6 +4828,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 agentModeRunID: agentModeRunID,
                 chatName: chatName,
                 model: model,
+                capturedProfile: profile,
                 gitScopeOverride: gitScopeOverride,
                 onProgress: onProgress,
                 progressReporter: progressReporter,
@@ -5027,6 +5045,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         let modeName = mode.mcpModeName
+        guard let capturedProfile = sessions[tabID]?.mcpAgentModelsProfile else {
+            throw ContextBuilderGenerationError.missingMCPAgentModelsProfile
+        }
         await progressReporter?(.modelResolution)
         let modelSelection: (
             model: AIModel,
@@ -5040,14 +5061,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
                     mode: modeName,
                     workspaceID: identity.workspaceID,
-                    planningModelRawOverride: sessions[tabID]?.mcpPlanningModelRaw
+                    planningModelRawOverride: capturedProfile.planningModelRaw
                 )
             }
         #else
             modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
                 mode: modeName,
                 workspaceID: identity.workspaceID,
-                planningModelRawOverride: sessions[tabID]?.mcpPlanningModelRaw
+                planningModelRawOverride: capturedProfile.planningModelRaw
             )
         #endif
         let mcpSessionUIState: OracleViewModel.MCPSessionUIState? = {
@@ -5062,9 +5083,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }()
 
         let usesOracleGroup = AppOracleGroupRouting.usesGroup(
-            additionalModelRaws: GlobalSettingsStore.shared
-                .effectiveAgentModelsProfile(workspaceID: identity.workspaceID)
-                .additionalOracleModelRaws
+            additionalModelRaws: capturedProfile.additionalOracleModelRaws
         )
         if workspaceManager?.activeWorkspaceID != identity.workspaceID, !usesOracleGroup {
             let session = session(for: tabID)
@@ -5134,6 +5153,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             model: modelSelection.model,
             chatPresetID: modelSelection.chatPresetID,
             mcpSessionUIState: mcpSessionUIState,
+            capturedProfile: capturedProfile,
             gitScopeOverride: gitScopeOverride,
             progressReporter: progressReporter,
             activityReporter: activityReporter
@@ -5758,6 +5778,7 @@ enum ContextBuilderGenerationError: LocalizedError {
     case emptyPrompt
     case missingTab
     case missingWorkspace
+    case missingMCPAgentModelsProfile
     case askUserAlreadyPending
 
     var errorDescription: String? {
@@ -5765,6 +5786,7 @@ enum ContextBuilderGenerationError: LocalizedError {
         case .emptyPrompt: "Context Builder has no prompt to generate from."
         case .missingTab: "Unable to locate the Context Builder tab."
         case .missingWorkspace: "Unable to locate the Context Builder workspace."
+        case .missingMCPAgentModelsProfile: "Context Builder MCP follow-up is missing its captured Agent Models profile."
         case .askUserAlreadyPending: "ask_user is already waiting for a response in this Context Builder session."
         }
     }
