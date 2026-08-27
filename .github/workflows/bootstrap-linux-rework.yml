@@ -69,14 +69,6 @@ jobs:
           python3 -c 'import pathlib, yaml; yaml.safe_load(pathlib.Path(".github/workflows/linux-headless.yml").read_text())'
           bash -n Scripts/test_linux_headless_native.sh Scripts/test_linux_headless_docker.sh
 
-      - name: Build and exercise native backend
-        env:
-          SWIFT_JOBS: "4"
-        run: bash Scripts/test_linux_headless_native.sh
-
-      - name: Build and exercise final image
-        run: bash Scripts/test_linux_headless_docker.sh "repoprompt-ce-headless:bootstrap-${GITHUB_SHA}"
-
       - name: Package generated tree
         env:
           BASE_SHA: 0c1aa28f8179ff98c11f6dbb420101eeba944a26
@@ -96,7 +88,38 @@ jobs:
           test -s /tmp/linux-headless-tree.tar.gz
           cat /tmp/linux-headless-files.txt
 
+      - name: Build and exercise native backend
+        env:
+          SWIFT_JOBS: "4"
+        run: |
+          set +e
+          bash Scripts/test_linux_headless_native.sh 2>&1 | tee /tmp/linux-headless-native.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+
+      - name: Build and exercise final image
+        run: |
+          set +e
+          bash Scripts/test_linux_headless_docker.sh "repoprompt-ce-headless:bootstrap-${GITHUB_SHA}" 2>&1 \
+            | tee /tmp/linux-headless-docker.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-headless-diagnostics
+          path: |
+            /tmp/linux-headless-tree.tar.gz
+            /tmp/linux-headless-files.txt
+            /tmp/linux-headless-native.log
+            /tmp/linux-headless-docker.log
+          if-no-files-found: warn
+          retention-days: 1
+
       - name: Upload validated tree
+        if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: linux-headless-validated-tree
