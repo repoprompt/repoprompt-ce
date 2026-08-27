@@ -25,7 +25,9 @@ jobs:
         run: git fetch origin linux-headless-mcp:refs/remotes/origin/legacy-linux-headless
 
       - name: Generate focused implementation
-        run: python3 .github/bootstrap_linux_rework.py
+        run: |
+          sed -i 's/"""Smoke-test the Linux headless MCP binary or final container\."""/# Smoke-test the Linux headless MCP binary or final container./' .github/bootstrap_linux_rework.py
+          python3 .github/bootstrap_linux_rework.py
 
       - name: Commit generated tree
         run: |
