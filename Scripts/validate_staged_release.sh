@@ -12,46 +12,93 @@ fail() {
 
 [[ -n "$APPROVED_SOURCE_ROOT" ]] ||
     fail "Missing required environment variable: REPOPROMPT_APPROVED_SOURCE_ROOT"
-[[ -n "${RELEASE_COMMIT:-}" ]] ||
-    fail "Missing required environment variable: RELEASE_COMMIT"
 
 TIP_ROLLOUT_DECLARATION_NAME=""
+TIP_CONTEXT_MODE=0
 case "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" in
     "") ;;
-    tip-rollout-v1) TIP_ROLLOUT_DECLARATION_NAME="tip-rollout.json" ;;
+    tip-rollout-v1)
+        TIP_CONTEXT_MODE=1
+        TIP_ROLLOUT_DECLARATION_NAME="tip-rollout.json"
+        ;;
     *) fail "Unsupported REPOPROMPT_TIP_ARCHIVE_CONTRACT: $REPOPROMPT_TIP_ARCHIVE_CONTRACT" ;;
 esac
 
-PROJECTED_BUNDLE_ID=""
-PROJECTED_SIGNING_TEAM_ID=""
-if [[ -n "$TIP_ROLLOUT_DECLARATION_NAME" ]]; then
+source "$SCRIPT_DIR/load_release_metadata.sh"
+if (( TIP_CONTEXT_MODE )); then
+    load_verified_tip_release_context \
+        "$SCRIPT_DIR" \
+        "$APPROVED_SOURCE_ROOT" \
+        "validate-staged-release" \
+        "$ROOT_DIR" || fail "Unable to verify the staged Tip release context"
     [[ -f "$APPROVED_SOURCE_ROOT/$TIP_ROLLOUT_DECLARATION_NAME" ]] ||
         fail "Missing approved Tip rollout declaration"
     [[ -f "$ROOT_DIR/$TIP_ROLLOUT_DECLARATION_NAME" ]] ||
         fail "missing staged file: $ROOT_DIR/$TIP_ROLLOUT_DECLARATION_NAME"
-    rollout_context="$(
-        python3 "$SCRIPT_DIR/stable_rollout.py" packaging-context \
-            --declaration "$APPROVED_SOURCE_ROOT/$TIP_ROLLOUT_DECLARATION_NAME" \
-            --policy "$SCRIPT_DIR/apple_identity_policy.json" \
-            --version-env "$APPROVED_SOURCE_ROOT/version.env"
-    )" || fail "Unable to derive the reviewed Tip packaging context"
-    eval "$rollout_context"
-    PROJECTED_BUNDLE_ID="$BUNDLE_ID"
-    PROJECTED_SIGNING_TEAM_ID="$SIGNING_TEAM_ID"
-fi
+    RELEASE_COMMIT="$TIP_COMMIT"
+    BUILD_NUMBER="$TIP_BUILD_NUMBER"
 
-if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" || -n "$PROJECTED_BUNDLE_ID" ]]; then
-    if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
-        [[ "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
-            fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
-    fi
-    python3 - "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" \
-        "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" "$PROJECTED_BUNDLE_ID" \
-        "$PROJECTED_SIGNING_TEAM_ID" <<'PYTHON'
+    python3 - \
+        "$ROOT_DIR/version.env" \
+        "$APP_NAME" \
+        "$DISPLAY_NAME" \
+        "$MARKETING_VERSION" \
+        "$TIP_BUILD_NUMBER" \
+        "$BUNDLE_ID" \
+        "$SIGNING_TEAM_ID" <<'PYTHON'
 import sys
 from pathlib import Path
 
-staged_path, approved_path, build_override, bundle_id, signing_team_id = sys.argv[1:]
+staged_path, app_name, display_name, marketing, build, bundle_id, team_id = sys.argv[1:]
+
+def parse(path: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise SystemExit(f"ERROR: invalid staged release metadata line: {raw_line}")
+        key, value = line.split("=", 1)
+        if key in values:
+            raise SystemExit(f"ERROR: duplicate staged release metadata key: {key}")
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+staged = parse(staged_path)
+expected = {
+    "APP_NAME": app_name,
+    "DISPLAY_NAME": display_name,
+    "MARKETING_VERSION": marketing,
+    "BUILD_NUMBER": build,
+    "BUNDLE_ID": bundle_id,
+    "SIGNING_TEAM_ID": team_id,
+}
+if staged != expected:
+    mismatches = sorted(
+        key for key in set(staged) | set(expected) if staged.get(key) != expected.get(key)
+    )
+    raise SystemExit(
+        "ERROR: staged version.env does not match the verified Tip release context: "
+        + ", ".join(mismatches)
+    )
+PYTHON
+else
+    [[ -n "${RELEASE_COMMIT:-}" ]] ||
+        fail "Missing required environment variable: RELEASE_COMMIT"
+    if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
+        [[ "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
+            fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
+        python3 - \
+            "$ROOT_DIR/version.env" \
+            "$APPROVED_SOURCE_ROOT/version.env" \
+            "$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE" <<'PYTHON'
+import sys
+from pathlib import Path
+
+staged_path, approved_path, build_override = sys.argv[1:]
 
 def parse(path: str) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -66,37 +113,25 @@ def parse(path: str) -> dict[str, str]:
     return values
 
 staged = parse(staged_path)
-approved = parse(approved_path)
-expected = dict(approved)
-for key, value in {
-    "BUILD_NUMBER": build_override,
-    "BUNDLE_ID": bundle_id,
-    "SIGNING_TEAM_ID": signing_team_id,
-}.items():
-    if value:
-        expected[key] = value
+expected = parse(approved_path)
+expected["BUILD_NUMBER"] = build_override
 if staged != expected:
-    mismatches = sorted(set(staged) | set(expected))
-    detail = ", ".join(
-        key for key in mismatches if staged.get(key) != expected.get(key)
+    mismatches = sorted(
+        key for key in set(staged) | set(expected) if staged.get(key) != expected.get(key)
     )
     raise SystemExit(
         "ERROR: staged version.env does not match approved source plus reviewed release projections: "
-        f"{detail}"
+        + ", ".join(mismatches)
     )
 PYTHON
-else
-    cmp "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" ||
-        fail "Staged version.env does not match approved source"
-fi
-source "$SCRIPT_DIR/load_release_metadata.sh"
-load_release_metadata "$APPROVED_SOURCE_ROOT"
-if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
-    BUILD_NUMBER="$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE"
-fi
-if [[ -n "$PROJECTED_BUNDLE_ID" ]]; then
-    BUNDLE_ID="$PROJECTED_BUNDLE_ID"
-    SIGNING_TEAM_ID="$PROJECTED_SIGNING_TEAM_ID"
+    else
+        cmp "$ROOT_DIR/version.env" "$APPROVED_SOURCE_ROOT/version.env" ||
+            fail "Staged version.env does not match approved source"
+    fi
+    load_release_metadata "$APPROVED_SOURCE_ROOT"
+    if [[ -n "${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}" ]]; then
+        BUILD_NUMBER="$REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE"
+    fi
 fi
 
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
@@ -157,11 +192,19 @@ for path in [
     require_regular_file(path)
 if tip_rollout_declaration_name:
     require_regular_file(root / tip_rollout_declaration_name)
+    require_regular_file(root / "tip-release-context.json")
+    require_regular_file(root / "tip-release-context.json.sha256")
 
 top_level = {path.name for path in root.iterdir()}
 expected_top_level = {".build", "LICENSE", "RELEASE_COMMIT", "THIRD_PARTY_NOTICES.md", "ThirdPartyLicenses", "version.env"}
 if tip_rollout_declaration_name:
-    expected_top_level.add(tip_rollout_declaration_name)
+    expected_top_level.update(
+        {
+            tip_rollout_declaration_name,
+            "tip-release-context.json",
+            "tip-release-context.json.sha256",
+        }
+    )
 if top_level != expected_top_level:
     fail(f"unexpected staged top-level entries: {sorted(top_level ^ expected_top_level)}")
 

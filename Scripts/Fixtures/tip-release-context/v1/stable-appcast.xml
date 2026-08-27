@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Synthetic Stable Updates</title>
+    <item>
+      <title>Synthetic Stable Build 35</title>
+      <sparkle:version>35</sparkle:version>
+    </item>
+  </channel>
+</rss>

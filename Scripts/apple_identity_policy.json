@@ -22,5 +22,16 @@
     "updateRepository": "repoprompt/repoprompt-ce-updates",
     "tipUpdateRepository": "repoprompt/repoprompt-ce-tip-updates",
     "minimumSystemVersion": "14.0"
+  },
+  "identityTransitionPackage": {
+    "identifier": "com.repoprompt.ce.transition",
+    "installLocation": "/Applications",
+    "appBundleName": "RepoPrompt CE.app",
+    "bundleIsRelocatable": false,
+    "bundleHasStrictIdentifier": false,
+    "bundleIsVersionChecked": true,
+    "bundleOverwriteAction": "upgrade",
+    "hasScripts": false,
+    "applicationBundleCount": 1
   }
 }

@@ -94,7 +94,7 @@ if [[ -n "$RELEASE_BUILD_NUMBER_OVERRIDE" ]]; then
         fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"
     BUILD_NUMBER="$RELEASE_BUILD_NUMBER_OVERRIDE"
 fi
-APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; BASE_SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID_OVERRIDE:-$BASE_SIGNING_TEAM_ID}"
+APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="$BUNDLE_ID"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; BASE_SIGNING_TEAM_ID="$SIGNING_TEAM_ID"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID_OVERRIDE:-$BASE_SIGNING_TEAM_ID}"
 IDENTITY_MIGRATION_PHASE="${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}"
 case "$IDENTITY_MIGRATION_PHASE" in
 disabled | legacy-preparer) ;;
@@ -110,11 +110,15 @@ if (( IS_RELEASE )); then
 else
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-$BASE_BUNDLE_ID.debug}}"
 fi
-if [[ "$IDENTITY_MIGRATION_PHASE" == "legacy-preparer" ]]; then
-    [[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce" ]] ||
-        fail "legacy-preparer requires bundle identifier com.pvncher.repoprompt.ce"
-    [[ "$SIGNING_TEAM_ID" == "648A27MST5" ]] ||
-        fail "legacy-preparer requires signing Team ID 648A27MST5"
+if [[ -n "${REPOPROMPT_STABLE_RELEASE_CONTEXT:-}" ]]; then
+    validate_stable_release_context \
+        "$BUNDLE_ID" \
+        "$SIGNING_TEAM_ID" \
+        "$IDENTITY_MIGRATION_PHASE" \
+        "${SIGN_IDENTITY:-}" || fail "Stable release context validation failed"
+elif [[ "$IDENTITY_MIGRATION_PHASE" == "legacy-preparer" && \
+        "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" != "tip-rollout-v1" ]]; then
+    fail "legacy-preparer packaging requires a resolved Stable or Tip release context"
 fi
 
 phase "Checking build environment"
@@ -204,11 +208,15 @@ if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
     SIGNING_MODE_MARKER="local-self-signed"
 elif (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     DEBUG_STORAGE_BACKEND_MARKER="keychain"
-    SIGNING_MODE_MARKER="$(python3 "$CONTROL_PLANE_SCRIPTS_DIR/stable_rollout.py" signing-mode \
-        --policy "$CONTROL_PLANE_SCRIPTS_DIR/apple_identity_policy.json" \
-        --bundle-id "$BUNDLE_ID" \
-        --team-id "$SIGNING_TEAM_ID")" ||
-        fail "Release bundle/team pair is not a reviewed Apple identity"
+    if [[ -n "${REPOPROMPT_STABLE_RELEASE_CONTEXT:-}" ]]; then
+        SIGNING_MODE_MARKER="$EXPECTED_SIGNING_MODE"
+    else
+        SIGNING_MODE_MARKER="$(python3 "$CONTROL_PLANE_SCRIPTS_DIR/stable_rollout.py" signing-mode \
+            --policy "$CONTROL_PLANE_SCRIPTS_DIR/apple_identity_policy.json" \
+            --bundle-id "$BUNDLE_ID" \
+            --team-id "$SIGNING_TEAM_ID")" ||
+            fail "Release bundle/team pair is not a reviewed Apple identity"
+    fi
 elif (( IS_RELEASE )); then
     SIGNING_MODE_MARKER="release-candidate-adhoc"
 elif [[ -n "$DEBUG_SECURE_STORAGE_BACKEND" ]]; then
@@ -366,7 +374,11 @@ elif (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     run security cms -D -i "$REPOPROMPT_PROVISIONING_PROFILE" -o "$PROFILE_PLIST"
     PROFILE_APP_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$PROFILE_PLIST" 2>/dev/null || true)"
     run rm -f "$PROFILE_PLIST"
-    [[ "$PROFILE_APP_IDENTIFIER" == "$SIGNING_TEAM_ID.$BUNDLE_ID" ]] || fail "Provisioning profile app identifier mismatch: expected $SIGNING_TEAM_ID.$BUNDLE_ID, got ${PROFILE_APP_IDENTIFIER:-<missing>}."
+    EXPECTED_PROFILE_APP_IDENTIFIER="$SIGNING_TEAM_ID.$BUNDLE_ID"
+    if [[ -n "${REPOPROMPT_STABLE_RELEASE_CONTEXT:-}" ]]; then
+        EXPECTED_PROFILE_APP_IDENTIFIER="$EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER"
+    fi
+    [[ "$PROFILE_APP_IDENTIFIER" == "$EXPECTED_PROFILE_APP_IDENTIFIER" ]] || fail "Provisioning profile app identifier mismatch: expected $EXPECTED_PROFILE_APP_IDENTIFIER, got ${PROFILE_APP_IDENTIFIER:-<missing>}."
     run cp "$REPOPROMPT_PROVISIONING_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
     APP_ENTITLEMENTS="$(mktemp)"
     run python3 - <<PY
@@ -517,6 +529,9 @@ else
     sign_path "$APP_BUNDLE"
 fi
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+if [[ -n "${REPOPROMPT_STABLE_RELEASE_CONTEXT:-}" ]] && (( ! USE_ADHOC_SIGNING )); then
+    run codesign --verify --strict --verbose=2 -R="$EXPECTED_APP_REQUIREMENT" "$APP_BUNDLE"
+fi
 # The outer signature seals the resource tree but must not mutate or replace
 # OpenAI's nested Developer ID signatures. Re-run the byte/signature contract.
 run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" verify-bundle \

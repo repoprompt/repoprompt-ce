@@ -8,26 +8,42 @@ CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"
 source "$SCRIPT_DIR/load_release_metadata.sh"
 
 TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-APPLE_IDENTITY_POLICY="$SCRIPT_DIR/apple_identity_policy.json"
 ROLLOUT_TOOL="$SCRIPT_DIR/stable_rollout.py"
 ENTITLEMENTS_TEMPLATE="$TRUSTED_ROOT/AppBundle/RepoPrompt.entitlements.template"
 CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"
 TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
-IDENTITY_MIGRATION_TARGET_IDENTIFIER="com.repoprompt.ce"
-IDENTITY_MIGRATION_TARGET_TEAM_ID="69N6K965SF"
-IDENTITY_MIGRATION_TARGET_REQUIREMENT='anchor apple generic and identifier "com.repoprompt.ce" and certificate leaf[subject.OU] = "69N6K965SF" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
 
-load_release_metadata_with_identity_projection \
-    "$METADATA_ROOT" \
-    "${REPOPROMPT_APPROVED_SOURCE_ROOT:-}" \
-    "$SCRIPT_DIR" \
-    "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" ||
-    fail "Unable to load the reviewed release identity context"
+TIP_CONTEXT_MODE=0
+case "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" in
+"")
+    load_release_metadata "$METADATA_ROOT" || fail "Unable to load release metadata"
+    validate_stable_release_context \
+        "$BUNDLE_ID" \
+        "$SIGNING_TEAM_ID" \
+        "${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}" \
+        "${SIGN_IDENTITY:-}" || fail "Stable release context validation failed"
+    IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"
+    ;;
+tip-rollout-v1)
+    TIP_CONTEXT_MODE=1
+    load_verified_tip_release_context \
+        "$SCRIPT_DIR" \
+        "${REPOPROMPT_APPROVED_SOURCE_ROOT:-}" \
+        "sign-staged-release" \
+        "$ROOT_DIR" || fail "Unable to verify the staged Tip release context"
+    IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"
+    EXPECTED_APP_BUNDLE_ID="$BUNDLE_ID"
+    EXPECTED_APP_TEAM_ID="$SIGNING_TEAM_ID"
+    ;;
+*)
+    fail "Unsupported REPOPROMPT_TIP_ARCHIVE_CONTRACT: $REPOPROMPT_TIP_ARCHIVE_CONTRACT"
+    ;;
+esac
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
@@ -35,6 +51,8 @@ ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 IDENTITY_MIGRATION_ANCHOR_DESTINATION="$APP_BUNDLE/Contents/Resources/IdentityMigration/RepoPromptIdentityAnchor"
 
 [[ -n "${SIGN_IDENTITY:-}" ]] || fail "Missing required environment variable: SIGN_IDENTITY"
+[[ "$SIGN_IDENTITY" == "$EXPECTED_SIGN_IDENTITY" ]] ||
+    fail "Application signing identity mismatch: expected $EXPECTED_SIGN_IDENTITY, got $SIGN_IDENTITY"
 [[ -f "${REPOPROMPT_PROVISIONING_PROFILE:-}" ]] ||
     fail "Missing RepoPrompt CE Developer ID provisioning profile"
 [[ -d "$APP_BUNDLE" ]] || fail "Missing staged app bundle: $APP_BUNDLE"
@@ -70,8 +88,8 @@ trap cleanup EXIT
 
 security cms -D -i "$REPOPROMPT_PROVISIONING_PROFILE" -o "$profile_plist"
 profile_app_identifier="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null || true)"
-[[ "$profile_app_identifier" == "$SIGNING_TEAM_ID.$BUNDLE_ID" ]] ||
-    fail "Provisioning profile app identifier mismatch: expected $SIGNING_TEAM_ID.$BUNDLE_ID, got ${profile_app_identifier:-<missing>}"
+[[ "$profile_app_identifier" == "$EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER" ]] ||
+    fail "Provisioning profile app identifier mismatch: expected $EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER, got ${profile_app_identifier:-<missing>}"
 cp "$REPOPROMPT_PROVISIONING_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
 python3 - "$ENTITLEMENTS_TEMPLATE" "$app_entitlements" "$BUNDLE_ID" "$SIGNING_TEAM_ID" <<'PYTHON'
 import sys
@@ -85,11 +103,12 @@ PYTHON
 plutil -lint "$app_entitlements"
 plutil -lint "$CODEX_V8_ENTITLEMENTS"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
-signing_mode_marker="$(python3 "$ROLLOUT_TOOL" signing-mode \
-    --policy "$APPLE_IDENTITY_POLICY" \
-    --bundle-id "$BUNDLE_ID" \
-    --team-id "$SIGNING_TEAM_ID")" ||
-    fail "Release bundle/team pair is not a reviewed Apple identity"
+if (( TIP_CONTEXT_MODE )); then
+    signing_mode_marker="$(python3 "$ROLLOUT_TOOL" signing-mode-from-context)" ||
+        fail "Unable to derive the signing mode from the verified Tip context"
+else
+    signing_mode_marker="$EXPECTED_SIGNING_MODE"
+fi
 plutil -replace RepoPromptSigningMode -string "$signing_mode_marker" "$APP_BUNDLE/Contents/Info.plist"
 
 identity_migration_phase="$(
@@ -103,10 +122,6 @@ case "$identity_migration_phase" in
 disabled)
     ;;
 legacy-preparer)
-    [[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce" ]] ||
-        fail "Legacy identity preparer must retain bundle identifier com.pvncher.repoprompt.ce"
-    [[ "$SIGNING_TEAM_ID" == "648A27MST5" ]] ||
-        fail "Legacy identity preparer must retain signing Team ID 648A27MST5"
     identity_migration_anchor="${REPOPROMPT_IDENTITY_MIGRATION_ANCHOR:-}"
     [[ -n "$identity_migration_anchor" ]] ||
         fail "Legacy identity preparer signing requires REPOPROMPT_IDENTITY_MIGRATION_ANCHOR"
@@ -117,10 +132,8 @@ legacy-preparer)
     anchor_signature_details="$(codesign -dv --verbose=4 "$identity_migration_anchor" 2>&1)"
     anchor_identifier="$(printf '%s\n' "$anchor_signature_details" | awk -F= '/^Identifier=/{print $2; exit}')"
     anchor_team="$(printf '%s\n' "$anchor_signature_details" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
-    [[ "$anchor_identifier" == "$IDENTITY_MIGRATION_TARGET_IDENTIFIER" ]] ||
-        fail "Identity migration anchor identifier mismatch: expected $IDENTITY_MIGRATION_TARGET_IDENTIFIER, got ${anchor_identifier:-<missing>}"
-    [[ "$anchor_team" == "$IDENTITY_MIGRATION_TARGET_TEAM_ID" ]] ||
-        fail "Identity migration anchor team mismatch: expected $IDENTITY_MIGRATION_TARGET_TEAM_ID, got ${anchor_team:-<missing>}"
+    validate_resolved_migration_anchor_identity "$anchor_identifier" "$anchor_team" ||
+        fail "Identity migration anchor does not match the resolved release context"
     mkdir -p "$(dirname "$IDENTITY_MIGRATION_ANCHOR_DESTINATION")"
     ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
     chmod 755 "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
@@ -180,6 +193,7 @@ sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+codesign --verify --strict --verbose=2 -R="$EXPECTED_APP_REQUIREMENT" "$APP_BUNDLE"
 python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --manifest "$CODEX_MANIFEST" verify-bundle \
     --arch all \
@@ -203,9 +217,9 @@ cmp "$canonical_app_entitlements" "$canonical_signed_entitlements" ||
 signature_details="$(codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1)"
 identifier="$(printf '%s\n' "$signature_details" | awk -F= '/^Identifier=/{print $2; exit}')"
 team="$(printf '%s\n' "$signature_details" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
-[[ "$identifier" == "$BUNDLE_ID" ]] ||
-    fail "Signed app identifier mismatch: expected $BUNDLE_ID, got ${identifier:-<missing>}"
-[[ "$team" == "$SIGNING_TEAM_ID" ]] ||
-    fail "Signed app team mismatch: expected $SIGNING_TEAM_ID, got ${team:-<missing>}"
+[[ "$identifier" == "$EXPECTED_APP_BUNDLE_ID" ]] ||
+    fail "Signed app identifier mismatch: expected $EXPECTED_APP_BUNDLE_ID, got ${identifier:-<missing>}"
+[[ "$team" == "$EXPECTED_APP_TEAM_ID" ]] ||
+    fail "Signed app team mismatch: expected $EXPECTED_APP_TEAM_ID, got ${team:-<missing>}"
 
 printf 'OK: staged app signed for Developer ID distribution.\n'

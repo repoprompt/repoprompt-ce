@@ -6,7 +6,7 @@ import XCTest
 /// carries more than one item. These tests pin the eligibility contract:
 /// filter first, then pick the greatest eligible build.
 final class AppcastEligibilityTests: XCTestCase {
-    /// Preparer ZIP: build 120, no autoupdate constraint.
+    /// Preparer ZIP: build 120, no update constraint.
     /// Transition PKG: build 150, requires build 120, package install.
     /// Successor ZIP: build 200, requires build 150.
     private let siblingLadderXML = """
@@ -25,6 +25,7 @@ final class AppcastEligibilityTests: XCTestCase {
                 <sparkle:shortVersionString>1.5.0</sparkle:shortVersionString>
                 <sparkle:version>150</sparkle:version>
                 <sparkle:minimumSystemVersion>13.5</sparkle:minimumSystemVersion>
+                <sparkle:minimumUpdateVersion>120</sparkle:minimumUpdateVersion>
                 <sparkle:minimumAutoupdateVersion>120</sparkle:minimumAutoupdateVersion>
                 <enclosure url="https://example.com/RepoPromptTransition-1.5.0.pkg" sparkle:installationType="package" />
             </item>
@@ -33,6 +34,7 @@ final class AppcastEligibilityTests: XCTestCase {
                 <sparkle:shortVersionString>2.0.0</sparkle:shortVersionString>
                 <sparkle:version>200</sparkle:version>
                 <sparkle:minimumSystemVersion>13.5</sparkle:minimumSystemVersion>
+                <sparkle:minimumUpdateVersion>150</sparkle:minimumUpdateVersion>
                 <sparkle:minimumAutoupdateVersion>150</sparkle:minimumAutoupdateVersion>
                 <enclosure url="https://example.com/RepoPrompt-2.0.0.zip" />
             </item>
@@ -64,6 +66,7 @@ final class AppcastEligibilityTests: XCTestCase {
         let version = try XCTUnwrap(AppcastParser().parse(data: Data(xml.utf8), context: context(build: "27")))
 
         XCTAssertEqual(version.buildNumber, "28")
+        XCTAssertNil(version.minimumUpdateVersion)
         XCTAssertNil(version.minimumAutoupdateVersion)
         XCTAssertNil(version.installationType)
     }
@@ -71,6 +74,12 @@ final class AppcastEligibilityTests: XCTestCase {
     func testSiblingLadderFiltersBeforeSelectingGreatestBuild() throws {
         let items = AppcastParser().parseItems(data: Data(siblingLadderXML.utf8))
         XCTAssertEqual(items.count, 3)
+        XCTAssertNil(items[0].minimumUpdateVersion)
+        XCTAssertNil(items[0].minimumAutoupdateVersion)
+        XCTAssertEqual(items[1].minimumUpdateVersion, "120")
+        XCTAssertEqual(items[1].minimumAutoupdateVersion, "120")
+        XCTAssertEqual(items[2].minimumUpdateVersion, "150")
+        XCTAssertEqual(items[2].minimumAutoupdateVersion, "150")
 
         // Unprepared legacy client sees only the preparer, not the higher builds.
         let oldClient = try XCTUnwrap(AppcastParser.select(from: items, context: context(build: "100")))
@@ -93,7 +102,7 @@ final class AppcastEligibilityTests: XCTestCase {
         XCTAssertNil(AppcastParser.select(from: items, context: context(build: "200", osMajor: 12)))
     }
 
-    func testMinimumAutoupdateVersionBoundaryIsInclusive() {
+    func testMinimumUpdateVersionBoundaryIsInclusive() {
         let item = AppcastVersion(
             version: "2.0.0",
             buildNumber: "200",
@@ -103,7 +112,8 @@ final class AppcastEligibilityTests: XCTestCase {
             releaseNotesURL: nil,
             downloadURL: "https://example.com/update.zip",
             minimumSystemVersion: nil,
-            minimumAutoupdateVersion: "150",
+            minimumUpdateVersion: "150",
+            minimumAutoupdateVersion: nil,
             installationType: nil
         )
 
@@ -112,6 +122,44 @@ final class AppcastEligibilityTests: XCTestCase {
         XCTAssertFalse(AppcastItemEligibility.isEligible(item, context: context(build: "149")))
         // A malformed local build cannot prove eligibility for a constrained item.
         XCTAssertFalse(AppcastItemEligibility.isEligible(item, context: context(build: "unknown")))
+    }
+
+    func testMinimumAutoupdateVersionAloneFailsClosed() {
+        let item = AppcastVersion(
+            version: "2.0.0",
+            buildNumber: "200",
+            title: nil,
+            date: nil,
+            description: nil,
+            releaseNotesURL: nil,
+            downloadURL: "https://example.com/update.zip",
+            minimumSystemVersion: nil,
+            minimumUpdateVersion: nil,
+            minimumAutoupdateVersion: "150",
+            installationType: nil
+        )
+
+        XCTAssertFalse(AppcastItemEligibility.isEligible(item, context: context(build: "150")))
+        XCTAssertFalse(AppcastItemEligibility.isEligible(item, context: context(build: "999")))
+    }
+
+    func testDivergentMinimumUpdateAndAutoupdateVersionsFailClosed() {
+        let item = AppcastVersion(
+            version: "2.0.0",
+            buildNumber: "200",
+            title: nil,
+            date: nil,
+            description: nil,
+            releaseNotesURL: nil,
+            downloadURL: "https://example.com/update.zip",
+            minimumSystemVersion: nil,
+            minimumUpdateVersion: "150",
+            minimumAutoupdateVersion: "149",
+            installationType: nil
+        )
+
+        XCTAssertFalse(AppcastItemEligibility.isEligible(item, context: context(build: "150")))
+        XCTAssertFalse(AppcastItemEligibility.isEligible(item, context: context(build: "999")))
     }
 
     func testSupportedInstallationTypesAreApplicationAndPackageOnly() {
@@ -125,6 +173,7 @@ final class AppcastEligibilityTests: XCTestCase {
                 releaseNotesURL: nil,
                 downloadURL: "https://example.com/update.zip",
                 minimumSystemVersion: nil,
+                minimumUpdateVersion: nil,
                 minimumAutoupdateVersion: nil,
                 installationType: installationType
             )
@@ -145,6 +194,7 @@ final class AppcastEligibilityTests: XCTestCase {
                 <item>
                     <sparkle:shortVersionString>3.0.0</sparkle:shortVersionString>
                     <sparkle:version>300</sparkle:version>
+                    <sparkle:minimumUpdateVersion>not-a-build</sparkle:minimumUpdateVersion>
                     <sparkle:minimumAutoupdateVersion>not-a-build</sparkle:minimumAutoupdateVersion>
                     <enclosure url="https://example.com/RepoPrompt-3.0.0.zip" />
                 </item>
@@ -246,6 +296,7 @@ final class AppcastEligibilityTests: XCTestCase {
                     releaseNotesURL: nil,
                     downloadURL: "https://example.com/Transition.pkg",
                     minimumSystemVersion: nil,
+                    minimumUpdateVersion: nil,
                     minimumAutoupdateVersion: nil,
                     installationType: "package"
                 )

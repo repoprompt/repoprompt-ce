@@ -18,7 +18,7 @@ on:
 
 concurrency:
   group: release-draft-creation
-  cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read
@@ -72,11 +72,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Reject dormant rollout roles and sibling publication
+      - name: Resolve Stable release identity context
+        env:
+          REQUESTED_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}
         run: |
+          set -euo pipefail
           python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard \
             --declaration release-source/release-rollout.json \
             --policy trusted-control-plane/Scripts/apple_identity_policy.json
+          python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration release-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env release-source/version.env \
+            --expected-migration-phase "$REQUESTED_IDENTITY_MIGRATION_PHASE" \
+            --github-env "$GITHUB_ENV" \
+            --github-summary "$GITHUB_STEP_SUMMARY"
 
       - name: Build and stage approved source
         env:
@@ -86,7 +96,6 @@ jobs:
           SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
-          REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}
           # Link the Sentry SDK into the official release binary. The protected DSN is
           # injected later in the signing job, so the secret-free stage stays inert.
           REPOPROMPT_ENABLE_SENTRY: "1"
@@ -135,16 +144,25 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Reject dormant rollout roles and sibling publication
+      - name: Resolve Stable release identity context
+        env:
+          REQUESTED_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}
         run: |
+          set -euo pipefail
           python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard \
             --declaration approved-source/release-rollout.json \
             --policy trusted-control-plane/Scripts/apple_identity_policy.json
+          python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration approved-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env approved-source/version.env \
+            --expected-migration-phase "$REQUESTED_IDENTITY_MIGRATION_PHASE" \
+            --github-env "$GITHUB_ENV" \
+            --github-summary "$GITHUB_STEP_SUMMARY"
 
       - name: Verify and expand staged release source
         env:
           RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
-          REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}
         run: |
           set -euo pipefail
           cd staged-release
@@ -180,10 +198,6 @@ jobs:
             fi
           }
           trap cleanup_certificate_and_failed_keychain EXIT
-          eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
-            --declaration approved-source/release-rollout.json \
-            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
-            --version-env approved-source/version.env)"
           : "${EXPECTED_SIGN_IDENTITY:?Apple application identity is missing from the reviewed policy}"
           printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
           security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
@@ -212,13 +226,9 @@ jobs:
           umask 077
           : "${SUCCESSOR_CERTIFICATE_P12_BASE64:?Successor Developer ID Application certificate is not configured}"
           : "${SUCCESSOR_CERTIFICATE_P12_PASSWORD:?Successor Developer ID Application password is not configured}"
-          eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
-            --declaration approved-source/release-rollout.json \
-            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
-            --version-env approved-source/version.env)"
-          expected_identity="$EXPECTED_SUCCESSOR_SIGN_IDENTITY"
+          expected_identity="$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY"
           [[ -n "$expected_identity" ]] || {
-            echo "Successor signing identity is missing from the reviewed policy" >&2
+            echo "Migration-anchor signing identity is missing from the reviewed policy" >&2
             exit 1
           }
           successor_certificate="$RUNNER_TEMP/repoprompt-release-successor.p12"
@@ -244,12 +254,15 @@ jobs:
               exit 1
             }
           codesign --force --sign "$expected_identity" --keychain "$KEYCHAIN_PATH" \
-            --identifier com.repoprompt.ce --timestamp --options runtime "$anchor"
-          successor_requirement='anchor apple generic and identifier "com.repoprompt.ce" and certificate leaf[subject.OU] = "69N6K965SF" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
-          codesign --verify --strict --verbose=2 -R="$successor_requirement" "$anchor"
+            --identifier "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" \
+            --timestamp --options runtime "$anchor"
+          codesign --verify --strict --verbose=2 \
+            -R="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" "$anchor"
           signature_details="$(codesign -dv --verbose=4 "$anchor" 2>&1)"
-          grep -Fx 'Identifier=com.repoprompt.ce' <<< "$signature_details" >/dev/null
-          grep -Fx 'TeamIdentifier=69N6K965SF' <<< "$signature_details" >/dev/null
+          grep -Fx "Identifier=$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" \
+            <<< "$signature_details" >/dev/null
+          grep -Fx "TeamIdentifier=$EXPECTED_MIGRATION_ANCHOR_TEAM_ID" \
+            <<< "$signature_details" >/dev/null
           printf 'REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=%s\n' "$anchor" >> "$GITHUB_ENV"
 
       - name: Prepare provisioning profile and notarization key
@@ -299,7 +312,6 @@ jobs:
           REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           REPOPROMPT_REQUIRE_HEAD_MATCH: 0
           REPOPROMPT_ENABLE_SENTRY: "1"
-          REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}

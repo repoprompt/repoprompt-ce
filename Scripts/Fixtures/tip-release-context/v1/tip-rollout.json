@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "channel": "tip",
+  "currentRole": "transition",
+  "eligibilityProfile": "synthetic-tip-transition-v1",
+  "expectedMigrationPhase": "disabled",
+  "expectedSigningIdentity": "successor",
+  "predecessors": [
+    {
+      "role": "preparer",
+      "tag": "tip-preparer0001",
+      "rolloutManifestSha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ]
+}

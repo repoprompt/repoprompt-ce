@@ -17,6 +17,7 @@ struct AppcastVersion {
     let releaseNotesURL: String?
     let downloadURL: String?
     let minimumSystemVersion: String?
+    let minimumUpdateVersion: String?
     let minimumAutoupdateVersion: String?
     let installationType: String?
 }
@@ -50,8 +51,16 @@ enum AppcastItemEligibility {
                   required <= context.osVersion
             else { return false }
         }
-        if let minimumAutoupdateVersion = item.minimumAutoupdateVersion {
-            guard let required = SparkleBuildVersion(minimumAutoupdateVersion),
+        switch (item.minimumUpdateVersion, item.minimumAutoupdateVersion) {
+        case (nil, nil):
+            break
+        case (nil, .some):
+            // minimumAutoupdateVersion is a compatibility projection, not the
+            // hard eligibility authority. It cannot gate an item by itself.
+            return false
+        case let (.some(minimumUpdateVersion), minimumAutoupdateVersion):
+            guard minimumAutoupdateVersion == nil || minimumAutoupdateVersion == minimumUpdateVersion,
+                  let required = SparkleBuildVersion(minimumUpdateVersion),
                   let currentBuild = SparkleBuildVersion(context.currentBuildNumber),
                   currentBuild >= required
             else { return false }
@@ -83,6 +92,7 @@ final class AppcastParser: NSObject, XMLParserDelegate {
     private var currentReleaseNotesURL: String?
     private var currentDownloadURL: String?
     private var currentMinimumSystemVersion: String?
+    private var currentMinimumUpdateVersion: String?
     private var currentMinimumAutoupdateVersion: String?
     private var currentInstallationType: String?
     private var currentText: String = ""
@@ -148,6 +158,7 @@ final class AppcastParser: NSObject, XMLParserDelegate {
         currentReleaseNotesURL = nil
         currentDownloadURL = nil
         currentMinimumSystemVersion = nil
+        currentMinimumUpdateVersion = nil
         currentMinimumAutoupdateVersion = nil
         currentInstallationType = nil
         currentText = ""
@@ -171,6 +182,7 @@ final class AppcastParser: NSObject, XMLParserDelegate {
             currentReleaseNotesURL = nil
             currentDownloadURL = nil
             currentMinimumSystemVersion = nil
+            currentMinimumUpdateVersion = nil
             currentMinimumAutoupdateVersion = nil
             currentInstallationType = nil
 
@@ -205,6 +217,7 @@ final class AppcastParser: NSObject, XMLParserDelegate {
                     releaseNotesURL: currentReleaseNotesURL,
                     downloadURL: currentDownloadURL,
                     minimumSystemVersion: currentMinimumSystemVersion,
+                    minimumUpdateVersion: currentMinimumUpdateVersion,
                     minimumAutoupdateVersion: currentMinimumAutoupdateVersion,
                     installationType: currentInstallationType
                 )
@@ -244,6 +257,11 @@ final class AppcastParser: NSObject, XMLParserDelegate {
         case "sparkle:minimumSystemVersion":
             if inItem, !trimmedText.isEmpty {
                 currentMinimumSystemVersion = trimmedText
+            }
+
+        case "sparkle:minimumUpdateVersion":
+            if inItem, !trimmedText.isEmpty {
+                currentMinimumUpdateVersion = trimmedText
             }
 
         case "sparkle:minimumAutoupdateVersion":

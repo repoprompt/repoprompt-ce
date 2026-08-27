@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<pkg-info overwrite-permissions="true" relocatable="false" identifier="com.repoprompt.ce.transition" postinstall-action="none" version="35.15.21" format-version="2" generator-version="InstallCmds-864.12 (25G76)" install-location="/Applications" auth="root">
+    <payload numberOfFiles="11" installKBytes="3"/>
+    <bundle path="./RepoPrompt CE.app" id="com.repoprompt.ce" CFBundleShortVersionString="1.3.0" CFBundleVersion="35.15.21"/>
+    <bundle-version>
+        <bundle id="com.repoprompt.ce"/>
+    </bundle-version>
+    <upgrade-bundle>
+        <bundle id="com.repoprompt.ce"/>
+    </upgrade-bundle>
+    <update-bundle/>
+    <atomic-update-bundle/>
+    <strict-identifier/>
+    <relocate/>
+</pkg-info>

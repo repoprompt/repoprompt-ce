@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "identities": {
+    "legacy": {
+      "bundleIdentifier": "com.example.legacy.repoprompt.ce",
+      "teamIdentifier": "OLDTEAM123",
+      "developerIDRequirement": "anchor apple generic and identifier \"com.example.legacy.repoprompt.ce\" and certificate leaf[subject.OU] = \"OLDTEAM123\"",
+      "developerIDApplicationIdentityName": "Developer ID Application: Synthetic Legacy (OLDTEAM123)"
+    },
+    "successor": {
+      "bundleIdentifier": "com.example.repoprompt.ce",
+      "teamIdentifier": "NEWTEAM456",
+      "developerIDRequirement": "anchor apple generic and identifier \"com.example.repoprompt.ce\" and certificate leaf[subject.OU] = \"NEWTEAM456\"",
+      "developerIDApplicationIdentityName": "Developer ID Application: Synthetic Successor (NEWTEAM456)",
+      "developerIDInstallerIdentityName": "Developer ID Installer: Synthetic Successor (NEWTEAM456)"
+    }
+  },
+  "sparkle": {
+    "stableFeedURL": "https://updates.example.invalid/stable/appcast.xml",
+    "tipFeedURL": "https://updates.example.invalid/tip/appcast.xml",
+    "sparklePublicEdDSAValue": "c3ludGhldGljLXB1YmxpYy1rZXk=",
+    "updateRepository": "example/repoprompt-ce-updates",
+    "tipUpdateRepository": "example/repoprompt-ce-tip-updates",
+    "minimumSystemVersion": "14.0"
+  },
+  "identityTransitionPackage": {
+    "identifier": "com.repoprompt.ce.transition",
+    "installLocation": "/Applications",
+    "appBundleName": "RepoPrompt CE.app",
+    "bundleIsRelocatable": false,
+    "bundleHasStrictIdentifier": false,
+    "bundleIsVersionChecked": true,
+    "bundleOverwriteAction": "upgrade",
+    "hasScripts": false,
+    "applicationBundleCount": 1
+  }
+}
