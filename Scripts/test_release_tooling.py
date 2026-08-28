@@ -6865,7 +6865,10 @@ class TipReleaseContextTests(unittest.TestCase):
                 marker.write_text(original + "dirty\n", encoding="utf-8")
                 rejected = self.resolve(fixture, output, digest)
                 self.assertNotEqual(rejected.returncode, 0)
-                self.assertIn(f"{label} Git checkout has tracked", rejected.stderr)
+                self.assertIn(
+                    f"{label} Git checkout has staged, working-tree, or untracked changes",
+                    rejected.stderr,
+                )
                 marker.write_text(original, encoding="utf-8")
 
         resolved = self.resolve(fixture, output, digest)
@@ -6891,7 +6894,52 @@ class TipReleaseContextTests(unittest.TestCase):
             "--trusted-tooling-root", str(fixture["trusted"]),
         )
         self.assertNotEqual(with_roots.returncode, 0)
-        self.assertIn("approved source Git checkout has tracked", with_roots.stderr)
+        self.assertIn(
+            "approved source Git checkout has staged, working-tree, or untracked changes",
+            with_roots.stderr,
+        )
+
+    def test_verify_rejects_untracked_shadow_module_and_writes_no_bytecode(self) -> None:
+        fixture = self.make_context_fixture()
+        trusted = Path(fixture["trusted"])
+
+        # Sibling-module imports inside the trusted root must not create
+        # untracked in-tree bytecode that would fail the next boundary's
+        # strict clean-checkout verification, even without the ambient
+        # PYTHONDONTWRITEBYTECODE test default.
+        bytecode_env = os.environ.copy()
+        bytecode_env.pop("PYTHONDONTWRITEBYTECODE", None)
+        bytecode_env.update(self.context_environment(fixture))
+        adapter = subprocess.run(
+            [
+                sys.executable,
+                str(trusted / "Scripts" / "stable_rollout.py"),
+                "predecessor-values-from-context",
+            ],
+            env=bytecode_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(adapter.returncode, 0, adapter.stderr)
+        self.assertEqual(list(trusted.rglob("__pycache__")), [])
+        clean = self.run_context("verify", *self.verification_arguments(fixture))
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+
+        # An untracked shadow module must be rejected even at the expected
+        # HEAD, before anything could import it from the trusted root.
+        shadow = trusted / "Scripts" / "hashlib.py"
+        shadow.write_text(
+            "raise AssertionError('untracked shadow module executed')\n",
+            encoding="utf-8",
+        )
+        rejected = self.run_context("verify", *self.verification_arguments(fixture))
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "trusted tooling Git checkout has staged, working-tree, or untracked changes",
+            rejected.stderr,
+        )
+        self.assertNotIn("untracked shadow module executed", rejected.stderr)
+        self.assertNotIn("untracked shadow module executed", rejected.stdout)
 
     def test_policy_owns_transition_contract_and_application_roles_omit_it(self) -> None:
         fixture = self.make_context_fixture()

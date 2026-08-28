@@ -34,6 +34,10 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+# Never write in-tree bytecode: an untracked __pycache__ would fail the
+# strict trusted-root clean-checkout verification.
+sys.dont_write_bytecode = True
+
 SPARKLE_NAMESPACE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 ROLLOUT_NAMESPACE = "https://repoprompt.com/xml-namespaces/rollout"
 DECLARATION_SCHEMA_VERSION = 1

@@ -16,7 +16,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-import tip_release_context
+# Never write in-tree bytecode: an untracked __pycache__ would fail the
+# strict trusted-root clean-checkout verification.
+sys.dont_write_bytecode = True
+
+import tip_release_context  # noqa: E402
 
 
 class TransitionPackageContractError(ValueError):

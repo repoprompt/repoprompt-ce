@@ -25,6 +25,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+# Never write in-tree bytecode: an untracked __pycache__ would fail the
+# strict trusted-root clean-checkout verification below.
+sys.dont_write_bytecode = True
+
 
 SCHEMA_VERSION = 1
 CONTEXT_KIND = "repoprompt-tip-release-context"
@@ -374,9 +378,13 @@ def require_git_head(root: Path, expected_commit: str, label: str) -> None:
 
 
 def require_clean_checkout(root: Path, label: str) -> None:
-    status = run_git(root, ["status", "--porcelain", "--untracked-files=no"], label)
+    # Include untracked files: an untracked shadow module (for example
+    # Scripts/hashlib.py) could execute on import even at the expected HEAD.
+    status = run_git(root, ["status", "--porcelain", "--untracked-files=all"], label)
     if status:
-        raise TipReleaseContextError(f"{label} Git checkout has tracked staged or working-tree changes")
+        raise TipReleaseContextError(
+            f"{label} Git checkout has staged, working-tree, or untracked changes"
+        )
 
 
 def require_committed_file(root: Path, commit: str, relative_path: str, label: str) -> Path:

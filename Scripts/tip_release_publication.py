@@ -43,6 +43,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+# Never write in-tree bytecode: an untracked __pycache__ would fail the
+# strict trusted-root clean-checkout verification.
+sys.dont_write_bytecode = True
+
 import stable_rollout as rollout  # noqa: E402
 import supervise_release_phase as supervisor  # noqa: E402
 import tip_release_context as context_tool  # noqa: E402
