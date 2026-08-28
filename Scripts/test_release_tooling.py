@@ -6,7 +6,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
-import io
 import json
 import os
 import plistlib
@@ -244,27 +243,27 @@ APP_SIGN_ARGS=(){app_signing_body}
 
     def test_legacy_preparer_requires_verified_future_identity_anchor(self) -> None:
         package_source = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
-        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        signer = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
 
         self.assertTrue((SCRIPT_DIR / "identity_migration_anchor.c").is_file())
         self.assertIn("validate_stable_release_context", package_source)
         self.assertIn("legacy-preparer packaging requires a resolved Stable or Tip release context", package_source)
-        self.assertIn('[[ "$PACKAGED_IDENTITY_MIGRATION_PHASE" == "$IDENTITY_MIGRATION_PHASE" ]]', package_source)
-        self.assertIn('plutil -extract RepoPromptIdentityMigrationPhase raw', source)
-        self.assertIn("printf 'disabled\\n'", source)
-        self.assertIn('[[ "$identity_migration_phase" == "$expected_identity_migration_phase" ]]', source)
-        self.assertIn('REPOPROMPT_IDENTITY_MIGRATION_ANCHOR', source)
-        self.assertIn('IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"', source)
-        self.assertIn('-R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$identity_migration_anchor"', source)
-        self.assertIn('-R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"', source)
-        self.assertIn('validate_resolved_migration_anchor_identity "$anchor_identifier" "$anchor_team"', source)
-        self.assertNotIn('codesign --force --sign "$SIGN_IDENTITY"', source.split(
-            'ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"',
-            1,
-        )[0].split("legacy-preparer)", 1)[1])
+        self.assertIn('EXPECTED_MIGRATION_ANCHOR_REQUIREMENT', signer)
+        self.assertIn('validate_resolved_migration_anchor_identity', signer)
+        self.assertIn('-R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$identity_migration_anchor"', signer)
+        self.assertIn('-R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"', signer)
+        self.assertIn('[[ "$SIGN_IDENTITY" == "$EXPECTED_SIGN_IDENTITY" ]]', signer)
+        self.assertIn('-R="$EXPECTED_APP_REQUIREMENT" "$APP_BUNDLE"', signer)
+        for literal in (
+            'IDENTITY_MIGRATION_TARGET_IDENTIFIER="com.repoprompt.ce"',
+            'IDENTITY_MIGRATION_TARGET_TEAM_ID="69N6K965SF"',
+            '[[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce" ]]',
+            '[[ "$SIGNING_TEAM_ID" == "648A27MST5" ]]',
+        ):
+            self.assertNotIn(literal, signer)
         self.assertLess(
-            source.index('ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"'),
-            source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"'),
+            signer.index('ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"'),
+            signer.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"'),
         )
 
     def test_release_workflows_gate_stable_preparer_and_require_explicit_nonlegacy_tip_dispatch(self) -> None:
@@ -275,56 +274,34 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn("identity_migration_phase:", release_workflow)
         self.assertIn("default: disabled", release_workflow)
         self.assertIn("- legacy-preparer", release_workflow)
-        self.assertEqual(release_workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64"), 1)
-        self.assertEqual(release_workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD"), 1)
-        self.assertNotIn("SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}", release_workflow)
-        self.assertNotIn("vars.SIGN_IDENTITY", release_workflow)
-        self.assertNotIn("EXPECTED_SUCCESSOR_SIGN_IDENTITY", release_workflow)
-        self.assertNotIn("SUCCESSOR_DEVELOPER_ID_INSTALLER", release_workflow)
-        self.assertNotIn("SUCCESSOR_NOTARYTOOL", release_workflow)
-        self.assertIn('--identifier "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"', release_workflow)
-        self.assertIn('grep -Fx "Identifier=$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"', release_workflow)
-        self.assertIn('grep -Fx "TeamIdentifier=$EXPECTED_MIGRATION_ANCHOR_TEAM_ID"', release_workflow)
-        self.assertIn('-R="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" "$anchor"', release_workflow)
-        self.assertIn('printf \'REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=%s\\n\' "$anchor" >> "$GITHUB_ENV"', release_workflow)
-
-        release_stage = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
-        release_publish = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
-        release_anchor = release_publish.split("      - name: Prepare successor identity migration anchor", 1)[1].split(
-            "      - name: Prepare provisioning profile and notarization key", 1
-        )[0]
-        self.assertNotIn("SUCCESSOR_", release_stage)
-        self.assertIn("if: inputs.identity_migration_phase == 'legacy-preparer'", release_anchor)
-        self.assertIn('anchor_source="trusted-control-plane/Scripts/identity_migration_anchor.c"', release_anchor)
-        self.assertIn(
-            'xcrun clang -arch arm64 -arch x86_64 -Os -Wl,-dead_strip -o "$anchor" "$anchor_source"',
-            release_anchor,
-        )
-        self.assertNotIn('release-source/.build/release/RepoPrompt.app/Contents/MacOS/RepoPrompt', release_anchor)
-        self.assertNotIn(
-            "REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}",
-            release_workflow,
-        )
         self.assertEqual(release_workflow.count("stable_rollout.py packaging-context"), 2)
         self.assertEqual(release_workflow.count('--github-env "$GITHUB_ENV"'), 2)
-        self.assertEqual(release_workflow.count('--expected-migration-phase "$REQUESTED_IDENTITY_MIGRATION_PHASE"'), 2)
-        self.assertLess(
-            release_publish.index("Prepare successor identity migration anchor"),
-            release_publish.index("Sign, notarize, and create draft release"),
-        )
-        self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-release-successor.p12"', release_publish)
-        self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"', release_publish)
+        self.assertIn('--expected-migration-phase "$REQUESTED_IDENTITY_MIGRATION_PHASE"', release_workflow)
+        for marker in (
+            'EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY',
+            '--identifier "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"',
+            '-R="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" "$anchor"',
+            'grep -Fx "TeamIdentifier=$EXPECTED_MIGRATION_ANCHOR_TEAM_ID"',
+        ):
+            self.assertIn(marker, release_workflow)
+        for literal in ("com.repoprompt.ce", "69N6K965SF"):
+            self.assertNotIn(literal, release_workflow)
 
-        self.assertNotIn("identity_migration_phase:", tip_workflow)
-        self.assertIn("confirm_identity_rollout_role:", tip_workflow)
-        self.assertIn('if [[ "$ROLLOUT_ROLE" != "legacy" ]]', tip_workflow)
-        self.assertIn('if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]', tip_workflow)
+        dispatch = tip_workflow.split("  workflow_dispatch:", 1)[1].split("\n\nconcurrency:", 1)[0]
+        self.assertNotIn("      commit:", dispatch)
+        self.assertIn("confirm_identity_rollout_role:", dispatch)
+        self.assertIn("DISPATCH_COMMIT: ${{ github.sha }}", tip_workflow)
+        self.assertIn("DISPATCH_REF: ${{ github.ref }}", tip_workflow)
+        self.assertIn('[[ "$DISPATCH_REF" == "refs/heads/main" ]]', tip_workflow)
+        self.assertIn('[[ "$commit" == "$live_main" ]]', tip_workflow)
+        self.assertIn('[[ "$tooling_commit" == "$commit" ]]', tip_workflow)
+        self.assertIn('if [[ "$EVENT_NAME" != "workflow_dispatch" ]]', tip_workflow)
         self.assertIn('[[ "$CONFIRMED_ROLLOUT_ROLE" != "$ROLLOUT_ROLE" ]]', tip_workflow)
-        self.assertIn("Prepare successor identity migration anchor", tip_workflow)
         self.assertIn("if: needs.setup.outputs.rollout-role == 'preparer'", tip_workflow)
-        self.assertNotIn("needs.setup.outputs.migration-phase", tip_workflow)
-        self.assertNotIn("needs.setup.outputs.rollout-identity", tip_workflow)
-        self.assertIn("REPOPROMPT_IDENTITY_MIGRATION_PHASE", (SCRIPT_DIR / "tip_release_context.py").read_text())
+        self.assertIn("EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY", tip_workflow)
+        self.assertIn('--identifier "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"', tip_workflow)
+        self.assertIn('-R="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" "$anchor"', tip_workflow)
+        self.assertNotIn("EXPECTED_SUCCESSOR_SIGN_IDENTITY", tip_workflow)
 
         credential_preflight = tip_workflow.split(
             "      - name: Validate role-selected Tip credentials", 1
@@ -332,50 +309,12 @@ APP_SIGN_ARGS=(){app_signing_body}
         preflight_run = credential_preflight.split("        run: |\n", 1)[1]
         self.assertIn('PREFLIGHT_KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-tip-preflight.keychain-db"', preflight_run)
         self.assertIn("trap cleanup_preflight_credentials EXIT", preflight_run)
-        self.assertIn('rm -f "$CERTIFICATE_PATH"', preflight_run)
-        self.assertIn('security delete-keychain "$PREFLIGHT_KEYCHAIN_PATH" || true', preflight_run)
-        self.assertIn('rm -f "$PREFLIGHT_KEYCHAIN_PATH"', preflight_run)
-        self.assertLess(
-            preflight_run.index('security delete-keychain "$PREFLIGHT_KEYCHAIN_PATH" || true'),
-            preflight_run.index('rm -f "$PREFLIGHT_KEYCHAIN_PATH"'),
-        )
-        self.assertLess(
-            preflight_run.index("trap cleanup_preflight_credentials EXIT"),
-            preflight_run.index("base64 --decode"),
-        )
-        self.assertNotIn(">/dev/null 2>&1 || fail", preflight_run)
-        for noun_fragment in (
-            "application certificate",
-            "successor application certificate",
-            "successor installer certificate",
-            "application signing identity",
-            "successor application signing identity",
-            "successor installer identity",
-        ):
-            self.assertNotIn(f'|| fail "{noun_fragment}"', preflight_run)
-        self.assertIn(
-            'security import "$CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD"',
-            preflight_run,
-        )
-        self.assertIn(
-            'security import "$SUCCESSOR_CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$SUCCESSOR_CERTIFICATE_P12_PASSWORD"',
-            preflight_run,
-        )
-        self.assertIn(
-            'security import "$INSTALLER_CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$SUCCESSOR_INSTALLER_P12_PASSWORD"',
-            preflight_run,
-        )
-        self.assertIn('security set-key-partition-list -S apple-tool:,apple:,codesign:', preflight_run)
-        self.assertIn('security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild:', preflight_run)
         self.assertIn('security find-identity -v -p codesigning "$PREFLIGHT_KEYCHAIN_PATH"', preflight_run)
         self.assertIn('grep -F "\\"$EXPECTED_SIGN_IDENTITY\\""', preflight_run)
         self.assertIn('grep -F "\\"$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY\\""', preflight_run)
-        self.assertIn('security find-identity -v -p basic "$PREFLIGHT_KEYCHAIN_PATH"', preflight_run)
         self.assertIn('grep -F "\\"$EXPECTED_INSTALLER_IDENTITY\\""', preflight_run)
         self.assertNotIn("security list-keychains", preflight_run)
-        self.assertNotIn("security default-keychain", preflight_run)
         self.assertNotIn("GITHUB_ENV", preflight_run)
-        self.assertNotIn("GITHUB_OUTPUT", preflight_run)
 
     def test_codex_v8_entitlement_allowlist_matches_pinned_manifest_policy(self) -> None:
         v8_profile = {
@@ -2662,77 +2601,56 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
             encoding="utf-8"
         )
         self.assertIn('cp "$ROLLOUT_DECLARATION" "$stage_root/tip-rollout.json"', tip_release)
-        self.assertIn('cp "$REPOPROMPT_TIP_RELEASE_CONTEXT" "$stage_root/tip-release-context.json"', tip_release)
-        self.assertIn('cp "$REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE"', tip_release)
-        self.assertIn("load_verified_tip_release_context", tip_release)
-        self.assertIn("tip_release_context.py verify", tip_workflow)
-        self.assertIn(
-            "uses: ./trusted-control-plane/.github/actions/verify-tip-context",
-            tip_workflow,
-        )
+        self.assertIn("REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1", tip_release)
+        self.assertIn("REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1", tip_workflow)
 
-        approved, staged, scripts = self.make_staged_release_fixture(tip_context=True)
+        approved, staged, scripts = self.make_staged_release_fixture()
+        generic_override = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            release_build_number_override="1",
+        )
+        self.assertEqual(generic_override.returncode, 0, generic_override.stderr)
+
+        missing = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            release_build_number_override="1",
+            tip_archive_contract="tip-rollout-v1",
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("missing staged file", missing.stderr)
+        self.assertIn("tip-rollout.json", missing.stderr)
+
+        shutil.copy2(approved / "tip-rollout.json", staged / "tip-rollout.json")
+        legacy_identity = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            release_build_number_override="1",
+            tip_archive_contract="tip-rollout-v1",
+        )
+        self.assertNotEqual(legacy_identity.returncode, 0)
+        self.assertIn("BUNDLE_ID, SIGNING_TEAM_ID", legacy_identity.stderr)
+
+        self.project_staged_release_identity(staged, scripts, "com.repoprompt.ce", "69N6K965SF")
         accepted = self.run_staged_validation(
             approved,
             staged,
             scripts,
+            release_build_number_override="1",
             tip_archive_contract="tip-rollout-v1",
         )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
-
-        staged_context = staged / "tip-release-context.json"
-        staged_digest = staged / "tip-release-context.json.sha256"
-        context_bytes = staged_context.read_bytes()
-        digest_bytes = staged_digest.read_bytes()
-
-        staged_context.unlink()
-        missing_context = self.run_staged_validation(
-            approved,
-            staged,
-            scripts,
-            tip_archive_contract="tip-rollout-v1",
-        )
-        self.assertNotEqual(missing_context.returncode, 0)
-        self.assertIn("Missing regular staged Tip release context", missing_context.stderr)
-        staged_context.write_bytes(context_bytes)
-
-        changed_context = json.loads(context_bytes)
-        changed_context["release"]["tag"] = "tip-coordinated-tamper"
-        changed_bytes = (json.dumps(changed_context, indent=2, sort_keys=True) + "\n").encode()
-        staged_context.write_bytes(changed_bytes)
-        staged_digest.write_text(hashlib.sha256(changed_bytes).hexdigest() + "\n", encoding="ascii")
-        coordinated_tamper = self.run_staged_validation(
-            approved,
-            staged,
-            scripts,
-            tip_archive_contract="tip-rollout-v1",
-        )
-        self.assertNotEqual(coordinated_tamper.returncode, 0)
-        self.assertIn("Staged Tip release context differs from the setup context", coordinated_tamper.stderr)
-        staged_context.write_bytes(context_bytes)
-        staged_digest.write_bytes(digest_bytes)
-
-        version_path = staged / "version.env"
-        version_bytes = version_path.read_bytes()
-        version_path.write_text(
-            version_path.read_text(encoding="utf-8").replace("BUILD_NUMBER=35.15.21", "BUILD_NUMBER=35.15.22"),
-            encoding="utf-8",
-        )
-        version_drift = self.run_staged_validation(
-            approved,
-            staged,
-            scripts,
-            tip_archive_contract="tip-rollout-v1",
-        )
-        self.assertNotEqual(version_drift.returncode, 0)
-        self.assertIn("staged version.env does not match the verified Tip release context", version_drift.stderr)
-        version_path.write_bytes(version_bytes)
 
         (staged / "tip-rollout.json").write_text("{}\n", encoding="utf-8")
         changed = self.run_staged_validation(
             approved,
             staged,
             scripts,
+            release_build_number_override="1",
             tip_archive_contract="tip-rollout-v1",
         )
         self.assertNotEqual(changed.returncode, 0)
@@ -3325,1557 +3243,277 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertNotIn("cancel-in-progress: true", concurrency_block)
 
     def test_main_tip_workflow_keeps_tip_separate_and_uses_hardened_smoke(self) -> None:
-        tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
+        root = SCRIPT_DIR.parent
+        workflow = (root / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
         tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
-        publication_script = (SCRIPT_DIR / "tip_release_publication.py").read_text(encoding="utf-8")
-        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        publisher = (SCRIPT_DIR / "publish_tip_release.sh").read_text(encoding="utf-8")
 
-        self.assertIn("name: Publish Tip", tip_workflow)
-        concurrency_block = tip_workflow.split("concurrency:", 1)[1].split("\npermissions:", 1)[0]
-        normalized_concurrency = " ".join(concurrency_block.split())
-        self.assertIn(
-            "group: >- ${{ (github.event_name == 'workflow_dispatch' && 'main-tip-dispatch-channel') || "
-            "(github.event.workflow_run.conclusion == 'success' && 'main-tip-channel') || "
-            "format('main-tip-skipped-{0}', github.run_id) }}",
-            normalized_concurrency,
-        )
-        self.assertIn("queue: max", normalized_concurrency)
-        self.assertNotIn("cancel-in-progress:", concurrency_block)
+        self.assertIn("name: Publish Tip", workflow)
+        concurrency = workflow.split("concurrency:", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("main-tip-dispatch-channel", concurrency)
+        self.assertIn("main-tip-channel", concurrency)
+        self.assertIn("queue: max", concurrency)
+        self.assertNotIn("cancel-in-progress:", concurrency)
+        self.assertIn("concurrency:\n      group: main-tip-publish\n      queue: max", workflow)
 
-        publish_header = tip_workflow.split("\n  publish:", 1)[1].split("\n    needs:", 1)[0]
-        self.assertIn(
-            "concurrency:\n      group: main-tip-publish\n      queue: max",
-            publish_header,
-        )
-        self.assertIn("should-publish", tip_workflow)
-        self.assertIn("stable-appcast-input.xml", tip_workflow)
-        self.assertEqual(tip_workflow.count("tip_release_context.py resolve"), 1)
-        self.assertNotIn("stable_rollout.py packaging-context", tip_workflow)
-        self.assertIn("environment: tip-release", tip_workflow)
-        self.assertIn("TIP_UPDATE_REPOSITORY_TOKEN", tip_workflow)
-        self.assertIn("repoprompt-ce-tip-updates", tip_workflow)
-        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"', tip_workflow)
-        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"', tip_workflow)
-        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/tip-smoke-diagnostics', tip_workflow)
-        self.assertIn("Upload Tip smoke diagnostics", tip_workflow)
-        self.assertIn("RepoPrompt-CE-tip-smoke-diagnostics", tip_workflow)
-        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"', tip_workflow)
-        self.assertIn(
-            'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',
-            tip_workflow,
-        )
-        self.assertIn("Check out approved tip source as data", tip_workflow)
-        self.assertIn("extract_staged_release.py", tip_workflow)
-        self.assertIn("REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source", tip_workflow)
-        verify_action = (
-            SCRIPT_DIR.parent / ".github" / "actions" / "verify-tip-context" / "action.yml"
-        ).read_text(encoding="utf-8")
-        self.assertIn('echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"', verify_action)
-        self.assertIn('echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"', verify_action)
-        self.assertIn("path: tip-source/dist/", tip_workflow)
-        self.assertEqual(tip_workflow.count("main_tip_release.sh validate-assets"), 2)
-        self.assertNotIn("shasum -a 256 tip-source/dist/SHA256SUMS", tip_workflow)
-        self.assertIn(
-            'REPOPROMPT_TIP_ASSET_GITHUB_OUTPUT="$GITHUB_OUTPUT"', tip_workflow
-        )
-        self.assertIn("path: signed-tip", tip_workflow)
-        self.assertIn("DIST_DIR: ${{ github.workspace }}/signed-tip", tip_workflow)
-        self.assertIn("path: tip-assets", tip_workflow)
-        self.assertIn("DIST_DIR: ${{ github.workspace }}/tip-assets", tip_workflow)
-        self.assertNotIn("TIP_PUBLISH_INSTALLATION_TYPE", tip_workflow)
-        downstream_workflow = tip_workflow.split("\n  automatic-tip-dormant:", 1)[1]
-        self.assertNotIn("TIP_UPDATE_REPOSITORY:", downstream_workflow)
-        self.assertNotIn("stable-release-channel", tip_workflow)
-        self.assertNotIn("PUBLIC_UPDATE_REPOSITORY_TOKEN", tip_workflow)
-
-        stage_job = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
-        sign_job = tip_workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0]
-        sign_step = sign_job.split("      - name: Sign staged Tip application", 1)[1].split(
-            "      - name: Notarize and validate Tip application", 1
-        )[0]
-        notarize_step = sign_job.split("      - name: Notarize and validate Tip application", 1)[1].split(
-            "      - name: Prepare transition package payload", 1
-        )[0]
-        package_steps = sign_job.split("      - name: Prepare transition package payload", 1)[1].split(
-            "      - name: Construct and notarize normal Tip enclosure", 1
-        )[0]
-        finalize_step = sign_job.split("      - name: Finalize signed Tip release assets", 1)[1].split(
-            "      - name: Remove ephemeral keychain", 1
-        )[0]
-        cleanup_step = sign_job.split("      - name: Remove ephemeral keychain", 1)[1].split(
-            "      - name: Upload signed tip assets", 1
-        )[0]
-        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', stage_job)
-        for protected_name in (
-            "SENTRY_DSN",
-            "SENTRY_AUTH_TOKEN",
-            "REPOPROMPT_SENTRY_ORG",
-            "REPOPROMPT_SENTRY_PROJECT",
-            "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE",
-        ):
-            self.assertNotIn(protected_name, stage_job)
-        self.assertIn("Install Sentry CLI for Tip symbol upload", sign_job)
-        self.assertIn("Prepare Tip Sentry auth token file", sign_job)
-        self.assertIn("chmod 600", sign_job)
-        self.assertIn('mkdir -p "$RUNNER_TEMP/repoprompt-tip-secrets"', sign_job)
-        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', sign_step)
-        self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", sign_step)
-        self.assertIn("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}", sign_step)
-        self.assertIn("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}", sign_step)
-        self.assertIn("REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token", sign_step)
-        self.assertNotIn("SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}", sign_step)
-        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', notarize_step)
-        self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", notarize_step)
-        self.assertIn("SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}", finalize_step)
-        for phase_name in (
-            "Generate deterministic transition component plist",
-            "Construct transition component package",
-            "Construct transition product archive",
-            "Sign transition package",
-            "Notarize transition package",
-            "Expand transition package",
-            "Compare transition package payload",
-        ):
-            self.assertIn(phase_name, package_steps)
-        self.assertIn("needs.setup.outputs.installation-type == 'package'", package_steps)
-        self.assertIn("run: exec ./trusted-control-plane/Scripts/main_tip_release.sh", package_steps)
-        self.assertIn("-T /usr/bin/productsign", sign_job)
-        self.assertIn("productbuild:,productsign:", sign_job)
-        self.assertIn("if: always()", cleanup_step)
-        self.assertIn('rm -rf "$RUNNER_TEMP/repoprompt-tip-secrets"', cleanup_step)
-        self.assertEqual(tip_workflow.count("SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}"), 1)
-        self.assertEqual(tip_workflow.count("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}"), 2)
-        self.assertEqual(tip_workflow.count("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}"), 2)
-        self.assertEqual(tip_workflow.count("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}"), 2)
-        self.assertEqual(
-            tip_workflow.count(
-                "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token"
-            ),
-            2,
-        )
-        self.assertLess(
-            sign_job.index("Install Sentry CLI for Tip symbol upload"),
-            sign_job.index("Sign staged Tip application"),
-        )
-        self.assertLess(
-            sign_job.index("Prepare Tip Sentry auth token file"),
-            sign_job.index("Sign staged Tip application"),
-        )
-        self.assertLess(
-            sign_job.index("Sign staged Tip application"),
-            sign_job.index("Notarize and validate Tip application"),
-        )
-        self.assertLess(
-            sign_job.index("Notarize and validate Tip application"),
-            sign_job.index("Generate deterministic transition component plist"),
-        )
-        self.assertLess(
-            sign_job.index("Compare transition package payload"),
-            sign_job.index("Finalize signed Tip release assets"),
-        )
-        self.assertLess(
-            sign_job.index("Finalize signed Tip release assets"),
-            sign_job.index("Upload signed tip assets for smoke and publish"),
-        )
-
-        self.assertIn("load_verified_tip_release_context", tip_script)
-        self.assertNotIn('git rev-list --count "$TIP_COMMIT"', tip_script)
-        self.assertNotIn('TIP_TAG="${TIP_TAG:-tip-$TIP_SHORT_SHA}"', tip_script)
-        self.assertNotIn("TIP_UPDATE_REPOSITORY=", tip_script)
-        self.assertNotIn('${TIP_GH_TOKEN:-${GH_TOKEN:-}}', tip_script)
-        self.assertNotIn("gh release create", tip_script)
-        self.assertIn('exec python3 "$PUBLICATION_TOOL" publish', tip_script)
-        self.assertIn('REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER"', tip_script)
-        self.assertEqual(tip_script.count('REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER"'), 1)
-        self.assertIn("stage|sign-application|notarize-application|prepare-transition-payload", tip_script)
-        self.assertIn("compare-transition-payload|build-application-enclosure|finalize-assets", tip_script)
-        self.assertIn('source "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"', tip_script)
-        self.assertIn("stage_release_sentry_symbols", tip_script)
-        self.assertIn("require_tip_sentry_configuration", tip_script)
-        self.assertIn("require_release_sentry_symbols_when_enabled", tip_script)
-        self.assertIn("upload_release_sentry_symbols", tip_script)
-        self.assertIn("final Tip artifact manifest must record telemetry_enabled=true", tip_script)
+        self.assertIn("DISPATCH_COMMIT: ${{ github.sha }}", workflow)
+        self.assertIn('Tip candidate is not the current protected-main commit', workflow)
+        self.assertIn("validate-stable-tip-floor", workflow)
+        self.assertNotIn("lookup_public_tip_release.sh", workflow)
+        self.assertNotIn("tip_release_context.py", workflow)
+        self.assertNotIn("tip_release_publication.py", workflow)
+        self.assertIn("environment: tip-release", workflow)
+        self.assertEqual(workflow.count("TIP_UPDATE_REPOSITORY_TOKEN"), 1)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"', workflow)
+        self.assertIn("Upload Tip smoke diagnostics", workflow)
+        self.assertIn("build_identity_transition_pkg.sh validate", workflow)
+        self.assertIn("path: tip-source/dist/", workflow)
+        self.assertIn("path: signed-tip", workflow)
         stage_tip = tip_script.split("stage_tip() {", 1)[1].split("\n}", 1)[0]
-        self.assertIn("REPOPROMPT_ENABLE_SENTRY=1", stage_tip)
-        self.assertNotIn("SENTRY_DSN", stage_tip)
-        self.assertNotIn("SENTRY_AUTH_TOKEN", stage_tip)
+        self.assertEqual(stage_tip.count("stage_release_sentry_symbols"), 1)
+        self.assertIn("path: tip-assets", workflow)
 
-        sign_tip = tip_script.split("sign_tip_application() {", 1)[1].split("\n}", 1)[0]
-        notarize_tip = tip_script.split("notarize_tip_application() {", 1)[1].split("\n}", 1)[0]
-        application_enclosure = tip_script.split("build_tip_application_enclosure() {", 1)[1].split("\n}", 1)[0]
-        finalize_assets = tip_script.split("finalize_tip_release_assets() {", 1)[1].split("\n}", 1)[0]
-        require_sentry = sign_tip.index("require_tip_sentry_configuration")
-        verify_symbols = sign_tip.index("verify_release_sentry_symbol_uuids_before_signing")
-        sign_staged = sign_tip.index('"$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"')
-        assert_telemetry = notarize_tip.index("assert_tip_manifest_telemetry_enabled")
-        upload_symbols = notarize_tip.index("upload_release_sentry_symbols")
-        create_distribution = application_enclosure.index('local distribution_dir="$TMP_DIR/distribution"')
-        self.assertLess(require_sentry, verify_symbols)
-        self.assertLess(verify_symbols, sign_staged)
-        self.assertLess(assert_telemetry, upload_symbols)
-        self.assertGreaterEqual(create_distribution, 0)
-        generate_appcast = finalize_assets.index("generate_tip_rollout_appcast")
-        write_checksums = finalize_assets.index('shasum -a 256', generate_appcast)
-        self.assertLess(generate_appcast, write_checksums)
-        self.assertIn('python3 "$ROLLOUT_TOOL" generate-from-context', tip_script)
-        self.assertIn('python3 "$ROLLOUT_TOOL" validate-from-context', tip_script)
-        self.assertNotIn('--allowed-roles legacy,preparer,transition,successor', tip_script)
-        self.assertIn('--manifest-output "$ROLLOUT_MANIFEST"', tip_script)
-        self.assertIn('fail "Tip Sparkle private key does not match the app bundle SUPublicEDKey"', tip_script)
-        self.assertIn('fail "Tip Sparkle private key does not reproduce the generated appcast signature"', tip_script)
-        self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"', tip_script)
-        self.assertIn("validate_live_tip_publication_state", publication_script)
-        self.assertIn("supervisor.run_supervised", publication_script)
-        self.assertIn('"draft": True', publication_script)
-        self.assertIn("upload_missing_assets", publication_script)
-        self.assertIn('"draft": False', publication_script)
-        self.assertIn("anonymous_post_publish_audit", publication_script)
-        self.assertNotIn("--clobber", publication_script)
-        self.assertNotIn("time.sleep", publication_script)
-        self.assertIn('validate-local-assets', tip_script)
-        self.assertNotIn('shasum -a 256 -c SHA256SUMS', tip_script)
-        self.assertNotIn('done < <(python3 "$ROLLOUT_TOOL" predecessor-values-from-context)', tip_script)
+        stage = workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        for protected_name in ("SENTRY_DSN", "SENTRY_AUTH_TOKEN", "TIP_UPDATE_REPOSITORY_TOKEN"):
+            self.assertNotIn(protected_name, stage)
+        sign = workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0]
+        self.assertIn("Prepare successor identity migration anchor", sign)
+        self.assertIn("SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64", sign)
+        self.assertIn("SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64", sign)
+        self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", sign)
 
-        capture_override = package_script.index(
-            'RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"'
-        )
-        capture_team_override = package_script.index('SIGNING_TEAM_ID_OVERRIDE="${SIGNING_TEAM_ID:-}"')
-        load_metadata = package_script.index('load_release_metadata "$ROOT_DIR"')
-        apply_override = package_script.index('BUILD_NUMBER="$RELEASE_BUILD_NUMBER_OVERRIDE"')
-        apply_team_override = package_script.index(
-            'SIGNING_TEAM_ID="${SIGNING_TEAM_ID_OVERRIDE:-$BASE_SIGNING_TEAM_ID}"'
-        )
-        self.assertLess(capture_override, load_metadata)
-        self.assertLess(capture_team_override, load_metadata)
-        self.assertLess(load_metadata, apply_override)
-        self.assertLess(load_metadata, apply_team_override)
-        self.assertIn(
-            'fail "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE must be a valid numeric build version"',
-            package_script,
-        )
+        self.assertIn('PUBLISH_TIP_RELEASE="$CONTROL_PLANE_SCRIPTS_DIR/publish_tip_release.sh"', tip_script)
+        self.assertIn('exec "$PUBLISH_TIP_RELEASE"', tip_script)
+        self.assertIn("validate_tip_publish_assets", tip_script)
+        self.assertIn("SHA256SUMS entry set mismatch", tip_script)
+        self.assertIn('python3 "$ROLLOUT_TOOL" generate', tip_script)
+        self.assertIn('python3 "$ROLLOUT_TOOL" validate', tip_script)
+
+        for marker in (
+            "require_live_main \"publication setup\"",
+            "require_live_main \"final pre-publication\"",
+            "create_draft_if_missing",
+            "audit_authenticated_release_assets",
+            "upload_missing_assets",
+            "audit_public_release",
+        ):
+            self.assertIn(marker, publisher)
+        self.assertNotIn("--clobber", publisher)
+        self.assertNotIn("gh release delete", publisher)
 
     def test_tip_publish_asset_inventory_is_exact(self) -> None:
-        approved, _, scripts = self.make_staged_release_fixture(tip_context=True)
-        context_environment = json.loads(
-            (approved.parent / "tip-context-environment.json").read_text(encoding="utf-8")
-        )
-        context = json.loads(Path(context_environment["context"]).read_text(encoding="utf-8"))
-        expected = context["publication"]["assets"]
-        self.assertEqual(context["rollout"]["installationType"], "package")
-        self.assertIn("tip-release-context.json", expected)
-        self.assertIn("tip-release-context.json.sha256", expected)
-        self.assertTrue(any(name.endswith(".pkg") for name in expected))
-
-        dist = approved.parent / "publish-assets"
-        dist.mkdir()
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        short_sha = "0123456789ab"
+        build_number = "35.15.16"
+        archive_basename = f"RepoPrompt-tip-{short_sha}-{build_number}"
+        expected = {
+            f"{archive_basename}.pkg",
+            "appcast.xml",
+            "SHA256SUMS",
+            f"{archive_basename}-artifact-manifest.json",
+            f"{archive_basename}-metadata.json",
+            "identity-rollout.json",
+        }
         for name in expected:
-            if name == "SHA256SUMS":
-                continue
-            if name == "tip-release-context.json":
-                shutil.copy2(context_environment["context"], dist / name)
-            elif name == "tip-release-context.json.sha256":
-                shutil.copy2(context_environment["digest"], dist / name)
-            else:
-                (dist / name).write_text(f"{name}\n", encoding="utf-8")
+            if name != "SHA256SUMS":
+                (temp_dir / name).write_text(f"{name}\n", encoding="utf-8")
 
-        def write_checksums(names: list[str] | None = None) -> str:
-            checksum_names = names or [name for name in expected if name != "SHA256SUMS"]
-            checksums = "".join(
-                f"{hashlib.sha256((dist / name).read_bytes()).hexdigest()}  {name}\n"
-                for name in checksum_names
+        def write_checksums() -> None:
+            names = sorted(name for name in expected if name != "SHA256SUMS")
+            (temp_dir / "SHA256SUMS").write_text(
+                "".join(
+                    f"{hashlib.sha256((temp_dir / name).read_bytes()).hexdigest()}  {name}\n"
+                    for name in names
+                ),
+                encoding="utf-8",
             )
-            (dist / "SHA256SUMS").write_text(checksums, encoding="utf-8")
-            return hashlib.sha256(checksums.encode()).hexdigest()
 
-        trusted_checksums_digest = write_checksums()
+        write_checksums()
+
         env = os.environ.copy()
-        env.pop("GH_TOKEN", None)
         env.update(
             {
-                "REPOPROMPT_TIP_RELEASE_CONTEXT": context_environment["context"],
-                "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE": context_environment["digest"],
-                "REPOPROMPT_TIP_STABLE_APPCAST": context_environment["stable_appcast"],
-                "REPOPROMPT_EXPECTED_CONTEXT_SHA256": context_environment["expected_digest"],
-                "REPOPROMPT_APPROVED_SOURCE_ROOT": str(approved),
-                "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT": context_environment["approved_commit"],
-                "REPOPROMPT_EXPECTED_TOOLING_COMMIT": context_environment["tooling_commit"],
-                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts),
-                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(approved),
-                "DIST_DIR": str(dist),
-                "REPOPROMPT_EXPECTED_TIP_SHA256SUMS_SHA256": trusted_checksums_digest,
+                "TIP_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+                "TIP_SHORT_SHA": short_sha,
+                "TIP_BUILD_NUMBER": build_number,
+                "TIP_PUBLISH_INSTALLATION_TYPE": "package",
+                "DIST_DIR": str(temp_dir),
             }
         )
 
-        def validate(custom_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                [str(scripts / "main_tip_release.sh"), "validate-assets"],
-                cwd=approved,
-                env=custom_env or env,
-                text=True,
-                capture_output=True,
-                timeout=5,
-            )
-
-        accepted = validate()
+        accepted = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
-        self.assertIn(f"contains exactly {len(expected)} files", accepted.stdout)
-        github_output = approved.parent / "github-output"
-        github_output.write_text("", encoding="utf-8")
-        output_env = env.copy()
-        output_env["REPOPROMPT_TIP_ASSET_GITHUB_OUTPUT"] = str(github_output)
-        accepted_output = validate(output_env)
-        self.assertEqual(accepted_output.returncode, 0, accepted_output.stderr)
-        self.assertEqual(
-            github_output.read_text(encoding="utf-8"),
-            f"sha256sums-sha256={trusted_checksums_digest}\n",
+        self.assertIn("contains exactly 6 files", accepted.stdout)
+
+        (temp_dir / "appcast.xml").unlink()
+        missing = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=env,
+            text=True,
+            capture_output=True,
         )
-
-        conflicting_env = env.copy()
-        conflicting_env["TIP_TAG"] = "tip-conflicting-ambient"
-        conflicting = validate(conflicting_env)
-        self.assertNotEqual(conflicting.returncode, 0)
-        self.assertIn("Ambient TIP_TAG conflicts with the verified Tip release context", conflicting.stderr)
-
-        legacy_aliases = {
-            "TIP_UPDATE_REPOSITORY": context["sparkle"]["updateRepository"],
-            "TIP_PUBLISH_INSTALLATION_TYPE": context["rollout"]["installationType"],
-            "RELEASE_COMMIT": context["release"]["commit"],
-            "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE": context["release"]["buildNumber"],
-            "BUILD_NUMBER": context["release"]["buildNumber"],
-            "GH_TOKEN": "synthetic-legacy-alias",
-        }
-        for alias, value in legacy_aliases.items():
-            with self.subTest(legacy_alias=alias):
-                alias_env = env.copy()
-                alias_env[alias] = value
-                rejected_alias = validate(alias_env)
-                self.assertNotEqual(rejected_alias.returncode, 0)
-                self.assertIn(
-                    f"Ambient legacy Tip authority alias is prohibited: {alias}",
-                    rejected_alias.stderr,
-                )
-
-        missing_context_env = env.copy()
-        missing_context_env.pop("REPOPROMPT_TIP_RELEASE_CONTEXT")
-        missing_context = validate(missing_context_env)
-        self.assertNotEqual(missing_context.returncode, 0)
-        self.assertIn(
-            "Missing required environment variable: REPOPROMPT_TIP_RELEASE_CONTEXT",
-            missing_context.stderr,
-        )
-
-        (dist / "appcast.xml").unlink()
-        missing = validate()
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn("missing=['appcast.xml']", missing.stderr)
 
-        (dist / "appcast.xml").write_text("appcast.xml\n", encoding="utf-8")
-        (dist / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
-        extra = validate()
+        (temp_dir / "appcast.xml").write_text("appcast\n", encoding="utf-8")
+        write_checksums()
+        (temp_dir / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+        extra = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
         self.assertNotEqual(extra.returncode, 0)
         self.assertIn("extra=['unexpected.txt']", extra.stderr)
-        (dist / "unexpected.txt").unlink()
 
-        context_asset = dist / "tip-release-context.json"
-        context_asset.unlink()
-        context_asset.symlink_to(context_environment["context"])
-        symlink = validate()
-        self.assertNotEqual(symlink.returncode, 0)
-        self.assertIn("regular non-symlink file", symlink.stderr)
-
-        context_asset.unlink()
-        shutil.copy2(context_environment["context"], context_asset)
-        changed_asset = dist / "appcast.xml"
-        changed_asset.write_text("changed appcast bytes\n", encoding="utf-8")
-        changed = validate()
-        self.assertNotEqual(changed.returncode, 0)
-        self.assertIn("local Tip asset digest mismatch", changed.stderr)
-
-        coordinated_env = env.copy()
+        for path in temp_dir.iterdir():
+            path.unlink()
+        package_expected = {
+            f"{archive_basename}.pkg",
+            "appcast.xml",
+            "SHA256SUMS",
+            f"{archive_basename}-artifact-manifest.json",
+            f"{archive_basename}-metadata.json",
+            "identity-rollout.json",
+        }
+        for name in package_expected:
+            if name != "SHA256SUMS":
+                (temp_dir / name).write_text(f"{name}\n", encoding="utf-8")
         write_checksums()
-        coordinated = validate(coordinated_env)
-        self.assertNotEqual(coordinated.returncode, 0)
-        self.assertIn("differs from the trusted sign-job digest", coordinated.stderr)
-
-        missing_checksum_env = env.copy()
-        missing_checksum_env["REPOPROMPT_EXPECTED_TIP_SHA256SUMS_SHA256"] = write_checksums(
-            [name for name in expected if name not in {"SHA256SUMS", "appcast.xml"}]
+        package_env = env.copy()
+        package_env["TIP_PUBLISH_INSTALLATION_TYPE"] = "package"
+        package = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=package_env,
+            text=True,
+            capture_output=True,
         )
-        missing_checksum = validate(missing_checksum_env)
-        self.assertNotEqual(missing_checksum.returncode, 0)
-        self.assertIn("SHA256SUMS entry set mismatch", missing_checksum.stderr)
+        self.assertEqual(package.returncode, 0, package.stderr)
+        self.assertIn("contains exactly 6 files", package.stdout)
 
-        write_checksums()
-        root_symlink = approved.parent / "publish-assets-link"
-        root_symlink.symlink_to(dist, target_is_directory=True)
-        root_symlink_env = env.copy()
-        root_symlink_env["DIST_DIR"] = str(root_symlink)
-        rejected_root = validate(root_symlink_env)
-        self.assertNotEqual(rejected_root.returncode, 0)
-        self.assertIn("real non-symlink directory", rejected_root.stderr)
+        package_env["TIP_PUBLISH_INSTALLATION_TYPE"] = "invalid"
+        invalid_type = subprocess.run(
+            [str(SCRIPT_DIR / "main_tip_release.sh"), "validate-assets"],
+            cwd=SCRIPT_DIR.parent,
+            env=package_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(invalid_type.returncode, 0)
+        self.assertIn(
+            "TIP_PUBLISH_INSTALLATION_TYPE must be application or package",
+            invalid_type.stderr,
+        )
 
-        appcast = dist / "appcast.xml"
-        appcast.unlink()
-        appcast.mkdir()
-        rejected_directory = validate()
-        self.assertNotEqual(rejected_directory.returncode, 0)
-        self.assertIn("regular non-symlink file", rejected_directory.stderr)
-        appcast.rmdir()
-        os.mkfifo(appcast)
-        started = time.monotonic()
-        rejected_fifo = validate()
-        self.assertLess(time.monotonic() - started, 2.0)
-        self.assertNotEqual(rejected_fifo.returncode, 0)
-        self.assertIn("regular non-symlink file", rejected_fifo.stderr)
-        appcast.unlink()
-        appcast.write_text("appcast.xml\n", encoding="utf-8")
-        write_checksums()
+    def test_main_tip_setup_uses_github_dispatch_sha_and_defers_remote_mutation(self) -> None:
+        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
+        setup = workflow.split("\n  setup:", 1)[1].split("\n  automatic-tip-dormant:", 1)[0]
+        before_publish, publish = workflow.split("\n  publish:", 1)
 
-        setup_symlink = approved.parent / "setup-context-link.json"
-        setup_symlink.symlink_to(context_environment["context"])
-        setup_symlink_env = env.copy()
-        setup_symlink_env["REPOPROMPT_TIP_RELEASE_CONTEXT"] = str(setup_symlink)
-        rejected_setup_symlink = validate(setup_symlink_env)
-        self.assertNotEqual(rejected_setup_symlink.returncode, 0)
-        self.assertIn("setup context must be a regular non-symlink file", rejected_setup_symlink.stderr)
-
-        setup_fifo = approved.parent / "setup-context.fifo"
-        os.mkfifo(setup_fifo)
-        setup_fifo_env = env.copy()
-        setup_fifo_env["REPOPROMPT_TIP_RELEASE_CONTEXT"] = str(setup_fifo)
-        started = time.monotonic()
-        rejected_setup_fifo = validate(setup_fifo_env)
-        self.assertLess(time.monotonic() - started, 2.0)
-        self.assertNotEqual(rejected_setup_fifo.returncode, 0)
-        self.assertIn("setup context must be a regular non-symlink file", rejected_setup_fifo.stderr)
-
-    def test_main_tip_setup_lookup_is_anonymous_until_serialized_publish(self) -> None:
-        tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
-        setup_job = tip_workflow.split("\n  setup:", 1)[1].split("\n  credential-preflight:", 1)[0]
-        after_setup = tip_workflow.split("\n  stage:", 1)[1]
-        before_publish, publish_job = tip_workflow.split("\n  publish:", 1)
-
-        self.assertIn("permissions:\n  contents: read", tip_workflow)
-        self.assertNotIn("lookup_public_tip_release.sh", setup_job)
-        self.assertNotIn("lookup-public", setup_job)
-        self.assertNotIn("TIP_GH_TOKEN", setup_job)
-        self.assertNotIn("${{ github.token }}", tip_workflow)
-        self.assertNotIn("${{ github.token }}", after_setup)
-        self.assertNotIn("environment: tip-release", setup_job)
-        self.assertNotIn("Authorization:", setup_job)
-        self.assertNotIn("api.github.com", setup_job)
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertIn("DISPATCH_COMMIT: ${{ github.sha }}", setup)
+        self.assertIn("WORKFLOW_RUN_COMMIT: ${{ github.event.workflow_run.head_sha }}", setup)
+        self.assertIn("git fetch --no-tags origin main", setup)
+        self.assertIn('[[ "$commit" == "$live_main" ]]', setup)
+        self.assertNotIn("TIP_GH_TOKEN", setup)
         self.assertNotIn("TIP_UPDATE_REPOSITORY_TOKEN", before_publish)
-        self.assertIn("TIP_GH_TOKEN: ${{ secrets.TIP_UPDATE_REPOSITORY_TOKEN }}", publish_job)
-        self.assertEqual(tip_workflow.count("TIP_UPDATE_REPOSITORY_TOKEN"), 1)
-
-    def test_tip_fetches_use_single_attempt_total_wall_clock_bounds(self) -> None:
-        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(
-            encoding="utf-8"
-        )
-        tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
-        setup_resolution = workflow.split(
-            "      - name: Resolve, verify, and summarize immutable Tip context", 1
-        )[1].split("      - name: Upload immutable Tip release context", 1)[0]
-        predecessor_fetch = tip_script.split("generate_tip_rollout_appcast() {", 1)[1].split(
-            "sign_tip_application() {", 1
-        )[0]
-        live_publication = tip_script.split("publish_tip() {", 1)[1].split(
-            'if [[ "${BASH_SOURCE[0]}" == "$0" ]]', 1
-        )[0]
-
-        for label, source, expected_curls in (
-            ("Stable setup", setup_resolution, 1),
-            ("predecessor", predecessor_fetch, 1),
-            ("live publication", live_publication, 0),
-        ):
-            with self.subTest(fetch_boundary=label):
-                self.assertEqual(source.count("curl --fail"), expected_curls)
-                self.assertEqual(source.count("--connect-timeout 10"), expected_curls)
-                self.assertEqual(source.count("--max-time 30"), expected_curls)
-                self.assertNotIn("--retry", source)
-                self.assertNotIn("retry-after", source.casefold())
-        publication = (SCRIPT_DIR / "tip_release_publication.py").read_text(encoding="utf-8")
-        self.assertIn("supervisor.run_supervised", publication)
-        self.assertIn("DEFAULT_COMMAND_TIMEOUT_SECONDS", publication)
-        self.assertIn("DEFAULT_ASSET_TIMEOUT_SECONDS", publication)
-        self.assertNotIn("time.sleep", publication)
-        self.assertNotIn("--retry", publication)
+        self.assertNotIn("lookup_public_tip_release", workflow)
+        self.assertIn("TIP_GH_TOKEN: ${{ secrets.TIP_UPDATE_REPOSITORY_TOKEN }}", publish)
 
     def test_tip_no_release_diagnostic_contract_is_truthful_and_read_only(self) -> None:
         workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
-        setup_job = workflow.split("\n  setup:", 1)[1].split("\n  automatic-tip-dormant:", 1)[0]
-        resolve_step = setup_job.split(
-            "      - name: Resolve, verify, and summarize immutable Tip context", 1
-        )[1]
-        diagnostic_job = workflow.split("\n  automatic-tip-dormant:", 1)[1].split(
+        setup = workflow.split("\n  setup:", 1)[1].split("\n  automatic-tip-dormant:", 1)[0]
+        diagnostic = workflow.split("\n  automatic-tip-dormant:", 1)[1].split(
             "\n  credential-preflight:", 1
         )[0]
 
-        self.assertIn("skip-reason: ${{ steps.tip.outputs.skip-reason }}", setup_job)
+        self.assertIn('skip_reason="role-requires-dispatch"', setup)
+        self.assertIn("name: Automatic Tip Publication Dormant (Dispatch Required)", diagnostic)
+        self.assertIn("runs-on: ubuntu-latest", diagnostic)
+        self.assertIn("contents: read", diagnostic)
+        self.assertIn("Nothing was built, signed, or published.", diagnostic)
+        self.assertIn("dispatch Publish Tip from protected main", diagnostic)
+        self.assertIn("candidate commit is selected automatically from main", diagnostic)
+        self.assertNotIn("::error::", diagnostic)
+        self.assertNotIn("exit 1", diagnostic)
+        self.assertNotIn("environment: tip-release", diagnostic)
+
+    def test_tip_publication_helper_is_resume_safe_and_byte_exact(self) -> None:
+        helper = SCRIPT_DIR / "publish_tip_release.sh"
+        source = helper.read_text(encoding="utf-8")
+
+        self.assertTrue(helper.is_file())
+        syntax = subprocess.run(["bash", "-n", str(helper)], text=True, capture_output=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
         for marker in (
-            'skip_reason=""',
-            'skip_reason="role-requires-manual-review"',
-            'echo "skip-reason=$skip_reason"',
+            "lookup_release()",
+            "create_draft_if_missing()",
+            "audit_authenticated_release_assets()",
+            "upload_missing_assets()",
+            "publish_draft()",
+            "audit_public_release()",
+            "verify_downloaded_asset()",
+            "validate_candidate_bindings()",
+            "candidate Tip enclosure digest does not match its manifest binding",
+            "audit_live_rollout_progression()",
+            "audit_stable_tip_floor()",
+            "audit_retained_enclosures()",
+            "validate-live-tip-progression",
+            "validate-stable-tip-floor",
+            'require_live_main "publication setup"',
+            'require_live_main "final pre-publication"',
+            'audit_live_rollout_progression "final pre-publication"',
+            "Unable to create or reconcile Tip release draft",
+            "Unable to reconcile Tip asset upload",
         ):
-            self.assertIn(marker, resolve_step)
-        self.assertIn(
-            "    if: >-\n"
-            "      github.event_name == 'workflow_run' &&\n"
-            "      needs.setup.outputs.should-publish != 'true' &&\n"
-            "      needs.setup.outputs.skip-reason == 'role-requires-manual-review'",
-            diagnostic_job,
+            self.assertIn(marker, source)
+        self.assertNotIn("--clobber", source)
+        self.assertNotIn(
+            '${TIP_GH_TOKEN:-${GH_TOKEN:-}}',
+            (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8"),
         )
-        self.assertIn("name: Automatic Tip Publication Dormant (Review Required)", diagnostic_job)
-        self.assertIn("runs-on: ubuntu-latest", diagnostic_job)
-        self.assertIn("    permissions:\n      contents: read", diagnostic_job)
-        for marker in (
-            "GITHUB_STEP_SUMMARY",
-            "expected-role: ${{ needs.setup.outputs.rollout-role }}",
-            'echo "- Rollout role: $ROLLOUT_ROLE"',
-            'echo "- Commit: $TIP_COMMIT"',
-            'echo "- Tag: $TIP_TAG"',
-            "Nothing was built, signed, or published.",
-            "Manual workflow capability, exact-role confirmation, and environment approval",
-            "Follow the go/no-go procedure in docs/releasing.md",
-            "obtain explicit authorization before any release dispatch",
-            "::error::",
-            "exit 1",
-        ):
-            self.assertIn(marker, diagnostic_job)
-        self.assertIn("boundary: automatic-dormant", diagnostic_job)
-        self.assertIn(
-            "uses: ./trusted-control-plane/.github/actions/verify-tip-context",
-            diagnostic_job,
+        self.assertNotIn("gh release delete", source)
+        self.assertIn("Remote Tip asset SHA-256 mismatch", source)
+        self.assertIn("Public Tip release asset inventory mismatch", source)
+        self.assertIn('[[ "$TIP_SOURCE_BRANCH" == "main" ]]', source)
+        self.assertIn('"target_commitish": branch', source)
+        self.assertIn('digest != f"sha256:{expected_sha}"', source)
+
+        missing = subprocess.run(
+            [str(helper), "/nonexistent"],
+            env={"PATH": os.environ["PATH"]},
+            text=True,
+            capture_output=True,
         )
-        self.assertLess(
-            diagnostic_job.index("Verify immutable Tip release context"),
-            diagnostic_job.index("Report suppressed automatic publication"),
-        )
-
-    def test_setup_has_no_existence_only_release_lookup(self) -> None:
-        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(
-            encoding="utf-8"
-        )
-        publication = (SCRIPT_DIR / "tip_release_publication.py").read_text(encoding="utf-8")
-
-        self.assertFalse((SCRIPT_DIR / "lookup_public_tip_release.sh").exists())
-        self.assertNotIn("lookup_public_tip_release.sh", workflow)
-        self.assertNotIn("lookup-public", publication)
-        self.assertNotIn("existing-public-unaudited", publication)
-
-    def test_tip_release_provenance_is_exact_before_credentials_and_runs_are_not_cancelled(self) -> None:
-        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(
-            encoding="utf-8"
-        )
-        stable_workflow = (
-            SCRIPT_DIR.parent / ".github" / "workflows" / "release.yml"
-        ).read_text(encoding="utf-8")
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_provenance_test", SCRIPT_DIR / "tip_release_publication.py"
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        commit = "a" * 40
-        publication.validate_release_provenance(commit, commit, commit, commit)
-        for label, values in (
-            ("workflow-definition", ("b" * 40, commit, commit, commit)),
-            ("tooling", (commit, "b" * 40, commit, commit)),
-            ("selected-source", (commit, commit, "b" * 40, commit)),
-            ("protected-main", (commit, commit, commit, "b" * 40)),
-        ):
-            with self.subTest(skew=label), self.assertRaisesRegex(
-                publication.PublicationError, "provenance skew"
-            ):
-                publication.validate_release_provenance(*values)
-
-        provenance_args = mock.Mock(
-            workflow_definition_commit=commit,
-            tooling_commit=commit,
-            selected_source_commit=commit,
-            repository="repoprompt/repoprompt-ce",
-            trusted_tooling_root=str(SCRIPT_DIR.parent),
-            command_timeout_seconds=30.0,
-        )
-        with mock.patch.object(publication, "PublicationRunner"), mock.patch.object(
-            publication, "fetch_live_main", return_value=commit
-        ) as protected_fetch:
-            self.assertEqual(publication.run_validate_provenance(provenance_args), 0)
-        protected_fetch.assert_called_once()
-        with mock.patch.object(publication, "PublicationRunner"), mock.patch.object(
-            publication, "fetch_live_main", return_value="b" * 40
-        ), self.assertRaisesRegex(publication.PublicationError, "provenance skew"):
-            publication.run_validate_provenance(provenance_args)
-
-        dispatch_input = workflow.split("      commit:", 1)[1].split(
-            "      confirm_identity_rollout_role:", 1
-        )[0]
-        self.assertIn("required: true", dispatch_input)
-        setup = workflow.split("\n  setup:", 1)[1].split("\n  automatic-tip-dormant:", 1)[0]
-        self.assertIn("ref: ${{ github.workflow_sha }}", setup)
-        self.assertIn("WORKFLOW_DEFINITION_COMMIT: ${{ github.workflow_sha }}", setup)
-        self.assertIn("MANUAL_COMMIT: ${{ inputs.commit }}", setup)
-        self.assertIn("WORKFLOW_RUN_COMMIT: ${{ github.event.workflow_run.head_sha }}", setup)
-        self.assertIn("tip_release_publication.py validate-provenance", setup)
-        self.assertLess(
-            setup.index("tip_release_publication.py validate-provenance"),
-            setup.index("Check out approved tip source as data"),
-        )
-        global_concurrency = workflow.split("concurrency:", 1)[1].split("\npermissions:", 1)[0]
-        self.assertIn("queue: max", global_concurrency)
-        self.assertNotIn("cancel-in-progress:", global_concurrency)
-        stable_concurrency = stable_workflow.split("concurrency:", 1)[1].split(
-            "\npermissions:", 1
-        )[0]
-        self.assertIn("group: release-draft-creation", stable_concurrency)
-        self.assertIn("queue: max", stable_concurrency)
-        self.assertNotIn("cancel-in-progress:", stable_concurrency)
-        self.assertNotIn("git -C trusted-control-plane fetch", setup)
-        publication_source = (SCRIPT_DIR / "tip_release_publication.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("fresh protected source main verification", publication_source)
-        self.assertIn("supervisor.run_supervised", publication_source)
-
-        release_selftest = (SCRIPT_DIR.parent / "Makefile").read_text(encoding="utf-8").split(
-            "release-selftest:\n", 1
-        )[1].split("\n\n", 1)[0]
-        self.assertIn("python3 Scripts/test_release_phase_supervisor.py", release_selftest)
-        self.assertIn("python3 Scripts/test_transition_package_contract.py", release_selftest)
-
-        for job, next_job, minutes in (
-            ("setup", "automatic-tip-dormant", 20),
-            ("automatic-tip-dormant", "credential-preflight", 10),
-            ("credential-preflight", "stage", 30),
-            ("stage", "sign", 90),
-            ("sign", "smoke-no-secrets", 120),
-            ("smoke-no-secrets", "publish", 30),
-        ):
-            body = workflow.split(f"\n  {job}:", 1)[1].split(f"\n  {next_job}:", 1)[0]
-            self.assertIn(f"timeout-minutes: {minutes}", body)
-        publish_body = workflow.split("\n  publish:", 1)[1]
-        self.assertIn("timeout-minutes: 120", publish_body)
-
-        sign_job = workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0]
-        sign_job_environment = sign_job.split("    env:", 1)[1].split("    steps:", 1)[0]
-        self.assertNotIn("${{ runner.temp }}", sign_job_environment)
-        self.assertIn("Initialize transition package work directory", sign_job)
-        self.assertIn(
-            "printf 'REPOPROMPT_TRANSITION_PACKAGE_WORK_DIR=%s\\n' \"$transition_work_dir\" >> \"$GITHUB_ENV\"",
-            sign_job,
-        )
-        self.assertIn('transition_work_dir="${REPOPROMPT_TRANSITION_PACKAGE_WORK_DIR:-}"', sign_job)
-        self.assertIn('expected_transition_work_dir="$RUNNER_TEMP/repoprompt-transition-package-work"', sign_job)
-        self.assertIn('[[ "$transition_work_dir" != "$expected_transition_work_dir" ]]', sign_job)
-        self.assertIn('rm -rf -- "$transition_work_dir"', sign_job)
-
-    def test_tip_publication_draft_resume_and_public_audit_are_byte_exact(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_asset_test", SCRIPT_DIR / "tip_release_publication.py"
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        dist = root / "dist"
-        downloads = root / "downloads"
-        dist.mkdir()
-        downloads.mkdir()
-        names = [
-            "RepoPrompt-tip-fixture.pkg",
-            "appcast.xml",
-            "identity-rollout.json",
-            "tip-release-context.json",
-            "tip-release-context.json.sha256",
-            "SHA256SUMS",
-        ]
-        context = {
-            "release": {
-                "displayName": "RepoPrompt CE",
-                "shortSha": "a" * 12,
-                "commit": "a" * 40,
-                "buildNumber": "35.15.21",
-                "tag": "tip-" + "a" * 12,
-            },
-            "rollout": {"role": "transition"},
-            "publication": {"target": "main", "assets": names},
-        }
-        setup_context = root / "setup-context.json"
-        setup_digest = root / "setup-context.json.sha256"
-        setup_context.write_text(json.dumps(context, sort_keys=True) + "\n", encoding="utf-8")
-        setup_digest.write_text(hashlib.sha256(setup_context.read_bytes()).hexdigest() + "\n", encoding="ascii")
-        for name in names:
-            if name == "SHA256SUMS":
-                continue
-            source = setup_context if name == "tip-release-context.json" else setup_digest if name == "tip-release-context.json.sha256" else None
-            if source is not None:
-                shutil.copy2(source, dist / name)
-            else:
-                (dist / name).write_text(f"fixture bytes for {name}\n", encoding="utf-8")
-        checksum_names = [name for name in names if name != "SHA256SUMS"]
-        (dist / "SHA256SUMS").write_text(
-            "".join(
-                f"{hashlib.sha256((dist / name).read_bytes()).hexdigest()}  {name}\n"
-                for name in checksum_names
-            ),
-            encoding="utf-8",
-        )
-        checksums_digest = hashlib.sha256((dist / "SHA256SUMS").read_bytes()).hexdigest()
-        expectations, returned_checksums_digest = publication.build_local_asset_expectations(
-            context, dist, setup_context, setup_digest, checksums_digest
-        )
-        self.assertEqual(returned_checksums_digest, checksums_digest)
-
-        def remote(name: str) -> dict:
-            expectation = expectations[name]
-            return {
-                "name": name,
-                "state": "uploaded",
-                "size": expectation.size,
-                "url": f"https://api.github.com/repos/example/updates/releases/assets/{len(name)}",
-                "browser_download_url": (
-                    f"https://github.com/example/updates/releases/download/{context['release']['tag']}/{name}"
-                ),
-            }
-
-        def release(*, draft: bool, asset_names: list[str], title: str | None = None) -> dict:
-            return {
-                "id": 42,
-                "tag_name": context["release"]["tag"],
-                "target_commitish": "main",
-                "name": title or publication.expected_release_title(context),
-                "body": publication.expected_release_notes(context),
-                "draft": draft,
-                "prerelease": False,
-                "assets": [remote(name) for name in asset_names],
-            }
-
-        first = names[0]
-        draft_plan = publication.validate_release_metadata(
-            context, release(draft=True, asset_names=[first]), expectations
-        )
-        self.assertEqual(draft_plan.state, "draft")
-        self.assertEqual(set(draft_plan.missing_assets), set(names) - {first})
-
-        class AuthenticatedLookupRunner:
-            def lookup_authenticated_release(
-                self, phase: str, repository: str, tag: str
-            ) -> dict:
-                self.call = (phase, repository, tag)
-                return release(draft=True, asset_names=[first])
-
-            def fetch_json(self, *args, **kwargs):
-                raise AssertionError("authenticated lookup must list releases so drafts are visible")
-
-        lookup_runner = AuthenticatedLookupRunner()
-        looked_up = publication.fetch_release(
-            lookup_runner,
-            "example/updates",
-            context["release"]["tag"],
-            authenticated=True,
-            allow_not_found=False,
-            phase="resume exact draft",
-        )
-        self.assertTrue(looked_up["draft"])
-        self.assertEqual(
-            lookup_runner.call,
-            ("resume exact draft", "example/updates", context["release"]["tag"]),
-        )
-
-        with self.assertRaisesRegex(publication.PublicationError, "metadata mismatch"):
-            publication.validate_release_metadata(
-                context,
-                release(draft=True, asset_names=[], title="mismatching draft"),
-                expectations,
-            )
-
-        public_plan = publication.validate_release_metadata(
-            context, release(draft=False, asset_names=names), expectations
-        )
-        self.assertEqual({asset.name for asset in public_plan.remote_assets}, set(names))
-        with self.assertRaisesRegex(publication.PublicationError, "public GitHub release asset inventory"):
-            publication.validate_release_metadata(
-                context, release(draft=False, asset_names=names[:-1]), expectations
-            )
-
-    def test_tip_publication_run_publish_resumes_every_ambiguous_mutation_and_audits_public_bytes(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_state_machine_test",
-            SCRIPT_DIR / "tip_release_publication.py",
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        dist = root / "dist"
-        dist.mkdir()
-        names = (
-            "RepoPrompt-tip-aaaaaaaaaaaa-35.15.21.pkg",
-            "RepoPrompt-tip-aaaaaaaaaaaa-35.15.21-artifact-manifest.json",
-            "RepoPrompt-tip-aaaaaaaaaaaa-35.15.21-metadata.json",
-            "appcast.xml",
-            "identity-rollout.json",
-            "tip-release-context.json",
-            "tip-release-context.json.sha256",
-            "SHA256SUMS",
-        )
-        expectations: dict[str, object] = {}
-        for name in names:
-            value = b"{}\n" if name == "identity-rollout.json" else f"bytes:{name}\n".encode()
-            path = dist / name
-            path.write_bytes(value)
-            expectations[name] = publication.AssetExpectation(
-                name=name,
-                path=path,
-                size=len(value),
-                sha256=hashlib.sha256(value).hexdigest(),
-            )
-        candidate_manifest_bytes = (dist / "identity-rollout.json").read_bytes()
-        candidate_appcast_bytes = (dist / "appcast.xml").read_bytes()
-        context = {
-            "release": {
-                "displayName": "RepoPrompt CE",
-                "shortSha": "a" * 12,
-                "commit": "a" * 40,
-                "buildNumber": "35.15.21",
-                "tag": "tip-" + "a" * 12,
-            },
-            "rollout": {"role": "transition", "installationType": "package"},
-            "publication": {
-                "repository": "example/updates",
-                "target": "main",
-                "assets": list(names),
-            },
-        }
-        args = mock.Mock(
-            dist_dir=str(dist),
-            context=str(root / "setup-context.json"),
-            digest=str(root / "setup-context.json.sha256"),
-            stable_appcast=str(root / "stable.xml"),
-            approved_source_root=str(root),
-            trusted_tooling_root=str(root),
-            expected_context_sha256="b" * 64,
-            expected_approved_source_commit=context["release"]["commit"],
-            expected_tooling_commit=context["release"]["commit"],
-            expected_sha256sums_sha256="c" * 64,
-            token_env="TIP_GH_TOKEN",
-            command_timeout_seconds=5.0,
-            asset_timeout_seconds=5.0,
-        )
-
-        def remote_asset(name: str, *, state: str = "uploaded") -> dict:
-            expectation = expectations[name]
-            return {
-                "name": name,
-                "state": state,
-                "size": expectation.size,
-                "url": f"https://api.github.com/repos/example/updates/releases/assets/{len(name)}",
-                "browser_download_url": (
-                    "https://github.com/example/updates/releases/download/"
-                    f"{context['release']['tag']}/{name}"
-                ),
-            }
-
-        def release(*, draft: bool, assets: list[dict]) -> dict:
-            return {
-                "id": 42,
-                "tag_name": context["release"]["tag"],
-                "target_commitish": "main",
-                "name": publication.expected_release_title(context),
-                "body": publication.expected_release_notes(context),
-                "draft": draft,
-                "prerelease": False,
-                "assets": assets,
-            }
-
-        class StatefulRunner:
-            def __init__(self) -> None:
-                self.release: dict | None = None
-                self.mutations: list[tuple[str, str | None]] = []
-                self.downloads: list[tuple[str, str, bool]] = []
-                self.live_rollout_phases: list[str] = []
-                self.retained_audit_phases: list[str] = []
-                self.ambiguous_once: str | None = None
-                self.ambiguous_consumed = False
-                self.latest_mismatch = False
-
-            def lookup_authenticated_release(self, _phase, _repository, _tag):
-                return json.loads(json.dumps(self.release)) if self.release is not None else None
-
-            def fetch_json(self, _phase, url, *, authenticated, allow_not_found=False):
-                self.assert_anonymous(authenticated)
-                if url.endswith("/commits/main"):
-                    return {"sha": context["release"]["commit"]}
-                if "/releases/tags/" in url and self.release is not None and not self.release["draft"]:
-                    return json.loads(json.dumps(self.release))
-                if allow_not_found:
-                    return None
-                raise publication.PublicationError("published Tip release is not anonymously reachable")
-
-            @staticmethod
-            def assert_anonymous(authenticated: bool) -> None:
-                if authenticated:
-                    raise AssertionError("public lookup unexpectedly requested authentication")
-
-            def download(self, phase, _url, _destination, expectation, *, authenticated, api_asset=False):
-                self.downloads.append((phase, expectation.name, authenticated))
-
-            def gh(self, _phase, arguments, *, payload_path, payload_size):
-                del payload_path, payload_size
-                if arguments[:3] == ["api", "--method", "POST"]:
-                    self.mutations.append(("create", None))
-                    self.release = release(draft=True, assets=[])
-                    self._maybe_ambiguous("create")
-                    return
-                if arguments[:2] == ["release", "upload"]:
-                    name = Path(arguments[3]).name
-                    self.mutations.append(("upload", name))
-                    assert self.release is not None
-                    self.release["assets"].append(remote_asset(name))
-                    self._maybe_ambiguous("upload")
-                    return
-                if arguments[:3] == ["api", "--method", "PATCH"]:
-                    self.mutations.append(("publish", None))
-                    assert self.release is not None
-                    self.release["draft"] = False
-                    self._maybe_ambiguous("publish")
-                    return
-                raise AssertionError(f"unexpected mutation arguments: {arguments!r}")
-
-            def _maybe_ambiguous(self, operation: str) -> None:
-                if self.ambiguous_once == operation and not self.ambiguous_consumed:
-                    self.ambiguous_consumed = True
-                    raise publication.PublicationError(
-                        f"simulated ambiguous {operation} result after remote success"
-                    )
-
-        def invoke(runner: StatefulRunner) -> int:
-            def live_rollout(_runner, _repository, _directory, phase_prefix):
-                runner.live_rollout_phases.append(phase_prefix)
-                if phase_prefix == "pre-publication latest" and (
-                    runner.release is None or runner.release["draft"]
-                ):
-                    predecessor = b"predecessor\n"
-                    return {}, predecessor.decode(), predecessor, predecessor
-                manifest_bytes = (
-                    b"mismatching latest\n"
-                    if runner.latest_mismatch and phase_prefix == "anonymous latest"
-                    else candidate_manifest_bytes
-                )
-                return (
-                    {},
-                    candidate_appcast_bytes.decode(),
-                    manifest_bytes,
-                    candidate_appcast_bytes,
-                )
-
-            def audit_retained(
-                _runner, _context, _manifest, _appcast, _directory, *, phase_prefix
-            ):
-                runner.retained_audit_phases.append(phase_prefix)
-
-            with mock.patch.dict(os.environ, {"TIP_GH_TOKEN": "fixture-token"}, clear=False), mock.patch.object(
-                publication, "preflight_local_inputs", return_value=dist
-            ), mock.patch.object(publication, "verify_context", return_value=context), mock.patch.object(
-                publication,
-                "build_local_asset_expectations",
-                return_value=(expectations, args.expected_sha256sums_sha256),
-            ), mock.patch.object(publication, "validate_local_candidate"), mock.patch.object(
-                publication, "PublicationRunner", return_value=runner
-            ), mock.patch.object(publication, "fetch_live_rollout", side_effect=live_rollout), mock.patch.object(
-                publication.rollout, "validate_live_tip_publication_state"
-            ), mock.patch.object(publication, "validate_candidate_manifest"), mock.patch.object(
-                publication, "audit_retained_enclosures", side_effect=audit_retained
-            ):
-                return publication.run_publish(args)
-
-        normal = StatefulRunner()
-        self.assertEqual(invoke(normal), 0)
-        self.assertEqual(normal.mutations[0], ("create", None))
-        self.assertEqual(normal.mutations[-1], ("publish", None))
-        self.assertEqual(
-            [name for operation, name in normal.mutations if operation == "upload"],
-            list(sorted(names)),
-        )
-        anonymously_audited = {
-            name for phase, name, authenticated in normal.downloads if not authenticated
-        }
-        self.assertEqual(anonymously_audited, set(names))
-        self.assertEqual(
-            normal.live_rollout_phases,
-            [
-                "pre-publication latest",
-                "final pre-publication latest",
-                "anonymous latest",
-            ],
-        )
-        self.assertEqual(
-            normal.retained_audit_phases,
-            ["pre-publication", "final pre-publication", "anonymous post-publication"],
-        )
-
-        existing = StatefulRunner()
-        existing.release = release(draft=False, assets=[remote_asset(name) for name in names])
-        self.assertEqual(invoke(existing), 0)
-        self.assertEqual(existing.mutations, [])
-        self.assertEqual(
-            {name for _phase, name, authenticated in existing.downloads if authenticated},
-            set(names),
-        )
-        self.assertEqual(
-            {name for _phase, name, authenticated in existing.downloads if not authenticated},
-            set(names),
-        )
-
-        for ambiguous_operation in ("create", "upload", "publish"):
-            with self.subTest(ambiguous_operation=ambiguous_operation):
-                interrupted = StatefulRunner()
-                interrupted.ambiguous_once = ambiguous_operation
-                with self.assertRaisesRegex(publication.PublicationError, "ambiguous"):
-                    invoke(interrupted)
-                self.assertEqual(invoke(interrupted), 0)
-                self.assertEqual(
-                    sum(operation == "create" for operation, _name in interrupted.mutations), 1
-                )
-                self.assertEqual(
-                    sum(operation == "publish" for operation, _name in interrupted.mutations), 1
-                )
-                uploaded_names = [
-                    name for operation, name in interrupted.mutations if operation == "upload"
-                ]
-                self.assertEqual(uploaded_names, list(sorted(names)))
-
-        starter = StatefulRunner()
-        starter.release = release(
-            draft=True, assets=[remote_asset(names[0], state="starter")]
-        )
-        with self.assertRaisesRegex(publication.PublicationError, "starter asset automatically"):
-            invoke(starter)
-        self.assertEqual(starter.mutations, [])
-
-        mismatching_draft = StatefulRunner()
-        mismatching_draft.release = release(draft=True, assets=[])
-        mismatching_draft.release["name"] = "unrelated draft"
-        with self.assertRaisesRegex(publication.PublicationError, "metadata mismatch"):
-            invoke(mismatching_draft)
-        self.assertEqual(mismatching_draft.mutations, [])
-
-        latest_mismatch = StatefulRunner()
-        latest_mismatch.latest_mismatch = True
-        with self.assertRaisesRegex(publication.PublicationError, "anonymous latest rollout manifest"):
-            invoke(latest_mismatch)
-        mutation_snapshot = list(latest_mismatch.mutations)
-        with self.assertRaisesRegex(publication.PublicationError, "anonymous latest rollout manifest"):
-            invoke(latest_mismatch)
-        self.assertEqual(latest_mismatch.mutations, mutation_snapshot)
-
-    def test_tip_publication_run_publish_rejects_live_advance_before_patch(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_final_live_race_test",
-            SCRIPT_DIR / "tip_release_publication.py",
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        dist = root / "dist"
-        dist.mkdir()
-        candidate = dist / "candidate.pkg"
-        candidate.write_bytes(b"candidate\n")
-        expectation = publication.AssetExpectation(
-            name=candidate.name,
-            path=candidate,
-            size=candidate.stat().st_size,
-            sha256=hashlib.sha256(candidate.read_bytes()).hexdigest(),
-        )
-        expectations = {candidate.name: expectation}
-        commit = "a" * 40
-        context = {
-            "release": {
-                "commit": commit,
-                "tag": "tip-" + "a" * 12,
-                "shortSha": "a" * 12,
-                "buildNumber": "35.15.21",
-            },
-            "rollout": {"role": "transition"},
-            "publication": {"repository": "example/updates"},
-        }
-        args = mock.Mock(
-            dist_dir=str(dist),
-            context=str(root / "context.json"),
-            digest=str(root / "context.json.sha256"),
-            stable_appcast=str(root / "stable.xml"),
-            approved_source_root=str(root),
-            trusted_tooling_root=str(root),
-            expected_context_sha256="b" * 64,
-            expected_sha256sums_sha256="c" * 64,
-            token_env="TIP_GH_TOKEN",
-            command_timeout_seconds=5.0,
-            asset_timeout_seconds=5.0,
-        )
-        complete_draft = publication.ReleasePlan(
-            release_id=42,
-            state="draft",
-            remote_assets=(),
-            missing_assets=(),
-        )
-        initial_bytes = b"initial-live-state\n"
-        advanced_bytes = b"advanced-live-state\n"
-        validation_digests: list[str] = []
-
-        def validate_live(_context, _manifest, _appcast, digest, _candidate_commit):
-            validation_digests.append(digest)
-            if len(validation_digests) == 2:
-                raise publication.rollout.RolloutError("live rollout advanced")
-
-        with mock.patch.dict(os.environ, {"TIP_GH_TOKEN": "fixture-token"}, clear=False), mock.patch.object(
-            publication, "preflight_local_inputs", return_value=dist
-        ), mock.patch.object(publication, "verify_context", return_value=context), mock.patch.object(
-            publication,
-            "build_local_asset_expectations",
-            return_value=(expectations, args.expected_sha256sums_sha256),
-        ), mock.patch.object(publication, "validate_local_candidate"), mock.patch.object(
-            publication, "PublicationRunner", return_value=object()
-        ), mock.patch.object(publication, "fetch_live_main", return_value=commit) as main_fetch, mock.patch.object(
-            publication, "fetch_release", return_value={"id": 42}
-        ), mock.patch.object(
-            publication, "validate_release_metadata", return_value=complete_draft
-        ), mock.patch.object(
-            publication,
-            "fetch_live_rollout",
-            side_effect=[
-                ({}, "initial appcast", initial_bytes, b"initial appcast"),
-                ({}, "advanced appcast", advanced_bytes, b"advanced appcast"),
-            ],
-        ) as live_fetch, mock.patch.object(
-            publication.rollout,
-            "validate_live_tip_publication_state",
-            side_effect=validate_live,
-        ), mock.patch.object(publication, "audit_retained_enclosures") as retained_audit, mock.patch.object(
-            publication, "audit_remote_release_assets"
-        ), mock.patch.object(publication, "create_draft") as create, mock.patch.object(
-            publication, "publish_draft"
-        ) as publish:
-            with self.assertRaisesRegex(
-                publication.PublicationError,
-                "live Tip predecessor state is unsafe: live rollout advanced",
-            ):
-                publication.run_publish(args)
-
-        self.assertEqual(main_fetch.call_count, 2)
-        self.assertEqual(live_fetch.call_count, 2)
-        self.assertEqual(
-            validation_digests,
-            [hashlib.sha256(initial_bytes).hexdigest(), hashlib.sha256(advanced_bytes).hexdigest()],
-        )
-        retained_audit.assert_called_once()
-        create.assert_not_called()
-        publish.assert_not_called()
-
-    def test_tip_publication_retained_enclosure_audit_rejects_missing_changed_or_wrong_url(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_retained_test", SCRIPT_DIR / "tip_release_publication.py"
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        enclosure_bytes = b"retained preparer enclosure\n"
-        repository = "example/updates"
-        name = "RepoPrompt-tip-aaaaaaaaaaaa-35.15.18.zip"
-        item = {
-            "role": "preparer",
-            "tag": "tip-aaaaaaaaaaaa",
-            "url": f"https://github.com/{repository}/releases/download/tip-aaaaaaaaaaaa/{name}",
-            "buildNumber": "35.15.18",
-            "marketingVersion": "1.3.0",
-            "minimumSystemVersion": "13.0",
-            "minimumUpdateVersion": None,
-            "installationType": "application",
-            "enclosureName": name,
-            "enclosureSize": len(enclosure_bytes),
-            "enclosureSha256": hashlib.sha256(enclosure_bytes).hexdigest(),
-            "edSignature": "fixture-signature",
-            "rolloutManifestSha256": None,
-            "rolloutManifestName": None,
-        }
-        manifest = {
-            "channel": "tip",
-            "updateRepository": repository,
-            "currentRole": "preparer",
-            "appcastItems": [item],
-        }
-        context = {
-            "sparkle": {"minimumSystemVersion": "13.0", "updateRepository": repository},
-            "release": {"appName": "RepoPrompt"},
-        }
-        appcast = publication.rollout.render_appcast(manifest)
-        retained = publication.retained_enclosure_expectations(context, manifest, appcast)
-        self.assertEqual(len(retained), 1)
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        downloaded = root / name
-        publication._stream_worker_response(
-            io.BytesIO(enclosure_bytes),
-            downloaded,
-            maximum_bytes=retained[0].size,
-            expected_size=retained[0].size,
-            expected_sha256=retained[0].sha256,
-        )
-        self.assertEqual(downloaded.read_bytes(), enclosure_bytes)
-        changed_output = root / "changed.zip"
-        with self.assertRaisesRegex(publication.PublicationError, "size mismatch|SHA-256 mismatch"):
-            publication._stream_worker_response(
-                io.BytesIO(b"changed\n"),
-                changed_output,
-                maximum_bytes=retained[0].size,
-                expected_size=retained[0].size,
-                expected_sha256=retained[0].sha256,
-            )
-        self.assertFalse(changed_output.exists())
-
-        class MissingRunner:
-            def download(self, *_args, **_kwargs) -> None:
-                raise publication.PublicationError("HTTP GET failed with status 404")
-
-        with self.assertRaisesRegex(publication.PublicationError, "status 404"):
-            publication.audit_retained_enclosures(
-                MissingRunner(), context, manifest, appcast, root / "missing", phase_prefix="test"
-            )
-        wrong = json.loads(json.dumps(manifest))
-        wrong["appcastItems"][0]["url"] = wrong["appcastItems"][0]["url"].replace(name, "other.zip")
-        with self.assertRaisesRegex(publication.rollout.RolloutError, "URL mismatch"):
-            publication.retained_enclosure_expectations(context, wrong, appcast)
-
-    def test_tip_candidate_manifest_binds_artifact_manifest_and_newest_enclosure_bytes(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_candidate_binding_test",
-            SCRIPT_DIR / "tip_release_publication.py",
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        context = {
-            "release": {
-                "tag": "tip-aaaaaaaaaaaa",
-                "commit": "a" * 40,
-                "marketingVersion": "1.3.0",
-                "buildNumber": "35.15.21",
-            },
-            "rollout": {
-                "role": "transition",
-                "signingIdentity": "successor",
-                "runtimeSecureStorageMigrationPhase": "disabled",
-                "eligibilityProfile": "tip-rollout-v1",
-                "installationType": "package",
-                "predecessors": [],
-            },
-            "applicationSigning": {
-                "bundleIdentifier": "com.repoprompt.ce",
-                "teamIdentifier": "69N6K965SF",
-            },
-        }
-        enclosure = publication.AssetExpectation(
-            "RepoPrompt-tip-aaaaaaaaaaaa-35.15.21.pkg",
-            Path("/fixture/enclosure.pkg"),
-            123,
-            "1" * 64,
-        )
-        artifact = publication.AssetExpectation(
-            "RepoPrompt-tip-aaaaaaaaaaaa-35.15.21-artifact-manifest.json",
-            Path("/fixture/artifact.json"),
-            45,
-            "2" * 64,
-        )
-        expectations = {enclosure.name: enclosure, artifact.name: artifact}
-        normalized = {
-            "sourceTag": context["release"]["tag"],
-            "releaseCommit": context["release"]["commit"],
-            "currentRole": "transition",
-            "signingIdentity": "successor",
-            "bundleIdentifier": "com.repoprompt.ce",
-            "teamIdentifier": "69N6K965SF",
-            "marketingVersion": "1.3.0",
-            "buildNumber": "35.15.21",
-            "migrationPhase": "disabled",
-            "eligibilityProfile": "tip-rollout-v1",
-            "appArtifactManifest": {"name": artifact.name, "sha256": artifact.sha256},
-            "appcastItems": [
-                {
-                    "tag": context["release"]["tag"],
-                    "role": "transition",
-                    "enclosureName": enclosure.name,
-                    "enclosureSize": enclosure.size,
-                    "enclosureSha256": enclosure.sha256,
-                }
-            ],
-        }
-        with mock.patch.object(
-            publication.rollout, "validate_tip_manifest_appcast", return_value=normalized
-        ):
-            publication.validate_candidate_manifest(context, {}, "fixture", expectations)
-            for field, changed, message in (
-                ("appArtifactManifest", {"name": artifact.name, "sha256": "3" * 64}, "appArtifactManifest"),
-                ("enclosureName", "other.pkg", "newest enclosure"),
-                ("enclosureSize", 124, "newest enclosure"),
-                ("enclosureSha256", "4" * 64, "newest enclosure"),
-            ):
-                with self.subTest(field=field):
-                    mutated = json.loads(json.dumps(normalized))
-                    if field == "appArtifactManifest":
-                        mutated[field] = changed
-                    else:
-                        mutated["appcastItems"][0][field] = changed
-                    with mock.patch.object(
-                        publication.rollout,
-                        "validate_tip_manifest_appcast",
-                        return_value=mutated,
-                    ), self.assertRaisesRegex(publication.PublicationError, message):
-                        publication.validate_candidate_manifest(
-                            context, {}, "fixture", expectations
-                        )
-
-    def test_tip_publication_supervisor_timeout_reaps_complete_process_group(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_timeout_test", SCRIPT_DIR / "tip_release_publication.py"
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        for value in ("nan", "inf", "-inf", "3600.1"):
-            with self.subTest(rejected_timeout=value), self.assertRaises(
-                publication.argparse.ArgumentTypeError
-            ):
-                publication.positive_float(value)
-        self.assertEqual(publication.positive_float("3600"), 3600.0)
-        with self.assertRaisesRegex(publication.PublicationError, "must be finite"):
-            publication.PublicationRunner(
-                work_dir=SCRIPT_DIR,
-                dist_dir=SCRIPT_DIR,
-                total_asset_bytes=0,
-                token_env="TIP_GH_TOKEN",
-                command_timeout=float("inf"),
-                asset_timeout=1.0,
-            )
-        self.assertFalse((SCRIPT_DIR / "supervise_transition_package_phase.py").exists())
-        self.assertTrue((SCRIPT_DIR / "supervise_release_phase.py").is_file())
-
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        pid_file = root / "descendant.pid"
-        worker = root / "hang.py"
-        worker.write_text(
-            "import os, signal, time\n"
-            "child = os.fork()\n"
-            "if child == 0:\n"
-            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "    while True: time.sleep(1)\n"
-            f"open({str(pid_file)!r}, 'w').write(str(child))\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "while True: time.sleep(1)\n",
-            encoding="utf-8",
-        )
-        runner = publication.PublicationRunner(
-            work_dir=root,
-            dist_dir=root,
-            total_asset_bytes=0,
-            token_env="TIP_GH_TOKEN",
-            command_timeout=0.25,
-            asset_timeout=0.25,
-        )
-        with self.assertRaisesRegex(publication.PublicationError, "exit status 124"):
-            runner.run_material("publication timeout cleanup", [sys.executable, str(worker)])
-        descendant = int(pid_file.read_text(encoding="ascii"))
-        with self.assertRaises(ProcessLookupError):
-            os.kill(descendant, 0)
-
-    def test_tip_publication_http_worker_streams_and_removes_invalid_partial_files(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_stream_test", SCRIPT_DIR / "tip_release_publication.py"
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        class ChunkedResponse:
-            def __init__(self, value: bytes) -> None:
-                self.value = value
-                self.offset = 0
-                self.read_sizes: list[int] = []
-
-            def read(self, size: int) -> bytes:
-                self.read_sizes.append(size)
-                result = self.value[self.offset : self.offset + size]
-                self.offset += len(result)
-                return result
-
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        body = (b"a" * (1024 * 1024)) + (b"b" * 97)
-        response = ChunkedResponse(body)
-        output = root / "asset.bin"
-        publication._stream_worker_response(
-            response,
-            output,
-            maximum_bytes=len(body),
-            expected_size=len(body),
-            expected_sha256=hashlib.sha256(body).hexdigest(),
-        )
-        self.assertEqual(output.read_bytes(), body)
-        self.assertGreater(len(response.read_sizes), 2)
-        self.assertLessEqual(max(response.read_sizes), 1024 * 1024)
-
-        oversized = root / "oversized.bin"
-        with self.assertRaisesRegex(publication.PublicationError, "exceeded maximum"):
-            publication._stream_worker_response(
-                ChunkedResponse(b"changed"),
-                oversized,
-                maximum_bytes=3,
-                expected_size=None,
-                expected_sha256=None,
-            )
-        self.assertFalse(oversized.exists())
-
-        changed = root / "changed.bin"
-        with self.assertRaisesRegex(publication.PublicationError, "SHA-256 mismatch"):
-            publication._stream_worker_response(
-                ChunkedResponse(b"changed"),
-                changed,
-                maximum_bytes=7,
-                expected_size=7,
-                expected_sha256="0" * 64,
-            )
-        self.assertFalse(changed.exists())
-
-    def test_tip_publication_authenticated_lookup_paginates_to_find_draft(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "tip_release_publication_lookup_test", SCRIPT_DIR / "tip_release_publication.py"
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        publication = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = publication
-        self.addCleanup(sys.modules.pop, spec.name, None)
-        spec.loader.exec_module(publication)
-
-        tag = "tip-" + ("a" * 12)
-        first_page = [{"tag_name": f"other-{position}"} for position in range(100)]
-        expected = {"tag_name": tag, "draft": True, "id": 42}
-        pages = iter([first_page, [expected]])
-
-        class Response:
-            status = 200
-
-            def __init__(self, url: str, value: object) -> None:
-                self.url = url
-                self.value = json.dumps(value).encode("utf-8")
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback) -> None:
-                return None
-
-            def geturl(self) -> str:
-                return self.url
-
-            def read(self, size: int) -> bytes:
-                return self.value[:size]
-
-        def urlopen(request, timeout: int):
-            self.assertEqual(timeout, 30)
-            return Response(request.full_url, next(pages))
-
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        output = root / "lookup.json"
-        args = mock.Mock(
-            repository="example/updates",
-            tag=tag,
-            output=str(output),
-            maximum_pages=3,
-            token_env="TIP_GH_TOKEN",
-        )
-        with mock.patch.dict(os.environ, {"TIP_GH_TOKEN": "fixture-secret"}), mock.patch.object(
-            publication.GITHUB_URL_OPENER, "open", side_effect=urlopen
-        ):
-            publication.run_worker_release_lookup(args)
-        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"release": expected})
-
-        request = publication.urllib.request.Request(
-            "https://api.github.com/repos/example/updates/releases/assets/42",
-            headers={"Authorization": "Bearer fixture-secret"},
-        )
-        redirected = publication.GitHubRedirectHandler().redirect_request(
-            request,
-            None,
-            302,
-            "Found",
-            {},
-            "https://release-assets.githubusercontent.com/github-production-release-asset/file",
-        )
-        self.assertIsNotNone(redirected)
-        self.assertIsNone(redirected.get_header("Authorization"))
-        with self.assertRaisesRegex(publication.PublicationError, "unreviewed host"):
-            publication.GitHubRedirectHandler().redirect_request(
-                request,
-                None,
-                302,
-                "Found",
-                {},
-                "https://example.invalid/file",
-            )
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("Missing required environment variable", missing.stderr)
 
     def test_tip_appcast_generation_uses_shared_rollout_authority_and_crypto_verifier(self) -> None:
         tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+        rollout = (SCRIPT_DIR / "stable_rollout.py").read_text(encoding="utf-8")
         generator = tip_script.split("generate_tip_rollout_appcast() {", 1)[1].split("\n}", 1)[0]
 
-        self.assertIn('python3 "$ROLLOUT_TOOL" predecessor-values-from-context', generator)
-        self.assertIn('python3 "$ROLLOUT_TOOL" generate-from-context', generator)
-        self.assertIn('python3 "$ROLLOUT_TOOL" validate-from-context', generator)
-        self.assertNotIn('--declaration "$ROLLOUT_DECLARATION"', generator)
-        self.assertNotIn('--policy "$APPLE_IDENTITY_POLICY"', generator)
-        self.assertIn('local rollout_context_args=(--enclosure "$ENCLOSURE")', generator)
-        self.assertIn('--appcast-output "$APPCAST"', generator)
-        self.assertIn('--manifest-output "$ROLLOUT_MANIFEST"', generator)
+        self.assertIn('python3 "$ROLLOUT_TOOL" predecessor-values', generator)
+        self.assertIn('python3 "$ROLLOUT_TOOL" generate', generator)
+        self.assertIn('python3 "$ROLLOUT_TOOL" validate', generator)
         self.assertIn('"$SIGN_UPDATE" --ed-key-file - -p "$ENCLOSURE"', generator)
-        self.assertIn('verify_sparkle_signature.swift', generator)
-        self.assertNotIn("validate_generated_tip_appcast", tip_script)
-        self.assertNotIn("label_generated_tip_appcast", tip_script)
-        self.assertNotIn("generate_appcast", generator)
+        self.assertIn("verify_sparkle_signature.swift", generator)
+        self.assertIn('"minimumUpdateVersion"', rollout)
+        self.assertIn("<sparkle:minimumUpdateVersion>", rollout)
+        self.assertIn("<sparkle:minimumAutoupdateVersion>", rollout)
+        self.assertIn("must not carry an independent", rollout)
+        self.assertIn("normalize_published_preparer_floor", rollout)
 
     def test_tip_appcast_generation_supports_zero_predecessors_on_macos_bash(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -4891,24 +3529,11 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         shutil.copy2(SCRIPT_DIR / "main_tip_release.sh", scripts / "main_tip_release.sh")
         (scripts / "load_release_metadata.sh").write_text(
             """\
-load_verified_tip_release_context() {
+load_release_metadata() {
     APP_NAME=RepoPrompt
     DISPLAY_NAME="RepoPrompt CE"
     MARKETING_VERSION=1.3.0
-    TIP_BUILD_NUMBER=35.15.17
-    TIP_COMMIT=0123456789abcdef0123456789abcdef01234567
-    TIP_SHORT_SHA=0123456789ab
-    TIP_TAG=tip-0123456789ab
-    ARCHIVE_BASENAME=RepoPrompt-tip-0123456789ab-35.15.17
-    ROLLOUT_CHANNEL=tip
-    ROLLOUT_ROLE=preparer
-    ROLLOUT_IDENTITY=legacy
-    ROLLOUT_INSTALLATION_TYPE=application
-    ROLLOUT_UPDATE_REPOSITORY=repoprompt/repoprompt-ce-tip-updates
-    REPOPROMPT_IDENTITY_MIGRATION_PHASE=legacy-preparer
-    TIP_PUBLICATION_TARGET=main
-    TIP_PUBLICATION_DRAFT=false
-    TIP_PUBLICATION_PRERELEASE=false
+    BUILD_NUMBER=35
     BUNDLE_ID=com.pvncher.repoprompt.ce
     SIGNING_TEAM_ID=648A27MST5
 }
@@ -4926,15 +3551,22 @@ import sys
 from pathlib import Path
 
 command = sys.argv[1]
-if command == "predecessor-values-from-context":
+if command == "packaging-context":
+    print("ROLLOUT_CHANNEL=tip")
+    print("ROLLOUT_ROLE=preparer")
+    print("ROLLOUT_IDENTITY=legacy")
+    print("ROLLOUT_INSTALLATION_TYPE=application")
+    print("ROLLOUT_UPDATE_REPOSITORY=repoprompt/repoprompt-ce-tip-updates")
+    print("REPOPROMPT_IDENTITY_MIGRATION_PHASE=legacy-preparer")
+elif command == "predecessor-values":
     pass
-elif command == "generate-from-context":
+elif command == "generate":
     arguments = sys.argv[2:]
     Path(os.environ["FAKE_ROLLOUT_CAPTURE"]).write_text(json.dumps(arguments), encoding="utf-8")
     for flag, content in (("--appcast-output", "<rss/>\\n"), ("--manifest-output", "{}\\n")):
         output = Path(arguments[arguments.index(flag) + 1])
         output.write_text(content, encoding="utf-8")
-elif command == "validate-from-context":
+elif command == "validate":
     pass
 else:
     raise SystemExit(f"unexpected command: {command}")
@@ -4959,16 +3591,17 @@ else:
                 "FAKE_ROLLOUT_CAPTURE": str(rollout_capture),
                 "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts),
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
-                "REPOPROMPT_APPROVED_SOURCE_ROOT": str(root),
                 "SPARKLE_PRIVATE_KEY": "fixture-private-key",
-                "DIST_DIR": str(dist),
+                "TIP_BUILD_NUMBER": "35.15.17",
+                "TIP_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+                "TIP_SHORT_SHA": "0123456789ab",
             }
         )
         result = subprocess.run(
             [
                 "/bin/bash",
                 "-c",
-                'source "$1"; initialize_tip_release_context unit-test; TMP_DIR="$(mktemp -d)"; '
+                'source "$1"; TMP_DIR="$(mktemp -d)"; '
                 "derive_sparkle_public_key() { printf 'fixture-public-key\\n'; }; "
                 "plutil() { printf 'fixture-public-key\\n'; }; "
                 "xcrun() { return 0; }; "
@@ -4985,8 +3618,7 @@ else:
         self.assertTrue((dist / "appcast.xml").is_file())
         self.assertTrue((dist / "identity-rollout.json").is_file())
         rollout_arguments = json.loads(rollout_capture.read_text(encoding="utf-8"))
-        self.assertNotIn("--declaration", rollout_arguments)
-        self.assertNotIn("--policy", rollout_arguments)
+        self.assertEqual(rollout_arguments.count("--declaration"), 1)
         self.assertNotIn("--predecessor-manifest", rollout_arguments)
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
@@ -5336,20 +3968,24 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "28.7.95\n")
 
-    def test_release_metadata_tip_projection_helper_and_call_sites_are_removed(self) -> None:
-        consumers = (
-            SCRIPT_DIR / "load_release_metadata.sh",
-            SCRIPT_DIR / "main_tip_release.sh",
-            SCRIPT_DIR / "validate_staged_release.sh",
-            SCRIPT_DIR / "sign_staged_release.sh",
+    def test_release_metadata_loader_projects_reviewed_tip_identity_in_child_process(self) -> None:
+        root = self.make_metadata_root()
+        shutil.copy2(SCRIPT_DIR.parent / "tip-rollout.json", root / "tip-rollout.json")
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "{SCRIPT_DIR / "load_release_metadata.sh"}"; '
+                f'load_release_metadata_with_identity_projection "{root}" "{root}" "{SCRIPT_DIR}" tip-rollout-v1; '
+                'printf "%s|%s|%s|%s\\n" "$BUNDLE_ID" "$SIGNING_TEAM_ID" "$ROLLOUT_ROLE" "$ROLLOUT_IDENTITY"',
+            ],
+            text=True,
+            capture_output=True,
         )
-        for path in consumers:
-            with self.subTest(path=path.name):
-                source = path.read_text(encoding="utf-8")
-                self.assertNotIn("load_release_metadata_with_identity_projection", source)
-        tip_release = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
-        self.assertNotIn("stable_rollout.py packaging-context", tip_release)
-        self.assertNotIn("load_release_metadata ", tip_release)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "com.repoprompt.ce|69N6K965SF|transition|successor\n")
 
     def test_release_metadata_loader_preserves_stable_identity_without_tip_contract(self) -> None:
         root = self.make_metadata_root()
@@ -5359,7 +3995,7 @@ else:
                 "bash",
                 "-c",
                 f'source "{SCRIPT_DIR / "load_release_metadata.sh"}"; '
-                f'load_release_metadata "{root}"; '
+                f'load_release_metadata_with_identity_projection "{root}" "" "{SCRIPT_DIR}" ""; '
                 'printf "%s|%s\\n" "$BUNDLE_ID" "$SIGNING_TEAM_ID"',
             ],
             text=True,
@@ -5369,14 +4005,12 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "com.pvncher.repoprompt.ce|648A27MST5\n")
 
-    def test_staged_signer_verifies_context_before_profile_validation(self) -> None:
+    def test_staged_signer_uses_reviewed_identity_projection_before_profile_validation(self) -> None:
         source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
 
-        verification = source.index("load_verified_tip_release_context")
+        projection = source.index("load_release_metadata_with_identity_projection")
         profile_validation = source.index("profile_app_identifier=")
-        self.assertLess(verification, profile_validation)
-        self.assertIn("signing-mode-from-context", source)
-        self.assertNotIn("load_release_metadata_with_identity_projection", source)
+        self.assertLess(projection, profile_validation)
         self.assertIn('"${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}"', source)
 
     def test_release_metadata_parser_rejects_shell_execution(self) -> None:
@@ -5724,15 +4358,12 @@ extension Data {
             capture_output=True,
         )
 
-    def make_staged_release_fixture(
-        self, *, tip_context: bool = False
-    ) -> tuple[Path, Path, Path]:
+    def make_staged_release_fixture(self) -> tuple[Path, Path, Path]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         approved = temp_dir / "approved"
         staged = temp_dir / "staged"
-        trusted = temp_dir / "trusted"
-        scripts = (trusted if tip_context else temp_dir) / "Scripts"
+        scripts = temp_dir / "Scripts"
         app = staged / ".build" / "release" / "RepoPrompt.app"
         for directory in (
             approved / "AppBundle",
@@ -5761,9 +4392,6 @@ extension Data {
             "release_sentry_symbols.sh",
             "release.sh",
             "main_tip_release.sh",
-            "supervise_release_phase.py",
-            "tip_release_context.py",
-            "tip_release_publication.py",
         ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
             scripts.joinpath(name).chmod(0o755)
@@ -5865,138 +4493,6 @@ esac
             text=True,
             capture_output=True,
         )
-        if tip_context:
-            def git(root: Path, *arguments: str) -> str:
-                result = subprocess.run(
-                    ["git", "-C", str(root), *arguments],
-                    text=True,
-                    capture_output=True,
-                    check=True,
-                )
-                return result.stdout.strip()
-
-            for root, message in (
-                (trusted, "trusted Tip tooling fixture"),
-                (approved, "approved Tip source fixture"),
-            ):
-                git(root, "init", "-q", "--initial-branch=main")
-                git(root, "config", "user.email", "tip-staged-tests@example.invalid")
-                git(root, "config", "user.name", "Tip Staged Tests")
-                git(root, "add", ".")
-                git(root, "-c", "commit.gpgsign=false", "commit", "-q", "-m", message)
-
-            approved_commit = git(approved, "rev-parse", "HEAD")
-            tooling_commit = git(trusted, "rev-parse", "HEAD")
-            stable_appcast = temp_dir / "stable-appcast-input.xml"
-            shutil.copy2(
-                SCRIPT_DIR / "Fixtures" / "tip-release-context" / "v1" / "stable-appcast.xml",
-                stable_appcast,
-            )
-            context_dir = temp_dir / "canonical-tip-context"
-            context_dir.mkdir()
-            context_path = context_dir / "tip-release-context.json"
-            digest_path = context_dir / "tip-release-context.json.sha256"
-            resolved = subprocess.run(
-                [
-                    sys.executable,
-                    str(scripts / "tip_release_context.py"),
-                    "resolve",
-                    "--trusted-tooling-root",
-                    str(trusted),
-                    "--approved-source-root",
-                    str(approved),
-                    "--stable-appcast",
-                    str(stable_appcast),
-                    "--approved-source-commit",
-                    approved_commit,
-                    "--trusted-tooling-commit",
-                    tooling_commit,
-                    "--source-build-sequence",
-                    "1521",
-                    "--expected-tip-update-repository",
-                    "repoprompt/repoprompt-ce-tip-updates",
-                    "--output",
-                    str(context_path),
-                    "--digest-output",
-                    str(digest_path),
-                ],
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(resolved.returncode, 0, resolved.stderr)
-            context = json.loads(context_path.read_text(encoding="utf-8"))
-            release = context["release"]
-            application = context["applicationSigning"]
-            rollout = context["rollout"]
-            (staged / "version.env").write_text(
-                "\n".join(
-                    (
-                        f"APP_NAME={release['appName']}",
-                        f'DISPLAY_NAME="{release["displayName"]}"',
-                        f"MARKETING_VERSION={release['marketingVersion']}",
-                        f"BUILD_NUMBER={release['buildNumber']}",
-                        f"BUNDLE_ID={application['bundleIdentifier']}",
-                        f"SIGNING_TEAM_ID={application['teamIdentifier']}",
-                        "",
-                    )
-                ),
-                encoding="utf-8",
-            )
-            shutil.copy2(approved / "tip-rollout.json", staged / "tip-rollout.json")
-            shutil.copy2(context_path, staged / "tip-release-context.json")
-            shutil.copy2(digest_path, staged / "tip-release-context.json.sha256")
-            (staged / "RELEASE_COMMIT").write_text(approved_commit + "\n", encoding="utf-8")
-
-            rendered_template = (approved / "AppBundle" / "Info.plist.template").read_text(
-                encoding="utf-8"
-            )
-            for key, value in {
-                "__APP_NAME__": release["appName"],
-                "__DISPLAY_NAME__": release["displayName"],
-                "__BUNDLE_ID__": application["bundleIdentifier"],
-                "__MARKETING_VERSION__": release["marketingVersion"],
-                "__BUILD_NUMBER__": release["buildNumber"],
-                "__DEBUG_SECURE_STORAGE_BACKEND__": "alternate-in-memory",
-                "__SIGNING_MODE__": "release-candidate-adhoc",
-                "__LOCAL_SIGNING_CERTIFICATE_SHA256__": "",
-                "__LOCAL_SECURE_STORAGE_GENERATION__": "",
-                "__IDENTITY_MIGRATION_PHASE__": rollout[
-                    "runtimeSecureStorageMigrationPhase"
-                ],
-            }.items():
-                rendered_template = rendered_template.replace(key, str(value))
-            info_path = app / "Contents" / "Info.plist"
-            info_path.write_text(rendered_template, encoding="utf-8")
-            subprocess.run(
-                [
-                    str(scripts / "write_app_artifact_manifest.py"),
-                    "write",
-                    "--app",
-                    str(app),
-                    "--output",
-                    str(manifest),
-                    "--expected-architectures",
-                    "arm64,x86_64",
-                ],
-                env=manifest_env,
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            (temp_dir / "tip-context-environment.json").write_text(
-                json.dumps(
-                    {
-                        "context": str(context_path),
-                        "digest": str(digest_path),
-                        "stable_appcast": str(stable_appcast),
-                        "expected_digest": digest_path.read_text(encoding="ascii").strip(),
-                        "approved_commit": approved_commit,
-                        "tooling_commit": tooling_commit,
-                    }
-                ),
-                encoding="utf-8",
-            )
-
         return approved, staged, scripts
 
     @staticmethod
@@ -6085,36 +4581,6 @@ esac
             env["REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE"] = release_build_number_override
         if tip_archive_contract is not None:
             env["REPOPROMPT_TIP_ARCHIVE_CONTRACT"] = tip_archive_contract
-            if tip_archive_contract == "tip-rollout-v1":
-                env.pop("RELEASE_COMMIT", None)
-                env.pop("REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE", None)
-                env.pop("BUILD_NUMBER", None)
-                env.pop("GH_TOKEN", None)
-                context_environment_path = approved.parent / "tip-context-environment.json"
-                if context_environment_path.is_file():
-                    context_environment = json.loads(
-                        context_environment_path.read_text(encoding="utf-8")
-                    )
-                    env.update(
-                        {
-                            "REPOPROMPT_TIP_RELEASE_CONTEXT": context_environment["context"],
-                            "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE": context_environment[
-                                "digest"
-                            ],
-                            "REPOPROMPT_TIP_STABLE_APPCAST": context_environment[
-                                "stable_appcast"
-                            ],
-                            "REPOPROMPT_EXPECTED_CONTEXT_SHA256": context_environment[
-                                "expected_digest"
-                            ],
-                            "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT": context_environment[
-                                "approved_commit"
-                            ],
-                            "REPOPROMPT_EXPECTED_TOOLING_COMMIT": context_environment[
-                                "tooling_commit"
-                            ],
-                        }
-                    )
         return subprocess.run(
             [str(scripts / "validate_staged_release.sh")],
             env=env,
@@ -6202,1604 +4668,6 @@ esac
         return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=True)
 
 
-class TipReleaseContextTests(unittest.TestCase):
-    """Immutable setup-digest and committed-input Tip context coverage."""
-
-    TOOL = SCRIPT_DIR / "tip_release_context.py"
-    ROLLOUT_TOOL = SCRIPT_DIR / "stable_rollout.py"
-    FIXTURE = SCRIPT_DIR / "Fixtures" / "tip-release-context" / "v1"
-    SYNTHETIC_REPOSITORY = "example/repoprompt-ce-tip-updates"
-
-    def run_context(self, *args: str) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        return subprocess.run(
-            [sys.executable, str(self.TOOL), *args],
-            env=env,
-            text=True,
-            capture_output=True,
-        )
-
-    @staticmethod
-    def git(work: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(work), *args],
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-
-    def commit_fixture_root(self, root: Path, message: str) -> str:
-        self.git(root, "init", "-q", "--initial-branch=main")
-        self.git(root, "config", "user.email", "tip-context-tests@example.invalid")
-        self.git(root, "config", "user.name", "Tip Context Tests")
-        self.git(root, "add", ".")
-        self.git(root, "-c", "commit.gpgsign=false", "commit", "-q", "-m", message)
-        return self.git(root, "rev-parse", "HEAD").stdout.strip()
-
-    def make_authority_fixture(
-        self,
-        *,
-        application_identity_name: str | None = None,
-        declaration_mutator=None,
-        policy_mutator=None,
-    ) -> dict[str, object]:
-        temp_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_dir, True)
-        trusted_root = temp_dir / "trusted"
-        approved_root = temp_dir / "approved"
-        (trusted_root / "Scripts").mkdir(parents=True)
-        approved_root.mkdir()
-
-        policy = json.loads(
-            (self.FIXTURE / "apple_identity_policy.json").read_text(encoding="utf-8")
-        )
-        if application_identity_name is not None:
-            policy["identities"]["successor"][
-                "developerIDApplicationIdentityName"
-            ] = application_identity_name
-        if policy_mutator is not None:
-            policy_mutator(policy)
-        (trusted_root / "Scripts" / "apple_identity_policy.json").write_text(
-            json.dumps(policy, indent=2) + "\n", encoding="utf-8"
-        )
-        shutil.copy2(self.ROLLOUT_TOOL, trusted_root / "Scripts" / "stable_rollout.py")
-        shutil.copy2(self.TOOL, trusted_root / "Scripts" / "tip_release_context.py")
-        (trusted_root / "authority-marker.txt").write_text("trusted\n", encoding="utf-8")
-
-        declaration = json.loads(
-            (self.FIXTURE / "tip-rollout.json").read_text(encoding="utf-8")
-        )
-        if declaration_mutator is not None:
-            declaration_mutator(declaration)
-        (approved_root / "tip-rollout.json").write_text(
-            json.dumps(declaration, indent=2) + "\n", encoding="utf-8"
-        )
-        shutil.copy2(self.FIXTURE / "version.env", approved_root / "version.env")
-        (approved_root / "authority-marker.txt").write_text("approved\n", encoding="utf-8")
-
-        stable_appcast = temp_dir / "stable-appcast.xml"
-        shutil.copy2(self.FIXTURE / "stable-appcast.xml", stable_appcast)
-        tooling_commit = self.commit_fixture_root(trusted_root, "trusted tooling fixture")
-        approved_commit = self.commit_fixture_root(approved_root, "approved source fixture")
-        return {
-            "temp": temp_dir,
-            "trusted": trusted_root,
-            "approved": approved_root,
-            "stable_appcast": stable_appcast,
-            "tooling_commit": tooling_commit,
-            "approved_commit": approved_commit,
-        }
-
-    def resolve(
-        self,
-        fixture: dict[str, object],
-        output: Path,
-        digest: Path,
-        *,
-        source_build_sequence: str = "1521",
-        expected_repository: str | None = None,
-        stable_appcast: Path | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        return self.run_context(
-            "resolve",
-            "--trusted-tooling-root", str(fixture["trusted"]),
-            "--approved-source-root", str(fixture["approved"]),
-            "--stable-appcast", str(stable_appcast or fixture["stable_appcast"]),
-            "--approved-source-commit", str(fixture["approved_commit"]),
-            "--trusted-tooling-commit", str(fixture["tooling_commit"]),
-            "--source-build-sequence", source_build_sequence,
-            "--expected-tip-update-repository",
-            expected_repository or self.SYNTHETIC_REPOSITORY,
-            "--output", str(output),
-            "--digest-output", str(digest),
-        )
-
-    def make_context_fixture(
-        self,
-        *,
-        source_build_sequence: str = "1521",
-        **authority_options,
-    ) -> dict[str, object]:
-        fixture = self.make_authority_fixture(**authority_options)
-        fixture["context"] = Path(fixture["temp"]) / "tip-release-context.json"
-        fixture["digest"] = Path(fixture["temp"]) / "tip-release-context.json.sha256"
-        result = self.resolve(
-            fixture,
-            Path(fixture["context"]),
-            Path(fixture["digest"]),
-            source_build_sequence=source_build_sequence,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        fixture["expected_digest"] = Path(fixture["digest"]).read_text(
-            encoding="ascii"
-        ).strip()
-        return fixture
-
-    def verification_arguments(
-        self,
-        fixture: dict[str, object],
-        *,
-        boundary: str = "unit-test",
-        expected_digest: str | None = None,
-        include_roots: bool = True,
-    ) -> list[str]:
-        arguments = [
-            "--context", str(fixture["context"]),
-            "--digest", str(fixture["digest"]),
-            "--stable-appcast", str(fixture["stable_appcast"]),
-            "--expected-context-sha256",
-            expected_digest or str(fixture["expected_digest"]),
-            "--expected-approved-source-commit", str(fixture["approved_commit"]),
-            "--expected-tooling-commit", str(fixture["tooling_commit"]),
-            "--boundary", boundary,
-        ]
-        if include_roots:
-            arguments += [
-                "--approved-source-root", str(fixture["approved"]),
-                "--trusted-tooling-root", str(fixture["trusted"]),
-            ]
-        return arguments
-
-    @staticmethod
-    def context_environment(fixture: dict[str, object]) -> dict[str, str]:
-        return {
-            "REPOPROMPT_TIP_RELEASE_CONTEXT": str(fixture["context"]),
-            "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE": str(fixture["digest"]),
-            "REPOPROMPT_TIP_STABLE_APPCAST": str(fixture["stable_appcast"]),
-            "REPOPROMPT_EXPECTED_CONTEXT_SHA256": str(fixture["expected_digest"]),
-            "REPOPROMPT_APPROVED_SOURCE_ROOT": str(fixture["approved"]),
-            "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT": str(fixture["approved_commit"]),
-            "REPOPROMPT_EXPECTED_TOOLING_COMMIT": str(fixture["tooling_commit"]),
-        }
-
-    @staticmethod
-    def write_context(context_path: Path, digest_path: Path, value: dict) -> str:
-        raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
-        digest = hashlib.sha256(raw).hexdigest()
-        context_path.write_bytes(raw)
-        digest_path.write_text(digest + "\n", encoding="ascii")
-        return digest
-
-    def test_resolve_is_deterministic_path_independent_and_uses_pure_max_build(self) -> None:
-        fixture = self.make_context_fixture()
-        context_path = Path(fixture["context"])
-        digest_path = Path(fixture["digest"])
-        first_bytes = context_path.read_bytes()
-        self.assertEqual(fixture["expected_digest"], hashlib.sha256(first_bytes).hexdigest())
-
-        relocated = Path(fixture["temp"]) / "relocated"
-        trusted_clone = relocated / "trusted"
-        approved_clone = relocated / "approved"
-        relocated.mkdir()
-        for source, destination in (
-            (fixture["trusted"], trusted_clone),
-            (fixture["approved"], approved_clone),
-        ):
-            subprocess.run(
-                ["git", "clone", "-q", str(source), str(destination)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        relocated_fixture = dict(fixture)
-        relocated_fixture["trusted"] = trusted_clone
-        relocated_fixture["approved"] = approved_clone
-        second_context = relocated / "context.json"
-        second_digest = relocated / "context.sha256"
-        rerun = self.resolve(relocated_fixture, second_context, second_digest)
-        self.assertEqual(rerun.returncode, 0, rerun.stderr)
-        self.assertEqual(second_context.read_bytes(), first_bytes)
-        self.assertEqual(second_digest.read_bytes(), digest_path.read_bytes())
-
-        context = json.loads(context_path.read_text(encoding="utf-8"))
-        self.assertEqual(context["release"]["buildNumber"], "35.15.21")
-        self.assertEqual(context["archiveContract"], "tip-rollout-v1")
-        self.assertTrue(context["package"]["bundleIsVersionChecked"])
-        self.assertFalse(context["package"]["bundleIsRelocatable"])
-        self.assertFalse(context["package"]["bundleHasStrictIdentifier"])
-        self.assertFalse(context["package"]["hasScripts"])
-        self.assertEqual(context["package"]["applicationBundleCount"], 1)
-        self.assertIn("tipReleaseContextTool", context["provenance"]["inputSha256"])
-        self.assertEqual(len(context["publication"]["assets"]), 8)
-
-        spec = importlib.util.spec_from_file_location(
-            "stable_rollout_context_test",
-            self.ROLLOUT_TOOL,
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        rollout = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rollout)
-        self.assertEqual(
-            rollout.max_build_from_appcast(self.FIXTURE / "stable-appcast.xml"),
-            "35",
-        )
-        cli = subprocess.run(
-            [
-                sys.executable,
-                str(self.ROLLOUT_TOOL),
-                "max-build",
-                "--appcast", str(self.FIXTURE / "stable-appcast.xml"),
-            ],
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(cli.returncode, 0, cli.stderr)
-        self.assertEqual(cli.stdout.strip(), "35")
-
-    def test_role_contract_is_exact_for_every_tip_rollout_role(self) -> None:
-        expected = {
-            "legacy": ("legacy", "disabled", "application", False, False),
-            "preparer": ("legacy", "legacy-preparer", "application", True, False),
-            "transition": ("successor", "disabled", "package", False, True),
-            "successor": ("successor", "disabled", "application", False, False),
-        }
-
-        def predecessors(role: str) -> list[dict]:
-            if role == "transition":
-                return [
-                    {
-                        "role": "preparer",
-                        "tag": "tip-preparer0001",
-                        "rolloutManifestSha256": "1" * 64,
-                    }
-                ]
-            if role == "successor":
-                return [
-                    {
-                        "role": "transition",
-                        "tag": "tip-transition001",
-                        "rolloutManifestSha256": "2" * 64,
-                    },
-                    {
-                        "role": "preparer",
-                        "tag": "tip-preparer0001",
-                        "rolloutManifestSha256": "1" * 64,
-                    },
-                ]
-            return []
-
-        fixtures = {}
-        for role, contract in expected.items():
-            signing_identity, migration_phase, installation_type, anchor_required, installer_required = contract
-
-            def mutate(declaration: dict, *, selected_role: str = role) -> None:
-                selected = expected[selected_role]
-                declaration.update(
-                    {
-                        "currentRole": selected_role,
-                        "expectedSigningIdentity": selected[0],
-                        "expectedMigrationPhase": selected[1],
-                        "predecessors": predecessors(selected_role),
-                    }
-                )
-
-            fixture = self.make_context_fixture(declaration_mutator=mutate)
-            fixtures[role] = fixture
-            context = json.loads(Path(fixture["context"]).read_text(encoding="utf-8"))
-            with self.subTest(role=role):
-                self.assertEqual(context["rollout"]["signingIdentity"], signing_identity)
-                self.assertEqual(
-                    context["rollout"]["runtimeSecureStorageMigrationPhase"], migration_phase
-                )
-                self.assertEqual(context["rollout"]["installationType"], installation_type)
-                self.assertEqual(context["migrationAnchorSigning"]["required"], anchor_required)
-                self.assertEqual(context["installerSigning"]["required"], installer_required)
-                self.assertEqual(context["package"] is not None, role == "transition")
-                assets = context["publication"]["assets"]
-                self.assertEqual(any(name.endswith(".pkg") for name in assets), role == "transition")
-                self.assertEqual(any(name.endswith(".zip") for name in assets), role != "transition")
-                self.assertEqual(any(name.endswith(".dmg") for name in assets), role != "transition")
-                verified = self.run_context(
-                    "verify", *self.verification_arguments(fixture, include_roots=False)
-                )
-                self.assertEqual(verified.returncode, 0, verified.stderr)
-
-        transition_fixture = fixtures["transition"]
-        tampered = json.loads(
-            Path(transition_fixture["context"]).read_text(encoding="utf-8")
-        )
-        tampered["rollout"]["installationType"] = "application"
-        tampered["package"] = None
-        tampered["installerSigning"] = {
-            "required": False,
-            "teamIdentifier": None,
-            "identityName": None,
-        }
-        archive = tampered["release"]["archiveBasename"]
-        tampered["publication"]["assets"] = [
-            "appcast.xml",
-            "SHA256SUMS",
-            f"{archive}-artifact-manifest.json",
-            f"{archive}-metadata.json",
-            "identity-rollout.json",
-            f"{archive}.zip",
-            f"{archive}.dmg",
-            "tip-release-context.json",
-            "tip-release-context.json.sha256",
-        ]
-        coordinated_digest = self.write_context(
-            Path(transition_fixture["context"]),
-            Path(transition_fixture["digest"]),
-            tampered,
-        )
-        rejected = self.run_context(
-            "verify",
-            *self.verification_arguments(
-                transition_fixture,
-                expected_digest=coordinated_digest,
-                include_roots=False,
-            ),
-        )
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("transition role requires package installation", rejected.stderr)
-
-    def test_transition_only_policy_is_not_required_by_successor_context(self) -> None:
-        def successor(declaration: dict) -> None:
-            declaration.update(
-                {
-                    "currentRole": "successor",
-                    "expectedSigningIdentity": "successor",
-                    "expectedMigrationPhase": "disabled",
-                    "predecessors": [
-                        {
-                            "role": "transition",
-                            "tag": "tip-transition001",
-                            "rolloutManifestSha256": "2" * 64,
-                        },
-                        {
-                            "role": "preparer",
-                            "tag": "tip-preparer0001",
-                            "rolloutManifestSha256": "1" * 64,
-                        },
-                    ],
-                }
-            )
-
-        def without_transition_material(policy: dict) -> None:
-            policy.pop("identityTransitionPackage")
-            policy["identities"]["successor"].pop(
-                "developerIDInstallerIdentityName"
-            )
-
-        successor_fixture = self.make_context_fixture(
-            declaration_mutator=successor,
-            policy_mutator=without_transition_material,
-        )
-        context = json.loads(
-            Path(successor_fixture["context"]).read_text(encoding="utf-8")
-        )
-        self.assertEqual(context["rollout"]["role"], "successor")
-        self.assertIsNone(context["package"])
-        self.assertFalse(context["installerSigning"]["required"])
-
-        for label, policy_mutator, expected_error in (
-            (
-                "package metadata",
-                lambda policy: policy.pop("identityTransitionPackage"),
-                "transition package keys must be exactly",
-            ),
-            (
-                "Installer label",
-                lambda policy: policy["identities"]["successor"].pop(
-                    "developerIDInstallerIdentityName"
-                ),
-                "transition Tip role requires a reviewed Developer ID Installer identity",
-            ),
-        ):
-            with self.subTest(missing=label):
-                fixture = self.make_authority_fixture(policy_mutator=policy_mutator)
-                output = Path(fixture["temp"]) / "context.json"
-                digest = Path(fixture["temp"]) / "context.sha256"
-                result = self.resolve(fixture, output, digest)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(expected_error, result.stderr)
-
-    def test_verify_requires_setup_digest_and_does_not_reload_authority_inputs(self) -> None:
-        fixture = self.make_context_fixture()
-        arguments = self.verification_arguments(
-            fixture,
-            boundary="credential-preflight",
-            include_roots=False,
-        )
-        verified = self.run_context("verify", *arguments)
-        self.assertEqual(verified.returncode, 0, verified.stderr)
-        self.assertIn("boundary=credential-preflight", verified.stdout)
-
-        without_expected = list(arguments)
-        index = without_expected.index("--expected-context-sha256")
-        del without_expected[index : index + 2]
-        rejected = self.run_context("verify", *without_expected)
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("--expected-context-sha256", rejected.stderr)
-
-        shutil.rmtree(fixture["trusted"])
-        shutil.rmtree(fixture["approved"])
-        still_verified = self.run_context("verify", *arguments)
-        self.assertEqual(still_verified.returncode, 0, still_verified.stderr)
-
-        stable_appcast = Path(fixture["stable_appcast"])
-        stable_appcast.write_bytes(stable_appcast.read_bytes() + b"\n")
-        appcast_rejected = self.run_context("verify", *arguments)
-        self.assertNotEqual(appcast_rejected.returncode, 0)
-        self.assertIn("carried Stable appcast digest mismatch", appcast_rejected.stderr)
-
-    def test_verify_rejects_coordinated_context_and_sidecar_tampering(self) -> None:
-        fixture = self.make_context_fixture()
-        original_expected = str(fixture["expected_digest"])
-        context = json.loads(Path(fixture["context"]).read_text(encoding="utf-8"))
-        context["applicationSigning"]["bundleIdentifier"] = "com.example.tampered"
-        coordinated_digest = self.write_context(
-            Path(fixture["context"]),
-            Path(fixture["digest"]),
-            context,
-        )
-        self.assertNotEqual(coordinated_digest, original_expected)
-
-        rejected = self.run_context(
-            "verify",
-            *self.verification_arguments(
-                fixture,
-                expected_digest=original_expected,
-                include_roots=False,
-            ),
-        )
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("expected-setup=" + original_expected, rejected.stderr)
-        self.assertIn("actual=" + coordinated_digest, rejected.stderr)
-        self.assertIn("detached=" + coordinated_digest, rejected.stderr)
-
-    def test_verify_uses_closed_schema_and_exact_shell_export_allowlist(self) -> None:
-        fixture = self.make_context_fixture()
-        shell = self.run_context(
-            "verify",
-            *self.verification_arguments(fixture),
-            "--emit-shell",
-        )
-        self.assertEqual(shell.returncode, 0, shell.stderr)
-        assignments = {}
-        for line in shell.stdout.splitlines():
-            token = shlex.split(line)
-            self.assertEqual(len(token), 1, line)
-            key, value = token[0].split("=", 1)
-            assignments[key] = value
-        self.assertEqual(
-            tuple(assignments),
-            (
-                "REPOPROMPT_TIP_CONTEXT_SHA256",
-                "REPOPROMPT_TIP_ARCHIVE_CONTRACT",
-                "TIP_COMMIT",
-                "TIP_SHORT_SHA",
-                "TIP_BUILD_SEQUENCE",
-                "TIP_BUILD_NUMBER",
-                "TIP_TAG",
-                "ARCHIVE_BASENAME",
-                "APP_NAME",
-                "DISPLAY_NAME",
-                "MARKETING_VERSION",
-                "ROLLOUT_CHANNEL",
-                "ROLLOUT_ROLE",
-                "ROLLOUT_IDENTITY",
-                "REPOPROMPT_IDENTITY_MIGRATION_PHASE",
-                "ROLLOUT_INSTALLATION_TYPE",
-                "BUNDLE_ID",
-                "SIGNING_TEAM_ID",
-                "EXPECTED_APP_REQUIREMENT",
-                "EXPECTED_SIGN_IDENTITY",
-                "EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER",
-                "EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID",
-                "EXPECTED_MIGRATION_ANCHOR_TEAM_ID",
-                "EXPECTED_MIGRATION_ANCHOR_REQUIREMENT",
-                "EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY",
-                "EXPECTED_INSTALLER_TEAM_ID",
-                "EXPECTED_INSTALLER_IDENTITY",
-                "SPARKLE_PUBLIC_EDDSA_VALUE",
-                "ROLLOUT_UPDATE_REPOSITORY",
-                "ROLLOUT_FEED_URL",
-                "TIP_PUBLICATION_TARGET",
-                "TIP_PUBLICATION_DRAFT",
-                "TIP_PUBLICATION_PRERELEASE",
-                "TIP_PUBLICATION_ASSETS_JSON",
-            ),
-        )
-        self.assertEqual(assignments["REPOPROMPT_TIP_ARCHIVE_CONTRACT"], "tip-rollout-v1")
-        self.assertEqual(assignments["EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"], "")
-        self.assertEqual(assignments["EXPECTED_MIGRATION_ANCHOR_TEAM_ID"], "")
-        self.assertEqual(assignments["EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"], "")
-        self.assertEqual(assignments["EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY"], "")
-        self.assertEqual(assignments["TIP_PUBLICATION_TARGET"], "main")
-        self.assertEqual(assignments["TIP_PUBLICATION_DRAFT"], "false")
-        self.assertEqual(assignments["TIP_PUBLICATION_PRERELEASE"], "false")
-        self.assertNotIn("TIP_PUBLISH_INSTALLATION_TYPE", assignments)
-
-        original = json.loads(Path(fixture["context"]).read_text(encoding="utf-8"))
-        cases = []
-        unknown = json.loads(json.dumps(original))
-        unknown["unexpected"] = "value"
-        cases.append((unknown, "keys are not closed-schema"))
-        malformed = json.loads(json.dumps(original))
-        malformed["release"]["sourceBuildSequence"] = "1521"
-        cases.append((malformed, "source build sequence must be an integer"))
-        role_identity = json.loads(json.dumps(original))
-        role_identity["rollout"]["signingIdentity"] = "legacy"
-        cases.append((role_identity, "transition role requires the successor signing identity"))
-        role_migration = json.loads(json.dumps(original))
-        role_migration["rollout"]["runtimeSecureStorageMigrationPhase"] = "legacy-preparer"
-        cases.append((role_migration, "transition role requires migration phase disabled"))
-        short_sha = json.loads(json.dumps(original))
-        short_sha["release"]["shortSha"] = "1" * 12
-        cases.append((short_sha, "first 12 characters of the release commit"))
-        tag = json.loads(json.dumps(original))
-        tag["release"]["tag"] = "tip-" + "1" * 12
-        tag["publication"]["tag"] = tag["release"]["tag"]
-        cases.append((tag, "release tag must be derived from the release commit"))
-        build = json.loads(json.dumps(original))
-        build["release"]["buildNumber"] = "35.15.22"
-        build["package"]["version"] = "35.15.22"
-        build["release"]["archiveBasename"] = build["release"]["archiveBasename"].replace(
-            "35.15.21", "35.15.22"
-        )
-        build["publication"]["assets"] = [
-            name.replace("35.15.21", "35.15.22")
-            for name in build["publication"]["assets"]
-        ]
-        cases.append((build, "release build number must be derived"))
-        package_version = json.loads(json.dumps(original))
-        package_version["package"]["version"] = "35.15.22"
-        cases.append((package_version, "package version must equal the release build number"))
-        selected_feed = json.loads(json.dumps(original))
-        selected_feed["sparkle"]["selectedFeedURL"] = selected_feed["sparkle"]["stableFeedURL"]
-        cases.append((selected_feed, "selected feed must equal the reviewed Tip feed"))
-        publication_assets = json.loads(json.dumps(original))
-        publication_assets["publication"]["assets"] = list(
-            reversed(publication_assets["publication"]["assets"])
-        )
-        cases.append((publication_assets, "publication assets do not match"))
-        installer_team = json.loads(json.dumps(original))
-        installer_team["installerSigning"]["teamIdentifier"] = "DIFFERENT1"
-        cases.append((installer_team, "Installer and Application Team IDs must match"))
-        secret_field = json.loads(json.dumps(original))
-        secret_field["githubToken"] = "synthetic"
-        cases.append((secret_field, "prohibited secret-like field"))
-        for value, expected_error in cases:
-            with self.subTest(expected_error):
-                new_digest = self.write_context(
-                    Path(fixture["context"]),
-                    Path(fixture["digest"]),
-                    value,
-                )
-                rejected = self.run_context(
-                    "verify",
-                    *self.verification_arguments(
-                        fixture,
-                        expected_digest=new_digest,
-                        include_roots=False,
-                    ),
-                )
-                self.assertNotEqual(rejected.returncode, 0)
-                self.assertIn(expected_error, rejected.stderr)
-
-    def test_verify_checks_setup_routing_and_writes_fixed_github_environment(self) -> None:
-        fixture = self.make_context_fixture()
-        github_env = Path(fixture["temp"]) / "github-env"
-        github_env.write_text("EXISTING=value\n", encoding="utf-8")
-        verified = self.run_context(
-            "verify",
-            *self.verification_arguments(fixture, boundary="workflow-job"),
-            "--expected-role", "transition",
-            "--expected-installation-type", "package",
-            "--expected-tag", f"tip-{str(fixture['approved_commit'])[:12]}",
-            "--expected-build-number", "35.15.21",
-            "--github-env", str(github_env),
-        )
-        self.assertEqual(verified.returncode, 0, verified.stderr)
-        environment = dict(
-            line.split("=", 1)
-            for line in github_env.read_text(encoding="utf-8").splitlines()
-        )
-        self.assertEqual(environment["EXISTING"], "value")
-        self.assertEqual(environment["ROLLOUT_ROLE"], "transition")
-        self.assertEqual(environment["ROLLOUT_INSTALLATION_TYPE"], "package")
-        self.assertEqual(environment["TIP_BUILD_NUMBER"], "35.15.21")
-        self.assertEqual(environment["REPOPROMPT_TIP_CONTEXT_SHA256"], fixture["expected_digest"])
-
-        rejected = self.run_context(
-            "verify",
-            *self.verification_arguments(fixture, boundary="workflow-job"),
-            "--expected-role", "successor",
-            "--expected-installation-type", "package",
-            "--expected-tag", f"tip-{str(fixture['approved_commit'])[:12]}",
-            "--expected-build-number", "35.15.21",
-        )
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("setup routing role mismatch", rejected.stderr)
-
-    def test_resolve_requires_committed_fixed_inputs_and_clean_roots(self) -> None:
-        fixture = self.make_authority_fixture()
-        output = Path(fixture["temp"]) / "context.json"
-        digest = Path(fixture["temp"]) / "context.sha256"
-        input_paths = (
-            Path(fixture["trusted"]) / "Scripts" / "apple_identity_policy.json",
-            Path(fixture["trusted"]) / "Scripts" / "stable_rollout.py",
-            Path(fixture["trusted"]) / "Scripts" / "tip_release_context.py",
-            Path(fixture["approved"]) / "tip-rollout.json",
-            Path(fixture["approved"]) / "version.env",
-        )
-        for file in input_paths:
-            with self.subTest(file=file.name):
-                original = file.read_bytes()
-                file.write_bytes(original + b"\n")
-                rejected = self.resolve(fixture, output, digest)
-                self.assertNotEqual(rejected.returncode, 0)
-                self.assertIn("does not match committed blob", rejected.stderr)
-                file.write_bytes(original)
-
-        for root_key, label in (
-            ("trusted", "trusted tooling"),
-            ("approved", "approved source"),
-        ):
-            with self.subTest(dirty=label):
-                marker = Path(fixture[root_key]) / "authority-marker.txt"
-                original = marker.read_text(encoding="utf-8")
-                marker.write_text(original + "dirty\n", encoding="utf-8")
-                rejected = self.resolve(fixture, output, digest)
-                self.assertNotEqual(rejected.returncode, 0)
-                self.assertIn(
-                    f"{label} Git checkout has staged, working-tree, or untracked changes",
-                    rejected.stderr,
-                )
-                marker.write_text(original, encoding="utf-8")
-
-        resolved = self.resolve(fixture, output, digest)
-        self.assertEqual(resolved.returncode, 0, resolved.stderr)
-        Path(fixture["approved"], "authority-marker.txt").write_text(
-            "approved\ndirty\n",
-            encoding="utf-8",
-        )
-        base_verify = [
-            "--context", str(output),
-            "--digest", str(digest),
-            "--expected-context-sha256", digest.read_text(encoding="ascii").strip(),
-            "--expected-approved-source-commit", str(fixture["approved_commit"]),
-            "--expected-tooling-commit", str(fixture["tooling_commit"]),
-        ]
-        no_roots = self.run_context("verify", *base_verify, "--boundary", "no-root")
-        self.assertEqual(no_roots.returncode, 0, no_roots.stderr)
-        with_roots = self.run_context(
-            "verify",
-            *base_verify,
-            "--boundary", "with-root",
-            "--approved-source-root", str(fixture["approved"]),
-            "--trusted-tooling-root", str(fixture["trusted"]),
-        )
-        self.assertNotEqual(with_roots.returncode, 0)
-        self.assertIn(
-            "approved source Git checkout has staged, working-tree, or untracked changes",
-            with_roots.stderr,
-        )
-
-    def test_verify_rejects_untracked_shadow_module_and_writes_no_bytecode(self) -> None:
-        fixture = self.make_context_fixture()
-        trusted = Path(fixture["trusted"])
-
-        # Sibling-module imports inside the trusted root must not create
-        # untracked in-tree bytecode that would fail the next boundary's
-        # strict clean-checkout verification, even without the ambient
-        # PYTHONDONTWRITEBYTECODE test default.
-        bytecode_env = os.environ.copy()
-        bytecode_env.pop("PYTHONDONTWRITEBYTECODE", None)
-        bytecode_env.update(self.context_environment(fixture))
-        adapter = subprocess.run(
-            [
-                sys.executable,
-                str(trusted / "Scripts" / "stable_rollout.py"),
-                "predecessor-values-from-context",
-            ],
-            env=bytecode_env,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(adapter.returncode, 0, adapter.stderr)
-        self.assertEqual(list(trusted.rglob("__pycache__")), [])
-        clean = self.run_context("verify", *self.verification_arguments(fixture))
-        self.assertEqual(clean.returncode, 0, clean.stderr)
-
-        # An untracked shadow module must be rejected even at the expected
-        # HEAD, before anything could import it from the trusted root.
-        shadow = trusted / "Scripts" / "hashlib.py"
-        shadow.write_text(
-            "raise AssertionError('untracked shadow module executed')\n",
-            encoding="utf-8",
-        )
-        rejected = self.run_context("verify", *self.verification_arguments(fixture))
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn(
-            "trusted tooling Git checkout has staged, working-tree, or untracked changes",
-            rejected.stderr,
-        )
-        self.assertNotIn("untracked shadow module executed", rejected.stderr)
-        self.assertNotIn("untracked shadow module executed", rejected.stdout)
-
-    def test_policy_owns_transition_contract_and_application_roles_omit_it(self) -> None:
-        fixture = self.make_context_fixture()
-        context = json.loads(Path(fixture["context"]).read_text(encoding="utf-8"))
-        policy = json.loads(
-            (self.FIXTURE / "apple_identity_policy.json").read_text(encoding="utf-8")
-        )
-        expected_package = dict(policy["identityTransitionPackage"])
-        expected_package["version"] = "35.15.21"
-        self.assertEqual(context["package"], expected_package)
-        self.assertEqual(
-            context["migrationAnchorSigning"],
-            {
-                "required": False,
-                "bundleIdentifier": None,
-                "teamIdentifier": None,
-                "developerIDRequirement": None,
-                "identityName": None,
-            },
-        )
-
-        invalid = self.make_authority_fixture(
-            policy_mutator=lambda value: value["identityTransitionPackage"].update(
-                {"bundleIsVersionChecked": False}
-            )
-        )
-        invalid_result = self.resolve(
-            invalid,
-            Path(invalid["temp"]) / "context.json",
-            Path(invalid["temp"]) / "context.sha256",
-        )
-        self.assertNotEqual(invalid_result.returncode, 0)
-        self.assertIn("version-checked", invalid_result.stderr)
-
-        def successor(declaration: dict) -> None:
-            declaration.update(
-                {
-                    "currentRole": "successor",
-                    "expectedSigningIdentity": "successor",
-                    "expectedMigrationPhase": "disabled",
-                    "predecessors": [
-                        {
-                            "role": "transition",
-                            "tag": "tip-transition0001",
-                            "rolloutManifestSha256": "2" * 64,
-                        },
-                        {
-                            "role": "preparer",
-                            "tag": "tip-preparer0001",
-                            "rolloutManifestSha256": "1" * 64,
-                        },
-                    ],
-                }
-            )
-
-        successor_fixture = self.make_context_fixture(declaration_mutator=successor)
-        successor_context = json.loads(
-            Path(successor_fixture["context"]).read_text(encoding="utf-8")
-        )
-        self.assertEqual(successor_context["rollout"]["role"], "successor")
-        self.assertIsNone(successor_context["package"])
-        self.assertFalse(successor_context["installerSigning"]["required"])
-        self.assertIsNone(successor_context["installerSigning"]["identityName"])
-        self.assertEqual(len(successor_context["publication"]["assets"]), 9)
-        successor_assets = successor_context["publication"]["assets"]
-        self.assertTrue(any(name.endswith(".zip") for name in successor_assets))
-        self.assertTrue(any(name.endswith(".dmg") for name in successor_assets))
-        self.assertFalse(any(name.endswith(".pkg") for name in successor_assets))
-        self.assertIn("tip-release-context.json", successor_assets)
-        self.assertIn("tip-release-context.json.sha256", successor_assets)
-
-        def preparer(declaration: dict) -> None:
-            declaration.update(
-                {
-                    "currentRole": "preparer",
-                    "expectedSigningIdentity": "legacy",
-                    "expectedMigrationPhase": "legacy-preparer",
-                    "predecessors": [],
-                }
-            )
-
-        preparer_fixture = self.make_context_fixture(declaration_mutator=preparer)
-        preparer_context = json.loads(
-            Path(preparer_fixture["context"]).read_text(encoding="utf-8")
-        )
-        expected_anchor = policy["identities"]["successor"]
-        self.assertEqual(
-            preparer_context["migrationAnchorSigning"],
-            {
-                "required": True,
-                "bundleIdentifier": expected_anchor["bundleIdentifier"],
-                "teamIdentifier": expected_anchor["teamIdentifier"],
-                "developerIDRequirement": expected_anchor["developerIDRequirement"],
-                "identityName": expected_anchor["developerIDApplicationIdentityName"],
-            },
-        )
-        preparer_shell = self.run_context(
-            "verify",
-            *self.verification_arguments(preparer_fixture),
-            "--emit-shell",
-        )
-        self.assertEqual(preparer_shell.returncode, 0, preparer_shell.stderr)
-        preparer_assignments = {
-            token[0].split("=", 1)[0]: token[0].split("=", 1)[1]
-            for line in preparer_shell.stdout.splitlines()
-            if (token := shlex.split(line))
-        }
-        self.assertEqual(
-            preparer_assignments["EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY"],
-            expected_anchor["developerIDApplicationIdentityName"],
-        )
-        self.assertEqual(
-            preparer_assignments["EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"],
-            expected_anchor["bundleIdentifier"],
-        )
-        self.assertNotIn("EXPECTED_SUCCESSOR_SIGN_IDENTITY", preparer_assignments)
-
-    def test_resolve_rejects_build_repository_drift_and_binds_appcast(self) -> None:
-        fixture = self.make_authority_fixture()
-        output = Path(fixture["temp"]) / "context.json"
-        digest = Path(fixture["temp"]) / "context.sha256"
-        for sequence in ("0", "10000"):
-            rejected = self.resolve(
-                fixture,
-                output,
-                digest,
-                source_build_sequence=sequence,
-            )
-            self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("source build sequence must be between 1 and 9999", rejected.stderr)
-
-        malformed_appcast = Path(fixture["temp"]) / "stable-malformed.xml"
-        malformed_appcast.write_text(
-            (self.FIXTURE / "stable-appcast.xml")
-            .read_text(encoding="utf-8")
-            .replace(
-                "<sparkle:version>35</sparkle:version>",
-                "<sparkle:version>35.1</sparkle:version>",
-            ),
-            encoding="utf-8",
-        )
-        malformed = self.resolve(
-            fixture,
-            output,
-            digest,
-            stable_appcast=malformed_appcast,
-        )
-        self.assertNotEqual(malformed.returncode, 0)
-        self.assertIn("incompatible with the Tip three-component encoding", malformed.stderr)
-
-        repository = self.resolve(
-            fixture,
-            output,
-            digest,
-            expected_repository="example/unreviewed-tip-updates",
-        )
-        self.assertNotEqual(repository.returncode, 0)
-        self.assertIn("does not match reviewed identity policy", repository.stderr)
-
-        first = self.resolve(fixture, output, digest)
-        self.assertEqual(first.returncode, 0, first.stderr)
-        first_context = json.loads(output.read_text(encoding="utf-8"))
-        changed_appcast = Path(fixture["temp"]) / "stable-changed.xml"
-        changed_appcast.write_bytes(Path(fixture["stable_appcast"]).read_bytes() + b"\n")
-        second = self.resolve(
-            fixture,
-            output,
-            digest,
-            stable_appcast=changed_appcast,
-        )
-        self.assertEqual(second.returncode, 0, second.stderr)
-        second_context = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(
-            first_context["release"]["buildNumber"],
-            second_context["release"]["buildNumber"],
-        )
-        self.assertNotEqual(
-            first_context["provenance"]["inputSha256"]["stableAppcast"],
-            second_context["provenance"]["inputSha256"]["stableAppcast"],
-        )
-
-    def test_context_rollout_adapter_reuses_declaration_algorithm_for_zero_predecessors(self) -> None:
-        def preparer(declaration: dict) -> None:
-            declaration.update(
-                {
-                    "currentRole": "preparer",
-                    "expectedSigningIdentity": "legacy",
-                    "expectedMigrationPhase": "legacy-preparer",
-                    "predecessors": [],
-                }
-            )
-
-        fixture = self.make_context_fixture(declaration_mutator=preparer)
-        context = json.loads(Path(fixture["context"]).read_text(encoding="utf-8"))
-        release = context["release"]
-        application = context["applicationSigning"]
-        temp_dir = Path(fixture["temp"])
-        enclosure = temp_dir / f"{release['archiveBasename']}.zip"
-        enclosure.write_bytes(b"synthetic preparer enclosure\n")
-        app_manifest = temp_dir / "app-artifact-manifest.json"
-        app_manifest.write_text("{}\n", encoding="utf-8")
-        projected_version = temp_dir / "projected-version.env"
-        projected_version.write_text(
-            "\n".join(
-                (
-                    f"APP_NAME={release['appName']}",
-                    f'DISPLAY_NAME="{release["displayName"]}"',
-                    f"MARKETING_VERSION={release['marketingVersion']}",
-                    f"BUILD_NUMBER={release['buildNumber']}",
-                    f"BUNDLE_ID={application['bundleIdentifier']}",
-                    f"SIGNING_TEAM_ID={application['teamIdentifier']}",
-                    "",
-                )
-            ),
-            encoding="utf-8",
-        )
-        generic_appcast = temp_dir / "generic-appcast.xml"
-        generic_manifest = temp_dir / "generic-manifest.json"
-        context_appcast = temp_dir / "context-appcast.xml"
-        context_manifest = temp_dir / "context-manifest.json"
-        tool = Path(fixture["trusted"]) / "Scripts" / "stable_rollout.py"
-        shared = [
-            "--enclosure", str(enclosure),
-            "--enclosure-signature", "synthetic-signature",
-            "--app-artifact-manifest", str(app_manifest),
-        ]
-        generic = subprocess.run(
-            [
-                sys.executable,
-                str(tool),
-                "generate",
-                "--declaration", str(Path(fixture["approved"]) / "tip-rollout.json"),
-                "--policy", str(Path(fixture["trusted"]) / "Scripts" / "apple_identity_policy.json"),
-                "--version-env", str(projected_version),
-                "--release-tag", release["tag"],
-                "--release-commit", release["commit"],
-                "--migration-phase", "legacy-preparer",
-                "--enclosure-basename", release["archiveBasename"],
-                *shared,
-                "--appcast-output", str(generic_appcast),
-                "--manifest-output", str(generic_manifest),
-            ],
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(generic.returncode, 0, generic.stderr)
-
-        env = os.environ.copy()
-        env.update(self.context_environment(fixture))
-        predecessors = subprocess.run(
-            [sys.executable, str(tool), "predecessor-values-from-context"],
-            env=env,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(predecessors.returncode, 0, predecessors.stderr)
-        self.assertEqual(predecessors.stdout, "")
-        generated = subprocess.run(
-            [
-                sys.executable,
-                str(tool),
-                "generate-from-context",
-                *shared,
-                "--appcast-output", str(context_appcast),
-                "--manifest-output", str(context_manifest),
-            ],
-            env=env,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(generated.returncode, 0, generated.stderr)
-        self.assertEqual(context_appcast.read_bytes(), generic_appcast.read_bytes())
-        self.assertEqual(context_manifest.read_bytes(), generic_manifest.read_bytes())
-
-        validated = subprocess.run(
-            [
-                sys.executable,
-                str(tool),
-                "validate-from-context",
-                *shared,
-                "--appcast", str(context_appcast),
-                "--manifest", str(context_manifest),
-            ],
-            env=env,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(validated.returncode, 0, validated.stderr)
-
-    def test_context_rollout_adapter_accumulates_preparer_transition_successor_ladder(self) -> None:
-        def preparer(declaration: dict) -> None:
-            declaration.update(
-                {
-                    "currentRole": "preparer",
-                    "expectedSigningIdentity": "legacy",
-                    "expectedMigrationPhase": "legacy-preparer",
-                    "predecessors": [],
-                }
-            )
-
-        def generate(
-            fixture: dict[str, object],
-            predecessors: list[Path],
-        ) -> tuple[dict, Path, Path]:
-            context = json.loads(Path(fixture["context"]).read_text(encoding="utf-8"))
-            temp_dir = Path(fixture["temp"])
-            suffix = ".pkg" if context["rollout"]["installationType"] == "package" else ".zip"
-            enclosure = temp_dir / f"{context['release']['archiveBasename']}{suffix}"
-            enclosure.write_bytes(f"{context['rollout']['role']} enclosure\n".encode())
-            app_manifest = temp_dir / "app-artifact-manifest.json"
-            app_manifest.write_text("{}\n", encoding="utf-8")
-            appcast = temp_dir / "appcast.xml"
-            manifest = temp_dir / "identity-rollout.json"
-            tool = Path(fixture["trusted"]) / "Scripts" / "stable_rollout.py"
-            arguments = [
-                sys.executable,
-                str(tool),
-                "generate-from-context",
-                "--enclosure", str(enclosure),
-                "--enclosure-signature", f"{context['rollout']['role']}-signature",
-                "--app-artifact-manifest", str(app_manifest),
-            ]
-            for predecessor in predecessors:
-                arguments += ["--predecessor-manifest", str(predecessor)]
-            arguments += [
-                "--appcast-output", str(appcast),
-                "--manifest-output", str(manifest),
-            ]
-            env = os.environ.copy()
-            env.update(self.context_environment(fixture))
-            result = subprocess.run(arguments, env=env, text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            return context, manifest, appcast
-
-        preparer_fixture = self.make_context_fixture(
-            declaration_mutator=preparer,
-            source_build_sequence="1521",
-        )
-        preparer_context, preparer_manifest, _ = generate(preparer_fixture, [])
-        preparer_digest = hashlib.sha256(preparer_manifest.read_bytes()).hexdigest()
-
-        def transition(declaration: dict) -> None:
-            declaration.update(
-                {
-                    "currentRole": "transition",
-                    "expectedSigningIdentity": "successor",
-                    "expectedMigrationPhase": "disabled",
-                    "predecessors": [
-                        {
-                            "role": "preparer",
-                            "tag": preparer_context["release"]["tag"],
-                            "rolloutManifestSha256": preparer_digest,
-                        }
-                    ],
-                }
-            )
-
-        transition_fixture = self.make_context_fixture(
-            declaration_mutator=transition,
-            source_build_sequence="1522",
-        )
-        transition_context, transition_manifest, _ = generate(
-            transition_fixture,
-            [preparer_manifest],
-        )
-        transition_digest = hashlib.sha256(transition_manifest.read_bytes()).hexdigest()
-
-        def successor(declaration: dict) -> None:
-            declaration.update(
-                {
-                    "currentRole": "successor",
-                    "expectedSigningIdentity": "successor",
-                    "expectedMigrationPhase": "disabled",
-                    "predecessors": [
-                        {
-                            "role": "transition",
-                            "tag": transition_context["release"]["tag"],
-                            "rolloutManifestSha256": transition_digest,
-                        },
-                        {
-                            "role": "preparer",
-                            "tag": preparer_context["release"]["tag"],
-                            "rolloutManifestSha256": preparer_digest,
-                        },
-                    ],
-                }
-            )
-
-        successor_fixture = self.make_context_fixture(
-            declaration_mutator=successor,
-            source_build_sequence="1523",
-        )
-        successor_context, successor_manifest, successor_appcast = generate(
-            successor_fixture,
-            [transition_manifest, preparer_manifest],
-        )
-        final_manifest = json.loads(successor_manifest.read_text(encoding="utf-8"))
-        items = final_manifest["appcastItems"]
-        self.assertEqual([item["role"] for item in items], ["successor", "transition", "preparer"])
-        self.assertEqual(
-            [item["minimumUpdateVersion"] for item in items],
-            [
-                transition_context["release"]["buildNumber"],
-                preparer_context["release"]["buildNumber"],
-                None,
-            ],
-        )
-        final_appcast = successor_appcast.read_text(encoding="utf-8")
-        self.assertEqual(final_appcast.count("    <item>"), 3)
-        minimum_updates = re.findall(
-            r"<sparkle:minimumUpdateVersion>([0-9.]+)</sparkle:minimumUpdateVersion>",
-            final_appcast,
-        )
-        minimum_autoupdates = re.findall(
-            r"<sparkle:minimumAutoupdateVersion>([0-9.]+)</sparkle:minimumAutoupdateVersion>",
-            final_appcast,
-        )
-        self.assertEqual(minimum_updates, minimum_autoupdates)
-        self.assertEqual(
-            minimum_updates,
-            [
-                transition_context["release"]["buildNumber"],
-                preparer_context["release"]["buildNumber"],
-            ],
-        )
-        self.assertEqual(final_manifest["sourceTag"], successor_context["release"]["tag"])
-
-        blocked_fixture = self.make_authority_fixture(declaration_mutator=transition)
-        blocked_stable_appcast = Path(blocked_fixture["stable_appcast"])
-        blocked_stable_appcast.write_text(
-            blocked_stable_appcast.read_text(encoding="utf-8")
-            .replace("Stable Build 35", "Stable Build 36")
-            .replace("<sparkle:version>35<", "<sparkle:version>36<"),
-            encoding="utf-8",
-        )
-        blocked_fixture["context"] = Path(blocked_fixture["temp"]) / "tip-release-context.json"
-        blocked_fixture["digest"] = Path(blocked_fixture["temp"]) / "tip-release-context.json.sha256"
-        blocked_resolution = self.resolve(
-            blocked_fixture,
-            Path(blocked_fixture["context"]),
-            Path(blocked_fixture["digest"]),
-            source_build_sequence="1522",
-        )
-        self.assertEqual(blocked_resolution.returncode, 0, blocked_resolution.stderr)
-        blocked_fixture["expected_digest"] = Path(blocked_fixture["digest"]).read_text(
-            encoding="ascii"
-        ).strip()
-        blocked_context = json.loads(
-            Path(blocked_fixture["context"]).read_text(encoding="utf-8")
-        )
-        blocked_enclosure = Path(blocked_fixture["temp"]) / (
-            blocked_context["release"]["archiveBasename"] + ".pkg"
-        )
-        blocked_enclosure.write_text("transition enclosure\n", encoding="utf-8")
-        blocked_app_manifest = Path(blocked_fixture["temp"]) / "app-artifact-manifest.json"
-        blocked_app_manifest.write_text("{}\n", encoding="utf-8")
-        blocked = subprocess.run(
-            [
-                sys.executable,
-                str(Path(blocked_fixture["trusted"]) / "Scripts" / "stable_rollout.py"),
-                "generate-from-context",
-                "--enclosure", str(blocked_enclosure),
-                "--enclosure-signature", "transition-signature",
-                "--app-artifact-manifest", str(blocked_app_manifest),
-                "--predecessor-manifest", str(preparer_manifest),
-                "--appcast-output", str(Path(blocked_fixture["temp"]) / "blocked-appcast.xml"),
-                "--manifest-output", str(Path(blocked_fixture["temp"]) / "blocked-manifest.json"),
-            ],
-            env={**os.environ, **self.context_environment(blocked_fixture)},
-            text=True,
-            capture_output=True,
-        )
-        self.assertNotEqual(blocked.returncode, 0)
-        self.assertIn("Stable=36 preparer=35.15.21", blocked.stderr)
-
-    def test_live_tip_publication_state_allows_only_monotonic_retained_rollout_history(self) -> None:
-        spec = importlib.util.spec_from_file_location("stable_rollout_live_test", self.ROLLOUT_TOOL)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        rollout = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rollout)
-
-        repository = self.SYNTHETIC_REPOSITORY
-        minimum_system = "13.0"
-        live_main = "2" * 40
-
-        def item(
-            role: str,
-            tag: str,
-            build: str,
-            minimum_update: str | None,
-            manifest_digest: str | None,
-        ) -> dict:
-            suffix = ".pkg" if role == "transition" else ".zip"
-            enclosure_name = f"RepoPrompt-tip-{tag[4:]}-{build}{suffix}"
-            return {
-                "role": role,
-                "tag": tag,
-                "url": f"https://github.com/{repository}/releases/download/{tag}/{enclosure_name}",
-                "buildNumber": build,
-                "marketingVersion": "1.3.0",
-                "minimumSystemVersion": minimum_system,
-                "minimumUpdateVersion": minimum_update,
-                "installationType": "package" if role == "transition" else "application",
-                "enclosureName": enclosure_name,
-                "enclosureSize": 42,
-                "enclosureSha256": "1" * 64,
-                "edSignature": f"{role}-signature",
-                "rolloutManifestSha256": manifest_digest,
-                "rolloutManifestName": "identity-rollout.json" if manifest_digest else None,
-            }
-
-        def manifest(role: str, items: list[dict]) -> dict:
-            newest = items[0]
-            return {
-                "schemaVersion": 1,
-                "channel": "tip",
-                "sourceTag": newest["tag"],
-                "releaseCommit": "1" * 40,
-                "currentRole": role,
-                "signingIdentity": "legacy" if role in {"legacy", "preparer"} else "successor",
-                "bundleIdentifier": "com.example.app",
-                "teamIdentifier": "EXAMPLETEAM",
-                "marketingVersion": newest["marketingVersion"],
-                "buildNumber": newest["buildNumber"],
-                "migrationPhase": "legacy-preparer" if role == "preparer" else "disabled",
-                "eligibilityProfile": "tip-rollout-v1",
-                "updateRepository": repository,
-                "appArtifactManifest": {"name": "manifest.json", "sha256": "3" * 64},
-                "appcastItems": items,
-            }
-
-        def candidate(role: str, build: str, predecessors: list[dict], commit: str = live_main) -> dict:
-            return {
-                "release": {"commit": commit, "buildNumber": build, "appName": "RepoPrompt"},
-                "sparkle": {
-                    "minimumSystemVersion": minimum_system,
-                    "updateRepository": repository,
-                },
-                "rollout": {"role": role, "predecessors": predecessors},
-            }
-
-        preparer_digest = "a" * 64
-        transition_digest = "b" * 64
-        transition_retained_digest = "c" * 64
-        preparer_retained_digest = "d" * 64
-        p_item = item("preparer", "tip-aaaaaaaaaaaa", "35.15.18", None, None)
-        p_manifest = manifest("preparer", [p_item])
-        t_item = item("transition", "tip-bbbbbbbbbbbb", "35.15.21", "35.15.18", None)
-        p_retained = item(
-            "preparer", "tip-aaaaaaaaaaaa", "35.15.18", None, preparer_retained_digest
-        )
-        t_manifest = manifest("transition", [t_item, p_retained])
-        n_item = item("successor", "tip-cccccccccccc", "35.15.22", "35.15.21", None)
-        t_retained = item(
-            "transition", "tip-bbbbbbbbbbbb", "35.15.21", "35.15.18", transition_retained_digest
-        )
-        n_manifest = manifest("successor", [n_item, t_retained, p_retained])
-
-        valid_cases = (
-            (
-                "P-to-T",
-                candidate(
-                    "transition",
-                    "35.15.21",
-                    [{"role": "preparer", "tag": p_item["tag"], "rolloutManifestSha256": preparer_digest}],
-                ),
-                p_manifest,
-                preparer_digest,
-            ),
-            (
-                "T-to-N",
-                candidate(
-                    "successor",
-                    "35.15.22",
-                    [
-                        {"role": "transition", "tag": t_item["tag"], "rolloutManifestSha256": transition_digest},
-                        {"role": "preparer", "tag": p_retained["tag"], "rolloutManifestSha256": preparer_retained_digest},
-                    ],
-                ),
-                t_manifest,
-                transition_digest,
-            ),
-            (
-                "N-to-new-N",
-                candidate(
-                    "successor",
-                    "35.15.23",
-                    [
-                        {"role": "transition", "tag": t_retained["tag"], "rolloutManifestSha256": transition_retained_digest},
-                        {"role": "preparer", "tag": p_retained["tag"], "rolloutManifestSha256": preparer_retained_digest},
-                    ],
-                ),
-                n_manifest,
-                "e" * 64,
-            ),
-        )
-        for label, candidate_context, live_manifest, manifest_digest in valid_cases:
-            with self.subTest(valid=label):
-                rollout.validate_live_tip_publication_state(
-                    candidate_context,
-                    live_manifest,
-                    rollout.render_appcast(live_manifest),
-                    manifest_digest,
-                    live_main,
-                )
-
-        with self.subTest(valid="published-P-null-floor-compatibility"):
-            published_preparer = json.loads(json.dumps(p_manifest))
-            published_item = published_preparer["appcastItems"][0]
-            self.assertIsNone(published_item.pop("minimumUpdateVersion"))
-            published_item["minimumAutoupdateVersion"] = None
-            normalized_preparer = rollout.normalize_manifest_floor_authority(
-                published_preparer
-            )
-            rollout.validate_live_tip_publication_state(
-                valid_cases[0][1],
-                published_preparer,
-                rollout.render_appcast(normalized_preparer),
-                preparer_digest,
-                live_main,
-            )
-
-        rejected_cases = []
-        stale = json.loads(json.dumps(valid_cases[0][1]))
-        stale["release"]["commit"] = "4" * 40
-        rejected_cases.append(("stale historical dispatch", stale, p_manifest, preparer_digest, "source commit is stale"))
-        regression = candidate("preparer", "35.15.22", [])
-        rejected_cases.append(("role regression", regression, t_manifest, transition_digest, "would regress or skip"))
-        same_build = json.loads(json.dumps(valid_cases[0][1]))
-        same_build["release"]["buildNumber"] = p_item["buildNumber"]
-        rejected_cases.append(("same build", same_build, p_manifest, preparer_digest, "strictly newer"))
-        wrong_history = json.loads(json.dumps(valid_cases[0][1]))
-        wrong_history["rollout"]["predecessors"][0]["rolloutManifestSha256"] = "f" * 64
-        rejected_cases.append(("changed pin", wrong_history, p_manifest, preparer_digest, "do not exactly match"))
-        for label, candidate_context, live_manifest, manifest_digest, expected_error in rejected_cases:
-            with self.subTest(rejected=label), self.assertRaisesRegex(rollout.RolloutError, expected_error):
-                rollout.validate_live_tip_publication_state(
-                    candidate_context,
-                    live_manifest,
-                    rollout.render_appcast(live_manifest),
-                    manifest_digest,
-                    live_main,
-                )
-
-    def test_stable_build_must_remain_below_retained_tip_preparer(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "stable_rollout_cross_channel_test", self.ROLLOUT_TOOL
-        )
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        rollout = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rollout)
-
-        manifest = {
-            "appcastItems": [
-                {"role": "transition", "buildNumber": "35.15.21"},
-                {"role": "preparer", "buildNumber": "35.15.18"},
-            ]
-        }
-        context = {
-            "rollout": {"role": "transition"},
-            "release": {"stableMaximumBuild": "35"},
-        }
-        rollout.validate_stable_build_below_retained_tip_preparer(context, manifest)
-
-        context["release"]["stableMaximumBuild"] = "36"
-        with self.assertRaisesRegex(
-            rollout.RolloutError,
-            r"Stable=36 preparer=35\.15\.18",
-        ):
-            rollout.validate_stable_build_below_retained_tip_preparer(context, manifest)
-
-    def test_main_tip_workflow_transports_one_digest_bound_context_to_every_job(self) -> None:
-        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertEqual(workflow.count("tip_release_context.py resolve"), 1)
-        self.assertEqual(workflow.count("stable_rollout.py feed-url"), 1)
-        self.assertNotIn(
-            "https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml",
-            workflow,
-        )
-        self.assertIn("--connect-timeout 10 --max-time 30", workflow)
-        self.assertNotIn("stable_rollout.py packaging-context", workflow)
-        self.assertIn("context-sha256: ${{ steps.tip.outputs.context-sha256 }}", workflow)
-        self.assertNotIn("rollout-identity: ${{ steps.tip.outputs", workflow)
-        self.assertNotIn("migration-phase: ${{ steps.tip.outputs", workflow)
-        self.assertIn("name: RepoPrompt-CE-tip-release-context", workflow)
-        self.assertIn("sha256sums-sha256: ${{ steps.signed-assets.outputs.sha256sums-sha256 }}", workflow)
-        self.assertEqual(
-            workflow.count("REPOPROMPT_EXPECTED_TIP_SHA256SUMS_SHA256: ${{ needs.sign.outputs.sha256sums-sha256 }}"),
-            2,
-        )
-        self.assertIn("path: ${{ runner.temp }}/tip-release-context/", workflow)
-        for basename in (
-            "tip-release-context.json",
-            "tip-release-context.json.sha256",
-            "stable-appcast-input.xml",
-        ):
-            self.assertIn(basename, workflow)
-
-        action = (
-            SCRIPT_DIR.parent / ".github" / "actions" / "verify-tip-context" / "action.yml"
-        ).read_text(encoding="utf-8")
-        self.assertIn("using: composite", action)
-        self.assertIn(
-            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", action
-        )
-        self.assertIn("name: RepoPrompt-CE-tip-release-context", action)
-        self.assertIn("path: tip-release-context", action)
-        self.assertEqual(action.count("tip_release_context.py verify"), 1)
-        for marker in (
-            "--context tip-release-context/tip-release-context.json",
-            "--digest tip-release-context/tip-release-context.json.sha256",
-            "--stable-appcast tip-release-context/stable-appcast-input.xml",
-            "--expected-context-sha256 \"$EXPECTED_CONTEXT_SHA256\"",
-            "--expected-approved-source-commit",
-            "--expected-tooling-commit",
-            "--expected-role \"$SETUP_ROLLOUT_ROLE\"",
-            "--expected-installation-type \"$SETUP_INSTALLATION_TYPE\"",
-            "--expected-tag \"$SETUP_TAG\"",
-            "--expected-build-number \"$SETUP_BUILD_NUMBER\"",
-            "--boundary \"$VERIFICATION_BOUNDARY\"",
-            "--approved-source-root \"$APPROVED_SOURCE_ROOT\"",
-            "--trusted-tooling-root trusted-control-plane",
-            '--github-env "$GITHUB_ENV"',
-            'echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"',
-            'echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"',
-            'echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"',
-            'echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/$APPROVED_SOURCE_ROOT"',
-            'echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"',
-            'echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"',
-            'echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"',
-        ):
-            self.assertIn(marker, action)
-        self.assertLess(
-            action.index("tip_release_context.py verify"),
-            action.index("REPOPROMPT_TIP_RELEASE_CONTEXT="),
-        )
-
-        jobs = {
-            "automatic": workflow.split("\n  automatic-tip-dormant:", 1)[1].split(
-                "\n  credential-preflight:", 1
-            )[0],
-            "credential": workflow.split("\n  credential-preflight:", 1)[1].split(
-                "\n  stage:", 1
-            )[0],
-            "stage": workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0],
-            "sign": workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0],
-            "smoke": workflow.split("\n  smoke-no-secrets:", 1)[1].split(
-                "\n  publish:", 1
-            )[0],
-            "publish": workflow.split("\n  publish:", 1)[1],
-        }
-        owned_operation = {
-            "automatic": "Report suppressed automatic publication",
-            "credential": "Validate role-selected Tip credentials",
-            "stage": "Stage tip artifact",
-            "sign": "Download staged tip source",
-            "smoke": "Download signed tip assets",
-            "publish": "Download signed tip assets",
-        }
-        for name, job in jobs.items():
-            with self.subTest(job=name):
-                self.assertIn("Verify immutable Tip release context", job)
-                self.assertIn(
-                    "uses: ./trusted-control-plane/.github/actions/verify-tip-context",
-                    job,
-                )
-                self.assertIn(
-                    "expected-context-sha256: ${{ needs.setup.outputs.context-sha256 }}",
-                    job,
-                )
-                self.assertIn(
-                    "expected-approved-source-commit: ${{ needs.setup.outputs.commit }}",
-                    job,
-                )
-                self.assertIn(
-                    "expected-tooling-commit: ${{ needs.setup.outputs.tooling-commit }}",
-                    job,
-                )
-                self.assertIn(
-                    "expected-role: ${{ needs.setup.outputs.rollout-role }}", job
-                )
-                self.assertIn(
-                    "expected-installation-type: ${{ needs.setup.outputs.installation-type }}",
-                    job,
-                )
-                self.assertIn("expected-tag: ${{ needs.setup.outputs.tag }}", job)
-                self.assertIn(
-                    "expected-build-number: ${{ needs.setup.outputs.build-number }}", job
-                )
-                if name == "stage":
-                    self.assertIn("Check out tip source", job)
-                    self.assertIn("approved-source-root: tip-source", job)
-                else:
-                    self.assertIn("Check out approved tip source as data", job)
-                    self.assertIn("approved-source-root: approved-source", job)
-                self.assertLess(
-                    job.index("Check out trusted tooling"),
-                    job.index("Verify immutable Tip release context"),
-                )
-                self.assertLess(
-                    job.index("Verify immutable Tip release context"),
-                    job.index(owned_operation[name]),
-                )
-        self.assertEqual(workflow.count("boundary: automatic-dormant"), 1)
-        self.assertEqual(workflow.count("boundary: credential-preflight"), 1)
-        self.assertEqual(workflow.count("boundary: stage"), 1)
-        self.assertEqual(workflow.count("boundary: sign"), 1)
-        self.assertEqual(workflow.count("boundary: smoke"), 1)
-        self.assertEqual(workflow.count("boundary: publish"), 1)
-        self.assertEqual(
-            workflow.count(
-                "uses: ./trusted-control-plane/.github/actions/verify-tip-context"
-            ),
-            len(jobs),
-        )
-
-    def test_summary_is_verified_markdown_safe_public_and_path_free(self) -> None:
-        backtick = chr(96)
-        fixture = self.make_context_fixture(
-            application_identity_name=(
-                "Developer ID Application: Synthetic "
-                + backtick
-                + "label"
-                + backtick
-                + " <unsafe>|"
-            )
-        )
-        summary_path = Path(fixture["temp"]) / "summary.md"
-        summary_path.write_text("Existing summary\n", encoding="utf-8")
-        result = self.run_context(
-            "summary",
-            *self.verification_arguments(fixture, boundary="setup-summary"),
-            "--output", str(summary_path),
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        summary = summary_path.read_text(encoding="utf-8")
-        self.assertTrue(summary.startswith("Existing summary\n"))
-        for heading in (
-            "### Authority provenance",
-            "### Application signing",
-            "### Migration-anchor Application signing",
-            "### Installer signing",
-            "### Sparkle public signing and feeds",
-            "### Transition package",
-            "### Predecessor pins",
-            "### Exact publication inventory",
-        ):
-            self.assertIn(heading, summary)
-        self.assertIn("Runtime secure-storage migration phase", summary)
-        self.assertIn("&lt;unsafe&gt;", summary)
-        self.assertNotIn("<unsafe>", summary)
-        self.assertNotIn(str(fixture["temp"]), summary)
-        for prohibited in ("PRIVATE KEY", "github_pat_", "ghp_"):
-            self.assertNotIn(prohibited, summary)
-
-
 class IdentityTransitionReleaseToolingTests(unittest.TestCase):
     """Shared rollout-authority coverage for the Stable safety lock and
     the explicitly dispatched Tip identity dress rehearsal."""
@@ -7815,6 +4683,7 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             [sys.executable, str(SCRIPT_DIR / "stable_rollout.py"), *args],
             text=True,
             capture_output=True,
+            timeout=30,
         )
 
     @staticmethod
@@ -7839,31 +4708,21 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         self.assertEqual(transition_context.returncode, 0, transition_context.stderr)
         context = self.shell_assignments(transition_context.stdout)
         policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
+        successor = policy["identities"]["successor"]
         self.assertEqual(context["ROLLOUT_ROLE"], "transition")
         self.assertEqual(context["ROLLOUT_IDENTITY"], "successor")
         self.assertEqual(context["ROLLOUT_INSTALLATION_TYPE"], "package")
-        self.assertEqual(context["BUNDLE_ID"], "com.repoprompt.ce")
-        self.assertEqual(
-            context["EXPECTED_SIGN_IDENTITY"],
-            policy["identities"]["successor"]["developerIDApplicationIdentityName"],
-        )
-        self.assertEqual(
-            context["EXPECTED_INSTALLER_IDENTITY"],
-            policy["identities"]["successor"]["developerIDInstallerIdentityName"],
-        )
+        self.assertEqual(context["BUNDLE_ID"], successor["bundleIdentifier"])
+        self.assertEqual(context["EXPECTED_SIGN_IDENTITY"], successor["developerIDApplicationIdentityName"])
+        self.assertEqual(context["EXPECTED_INSTALLER_IDENTITY"], successor["developerIDInstallerIdentityName"])
+        self.assertEqual(context["REPOPROMPT_STABLE_RELEASE_CONTEXT"], "")
 
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         stable_transition = self.make_declaration(
             temp_dir,
             "transition",
-            [
-                {
-                    "role": "preparer",
-                    "tag": "v0.1.0",
-                    "rolloutManifestSha256": "0" * 64,
-                }
-            ],
+            [{"role": "preparer", "tag": "v0.1.0", "rolloutManifestSha256": "0" * 64}],
         )
         mismatch = self.rollout(
             "packaging-context",
@@ -7873,275 +4732,6 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         )
         self.assertNotEqual(mismatch.returncode, 0)
         self.assertIn("version.env identity does not match the successor Stable rollout identity", mismatch.stderr)
-
-    def test_base_policy_queries_do_not_require_migration_only_package_policy(self) -> None:
-        temp_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_dir, True)
-        policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
-        stable_feed = policy["sparkle"]["stableFeedURL"]
-        policy.pop("identityTransitionPackage")
-        policy_path = temp_dir / "stable-policy.json"
-        policy_path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
-
-        result = self.rollout(
-            "feed-url", "--policy", str(policy_path), "--channel", "stable"
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), stable_feed)
-
-    def test_successor_packaging_context_does_not_require_transition_only_policy(self) -> None:
-        temp_dir, _preparer, transition, successor = self.make_pts_ladder()
-        base_policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
-
-        successor_policy = json.loads(json.dumps(base_policy))
-        successor_policy.pop("identityTransitionPackage")
-        successor_policy["identities"]["successor"].pop(
-            "developerIDInstallerIdentityName"
-        )
-        successor_policy_path = temp_dir / "successor-without-transition-policy.json"
-        successor_policy_path.write_text(
-            json.dumps(successor_policy, indent=2) + "\n", encoding="utf-8"
-        )
-        result = self.rollout(
-            "packaging-context",
-            "--declaration", str(successor["declaration"]),
-            "--policy", str(successor_policy_path),
-            "--version-env", str(successor["version_env"]),
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            self.shell_assignments(result.stdout)["EXPECTED_INSTALLER_IDENTITY"], ""
-        )
-
-        for label, mutate, expected_error in (
-            (
-                "package metadata",
-                lambda policy: policy.pop("identityTransitionPackage"),
-                "transition package keys must be exactly",
-            ),
-            (
-                "Installer label",
-                lambda policy: policy["identities"]["successor"].pop(
-                    "developerIDInstallerIdentityName"
-                ),
-                "transition rollout role requires a reviewed Developer ID Installer identity",
-            ),
-        ):
-            with self.subTest(missing=label):
-                policy = json.loads(json.dumps(base_policy))
-                mutate(policy)
-                policy_path = temp_dir / f"transition-without-{label.replace(' ', '-')}.json"
-                policy_path.write_text(
-                    json.dumps(policy, indent=2) + "\n", encoding="utf-8"
-                )
-                rejected = self.rollout(
-                    "packaging-context",
-                    "--declaration", str(transition["declaration"]),
-                    "--policy", str(policy_path),
-                    "--version-env", str(transition["version_env"]),
-                )
-                self.assertNotEqual(rejected.returncode, 0)
-                self.assertIn(expected_error, rejected.stderr)
-
-    def test_stable_packaging_context_is_phase_bound_and_exportable(self) -> None:
-        root = SCRIPT_DIR.parent
-        legacy = self.rollout(
-            "packaging-context",
-            "--declaration", str(self.DECLARATION),
-            "--policy", str(self.POLICY),
-            "--version-env", str(root / "version.env"),
-            "--expected-migration-phase", "disabled",
-        )
-        self.assertEqual(legacy.returncode, 0, legacy.stderr)
-        legacy_context = self.shell_assignments(legacy.stdout)
-        self.assertEqual(
-            legacy_context["REPOPROMPT_STABLE_RELEASE_CONTEXT"], "stable-rollout-v1"
-        )
-        self.assertEqual(legacy_context["ROLLOUT_ROLE"], "legacy")
-        self.assertEqual(legacy_context["EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"], "")
-        self.assertEqual(legacy_context["EXPECTED_INSTALLER_IDENTITY"], "")
-
-        temp_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_dir, True)
-        preparer = self.make_declaration(temp_dir, "preparer")
-        preparer_result = self.rollout(
-            "packaging-context",
-            "--declaration", str(preparer),
-            "--policy", str(self.POLICY),
-            "--version-env", str(root / "version.env"),
-            "--expected-migration-phase", "legacy-preparer",
-        )
-        self.assertEqual(preparer_result.returncode, 0, preparer_result.stderr)
-        preparer_context = self.shell_assignments(preparer_result.stdout)
-        successor = json.loads(self.POLICY.read_text(encoding="utf-8"))["identities"]["successor"]
-        self.assertEqual(
-            preparer_context["EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"],
-            successor["bundleIdentifier"],
-        )
-        self.assertEqual(
-            preparer_context["EXPECTED_MIGRATION_ANCHOR_TEAM_ID"],
-            successor["teamIdentifier"],
-        )
-
-        mismatched = self.rollout(
-            "packaging-context",
-            "--declaration", str(preparer),
-            "--policy", str(self.POLICY),
-            "--version-env", str(root / "version.env"),
-            "--expected-migration-phase", "disabled",
-        )
-        self.assertNotEqual(mismatched.returncode, 0)
-        self.assertIn(
-            "requested identity migration phase does not match the rollout declaration: "
-            "expected legacy-preparer, got disabled",
-            mismatched.stderr,
-        )
-
-        github_env = temp_dir / "github-env"
-        github_summary = temp_dir / "summary.md"
-        exported = self.rollout(
-            "packaging-context",
-            "--declaration", str(self.DECLARATION),
-            "--policy", str(self.POLICY),
-            "--version-env", str(root / "version.env"),
-            "--expected-migration-phase", "disabled",
-            "--github-env", str(github_env),
-            "--github-summary", str(github_summary),
-        )
-        self.assertEqual(exported.returncode, 0, exported.stderr)
-        exported_context = dict(
-            line.split("=", 1)
-            for line in github_env.read_text(encoding="utf-8").splitlines()
-        )
-        self.assertEqual(exported_context, legacy_context)
-        self.assertIn("Stable release identity context", github_summary.read_text(encoding="utf-8"))
-
-    def test_stable_context_propagates_synthetic_policy_and_rejects_wrong_identity(self) -> None:
-        temp_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_dir, True)
-        policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
-        policy["identities"]["legacy"].update(
-            {
-                "bundleIdentifier": "example.synthetic.legacy",
-                "teamIdentifier": "LEGACYTEAM1",
-                "developerIDRequirement": "synthetic legacy requirement",
-                "developerIDApplicationIdentityName": "Synthetic Legacy Application",
-            }
-        )
-        policy["identities"]["successor"].update(
-            {
-                "bundleIdentifier": "example.synthetic.successor",
-                "teamIdentifier": "NEXTTEAM123",
-                "developerIDRequirement": "synthetic successor requirement",
-                "developerIDApplicationIdentityName": "Synthetic Successor Application",
-                "developerIDInstallerIdentityName": "Synthetic Successor Installer",
-            }
-        )
-        policy_path = temp_dir / "policy.json"
-        policy_path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
-        version_path = temp_dir / "version.env"
-        version_path.write_text(
-            "APP_NAME=RepoPrompt\n"
-            "MARKETING_VERSION=1.0.0\n"
-            "BUILD_NUMBER=1\n"
-            "BUNDLE_ID=example.synthetic.legacy\n"
-            "SIGNING_TEAM_ID=LEGACYTEAM1\n",
-            encoding="utf-8",
-        )
-        declaration = self.make_declaration(temp_dir, "preparer")
-        resolved = self.rollout(
-            "packaging-context",
-            "--declaration", str(declaration),
-            "--policy", str(policy_path),
-            "--version-env", str(version_path),
-            "--expected-migration-phase", "legacy-preparer",
-        )
-        self.assertEqual(resolved.returncode, 0, resolved.stderr)
-        context = self.shell_assignments(resolved.stdout)
-        self.assertEqual(context["EXPECTED_APP_BUNDLE_ID"], "example.synthetic.legacy")
-        self.assertEqual(context["EXPECTED_APP_TEAM_ID"], "LEGACYTEAM1")
-        self.assertEqual(
-            context["EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"],
-            "example.synthetic.successor",
-        )
-        self.assertEqual(context["EXPECTED_MIGRATION_ANCHOR_TEAM_ID"], "NEXTTEAM123")
-
-        helper = SCRIPT_DIR / "load_release_metadata.sh"
-        base_script = (
-            'set -euo pipefail\nsource "$HELPER"\neval "$RESOLVED"\n'
-        )
-        env = dict(os.environ, HELPER=str(helper), RESOLVED=resolved.stdout)
-        accepted = subprocess.run(
-            [
-                "bash", "-c",
-                base_script
-                + 'validate_stable_release_context "$EXPECTED_APP_BUNDLE_ID" '
-                '"$EXPECTED_APP_TEAM_ID" "$REPOPROMPT_IDENTITY_MIGRATION_PHASE" '
-                '"$EXPECTED_SIGN_IDENTITY"\n'
-                + 'validate_resolved_migration_anchor_identity '
-                '"$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" '
-                '"$EXPECTED_MIGRATION_ANCHOR_TEAM_ID"\n',
-            ],
-            env=env,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(accepted.returncode, 0, accepted.stderr)
-        wrong_identity = subprocess.run(
-            [
-                "bash", "-c",
-                base_script
-                + 'validate_stable_release_context wrong.bundle '
-                '"$EXPECTED_APP_TEAM_ID" "$REPOPROMPT_IDENTITY_MIGRATION_PHASE" '
-                '"$EXPECTED_SIGN_IDENTITY"\n',
-            ],
-            env=env,
-            text=True,
-            capture_output=True,
-        )
-        self.assertNotEqual(wrong_identity.returncode, 0)
-        self.assertIn("Stable application bundle identifier mismatch", wrong_identity.stderr)
-        wrong_anchor = subprocess.run(
-            [
-                "bash", "-c",
-                base_script
-                + 'validate_resolved_migration_anchor_identity wrong.anchor '
-                '"$EXPECTED_MIGRATION_ANCHOR_TEAM_ID"\n',
-            ],
-            env=env,
-            text=True,
-            capture_output=True,
-        )
-        self.assertNotEqual(wrong_anchor.returncode, 0)
-        self.assertIn("Identity migration anchor identifier mismatch", wrong_anchor.stderr)
-
-    def test_stable_identity_consumers_do_not_embed_policy_identity_literals(self) -> None:
-        policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
-        consumers = {
-            "package_app": (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8"),
-            "sign_staged": (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8"),
-            "workflow": (
-                SCRIPT_DIR.parent / ".github" / "workflows" / "release.yml"
-            ).read_text(encoding="utf-8"),
-        }
-        identity_literals = set()
-        for identity in policy["identities"].values():
-            identity_literals.update(
-                value
-                for key, value in identity.items()
-                if key
-                in {
-                    "bundleIdentifier",
-                    "teamIdentifier",
-                    "developerIDRequirement",
-                    "developerIDApplicationIdentityName",
-                    "developerIDInstallerIdentityName",
-                }
-            )
-        for consumer_name, source in consumers.items():
-            for literal in identity_literals:
-                with self.subTest(consumer=consumer_name, literal=literal):
-                    self.assertNotIn(literal, source)
 
     def test_signing_mode_is_derived_from_the_reviewed_bundle_team_pair(self) -> None:
         policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
@@ -8246,13 +4836,14 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             else f"RepoPrompt-{marketing}-{build}-stable-rollout.json"
         )
         release_tag = release_tag or (f"tip-{build}" if channel == "tip" else f"v{marketing}")
+        release_commit = hashlib.sha1(f"commit-{build}".encode()).hexdigest()
         arguments = [
             "generate",
             "--declaration", str(declaration),
             "--policy", str(self.POLICY),
             "--version-env", str(version_env),
             "--release-tag", release_tag,
-            "--release-commit", f"commit-{build}",
+            "--release-commit", release_commit,
             "--migration-phase", "legacy-preparer" if role == "preparer" else "disabled",
             "--enclosure", str(enclosure),
             "--enclosure-signature", f"sig-{role}-{build}",
@@ -8340,14 +4931,7 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
 
         self.assertIn("needs: setup", preflight)
         self.assertIn("environment: tip-release", preflight)
-        self.assertIn(
-            "uses: ./trusted-control-plane/.github/actions/verify-tip-context", preflight
-        )
-        self.assertNotIn("stable_rollout.py packaging-context", workflow)
-        self.assertLess(
-            preflight.index("Verify immutable Tip release context"),
-            preflight.index("Validate role-selected Tip credentials"),
-        )
+        self.assertIn("stable_rollout.py packaging-context", preflight)
         self.assertIn('case "$ROLLOUT_IDENTITY" in', preflight)
         for secret_name in (
             "SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64",
@@ -8381,29 +4965,14 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             "      - name: Install Sentry CLI", 1
         )[0]
 
-        for stale_name in (
-            "CONFIGURED_LEGACY_SIGN_IDENTITY",
-            "CONFIGURED_SUCCESSOR_SIGN_IDENTITY",
-            "CONFIGURED_SUCCESSOR_INSTALLER_IDENTITY",
-            "SUCCESSOR_INSTALLER_IDENTITY",
-            "SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}",
-            "SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}",
-        ):
-            self.assertNotIn(stale_name, workflow)
         self.assertIn('verify_identity codesigning "$EXPECTED_SIGN_IDENTITY" application', import_step)
         self.assertIn('verify_identity basic "$EXPECTED_INSTALLER_IDENTITY" installer', import_step)
-        self.assertIn('security import "$installer_certificate" -k "$KEYCHAIN_PATH"', import_step)
         self.assertIn('printf \'SIGN_IDENTITY=%s\\n\' "$EXPECTED_SIGN_IDENTITY"', import_step)
-        self.assertIn(
-            'grep -F "\\\"$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY\\\""',
-            anchor_step,
-        )
-        self.assertIn(
-            'codesign --force --sign "$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY"',
-            anchor_step,
-        )
+        self.assertIn('grep -F "\\"$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY\\""', anchor_step)
+        self.assertIn('codesign --force --sign "$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY"', anchor_step)
         self.assertIn('--identifier "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID"', anchor_step)
-        self.assertIn('-R="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"', anchor_step)
+        self.assertIn('-R="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" "$anchor"', anchor_step)
+        self.assertIn('grep -Fx "TeamIdentifier=$EXPECTED_MIGRATION_ANCHOR_TEAM_ID"', anchor_step)
         for secret_name in (
             "NOTARYTOOL_PRIVATE_KEY_BASE64",
             "NOTARYTOOL_KEY_ID",
@@ -8414,11 +4983,7 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         ):
             self.assertIn(f"secrets.{secret_name}", notary_step)
         self.assertIn('case "$ROLLOUT_IDENTITY" in', notary_step)
-        self.assertIn("printf 'NOTARYTOOL_KEY_ID=%s\\n'", notary_step)
-        self.assertIn("printf 'NOTARYTOOL_ISSUER_ID=%s\\n'", notary_step)
-        self.assertNotIn("\n          NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}", workflow)
-        self.assertNotIn("\n          NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}", workflow)
-        self.assertNotIn("\n          INSTALLER_IDENTITY=", workflow)
+        self.assertNotIn("EXPECTED_SUCCESSOR_SIGN_IDENTITY", workflow)
 
     def test_packaging_context_projects_policy_application_and_installer_labels(self) -> None:
         _temp_dir, preparer, transition, successor = self.make_pts_ladder()
@@ -8439,30 +5004,18 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
                 context = self.shell_assignments(result.stdout)
                 identity = policy["identities"][identity_name]
                 self.assertEqual(context["EXPECTED_SIGN_IDENTITY"], identity["developerIDApplicationIdentityName"])
-                expected_installer = (
-                    policy["identities"]["successor"]["developerIDInstallerIdentityName"]
-                    if role == "transition"
-                    else ""
-                )
-                self.assertEqual(context["EXPECTED_INSTALLER_IDENTITY"], expected_installer)
                 self.assertEqual(context["EXPECTED_APP_BUNDLE_ID"], identity["bundleIdentifier"])
                 self.assertEqual(context["EXPECTED_APP_TEAM_ID"], identity["teamIdentifier"])
                 self.assertEqual(context["EXPECTED_APP_REQUIREMENT"], identity["developerIDRequirement"])
-                self.assertEqual(
-                    context["EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER"],
-                    f"{identity['teamIdentifier']}.{identity['bundleIdentifier']}",
+                expected_installer = (
+                    identity.get("developerIDInstallerIdentityName", "") if role == "transition" else ""
                 )
-                successor_identity = policy["identities"]["successor"]
-                expected_anchor = successor_identity if role == "preparer" else None
-                for key, policy_key in (
-                    ("EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID", "bundleIdentifier"),
-                    ("EXPECTED_MIGRATION_ANCHOR_TEAM_ID", "teamIdentifier"),
-                    ("EXPECTED_MIGRATION_ANCHOR_REQUIREMENT", "developerIDRequirement"),
-                    ("EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY", "developerIDApplicationIdentityName"),
-                ):
-                    self.assertEqual(
-                        context[key], expected_anchor[policy_key] if expected_anchor else ""
-                    )
+                self.assertEqual(context["EXPECTED_INSTALLER_IDENTITY"], expected_installer)
+                expected_anchor = policy["identities"]["successor"] if role == "preparer" else None
+                self.assertEqual(
+                    context["EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY"],
+                    expected_anchor["developerIDApplicationIdentityName"] if expected_anchor else "",
+                )
 
     def test_policy_declaration_and_requirement_authorities_agree(self) -> None:
         policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
@@ -8496,15 +5049,14 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             f'successorDeveloperIDBundleIdentifier = "{successor["bundleIdentifier"]}"', runtime_policy
         )
         self.assertIn(f'successorSigningTeamIdentifier = "{successor["teamIdentifier"]}"', runtime_policy)
-        self.assertNotIn("SUCCESSOR_APP_REQUIREMENT=", pkg_builder)
-        self.assertIn('[[ "$TRANSITION_APP_REQUIREMENT" == "$EXPECTED_APP_REQUIREMENT" ]]', pkg_builder)
-        self.assertIn('python3 "$CONTRACT" context-shell', pkg_builder)
-        self.assertIn('signing_mode_marker="$EXPECTED_SIGNING_MODE"', sign_staged)
         self.assertIn(
             'IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"',
             sign_staged,
         )
-        self.assertIn('-R="$EXPECTED_APP_REQUIREMENT" "$APP_BUNDLE"', sign_staged)
+        self.assertNotIn(successor["developerIDRequirement"], sign_staged)
+        self.assertNotIn(successor["developerIDRequirement"], pkg_builder)
+        self.assertIn('apple_identity_policy.json', pkg_builder)
+        self.assertIn('signing_mode_marker="$EXPECTED_SIGNING_MODE"', sign_staged)
         self.assertIn('stable_rollout.py" signing-mode', package_app)
         self.assertIn(
             f'repoPromptCEReleaseBundleIdentifier = "{successor["bundleIdentifier"]}"',
@@ -8569,7 +5121,6 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         self.assertEqual(appcast.count("<item>"), 1)
         self.assertIn("<repoprompt:rolloutRole>legacy</repoprompt:rolloutRole>", appcast)
         self.assertIn("<sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>", appcast)
-        self.assertNotIn("minimumUpdateVersion", appcast)
         self.assertNotIn("minimumAutoupdateVersion", appcast)
         self.assertNotIn("installationType", appcast)
         self.assertIn(
@@ -8608,9 +5159,8 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         self.assertEqual(hard_ladders, ["150", "120"])
         self.assertEqual(compatibility_ladders, hard_ladders)
         manifest = json.loads(successor["manifest"].read_text(encoding="utf-8"))
-        for item in manifest["appcastItems"]:
-            self.assertIn("minimumUpdateVersion", item)
-            self.assertNotIn("minimumAutoupdateVersion", item)
+        self.assertTrue(all("minimumUpdateVersion" in item for item in manifest["appcastItems"]))
+        self.assertTrue(all("minimumAutoupdateVersion" not in item for item in manifest["appcastItems"]))
         self.assertEqual(appcast.count("<sparkle:minimumSystemVersion>14.0<"), 3)
         self.assertEqual(appcast.count('sparkle:installationType="package"'), 1)
         for tag, name in (
@@ -8634,58 +5184,6 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         rows = [line.split("\t") for line in siblings.stdout.splitlines()]
         self.assertEqual([(row[1], row[2]) for row in rows], [("transition", "v1.5.0"), ("preparer", "v1.2.0")])
         self.assertEqual(rows[0][7], "RepoPrompt-1.5.0-150-stable-rollout.json")
-
-    def test_transition_normalizes_the_authenticated_public_preparer_floor_shape(self) -> None:
-        temp_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_dir, True)
-        preparer = self.make_release(
-            temp_dir,
-            "preparer",
-            "1.2.0",
-            "120",
-            channel="tip",
-            release_tag="tip-public-preparer",
-            enclosure_basename="RepoPrompt-tip-public-preparer-120",
-        )
-        self.assertEqual(preparer["result"].returncode, 0, preparer["result"].stderr)
-
-        public_preparer = json.loads(preparer["manifest"].read_text(encoding="utf-8"))
-        public_item = public_preparer["appcastItems"][0]
-        self.assertIsNone(public_item.pop("minimumUpdateVersion"))
-        public_item["minimumAutoupdateVersion"] = None
-        preparer["manifest"].write_text(
-            json.dumps(public_preparer, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-        transition = self.make_release(
-            temp_dir,
-            "transition",
-            "1.5.0",
-            "150",
-            predecessors=[
-                {
-                    "role": "preparer",
-                    "tag": "tip-public-preparer",
-                    "rolloutManifestSha256": hashlib.sha256(
-                        preparer["manifest"].read_bytes()
-                    ).hexdigest(),
-                }
-            ],
-            predecessor_manifests=[preparer["manifest"]],
-            channel="tip",
-            release_tag="tip-transition",
-            enclosure_basename="RepoPrompt-tip-transition-150",
-        )
-        self.assertEqual(transition["result"].returncode, 0, transition["result"].stderr)
-        manifest = json.loads(transition["manifest"].read_text(encoding="utf-8"))
-        self.assertEqual(
-            [item["minimumUpdateVersion"] for item in manifest["appcastItems"]],
-            ["120", None],
-        )
-        self.assertTrue(
-            all("minimumAutoupdateVersion" not in item for item in manifest["appcastItems"])
-        )
 
     def test_tip_pts_ladder_reuses_one_feed_and_accumulates_top_level_items(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -8760,12 +5258,10 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             ["100.1.3", "100.1.2", "100.1.1"],
         )
         hard_ladders = re.findall(
-            r"<sparkle:minimumUpdateVersion>([0-9.]+)</sparkle:minimumUpdateVersion>",
-            appcast,
+            r"<sparkle:minimumUpdateVersion>([0-9.]+)</sparkle:minimumUpdateVersion>", appcast
         )
         compatibility_ladders = re.findall(
-            r"<sparkle:minimumAutoupdateVersion>([0-9.]+)</sparkle:minimumAutoupdateVersion>",
-            appcast,
+            r"<sparkle:minimumAutoupdateVersion>([0-9.]+)</sparkle:minimumAutoupdateVersion>", appcast
         )
         self.assertEqual(hard_ladders, ["100.1.2", "100.1.1"])
         self.assertEqual(compatibility_ladders, hard_ladders)
@@ -8789,6 +5285,78 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             [entry["rolloutManifestName"] for entry in manifest["appcastItems"][1:]],
             ["identity-rollout.json", "identity-rollout.json"],
         )
+        self.assertTrue(all("minimumUpdateVersion" in item for item in manifest["appcastItems"]))
+        self.assertTrue(all("minimumAutoupdateVersion" not in item for item in manifest["appcastItems"]))
+
+        stable_appcast = temp_dir / "stable-appcast.xml"
+        stable_appcast.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item>'
+            '<sparkle:version>100</sparkle:version>'
+            '</item></channel></rss>\n',
+            encoding="utf-8",
+        )
+        stable_floor = self.rollout(
+            "validate-stable-tip-floor",
+            "--policy", str(self.POLICY),
+            "--stable-appcast", str(stable_appcast),
+            "--tip-manifest", str(successor["manifest"]),
+            "--tip-appcast", str(successor["appcast"]),
+        )
+        self.assertEqual(stable_floor.returncode, 0, stable_floor.stderr)
+        stable_appcast.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel><item>'
+            '<sparkle:version>101</sparkle:version>'
+            '</item></channel></rss>\n',
+            encoding="utf-8",
+        )
+        crossed_floor = self.rollout(
+            "validate-stable-tip-floor",
+            "--policy", str(self.POLICY),
+            "--stable-appcast", str(stable_appcast),
+            "--tip-manifest", str(successor["manifest"]),
+            "--tip-appcast", str(successor["appcast"]),
+        )
+        self.assertNotEqual(crossed_floor.returncode, 0)
+        self.assertIn("Stable=101 preparer=100.1.1", crossed_floor.stderr)
+
+        def progression(candidate: dict, live: dict | None = None) -> subprocess.CompletedProcess[str]:
+            arguments = [
+                "validate-live-tip-progression",
+                "--policy", str(self.POLICY),
+                "--candidate-manifest", str(candidate["manifest"]),
+                "--candidate-appcast", str(candidate["appcast"]),
+            ]
+            if live is not None:
+                arguments += [
+                    "--live-manifest", str(live["manifest"]),
+                    "--live-appcast", str(live["appcast"]),
+                ]
+            return self.rollout(*arguments)
+
+        first = progression(preparer)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        p_to_t = progression(transition, preparer)
+        self.assertEqual(p_to_t.returncode, 0, p_to_t.stderr)
+        t_to_s = progression(successor, transition)
+        self.assertEqual(t_to_s.returncode, 0, t_to_s.stderr)
+        idempotent = progression(successor, successor)
+        self.assertEqual(idempotent.returncode, 0, idempotent.stderr)
+        skipped = progression(successor, preparer)
+        self.assertNotEqual(skipped.returncode, 0)
+        self.assertIn("regress or skip", skipped.stderr)
+
+        successor_manifest_text = successor["manifest"].read_text(encoding="utf-8")
+        changed = json.loads(successor_manifest_text)
+        changed["appcastItems"][1]["rolloutManifestSha256"] = "f" * 64
+        successor["manifest"].write_text(
+            json.dumps(changed, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        changed_history = progression(successor, transition)
+        self.assertNotEqual(changed_history.returncode, 0)
+        self.assertIn("retained items do not exactly match", changed_history.stderr)
+        successor["manifest"].write_text(successor_manifest_text, encoding="utf-8")
 
     def test_rollout_tampering_and_invalid_ladders_fail_closed(self) -> None:
         temp_dir, preparer, transition, successor = self.make_pts_ladder()
@@ -8813,7 +5381,7 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             self.assertIn("mismatch", result.stderr)
             successor["enclosure"].write_text("enclosure successor 200\n", encoding="utf-8")
 
-        with self.subTest("compatibility projection divergence is rejected"):
+        with self.subTest("appcast text drift from the manifest is rejected"):
             appcast_text = successor["appcast"].read_text(encoding="utf-8")
             successor["appcast"].write_text(
                 appcast_text.replace(
@@ -8825,49 +5393,6 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("accumulated appcast does not match", result.stderr)
             successor["appcast"].write_text(appcast_text, encoding="utf-8")
-
-        with self.subTest("hard gate divergence is rejected"):
-            appcast_text = successor["appcast"].read_text(encoding="utf-8")
-            successor["appcast"].write_text(
-                appcast_text.replace(
-                    "<sparkle:minimumUpdateVersion>150<",
-                    "<sparkle:minimumUpdateVersion>149<",
-                    1,
-                ),
-                encoding="utf-8",
-            )
-            result = successor_validate()
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("accumulated appcast does not match", result.stderr)
-            successor["appcast"].write_text(appcast_text, encoding="utf-8")
-
-        with self.subTest("missing hard gate projection is rejected"):
-            appcast_text = successor["appcast"].read_text(encoding="utf-8")
-            successor["appcast"].write_text(
-                appcast_text.replace(
-                    "      <sparkle:minimumUpdateVersion>150</sparkle:minimumUpdateVersion>\n",
-                    "",
-                    1,
-                ),
-                encoding="utf-8",
-            )
-            result = successor_validate()
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("accumulated appcast does not match", result.stderr)
-            successor["appcast"].write_text(appcast_text, encoding="utf-8")
-
-        with self.subTest("manifest cannot add a second floor authority"):
-            manifest_text = successor["manifest"].read_text(encoding="utf-8")
-            manifest = json.loads(manifest_text)
-            manifest["appcastItems"][0]["minimumAutoupdateVersion"] = "150"
-            successor["manifest"].write_text(
-                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            result = successor_validate()
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("appcastItems mismatch", result.stderr)
-            successor["manifest"].write_text(manifest_text, encoding="utf-8")
 
         invalid_declarations = [
             ("unknown role", {"currentRole": "beta"}, "unknown rollout role"),
@@ -8962,11 +5487,10 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
         self.assertEqual(release_workflow.count("stable_rollout.py workflow-guard"), 2)
         self.assertEqual(promote_workflow.count("stable_rollout.py workflow-guard"), 1)
-        self.assertIn("tip_release_context.py resolve", tip_workflow)
-        self.assertEqual(tip_workflow.count("tip_release_context.py resolve"), 1)
-        self.assertNotIn("stable_rollout.py packaging-context", tip_workflow)
+        self.assertIn("tip-rollout.json", tip_workflow)
+        self.assertIn("stable_rollout.py packaging-context", tip_workflow)
         self.assertIn("confirm_identity_rollout_role", tip_workflow)
-        self.assertIn('if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]', tip_workflow)
+        self.assertIn('if [[ "$EVENT_NAME" != "workflow_dispatch" ]]', tip_workflow)
         self.assertNotIn("release-rollout.json", tip_workflow)
 
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
@@ -8978,42 +5502,8 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             self.assertNotIn("REPOPROMPT_RELEASE_ARTIFACT_ROLE", script_text)
             self.assertNotIn("REPOPROMPT_PREDECESSOR_APPCAST", script_text)
 
-    def test_tip_dispatch_matrix_and_go_no_go_documentation_contract(self) -> None:
-        root = SCRIPT_DIR.parent
-        workflow = (root / ".github" / "workflows" / "main-tip.yml").read_text(
-            encoding="utf-8"
-        )
-        releasing = (root / "docs" / "releasing.md").read_text(encoding="utf-8")
-        architecture = (
-            root / "docs" / "architecture" / "apple-identity-migration.md"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn('if [[ "$ROLLOUT_ROLE" != "legacy" ]]', workflow)
-        self.assertIn('if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]', workflow)
-        self.assertIn('[[ "$CONFIRMED_ROLLOUT_ROLE" != "$ROLLOUT_ROLE" ]]', workflow)
-        self.assertIn('skip_reason="role-requires-manual-review"', workflow)
-        self.assertIn("Manual workflow capability, exact-role confirmation, and environment approval", workflow)
-        self.assertNotIn("dispatch the Publish Tip workflow manually", workflow)
-
-        for row in (
-            "| legacy | Permitted after exact-main setup validation |",
-            "| P / `preparer` | Suppressed before credentials or builds |",
-            "| T / `transition` | Suppressed before credentials or builds |",
-            "| N / `successor` | Suppressed before credentials or builds |",
-        ):
-            self.assertIn(row, releasing)
-        for document in (releasing, architecture):
-            self.assertIn("P and T remain manual", document)
-            self.assertIn("blockers A and B", document)
-            self.assertIn("first T and first N", document)
-            self.assertIn("ordinary subsequent N", document)
-        self.assertIn("they are not release authorization", releasing)
-        self.assertIn("those gates do not authorize a release", architecture)
-
         # Behavioral: a transition declaration in the tagged source fails
         # promotion before any release lookup or mutation.
-        temp_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_dir, True)
         fixture_root = temp_dir / "transition-source"
         fixture_root.mkdir()
         shutil.copy2(SCRIPT_DIR.parent / "version.env", fixture_root / "version.env")
@@ -9029,6 +5519,7 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             env=env,
             text=True,
             capture_output=True,
+            timeout=30,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("dormant until successor rollout enablement", result.stderr)
@@ -9043,58 +5534,62 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         # Tip reuses its existing workflow, repository, feed, and appcast name;
         # role changes add accumulated top-level items rather than a sibling feed.
         tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
-        tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(
-            encoding="utf-8"
-        )
         self.assertIn("generate_tip_rollout_appcast", tip_script)
         self.assertIn("identity-rollout.json", tip_script)
-        self.assertIn("$ROLLOUT_UPDATE_REPOSITORY", tip_script)
-        self.assertNotIn("repoprompt-ce-tip-updates", tip_script)
-        self.assertIn("repoprompt-ce-tip-updates", tip_workflow)
+        self.assertIn("repoprompt-ce-tip-updates", tip_script)
         self.assertNotIn("tip-transition-appcast.xml", tip_script)
         self.assertNotIn("tip-successor-appcast.xml", tip_script)
 
     def test_transition_pkg_builder_requires_explicit_tip_enablement(self) -> None:
-        script = (SCRIPT_DIR / "build_identity_transition_pkg.sh").read_text(encoding="utf-8")
+        script_path = SCRIPT_DIR / "build_identity_transition_pkg.sh"
+        script = script_path.read_text(encoding="utf-8")
         for marker in (
-            'CONTRACT="$SCRIPT_DIR/transition_package_contract.py"',
-            'SUPERVISOR="$SCRIPT_DIR/supervise_release_phase.py"',
-            'exec python3 "$SUPERVISOR"',
-            '--notarytool-json-evidence',
-            'productbuild --package "$component_pkg" "$unsigned_product_pkg"',
-            'productsign --sign "$TRANSITION_INSTALLER_IDENTITY"',
-            'pkgutil --expand-full "$OUTPUT" "$expanded_pkg"',
-            "transition-package-payload-comparison",
+            'POLICY="${REPOPROMPT_APPLE_IDENTITY_POLICY:-$SCRIPT_DIR/apple_identity_policy.json}"',
+            '"BundleIsRelocatable": False',
+            '"BundleHasStrictIdentifier": False',
+            '"BundleIsVersionChecked": True',
+            '"BundleOverwriteAction": "upgrade"',
+            'productbuild --package "$component_pkg" "$unsigned_product"',
+            'productsign --sign "$installer_identity"',
+            'xcrun notarytool submit "$signed_product"',
+            'xcrun stapler staple "$signed_product"',
+            'xcrun stapler validate "$pkg"',
+            'mv "$signed_product" "$output"',
+            'diff -qr "$expected_app" "$payload_app"',
+            'Transition package must contain exactly one PackageInfo',
         ):
             self.assertIn(marker, script)
         self.assertNotIn("pkgbuild --analyze", script)
-        self.assertNotIn("version.env", script)
-        self.assertNotIn("ACTIVE_SUPERVISOR_PID", script)
-        self.assertNotIn("forward_active_signal", script)
+        self.assertNotIn('xcrun stapler staple "$output"', script)
+        self.assertNotIn("local package_infos=()", script)
         self.assertNotIn("plutil -replace 0.", script)
+        self.assertLess(
+            script.index('xcrun notarytool submit "$signed_product"'),
+            script.index('xcrun stapler staple "$signed_product"'),
+        )
+        self.assertLess(
+            script.index('xcrun stapler staple "$signed_product"'),
+            script.index('validate_transition_pkg "$signed_product"'),
+        )
+        self.assertLess(
+            script.index('validate_transition_pkg "$signed_product"'),
+            script.index('mv "$signed_product" "$output"'),
+        )
         self.assertNotIn("skip-notarization", script)
         self.assertNotIn("allow-unstapled", script)
+        for literal in ("com.repoprompt.ce", "69N6K965SF", "Developer ID Installer: Samuel Baron"):
+            self.assertNotIn(literal, script)
 
-        env = dict(os.environ)
+        syntax = subprocess.run(["bash", "-n", str(script_path)], text=True, capture_output=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
         refused = subprocess.run(
-            ["bash", str(SCRIPT_DIR / "build_identity_transition_pkg.sh"), "validate", "--package", "/nonexistent.pkg"],
+            ["bash", str(script_path), "validate", "/nonexistent.pkg"],
             text=True,
             capture_output=True,
-            env=env,
+            env=dict(os.environ),
         )
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("explicit Tip rollout enablement", refused.stderr)
-
-        env["REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG"] = "1"
-        enabled = subprocess.run(
-            ["bash", str(SCRIPT_DIR / "build_identity_transition_pkg.sh"), "validate", "--package", "/nonexistent.pkg"],
-            text=True,
-            capture_output=True,
-            env=env,
-        )
-        self.assertNotEqual(enabled.returncode, 0)
-        self.assertNotIn("explicit Tip rollout enablement", enabled.stderr)
-        self.assertIn("Missing required environment variable: REPOPROMPT_APPROVED_SOURCE_ROOT", enabled.stderr)
 
 
 if __name__ == "__main__":

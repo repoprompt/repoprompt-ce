@@ -10,11 +10,16 @@ Commands:
 - ``workflow-guard``: protected workflows call this to reject transition or
   successor roles, sibling predecessors, and the successor identity.
 - ``current-role``: print the declared role for shell callers.
-- ``packaging-context``: emit one phase-bound application, migration-anchor, and Installer context.
+- ``feed-url``: print the policy-owned feed URL for one channel.
+- ``packaging-context``: emit policy-derived bundle, team, application, and installer identity labels.
 - ``signing-mode``: map one reviewed bundle/team pair to its runtime signing marker.
 - ``generate``: assemble the accumulated appcast plus rollout manifest.
 - ``validate``: prove a reviewed appcast/manifest pair against the declaration,
   policy, version metadata, and enclosure/app-manifest digests.
+- ``validate-live-tip-progression``: prove the candidate advances the authenticated
+  public Tip ladder without skipping or rewriting retained history.
+- ``validate-stable-tip-floor``: keep Stable builds below the retained preparer so
+  an unprepared Stable client cannot satisfy the transition hard gate.
 - ``max-build``: greatest Sparkle build in an appcast (monotonicity input).
 - ``sibling-values``: TSV projection of predecessor items for shell loops.
 
@@ -27,15 +32,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import shlex
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# Never write in-tree bytecode: an untracked __pycache__ would fail the
-# strict trusted-root clean-checkout verification.
+# Release helpers import this module from clean trusted checkouts. Never leave
+# an untracked __pycache__ behind in the control plane.
 sys.dont_write_bytecode = True
 
 SPARKLE_NAMESPACE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
@@ -105,6 +109,39 @@ DECLARATION_KEYS = {
     "predecessors",
 }
 PREDECESSOR_KEYS = {"role", "tag", "rolloutManifestSha256"}
+MANIFEST_KEYS = {
+    "schemaVersion",
+    "channel",
+    "sourceTag",
+    "releaseCommit",
+    "currentRole",
+    "signingIdentity",
+    "bundleIdentifier",
+    "teamIdentifier",
+    "marketingVersion",
+    "buildNumber",
+    "migrationPhase",
+    "eligibilityProfile",
+    "updateRepository",
+    "appArtifactManifest",
+    "appcastItems",
+}
+APPCAST_ITEM_KEYS = {
+    "role",
+    "tag",
+    "url",
+    "buildNumber",
+    "marketingVersion",
+    "minimumSystemVersion",
+    "minimumUpdateVersion",
+    "installationType",
+    "enclosureName",
+    "enclosureSize",
+    "enclosureSha256",
+    "edSignature",
+    "rolloutManifestSha256",
+    "rolloutManifestName",
+}
 
 
 class RolloutError(Exception):
@@ -166,24 +203,28 @@ def load_policy(path: Path) -> dict:
 
 
 def validate_identity_transition_package(policy: dict) -> dict:
-    """Validate the migration-only package policy without coupling Stable callers to it."""
+    """Validate package-only policy without coupling application releases to it."""
     transition_package = policy.get("identityTransitionPackage")
-    if not isinstance(transition_package, dict) or set(transition_package) != IDENTITY_TRANSITION_PACKAGE_KEYS:
+    if (
+        not isinstance(transition_package, dict)
+        or set(transition_package) != IDENTITY_TRANSITION_PACKAGE_KEYS
+    ):
         raise RolloutError(
             "apple identity policy transition package keys must be exactly "
             + ", ".join(sorted(IDENTITY_TRANSITION_PACKAGE_KEYS))
         )
-    if not all(
-        isinstance(transition_package.get(key), str) and transition_package[key]
-        for key in ("identifier", "installLocation", "appBundleName", "bundleOverwriteAction")
+    for key in ("identifier", "installLocation", "appBundleName", "bundleOverwriteAction"):
+        if not isinstance(transition_package.get(key), str) or not transition_package[key]:
+            raise RolloutError("apple identity policy transition package strings must be nonempty")
+    if not re.fullmatch(
+        r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", transition_package["identifier"]
     ):
-        raise RolloutError("apple identity policy transition package strings must be nonempty")
-    if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", transition_package["identifier"]):
         raise RolloutError("apple identity policy transition package identifier must be reverse-DNS")
-    if Path(transition_package["appBundleName"]).name != transition_package["appBundleName"] or not transition_package[
-        "appBundleName"
-    ].endswith(".app"):
-        raise RolloutError("apple identity policy transition package appBundleName must be one app basename")
+    app_bundle_name = transition_package["appBundleName"]
+    if Path(app_bundle_name).name != app_bundle_name or not app_bundle_name.endswith(".app"):
+        raise RolloutError(
+            "apple identity policy transition package appBundleName must be one app basename"
+        )
     expected_semantics = {
         "installLocation": "/Applications",
         "bundleIsRelocatable": False,
@@ -351,7 +392,7 @@ def validate_item_shape(
     if not isinstance(size, int) or size <= 0:
         raise RolloutError(f"appcast item {position} enclosure size must be a positive integer")
     digest = item.get("enclosureSha256", "")
-    if not isinstance(digest, str) or len(digest) != 64:
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise RolloutError(f"appcast item {position} enclosure sha256 is malformed")
     if not item.get("edSignature"):
         raise RolloutError(f"appcast item {position} is missing an EdDSA signature")
@@ -389,14 +430,7 @@ def validate_item_ladder(items: list[dict]) -> None:
 def normalize_published_preparer_floor(
     item: dict, position: int, allow_published_tip_preparer: bool
 ) -> dict:
-    """Normalize only the already-published Tip P null-floor representation.
-
-    Public preparer P was generated before ``minimumUpdateVersion`` became the
-    manifest authority. Its digest-bound manifest carries
-    ``minimumAutoupdateVersion: null``. Accept that exact ungated legacy form
-    after its bytes have been authenticated, but never accept a gated item or
-    retain the compatibility projection as a second manifest authority.
-    """
+    """Accept only the authenticated public P manifest's historical null-floor shape."""
     normalized = dict(item)
     if "minimumUpdateVersion" in normalized:
         return normalized
@@ -481,6 +515,8 @@ def render_appcast(manifest: dict) -> str:
                 "      <sparkle:minimumUpdateVersion>"
                 f"{floor}</sparkle:minimumUpdateVersion>"
             )
+            # Older supported Sparkle clients still read the historical projection.
+            # It is generated from the hard floor; it is never an independent authority.
             lines.append(
                 "      <sparkle:minimumAutoupdateVersion>"
                 f"{floor}</sparkle:minimumAutoupdateVersion>"
@@ -549,12 +585,10 @@ def load_predecessor_manifests(
     return loaded
 
 
-def build_manifest_from_inputs(
-    args: argparse.Namespace,
-    policy: dict,
-    declaration: dict,
-    version: dict[str, str],
-) -> tuple[dict, str]:
+def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
+    policy = load_policy(Path(args.policy))
+    declaration = load_declaration(Path(args.declaration))
+    version = load_version_env(Path(args.version_env))
     role = declaration["currentRole"]
     channel = declaration["channel"]
 
@@ -657,152 +691,27 @@ def build_manifest_from_inputs(
     return manifest, render_appcast(manifest)
 
 
-def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
-    policy = load_policy(Path(args.policy))
-    declaration = load_declaration(Path(args.declaration))
-    version = load_version_env(Path(args.version_env))
-    return build_manifest_from_inputs(args, policy, declaration, version)
-
-
-def load_verified_tip_context(boundary: str) -> dict:
-    script_dir = Path(__file__).resolve().parent
-    if str(script_dir) not in sys.path:
-        sys.path.insert(0, str(script_dir))
-    import tip_release_context as context_tool
-
-    try:
-        context, digest, elapsed_ms = context_tool.verify_context_from_environment(
-            boundary, str(script_dir.parent)
-        )
-    except context_tool.TipReleaseContextError as error:
-        raise RolloutError(str(error)) from error
-    # Consume the verifier's in-memory verified snapshot directly so later
-    # filesystem changes cannot swap in an unverified context.
-    print(
-        context_tool.verification_line(context, digest, boundary, elapsed_ms),
-        file=sys.stderr,
-    )
-    return context
-
-
-def context_manifest_inputs(
-    args: argparse.Namespace, context: dict
-) -> tuple[argparse.Namespace, dict, dict, dict[str, str]]:
-    rollout = context["rollout"]
-    release = context["release"]
-    application = context["applicationSigning"]
-    sparkle = context["sparkle"]
-    publication = context["publication"]
-    role = rollout["role"]
-    identity_name = rollout["signingIdentity"]
-    if ROLE_IDENTITY[role] != identity_name:
-        raise RolloutError("Tip context role and signing identity disagree")
-    if rollout["runtimeSecureStorageMigrationPhase"] != ROLE_MIGRATION_PHASE[role]:
-        raise RolloutError("Tip context role and runtime migration phase disagree")
-    if rollout["installationType"] != ROLE_INSTALLATION_TYPE[role]:
-        raise RolloutError("Tip context role and installation type disagree")
-    if publication["repository"] != sparkle["updateRepository"]:
-        raise RolloutError("Tip context publication and Sparkle repositories disagree")
-    if publication["tag"] != release["tag"]:
-        raise RolloutError("Tip context publication and release tags disagree")
-
-    args.release_tag = release["tag"]
-    args.release_commit = release["commit"]
-    args.migration_phase = rollout["runtimeSecureStorageMigrationPhase"]
-    args.allowed_roles = ",".join(ROLES)
-    args.enclosure_basename = release["archiveBasename"]
-    policy = {
-        "identities": {
-            identity_name: {
-                "bundleIdentifier": application["bundleIdentifier"],
-                "teamIdentifier": application["teamIdentifier"],
-            }
-        },
-        "sparkle": {
-            "minimumSystemVersion": sparkle["minimumSystemVersion"],
-            "tipUpdateRepository": sparkle["updateRepository"],
-        },
-    }
-    declaration = {
-        "channel": rollout["channel"],
-        "currentRole": role,
-        "eligibilityProfile": rollout["eligibilityProfile"],
-        "predecessors": rollout["predecessors"],
-    }
-    version = {
-        "APP_NAME": release["appName"],
-        "DISPLAY_NAME": release["displayName"],
-        "MARKETING_VERSION": release["marketingVersion"],
-        "BUILD_NUMBER": release["buildNumber"],
-        "BUNDLE_ID": application["bundleIdentifier"],
-        "SIGNING_TEAM_ID": application["teamIdentifier"],
-    }
-    return args, policy, declaration, version
-
-
-def build_manifest_from_context(
-    args: argparse.Namespace, context: dict
-) -> tuple[dict, str]:
-    args, policy, declaration, version = context_manifest_inputs(args, context)
-    manifest, appcast = build_manifest_from_inputs(args, policy, declaration, version)
-    validate_stable_build_below_retained_tip_preparer(context, manifest)
-    return manifest, appcast
-
-
-def validate_stable_build_below_retained_tip_preparer(
-    context: dict, manifest: dict
-) -> None:
-    """Keep Stable builds below P so they cannot satisfy Tip's T hard gate."""
-    role = context["rollout"]["role"]
-    if role not in {"transition", "successor"}:
-        return
-    preparers = [
-        item for item in manifest["appcastItems"] if item.get("role") == "preparer"
-    ]
-    if len(preparers) != 1:
-        raise RolloutError(
-            f"the {role} Tip rollout must retain exactly one preparer item"
-        )
-    stable_build = str(context["release"]["stableMaximumBuild"])
-    preparer_build = str(preparers[0]["buildNumber"])
-    if not parse_build(stable_build, "Stable maximum build") < parse_build(
-        preparer_build, "retained Tip preparer build"
-    ):
-        raise RolloutError(
-            "Stable maximum build must remain below the retained Tip preparer build: "
-            f"Stable={stable_build} preparer={preparer_build}"
-        )
-
-
-def write_generated_outputs(args: argparse.Namespace, manifest: dict, appcast: str) -> None:
+def run_generate(args: argparse.Namespace) -> None:
+    if not args.enclosure_signature.strip():
+        raise RolloutError("generate requires --enclosure-signature")
+    manifest, appcast = build_manifest(args)
     Path(args.manifest_output).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     Path(args.appcast_output).write_text(appcast, encoding="utf-8")
     print(
-        f"OK: generated {manifest['channel']} rollout manifest and appcast with "
-        f"{len(manifest['appcastItems'])} item(s) for the {manifest['currentRole']} role."
+        f"OK: generated {manifest['channel']} rollout manifest and appcast with {len(manifest['appcastItems'])} "
+        f"item(s) for the {manifest['currentRole']} role."
     )
 
 
-def run_generate(args: argparse.Namespace) -> None:
-    if not args.enclosure_signature.strip():
-        raise RolloutError("generate requires --enclosure-signature")
-    manifest, appcast = build_manifest(args)
-    write_generated_outputs(args, manifest, appcast)
-
-
-def run_generate_from_context(args: argparse.Namespace) -> None:
-    if not args.enclosure_signature.strip():
-        raise RolloutError("generate-from-context requires --enclosure-signature")
-    context = load_verified_tip_context("stable-rollout-generate")
-    manifest, appcast = build_manifest_from_context(args, context)
-    write_generated_outputs(args, manifest, appcast)
-
-
-def validate_generated_outputs(
-    args: argparse.Namespace, expected_manifest: dict, expected_appcast: str
-) -> None:
+def run_validate(args: argparse.Namespace) -> None:
+    if not args.enclosure_signature:
+        # The reviewed manifest carries the published signature; shell callers
+        # separately prove it with the protected private key.
+        actual_items = load_manifest(Path(args.manifest))["appcastItems"]
+        args.enclosure_signature = str(actual_items[0].get("edSignature", ""))
+    expected_manifest, expected_appcast = build_manifest(args)
     actual_manifest_text = Path(args.manifest).read_text(encoding="utf-8")
     expected_manifest_text = json.dumps(expected_manifest, indent=2, sort_keys=True) + "\n"
     if actual_manifest_text != expected_manifest_text:
@@ -824,195 +733,176 @@ def validate_generated_outputs(
     )
 
 
-def run_validate(args: argparse.Namespace) -> None:
-    if not args.enclosure_signature:
-        actual_items = load_manifest(Path(args.manifest))["appcastItems"]
-        args.enclosure_signature = str(actual_items[0].get("edSignature", ""))
-    expected_manifest, expected_appcast = build_manifest(args)
-    validate_generated_outputs(args, expected_manifest, expected_appcast)
-
-
-def run_validate_from_context(args: argparse.Namespace) -> None:
-    if not args.enclosure_signature:
-        actual_items = load_manifest(Path(args.manifest))["appcastItems"]
-        args.enclosure_signature = str(actual_items[0].get("edSignature", ""))
-    context = load_verified_tip_context("stable-rollout-validate")
-    expected_manifest, expected_appcast = build_manifest_from_context(args, context)
-    validate_generated_outputs(args, expected_manifest, expected_appcast)
-
-
-def validate_tip_manifest_appcast(
-    context: dict, manifest: dict, appcast: str
+def validate_tip_manifest_pair(
+    policy: dict,
+    manifest_path: Path,
+    appcast_path: Path,
+    label: str,
 ) -> dict:
-    """Validate one Tip manifest/appcast pair against the immutable context.
-
-    This is the shared structural trust boundary for both predecessor-state
-    admission and post-publication byte audits. It intentionally does not
-    decide whether the manifest is the predecessor or the candidate; callers
-    layer that state-machine decision on top of the same parsed representation.
-    """
-    if manifest.get("channel") != "tip":
-        raise RolloutError("live rollout manifest must describe the Tip channel")
-    if manifest.get("updateRepository") != context["sparkle"]["updateRepository"]:
-        raise RolloutError("live Tip update repository differs from the candidate context")
-    normalized = normalize_manifest_floor_authority(manifest)
-    items = normalized.get("appcastItems")
-    if not isinstance(items, list) or not items:
-        raise RolloutError("live Tip rollout manifest must contain appcast items")
-    live_policy = {
-        "sparkle": {
-            "minimumSystemVersion": context["sparkle"]["minimumSystemVersion"],
-            "tipUpdateRepository": context["sparkle"]["updateRepository"],
-        }
-    }
-    for position, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            raise RolloutError(f"live appcast item {position} must be an object")
-        validate_item_shape(
-            item, position, live_policy, context["release"]["appName"], "tip"
-        )
-    validate_item_ladder(items)
-    try:
-        expected_appcast = render_appcast(normalized)
-    except (KeyError, TypeError) as error:
-        raise RolloutError(f"live Tip rollout manifest cannot render its appcast: {error}") from error
-    if expected_appcast != appcast:
-        raise RolloutError("live Tip appcast does not match its rollout manifest")
-    return normalized
-
-
-def validate_live_tip_publication_state(
-    context: dict,
-    live_manifest: dict,
-    live_appcast: str,
-    live_manifest_sha256: str,
-    live_main_commit: str,
-) -> None:
-    """Fail closed unless a candidate advances the authenticated live Tip ladder."""
-    if not re.fullmatch(r"[0-9a-f]{40}", live_main_commit):
-        raise RolloutError("live source main commit must be a full lowercase Git SHA")
-    if context["release"]["commit"] != live_main_commit:
+    manifest = normalize_manifest_floor_authority(load_manifest(manifest_path))
+    if set(manifest) != MANIFEST_KEYS:
         raise RolloutError(
-            "candidate Tip source commit is stale: "
-            f"candidate={context['release']['commit']} live-main={live_main_commit}"
+            f"{label} rollout manifest keys must be exactly "
+            + ", ".join(sorted(MANIFEST_KEYS))
         )
-    if not re.fullmatch(r"[0-9a-f]{64}", live_manifest_sha256):
-        raise RolloutError("live Tip rollout manifest digest must be a lowercase SHA-256")
-    live_manifest = validate_tip_manifest_appcast(context, live_manifest, live_appcast)
-    items = live_manifest["appcastItems"]
+    if manifest.get("channel") != "tip":
+        raise RolloutError(f"{label} rollout manifest must describe the Tip channel")
+    if manifest.get("updateRepository") != update_repository(policy, "tip"):
+        raise RolloutError(f"{label} Tip update repository differs from policy")
 
-    live_role = live_manifest.get("currentRole")
-    live_item = items[0]
-    if live_role != live_item.get("role"):
-        raise RolloutError("live rollout manifest role differs from its newest appcast item")
-    if live_role not in ROLES:
-        raise RolloutError(f"live rollout manifest has unknown role {live_role!r}")
-    if live_manifest.get("signingIdentity") != ROLE_IDENTITY[live_role]:
-        raise RolloutError("live rollout manifest role and signing identity disagree")
+    role = manifest.get("currentRole")
+    if role not in ROLES:
+        raise RolloutError(f"{label} rollout manifest has unknown role {role!r}")
+    identity_name = ROLE_IDENTITY[role]
+    identity = policy["identities"][identity_name]
+    if manifest.get("signingIdentity") != identity_name:
+        raise RolloutError(f"{label} rollout role and signing identity disagree")
+    if manifest.get("bundleIdentifier") != identity["bundleIdentifier"]:
+        raise RolloutError(f"{label} rollout bundle identifier differs from policy")
+    if manifest.get("teamIdentifier") != identity["teamIdentifier"]:
+        raise RolloutError(f"{label} rollout Team ID differs from policy")
+    if manifest.get("migrationPhase") != ROLE_MIGRATION_PHASE[role]:
+        raise RolloutError(f"{label} rollout role and migration phase disagree")
+    if not isinstance(manifest.get("eligibilityProfile"), str) or not manifest["eligibilityProfile"]:
+        raise RolloutError(f"{label} rollout eligibility profile must be nonempty")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("releaseCommit", ""))):
+        raise RolloutError(f"{label} rollout release commit must be a full lowercase Git SHA")
+
+    app_artifact_manifest = manifest.get("appArtifactManifest")
+    if not isinstance(app_artifact_manifest, dict) or set(app_artifact_manifest) != {"name", "sha256"}:
+        raise RolloutError(f"{label} rollout app artifact manifest binding is malformed")
+    if not isinstance(app_artifact_manifest["name"], str) or not app_artifact_manifest["name"]:
+        raise RolloutError(f"{label} rollout app artifact manifest name is missing")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(app_artifact_manifest["sha256"])):
+        raise RolloutError(f"{label} rollout app artifact manifest digest is malformed")
+
+    items = manifest["appcastItems"]
+    for position, item in enumerate(items, start=1):
+        if set(item) != APPCAST_ITEM_KEYS:
+            raise RolloutError(
+                f"{label} appcast item {position} keys must be exactly "
+                + ", ".join(sorted(APPCAST_ITEM_KEYS))
+            )
+        validate_item_shape(item, position, policy, "RepoPrompt", "tip")
+        if position == 1:
+            if item["rolloutManifestName"] is not None or item["rolloutManifestSha256"] is not None:
+                raise RolloutError(f"{label} newest appcast item must not refer to itself")
+        else:
+            if item["rolloutManifestName"] != "identity-rollout.json":
+                raise RolloutError(f"{label} retained item {position} has the wrong manifest name")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(item["rolloutManifestSha256"])):
+                raise RolloutError(f"{label} retained item {position} has a malformed manifest digest")
+    validate_item_ladder(items)
+
+    newest = items[0]
     for manifest_key, item_key in (
         ("sourceTag", "tag"),
-        ("buildNumber", "buildNumber"),
+        ("currentRole", "role"),
         ("marketingVersion", "marketingVersion"),
+        ("buildNumber", "buildNumber"),
     ):
-        if live_manifest.get(manifest_key) != live_item.get(item_key):
+        if manifest.get(manifest_key) != newest.get(item_key):
             raise RolloutError(
-                f"live rollout manifest {manifest_key} differs from its newest appcast item"
+                f"{label} rollout manifest {manifest_key} differs from its newest appcast item"
             )
-    if not re.fullmatch(r"[0-9a-f]{40}", str(live_manifest.get("releaseCommit", ""))):
-        raise RolloutError("live rollout manifest release commit is malformed")
-    if live_item.get("rolloutManifestName") is not None or live_item.get(
-        "rolloutManifestSha256"
-    ) is not None:
-        raise RolloutError("live newest appcast item must not refer to itself as a predecessor")
 
-    candidate_build = parse_build(context["release"]["buildNumber"], "candidate Tip build")
-    live_build = parse_build(str(live_item["buildNumber"]), "live Tip build")
-    if not candidate_build > live_build:
-        raise RolloutError(
-            "candidate Tip build must be strictly newer than live Tip: "
-            f"candidate={context['release']['buildNumber']} live={live_item['buildNumber']}"
-        )
+    try:
+        appcast = appcast_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise RolloutError(f"unreadable {label} Tip appcast at {appcast_path}: {error}") from error
+    if render_appcast(manifest) != appcast:
+        raise RolloutError(f"{label} Tip appcast does not match its rollout manifest")
+    return manifest
 
-    candidate_role = context["rollout"]["role"]
+
+def expected_retained_history(live: dict, live_digest: str, candidate_role: str) -> list[dict]:
+    live_role = live["currentRole"]
+    live_items = live["appcastItems"]
     if live_role == "preparer" and candidate_role == "transition":
-        expected_predecessors = [
-            {
-                "role": "preparer",
-                "tag": live_manifest["sourceTag"],
-                "rolloutManifestSha256": live_manifest_sha256,
-            }
-        ]
-    elif live_role == "transition" and candidate_role == "successor":
-        expected_predecessors = [
-            {
-                "role": "transition",
-                "tag": live_manifest["sourceTag"],
-                "rolloutManifestSha256": live_manifest_sha256,
-            }
-        ]
-        retained_items = items[1:]
-        if [item.get("role") for item in retained_items] != ["preparer"]:
+        newest = dict(live_items[0])
+        newest["rolloutManifestName"] = "identity-rollout.json"
+        newest["rolloutManifestSha256"] = live_digest
+        return [newest]
+    if live_role == "transition" and candidate_role == "successor":
+        if [item["role"] for item in live_items[1:]] != ["preparer"]:
             raise RolloutError("live transition must retain exactly the preparer predecessor")
-        expected_predecessors.extend(
-            {
-                "role": item["role"],
-                "tag": item["tag"],
-                "rolloutManifestSha256": item.get("rolloutManifestSha256"),
-            }
-            for item in retained_items
-        )
-    elif live_role == "successor" and candidate_role == "successor":
-        retained_items = items[1:]
-        if [item.get("role") for item in retained_items] != ["transition", "preparer"]:
+        newest = dict(live_items[0])
+        newest["rolloutManifestName"] = "identity-rollout.json"
+        newest["rolloutManifestSha256"] = live_digest
+        return [newest, *live_items[1:]]
+    if live_role == "successor" and candidate_role == "successor":
+        if [item["role"] for item in live_items[1:]] != ["transition", "preparer"]:
             raise RolloutError(
                 "live successor must retain exactly the transition and preparer predecessors"
             )
-        expected_predecessors = [
-            {
-                "role": item["role"],
-                "tag": item["tag"],
-                "rolloutManifestSha256": item.get("rolloutManifestSha256"),
-            }
-            for item in retained_items
-        ]
-    else:
-        raise RolloutError(
-            "candidate Tip rollout role would regress or skip the live rollout state: "
-            f"live={live_role} candidate={candidate_role}"
-        )
+        return live_items[1:]
+    if live_role == "legacy" and candidate_role == "legacy":
+        return []
+    raise RolloutError(
+        "candidate Tip rollout role would regress or skip the live rollout state: "
+        f"live={live_role} candidate={candidate_role}"
+    )
 
-    for position, predecessor in enumerate(expected_predecessors, start=1):
-        digest = predecessor["rolloutManifestSha256"]
-        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+
+def run_validate_live_tip_progression(args: argparse.Namespace) -> None:
+    policy = load_policy(Path(args.policy))
+    candidate_manifest_path = Path(args.candidate_manifest)
+    candidate_appcast_path = Path(args.candidate_appcast)
+    candidate = validate_tip_manifest_pair(
+        policy, candidate_manifest_path, candidate_appcast_path, "candidate"
+    )
+
+    if bool(args.live_manifest) != bool(args.live_appcast):
+        raise RolloutError("--live-manifest and --live-appcast must be supplied together")
+    if not args.live_manifest:
+        if candidate["currentRole"] not in {"legacy", "preparer"} or len(candidate["appcastItems"]) != 1:
             raise RolloutError(
-                f"live retained predecessor {position} has a malformed rollout manifest digest"
+                "the first public Tip rollout must be a single-item legacy or preparer release"
             )
-    if context["rollout"]["predecessors"] != expected_predecessors:
+        print(
+            "OK: no public Tip rollout exists; candidate may establish "
+            f"the {candidate['currentRole']} baseline."
+        )
+        return
+
+    live_manifest_path = Path(args.live_manifest)
+    live_appcast_path = Path(args.live_appcast)
+    live = validate_tip_manifest_pair(policy, live_manifest_path, live_appcast_path, "live")
+    live_digest = sha256_file(live_manifest_path)
+    candidate_digest = sha256_file(candidate_manifest_path)
+
+    if candidate["sourceTag"] == live["sourceTag"]:
+        if candidate_digest != live_digest or candidate_appcast_path.read_bytes() != live_appcast_path.read_bytes():
+            raise RolloutError(
+                "the public Tip release uses the candidate tag with different manifest or appcast bytes"
+            )
+        print(f"OK: public Tip rollout already matches candidate {candidate['sourceTag']} exactly.")
+        return
+
+    candidate_build = parse_build(candidate["buildNumber"], "candidate Tip build")
+    live_build = parse_build(live["buildNumber"], "live Tip build")
+    if not candidate_build > live_build:
         raise RolloutError(
-            "candidate Tip predecessor pins do not exactly match the authenticated live history"
+            "candidate Tip build must be strictly newer than live Tip: "
+            f"candidate={candidate['buildNumber']} live={live['buildNumber']}"
         )
 
-
-def run_validate_live_tip_publication(args: argparse.Namespace) -> None:
-    context = load_verified_tip_context("stable-rollout-live-publication")
-    manifest_path = Path(args.live_manifest)
-    live_manifest = load_manifest(manifest_path)
-    try:
-        live_appcast = Path(args.live_appcast).read_text(encoding="utf-8")
-    except OSError as error:
-        raise RolloutError(f"unreadable live Tip appcast: {error}") from error
-    validate_live_tip_publication_state(
-        context,
-        live_manifest,
-        live_appcast,
-        sha256_file(manifest_path),
-        args.live_main_commit,
-    )
+    expected = expected_retained_history(live, live_digest, candidate["currentRole"])
+    actual = candidate["appcastItems"][1:]
+    if actual != expected:
+        raise RolloutError(
+            "candidate Tip retained items do not exactly match the authenticated live history"
+        )
     print(
-        "OK: live Tip publication state permits "
-        f"{context['rollout']['role']} {context['release']['tag']} "
-        f"build {context['release']['buildNumber']}."
+        "OK: candidate Tip rollout safely advances "
+        f"{live['currentRole']} -> {candidate['currentRole']} with exact retained history."
     )
+
+
+def run_feed_url(args: argparse.Namespace) -> None:
+    policy = load_policy(Path(args.policy))
+    key = "tipFeedURL" if args.channel == "tip" else "stableFeedURL"
+    print(policy["sparkle"][key])
 
 
 def run_workflow_guard(args: argparse.Namespace) -> None:
@@ -1036,12 +926,6 @@ def run_workflow_guard(args: argparse.Namespace) -> None:
 
 def run_current_role(args: argparse.Namespace) -> None:
     print(load_declaration(Path(args.declaration))["currentRole"])
-
-
-def run_feed_url(args: argparse.Namespace) -> None:
-    policy = load_policy(Path(args.policy))
-    key = "tipFeedURL" if args.channel == "tip" else "stableFeedURL"
-    print(policy["sparkle"][key])
 
 
 def run_packaging_context(args: argparse.Namespace) -> None:
@@ -1174,22 +1058,11 @@ def run_predecessor_values(args: argparse.Namespace) -> None:
         print("\t".join((entry["role"], entry["tag"], entry["rolloutManifestSha256"])))
 
 
-def run_predecessor_values_from_context(_args: argparse.Namespace) -> None:
-    context = load_verified_tip_context("stable-rollout-predecessors")
-    for entry in context["rollout"]["predecessors"]:
-        print("\t".join((entry["role"], entry["tag"], entry["rolloutManifestSha256"])))
-
-
-def run_signing_mode_from_context(_args: argparse.Namespace) -> None:
-    context = load_verified_tip_context("stable-rollout-signing-mode")
-    print(SIGNING_MODE_BY_IDENTITY[context["rollout"]["signingIdentity"]])
-
-
 def max_build_from_appcast(path: Path) -> str:
     try:
         root = ET.parse(path).getroot()
-    except ET.ParseError as error:
-        raise RolloutError(f"unparseable appcast XML: {error}") from error
+    except (OSError, ET.ParseError) as error:
+        raise RolloutError(f"unparseable appcast XML at {path}: {error}") from error
     items = root.findall("./channel/item")
     if not items:
         raise RolloutError("appcast must contain at least one item")
@@ -1205,6 +1078,37 @@ def max_build_from_appcast(path: Path) -> str:
 
 def run_max_build(args: argparse.Namespace) -> None:
     print(max_build_from_appcast(Path(args.appcast)))
+
+
+def run_validate_stable_tip_floor(args: argparse.Namespace) -> None:
+    policy = load_policy(Path(args.policy))
+    manifest = validate_tip_manifest_pair(
+        policy,
+        Path(args.tip_manifest),
+        Path(args.tip_appcast),
+        "Tip floor",
+    )
+    role = manifest["currentRole"]
+    if role in {"legacy", "preparer"}:
+        print(f"OK: the {role} Tip role does not require a retained preparer floor.")
+        return
+
+    preparers = [item for item in manifest["appcastItems"] if item["role"] == "preparer"]
+    if len(preparers) != 1:
+        raise RolloutError(f"the {role} Tip rollout must retain exactly one preparer item")
+    stable_build = max_build_from_appcast(Path(args.stable_appcast))
+    preparer_build = str(preparers[0]["buildNumber"])
+    if not parse_build(stable_build, "Stable maximum build") < parse_build(
+        preparer_build, "retained Tip preparer build"
+    ):
+        raise RolloutError(
+            "Stable maximum build must remain below the retained Tip preparer build: "
+            f"Stable={stable_build} preparer={preparer_build}"
+        )
+    print(
+        "OK: Stable maximum build remains below the retained Tip preparer: "
+        f"Stable={stable_build} preparer={preparer_build}."
+    )
 
 
 def run_sibling_values(args: argparse.Namespace) -> None:
@@ -1241,13 +1145,6 @@ def add_shared_generate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--predecessor-manifest", action="append", default=[])
     parser.add_argument("--allowed-roles")
     parser.add_argument("--enclosure-basename")
-
-
-def add_context_generate_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--enclosure", required=True)
-    parser.add_argument("--enclosure-signature", default="")
-    parser.add_argument("--app-artifact-manifest", required=True)
-    parser.add_argument("--predecessor-manifest", action="append", default=[])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1290,14 +1187,6 @@ def build_parser() -> argparse.ArgumentParser:
     predecessor_values.add_argument("--declaration", required=True)
     predecessor_values.set_defaults(func=run_predecessor_values)
 
-    predecessor_values_from_context = subparsers.add_parser(
-        "predecessor-values-from-context"
-    )
-    predecessor_values_from_context.set_defaults(func=run_predecessor_values_from_context)
-
-    signing_mode_from_context = subparsers.add_parser("signing-mode-from-context")
-    signing_mode_from_context.set_defaults(func=run_signing_mode_from_context)
-
     generate = subparsers.add_parser("generate")
     add_shared_generate_arguments(generate)
     generate.add_argument("--appcast-output", required=True)
@@ -1310,23 +1199,20 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--manifest", required=True)
     validate.set_defaults(func=run_validate)
 
-    generate_from_context = subparsers.add_parser("generate-from-context")
-    add_context_generate_arguments(generate_from_context)
-    generate_from_context.add_argument("--appcast-output", required=True)
-    generate_from_context.add_argument("--manifest-output", required=True)
-    generate_from_context.set_defaults(func=run_generate_from_context)
+    live_progression = subparsers.add_parser("validate-live-tip-progression")
+    live_progression.add_argument("--policy", required=True)
+    live_progression.add_argument("--candidate-manifest", required=True)
+    live_progression.add_argument("--candidate-appcast", required=True)
+    live_progression.add_argument("--live-manifest")
+    live_progression.add_argument("--live-appcast")
+    live_progression.set_defaults(func=run_validate_live_tip_progression)
 
-    validate_from_context = subparsers.add_parser("validate-from-context")
-    add_context_generate_arguments(validate_from_context)
-    validate_from_context.add_argument("--appcast", required=True)
-    validate_from_context.add_argument("--manifest", required=True)
-    validate_from_context.set_defaults(func=run_validate_from_context)
-
-    validate_live = subparsers.add_parser("validate-live-tip-publication")
-    validate_live.add_argument("--live-main-commit", required=True)
-    validate_live.add_argument("--live-manifest", required=True)
-    validate_live.add_argument("--live-appcast", required=True)
-    validate_live.set_defaults(func=run_validate_live_tip_publication)
+    stable_floor = subparsers.add_parser("validate-stable-tip-floor")
+    stable_floor.add_argument("--policy", required=True)
+    stable_floor.add_argument("--stable-appcast", required=True)
+    stable_floor.add_argument("--tip-manifest", required=True)
+    stable_floor.add_argument("--tip-appcast", required=True)
+    stable_floor.set_defaults(func=run_validate_stable_tip_floor)
 
     max_build = subparsers.add_parser("max-build")
     max_build.add_argument("--appcast", required=True)

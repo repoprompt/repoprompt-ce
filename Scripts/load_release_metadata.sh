@@ -44,7 +44,6 @@ PYTHON
     eval "$assignments"
 }
 
-
 validate_stable_release_context() {
     local actual_bundle_id="$1"
     local actual_team_id="$2"
@@ -170,124 +169,40 @@ validate_resolved_migration_anchor_identity() {
     }
 }
 
-
-load_verified_tip_release_context() {
-    local scripts_root="$1"
+load_release_metadata_with_identity_projection() {
+    local metadata_root="$1"
     local approved_source_root="$2"
-    local boundary="$3"
-    local staged_root="${4:-}"
-    local trusted_root
-    local required
+    local scripts_root="$3"
+    local archive_contract="${4:-}"
     local assignments
 
-    trusted_root="$(cd "$scripts_root/.." && pwd)" || return
-    for required in \
-        REPOPROMPT_TIP_RELEASE_CONTEXT \
-        REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE \
-        REPOPROMPT_TIP_STABLE_APPCAST \
-        REPOPROMPT_EXPECTED_CONTEXT_SHA256 \
-        REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT \
-        REPOPROMPT_EXPECTED_TOOLING_COMMIT; do
-        if [[ -z "${!required:-}" ]]; then
-            printf 'ERROR: Missing required Tip context environment variable: %s\n' "$required" >&2
-            return 1
-        fi
-    done
-    if [[ -z "$approved_source_root" ]]; then
-        printf 'ERROR: Tip context verification requires an approved source root\n' >&2
-        return 1
-    fi
-
-    local legacy_alias
-    for legacy_alias in \
-        TIP_UPDATE_REPOSITORY \
-        TIP_PUBLISH_INSTALLATION_TYPE \
-        RELEASE_COMMIT \
-        REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE \
-        BUILD_NUMBER \
-        GH_TOKEN; do
-        if [[ "${!legacy_alias+x}" == "x" ]]; then
-            printf 'ERROR: Ambient legacy Tip authority alias is prohibited: %s\n' \
-                "$legacy_alias" >&2
-            return 1
-        fi
-    done
-
-    assignments="$(
-        python3 "$scripts_root/tip_release_context.py" verify \
-            --context "$REPOPROMPT_TIP_RELEASE_CONTEXT" \
-            --digest "$REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE" \
-            --stable-appcast "$REPOPROMPT_TIP_STABLE_APPCAST" \
-            --expected-context-sha256 "$REPOPROMPT_EXPECTED_CONTEXT_SHA256" \
-            --expected-approved-source-commit "$REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT" \
-            --expected-tooling-commit "$REPOPROMPT_EXPECTED_TOOLING_COMMIT" \
-            --boundary "$boundary" \
-            --approved-source-root "$approved_source_root" \
-            --trusted-tooling-root "$trusted_root" \
-            --emit-shell
-    )" || return
-
-    # The verifier's emitted assignments are the single authority for which
-    # variables it exports; derive their names here instead of duplicating
-    # the Python SHELL_EXPORT_KEYS allowlist in shell.
-    if [[ -z "$assignments" ]]; then
-        printf 'ERROR: Verified Tip context emitted no shell assignments\n' >&2
-        return 1
-    fi
-    local authority_variables=()
-    local line name
-    while IFS= read -r line; do
-        if [[ "$line" != *=* ]]; then
-            printf 'ERROR: Malformed verified Tip context assignment: %s\n' "$line" >&2
-            return 1
-        fi
-        name="${line%%=*}"
-        if [[ ! "$name" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
-            printf 'ERROR: Malformed verified Tip context variable name: %s\n' "$name" >&2
-            return 1
-        fi
-        authority_variables[${#authority_variables[@]}]="$name"
-    done <<< "$assignments"
-
-    local ambient_values=()
-    local ambient_present=()
-    local index variable
-    for ((index = 0; index < ${#authority_variables[@]}; index++)); do
-        variable="${authority_variables[$index]}"
-        ambient_values[$index]="${!variable-}"
-        ambient_present[$index]="${!variable+x}"
-    done
-
-    eval "$assignments"
-    for ((index = 0; index < ${#authority_variables[@]}; index++)); do
-        variable="${authority_variables[$index]}"
-        if [[ "${ambient_present[$index]}" == "x" && "${ambient_values[$index]}" != "${!variable}" ]]; then
-            printf 'ERROR: Ambient %s conflicts with the verified Tip release context\n' "$variable" >&2
-            return 1
-        fi
-        export "$variable"
-    done
-
-    BUILD_NUMBER="$TIP_BUILD_NUMBER"
-
-    if [[ -n "$staged_root" ]]; then
-        local staged_context="$staged_root/tip-release-context.json"
-        local staged_digest="$staged_root/tip-release-context.json.sha256"
-        if [[ ! -f "$staged_context" || -L "$staged_context" ]]; then
-            printf 'ERROR: Missing regular staged Tip release context: %s\n' "$staged_context" >&2
-            return 1
-        fi
-        if [[ ! -f "$staged_digest" || -L "$staged_digest" ]]; then
-            printf 'ERROR: Missing regular staged Tip release context digest: %s\n' "$staged_digest" >&2
-            return 1
-        fi
-        cmp "$REPOPROMPT_TIP_RELEASE_CONTEXT" "$staged_context" || {
-            printf 'ERROR: Staged Tip release context differs from the setup context\n' >&2
+    load_release_metadata "$metadata_root" || return
+    case "$archive_contract" in
+    "") return 0 ;;
+    tip-rollout-v1)
+        [[ -n "$approved_source_root" ]] || {
+            printf 'ERROR: Tip release identity projection requires an approved source root\n' >&2
             return 1
         }
-        cmp "$REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE" "$staged_digest" || {
-            printf 'ERROR: Staged Tip release context digest differs from the setup digest\n' >&2
+        [[ -f "$approved_source_root/tip-rollout.json" ]] || {
+            printf 'ERROR: Missing approved Tip rollout declaration\n' >&2
             return 1
         }
-    fi
+        assignments="$(
+            python3 "$scripts_root/stable_rollout.py" packaging-context \
+                --declaration "$approved_source_root/tip-rollout.json" \
+                --policy "$scripts_root/apple_identity_policy.json" \
+                --version-env "$approved_source_root/version.env"
+        )" || return
+        eval "$assignments"
+        [[ "$ROLLOUT_CHANNEL" == "tip" ]] || {
+            printf 'ERROR: Tip release identity projection requires a Tip rollout declaration\n' >&2
+            return 1
+        }
+        ;;
+    *)
+        printf 'ERROR: Unsupported REPOPROMPT_TIP_ARCHIVE_CONTRACT: %s\n' "$archive_contract" >&2
+        return 1
+        ;;
+    esac
 }

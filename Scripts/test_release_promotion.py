@@ -522,7 +522,8 @@ class ReleasePromotionTests(unittest.TestCase):
                 https://sentry.io/api/0/organizations/repoprompt/releases/com.pvncher.repoprompt.ce%401.0.0%2B1/deploys/)
                     printf 'sentry %s %s\n' "$method" "$url" >> "$FAKE_TOOL_CAPTURE"
                     [[ "$args" != *"fixture-sentry-token"* ]] || { printf 'token leaked in curl args\n' >&2; exit 1; }
-                    [[ -n "$config" && "$(stat -f %Lp "$config")" == "600" ]] || {
+                    config_mode="$(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$config")"
+                    [[ -n "$config" && "$config_mode" == "600" ]] || {
                         printf 'Sentry curl config is missing or not mode 0600\n' >&2
                         exit 1
                     }

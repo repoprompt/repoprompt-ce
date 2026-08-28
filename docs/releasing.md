@@ -218,8 +218,6 @@ The intended process is:
    releases without rebuilding, explicitly marks that tag as GitHub's latest
    stable release, and runs anonymous post-publish checks.
 
-The release-capable **Publish Release** workflow uses a maximum-depth queue rather than
-canceling an older signing or draft-publication run when another dispatch arrives.
 
 ## Tip Builds
 
@@ -237,166 +235,73 @@ Stable: https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/down
 Tip:    https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/latest/download/appcast.xml
 ```
 
-The Tip channel uses the same CE Sparkle EdDSA key as Stable but publishes only to the separate Tip
-update repository. The currently implemented appcast model represents one single-P `P → T → N`
-ladder in one feed:
+The Tip channel uses the same CE Sparkle EdDSA key and the same application/feed contract as
+stable, but publishes only to the separate tip update repository. It is currently the controlled
+`P → T → S` identity-transition rehearsal:
 
-| Role | Application identity and migration phase | Publication form | Retained feed items |
+| Role | Application identity | Artifact | Feed contents |
 | --- | --- | --- | --- |
-| P / `preparer` | Legacy; `legacy-preparer` | Application ZIP | P |
-| T / `transition` | Successor; migration disabled | Installer PKG | T, P |
-| N / `successor` | Successor; migration disabled | Application ZIP and DMG | N, T, P |
+| P / `preparer` | Legacy | ZIP, `legacy-preparer` phase | P only |
+| T / `transition` | Successor | Notarized successor-Installer-signed PKG | T and retained P |
+| S / `successor` | Successor | Notarized ZIP/DMG | S, retained T, and retained P |
 
-This is the currently implemented **single-P** publication model, not a ready-made P1-to-P2-to-T
-model. The public preparer is P1. The current declaration, appcast, and publication state machine does
-not represent or permit P1-to-P2-to-T, and T remains **NO-GO**.
+`tip-rollout.json` is the checked-in authority for the current role, expected identity, migration
+phase, and predecessor manifest digests. Every role uses the same Tip feed URL and `appcast.xml`
+asset, with retained top-level entries in that appcast; there are no transition/successor sibling
+feeds and no Sparkle-key change. Tip workflows must never write to `repoprompt-ce-updates`, must not
+use `v*` tags, and must not feed into `Promote Release`. Stable promotion remains the only path that
+updates the stable appcast.
 
-Every role uses the same Tip feed URL and `appcast.xml` asset. There are no transition or successor
-sibling feeds and no Sparkle-key change. Tip must never publish to `repoprompt-ce-updates`, use `v*`
-tags, or enter `Promote Release`; Stable promotion remains the only path that updates the Stable
-appcast.
+`Publish Tip` can be notified automatically after successful CI on `main` or dispatched manually.
+The automatic `workflow_run` path publishes only the legacy role. For P, T, and S it ends in a
+successful read-only diagnostic before credentials, staging, signing, or publication. A nonlegacy
+role is published only by an explicit dispatch from `main` whose
+`confirm_identity_rollout_role` exactly matches the checked-in role.
 
-### Current rollout state and blockers
+There is deliberately no commit input. For a manual dispatch, GitHub's selected `main` ref and
+`github.sha` are the immutable candidate. Setup fetches protected `origin/main` and requires the
+candidate commit, workflow-definition commit, and checked-out release tooling to be that exact live
+commit. A stale browser tab therefore cannot publish an older main commit merely because somebody
+pasted a convincing SHA into a text box. The protected role-aware credential preflight runs before
+the secret-free build and uses an isolated ephemeral keychain without changing the runner user's
+keychain search list.
 
-The only public identity-transition release is P:
+After P is reviewed, advance `tip-rollout.json` with its exact `identity-rollout.json` digest before
+dispatching T; advance it again with T and P digests before S. Each published role uses an immutable
+`tip-<shortsha>` tag and the tip-only repository's latest release. Do not mark it as a prerelease,
+because GitHub excludes prereleases from `releases/latest`.
 
-- tag: `tip-2f94412e6ab5`
-- build: `35.15.18`
-- `identity-rollout.json` SHA-256:
-  `3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`
+Current checkpoint: verified P is `tip-2f94412e6ab5`, with rollout-manifest SHA-256
+`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. The reviewed declaration
+pins that predecessor and selects T. The workflow can build T only through an exact-role dispatch,
+but T and S remain NO-GO until the isolated runtime proof is approved, including lost-journal recovery
+and a fresh-successor-install policy. Workflow capability, environment approval, and role confirmation
+are safety gates; they are not release authorization.
 
-The live Tip appcast contains only that P ZIP. No successful T release or transition tag exists.
-Later merged source does not prove that transition occurred.
-
-T is **NO-GO** until the post-commit missing-journal stale rebootstrap defect is repaired and proven.
-A later preparer cannot distinguish a journal that was never created from a committed journal that was
-lost before the later build observed it, so publishing an ungated P1-to-newer-P2 update is unsafe. A
-coherent blocker-A follow-up must either provide another durable provenance mechanism, or retain P1,
-gate P2 on P1, make a nil journal fail closed in P2, and retain both preparer stages through T and N.
-That P1/P2 route is not implemented by the current declaration/appcast/publication state machine.
-
-Acceptance must cover committed-journal loss before P2, committed-journal loss after P2, fresh
-P1-to-P2 routing, P1-to-P2-to-T, delayed P1/P2 clients after N, and retained P1/P2 appcast history.
-N is independently **NO-GO** until a genuinely fresh successor install can be distinguished from an
-install that skipped P and can select persistent successor-only secure storage safely. See
-[Apple identity migration architecture](architecture/apple-identity-migration.md) for the audited
-runtime behavior and validation limits.
-
-The next release action is therefore not a T dispatch. First merge the reviewed release-pipeline
-changes, obtain the new exact protected `main` SHA, verify hosted CI and the automatic dispatch guard
-for that exact SHA, and complete the blocking runtime follow-up.
-
-### Immutable Tip release context
-
-`Scripts/tip_release_context.py` resolves the release decision once during setup from the exact
-approved source commit, trusted tooling commit, checked-in identity policy and rollout declaration,
-`version.env`, and the bounded Stable appcast downloaded as a GitHub release asset over HTTPS. That
-GitHub asset/HTTPS delivery is the setup trust root for the Stable input; the appcast is not
-independently authenticated. Setup records its exact hash in canonical JSON and emits a detached
-SHA-256 digest. That digest authenticates byte-for-byte carriage of the context downstream. The pair
-is uploaded as a dedicated artifact and is the immutable in-run authority for every downstream
-release job and child process. Each consumer validates its bytes, setup digest, expected
-source/tooling commits, closed schema, and semantic invariants before it may use credentials, build,
-sign, smoke-test, or publish.
-
-The context owns the resolved role and migration phase; application, migration-anchor, Installer,
-and Sparkle identities; version, build and `tip-<shortsha>` tag; installation/package form; package
-identifier and component schema; artifact names; publication repository and flags; retained
-predecessors; and exact appcast items. `tip-rollout.json`, policy, version files, and the Stable
-appcast are setup inputs, not downstream authorities. `stable_rollout.py` supplies shared rollout
-algorithms, but its `packaging-context` projection is not Tip authority. Protected certificates,
-profiles, keys, passwords, and repository tokens provide private material only; they do not choose
-identity or phase.
-
-Published assets include the canonical context JSON and detached digest in addition to the rollout
-manifest, appcast, `SHA256SUMS`, staged archive metadata and artifact manifest, and the role-specific
-ZIP/DMG or PKG. The signing job binds `SHA256SUMS` with its own trusted digest; smoke and publication
-recompare the context and digest byte-for-byte and reject missing, extra, changed, symlinked, or
-coordinated asset/checksum substitutions.
-
-### Sparkle eligibility and retained history
-
-The rollout manifest has one predecessor-floor authority: `minimumUpdateVersion`. In the current
-single-P model, P has no floor, T uses P's exact build, and N uses T's exact build. Every gated appcast
-item renders that same value as both `sparkle:minimumUpdateVersion` and
-`sparkle:minimumAutoupdateVersion`, and validation requires exact equality. Only
-`minimumUpdateVersion` is an exclusion boundary, and it requires supported source clients to embed
-Sparkle 2.9 or later. `minimumAutoupdateVersion` affects automatic-update behavior; it is not an
-exclusion gate and cannot replace `minimumUpdateVersion`.
-
-The `AppcastParser` XCTest is a passive UI-eligibility check. Real update selection and installation
-belong to Sparkle, so that XCTest and release-tooling mocks do not prove the intended upgrade route.
-Before T, authenticate every supported predecessor artifact, verify its embedded Sparkle is at least
-2.9, and exercise generated P1/P2/T/N appcasts through real Sparkle. That proof must include fresh
-P1-to-P2 selection, P1-to-P2-to-T, delayed P1/P2 clients after N, and rejection of every skipped stage.
-
-The authenticated public P manifest is the only legacy form that may be normalized from an explicit
-null `minimumAutoupdateVersion` to the current ungated representation. Its exact tag, build, identity,
-artifact type, manifest digest, and single-P history must match before normalization. This exception is
-conditional on there being no P2; it does not establish P1/P2 support. The authenticated Stable maximum
-build must remain lower than retained Tip P: Stable `35` is valid against P `35.15.18`, while Stable
-`36` blocks setup/publication.
-
-Normal feed regeneration must retain P and T. They may be removed only after the documented delayed-
-upgrader window and telemetry/support policy show no supported legacy population remains, direct
-legacy-to-successor installation has an approved replacement or is explicitly unsupported, rollback
-and migration recovery no longer need the entries, and a reviewed removal release proves hosted
-Sparkle selection. Do not infer removal safety merely because a later N exists. If blocker A adopts a
-P1/P2 ladder, these retention rules must expand to retain both P1 and P2 through T/N and to verify
-delayed clients from both preparer stages.
-
-### Dispatch and publication gates
-
-`Publish Tip` is notified automatically after successful CI on `main` and may also be dispatched
-manually. The dispatch matrix is deliberately asymmetric during the identity transition:
-
-| Checked-in role | Automatic `workflow_run` | Manual workflow capability |
-| --- | --- | --- |
-| legacy | Permitted after exact-main setup validation | Available; ordinary release authorization still applies |
-| P / `preparer` | Suppressed before credentials or builds | Exact-role confirmation plus environment approval required |
-| T / `transition` | Suppressed before credentials or builds | Exact-role confirmation plus environment approval required |
-| N / `successor` | Suppressed before credentials or builds | Exact-role confirmation plus environment approval required |
-
-Manual workflow capability, exact-role confirmation, and environment approval are safety gates;
-they are not release authorization. P, T, and N remain manual until an operator completes the
-documented go/no-go review, presents the exact candidate inputs, and receives explicit authorization.
-The credential preflight imports only context-selected material into an ephemeral keychain without
-changing the runner user's keychain search list or exporting credential state.
-
-Only after runtime blockers A and B are repaired, the first T and first N are independently proven,
-and a separate reviewed change is merged may ordinary subsequent N releases regain automatic
-publication. P and T remain manual transition operations. Removing that temporary N guard must not
-remove the retained P/T appcast history or delayed-upgrader policy.
-
-The automatic and manual source lanes remain separate, but publication safety does not rely on lane
-ordering or a later run repairing stale state. Both the release-capable workflow and the serialized
-`main-tip-publish` job use maximum-depth queues rather than cancellation. Under the publish lock, the
-publisher re-fetches bounded live source `main` and live Tip rollout/appcast state immediately before
-mutation, then repeats the source and rollout checks plus retained-enclosure audit after the complete
-draft audit and immediately before the publication PATCH. It requires the candidate source to remain exact current `main`, the
-candidate build to be strictly newer, the role/history to advance without regression or skipping, and
-all retained predecessor manifests to match. In the currently implemented single-P graph, the valid
-transitions are P to T, T to N, and monotonic N to a newer N with identical retained transition
-history. It does not implement P1 to P2 to T. A stale historical dispatch, same/lower build, role
-regression, changed predecessor, or Stable/P ordering violation fails closed.
-
-Publication creates or resumes one exact draft, uploads only absent assets, downloads and byte-audits
-the complete draft, publishes it, and repeats the complete audit anonymously. A fully byte-audited
-existing public tag is success; asset names or release metadata alone never prove completion. The
-protected update-repository token remains confined to publication. Every retained P/T enclosure is
-also downloaded under a bound, size-and-SHA-256 checked transfer before mutation and after publication.
-
-A GitHub asset left in `starter` or any other non-`uploaded` state is irreparable by the automated
-no-delete/no-clobber protocol. The run stops before further mutation. Recovery is an explicit
-maintainer action: first audit the exact draft/tag, source commit, release metadata, and asset list;
-then, with separate approval, either remove only the incomplete asset and rerun the same immutable
-context or abandon that unpublished draft/tag and derive a fresh release from current `main`. Never
-delete or replace a public asset, an unrelated release, or a tag as an automated recovery step.
-
-Tip `CFBundleVersion` values sort between adjacent Stable builds. Setup combines the authenticated
-Stable build with the source commit count; for example, commit sequence `795` on Stable build `28`
-becomes Tip build `28.7.95`. The source commit count must remain at or below `9999`; replace this
+Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow reads the published
+stable appcast and combines that stable build with the source commit count. For example, commit
+sequence `795` on stable build `28` becomes Tip build `28.7.95`: it is newer than stable `28`, while
+stable `29` still supersedes it. The source commit count must remain at or below `9999`; replace this
 encoding before the repository reaches that limit.
+
+During T and S, that normal Stable supersession must be deliberately paused: setup and the final
+publisher require the greatest Stable build to remain strictly below the retained P build. Advancing
+Stable to the next integer first would make an unprepared Stable client appear new enough to satisfy
+T's `sparkle:minimumUpdateVersion`, bypassing the credential preparer.
+
+Automatic and manual runs use separate concurrency lanes, and neither lane cancels in-flight release
+work. The publication job is serialized across both lanes, so a retry resumes or audits one exact
+draft instead of abandoning a different tag halfway through publication.
+
+Remote mutation is confined to that protected publication job. Immediately before draft creation
+and again immediately before making a draft public, it rechecks live protected `main`, downloads the
+public Tip manifest/appcast, proves that the candidate advances only `P → T → S` (or a later S) with
+exact retained history, and audits every retained enclosure against GitHub's published size and
+SHA-256. Existing drafts are resumed only when their metadata and uploaded bytes exactly match;
+missing assets are added without overwriting anything. After publication, every public asset is
+downloaded anonymously and compared byte-for-byte with the signed local inventory, and the release
+must be the repository's latest. The update-repository token is not available to setup, staging, or
+smoke jobs.
 
 Configure protected GitHub Actions environments named `release` and `tip-release`, with maintainer
 approval and protected-branch restrictions. Before the rehearsal, store this one-time identity
@@ -410,10 +315,13 @@ inventory in both environments:
 | Transition Installer P12/password | not used | `SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64` / `SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_PASSWORD` |
 
 Also retain `CI_KEYCHAIN_PASSWORD`, `SPARKLE_PRIVATE_KEY`, the Sentry credentials/configuration,
-and the environment-specific update-repository token. Tip setup selects the required material through
-the canonical context; do not configure `SIGN_IDENTITY`, `SUCCESSOR_SIGN_IDENTITY`, or an
-installer-name alias as a second authority. The immutable context verifier and publication protocol
-fail closed if the resolved Tip repository aliases the source or Stable update repository.
+and the environment-specific update-repository token. The workflows derive application and Installer
+identity labels from `Scripts/apple_identity_policy.json` through `stable_rollout.py
+packaging-context`; do not configure `SIGN_IDENTITY`, `SUCCESSOR_SIGN_IDENTITY`, or an installer-name
+alias as a second authority. The Tip publishing script fails closed if `TIP_UPDATE_REPOSITORY`
+points at the source or stable update repository. Tip artifacts also include a small
+`*-metadata.json` asset recording the source commit, immutable tag, marketing version, and build
+number.
 
 Tip builds use the same Sentry-linked binary and symbolication policy as stable
 releases. The secret-free stage enables Sentry linking and carries release dSYMs
@@ -682,15 +590,10 @@ Relaunch the app once without the argument so the SDK can flush the cached nativ
 crash report.
 
 Official workflows do not take an application or Installer identity label from a GitHub Actions
-string variable. Stable resolves `stable_rollout.py packaging-context` once at each stage and publish
-boundary, rejects an input phase that differs from `release-rollout.json`, and passes the policy-owned
-application and conditional P migration-anchor identities to its consumers. The package builder and
-staged signer compare against that export rather than carrying Apple identity literals. Tip resolves
-all identity and rollout decisions once into the canonical `tip_release_context.py` JSON and detached
-digest; downstream jobs and scripts validate that immutable context instead of reloading policy,
-rollout, version, or ambient identity values. Both workflows validate imported material in an
-ephemeral keychain before signing. The selected provisioning profile must match the resolved
-bundle/team pair; release tooling validates that identifier before signing.
+string variable. They derive the expected labels from `Scripts/apple_identity_policy.json` through
+`stable_rollout.py packaging-context`, then validate the imported identity in the ephemeral keychain
+before signing. The selected provisioning profile must match the role-selected bundle/team pair; the
+release tooling validates that identifier before signing.
 
 `PUBLIC_UPDATE_REPOSITORY_TOKEN` is intentionally separate from the workflow's
 source-repository `github.token`. Keep its repository scope narrow: the

@@ -18,32 +18,33 @@ fail() {
     exit 1
 }
 
-TIP_CONTEXT_MODE=0
-case "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" in
-"")
-    load_release_metadata "$METADATA_ROOT" || fail "Unable to load release metadata"
+load_release_metadata_with_identity_projection \
+    "$METADATA_ROOT" \
+    "${REPOPROMPT_APPROVED_SOURCE_ROOT:-}" \
+    "$SCRIPT_DIR" \
+    "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" ||
+    fail "Unable to load the reviewed release identity context"
+
+# Stable workflows export this context before staging. Local/focused callers
+# derive the same policy projection here rather than relying on identity literals.
+if [[ -z "${EXPECTED_SIGN_IDENTITY+x}" ]]; then
+    declaration_name="release-rollout.json"
+    [[ "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" == "tip-rollout-v1" ]] && \
+        declaration_name="tip-rollout.json"
+    eval "$(python3 "$ROLLOUT_TOOL" packaging-context \
+        --declaration "$METADATA_ROOT/$declaration_name" \
+        --policy "$SCRIPT_DIR/apple_identity_policy.json" \
+        --version-env "$METADATA_ROOT/version.env")" ||
+        fail "Unable to derive the reviewed release identity context"
+fi
+if [[ "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" != "tip-rollout-v1" ]]; then
     validate_stable_release_context \
         "$BUNDLE_ID" \
         "$SIGNING_TEAM_ID" \
         "${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}" \
         "${SIGN_IDENTITY:-}" || fail "Stable release context validation failed"
-    IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"
-    ;;
-tip-rollout-v1)
-    TIP_CONTEXT_MODE=1
-    load_verified_tip_release_context \
-        "$SCRIPT_DIR" \
-        "${REPOPROMPT_APPROVED_SOURCE_ROOT:-}" \
-        "sign-staged-release" \
-        "$ROOT_DIR" || fail "Unable to verify the staged Tip release context"
-    IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"
-    EXPECTED_APP_BUNDLE_ID="$BUNDLE_ID"
-    EXPECTED_APP_TEAM_ID="$SIGNING_TEAM_ID"
-    ;;
-*)
-    fail "Unsupported REPOPROMPT_TIP_ARCHIVE_CONTRACT: $REPOPROMPT_TIP_ARCHIVE_CONTRACT"
-    ;;
-esac
+fi
+IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
@@ -103,12 +104,7 @@ PYTHON
 plutil -lint "$app_entitlements"
 plutil -lint "$CODEX_V8_ENTITLEMENTS"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
-if (( TIP_CONTEXT_MODE )); then
-    signing_mode_marker="$(python3 "$ROLLOUT_TOOL" signing-mode-from-context)" ||
-        fail "Unable to derive the signing mode from the verified Tip context"
-else
-    signing_mode_marker="$EXPECTED_SIGNING_MODE"
-fi
+signing_mode_marker="$EXPECTED_SIGNING_MODE"
 plutil -replace RepoPromptSigningMode -string "$signing_mode_marker" "$APP_BUNDLE/Contents/Info.plist"
 
 identity_migration_phase="$(
@@ -122,6 +118,10 @@ case "$identity_migration_phase" in
 disabled)
     ;;
 legacy-preparer)
+    [[ -n "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" && \
+       -n "$EXPECTED_MIGRATION_ANCHOR_TEAM_ID" && \
+       -n "$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" ]] ||
+        fail "Legacy identity preparer requires the complete migration-anchor policy"
     identity_migration_anchor="${REPOPROMPT_IDENTITY_MIGRATION_ANCHOR:-}"
     [[ -n "$identity_migration_anchor" ]] ||
         fail "Legacy identity preparer signing requires REPOPROMPT_IDENTITY_MIGRATION_ANCHOR"

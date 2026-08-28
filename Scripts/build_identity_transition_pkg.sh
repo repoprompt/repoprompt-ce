@@ -1,278 +1,316 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deterministic, bounded builder/validator for the one-time transition package.
-# Each material command is exec'd through the process-group-owning supervisor.
+# Build or validate the one-time installer enclosure used to replace the legacy
+# bundle/team identity. Policy owns every public identity and package setting;
+# secrets provide signing material only.
 
 MODE="${1:-}"
 if [[ $# -gt 0 ]]; then shift; fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONTRACT="$SCRIPT_DIR/transition_package_contract.py"
-SUPERVISOR="$SCRIPT_DIR/supervise_release_phase.py"
-
-readonly PAYLOAD_COPY_TIMEOUT_SECONDS=300
-readonly COMPONENT_PLIST_TIMEOUT_SECONDS=60
-readonly COMPONENT_PACKAGE_TIMEOUT_SECONDS=300
-readonly PRODUCT_ARCHIVE_TIMEOUT_SECONDS=300
-readonly PACKAGE_SIGN_TIMEOUT_SECONDS=300
-readonly PACKAGE_NOTARIZATION_TIMEOUT_SECONDS=1860
-readonly PACKAGE_STAPLE_TIMEOUT_SECONDS=300
-readonly PACKAGE_VALIDATION_TIMEOUT_SECONDS=300
-readonly PACKAGE_EXPANSION_TIMEOUT_SECONDS=300
-readonly PAYLOAD_COMPARISON_TIMEOUT_SECONDS=300
+POLICY="${REPOPROMPT_APPLE_IDENTITY_POLICY:-$SCRIPT_DIR/apple_identity_policy.json}"
+TMP_DIR=""
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 require_command() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
 require_file() { [[ -f "$1" && ! -L "$1" ]] || fail "Missing regular non-symlink file: $1"; }
-require_directory() { [[ -d "$1" && ! -L "$1" ]] || fail "Missing non-symlink directory: $1"; }
-require_env() { [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"; }
-require_absent() { [[ ! -e "$1" && ! -L "$1" ]] || fail "Refusing to overwrite existing transition path: $1"; }
+cleanup() { [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
 
 [[ "${REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG:-}" == "1" ]] ||
     fail "identity transition package construction requires explicit Tip rollout enablement"
-require_env REPOPROMPT_APPROVED_SOURCE_ROOT
-require_file "$CONTRACT"
-require_file "$SUPERVISOR"
+require_file "$POLICY"
 require_command python3
 
-source "$SCRIPT_DIR/load_release_metadata.sh"
-load_verified_tip_release_context \
-    "$SCRIPT_DIR" "$REPOPROMPT_APPROVED_SOURCE_ROOT" \
-    "transition-package-${MODE:-unknown}" ||
-    fail "Unable to load the verified transition package context"
-[[ "$ROLLOUT_ROLE" == "transition" ]] ||
-    fail "transition package command requires rollout role=transition, got $ROLLOUT_ROLE"
-[[ "$ROLLOUT_INSTALLATION_TYPE" == "package" ]] ||
-    fail "transition package command requires installation type=package, got $ROLLOUT_INSTALLATION_TYPE"
-
-context_assignments="$(
-    python3 "$CONTRACT" context-shell --boundary "transition-package-${MODE:-unknown}"
-)" || fail "Unable to resolve transition package values from the verified context"
-eval "$context_assignments"
-[[ "$TRANSITION_APP_BUNDLE_ID" == "$BUNDLE_ID" ]] ||
-    fail "Transition package context bundle ID mismatch: expected $BUNDLE_ID, got $TRANSITION_APP_BUNDLE_ID"
-[[ "$TRANSITION_APP_TEAM_ID" == "$SIGNING_TEAM_ID" ]] ||
-    fail "Transition package context Application Team ID mismatch: expected $SIGNING_TEAM_ID, got $TRANSITION_APP_TEAM_ID"
-[[ "$TRANSITION_APP_REQUIREMENT" == "$EXPECTED_APP_REQUIREMENT" ]] ||
-    fail "Transition package context Application requirement mismatch"
-[[ "$TRANSITION_INSTALLER_TEAM_ID" == "$EXPECTED_INSTALLER_TEAM_ID" ]] ||
-    fail "Transition package context Installer Team ID mismatch: expected $EXPECTED_INSTALLER_TEAM_ID, got $TRANSITION_INSTALLER_TEAM_ID"
-[[ "$TRANSITION_INSTALLER_IDENTITY" == "$EXPECTED_INSTALLER_IDENTITY" ]] ||
-    fail "Transition package context Installer identity mismatch"
-
-APP=""
-ARTIFACT_MANIFEST=""
-EXPANDED_PAYLOAD_DIR=""
-OUTPUT=""
-PACKAGE=""
-WORK_DIR=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --app) APP="$2"; shift 2 ;;
-        --artifact-manifest) ARTIFACT_MANIFEST="$2"; shift 2 ;;
-        --expanded-payload-dir) EXPANDED_PAYLOAD_DIR="$2"; shift 2 ;;
-        --output) OUTPUT="$2"; shift 2 ;;
-        --package) PACKAGE="$2"; shift 2 ;;
-        --work-dir) WORK_DIR="$2"; shift 2 ;;
-        *) fail "Unknown $MODE argument: $1" ;;
-    esac
-done
-
-safe_work_dir() {
-    [[ -n "$WORK_DIR" && "$WORK_DIR" == /* && "$WORK_DIR" != "/" ]] ||
-        fail "$MODE requires an absolute, non-root --work-dir"
-    [[ "$WORK_DIR" != "$REPOPROMPT_APPROVED_SOURCE_ROOT" ]] ||
-        fail "Transition package work directory must not be the approved source root"
-}
-
-work_context="$WORK_DIR/tip-release-context.json"
-work_digest="$WORK_DIR/tip-release-context.json.sha256"
-payload_root="$WORK_DIR/payload-root"
-component_plist="$WORK_DIR/component.plist"
-component_pkg="$WORK_DIR/transition-component.pkg"
-unsigned_product_pkg="$WORK_DIR/transition-unsigned.pkg"
-expanded_pkg="$WORK_DIR/expanded-package"
-expanded_app_path_file="$WORK_DIR/expanded-app-path"
-
-initialize_work_dir() {
-    safe_work_dir
-    require_absent "$WORK_DIR"
-    mkdir -p "$WORK_DIR" "$payload_root"
-    chmod 700 "$WORK_DIR"
-    cp "$REPOPROMPT_TIP_RELEASE_CONTEXT" "$work_context"
-    cp "$REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE" "$work_digest"
-}
-
-verify_work_dir() {
-    safe_work_dir
-    require_directory "$WORK_DIR"
-    require_file "$work_context"
-    require_file "$work_digest"
-    cmp "$REPOPROMPT_TIP_RELEASE_CONTEXT" "$work_context" >/dev/null ||
-        fail "Transition package work context differs byte-for-byte from setup context"
-    cmp "$REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE" "$work_digest" >/dev/null ||
-        fail "Transition package work digest differs byte-for-byte from setup digest"
-}
-
-path_size_bytes() {
-    local path="$1"
-    python3 - "$path" <<'PYTHON'
-import os
-import signal
+# Closed, shell-safe projection of the reviewed policy. The package builder has
+# no identity literals and cannot be redirected by workflow variables.
+eval "$(python3 - "$POLICY" <<'PYTHON'
+import json
+import re
+import shlex
 import sys
 from pathlib import Path
 
-def timeout(_signal, _frame):
-    raise TimeoutError("size calculation exceeded 15 seconds")
+policy = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if policy.get("schemaVersion") != 1:
+    raise SystemExit("ERROR: apple identity policy schema version mismatch")
+successor = policy.get("identities", {}).get("successor")
+sparkle = policy.get("sparkle")
+package = policy.get("identityTransitionPackage")
+if not isinstance(successor, dict) or not isinstance(sparkle, dict) or not isinstance(package, dict):
+    raise SystemExit("ERROR: apple identity policy is missing transition settings")
+package_keys = {
+    "identifier", "installLocation", "appBundleName", "bundleIsRelocatable",
+    "bundleHasStrictIdentifier", "bundleIsVersionChecked", "bundleOverwriteAction",
+    "hasScripts", "applicationBundleCount",
+}
+if set(package) != package_keys:
+    raise SystemExit("ERROR: apple identity policy transition package schema mismatch")
+required = {
+    "SUCCESSOR_BUNDLE_IDENTIFIER": successor.get("bundleIdentifier"),
+    "SUCCESSOR_TEAM_IDENTIFIER": successor.get("teamIdentifier"),
+    "SUCCESSOR_APP_REQUIREMENT": successor.get("developerIDRequirement"),
+    "SUCCESSOR_INSTALLER_IDENTITY": successor.get("developerIDInstallerIdentityName"),
+    "TRANSITION_PKG_IDENTIFIER": package.get("identifier"),
+    "TRANSITION_INSTALL_LOCATION": package.get("installLocation"),
+    "DISTRIBUTION_APP_BUNDLE_NAME": package.get("appBundleName"),
+    "EXPECTED_FEED_URL": sparkle.get("stableFeedURL"),
+}
+if not all(isinstance(value, str) and value for value in required.values()):
+    raise SystemExit("ERROR: apple identity policy has incomplete transition strings")
+expected = {
+    "bundleIsRelocatable": False,
+    "bundleHasStrictIdentifier": False,
+    "bundleIsVersionChecked": True,
+    "bundleOverwriteAction": "upgrade",
+    "hasScripts": False,
+    "applicationBundleCount": 1,
+}
+for key, value in expected.items():
+    if package.get(key) != value:
+        raise SystemExit(f"ERROR: unsupported transition package policy: {key}")
+if package["installLocation"] != "/Applications":
+    raise SystemExit("ERROR: transition package must install into /Applications")
+if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", package["identifier"]):
+    raise SystemExit("ERROR: transition package identifier must be reverse-DNS")
+for key, value in required.items():
+    print(f"{key}={shlex.quote(value)}")
+PYTHON
+)"
 
-signal.signal(signal.SIGALRM, timeout)
-signal.alarm(15)
-path = Path(sys.argv[1])
-if not path.exists() and not path.is_symlink():
-    print(0)
-    raise SystemExit(0)
-total = path.lstat().st_size
-pending = [path] if path.is_dir() and not path.is_symlink() else []
-while pending:
-    directory = pending.pop()
-    with os.scandir(directory) as entries:
-        for entry in entries:
-            stat = entry.stat(follow_symlinks=False)
-            total += stat.st_size
-            if entry.is_dir(follow_symlinks=False):
-                pending.append(Path(entry.path))
-signal.alarm(0)
-print(total)
+validate_successor_app() {
+    local app="$1" label="$2"
+    [[ -d "$app" && ! -L "$app" ]] || fail "$label app bundle does not exist as a real directory: $app"
+    require_file "$app/Contents/Info.plist"
+    codesign --verify --deep --strict --verbose=2 "$app"
+    codesign --verify --strict --verbose=2 -R="$SUCCESSOR_APP_REQUIREMENT" "$app"
+
+    local signature_details identifier team_identifier bundle_identifier feed_url public_key
+    signature_details="$(codesign -dv --verbose=4 "$app" 2>&1)"
+    identifier="$(printf '%s\n' "$signature_details" | awk -F= '$1 == "Identifier" { print $2; exit }')"
+    team_identifier="$(printf '%s\n' "$signature_details" | awk -F= '$1 == "TeamIdentifier" { print $2; exit }')"
+    printf '%s\n' "$signature_details" | grep -q '^Authority=Developer ID Application:' ||
+        fail "$label app is not signed with Developer ID Application"
+    [[ "$identifier" == "$SUCCESSOR_BUNDLE_IDENTIFIER" ]] ||
+        fail "$label app identifier mismatch: expected $SUCCESSOR_BUNDLE_IDENTIFIER, got ${identifier:-<missing>}"
+    [[ "$team_identifier" == "$SUCCESSOR_TEAM_IDENTIFIER" ]] ||
+        fail "$label app team mismatch: expected $SUCCESSOR_TEAM_IDENTIFIER, got ${team_identifier:-<missing>}"
+
+    bundle_identifier="$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")"
+    feed_url="$(plutil -extract SUFeedURL raw "$app/Contents/Info.plist")"
+    public_key="$(plutil -extract SUPublicEDKey raw "$app/Contents/Info.plist")"
+    [[ "$bundle_identifier" == "$SUCCESSOR_BUNDLE_IDENTIFIER" ]] ||
+        fail "$label CFBundleIdentifier mismatch"
+    [[ "$feed_url" == "$EXPECTED_FEED_URL" ]] ||
+        fail "$label must retain the Stable feed URL"
+    [[ -n "$public_key" ]] || fail "$label is missing SUPublicEDKey"
+}
+
+write_component_plist() {
+    local output="$1"
+    python3 - "$output" "$DISTRIBUTION_APP_BUNDLE_NAME" <<'PYTHON'
+import plistlib
+import sys
+from pathlib import Path
+
+output, bundle_name = sys.argv[1:]
+value = [{
+    "RootRelativeBundlePath": bundle_name,
+    "BundleIsRelocatable": False,
+    "BundleHasStrictIdentifier": False,
+    "BundleIsVersionChecked": True,
+    "BundleOverwriteAction": "upgrade",
+}]
+Path(output).write_bytes(plistlib.dumps(value, fmt=plistlib.FMT_XML, sort_keys=False))
+PYTHON
+    plutil -lint "$output"
+}
+
+validate_component_plist() {
+    local path="$1"
+    python3 - "$path" "$DISTRIBUTION_APP_BUNDLE_NAME" <<'PYTHON'
+import plistlib
+import sys
+from pathlib import Path
+
+value = plistlib.loads(Path(sys.argv[1]).read_bytes())
+expected = [{
+    "RootRelativeBundlePath": sys.argv[2],
+    "BundleIsRelocatable": False,
+    "BundleHasStrictIdentifier": False,
+    "BundleIsVersionChecked": True,
+    "BundleOverwriteAction": "upgrade",
+}]
+if value != expected:
+    raise SystemExit("ERROR: transition component plist differs from the deterministic contract")
 PYTHON
 }
 
-run_supervised() {
-    # Every builder invocation owns exactly one material command. Replace this
-    # shell directly with the supervisor so cancellation cannot land between a
-    # background fork and publication of the supervisor PID.
-    local phase="$1" timeout_seconds="$2" app_path="$3" payload_path="$4"
-    shift 4
-    local capture="$WORK_DIR/supervisor-${phase//[^A-Za-z0-9._-]/-}.capture"
-    local app_size payload_size
-    # macOS Bash 3.2 aborts on empty-array expansion under set -u. Keep the
-    # trailing supervisor argument vector non-empty by folding the mandatory
-    # command separator into it alongside the phase-specific evidence flag.
-    local supervisor_tail_args=(--)
-    require_absent "$capture"
-    app_size="$(path_size_bytes "$app_path")"
-    payload_size="$(path_size_bytes "$payload_path")"
-    printf 'PHASE START [%s]: phase=%s command=%s app=%s app-size-bytes=%s payload=%s payload-size-bytes=%s\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$phase" "$(basename "$1")" \
-        "$app_path" "$app_size" "$payload_path" "$payload_size"
-    if [[ "$phase" == "transition-package-notarization" ]]; then
-        supervisor_tail_args=(--notarytool-json-evidence --)
-    fi
-    exec python3 "$SUPERVISOR" \
-        --phase "$phase" --timeout-seconds "$timeout_seconds" \
-        --heartbeat-seconds 30 \
-        --capture-file "$capture" --cwd "$WORK_DIR" \
-        --app-path "$app_path" --app-size-bytes "$app_size" \
-        --payload-path "$payload_path" --payload-size-bytes "$payload_size" \
-        --redact-env NOTARYTOOL_PRIVATE_KEY --redact-env NOTARYTOOL_KEY_ID \
-        --redact-env NOTARYTOOL_ISSUER_ID "${supervisor_tail_args[@]}" "$@"
+validate_package_info() {
+    local package_info="$1" expected_version="$2"
+    python3 - "$package_info" "$TRANSITION_PKG_IDENTIFIER" "$TRANSITION_INSTALL_LOCATION" \
+        "$DISTRIBUTION_APP_BUNDLE_NAME" "$SUCCESSOR_BUNDLE_IDENTIFIER" "$expected_version" <<'PYTHON'
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+path, package_id, install_location, bundle_name, bundle_id, expected_version = sys.argv[1:]
+root = ET.parse(Path(path)).getroot()
+if root.tag != "pkg-info":
+    raise SystemExit("ERROR: transition PackageInfo root must be pkg-info")
+if root.get("identifier") != package_id:
+    raise SystemExit("ERROR: transition package identifier mismatch")
+if root.get("install-location") != install_location:
+    raise SystemExit("ERROR: transition package install location mismatch")
+if root.get("version") != expected_version:
+    raise SystemExit("ERROR: transition package version mismatch")
+if root.get("relocatable") != "false":
+    raise SystemExit("ERROR: transition package must be non-relocatable")
+if root.get("postinstall-action") not in {None, "none"}:
+    raise SystemExit("ERROR: transition package must not request a postinstall action")
+if root.findall("scripts") or root.findall("./scripts/*"):
+    raise SystemExit("ERROR: transition package must be script-free")
+
+bundles = root.findall("bundle")
+if len(bundles) != 1:
+    raise SystemExit("ERROR: transition PackageInfo must contain exactly one top-level bundle")
+bundle = bundles[0]
+if bundle.get("id") != bundle_id:
+    raise SystemExit("ERROR: transition payload bundle identifier mismatch")
+path_value = bundle.get("path", "")
+if path_value not in {bundle_name, f"./{bundle_name}"}:
+    raise SystemExit("ERROR: transition payload bundle path mismatch")
+
+# pkgbuild emits an empty <relocate/> even for a non-relocatable component.
+# Empty is safe; any child rule or true-ish attribute is not.
+for relocate in root.findall("relocate"):
+    if list(relocate) or any(value.lower() not in {"", "false", "0"} for value in relocate.attrib.values()):
+        raise SystemExit("ERROR: transition package contains active relocation rules")
+PYTHON
 }
 
-require_app_and_manifest() {
-    require_directory "$APP"
-    require_file "$ARTIFACT_MANIFEST"
+build_transition_pkg() {
+    local app="" output="" installer_identity=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --app) app="$2"; shift 2 ;;
+            --output) output="$2"; shift 2 ;;
+            --installer-identity) installer_identity="$2"; shift 2 ;;
+            *) fail "Unknown build argument: $1" ;;
+        esac
+    done
+    [[ -n "$app" && -n "$output" && -n "$installer_identity" ]] ||
+        fail "Usage: $0 build --app <successor.app> --output <transition.pkg> --installer-identity <identity>"
+    [[ "$installer_identity" == "$SUCCESSOR_INSTALLER_IDENTITY" ]] ||
+        fail "Transition Installer identity must match the reviewed policy"
+    [[ ! -e "$output" && ! -L "$output" ]] || fail "Refusing to overwrite transition package: $output"
+    for command in codesign diff ditto pkgbuild pkgutil plutil productbuild productsign xcrun; do
+        require_command "$command"
+    done
+    validate_successor_app "$app" "Transition payload input"
+    [[ -n "${NOTARYTOOL_PRIVATE_KEY:-}" && -n "${NOTARYTOOL_KEY_ID:-}" && -n "${NOTARYTOOL_ISSUER_ID:-}" ]] ||
+        fail "Transition package notarization credentials are incomplete"
+    require_file "$NOTARYTOOL_PRIVATE_KEY"
+
+    TMP_DIR="$(mktemp -d)"
+    local payload_root="$TMP_DIR/payload-root"
+    local component_plist="$TMP_DIR/component.plist"
+    local component_pkg="$TMP_DIR/transition-component.pkg"
+    local unsigned_product="$TMP_DIR/transition-unsigned.pkg"
+    local signed_product="$TMP_DIR/transition-signed.pkg"
+    mkdir -p "$payload_root"
+    ditto "$app" "$payload_root/$DISTRIBUTION_APP_BUNDLE_NAME"
+    write_component_plist "$component_plist"
+    validate_component_plist "$component_plist"
+
+    local payload_build
+    payload_build="$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")"
+    [[ "$payload_build" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
+        fail "Transition payload has an invalid CFBundleVersion: $payload_build"
+
+    pkgbuild \
+        --root "$payload_root" \
+        --component-plist "$component_plist" \
+        --identifier "$TRANSITION_PKG_IDENTIFIER" \
+        --version "$payload_build" \
+        --install-location "$TRANSITION_INSTALL_LOCATION" \
+        "$component_pkg"
+    productbuild --package "$component_pkg" "$unsigned_product"
+    productsign --sign "$installer_identity" "$unsigned_product" "$signed_product"
+
+    xcrun notarytool submit "$signed_product" \
+        --key "$NOTARYTOOL_PRIVATE_KEY" \
+        --key-id "$NOTARYTOOL_KEY_ID" \
+        --issuer "$NOTARYTOOL_ISSUER_ID" \
+        --wait --timeout "${NOTARYTOOL_TIMEOUT:-30m}"
+    xcrun stapler staple "$signed_product"
+    validate_transition_pkg "$signed_product" --expected-app "$app"
+    [[ -d "$(dirname "$output")" && ! -L "$(dirname "$output")" ]] ||
+        fail "Transition package output parent must be a real directory"
+    mv "$signed_product" "$output"
+    printf 'OK: created identity-transition package: %s\n' "$output"
+}
+
+validate_transition_pkg() {
+    local pkg="$1"; shift
+    local expanded_payload_dir="" expected_app=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --expanded-payload-dir) expanded_payload_dir="$2"; shift 2 ;;
+            --expected-app) expected_app="$2"; shift 2 ;;
+            *) fail "Unknown validate argument: $1" ;;
+        esac
+    done
+    for command in codesign ditto pkgutil plutil xcrun; do require_command "$command"; done
+    require_file "$pkg"
+
+    local signature_details
+    signature_details="$(pkgutil --check-signature "$pkg")"
+    printf '%s\n' "$signature_details" | grep -F "$SUCCESSOR_INSTALLER_IDENTITY" >/dev/null ||
+        fail "Transition package Installer identity mismatch"
+    printf '%s\n' "$signature_details" | grep -F "($SUCCESSOR_TEAM_IDENTIFIER)" >/dev/null ||
+        fail "Transition package Installer Team ID mismatch"
+    xcrun stapler validate "$pkg"
+
+    [[ -n "$TMP_DIR" ]] || TMP_DIR="$(mktemp -d)"
+    local expand_dir="$TMP_DIR/transition-expand"
+    rm -rf "$expand_dir"
+    pkgutil --expand-full "$pkg" "$expand_dir"
+
+    local package_info payload_app payload_build
+    local package_info_list="$TMP_DIR/package-info-list"
+    local payload_app_list="$TMP_DIR/payload-app-list"
+    find "$expand_dir" -name PackageInfo -type f -print > "$package_info_list"
+    [[ "$(awk 'END { print NR + 0 }' "$package_info_list")" == "1" ]] ||
+        fail "Transition package must contain exactly one PackageInfo"
+    IFS= read -r package_info < "$package_info_list"
+    find "$expand_dir" -type d -name "$DISTRIBUTION_APP_BUNDLE_NAME" -print > "$payload_app_list"
+    [[ "$(awk 'END { print NR + 0 }' "$payload_app_list")" == "1" ]] ||
+        fail "Transition package must contain exactly one $DISTRIBUTION_APP_BUNDLE_NAME"
+    IFS= read -r payload_app < "$payload_app_list"
+    validate_successor_app "$payload_app" "Transition payload"
+    payload_build="$(plutil -extract CFBundleVersion raw "$payload_app/Contents/Info.plist")"
+    validate_package_info "$package_info" "$payload_build"
+
+    if [[ -n "$expected_app" ]]; then
+        diff -qr "$expected_app" "$payload_app" >/dev/null ||
+            fail "Transition package payload does not byte-match the signed input app"
+    fi
+    if [[ -n "$expanded_payload_dir" ]]; then
+        [[ ! -e "$expanded_payload_dir/$DISTRIBUTION_APP_BUNDLE_NAME" ]] ||
+            fail "Refusing to overwrite expanded transition payload"
+        mkdir -p "$expanded_payload_dir"
+        ditto "$payload_app" "$expanded_payload_dir/$DISTRIBUTION_APP_BUNDLE_NAME"
+    fi
+    printf 'OK: transition package validated: %s\n' "$pkg"
 }
 
 case "$MODE" in
-    prepare-payload)
-        require_app_and_manifest
-        initialize_work_dir
-        run_supervised "transition-payload-copy" "$PAYLOAD_COPY_TIMEOUT_SECONDS" \
-            "$APP" "$payload_root" ditto "$APP" "$payload_root/$TRANSITION_APP_BUNDLE_NAME"
-        ;;
-    write-component-plist)
-        require_app_and_manifest; verify_work_dir; require_directory "$payload_root"
-        require_absent "$component_plist"
-        run_supervised "transition-component-plist-generation" "$COMPONENT_PLIST_TIMEOUT_SECONDS" \
-            "$APP" "$payload_root" python3 "$CONTRACT" write-component-plist \
-            --boundary transition-component-plist --payload-root "$payload_root" --output "$component_plist"
-        ;;
-    build-component)
-        require_app_and_manifest; verify_work_dir; require_directory "$payload_root"; require_file "$component_plist"
-        python3 "$CONTRACT" verify-component-plist \
-            --boundary transition-component-package-input \
-            --payload-root "$payload_root" --component-plist "$component_plist"
-        require_command pkgbuild; require_absent "$component_pkg"
-        run_supervised "transition-component-package-construction" "$COMPONENT_PACKAGE_TIMEOUT_SECONDS" \
-            "$APP" "$payload_root" pkgbuild --root "$payload_root" \
-            --component-plist "$component_plist" --identifier "$TRANSITION_PACKAGE_IDENTIFIER" \
-            --version "$TRANSITION_PACKAGE_VERSION" --install-location "$TRANSITION_INSTALL_LOCATION" \
-            "$component_pkg"
-        ;;
-    build-product)
-        require_app_and_manifest; verify_work_dir; require_file "$component_pkg"; require_command productbuild
-        require_absent "$unsigned_product_pkg"
-        run_supervised "transition-product-archive-construction" "$PRODUCT_ARCHIVE_TIMEOUT_SECONDS" \
-            "$APP" "$component_pkg" productbuild --package "$component_pkg" "$unsigned_product_pkg"
-        ;;
-    sign-package)
-        require_app_and_manifest; verify_work_dir; require_file "$unsigned_product_pkg"; require_command productsign
-        [[ -n "$OUTPUT" ]] || fail "sign-package requires --output"
-        require_absent "$OUTPUT"; mkdir -p "$(dirname "$OUTPUT")"
-        run_supervised "transition-package-signing" "$PACKAGE_SIGN_TIMEOUT_SECONDS" \
-            "$APP" "$unsigned_product_pkg" productsign --sign "$TRANSITION_INSTALLER_IDENTITY" \
-            "$unsigned_product_pkg" "$OUTPUT"
-        ;;
-    notarize-package)
-        require_app_and_manifest; verify_work_dir
-        [[ -n "$OUTPUT" ]] || fail "notarize-package requires --output"; require_file "$OUTPUT"
-        require_env NOTARYTOOL_PRIVATE_KEY; require_env NOTARYTOOL_KEY_ID; require_env NOTARYTOOL_ISSUER_ID
-        require_file "$NOTARYTOOL_PRIVATE_KEY"; require_command xcrun
-        run_supervised "transition-package-notarization" "$PACKAGE_NOTARIZATION_TIMEOUT_SECONDS" \
-            "$APP" "$OUTPUT" xcrun notarytool submit "$OUTPUT" \
-            --key "$NOTARYTOOL_PRIVATE_KEY" --key-id "$NOTARYTOOL_KEY_ID" \
-            --issuer "$NOTARYTOOL_ISSUER_ID" --wait --timeout 30m --output-format json
-        ;;
-    staple-package)
-        require_app_and_manifest; verify_work_dir
-        [[ -n "$OUTPUT" ]] || fail "staple-package requires --output"; require_file "$OUTPUT"; require_command xcrun
-        run_supervised "transition-package-stapling" "$PACKAGE_STAPLE_TIMEOUT_SECONDS" \
-            "$APP" "$OUTPUT" xcrun stapler staple "$OUTPUT"
-        ;;
-    validate-package)
-        require_app_and_manifest; verify_work_dir
-        [[ -n "$OUTPUT" ]] || fail "validate-package requires --output"; require_file "$OUTPUT"
-        run_supervised "transition-package-signature-validation" "$PACKAGE_VALIDATION_TIMEOUT_SECONDS" \
-            "$APP" "$OUTPUT" python3 "$CONTRACT" validate-package-signature \
-            --boundary transition-package-signature --package "$OUTPUT"
-        ;;
-    expand-package)
-        require_app_and_manifest; verify_work_dir
-        [[ -n "$OUTPUT" ]] || fail "expand-package requires --output"; require_file "$OUTPUT"; require_command pkgutil
-        require_absent "$expanded_pkg"
-        run_supervised "transition-package-expansion" "$PACKAGE_EXPANSION_TIMEOUT_SECONDS" \
-            "$APP" "$OUTPUT" pkgutil --expand-full "$OUTPUT" "$expanded_pkg"
-        ;;
-    compare-payload)
-        require_app_and_manifest; verify_work_dir; require_directory "$expanded_pkg"
-        require_absent "$expanded_app_path_file"
-        run_supervised "transition-package-payload-comparison" "$PAYLOAD_COMPARISON_TIMEOUT_SECONDS" \
-            "$APP" "$expanded_pkg" python3 "$CONTRACT" validate-expanded \
-            --boundary transition-package-payload --expanded-root "$expanded_pkg" \
-            --expected-app "$APP" --artifact-manifest "$ARTIFACT_MANIFEST" \
-            --output-app-path "$expanded_app_path_file"
-        ;;
+    build) build_transition_pkg "$@" ;;
     validate)
-        [[ -n "$PACKAGE" ]] || fail "validate requires --package"; require_file "$PACKAGE"; require_file "$ARTIFACT_MANIFEST"
-        safe_work_dir; require_absent "$WORK_DIR"; mkdir -p "$WORK_DIR"; chmod 700 "$WORK_DIR"
-        cp "$REPOPROMPT_TIP_RELEASE_CONTEXT" "$work_context"
-        cp "$REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE" "$work_digest"
-        command=(python3 "$CONTRACT" validate-package --boundary transition-package-smoke \
-            --package "$PACKAGE" --work-dir "$WORK_DIR" --artifact-manifest "$ARTIFACT_MANIFEST")
-        if [[ -n "$EXPANDED_PAYLOAD_DIR" ]]; then command+=(--expanded-payload-dir "$EXPANDED_PAYLOAD_DIR"); fi
-        run_supervised "transition-package-smoke-validation" "$PACKAGE_NOTARIZATION_TIMEOUT_SECONDS" \
-            "$WORK_DIR/expanded-package/$TRANSITION_APP_BUNDLE_NAME" "$PACKAGE" "${command[@]}"
+        [[ $# -ge 1 ]] || fail "Usage: $0 validate <transition.pkg> [--expected-app <app>] [--expanded-payload-dir <dir>]"
+        pkg_path="$1"; shift
+        validate_transition_pkg "$pkg_path" "$@"
         ;;
-    *)
-        fail "Usage: $0 prepare-payload|write-component-plist|build-component|build-product|sign-package|notarize-package|staple-package|validate-package|expand-package|compare-payload|validate ..."
-        ;;
+    *) fail "Usage: $0 build|validate ..." ;;
 esac
