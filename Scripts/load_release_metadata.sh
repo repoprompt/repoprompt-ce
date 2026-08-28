@@ -227,42 +227,28 @@ load_verified_tip_release_context() {
             --emit-shell
     )" || return
 
-    local authority_variables=(
-        REPOPROMPT_TIP_CONTEXT_SHA256
-        REPOPROMPT_TIP_ARCHIVE_CONTRACT
-        TIP_COMMIT
-        TIP_SHORT_SHA
-        TIP_BUILD_SEQUENCE
-        TIP_BUILD_NUMBER
-        TIP_TAG
-        ARCHIVE_BASENAME
-        APP_NAME
-        DISPLAY_NAME
-        MARKETING_VERSION
-        ROLLOUT_CHANNEL
-        ROLLOUT_ROLE
-        ROLLOUT_IDENTITY
-        REPOPROMPT_IDENTITY_MIGRATION_PHASE
-        ROLLOUT_INSTALLATION_TYPE
-        BUNDLE_ID
-        SIGNING_TEAM_ID
-        EXPECTED_APP_REQUIREMENT
-        EXPECTED_SIGN_IDENTITY
-        EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER
-        EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID
-        EXPECTED_MIGRATION_ANCHOR_TEAM_ID
-        EXPECTED_MIGRATION_ANCHOR_REQUIREMENT
-        EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY
-        EXPECTED_INSTALLER_TEAM_ID
-        EXPECTED_INSTALLER_IDENTITY
-        SPARKLE_PUBLIC_EDDSA_VALUE
-        ROLLOUT_UPDATE_REPOSITORY
-        ROLLOUT_FEED_URL
-        TIP_PUBLICATION_TARGET
-        TIP_PUBLICATION_DRAFT
-        TIP_PUBLICATION_PRERELEASE
-        TIP_PUBLICATION_ASSETS_JSON
-    )
+    # The verifier's emitted assignments are the single authority for which
+    # variables it exports; derive their names here instead of duplicating
+    # the Python SHELL_EXPORT_KEYS allowlist in shell.
+    if [[ -z "$assignments" ]]; then
+        printf 'ERROR: Verified Tip context emitted no shell assignments\n' >&2
+        return 1
+    fi
+    local authority_variables=()
+    local line name
+    while IFS= read -r line; do
+        if [[ "$line" != *=* ]]; then
+            printf 'ERROR: Malformed verified Tip context assignment: %s\n' "$line" >&2
+            return 1
+        fi
+        name="${line%%=*}"
+        if [[ ! "$name" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+            printf 'ERROR: Malformed verified Tip context variable name: %s\n' "$name" >&2
+            return 1
+        fi
+        authority_variables[${#authority_variables[@]}]="$name"
+    done <<< "$assignments"
+
     local ambient_values=()
     local ambient_present=()
     local index variable

@@ -1,0 +1,80 @@
+name: Verify immutable Tip release context
+description: >-
+  Download the digest-bound immutable Tip release context artifact, verify it
+  against the setup expectations with the trusted tooling checkout, and export
+  the verified Tip authority environment for the calling job.
+inputs:
+  boundary:
+    description: Exact verification boundary label for the calling job.
+    required: true
+  approved-source-root:
+    description: Workspace-relative approved Tip source checkout path.
+    required: true
+  expected-context-sha256:
+    description: Setup-resolved immutable context SHA-256.
+    required: true
+  expected-approved-source-commit:
+    description: Setup-resolved approved source commit.
+    required: true
+  expected-tooling-commit:
+    description: Setup-resolved trusted tooling commit.
+    required: true
+  expected-role:
+    description: Setup-resolved rollout role.
+    required: true
+  expected-installation-type:
+    description: Setup-resolved installation type.
+    required: true
+  expected-tag:
+    description: Setup-resolved release tag.
+    required: true
+  expected-build-number:
+    description: Setup-resolved release build number.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Download immutable Tip release context
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: RepoPrompt-CE-tip-release-context
+        path: tip-release-context
+
+    - name: Verify immutable Tip release context
+      shell: bash
+      env:
+        EXPECTED_CONTEXT_SHA256: ${{ inputs.expected-context-sha256 }}
+        EXPECTED_APPROVED_SOURCE_COMMIT: ${{ inputs.expected-approved-source-commit }}
+        EXPECTED_TOOLING_COMMIT: ${{ inputs.expected-tooling-commit }}
+        SETUP_ROLLOUT_ROLE: ${{ inputs.expected-role }}
+        SETUP_INSTALLATION_TYPE: ${{ inputs.expected-installation-type }}
+        SETUP_TAG: ${{ inputs.expected-tag }}
+        SETUP_BUILD_NUMBER: ${{ inputs.expected-build-number }}
+        VERIFICATION_BOUNDARY: ${{ inputs.boundary }}
+        APPROVED_SOURCE_ROOT: ${{ inputs.approved-source-root }}
+      run: |
+        set -euo pipefail
+        python3 trusted-control-plane/Scripts/tip_release_context.py verify \
+          --context tip-release-context/tip-release-context.json \
+          --digest tip-release-context/tip-release-context.json.sha256 \
+          --stable-appcast tip-release-context/stable-appcast-input.xml \
+          --expected-context-sha256 "$EXPECTED_CONTEXT_SHA256" \
+          --expected-approved-source-commit "$EXPECTED_APPROVED_SOURCE_COMMIT" \
+          --expected-tooling-commit "$EXPECTED_TOOLING_COMMIT" \
+          --expected-role "$SETUP_ROLLOUT_ROLE" \
+          --expected-installation-type "$SETUP_INSTALLATION_TYPE" \
+          --expected-tag "$SETUP_TAG" \
+          --expected-build-number "$SETUP_BUILD_NUMBER" \
+          --boundary "$VERIFICATION_BOUNDARY" \
+          --approved-source-root "$APPROVED_SOURCE_ROOT" \
+          --trusted-tooling-root trusted-control-plane \
+          --github-env "$GITHUB_ENV"
+        {
+          echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"
+          echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"
+          echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"
+          echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/$APPROVED_SOURCE_ROOT"
+          echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"
+          echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"
+          echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"
+        } >> "$GITHUB_ENV"

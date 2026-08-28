@@ -996,6 +996,46 @@ def verify_context(args: argparse.Namespace) -> tuple[dict[str, Any], str, float
     return context, actual_digest, elapsed_ms
 
 
+REQUIRED_ENVIRONMENT_NAMES = (
+    "REPOPROMPT_TIP_RELEASE_CONTEXT",
+    "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE",
+    "REPOPROMPT_TIP_STABLE_APPCAST",
+    "REPOPROMPT_EXPECTED_CONTEXT_SHA256",
+    "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT",
+    "REPOPROMPT_EXPECTED_TOOLING_COMMIT",
+    "REPOPROMPT_APPROVED_SOURCE_ROOT",
+)
+
+
+def verify_context_from_environment(
+    boundary: str, trusted_tooling_root: str
+) -> tuple[dict[str, Any], str, float]:
+    """Verify the context selected by the REPOPROMPT_* environment authority."""
+    missing = [name for name in REQUIRED_ENVIRONMENT_NAMES if not os.environ.get(name)]
+    if missing:
+        raise TipReleaseContextError(
+            "missing required Tip context environment: " + ", ".join(missing)
+        )
+    args = argparse.Namespace(
+        context=os.environ["REPOPROMPT_TIP_RELEASE_CONTEXT"],
+        digest=os.environ["REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE"],
+        stable_appcast=os.environ["REPOPROMPT_TIP_STABLE_APPCAST"],
+        expected_context_sha256=os.environ["REPOPROMPT_EXPECTED_CONTEXT_SHA256"],
+        expected_approved_source_commit=os.environ[
+            "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT"
+        ],
+        expected_tooling_commit=os.environ["REPOPROMPT_EXPECTED_TOOLING_COMMIT"],
+        boundary=boundary,
+        approved_source_root=os.environ["REPOPROMPT_APPROVED_SOURCE_ROOT"],
+        trusted_tooling_root=trusted_tooling_root,
+        expected_role=None,
+        expected_installation_type=None,
+        expected_tag=None,
+        expected_build_number=None,
+    )
+    return verify_context(args)
+
+
 def verification_line(context: dict[str, Any], digest: str, boundary: str, elapsed_ms: float) -> str:
     provenance = context["provenance"]
     rollout = context["rollout"]

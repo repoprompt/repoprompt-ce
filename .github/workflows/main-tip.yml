@@ -248,47 +248,18 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Download immutable Tip release context
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: RepoPrompt-CE-tip-release-context
-          path: tip-release-context
-
       - name: Verify immutable Tip release context
-        env:
-          EXPECTED_CONTEXT_SHA256: ${{ needs.setup.outputs.context-sha256 }}
-          EXPECTED_APPROVED_SOURCE_COMMIT: ${{ needs.setup.outputs.commit }}
-          EXPECTED_TOOLING_COMMIT: ${{ needs.setup.outputs.tooling-commit }}
-          SETUP_ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
-          SETUP_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
-          SETUP_TAG: ${{ needs.setup.outputs.tag }}
-          SETUP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
-        run: |
-          set -euo pipefail
-          python3 trusted-control-plane/Scripts/tip_release_context.py verify \
-            --context tip-release-context/tip-release-context.json \
-            --digest tip-release-context/tip-release-context.json.sha256 \
-            --stable-appcast tip-release-context/stable-appcast-input.xml \
-            --expected-context-sha256 "$EXPECTED_CONTEXT_SHA256" \
-            --expected-approved-source-commit "$EXPECTED_APPROVED_SOURCE_COMMIT" \
-            --expected-tooling-commit "$EXPECTED_TOOLING_COMMIT" \
-            --expected-role "$SETUP_ROLLOUT_ROLE" \
-            --expected-installation-type "$SETUP_INSTALLATION_TYPE" \
-            --expected-tag "$SETUP_TAG" \
-            --expected-build-number "$SETUP_BUILD_NUMBER" \
-            --boundary automatic-dormant \
-            --approved-source-root approved-source \
-            --trusted-tooling-root trusted-control-plane \
-            --github-env "$GITHUB_ENV"
-          {
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"
-            echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"
-            echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/approved-source"
-            echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"
-            echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"
-            echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"
-          } >> "$GITHUB_ENV"
+        uses: ./trusted-control-plane/.github/actions/verify-tip-context
+        with:
+          boundary: automatic-dormant
+          approved-source-root: approved-source
+          expected-context-sha256: ${{ needs.setup.outputs.context-sha256 }}
+          expected-approved-source-commit: ${{ needs.setup.outputs.commit }}
+          expected-tooling-commit: ${{ needs.setup.outputs.tooling-commit }}
+          expected-role: ${{ needs.setup.outputs.rollout-role }}
+          expected-installation-type: ${{ needs.setup.outputs.installation-type }}
+          expected-tag: ${{ needs.setup.outputs.tag }}
+          expected-build-number: ${{ needs.setup.outputs.build-number }}
 
       - name: Report suppressed automatic publication
         run: |
@@ -335,47 +306,18 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Download immutable Tip release context
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: RepoPrompt-CE-tip-release-context
-          path: tip-release-context
-
       - name: Verify immutable Tip release context
-        env:
-          EXPECTED_CONTEXT_SHA256: ${{ needs.setup.outputs.context-sha256 }}
-          EXPECTED_APPROVED_SOURCE_COMMIT: ${{ needs.setup.outputs.commit }}
-          EXPECTED_TOOLING_COMMIT: ${{ needs.setup.outputs.tooling-commit }}
-          SETUP_ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
-          SETUP_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
-          SETUP_TAG: ${{ needs.setup.outputs.tag }}
-          SETUP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
-        run: |
-          set -euo pipefail
-          python3 trusted-control-plane/Scripts/tip_release_context.py verify \
-            --context tip-release-context/tip-release-context.json \
-            --digest tip-release-context/tip-release-context.json.sha256 \
-            --stable-appcast tip-release-context/stable-appcast-input.xml \
-            --expected-context-sha256 "$EXPECTED_CONTEXT_SHA256" \
-            --expected-approved-source-commit "$EXPECTED_APPROVED_SOURCE_COMMIT" \
-            --expected-tooling-commit "$EXPECTED_TOOLING_COMMIT" \
-            --expected-role "$SETUP_ROLLOUT_ROLE" \
-            --expected-installation-type "$SETUP_INSTALLATION_TYPE" \
-            --expected-tag "$SETUP_TAG" \
-            --expected-build-number "$SETUP_BUILD_NUMBER" \
-            --boundary credential-preflight \
-            --approved-source-root approved-source \
-            --trusted-tooling-root trusted-control-plane \
-            --github-env "$GITHUB_ENV"
-          {
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"
-            echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"
-            echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/approved-source"
-            echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"
-            echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"
-            echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"
-          } >> "$GITHUB_ENV"
+        uses: ./trusted-control-plane/.github/actions/verify-tip-context
+        with:
+          boundary: credential-preflight
+          approved-source-root: approved-source
+          expected-context-sha256: ${{ needs.setup.outputs.context-sha256 }}
+          expected-approved-source-commit: ${{ needs.setup.outputs.commit }}
+          expected-tooling-commit: ${{ needs.setup.outputs.tooling-commit }}
+          expected-role: ${{ needs.setup.outputs.rollout-role }}
+          expected-installation-type: ${{ needs.setup.outputs.installation-type }}
+          expected-tag: ${{ needs.setup.outputs.tag }}
+          expected-build-number: ${{ needs.setup.outputs.build-number }}
 
       - name: Validate role-selected Tip credentials
         env:
@@ -532,47 +474,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download immutable Tip release context
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: RepoPrompt-CE-tip-release-context
-          path: tip-release-context
-
       - name: Verify immutable Tip release context
-        env:
-          EXPECTED_CONTEXT_SHA256: ${{ needs.setup.outputs.context-sha256 }}
-          EXPECTED_APPROVED_SOURCE_COMMIT: ${{ needs.setup.outputs.commit }}
-          EXPECTED_TOOLING_COMMIT: ${{ needs.setup.outputs.tooling-commit }}
-          SETUP_ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
-          SETUP_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
-          SETUP_TAG: ${{ needs.setup.outputs.tag }}
-          SETUP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
-        run: |
-          set -euo pipefail
-          python3 trusted-control-plane/Scripts/tip_release_context.py verify \
-            --context tip-release-context/tip-release-context.json \
-            --digest tip-release-context/tip-release-context.json.sha256 \
-            --stable-appcast tip-release-context/stable-appcast-input.xml \
-            --expected-context-sha256 "$EXPECTED_CONTEXT_SHA256" \
-            --expected-approved-source-commit "$EXPECTED_APPROVED_SOURCE_COMMIT" \
-            --expected-tooling-commit "$EXPECTED_TOOLING_COMMIT" \
-            --expected-role "$SETUP_ROLLOUT_ROLE" \
-            --expected-installation-type "$SETUP_INSTALLATION_TYPE" \
-            --expected-tag "$SETUP_TAG" \
-            --expected-build-number "$SETUP_BUILD_NUMBER" \
-            --boundary stage \
-            --approved-source-root tip-source \
-            --trusted-tooling-root trusted-control-plane \
-            --github-env "$GITHUB_ENV"
-          {
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"
-            echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"
-            echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/tip-source"
-            echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"
-            echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"
-            echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"
-          } >> "$GITHUB_ENV"
+        uses: ./trusted-control-plane/.github/actions/verify-tip-context
+        with:
+          boundary: stage
+          approved-source-root: tip-source
+          expected-context-sha256: ${{ needs.setup.outputs.context-sha256 }}
+          expected-approved-source-commit: ${{ needs.setup.outputs.commit }}
+          expected-tooling-commit: ${{ needs.setup.outputs.tooling-commit }}
+          expected-role: ${{ needs.setup.outputs.rollout-role }}
+          expected-installation-type: ${{ needs.setup.outputs.installation-type }}
+          expected-tag: ${{ needs.setup.outputs.tag }}
+          expected-build-number: ${{ needs.setup.outputs.build-number }}
 
       - name: Stage tip artifact
         env:
@@ -636,47 +549,18 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Download immutable Tip release context
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: RepoPrompt-CE-tip-release-context
-          path: tip-release-context
-
       - name: Verify immutable Tip release context
-        env:
-          EXPECTED_CONTEXT_SHA256: ${{ needs.setup.outputs.context-sha256 }}
-          EXPECTED_APPROVED_SOURCE_COMMIT: ${{ needs.setup.outputs.commit }}
-          EXPECTED_TOOLING_COMMIT: ${{ needs.setup.outputs.tooling-commit }}
-          SETUP_ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
-          SETUP_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
-          SETUP_TAG: ${{ needs.setup.outputs.tag }}
-          SETUP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
-        run: |
-          set -euo pipefail
-          python3 trusted-control-plane/Scripts/tip_release_context.py verify \
-            --context tip-release-context/tip-release-context.json \
-            --digest tip-release-context/tip-release-context.json.sha256 \
-            --stable-appcast tip-release-context/stable-appcast-input.xml \
-            --expected-context-sha256 "$EXPECTED_CONTEXT_SHA256" \
-            --expected-approved-source-commit "$EXPECTED_APPROVED_SOURCE_COMMIT" \
-            --expected-tooling-commit "$EXPECTED_TOOLING_COMMIT" \
-            --expected-role "$SETUP_ROLLOUT_ROLE" \
-            --expected-installation-type "$SETUP_INSTALLATION_TYPE" \
-            --expected-tag "$SETUP_TAG" \
-            --expected-build-number "$SETUP_BUILD_NUMBER" \
-            --boundary sign \
-            --approved-source-root approved-source \
-            --trusted-tooling-root trusted-control-plane \
-            --github-env "$GITHUB_ENV"
-          {
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"
-            echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"
-            echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/approved-source"
-            echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"
-            echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"
-            echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"
-          } >> "$GITHUB_ENV"
+        uses: ./trusted-control-plane/.github/actions/verify-tip-context
+        with:
+          boundary: sign
+          approved-source-root: approved-source
+          expected-context-sha256: ${{ needs.setup.outputs.context-sha256 }}
+          expected-approved-source-commit: ${{ needs.setup.outputs.commit }}
+          expected-tooling-commit: ${{ needs.setup.outputs.tooling-commit }}
+          expected-role: ${{ needs.setup.outputs.rollout-role }}
+          expected-installation-type: ${{ needs.setup.outputs.installation-type }}
+          expected-tag: ${{ needs.setup.outputs.tag }}
+          expected-build-number: ${{ needs.setup.outputs.build-number }}
 
       - name: Download staged tip source
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -992,47 +876,18 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Download immutable Tip release context
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: RepoPrompt-CE-tip-release-context
-          path: tip-release-context
-
       - name: Verify immutable Tip release context
-        env:
-          EXPECTED_CONTEXT_SHA256: ${{ needs.setup.outputs.context-sha256 }}
-          EXPECTED_APPROVED_SOURCE_COMMIT: ${{ needs.setup.outputs.commit }}
-          EXPECTED_TOOLING_COMMIT: ${{ needs.setup.outputs.tooling-commit }}
-          SETUP_ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
-          SETUP_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
-          SETUP_TAG: ${{ needs.setup.outputs.tag }}
-          SETUP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
-        run: |
-          set -euo pipefail
-          python3 trusted-control-plane/Scripts/tip_release_context.py verify \
-            --context tip-release-context/tip-release-context.json \
-            --digest tip-release-context/tip-release-context.json.sha256 \
-            --stable-appcast tip-release-context/stable-appcast-input.xml \
-            --expected-context-sha256 "$EXPECTED_CONTEXT_SHA256" \
-            --expected-approved-source-commit "$EXPECTED_APPROVED_SOURCE_COMMIT" \
-            --expected-tooling-commit "$EXPECTED_TOOLING_COMMIT" \
-            --expected-role "$SETUP_ROLLOUT_ROLE" \
-            --expected-installation-type "$SETUP_INSTALLATION_TYPE" \
-            --expected-tag "$SETUP_TAG" \
-            --expected-build-number "$SETUP_BUILD_NUMBER" \
-            --boundary smoke \
-            --approved-source-root approved-source \
-            --trusted-tooling-root trusted-control-plane \
-            --github-env "$GITHUB_ENV"
-          {
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"
-            echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"
-            echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/approved-source"
-            echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"
-            echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"
-            echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"
-          } >> "$GITHUB_ENV"
+        uses: ./trusted-control-plane/.github/actions/verify-tip-context
+        with:
+          boundary: smoke
+          approved-source-root: approved-source
+          expected-context-sha256: ${{ needs.setup.outputs.context-sha256 }}
+          expected-approved-source-commit: ${{ needs.setup.outputs.commit }}
+          expected-tooling-commit: ${{ needs.setup.outputs.tooling-commit }}
+          expected-role: ${{ needs.setup.outputs.rollout-role }}
+          expected-installation-type: ${{ needs.setup.outputs.installation-type }}
+          expected-tag: ${{ needs.setup.outputs.tag }}
+          expected-build-number: ${{ needs.setup.outputs.build-number }}
 
       - name: Download signed tip assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -1143,47 +998,18 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Download immutable Tip release context
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: RepoPrompt-CE-tip-release-context
-          path: tip-release-context
-
       - name: Verify immutable Tip release context
-        env:
-          EXPECTED_CONTEXT_SHA256: ${{ needs.setup.outputs.context-sha256 }}
-          EXPECTED_APPROVED_SOURCE_COMMIT: ${{ needs.setup.outputs.commit }}
-          EXPECTED_TOOLING_COMMIT: ${{ needs.setup.outputs.tooling-commit }}
-          SETUP_ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
-          SETUP_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
-          SETUP_TAG: ${{ needs.setup.outputs.tag }}
-          SETUP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
-        run: |
-          set -euo pipefail
-          python3 trusted-control-plane/Scripts/tip_release_context.py verify \
-            --context tip-release-context/tip-release-context.json \
-            --digest tip-release-context/tip-release-context.json.sha256 \
-            --stable-appcast tip-release-context/stable-appcast-input.xml \
-            --expected-context-sha256 "$EXPECTED_CONTEXT_SHA256" \
-            --expected-approved-source-commit "$EXPECTED_APPROVED_SOURCE_COMMIT" \
-            --expected-tooling-commit "$EXPECTED_TOOLING_COMMIT" \
-            --expected-role "$SETUP_ROLLOUT_ROLE" \
-            --expected-installation-type "$SETUP_INSTALLATION_TYPE" \
-            --expected-tag "$SETUP_TAG" \
-            --expected-build-number "$SETUP_BUILD_NUMBER" \
-            --boundary publish \
-            --approved-source-root approved-source \
-            --trusted-tooling-root trusted-control-plane \
-            --github-env "$GITHUB_ENV"
-          {
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"
-            echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"
-            echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"
-            echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/approved-source"
-            echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"
-            echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"
-            echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"
-          } >> "$GITHUB_ENV"
+        uses: ./trusted-control-plane/.github/actions/verify-tip-context
+        with:
+          boundary: publish
+          approved-source-root: approved-source
+          expected-context-sha256: ${{ needs.setup.outputs.context-sha256 }}
+          expected-approved-source-commit: ${{ needs.setup.outputs.commit }}
+          expected-tooling-commit: ${{ needs.setup.outputs.tooling-commit }}
+          expected-role: ${{ needs.setup.outputs.rollout-role }}
+          expected-installation-type: ${{ needs.setup.outputs.installation-type }}
+          expected-tag: ${{ needs.setup.outputs.tag }}
+          expected-build-number: ${{ needs.setup.outputs.build-number }}
 
       - name: Download signed tip assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093

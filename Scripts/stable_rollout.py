@@ -30,7 +30,6 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -662,67 +661,23 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
 
 
 def load_verified_tip_context(boundary: str) -> dict:
-    required_names = (
-        "REPOPROMPT_TIP_RELEASE_CONTEXT",
-        "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE",
-        "REPOPROMPT_TIP_STABLE_APPCAST",
-        "REPOPROMPT_EXPECTED_CONTEXT_SHA256",
-        "REPOPROMPT_APPROVED_SOURCE_ROOT",
-        "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT",
-        "REPOPROMPT_EXPECTED_TOOLING_COMMIT",
-    )
-    missing = [name for name in required_names if not os.environ.get(name)]
-    if missing:
-        raise RolloutError(
-            "missing verified Tip context environment: " + ", ".join(missing)
-        )
-    context_path = Path(os.environ["REPOPROMPT_TIP_RELEASE_CONTEXT"])
-    digest_path = Path(os.environ["REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE"])
-    approved_root = Path(os.environ["REPOPROMPT_APPROVED_SOURCE_ROOT"])
-    trusted_root = Path(__file__).resolve().parent.parent
-    verifier = trusted_root / "Scripts" / "tip_release_context.py"
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(verifier),
-            "verify",
-            "--context",
-            str(context_path),
-            "--digest",
-            str(digest_path),
-            "--stable-appcast",
-            os.environ["REPOPROMPT_TIP_STABLE_APPCAST"],
-            "--expected-context-sha256",
-            os.environ["REPOPROMPT_EXPECTED_CONTEXT_SHA256"],
-            "--expected-approved-source-commit",
-            os.environ["REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT"],
-            "--expected-tooling-commit",
-            os.environ["REPOPROMPT_EXPECTED_TOOLING_COMMIT"],
-            "--boundary",
-            boundary,
-            "--approved-source-root",
-            str(approved_root),
-            "--trusted-tooling-root",
-            str(trusted_root),
-        ],
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or "Tip context verifier failed"
-        raise RolloutError(detail.removeprefix("ERROR: "))
-    if result.stdout.strip():
-        print(result.stdout.strip(), file=sys.stderr)
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import tip_release_context as context_tool
+
     try:
-        raw = context_path.read_bytes()
-        expected_digest = os.environ["REPOPROMPT_EXPECTED_CONTEXT_SHA256"]
-        if hashlib.sha256(raw).hexdigest() != expected_digest:
-            raise RolloutError("Tip context changed after verification")
-        context = json.loads(raw)
-    except (OSError, json.JSONDecodeError) as error:
-        raise RolloutError(f"unable to read verified Tip context: {error}") from error
-    if not isinstance(context, dict):
-        raise RolloutError("verified Tip context must be a JSON object")
+        context, digest, elapsed_ms = context_tool.verify_context_from_environment(
+            boundary, str(script_dir.parent)
+        )
+    except context_tool.TipReleaseContextError as error:
+        raise RolloutError(str(error)) from error
+    # Consume the verifier's in-memory verified snapshot directly so later
+    # filesystem changes cannot swap in an unverified context.
+    print(
+        context_tool.verification_line(context, digest, boundary, elapsed_ms),
+        file=sys.stderr,
+    )
     return context
 
 

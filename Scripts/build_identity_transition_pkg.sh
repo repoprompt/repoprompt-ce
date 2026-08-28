@@ -154,7 +154,10 @@ run_supervised() {
     shift 4
     local capture="$WORK_DIR/supervisor-${phase//[^A-Za-z0-9._-]/-}.capture"
     local app_size payload_size
-    local evidence_args=()
+    # macOS Bash 3.2 aborts on empty-array expansion under set -u. Keep the
+    # trailing supervisor argument vector non-empty by folding the mandatory
+    # command separator into it alongside the phase-specific evidence flag.
+    local supervisor_tail_args=(--)
     require_absent "$capture"
     app_size="$(path_size_bytes "$app_path")"
     payload_size="$(path_size_bytes "$payload_path")"
@@ -162,7 +165,7 @@ run_supervised() {
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$phase" "$(basename "$1")" \
         "$app_path" "$app_size" "$payload_path" "$payload_size"
     if [[ "$phase" == "transition-package-notarization" ]]; then
-        evidence_args+=(--notarytool-json-evidence)
+        supervisor_tail_args=(--notarytool-json-evidence --)
     fi
     exec python3 "$SUPERVISOR" \
         --phase "$phase" --timeout-seconds "$timeout_seconds" \
@@ -171,7 +174,7 @@ run_supervised() {
         --app-path "$app_path" --app-size-bytes "$app_size" \
         --payload-path "$payload_path" --payload-size-bytes "$payload_size" \
         --redact-env NOTARYTOOL_PRIVATE_KEY --redact-env NOTARYTOOL_KEY_ID \
-        --redact-env NOTARYTOOL_ISSUER_ID "${evidence_args[@]}" -- "$@"
+        --redact-env NOTARYTOOL_ISSUER_ID "${supervisor_tail_args[@]}" "$@"
 }
 
 require_app_and_manifest() {

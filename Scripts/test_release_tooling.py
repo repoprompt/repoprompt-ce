@@ -2666,7 +2666,10 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn('cp "$REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE"', tip_release)
         self.assertIn("load_verified_tip_release_context", tip_release)
         self.assertIn("tip_release_context.py verify", tip_workflow)
-        self.assertIn('--github-env "$GITHUB_ENV"', tip_workflow)
+        self.assertIn(
+            "uses: ./trusted-control-plane/.github/actions/verify-tip-context",
+            tip_workflow,
+        )
 
         approved, staged, scripts = self.make_staged_release_fixture(tip_context=True)
         accepted = self.run_staged_validation(
@@ -3364,8 +3367,11 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn("Check out approved tip source as data", tip_workflow)
         self.assertIn("extract_staged_release.py", tip_workflow)
         self.assertIn("REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source", tip_workflow)
-        self.assertIn('echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"', tip_workflow)
-        self.assertIn('echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"', tip_workflow)
+        verify_action = (
+            SCRIPT_DIR.parent / ".github" / "actions" / "verify-tip-context" / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"', verify_action)
+        self.assertIn('echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"', verify_action)
         self.assertIn("path: tip-source/dist/", tip_workflow)
         self.assertEqual(tip_workflow.count("main_tip_release.sh validate-assets"), 2)
         self.assertNotIn("shasum -a 256 tip-source/dist/SHA256SUMS", tip_workflow)
@@ -3824,7 +3830,7 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn("    permissions:\n      contents: read", diagnostic_job)
         for marker in (
             "GITHUB_STEP_SUMMARY",
-            '--expected-role "$SETUP_ROLLOUT_ROLE"',
+            "expected-role: ${{ needs.setup.outputs.rollout-role }}",
             'echo "- Rollout role: $ROLLOUT_ROLE"',
             'echo "- Commit: $TIP_COMMIT"',
             'echo "- Tag: $TIP_TAG"',
@@ -3836,7 +3842,11 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
             "exit 1",
         ):
             self.assertIn(marker, diagnostic_job)
-        self.assertIn("--boundary automatic-dormant", diagnostic_job)
+        self.assertIn("boundary: automatic-dormant", diagnostic_job)
+        self.assertIn(
+            "uses: ./trusted-control-plane/.github/actions/verify-tip-context",
+            diagnostic_job,
+        )
         self.assertLess(
             diagnostic_job.index("Verify immutable Tip release context"),
             diagnostic_job.index("Report suppressed automatic publication"),
@@ -7584,6 +7594,45 @@ class TipReleaseContextTests(unittest.TestCase):
         ):
             self.assertIn(basename, workflow)
 
+        action = (
+            SCRIPT_DIR.parent / ".github" / "actions" / "verify-tip-context" / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("using: composite", action)
+        self.assertIn(
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", action
+        )
+        self.assertIn("name: RepoPrompt-CE-tip-release-context", action)
+        self.assertIn("path: tip-release-context", action)
+        self.assertEqual(action.count("tip_release_context.py verify"), 1)
+        for marker in (
+            "--context tip-release-context/tip-release-context.json",
+            "--digest tip-release-context/tip-release-context.json.sha256",
+            "--stable-appcast tip-release-context/stable-appcast-input.xml",
+            "--expected-context-sha256 \"$EXPECTED_CONTEXT_SHA256\"",
+            "--expected-approved-source-commit",
+            "--expected-tooling-commit",
+            "--expected-role \"$SETUP_ROLLOUT_ROLE\"",
+            "--expected-installation-type \"$SETUP_INSTALLATION_TYPE\"",
+            "--expected-tag \"$SETUP_TAG\"",
+            "--expected-build-number \"$SETUP_BUILD_NUMBER\"",
+            "--boundary \"$VERIFICATION_BOUNDARY\"",
+            "--approved-source-root \"$APPROVED_SOURCE_ROOT\"",
+            "--trusted-tooling-root trusted-control-plane",
+            '--github-env "$GITHUB_ENV"',
+            'echo "REPOPROMPT_TIP_RELEASE_CONTEXT=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json"',
+            'echo "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE=$GITHUB_WORKSPACE/tip-release-context/tip-release-context.json.sha256"',
+            'echo "REPOPROMPT_TIP_STABLE_APPCAST=$GITHUB_WORKSPACE/tip-release-context/stable-appcast-input.xml"',
+            'echo "REPOPROMPT_APPROVED_SOURCE_ROOT=$GITHUB_WORKSPACE/$APPROVED_SOURCE_ROOT"',
+            'echo "REPOPROMPT_EXPECTED_CONTEXT_SHA256=$EXPECTED_CONTEXT_SHA256"',
+            'echo "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT=$EXPECTED_APPROVED_SOURCE_COMMIT"',
+            'echo "REPOPROMPT_EXPECTED_TOOLING_COMMIT=$EXPECTED_TOOLING_COMMIT"',
+        ):
+            self.assertIn(marker, action)
+        self.assertLess(
+            action.index("tip_release_context.py verify"),
+            action.index("REPOPROMPT_TIP_RELEASE_CONTEXT="),
+        )
+
         jobs = {
             "automatic": workflow.split("\n  automatic-tip-dormant:", 1)[1].split(
                 "\n  credential-preflight:", 1
@@ -7608,30 +7657,58 @@ class TipReleaseContextTests(unittest.TestCase):
         }
         for name, job in jobs.items():
             with self.subTest(job=name):
-                self.assertIn("Download immutable Tip release context", job)
                 self.assertIn("Verify immutable Tip release context", job)
-                self.assertIn("--expected-context-sha256 \"$EXPECTED_CONTEXT_SHA256\"", job)
-                self.assertIn("--stable-appcast tip-release-context/stable-appcast-input.xml", job)
-                self.assertIn("--expected-approved-source-commit", job)
-                self.assertIn("--expected-tooling-commit", job)
-                self.assertIn("--expected-role \"$SETUP_ROLLOUT_ROLE\"", job)
-                self.assertIn('--github-env "$GITHUB_ENV"', job)
+                self.assertIn(
+                    "uses: ./trusted-control-plane/.github/actions/verify-tip-context",
+                    job,
+                )
+                self.assertIn(
+                    "expected-context-sha256: ${{ needs.setup.outputs.context-sha256 }}",
+                    job,
+                )
+                self.assertIn(
+                    "expected-approved-source-commit: ${{ needs.setup.outputs.commit }}",
+                    job,
+                )
+                self.assertIn(
+                    "expected-tooling-commit: ${{ needs.setup.outputs.tooling-commit }}",
+                    job,
+                )
+                self.assertIn(
+                    "expected-role: ${{ needs.setup.outputs.rollout-role }}", job
+                )
+                self.assertIn(
+                    "expected-installation-type: ${{ needs.setup.outputs.installation-type }}",
+                    job,
+                )
+                self.assertIn("expected-tag: ${{ needs.setup.outputs.tag }}", job)
+                self.assertIn(
+                    "expected-build-number: ${{ needs.setup.outputs.build-number }}", job
+                )
                 if name == "stage":
                     self.assertIn("Check out tip source", job)
-                    self.assertIn("--approved-source-root tip-source", job)
+                    self.assertIn("approved-source-root: tip-source", job)
                 else:
                     self.assertIn("Check out approved tip source as data", job)
+                    self.assertIn("approved-source-root: approved-source", job)
+                self.assertLess(
+                    job.index("Check out trusted tooling"),
+                    job.index("Verify immutable Tip release context"),
+                )
                 self.assertLess(
                     job.index("Verify immutable Tip release context"),
                     job.index(owned_operation[name]),
                 )
-        self.assertEqual(workflow.count("--boundary credential-preflight"), 1)
-        self.assertEqual(workflow.count("--boundary stage"), 1)
-        self.assertEqual(workflow.count("--boundary sign"), 1)
-        self.assertEqual(workflow.count("--boundary smoke"), 1)
-        self.assertEqual(workflow.count("--boundary publish"), 1)
+        self.assertEqual(workflow.count("boundary: automatic-dormant"), 1)
+        self.assertEqual(workflow.count("boundary: credential-preflight"), 1)
+        self.assertEqual(workflow.count("boundary: stage"), 1)
+        self.assertEqual(workflow.count("boundary: sign"), 1)
+        self.assertEqual(workflow.count("boundary: smoke"), 1)
+        self.assertEqual(workflow.count("boundary: publish"), 1)
         self.assertEqual(
-            workflow.count("REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT="),
+            workflow.count(
+                "uses: ./trusted-control-plane/.github/actions/verify-tip-context"
+            ),
             len(jobs),
         )
 
@@ -8215,7 +8292,9 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
 
         self.assertIn("needs: setup", preflight)
         self.assertIn("environment: tip-release", preflight)
-        self.assertIn("tip_release_context.py verify", preflight)
+        self.assertIn(
+            "uses: ./trusted-control-plane/.github/actions/verify-tip-context", preflight
+        )
         self.assertNotIn("stable_rollout.py packaging-context", workflow)
         self.assertLess(
             preflight.index("Verify immutable Tip release context"),

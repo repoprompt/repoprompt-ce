@@ -33,51 +33,16 @@ EXPECTED_PACKAGE_FLAGS = {
     "hasScripts": False,
     "applicationBundleCount": 1,
 }
-REQUIRED_CONTEXT_ENV = (
-    "REPOPROMPT_TIP_RELEASE_CONTEXT",
-    "REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE",
-    "REPOPROMPT_TIP_STABLE_APPCAST",
-    "REPOPROMPT_EXPECTED_CONTEXT_SHA256",
-    "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT",
-    "REPOPROMPT_EXPECTED_TOOLING_COMMIT",
-    "REPOPROMPT_APPROVED_SOURCE_ROOT",
-)
-
-
 def fail(message: str) -> None:
     raise TransitionPackageContractError(message)
 
 
-def require_environment(name: str) -> str:
-    value = os.environ.get(name, "")
-    if not value:
-        fail(f"missing required Tip context environment variable: {name}")
-    return value
-
-
 def verified_context(boundary: str) -> dict[str, Any]:
-    values = {name: require_environment(name) for name in REQUIRED_CONTEXT_ENV}
-    scripts_root = Path(__file__).resolve().parent
-    trusted_root = scripts_root.parent
-    args = argparse.Namespace(
-        context=values["REPOPROMPT_TIP_RELEASE_CONTEXT"],
-        digest=values["REPOPROMPT_TIP_RELEASE_CONTEXT_SHA256_FILE"],
-        stable_appcast=values["REPOPROMPT_TIP_STABLE_APPCAST"],
-        expected_context_sha256=values["REPOPROMPT_EXPECTED_CONTEXT_SHA256"],
-        expected_approved_source_commit=values[
-            "REPOPROMPT_EXPECTED_APPROVED_SOURCE_COMMIT"
-        ],
-        expected_tooling_commit=values["REPOPROMPT_EXPECTED_TOOLING_COMMIT"],
-        boundary=boundary,
-        approved_source_root=values["REPOPROMPT_APPROVED_SOURCE_ROOT"],
-        trusted_tooling_root=str(trusted_root),
-        expected_role=None,
-        expected_installation_type=None,
-        expected_tag=None,
-        expected_build_number=None,
-    )
+    trusted_root = Path(__file__).resolve().parent.parent
     try:
-        context, digest, elapsed_ms = tip_release_context.verify_context(args)
+        context, digest, elapsed_ms = tip_release_context.verify_context_from_environment(
+            boundary, str(trusted_root)
+        )
     except tip_release_context.TipReleaseContextError as error:
         fail(f"Tip context verification failed: {error}")
     print(
