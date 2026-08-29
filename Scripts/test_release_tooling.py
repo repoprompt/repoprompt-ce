@@ -294,20 +294,15 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn("    branches: [main]", trigger)
         self.assertIn("  workflow_dispatch:", trigger)
         self.assertNotIn("      commit:", dispatch)
-        self.assertIn("confirm_identity_rollout_role:", dispatch)
-        confirmation = dispatch.split("      confirm_identity_rollout_role:", 1)[1]
-        self.assertIn("        required: true", confirmation)
-        self.assertNotIn("        required: false", confirmation)
+        self.assertNotIn("    inputs:", dispatch)
+        self.assertNotIn("confirm_identity_rollout_role", tip_workflow)
         self.assertIn("DISPATCH_COMMIT: ${{ github.sha }}", tip_workflow)
         self.assertIn("DISPATCH_REF: ${{ github.ref }}", tip_workflow)
         self.assertIn("WORKFLOW_RUN_COMMIT: ${{ github.event.workflow_run.head_sha }}", tip_workflow)
         self.assertIn('[[ "$DISPATCH_REF" == "refs/heads/main" ]]', tip_workflow)
         self.assertIn('[[ "$commit" == "$live_main" ]]', tip_workflow)
         self.assertIn('[[ "$tooling_commit" == "$commit" ]]', tip_workflow)
-        self.assertIn(
-            '[[ "$EVENT_NAME" == "workflow_dispatch" && "$CONFIRMED_ROLLOUT_ROLE" != "$ROLLOUT_ROLE" ]]',
-            tip_workflow,
-        )
+        self.assertNotIn("CONFIRMED_ROLLOUT_ROLE", tip_workflow)
         self.assertNotIn("automatic-tip-dormant", tip_workflow)
         self.assertNotIn("should-publish", tip_workflow)
         self.assertNotIn("skip-reason", tip_workflow)
@@ -5573,12 +5568,8 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         self.assertEqual(promote_workflow.count("stable_rollout.py workflow-guard"), 1)
         self.assertIn("tip-rollout.json", tip_workflow)
         self.assertIn("stable_rollout.py packaging-context", tip_workflow)
-        self.assertIn("confirm_identity_rollout_role", tip_workflow)
-        self.assertIn("required: true", tip_workflow)
-        self.assertIn(
-            '[[ "$EVENT_NAME" == "workflow_dispatch" && "$CONFIRMED_ROLLOUT_ROLE" != "$ROLLOUT_ROLE" ]]',
-            tip_workflow,
-        )
+        self.assertNotIn("confirm_identity_rollout_role", tip_workflow)
+        self.assertNotIn("CONFIRMED_ROLLOUT_ROLE", tip_workflow)
         self.assertIn("workflow_run", tip_workflow)
         self.assertNotIn("release-rollout.json", tip_workflow)
 

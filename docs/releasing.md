@@ -255,8 +255,8 @@ updates the stable appcast.
 `Publish Tip` runs automatically after successful CI on protected `main`. Every checked-in rollout
 role follows the complete build, sign, notarize, smoke, and publish path; a role changes the artifact
 and identity policy but never suppresses the release or produces a successful no-publication run.
-Manual dispatch remains a recovery path and requires a non-empty `confirm_identity_rollout_role`
-input that exactly matches the checked-in role.
+Manual dispatch remains a recovery path and takes no operator-supplied release inputs. It derives the
+rollout role and identity policy from the checked-in declaration on protected `main`.
 
 There is deliberately no commit input. For a manual dispatch, GitHub's selected `main` ref and
 `github.sha` are the immutable candidate. Setup fetches protected `origin/main` and requires the

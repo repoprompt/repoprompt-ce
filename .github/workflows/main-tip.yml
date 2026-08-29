@@ -6,11 +6,6 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
-    inputs:
-      confirm_identity_rollout_role:
-        description: Enter the exact checked-in role (legacy/preparer/transition/successor)
-        required: true
-        type: string
 
 concurrency:
   group: main-tip-channel
@@ -54,7 +49,6 @@ jobs:
           WORKFLOW_RUN_COMMIT: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_DEFINITION_COMMIT: ${{ github.workflow_sha }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
-          CONFIRMED_ROLLOUT_ROLE: ${{ inputs.confirm_identity_rollout_role }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
@@ -116,11 +110,6 @@ jobs:
             echo "Configured Tip update repository does not match the reviewed identity policy" >&2
             exit 1
           }
-
-          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$CONFIRMED_ROLLOUT_ROLE" != "$ROLLOUT_ROLE" ]]; then
-            echo "confirm_identity_rollout_role must exactly match checked-in role $ROLLOUT_ROLE" >&2
-            exit 1
-          fi
 
           stable_appcast="$RUNNER_TEMP/stable-appcast.xml"
           stable_feed_url="$(python3 Scripts/stable_rollout.py feed-url \

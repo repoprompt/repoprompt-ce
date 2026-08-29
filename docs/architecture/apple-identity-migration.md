@@ -35,10 +35,9 @@ run for protected `main` automatically continues into the complete `Publish Tip`
 exact passing commit, regardless of the checked-in rollout role. A role changes the artifact and
 identity policy; it never suppresses publication or produces a successful no-publication run.
 
-Manual dispatch is a recovery path. Every dispatch from protected `main` requires a non-empty
-`confirm_identity_rollout_role` input
-exactly equal to the checked-in role, preventing an empty confirmation from starting a release job.
-There is no operator-supplied commit field. GitHub's selected `main` SHA is the candidate, and setup
+Manual dispatch is a recovery path and takes no operator-supplied release inputs. The checked-in
+declaration on protected `main` supplies the rollout role and identity policy. There is no
+operator-supplied commit field. GitHub's selected `main` SHA is the candidate, and setup
 requires that SHA, the workflow definition, the release-tooling checkout, and freshly fetched
 protected `origin/main` to be the same commit.
 
