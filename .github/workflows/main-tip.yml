@@ -614,7 +614,7 @@ jobs:
           REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
           REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token
-          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ needs.setup.outputs.installation-type == 'application' && secrets.SPARKLE_PRIVATE_KEY || '' }}
         run: ./trusted-control-plane/Scripts/main_tip_release.sh sign-application
 
       - name: Build package

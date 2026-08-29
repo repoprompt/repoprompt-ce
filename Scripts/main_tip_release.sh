@@ -332,6 +332,7 @@ derive_sparkle_public_key() {
 }
 
 generate_tip_rollout_appcast() {
+    require_env SPARKLE_PRIVATE_KEY
     local predecessor_dir="$TMP_DIR/predecessors"
     mkdir -p "$predecessor_dir"
     # macOS still ships Bash 3.2, where expanding an empty array under
@@ -461,7 +462,6 @@ sign_tip_application_phase() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"
     require_env SIGN_IDENTITY
     require_env REPOPROMPT_PROVISIONING_PROFILE
-    require_env SPARKLE_PRIVATE_KEY
     require_env RELEASE_COMMIT
     require_env REPOPROMPT_APPROVED_SOURCE_ROOT
     require_tip_sentry_configuration
@@ -558,7 +558,6 @@ validate_tip_package_phase() {
     require_command curl
     require_command shasum
     require_command xcrun
-    require_env SPARKLE_PRIVATE_KEY
     require_file "$SIGN_UPDATE"
     require_file "$FINAL_ARTIFACT_MANIFEST"
     require_file "$FINAL_METADATA"

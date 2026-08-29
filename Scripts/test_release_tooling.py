@@ -3304,6 +3304,25 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         for step in phase_steps[1:]:
             block = sign.split(step, 1)[1].split("\n      - name:", 1)[0]
             self.assertIn("if: needs.setup.outputs.installation-type == 'package'", block)
+        sign_application_step = sign.split("      - name: Sign application", 1)[1].split(
+            "\n      - name: Build package", 1
+        )[0]
+        validate_package_step = sign.split("      - name: Validate package", 1)[1].split(
+            "\n      - name: Remove ephemeral keychain", 1
+        )[0]
+        self.assertIn(
+            "SPARKLE_PRIVATE_KEY: ${{ needs.setup.outputs.installation-type == 'application' && "
+            "secrets.SPARKLE_PRIVATE_KEY || '' }}",
+            sign_application_step,
+        )
+        self.assertIn("SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}", validate_package_step)
+        generate_appcast = tip_script.split("generate_tip_rollout_appcast() {", 1)[1].split("\n}", 1)[0]
+        sign_application_phase = tip_script.split("sign_tip_application_phase() {", 1)[1].split("\n}", 1)[0]
+        validate_package_phase = tip_script.split("validate_tip_package_phase() {", 1)[1].split("\n}", 1)[0]
+        self.assertEqual(tip_script.count("require_env SPARKLE_PRIVATE_KEY"), 1)
+        self.assertIn("require_env SPARKLE_PRIVATE_KEY", generate_appcast)
+        self.assertNotIn("require_env SPARKLE_PRIVATE_KEY", sign_application_phase)
+        self.assertNotIn("require_env SPARKLE_PRIVATE_KEY", validate_package_phase)
         for marker in ("PHASE START:", "PHASE END:", "elapsed_seconds=", "date -u"):
             self.assertIn(marker, tip_script)
         self.assertIn('submit_notarization "$notary_zip"', tip_script)
