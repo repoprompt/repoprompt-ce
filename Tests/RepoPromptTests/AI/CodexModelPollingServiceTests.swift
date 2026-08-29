@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPromptApp
 import XCTest
 
@@ -178,20 +179,20 @@ private actor PollingClientSpy: CodexModelListingClient {
 
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel] {
         listCallCount += 1
-        fulfillSatisfiedSignals(&listCallSignals, count: listCallCount)
+        Self.fulfillSatisfiedSignals(&listCallSignals, count: listCallCount)
         return models
     }
 
     func stop() async {
         stopCallCount += 1
-        fulfillSatisfiedSignals(&stopCallSignals, count: stopCallCount)
+        Self.fulfillSatisfiedSignals(&stopCallSignals, count: stopCallCount)
     }
 
     func fulfill(
         _ signal: PollingExpectationSignal,
         whenListCallCountReaches target: Int
     ) {
-        register(
+        Self.register(
             signal,
             target: target,
             currentCount: listCallCount,
@@ -203,7 +204,7 @@ private actor PollingClientSpy: CodexModelListingClient {
         _ signal: PollingExpectationSignal,
         whenStopCallCountReaches target: Int
     ) {
-        register(
+        Self.register(
             signal,
             target: target,
             currentCount: stopCallCount,
@@ -211,7 +212,7 @@ private actor PollingClientSpy: CodexModelListingClient {
         )
     }
 
-    private func register(
+    private static func register(
         _ signal: PollingExpectationSignal,
         target: Int,
         currentCount: Int,
@@ -224,7 +225,7 @@ private actor PollingClientSpy: CodexModelListingClient {
         }
     }
 
-    private func fulfillSatisfiedSignals(
+    private static func fulfillSatisfiedSignals(
         _ pending: inout [PendingSignal],
         count: Int
     ) {

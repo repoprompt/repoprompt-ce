@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPromptDomainRuntime
 import XCTest
 
