@@ -4,27 +4,40 @@ import XCTest
 
 @MainActor
 final class CodexManagedLogoutCoordinatorTests: XCTestCase {
-    func testMultiWindowLogoutIsIdempotentAndAwaitsEveryParticipant() async throws {
+    func testMultiWindowLogoutIsIdempotentAndAwaitsEveryParticipant() async {
         let fence = CodexManagedSessionFence()
-        let logoutGate = ManagedLogoutTestGate(result: .signedOut)
+        let logoutCalled = expectation(description: "logout operation started")
+        let logoutGate = ManagedLogoutTestGate(
+            result: .signedOut,
+            onCall: ManagedLogoutExpectationSignal(logoutCalled)
+        )
+        let participantsStopped = expectation(description: "all logout participants stopped")
+        participantsStopped.expectedFulfillmentCount = 2
+        let firstWindow = ManagedLogoutParticipant {
+            participantsStopped.fulfill()
+        }
+        let secondWindow = ManagedLogoutParticipant {
+            participantsStopped.fulfill()
+        }
         let coordinator = CodexManagedLogoutCoordinator(
             fence: fence,
             logoutOperation: { await logoutGate.run() }
         )
-        let firstWindow = ManagedLogoutParticipant()
-        let secondWindow = ManagedLogoutParticipant()
 
-        let first = Task {
+        let first = Task { @MainActor in
             await coordinator.stopSessionsAndSignOut(participants: [firstWindow, secondWindow])
         }
-        try await waitUntil { firstWindow.stopCount == 1 && secondWindow.stopCount == 1 }
+        await fulfillment(of: [participantsStopped, logoutCalled], timeout: 2)
         XCTAssertTrue(fence.isFenced)
         XCTAssertTrue(fence.isLogoutInProgress)
 
-        let repeated = Task {
-            await coordinator.stopSessionsAndSignOut(participants: [firstWindow, secondWindow])
+        let repeatedEntered = expectation(description: "repeated logout entered coordinator")
+        let repeated = Task { @MainActor in
+            repeatedEntered.fulfill()
+            return await coordinator.stopSessionsAndSignOut(participants: [firstWindow, secondWindow])
         }
-        await Task.yield()
+        await fulfillment(of: [repeatedEntered], timeout: 2)
+
         XCTAssertEqual(firstWindow.stopCount, 1)
         XCTAssertEqual(secondWindow.stopCount, 1)
         let logoutCallCount = await logoutGate.callCount
@@ -86,17 +99,6 @@ final class CodexManagedLogoutCoordinatorTests: XCTestCase {
         XCTAssertEqual(CodexManagedSignOutConfirmation.cancelTitle, "Cancel")
         XCTAssertEqual(CodexManagedSignOutConfirmation.confirmTitle, "Stop Sessions & Sign Out")
     }
-
-    private func waitUntil(
-        timeout: TimeInterval = 1,
-        condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition(), Date() < deadline {
-            try await Task.sleep(nanoseconds: 1_000_000)
-        }
-        XCTAssertTrue(condition(), "Condition was not satisfied before timeout")
-    }
 }
 
 @MainActor
@@ -111,31 +113,62 @@ private final class ManagedLogoutCounter {
 @MainActor
 private final class ManagedLogoutParticipant: CodexManagedSessionShutdownParticipant {
     private(set) var stopCount = 0
+    private let onStop: @MainActor () -> Void
+
+    init(onStop: @escaping @MainActor () -> Void = {}) {
+        self.onStop = onStop
+    }
 
     func stopCodexSessionsForManagedLogout() async {
         stopCount += 1
+        onStop()
+    }
+}
+
+private final class ManagedLogoutExpectationSignal: @unchecked Sendable {
+    private let expectation: XCTestExpectation
+
+    init(_ expectation: XCTestExpectation) {
+        self.expectation = expectation
+    }
+
+    func fulfill() {
+        expectation.fulfill()
     }
 }
 
 private actor ManagedLogoutTestGate {
     let result: CodexManagedAuthLogoutResult
+    private let onCall: ManagedLogoutExpectationSignal?
     private(set) var callCount = 0
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
 
-    init(result: CodexManagedAuthLogoutResult) {
+    init(
+        result: CodexManagedAuthLogoutResult,
+        onCall: ManagedLogoutExpectationSignal? = nil
+    ) {
         self.result = result
+        self.onCall = onCall
     }
 
     func run() async -> CodexManagedAuthLogoutResult {
         callCount += 1
+        onCall?.fulfill()
+        guard !isOpen else { return result }
         await withCheckedContinuation { continuation in
-            self.continuation = continuation
+            continuations.append(continuation)
         }
         return result
     }
 
     func finish() {
-        continuation?.resume()
-        continuation = nil
+        guard !isOpen else { return }
+        isOpen = true
+        let pending = continuations
+        continuations.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
     }
 }

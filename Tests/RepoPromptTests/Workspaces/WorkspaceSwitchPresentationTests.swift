@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -14,10 +15,16 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
             repoPaths: [],
             ephemeral: true
         )
+        let firstPresented = expectation(description: "first switch confirmation presented")
+        let firstObservation = manager.$pendingSwitchConfirmation
+            .compactMap { $0 }
+            .prefix(1)
+            .sink { _ in firstPresented.fulfill() }
         let firstRequest = Task { @MainActor in
             await manager.requestWorkspaceSwitch(to: firstTarget, reason: "presentationFirst")
         }
-        try await waitUntil { manager.pendingSwitchConfirmation != nil }
+        await fulfillment(of: [firstPresented], timeout: 2)
+        firstObservation.cancel()
         let firstID = try XCTUnwrap(manager.pendingSwitchConfirmation?.id)
         let staleBinding = WorkspaceSwitchConfirmationModifier.confirmationPresentationBinding(
             manager: manager,
@@ -31,10 +38,16 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
             repoPaths: [],
             ephemeral: true
         )
+        let secondPresented = expectation(description: "replacement switch confirmation presented")
+        let secondObservation = manager.$pendingSwitchConfirmation
+            .compactMap { $0 }
+            .prefix(1)
+            .sink { _ in secondPresented.fulfill() }
         let secondRequest = Task { @MainActor in
             await manager.requestWorkspaceSwitch(to: secondTarget, reason: "presentationSecond")
         }
-        try await waitUntil { manager.pendingSwitchConfirmation != nil }
+        await fulfillment(of: [secondPresented], timeout: 2)
+        secondObservation.cancel()
         let secondID = try XCTUnwrap(manager.pendingSwitchConfirmation?.id)
 
         staleBinding.wrappedValue = false
@@ -166,20 +179,6 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
             deferredInitialAgentSystemWorkspaceRefresh: true,
             sharedMCPService: MCPService()
         )
-    }
-
-    private func waitUntil(
-        timeout: TimeInterval = 3,
-        file: StaticString = #filePath,
-        line: UInt = #line,
-        _ condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition", file: file, line: line)
     }
 }
 

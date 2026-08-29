@@ -26,6 +26,9 @@ jobs:
       - name: Run repository guardrails
         run: make guardrails
 
+      - name: Test cross-target CI policy
+        run: python3 Scripts/test_ci_test_policy_targets.py
+
       - name: Enforce pull-request test hygiene
         run: python3 Scripts/check_test_hygiene.py
 

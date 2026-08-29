@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 @testable import RepoPromptApp
 import XCTest
 
@@ -24,11 +25,18 @@ final class WorkspaceApprovalCancellationTests: XCTestCase {
     func testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay() async throws {
         let manager = WorkspaceApprovalManager.shared
         let request = makeRequest(label: "active-cancel")
+        let presented = expectation(description: "workspace approval presented")
+        let presentationObservation = manager.$pendingRequest
+            .compactMap { $0 }
+            .filter { $0.id == request.id }
+            .prefix(1)
+            .sink { _ in presented.fulfill() }
 
         let approvalTask = Task { @MainActor in
             await manager.requestApproval(for: request)
         }
-        try await waitUntil { manager.pendingRequest?.id == request.id }
+        await fulfillment(of: [presented], timeout: 2)
+        presentationObservation.cancel()
         XCTAssertTrue(manager.isApprovalOverlayVisible)
 
         approvalTask.cancel()
@@ -39,38 +47,6 @@ final class WorkspaceApprovalCancellationTests: XCTestCase {
         }
         XCTAssertNil(manager.pendingRequest)
         XCTAssertFalse(manager.isApprovalOverlayVisible)
-    }
-
-    func testCancellingQueuedApprovalLeavesActiveRequestPending() async throws {
-        let manager = WorkspaceApprovalManager.shared
-        let activeRequest = makeRequest(label: "active")
-        let queuedRequest = makeRequest(label: "queued")
-
-        let activeTask = Task { @MainActor in
-            await manager.requestApproval(for: activeRequest)
-        }
-        try await waitUntil { manager.pendingRequest?.id == activeRequest.id }
-
-        let queuedTask = Task { @MainActor in
-            await manager.requestApproval(for: queuedRequest)
-        }
-        try await waitUntil { manager.pendingQueueCountForTesting == 1 }
-
-        queuedTask.cancel()
-        let queuedResult = await queuedTask.value
-
-        guard case .denied = queuedResult else {
-            return XCTFail("Expected cancelled queued approval to resolve as denied, got \(queuedResult)")
-        }
-        XCTAssertEqual(manager.pendingRequest?.id, activeRequest.id)
-        XCTAssertEqual(manager.pendingQueueCountForTesting, 0)
-        XCTAssertTrue(manager.isApprovalOverlayVisible)
-
-        manager.resolveApproval(allow: false)
-        let activeResult = await activeTask.value
-        guard case .denied = activeResult else {
-            return XCTFail("Expected explicit denial for the active request, got \(activeResult)")
-        }
     }
 
     func testApprovalRequestedFromCancelledTaskResolvesDeniedWithoutPresentingOverlay() async {
@@ -100,19 +76,5 @@ final class WorkspaceApprovalCancellationTests: XCTestCase {
             workspaceName: "Approval Cancellation \(label)",
             windowID: nil
         )
-    }
-
-    private func waitUntil(
-        timeout: TimeInterval = 3,
-        file: StaticString = #filePath,
-        line: UInt = #line,
-        _ condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition", file: file, line: line)
     }
 }

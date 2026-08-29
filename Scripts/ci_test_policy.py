@@ -13,7 +13,9 @@ CONTRACT_TIER = "contract"
 INTEGRATION_TIER = "integration"
 ALL_TIER = "all"
 TIERS = (CONTRACT_TIER, INTEGRATION_TIER, ALL_TIER)
-TEST_ROOT = Path("Tests/RepoPromptTests")
+TESTS_ROOT = Path("Tests")
+# Compatibility path used by synthetic policy tests that model the app target.
+TEST_ROOT = TESTS_ROOT / "RepoPromptTests"
 
 
 @dataclass(frozen=True)
@@ -200,13 +202,31 @@ def suite_class_name(suite: str) -> str:
     return suite.rsplit(".", 1)[-1]
 
 
-def test_suites_in_source(source: str, path: Path) -> tuple[str, ...]:
-    del path  # Suite identity comes from declarations, never filename folklore.
+def test_target_name(path: Path, repository_root: Path) -> str | None:
+    try:
+        relative_path = path.relative_to(repository_root / TESTS_ROOT)
+    except ValueError:
+        return None
+    if len(relative_path.parts) < 2:
+        return None
+    target_name = relative_path.parts[0]
+    return target_name if target_name.endswith("Tests") else None
+
+
+def test_suites_in_source(
+    source: str,
+    path: Path,
+    repository_root: Path,
+) -> tuple[str, ...]:
+    target_name = test_target_name(path, repository_root)
+    if target_name is None:
+        return ()
+
     class_names = set(TEST_TYPE_RE.findall(source))
     class_names.update(TEST_EXTENSION_RE.findall(source))
     class_names.discard("XCTestCase")
     return tuple(
-        f"RepoPromptTests.{class_name}"
+        f"{target_name}.{class_name}"
         for class_name in sorted(class_names)
     )
 
@@ -230,15 +250,15 @@ def matching_lines(source: str, pattern: re.Pattern[str]) -> tuple[int, ...]:
 
 
 def scan_source_test_policy(repository_root: Path) -> SourceTestPolicy:
-    test_root = repository_root / TEST_ROOT
-    if not test_root.is_dir():
-        raise FileNotFoundError(f"missing test root: {test_root}")
+    tests_root = repository_root / TESTS_ROOT
+    if not tests_root.is_dir():
+        raise FileNotFoundError(f"missing tests root: {tests_root}")
 
     occurrences: list[SourceWaitOccurrence] = []
     unmapped: list[SourceWaitOccurrence] = []
     occurrences_by_suite: dict[str, list[SourceWaitOccurrence]] = {}
 
-    for path in sorted(test_root.rglob("*.swift")):
+    for path in sorted(tests_root.rglob("*.swift")):
         source = path.read_text(encoding="utf-8")
         file_occurrences: set[tuple[str, int]] = set()
         for symbol, pattern in SOURCE_INTEGRATION_PRIMITIVES:
@@ -249,7 +269,7 @@ def scan_source_test_policy(repository_root: Path) -> SourceTestPolicy:
         if not file_occurrences:
             continue
 
-        suites = test_suites_in_source(source, path)
+        suites = test_suites_in_source(source, path, repository_root)
         for symbol, line in sorted(file_occurrences, key=lambda item: (item[1], item[0])):
             occurrence = SourceWaitOccurrence(
                 path=path,
@@ -259,7 +279,7 @@ def scan_source_test_policy(repository_root: Path) -> SourceTestPolicy:
             )
             occurrences.append(occurrence)
             if not suites:
-                unmapped.append(occurrence)
+                unmapped.append(occcurrence)
             for suite in suites:
                 occurrences_by_suite.setdefault(suite, []).append(occurrence)
 
@@ -325,7 +345,7 @@ def classify_suite(
 
     return TestPolicyDecision(
         CONTRACT_TIER,
-        "deterministic pull-request contract coverage",
+        "deterministic pull-request coverage",
     )
 
 

@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -26,6 +27,13 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
                 repoPaths: [rootURL.path],
                 ephemeral: true
             )
+            let titleUpdated = expectation(description: "workspace title published")
+            let titleObservation = window.$displayedWindowTitle
+                .filter { $0.hasSuffix(workspaceName) }
+                .prefix(1)
+                .sink { _ in titleUpdated.fulfill() }
+            defer { titleObservation.cancel() }
+
             await window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
@@ -34,7 +42,9 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             XCTAssertEqual(activeWorkspace.id, workspace.id)
 
-            try await waitForDisplayedTitle(window, and: nsWindow, endingWith: workspaceName)
+            await fulfillment(of: [titleUpdated], timeout: 2)
+            XCTAssertTrue(window.displayedWindowTitle.hasSuffix(workspaceName))
+            XCTAssertTrue(nsWindow.title.hasSuffix(workspaceName))
         } catch {
             await cleanup(window: window, rootURL: rootURL)
             throw error
@@ -69,14 +79,19 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
                 reason: "windowStateDisplayedTitleRenameTests"
             )
             let activeTabID = try XCTUnwrap(window.promptManager.activeComposeTabID)
+            let expectedTitle = "Renamed Agent Session — \(workspaceName)"
+            let titleUpdated = expectation(description: "renamed Agent session title published")
+            let titleObservation = window.$displayedWindowTitle
+                .filter { $0 == expectedTitle }
+                .prefix(1)
+                .sink { _ in titleUpdated.fulfill() }
+            defer { titleObservation.cancel() }
 
             window.agentModeViewModel.renameSession(tabID: activeTabID, to: "Renamed Agent Session")
 
-            try await waitForDisplayedTitle(
-                window,
-                and: nsWindow,
-                equalTo: "Renamed Agent Session — \(workspaceName)"
-            )
+            await fulfillment(of: [titleUpdated], timeout: 2)
+            XCTAssertEqual(window.displayedWindowTitle, expectedTitle)
+            XCTAssertEqual(nsWindow.title, expectedTitle)
         } catch {
             await cleanup(window: window, rootURL: rootURL)
             throw error
@@ -99,48 +114,5 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
         await window.tearDown()
         WindowStatesManager.shared.unregisterWindowState(window)
         try? FileManager.default.removeItem(at: rootURL)
-    }
-
-    /// The displayed title is published from a deferred task, so poll briefly instead of
-    /// asserting immediately after the workspace switch returns. The title may carry an
-    /// Agent session prefix ("T1 — <workspace>"), so only the workspace suffix is asserted.
-    private func waitForDisplayedTitle(
-        _ window: WindowState,
-        and nsWindow: NSWindow,
-        endingWith expectedSuffix: String,
-        timeout: TimeInterval = 5
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if window.displayedWindowTitle.hasSuffix(expectedSuffix),
-               nsWindow.title.hasSuffix(expectedSuffix)
-            {
-                return
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        XCTFail(
-            "displayedWindowTitle was \"\(window.displayedWindowTitle)\" and NSWindow.title was \"\(nsWindow.title)\", expected suffix \"\(expectedSuffix)\""
-        )
-    }
-
-    private func waitForDisplayedTitle(
-        _ window: WindowState,
-        and nsWindow: NSWindow,
-        equalTo expected: String,
-        timeout: TimeInterval = 5
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if window.displayedWindowTitle == expected,
-               nsWindow.title == expected
-            {
-                return
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        XCTFail(
-            "displayedWindowTitle was \"\(window.displayedWindowTitle)\" and NSWindow.title was \"\(nsWindow.title)\", expected \"\(expected)\""
-        )
     }
 }

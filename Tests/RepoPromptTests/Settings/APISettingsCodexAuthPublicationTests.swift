@@ -4,8 +4,11 @@ import XCTest
 
 @MainActor
 final class APISettingsCodexAuthPublicationTests: XCTestCase {
-    func testSnapshotPublicationIsDiscardedWhenCrossWindowLogoutInvalidatesEpoch() async throws {
-        let snapshotGate = CodexAuthPublicationGate()
+    func testSnapshotPublicationIsDiscardedWhenCrossWindowLogoutInvalidatesEpoch() async {
+        let snapshotBlocked = expectation(description: "managed account snapshot blocked")
+        let snapshotGate = CodexAuthPublicationGate(
+            onWait: AuthPublicationExpectationSignal(snapshotBlocked)
+        )
         let auth = ControlledCodexAuthRecovery(snapshotGate: snapshotGate)
         let fence = CodexManagedSessionFence()
         let viewModel = makeViewModel(auth: auth, fence: fence)
@@ -14,7 +17,7 @@ final class APISettingsCodexAuthPublicationTests: XCTestCase {
         let refresh = Task { @MainActor in
             await viewModel.test_refreshManagedCodexAccountSnapshotIfConnected()
         }
-        try await waitUntil { await auth.snapshotCallCount == 1 }
+        await fulfillment(of: [snapshotBlocked], timeout: 2)
         let logoutToken = fence.beginLogout()
         await snapshotGate.open()
         await refresh.value
@@ -25,7 +28,10 @@ final class APISettingsCodexAuthPublicationTests: XCTestCase {
     }
 
     func testBrowserLoginPublicationIsDiscardedWhenCrossWindowLogoutInvalidatesEpoch() async throws {
-        let loginGate = CodexAuthPublicationGate()
+        let loginBlocked = expectation(description: "browser login blocked")
+        let loginGate = CodexAuthPublicationGate(
+            onWait: AuthPublicationExpectationSignal(loginBlocked)
+        )
         let auth = ControlledCodexAuthRecovery(loginGate: loginGate)
         let fence = CodexManagedSessionFence()
         let viewModel = makeViewModel(auth: auth, fence: fence)
@@ -34,7 +40,7 @@ final class APISettingsCodexAuthPublicationTests: XCTestCase {
         let login = Task { @MainActor in
             try await viewModel.startCodexManagedChatgptLogin { _ in }
         }
-        try await waitUntil { await auth.browserLoginCallCount == 1 }
+        await fulfillment(of: [loginBlocked], timeout: 2)
         let logoutToken = fence.beginLogout()
         await loginGate.open()
         let published = try await login.value
@@ -50,7 +56,10 @@ final class APISettingsCodexAuthPublicationTests: XCTestCase {
     }
 
     func testDeviceCodeLoginPublicationIsDiscardedWhenCrossWindowLogoutInvalidatesEpoch() async throws {
-        let loginGate = CodexAuthPublicationGate()
+        let loginBlocked = expectation(description: "device-code login blocked")
+        let loginGate = CodexAuthPublicationGate(
+            onWait: AuthPublicationExpectationSignal(loginBlocked)
+        )
         let auth = ControlledCodexAuthRecovery(loginGate: loginGate)
         let fence = CodexManagedSessionFence()
         let viewModel = makeViewModel(auth: auth, fence: fence)
@@ -59,7 +68,7 @@ final class APISettingsCodexAuthPublicationTests: XCTestCase {
         let login = Task { @MainActor in
             try await viewModel.startCodexManagedChatgptDeviceCodeLogin { _, _ in }
         }
-        try await waitUntil { await auth.deviceLoginCallCount == 1 }
+        await fulfillment(of: [loginBlocked], timeout: 2)
         let logoutToken = fence.beginLogout()
         await loginGate.open()
         let published = try await login.value
@@ -75,7 +84,10 @@ final class APISettingsCodexAuthPublicationTests: XCTestCase {
     }
 
     func testConnectionRefreshPublicationIsDiscardedWhenCrossWindowLogoutInvalidatesEpoch() async throws {
-        let refreshGate = CodexAuthPublicationGate()
+        let refreshBlocked = expectation(description: "connection refresh blocked")
+        let refreshGate = CodexAuthPublicationGate(
+            onWait: AuthPublicationExpectationSignal(refreshBlocked)
+        )
         let auth = ControlledCodexAuthRecovery(refreshGate: refreshGate)
         let fence = CodexManagedSessionFence()
         let viewModel = makeViewModel(auth: auth, fence: fence)
@@ -84,7 +96,7 @@ final class APISettingsCodexAuthPublicationTests: XCTestCase {
         let test = Task { @MainActor in
             try await viewModel.testCodexConnection()
         }
-        try await waitUntil { await auth.refreshCallCount == 1 }
+        await fulfillment(of: [refreshBlocked], timeout: 2)
         let logoutToken = fence.beginLogout()
         await refreshGate.open()
         let published = try await test.value
@@ -126,28 +138,31 @@ final class APISettingsCodexAuthPublicationTests: XCTestCase {
             }
         )
     }
+}
 
-    private func waitUntil(
-        timeout: Duration = .seconds(2),
-        condition: @escaping @Sendable () async -> Bool
-    ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while await !condition() {
-            guard clock.now < deadline else {
-                XCTFail("Timed out waiting for controlled auth call")
-                return
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
+private final class AuthPublicationExpectationSignal: @unchecked Sendable {
+    private let expectation: XCTestExpectation
+
+    init(_ expectation: XCTestExpectation) {
+        self.expectation = expectation
+    }
+
+    func fulfill() {
+        expectation.fulfill()
     }
 }
 
 private actor CodexAuthPublicationGate {
+    private let onWait: AuthPublicationExpectationSignal?
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
+    init(onWait: AuthPublicationExpectationSignal? = nil) {
+        self.onWait = onWait
+    }
+
     func wait() async {
+        onWait?.fulfill()
         guard !isOpen else { return }
         await withCheckedContinuation { continuation in
             waiters.append(continuation)
@@ -155,6 +170,7 @@ private actor CodexAuthPublicationGate {
     }
 
     func open() {
+        guard !isOpen else { return }
         isOpen = true
         let pending = waiters
         waiters.removeAll()
@@ -174,10 +190,6 @@ private actor ControlledCodexAuthRecovery: CodexManagedAuthRecovering {
     private let snapshotGate: CodexAuthPublicationGate?
     private let loginGate: CodexAuthPublicationGate?
     private let refreshGate: CodexAuthPublicationGate?
-    private(set) var snapshotCallCount = 0
-    private(set) var browserLoginCallCount = 0
-    private(set) var deviceLoginCallCount = 0
-    private(set) var refreshCallCount = 0
 
     init(
         snapshotGate: CodexAuthPublicationGate? = nil,
@@ -190,13 +202,11 @@ private actor ControlledCodexAuthRecovery: CodexManagedAuthRecovering {
     }
 
     func refreshManagedAccount() async -> CodexManagedAuthRefreshResult {
-        refreshCallCount += 1
         await refreshGate?.wait()
         return .recovered(account: account)
     }
 
     func managedAccountSnapshot() async -> CodexManagedAccount? {
-        snapshotCallCount += 1
         await snapshotGate?.wait()
         return account
     }
@@ -204,7 +214,6 @@ private actor ControlledCodexAuthRecovery: CodexManagedAuthRecovering {
     func startManagedChatgptLogin(
         openURL _: @MainActor @escaping @Sendable (URL) -> Void
     ) async -> CodexManagedChatgptLoginResult {
-        browserLoginCallCount += 1
         await loginGate?.wait()
         return .authenticated(account: account)
     }
@@ -212,7 +221,6 @@ private actor ControlledCodexAuthRecovery: CodexManagedAuthRecovering {
     func startManagedChatgptDeviceCodeLogin(
         presentDeviceCode _: @MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void
     ) async -> CodexManagedChatgptLoginResult {
-        deviceLoginCallCount += 1
         await loginGate?.wait()
         return .authenticated(account: account)
     }

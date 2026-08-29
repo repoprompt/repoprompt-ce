@@ -52,16 +52,14 @@ final class MCPDomainConnectionCallAdmissionTests: XCTestCase {
         XCTAssertEqual(snapshot.laneCount, MCPDomainConnectionCallLane.allCases.count)
     }
 
-    func testTentativeCloseRestoresQueuedAdmissionToExactReplacement() async throws {
-        let sleepGate = AdmissionSleepGate()
+    func testTentativeCloseRestoresQueuedAdmissionToExactReplacement() async {
         let original = MCPDomainConnectionCallLimiters(
             limit: 1,
             controlLimit: 1,
             smallReadLimit: 1,
             fileReadLimit: 1,
             gitReadLimit: 1,
-            fileSearchLimit: 1,
-            idleWaitSleep: { duration in try await sleepGate.sleep(duration) }
+            fileSearchLimit: 1
         )
         let replacement = MCPDomainConnectionCallLimiters(
             limit: 1,
@@ -75,17 +73,10 @@ final class MCPDomainConnectionCallAdmissionTests: XCTestCase {
         let didClose = await original.closeIfIdle()
         XCTAssertTrue(didClose)
         let retry = Task { await original.admissionRetryReplacement() }
-        await Task.yield()
         await original.markTentativeCloseRestored(by: replacement)
         let resolved = await retry.value
         XCTAssertTrue(resolved === replacement)
         let waiterCount = await original.admissionRetryWaiterCountForTesting()
         XCTAssertEqual(waiterCount, 0)
-    }
-}
-
-private actor AdmissionSleepGate {
-    func sleep(_ duration: Duration) async throws {
-        try await Task.sleep(for: duration)
     }
 }
