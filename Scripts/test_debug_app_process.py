@@ -125,12 +125,6 @@ class DebugAppProcessTests(unittest.TestCase):
 
 
 class LifecycleSurfaceTests(unittest.TestCase):
-    @staticmethod
-    def copy_finder_launcher(root: Path) -> Path:
-        launcher = root / "Launch RepoPrompt CE.command"
-        launcher.write_text((SCRIPT_DIR.parent / launcher.name).read_text(encoding="utf-8"), encoding="utf-8")
-        return launcher
-
     def test_lifecycle_surfaces_have_no_process_name_kill_fallback(self) -> None:
         run_script = (SCRIPT_DIR / "run.sh").read_text(encoding="utf-8")
         conductor_script = (SCRIPT_DIR / "conductor.py").read_text(encoding="utf-8")
@@ -139,8 +133,7 @@ class LifecycleSurfaceTests(unittest.TestCase):
         for source in [run_script, conductor_script, finder_launcher]:
             self.assertNotIn("pgrep -x RepoPrompt", source)
             self.assertNotIn("pkill -x RepoPrompt", source)
-        self.assertIn('exec python3 -u "$ROOT_DIR/Scripts/conductor.py" __operation_runner "$PAYLOAD"', run_script)
-        self.assertIn('"kind": "debug_app_build_then_launch"', run_script)
+        self.assertIn('python3 "$PROCESS_HELPER" list --executable "$APP_EXECUTABLE"', run_script)
         self.assertIn("terminate_matching_processes(debug_app_executable_path())", conductor_script)
         self.assertIn("safe coordinated launcher requires Python 3", finder_launcher)
         self.assertIn("No uncoordinated fallback is provided", finder_launcher)
@@ -162,7 +155,8 @@ class LifecycleSurfaceTests(unittest.TestCase):
         self.assertIsNotNone(dirname)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            launcher = self.copy_finder_launcher(root)
+            launcher = root / "Launch RepoPrompt CE.command"
+            launcher.write_text((SCRIPT_DIR.parent / launcher.name).read_text(encoding="utf-8"), encoding="utf-8")
             bin_dir = root / "bin"
             bin_dir.mkdir()
             (bin_dir / "dirname").symlink_to(dirname)
@@ -183,77 +177,96 @@ class LifecycleSurfaceTests(unittest.TestCase):
         self.assertIn("No uncoordinated fallback is provided", result.stdout)
         self.assertNotIn("Building and relaunching", result.stdout)
 
-    def test_finder_launcher_exports_resolved_full_xcode_to_conductor(self) -> None:
+    def test_finder_launcher_uses_ad_hoc_signing_when_no_identity_exists(self) -> None:
+        dirname = shutil.which("dirname")
+        self.assertIsNotNone(dirname)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            launcher = self.copy_finder_launcher(root)
-            scripts = root / "Scripts"
-            scripts.mkdir()
-            developer_dir = root / "Xcode-beta.app" / "Contents" / "Developer"
-            resolver = scripts / "resolve_full_xcode_developer_dir.sh"
-            resolver.write_text(
-                f"#!/usr/bin/env bash\nprintf '%s\\n' {str(developer_dir)!r}\n",
-                encoding="utf-8",
-            )
-            resolver.chmod(0o755)
-            capture = root / "capture.txt"
+            launcher = root / "Launch RepoPrompt CE.command"
+            launcher.write_text((SCRIPT_DIR.parent / launcher.name).read_text(encoding="utf-8"), encoding="utf-8")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "dirname").symlink_to(dirname)
+            python = bin_dir / "python3"
+            python.write_text("binary", encoding="utf-8")
+            python.chmod(0o755)
+            conductor_log = root / "conductor-env.log"
             conductor = root / "conductor"
             conductor.write_text(
-                "#!/usr/bin/env bash\n"
-                "printf '%s\\n' \"$DEVELOPER_DIR\" > \"$LAUNCHER_CAPTURE\"\n"
-                "printf '%s\\n' \"$*\" >> \"$LAUNCHER_CAPTURE\"\n",
+                "#!/bin/bash\n"
+                "printf 'ALLOW_ADHOC_SIGNING=%s\\n' \"${ALLOW_ADHOC_SIGNING:-}\" >> conductor-env.log\n"
+                "exit 0\n",
                 encoding="utf-8",
             )
             conductor.chmod(0o755)
+            security = bin_dir / "security"
+            security.write_text("#!/bin/bash\nprintf '     0 valid identities found\\n'\n", encoding="utf-8")
+            security.chmod(0o755)
             env = os.environ.copy()
-            env["LAUNCHER_CAPTURE"] = str(capture)
-            env.pop("DEVELOPER_DIR", None)
+            env["PATH"] = str(bin_dir)
+            env.pop("SIGN_IDENTITY", None)
+            env.pop("ALLOW_ADHOC_SIGNING", None)
 
             result = subprocess.run(
                 ["/bin/bash", str(launcher)],
                 env=env,
-                input="q\n",
+                input="q",
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=2,
             )
-            captured_lines = capture.read_text(encoding="utf-8").splitlines()
+            conductor_log_text = conductor_log.read_text(encoding="utf-8")
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(captured_lines, [str(developer_dir), "app relaunch"])
-        self.assertIn(f"Xcode:   {developer_dir}", result.stdout)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("using explicit ad-hoc debug signing", result.stdout)
+        self.assertIn("Debug secure storage will be in-memory", result.stdout)
+        self.assertIn("ALLOW_ADHOC_SIGNING=1", conductor_log_text)
 
-    def test_finder_launcher_resolver_failure_precedes_lifecycle_action(self) -> None:
+    def test_finder_launcher_shows_fallback_message_when_signing_still_refused(self) -> None:
+        dirname = shutil.which("dirname")
+        self.assertIsNotNone(dirname)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            launcher = self.copy_finder_launcher(root)
-            scripts = root / "Scripts"
-            scripts.mkdir()
-            resolver = scripts / "resolve_full_xcode_developer_dir.sh"
-            resolver.write_text("#!/usr/bin/env bash\necho 'no compatible Xcode' >&2\nexit 1\n", encoding="utf-8")
-            resolver.chmod(0o755)
-            lifecycle_marker = root / "lifecycle-invoked"
+            launcher = root / "Launch RepoPrompt CE.command"
+            launcher.write_text((SCRIPT_DIR.parent / launcher.name).read_text(encoding="utf-8"), encoding="utf-8")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "dirname").symlink_to(dirname)
+            python = bin_dir / "python3"
+            python.write_text("binary", encoding="utf-8")
+            python.chmod(0o755)
             conductor = root / "conductor"
             conductor.write_text(
-                f"#!/usr/bin/env bash\nprintf 'invoked\\n' > {str(lifecycle_marker)!r}\n",
+                "#!/bin/bash\n"
+                "echo 'ERROR: Debug ad-hoc signing is disabled by default. Set ALLOW_ADHOC_SIGNING=1 to build an ad-hoc package, or set SIGN_IDENTITY for stable signing.'\n"
+                "exit 1\n",
                 encoding="utf-8",
             )
             conductor.chmod(0o755)
+            security = bin_dir / "security"
+            security.write_text("#!/bin/bash\nprintf '     0 valid identities found\\n'\n", encoding="utf-8")
+            security.chmod(0o755)
+            env = os.environ.copy()
+            # Include system paths so tee, mktemp, grep, and rm are available
+            # for the launcher's reactive fallback log capture and grep.
+            env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+            env.pop("SIGN_IDENTITY", None)
+            env.pop("ALLOW_ADHOC_SIGNING", None)
 
             result = subprocess.run(
                 ["/bin/bash", str(launcher)],
-                env=os.environ.copy(),
-                input="\n",
+                env=env,
+                input="q",
                 text=True,
                 capture_output=True,
                 timeout=5,
             )
-            lifecycle_was_invoked = lifecycle_marker.exists()
 
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("Couldn't select a compatible full Xcode installation", result.stdout)
-        self.assertIn("no compatible Xcode", result.stderr)
-        self.assertFalse(lifecycle_was_invoked)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("RepoPrompt CE was not relaunched", result.stdout)
+        self.assertIn("Debug signing was refused even though this launcher tried to configure it automatically", result.stdout)
+        self.assertIn("ALLOW_ADHOC_SIGNING=1 ./conductor app relaunch", result.stdout)
+        self.assertIn('SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./conductor app relaunch', result.stdout)
 
 
 if __name__ == "__main__":
