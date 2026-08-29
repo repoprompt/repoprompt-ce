@@ -1379,7 +1379,10 @@ final class CodexNativeSessionControllerHookApprovalTests: XCTestCase {
             requestLogURL: requestLogURL,
             wrongResumeProcessNumber: wrongResumeProcessNumber
         )
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(.init(
             commandName: executableURL.path,
             additionalPathHints: [],

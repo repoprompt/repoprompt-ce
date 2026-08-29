@@ -33,9 +33,19 @@ enum CodexRuntimeAuthority {
         let source: Source
         let statePaths: StatePaths
 
-        func prepareState(fileManager: FileManager = .default) throws {
+        func prepareState(
+            fileManager: FileManager = .default,
+            ordinaryCodexHomeURL: URL? = nil
+        ) throws {
             try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
+            let ordinaryCodexHome = ordinaryCodexHomeURL
+                ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+            try CodexGlobalInstructionsProjection.prepare(
+                ordinaryCodexHome: ordinaryCodexHome,
+                managedCodexHome: statePaths.codexHome,
+                fileManager: fileManager
+            )
         }
 
         var redactedDiagnosticSummary: String {

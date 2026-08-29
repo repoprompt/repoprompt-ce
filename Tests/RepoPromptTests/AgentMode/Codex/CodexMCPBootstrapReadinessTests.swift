@@ -10,6 +10,106 @@ import XCTest
 final class CodexMCPBootstrapReadinessTests: XCTestCase {
     private let expectedClientName = "RepoPromptCE"
 
+    func testCachedRuntimeRecoversAfterStatePreparationFailureWithoutReresolvingRuntime() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexMCPBootstrapReadinessTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let executableURL = try makeFakeCodexAppServer(in: directory)
+        let environmentBuilds = CallCounter()
+        let statePreparations = CachedStatePreparationSequence()
+
+        let client = CodexAppServerClient(
+            processEnvironmentBuilder: { request in
+                environmentBuilds.increment()
+                return await ProcessEnvironmentBuilder.build(
+                    request,
+                    shellEnvironmentProvider: { _, _ in
+                        CLIEnvironmentSnapshot(
+                            environment: ["HOME": directory.path],
+                            source: .capturedLoginShell
+                        )
+                    }
+                )
+            },
+            runtimeStatePreparer: { _ in try statePreparations.prepare() },
+            provisionsRepoPromptMCPOnStart: false
+        )
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 5,
+            processLaunchDirectory: directory.path
+        ))
+
+        let first = try await client.prepareRuntimeForLaunch()
+        do {
+            _ = try await client.prepareRuntimeForLaunch()
+            XCTFail("cached state preparation must surface its failure")
+        } catch let CodexAppServerClient.ClientError.executableUnavailable(message) {
+            XCTAssertTrue(message.contains("projection conflict"))
+        }
+        let retried = try await client.prepareRuntimeForLaunch()
+
+        XCTAssertEqual(first, retried)
+        XCTAssertEqual(environmentBuilds.value, 1)
+        XCTAssertEqual(statePreparations.callCount, 3)
+    }
+
+    func testStatePreparationFailureAbortsBeforeProvisioningProcessAndThreadRequest() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexMCPBootstrapReadinessTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let executableURL = try makeFakeCodexAppServer(in: directory)
+        let registrar = RecordingExpectedAgentPIDRegistrar()
+        let requests = RecordedRequests()
+        let provisionerCalls = CallCounter()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in throw StatePreparationFailure.conflict },
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar.registrar
+        )
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 5,
+            processLaunchDirectory: directory.path
+        ))
+        var options = makeAgentModeOptions()
+        options.repoPromptMCPProvisioner = { _ in provisionerCalls.increment() }
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 0,
+            workspacePaths: .uniform(directory.path),
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown,
+            expectedMCPClientName: expectedClientName,
+            requestExecutor: requests.executor
+        )
+        addTeardownBlock { await controller.shutdown() }
+
+        do {
+            _ = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+            XCTFail("startOrResume must fail when isolated Codex state preparation fails")
+        } catch let CodexAppServerClient.ClientError.executableUnavailable(message) {
+            XCTAssertTrue(message.contains("unable to prepare its isolated Codex state"))
+            XCTAssertTrue(message.contains("projection conflict"))
+        }
+
+        XCTAssertEqual(provisionerCalls.value, 0)
+        XCTAssertEqual(requests.methods, [])
+        let processRunning = await client.debugIsProcessRunning()
+        XCTAssertFalse(processRunning)
+        XCTAssertEqual(registrar.registeredCount, 0)
+        XCTAssertEqual(registrar.clearedCount, 0)
+        let bindingState = try await controller.test_bindingBufferState()
+        XCTAssertFalse(bindingState.isBinding)
+        XCTAssertEqual(bindingState.bufferedCount, 0)
+    }
+
     // MARK: - Throwing provisioner fails closed (fresh start and resume)
 
     func testThrowingProvisionerAbortsBeforeProcessStartAndThreadRequest() async throws {
@@ -29,6 +129,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         for existing in [nil, resumeRef] {
             let registrar = RecordingExpectedAgentPIDRegistrar()
             let client = CodexAppServerClient(
+                runtimeStatePreparer: { _ in },
                 provisionsRepoPromptMCPOnStart: false,
                 expectedAgentPIDRegistrar: registrar.registrar
             )
@@ -87,6 +188,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         let executableURL = try makeFakeCodexAppServer(in: directory)
         let registrar = RecordingExpectedAgentPIDRegistrar()
         let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
             provisionsRepoPromptMCPOnStart: false,
             expectedAgentPIDRegistrar: registrar.registrar
         )
@@ -176,6 +278,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
                     }
                 )
             },
+            runtimeStatePreparer: { _ in },
             provisionsRepoPromptMCPOnStart: false,
             expectedAgentPIDRegistrar: registrar.registrar
         )
@@ -311,6 +414,33 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
 }
 
 // MARK: - Test doubles
+
+private enum StatePreparationFailure: Error, LocalizedError {
+    case conflict
+
+    var errorDescription: String? {
+        "projection conflict"
+    }
+}
+
+private final class CachedStatePreparationSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func prepare() throws {
+        lock.lock()
+        count += 1
+        let shouldFail = count == 2
+        lock.unlock()
+        if shouldFail { throw StatePreparationFailure.conflict }
+    }
+
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
 
 private final class ProvisionedRuntimeRecorder: @unchecked Sendable {
     private let lock = NSLock()

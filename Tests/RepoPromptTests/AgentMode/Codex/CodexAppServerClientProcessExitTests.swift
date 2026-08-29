@@ -364,9 +364,13 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         let directory = try makeTemporaryDirectory()
         let recordURL = directory.appendingPathComponent("requests.jsonl")
         let executable = try makePersistentServer(in: directory, recordURL: recordURL)
-        let client = CodexAppServerClient(writeFrameHandler: { _, _ in
-            throw FDWriteError.brokenPipe(errno: EPIPE)
-        })
+        let client = CodexAppServerClient(
+            writeFrameHandler: { _, _ in
+                throw FDWriteError.brokenPipe(errno: EPIPE)
+            },
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(.init(
             commandName: executable.path,
             additionalPathHints: [],
@@ -939,7 +943,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         launchDirectory: URL?,
         timeout: TimeInterval,
         processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
-        provisionsRepoPromptMCPOnStart: Bool = true,
+        provisionsRepoPromptMCPOnStart: Bool = false,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver(pid: $0)
         },
@@ -947,6 +951,7 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
     ) async throws -> CodexAppServerClient {
         let client = CodexAppServerClient(
             processSpawnPreparation: processSpawnPreparation,
+            runtimeStatePreparer: { _ in },
             provisionsRepoPromptMCPOnStart: provisionsRepoPromptMCPOnStart,
             processExitObserverFactory: processExitObserverFactory,
             expectedAgentPIDRegistrar: expectedAgentPIDRegistrar

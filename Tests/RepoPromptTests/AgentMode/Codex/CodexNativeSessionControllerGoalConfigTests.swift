@@ -173,7 +173,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         let recordURL = directory.appendingPathComponent("requests.jsonl")
         let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(
             CodexAppServerClient.Config(
                 commandName: executableURL.path,
@@ -199,7 +202,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         let recordURL = directory.appendingPathComponent("requests.jsonl")
         let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(
             CodexAppServerClient.Config(
                 commandName: executableURL.path,
@@ -229,7 +235,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         let recordURL = directory.appendingPathComponent("requests.jsonl")
         let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(
             CodexAppServerClient.Config(
                 commandName: executableURL.path,
@@ -286,7 +295,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         let recordURL = directory.appendingPathComponent("requests.jsonl")
         let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(
             CodexAppServerClient.Config(
                 commandName: executableURL.path,
@@ -500,6 +512,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
 
         let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
             provisionsRepoPromptMCPOnStart: false,
             expectedAgentPIDRegistrar: registrar
         )
@@ -538,6 +551,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         await controller.shutdown()
 
         let resumeClient = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
             provisionsRepoPromptMCPOnStart: false,
             expectedAgentPIDRegistrar: registrar
         )
@@ -606,6 +620,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         AgentModePerfDiagnostics.clearRecentMetrics()
         let failingClient = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
             provisionsRepoPromptMCPOnStart: false,
             expectedAgentPIDRegistrar: registrar
         )
@@ -670,7 +685,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             recordURL: recordURL,
             ignoreInitializeRequests: true
         )
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(.init(
             commandName: executableURL.path,
             additionalPathHints: [],
@@ -743,7 +761,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             recordURL: recordURL,
             ignoreTurnStartRequests: true
         )
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(.init(
             commandName: executableURL.path,
             additionalPathHints: [],
@@ -1153,7 +1174,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             initialMemoryMode: initialMemoryMode,
             rejectMemoryModeRequests: rejectMemoryModeRequests
         )
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(
             CodexAppServerClient.Config(
                 commandName: executableURL.path,
@@ -1261,7 +1285,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         workspacePaths: CodexRuntimeWorkspacePaths,
         options: CodexNativeSessionController.Options
     ) async -> CodexNativeSessionController {
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(
+            runtimeStatePreparer: { _ in },
+            provisionsRepoPromptMCPOnStart: false
+        )
         await client.updateConfig(.init(
             commandName: executableURL.path,
             additionalPathHints: [],
