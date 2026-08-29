@@ -116,9 +116,12 @@ class HighOutputDiagnosticTest(unittest.TestCase):
         self.fail("job did not reach running state with a process PID")
 
     def _wait_for_terminal(self, ticket: str, timeout: float = 30.0) -> Dict[str, Any]:
-        return self._request(
-            {"type": "job-wait", "ticket": ticket, "timeout": timeout},
-            socket_timeout=timeout + 5.0,
+        return conductor.wait_for_terminal(
+            self.paths,
+            ticket,
+            request_key=None,
+            json_mode=True,
+            user_timeout=timeout,
         )
 
     def _pid(self, payload: Dict[str, Any]) -> int:
