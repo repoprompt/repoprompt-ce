@@ -5380,19 +5380,28 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Applies the newest stored selection after deferred `read_file` auto-selection.
     @MainActor
-    func applyStoredSelectionMirrorForReadFileAutoSelection(tabID: UUID) async {
+    func applyStoredSelectionMirrorForReadFileAutoSelection(
+        tabID: UUID
+    ) async -> WorkspaceSelectionCoordinator.SelectionMirrorOutcome {
         guard let active = activeWorkspace,
               active.activeComposeTabID == tabID,
               let tab = composeTab(with: tabID)
-        else { return }
+        else { return .invalidated }
         if let selectionCoordinator {
-            await selectionCoordinator.mirrorSelectionToActiveUI(tab.selection, forTabID: tabID)
+            return await selectionCoordinator.mirrorSelectionToActiveUI(tab.selection, forTabID: tabID)
         } else {
             await applySelectionMirrorAttempt(
                 tab.selection,
                 forTabID: tabID,
                 workspaceID: active.id
             )
+            guard !Task.isCancelled else { return .cancelled }
+            guard let current = activeWorkspace,
+                  current.id == active.id,
+                  current.activeComposeTabID == tabID,
+                  composeTab(with: tabID)?.selection == tab.selection
+            else { return .invalidated }
+            return .converged
         }
     }
 

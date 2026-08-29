@@ -1841,13 +1841,14 @@ final class MCPServerViewModel: ObservableObject {
             return await applyReadFileAutoSelectionBatch(batch, for: key)
         },
         applyMirror: { [weak self] key in
-            await self?.applyReadFileAutoSelectionMirror(for: key)
+            guard let self else { return .invalidated }
+            return await applyReadFileAutoSelectionMirror(for: key)
         }
     )
     @MainActor
     private func applyReadFileAutoSelectionMirror(
         for key: MCPReadFileAutoSelectionCoordinator.TabMirrorKey
-    ) async {
+    ) async -> WorkspaceSelectionCoordinator.SelectionMirrorOutcome {
         #if DEBUG
             await readFileAutoSelectionMirrorGateForTesting?()
         #endif
@@ -1865,9 +1866,10 @@ final class MCPServerViewModel: ObservableObject {
             )?.selection {
                 workspaceManager?.updateComposeTabSelectionPresentation(selection, forTabID: key.tabID)
             }
-            return
+            return .converged
         }
-        await workspaceManager?.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
+        guard let workspaceManager else { return .invalidated }
+        return await workspaceManager.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
     }
 
     /// Presentation snapshot cache. Domain routing remains the only routing authority.

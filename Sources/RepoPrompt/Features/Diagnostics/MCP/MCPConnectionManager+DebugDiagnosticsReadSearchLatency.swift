@@ -266,7 +266,12 @@ import RepoPromptShared
                 return debugDiagnosticsResult(readFileAutoSelectionStaleProbePayload(op: op, entry: entry))
             }
             let settleElapsedMS = Self.debugDurationMilliseconds(settleStartedAt.duration(to: clock.now))
-            let result = drain.result == .completed ? "completed" : "cancelled"
+            let result = switch drain.result {
+            case .completed: "completed"
+            case .deferred: "deferred"
+            case .invalidated: "invalidated"
+            case .cancelled: "cancelled"
+            }
             let delta = readFileAutoSelectionDeltaPayload(baseline: entry.baseline, final: final)
 
             return debugDiagnosticsResult([

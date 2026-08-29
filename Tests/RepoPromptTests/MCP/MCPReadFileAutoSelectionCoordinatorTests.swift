@@ -388,6 +388,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 if invocation == 1 {
                     await mirrorGate.markStartedAndWaitForRelease()
                 }
+                return .converged
             }
         )
 
@@ -445,7 +446,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         await coordinator.drain(.canonicalSelection, for: key)
     }
 
-    func testCancelledCanonicalDrainResumesPromptlyWithoutStoppingWorker() async {
+    func testCallerCancelledCanonicalDrainResumesPromptlyWhilePhysicalWorkerContinues() async {
         let gate = CoordinatorAsyncGate()
         let coordinator = makeCoordinator(recorder: CoordinatorRecorder()) { _, _ in
             await gate.markStartedAndWaitForRelease()
@@ -479,7 +480,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         XCTAssertTrue(canonicalWorkerStopped)
     }
 
-    func testCancelledMirrorDrainResumesPromptlyWithoutStoppingWorker() async {
+    func testCallerCancelledMirrorDrainResumesPromptlyWhilePhysicalWorkerContinues() async {
         let mirrorGate = CoordinatorAsyncGate()
         let coordinator = MCPReadFileAutoSelectionCoordinator(
             isContextCurrent: { _ in true },
@@ -488,6 +489,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
             },
             applyMirror: { _ in
                 await mirrorGate.markStartedAndWaitForRelease()
+                return .converged
             }
         )
         let key = contextKey()
@@ -567,6 +569,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
             },
             applyMirror: { _ in
                 await mirrorGate.markStartedAndWaitForRelease()
+                return .converged
             }
         )
         MCPReadFileAutoSelectionDiagnosticTracer.setTestSink { diagnostics.append($0) }
@@ -666,7 +669,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 await recorder.recordCanonical(batch)
                 return .unchanged
             },
-            applyMirror: { _ in }
+            applyMirror: { _ in .converged }
         )
         let key = contextKey()
         currentKey = key
@@ -680,6 +683,11 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         let recordedBatches = await recorder.canonicalBatches()
         XCTAssertTrue(recordedBatches.isEmpty)
         XCTAssertFalse(coordinator.enqueue(intent: .full(paths: ["/tmp/B.swift"]), for: key))
+        let reclaimed = await waitUntil {
+            coordinator.debugSnapshot().canonicalLaneCount == 0
+                && coordinator.debugSnapshot().canonicalWorkerCount == 0
+        }
+        XCTAssertTrue(reclaimed)
         XCTAssertEqual(coordinator.debugSnapshot().canonicalLaneCount, 0)
     }
 
@@ -733,6 +741,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 if invocation == 2 {
                     await lateMirrorGate.markStartedAndWaitForRelease()
                 }
+                return .converged
             }
         )
 
@@ -772,7 +781,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                 await recorder.recordCanonical(batch)
                 return .unchanged
             },
-            applyMirror: { _ in }
+            applyMirror: { _ in .converged }
         )
         coordinator.setCanonicalApplyGateForTesting {
             await gate.markStartedAndWaitForRelease()
@@ -790,6 +799,317 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         await coordinator.drain(.canonicalSelection, for: replacement)
         let batches = await recorder.canonicalBatches()
         XCTAssertEqual(batches.map(\.fullPaths), [["/tmp/New.swift"]])
+    }
+
+    func testInvalidationReleasesExactParkedMirrorWaiterAndLateWorkerCannotAdvanceReplacement() async {
+        let gate = CoordinatorAsyncGate()
+        let recorder = CoordinatorRecorder()
+        let connectionID = UUID()
+        let tabID = UUID()
+        let workspaceID = UUID()
+        let old = contextKey(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            route: .bound(connectionID: connectionID, runID: UUID()),
+            bindingGeneration: 1
+        )
+        let replacement = contextKey(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            route: .bound(connectionID: connectionID, runID: UUID()),
+            bindingGeneration: 2
+        )
+        var current = old
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { $0 == current },
+            applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
+            applyMirror: { key in
+                let invocation = await recorder.recordMirror(key)
+                if invocation == 1 { await gate.markStartedAndWaitForRelease() }
+                return .converged
+            },
+            mirrorWaitTimeout: .milliseconds(200)
+        )
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/old.swift"]), for: old))
+        await gate.waitUntilStarted()
+        let oldDrain = Task { @MainActor in
+            await coordinator.drain(.mirroredSelectionAndMetrics, for: old)
+        }
+        let waiterRegistered = await waitUntil { coordinator.debugSnapshot().mirrorWaiterCount == 1 }
+        XCTAssertTrue(waiterRegistered)
+
+        current = replacement
+        coordinator.invalidate(context: old)
+        let oldResult = await oldDrain.value
+        XCTAssertEqual(oldResult, .invalidated)
+        XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 0)
+        XCTAssertEqual(coordinator.debugSnapshot().retiredMirrorWorkerCount, 1)
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/new.swift"]), for: replacement))
+        let replacementResult = await coordinator.drain(.mirroredSelectionAndMetrics, for: replacement)
+        XCTAssertEqual(replacementResult, .completed)
+        let mirrorCountBeforeRelease = await recorder.mirrorCount()
+        XCTAssertEqual(mirrorCountBeforeRelease, 2)
+
+        await gate.release()
+        let retiredExited = await waitUntil { coordinator.debugSnapshot().retiredMirrorWorkerCount == 0 }
+        XCTAssertTrue(retiredExited)
+        let mirrorCountAfterRelease = await recorder.mirrorCount()
+        XCTAssertEqual(mirrorCountAfterRelease, 2)
+    }
+
+    func testFinishReturnsDeferredAtDeadlineThenReclaimsAfterPhysicalExit() async {
+        let gate = CoordinatorAsyncGate()
+        let key = contextKey()
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { $0 == key },
+            applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
+            applyMirror: { _ in
+                await gate.markStartedAndWaitForRelease()
+                return .converged
+            },
+            mirrorWaitTimeout: .milliseconds(40)
+        )
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        await gate.waitUntilStarted()
+        let started = ContinuousClock.now
+        let finishResult = await coordinator.finish(context: key)
+        XCTAssertEqual(finishResult, .deferred)
+        XCTAssertLessThan(started.duration(to: ContinuousClock.now), .seconds(1))
+        XCTAssertEqual(coordinator.debugSnapshot().liveMirrorDeadlineCount, 0)
+
+        coordinator.invalidate(context: key)
+        await gate.release()
+        let reclaimed = await waitUntil {
+            let snapshot = coordinator.debugSnapshot()
+            return snapshot.retiredMirrorWorkerCount == 0
+                && snapshot.mirrorWorkerCount == 0
+                && snapshot.mirrorWaiterCount == 0
+                && snapshot.liveMirrorDeadlineCount == 0
+        }
+        XCTAssertTrue(reclaimed)
+    }
+
+    func testCanonicalInvalidationSettlesExactWaiterAsInvalidated() async {
+        let gate = CoordinatorAsyncGate()
+        let key = contextKey()
+        var current: MCPReadFileAutoSelectionCoordinator.ContextKey? = key
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { $0 == current },
+            applyCanonical: { _, _ in .unchanged },
+            applyMirror: { _ in .converged }
+        )
+        coordinator.setCanonicalApplyGateForTesting { await gate.markStartedAndWaitForRelease() }
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        await gate.waitUntilStarted()
+        let drain = Task { @MainActor in await coordinator.drain(.canonicalSelection, for: key) }
+        let registered = await waitUntil { coordinator.debugSnapshot().canonicalWaiterCount == 1 }
+        XCTAssertTrue(registered)
+
+        current = nil
+        coordinator.invalidate(context: key)
+        let result = await drain.value
+        XCTAssertEqual(result, .invalidated)
+        XCTAssertEqual(coordinator.debugSnapshot().canonicalWaiterCount, 0)
+        await gate.release()
+    }
+
+    func testLateMirrorWaiterReceivesExactTerminalOutcomeHistory() async {
+        for expected in [
+            WorkspaceSelectionCoordinator.SelectionMirrorOutcome.invalidated,
+            .cancelled,
+            .deferred,
+            .converged
+        ] {
+            let key = contextKey()
+            let coordinator = MCPReadFileAutoSelectionCoordinator(
+                isContextCurrent: { _ in true },
+                applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
+                applyMirror: { _ in expected }
+            )
+            XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+            let physicallySettled = await waitUntil {
+                let snapshot = coordinator.debugSnapshot()
+                return snapshot.canonicalWorkerCount == 0 && snapshot.mirrorWorkerCount == 0
+            }
+            XCTAssertTrue(physicallySettled)
+
+            let result = await coordinator.drain(.mirroredSelectionAndMetrics, for: key)
+            switch expected {
+            case .converged: XCTAssertEqual(result, .completed)
+            case .deferred: XCTAssertEqual(result, .deferred)
+            case .invalidated: XCTAssertEqual(result, .invalidated)
+            case .cancelled: XCTAssertEqual(result, .cancelled)
+            }
+        }
+    }
+
+    func testLaterSameTabConvergenceUpgradesEarlierDeferredLiveOwnerTicket() async {
+        let recorder = CoordinatorRecorder()
+        let tabID = UUID()
+        let workspaceID = UUID()
+        let first = contextKey(tabID: tabID, workspaceID: workspaceID)
+        let second = contextKey(tabID: tabID, workspaceID: workspaceID)
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { _ in true },
+            applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
+            applyMirror: { key in
+                let invocation = await recorder.recordMirror(key)
+                return invocation == 1 ? .deferred : .converged
+            }
+        )
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/first.swift"]), for: first))
+        let firstSettled = await waitUntil {
+            let snapshot = coordinator.debugSnapshot()
+            return snapshot.canonicalWorkerCount == 0 && snapshot.mirrorWorkerCount == 0
+        }
+        XCTAssertTrue(firstSettled)
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/second.swift"]), for: second))
+        let secondResult = await coordinator.drain(.mirroredSelectionAndMetrics, for: second)
+        XCTAssertEqual(secondResult, .completed)
+
+        let firstResult = await coordinator.drain(.mirroredSelectionAndMetrics, for: first)
+        XCTAssertEqual(firstResult, .completed)
+        XCTAssertLessThanOrEqual(coordinator.debugSnapshot().mirrorSettlementRangeCount, 2)
+    }
+
+    func testMirrorSettlementHistoryPrunesToLatestLiveRequirement() async {
+        let recorder = CoordinatorRecorder()
+        let key = contextKey()
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { $0 == key },
+            applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
+            applyMirror: { mirrorKey in
+                let invocation = await recorder.recordMirror(mirrorKey)
+                return invocation.isMultiple(of: 2) ? .converged : .deferred
+            }
+        )
+
+        for iteration in 0 ..< 64 {
+            XCTAssertTrue(coordinator.enqueue(
+                intent: .full(paths: ["/tmp/history-\(iteration).swift"]),
+                for: key
+            ))
+            let settled = await waitUntil {
+                let snapshot = coordinator.debugSnapshot()
+                return snapshot.canonicalWorkerCount == 0 && snapshot.mirrorWorkerCount == 0
+            }
+            XCTAssertTrue(settled, "iteration \(iteration)")
+            XCTAssertLessThanOrEqual(
+                coordinator.debugSnapshot().mirrorSettlementRangeCount,
+                1,
+                "iteration \(iteration)"
+            )
+        }
+
+        coordinator.invalidate(context: key)
+        let reclaimed = await waitUntil { coordinator.debugSnapshot().mirrorSettlementRangeCount == 0 }
+        XCTAssertTrue(reclaimed)
+    }
+
+    func testSameTabInvalidationPreservesSurvivingOwnerDemandWaiterAndConvergence() async {
+        let gate = CoordinatorAsyncGate()
+        let recorder = CoordinatorRecorder()
+        let tabID = UUID()
+        let workspaceID = UUID()
+        let first = contextKey(tabID: tabID, workspaceID: workspaceID)
+        let survivor = contextKey(tabID: tabID, workspaceID: workspaceID)
+        var liveContexts: Set<MCPReadFileAutoSelectionCoordinator.ContextKey> = [first, survivor]
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { liveContexts.contains($0) },
+            applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
+            applyMirror: { key in
+                let invocation = await recorder.recordMirror(key)
+                if invocation == 1 { await gate.markStartedAndWaitForRelease() }
+                return .converged
+            }
+        )
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/first.swift"]), for: first))
+        await gate.waitUntilStarted()
+        let firstDrain = Task { @MainActor in
+            await coordinator.drain(.mirroredSelectionAndMetrics, for: first)
+        }
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/survivor.swift"]), for: survivor))
+        let survivorDrain = Task { @MainActor in
+            await coordinator.drain(.mirroredSelectionAndMetrics, for: survivor)
+        }
+        let bothWaiters = await waitUntil { coordinator.debugSnapshot().mirrorWaiterCount == 2 }
+        XCTAssertTrue(bothWaiters)
+
+        liveContexts.remove(first)
+        coordinator.invalidate(context: first)
+        let firstResult = await firstDrain.value
+        XCTAssertEqual(firstResult, .invalidated)
+        XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 1)
+
+        let survivorResult = await survivorDrain.value
+        XCTAssertEqual(survivorResult, .completed)
+        let mirrorCount = await recorder.mirrorCount()
+        XCTAssertEqual(mirrorCount, 2)
+        await gate.release()
+        coordinator.invalidate(context: survivor)
+    }
+
+    func testRepeatedInvalidationReplacementReclaimsEveryWorkerAndWaiter() async {
+        for iteration in 0 ..< 50 {
+            let gate = CoordinatorAsyncGate()
+            let recorder = CoordinatorRecorder()
+            let tabID = UUID()
+            let workspaceID = UUID()
+            let old = contextKey(tabID: tabID, workspaceID: workspaceID, bindingGeneration: 1)
+            let replacement = contextKey(tabID: tabID, workspaceID: workspaceID, bindingGeneration: 2)
+            var current = old
+            let coordinator = MCPReadFileAutoSelectionCoordinator(
+                isContextCurrent: { $0 == current },
+                applyCanonical: { key, _ in .init(mirrorKey: key.mirrorKey) },
+                applyMirror: { key in
+                    let invocation = await recorder.recordMirror(key)
+                    if invocation == 1 { await gate.markStartedAndWaitForRelease() }
+                    return .converged
+                },
+                mirrorWaitTimeout: .milliseconds(200)
+            )
+
+            XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/old-\(iteration).swift"]), for: old))
+            await gate.waitUntilStarted()
+            let oldDrain = Task { @MainActor in
+                await coordinator.drain(.mirroredSelectionAndMetrics, for: old)
+            }
+            let registered = await waitUntil { coordinator.debugSnapshot().mirrorWaiterCount == 1 }
+            XCTAssertTrue(registered, "iteration \(iteration)")
+
+            current = replacement
+            coordinator.invalidate(context: old)
+            let oldResult = await oldDrain.value
+            XCTAssertEqual(oldResult, .invalidated, "iteration \(iteration)")
+            XCTAssertTrue(coordinator.enqueue(
+                intent: .full(paths: ["/tmp/new-\(iteration).swift"]),
+                for: replacement
+            ))
+            let replacementResult = await coordinator.drain(.mirroredSelectionAndMetrics, for: replacement)
+            XCTAssertEqual(replacementResult, .completed, "iteration \(iteration)")
+
+            await gate.release()
+            coordinator.invalidate(context: replacement)
+            let reclaimed = await waitUntil {
+                let snapshot = coordinator.debugSnapshot()
+                return snapshot.canonicalLaneCount == 0
+                    && snapshot.mirrorLaneCount == 0
+                    && snapshot.canonicalWorkerCount == 0
+                    && snapshot.mirrorWorkerCount == 0
+                    && snapshot.retiredMirrorWorkerCount == 0
+                    && snapshot.canonicalWaiterCount == 0
+                    && snapshot.mirrorWaiterCount == 0
+                    && snapshot.liveMirrorDeadlineCount == 0
+            }
+            XCTAssertTrue(reclaimed, "iteration \(iteration)")
+        }
     }
 
     func testInvalidationDuringSuspensionPreventsStoredCommit() async {
@@ -841,6 +1161,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
             },
             applyMirror: { key in
                 _ = await recorder.recordMirror(key)
+                return .converged
             }
         )
     }

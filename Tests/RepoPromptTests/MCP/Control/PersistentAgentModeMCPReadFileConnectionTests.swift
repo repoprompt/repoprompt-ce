@@ -246,6 +246,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
         #endif
     }
+
+    func testConnectionRemovalIsBoundedWhileSelectionMirrorIsPhysicallyParked() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .connectionRemovalWithParkedMirror)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
 }
 
 #if DEBUG
@@ -274,6 +284,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case worktreeSearchPhysicalCoverage
             case threeRootFileToolScope
             case hiddenWorktreeReadSliceRebase
+            case connectionRemovalWithParkedMirror
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
@@ -282,7 +293,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                      .protectedSelectionIdentity, .manageSelectionGetCanonicalHandover,
                      .worktreeCoverageCertificateRepeats,
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
-                     .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase:
+                     .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase,
+                     .connectionRemovalWithParkedMirror:
                     false
                 default:
                     true
@@ -496,7 +508,67 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertThreeRootFileToolScope(fixture: fixture)
             case .hiddenWorktreeReadSliceRebase:
                 try await assertHiddenWorktreeReadSliceRebase(fixture: fixture)
+            case .connectionRemovalWithParkedMirror:
+                try await assertConnectionRemovalWithParkedMirror(fixture: fixture)
             }
+        }
+
+        func assertConnectionRemovalWithParkedMirror(fixture: Fixture) async throws {
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.readFileAutoSelectionCoordinator
+                .setMirrorWaitTimeoutForTesting(.milliseconds(40))
+            fixture.window.mcpServer.setReadFileAutoSelectionMirrorGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionMirrorGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            _ = try await readFile(fixture: fixture, id: 30, path: fixture.liveFileURL.path)
+            try await requireGateStarted(gate)
+
+            let removalFinished = PersistentAsyncSignal()
+            let removal = Task {
+                await fixture.networkManager.removeConnection(fixture.connectionID)
+                await removalFinished.mark()
+            }
+            let returned = await waitUntilMarked(removalFinished, timeout: .seconds(2))
+            XCTAssertTrue(returned, "Connection removal must not wait forever on a parked presentation mirror")
+            if !returned { await gate.release() }
+            await removal.value
+            XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID])
+
+            await gate.release()
+            let reclaimedDeadline = ContinuousClock.now + .seconds(2)
+            while ContinuousClock.now < reclaimedDeadline {
+                let snapshot = fixture.window.mcpServer.readFileAutoSelectionCoordinator.debugSnapshot()
+                if snapshot.canonicalLaneCount == 0,
+                   snapshot.canonicalWorkerCount == 0,
+                   snapshot.mirrorLaneCount == 0,
+                   snapshot.mirrorWorkerCount == 0,
+                   snapshot.pendingCanonicalBatchCount == 0,
+                   snapshot.pendingMirrorBatchCount == 0,
+                   snapshot.inFlightMirrorBatchCount == 0,
+                   snapshot.retiredMirrorWorkerCount == 0,
+                   snapshot.canonicalWaiterCount == 0,
+                   snapshot.mirrorWaiterCount == 0,
+                   snapshot.liveMirrorDeadlineCount == 0
+                { break }
+                await Task.yield()
+            }
+            let snapshot = fixture.window.mcpServer.readFileAutoSelectionCoordinator.debugSnapshot()
+            XCTAssertEqual(snapshot.canonicalLaneCount, 0)
+            XCTAssertEqual(snapshot.canonicalWorkerCount, 0)
+            XCTAssertEqual(snapshot.mirrorLaneCount, 0)
+            XCTAssertEqual(snapshot.mirrorWorkerCount, 0)
+            XCTAssertEqual(snapshot.pendingCanonicalBatchCount, 0)
+            XCTAssertEqual(snapshot.pendingMirrorBatchCount, 0)
+            XCTAssertEqual(snapshot.inFlightMirrorBatchCount, 0)
+            XCTAssertEqual(snapshot.retiredMirrorWorkerCount, 0)
+            XCTAssertEqual(snapshot.canonicalWaiterCount, 0)
+            XCTAssertEqual(snapshot.mirrorWaiterCount, 0)
+            XCTAssertEqual(snapshot.liveMirrorDeadlineCount, 0)
         }
 
         func assertHiddenWorktreeReadSliceRebase(fixture: Fixture) async throws {

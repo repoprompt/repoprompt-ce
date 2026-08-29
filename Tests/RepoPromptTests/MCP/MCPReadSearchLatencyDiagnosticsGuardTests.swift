@@ -28,7 +28,7 @@
             let coordinator = MCPReadFileAutoSelectionCoordinator(
                 isContextCurrent: { $0 == key },
                 applyCanonical: { _, _ in .unchanged },
-                applyMirror: { _ in }
+                applyMirror: { _ in .converged }
             )
             XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
             let drainResult = await coordinator.drain(.canonicalSelection, for: key)

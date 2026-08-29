@@ -4331,7 +4331,7 @@ extension MCPServerViewModel {
             #if DEBUG
                 readFileAutoSelectionForcedAuthoritativeProbeIDsByContext.removeValue(forKey: key)
             #endif
-            if finishResult == .cancelled {
+            if finishResult == .cancelled || finishResult == .invalidated {
                 shouldCommit = false
             }
             if !isStillCurrent() || Task.isCancelled {
