@@ -3259,11 +3259,12 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
 
         self.assertIn("name: Publish Tip", workflow)
         concurrency = workflow.split("concurrency:", 1)[1].split("\npermissions:", 1)[0]
-        self.assertIn("group: main-tip-channel", concurrency)
-        self.assertNotIn("main-tip-dispatch-channel", concurrency)
-        self.assertNotIn("github.event", concurrency)
-        self.assertIn("queue: max", concurrency)
-        self.assertNotIn("cancel-in-progress:", concurrency)
+        self.assertIn("main-tip-dispatch-channel", concurrency)
+        self.assertIn("main-tip-channel", concurrency)
+        self.assertIn("main-tip-skipped-{0}", concurrency)
+        self.assertIn("github.event_name == 'workflow_dispatch'", concurrency)
+        self.assertIn("queue: single", concurrency)
+        self.assertIn("cancel-in-progress: false", concurrency)
         self.assertIn("concurrency:\n      group: main-tip-publish\n      queue: max", workflow)
 
         self.assertIn("DISPATCH_COMMIT: ${{ github.sha }}", workflow)
@@ -3291,6 +3292,24 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn("SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64", sign)
         self.assertIn("SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64", sign)
         self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", sign)
+        phase_steps = [
+            "      - name: Sign application",
+            "      - name: Build package",
+            "      - name: Submit package notarization",
+            "      - name: Staple package",
+            "      - name: Validate package",
+        ]
+        phase_positions = [sign.index(step) for step in phase_steps]
+        self.assertEqual(phase_positions, sorted(phase_positions))
+        for step in phase_steps[1:]:
+            block = sign.split(step, 1)[1].split("\n      - name:", 1)[0]
+            self.assertIn("if: needs.setup.outputs.installation-type == 'package'", block)
+        for marker in ("PHASE START:", "PHASE END:", "elapsed_seconds=", "date -u"):
+            self.assertIn(marker, tip_script)
+        self.assertIn('submit_notarization "$notary_zip"', tip_script)
+        self.assertIn('submit_notarization "$DMG"', tip_script)
+        self.assertIn('submit_notarization "$TRANSITION_PKG"', tip_script)
+        self.assertIn('NOTARYTOOL_TIMEOUT:-30m', tip_script)
 
         self.assertIn('PUBLISH_TIP_RELEASE="$CONTROL_PLANE_SCRIPTS_DIR/publish_tip_release.sh"', tip_script)
         self.assertIn('exec "$PUBLISH_TIP_RELEASE"', tip_script)
@@ -3310,6 +3329,143 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
             self.assertIn(marker, publisher)
         self.assertNotIn("--clobber", publisher)
         self.assertNotIn("gh release delete", publisher)
+
+    def test_tip_notarization_contract_submits_one_package_and_keeps_application_explicit(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        bin_dir = temp_dir / "bin"
+        bin_dir.mkdir()
+        capture = temp_dir / "xcrun-calls.tsv"
+        submission_id = "12345678-1234-5678-1234-567812345678"
+        xcrun_stub = bin_dir / "xcrun"
+        xcrun_stub.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+{
+  printf '%s' "$1"
+  shift
+  printf '\t%s' "$@"
+  printf '\n'
+} >> "$XCRUN_CAPTURE"
+if [[ "${1:-}" == "submit" ]]; then
+  printf '{"id":"%s","status":"%s"}\n' "$NOTARY_STUB_ID" "$NOTARY_STUB_STATUS"
+  exit "$NOTARY_STUB_EXIT"
+elif [[ "${1:-}" == "log" ]]; then
+  printf '{"id":"%s","log":"fixture rejection details"}\n' "$NOTARY_STUB_ID"
+fi
+""",
+            encoding="utf-8",
+        )
+        xcrun_stub.chmod(0o755)
+        ditto_stub = bin_dir / "ditto"
+        ditto_stub.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\noutput=\"${!#}\"\nmkdir -p \"$(dirname \"$output\")\"\nprintf 'fixture archive\\n' > \"$output\"\n",
+            encoding="utf-8",
+        )
+        ditto_stub.chmod(0o755)
+        notary_key = temp_dir / "notary-key.p8"
+        notary_key.write_text("fixture-key\n", encoding="utf-8")
+        fixture_root = temp_dir / "artifacts"
+        fixture_root.mkdir()
+
+        def run_probe(
+            body: str,
+            status: str = "Accepted",
+            exit_code: int = 0,
+        ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+            capture.write_text("", encoding="utf-8")
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DIST_DIR": str(temp_dir / "dist"),
+                    "FIXTURE_ROOT": str(fixture_root),
+                    "NOTARYTOOL_PRIVATE_KEY": str(notary_key),
+                    "NOTARYTOOL_KEY_ID": "fixture-key-id",
+                    "NOTARYTOOL_ISSUER_ID": "fixture-issuer-id",
+                    "NOTARY_STUB_EXIT": str(exit_code),
+                    "NOTARY_STUB_ID": submission_id,
+                    "NOTARY_STUB_STATUS": status,
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                    "TIP_BUILD_NUMBER": "35.1.1",
+                    "TIP_COMMIT": "1" * 40,
+                    "TIP_SHORT_SHA": "1" * 12,
+                    "XCRUN_CAPTURE": str(capture),
+                }
+            )
+            result = subprocess.run(
+                ["/bin/bash", "-c", 'source "$1"\n' + body, "bash", str(SCRIPT_DIR / "main_tip_release.sh")],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            calls = [line.split("\t") for line in capture.read_text(encoding="utf-8").splitlines()]
+            return result, calls
+
+        package_result, package_calls = run_probe(
+            'TRANSITION_PKG="$FIXTURE_ROOT/RepoPrompt-transition.pkg"\n'
+            'printf "fixture package\\n" > "$TRANSITION_PKG"\n'
+            "notarize_signed_app_for_rollout\n"
+            "submit_tip_package_notarization_phase\n"
+        )
+        self.assertEqual(package_result.returncode, 0, package_result.stderr)
+        package_submissions = [call for call in package_calls if call[:2] == ["notarytool", "submit"]]
+        self.assertEqual(len(package_submissions), 1, package_calls)
+        self.assertTrue(package_submissions[0][2].endswith(".pkg"), package_submissions)
+        self.assertNotIn(".zip", package_submissions[0][2])
+        self.assertEqual(package_result.stdout.count(f"Apple notarization submission ID: {submission_id}"), 1)
+        self.assertFalse(any(call[:2] == ["notarytool", "log"] for call in package_calls))
+
+        application_result, application_calls = run_probe(
+            "ROLLOUT_INSTALLATION_TYPE=application\n"
+            "ROLLOUT_ROLE=preparer\n"
+            'APP_BUNDLE="$FIXTURE_ROOT/RepoPrompt.app"\n'
+            'DMG="$FIXTURE_ROOT/RepoPrompt.dmg"\n'
+            'ARCHIVE_BASENAME="RepoPrompt-application"\n'
+            'TMP_DIR="$(mktemp -d)"\n'
+            'mkdir -p "$APP_BUNDLE"\n'
+            'printf "fixture dmg\\n" > "$DMG"\n'
+            "notarize_signed_app_for_rollout\n"
+            "notarize_application_dmg\n"
+        )
+        self.assertEqual(application_result.returncode, 0, application_result.stderr)
+        application_submissions = [call for call in application_calls if call[:2] == ["notarytool", "submit"]]
+        self.assertEqual(len(application_submissions), 2, application_calls)
+        self.assertTrue(application_submissions[0][2].endswith("-notarization.zip"))
+        self.assertTrue(application_submissions[1][2].endswith(".dmg"))
+        self.assertEqual(application_result.stdout.count(f"Apple notarization submission ID: {submission_id}"), 2)
+        stapled_paths = [call[2] for call in application_calls if call[:2] == ["stapler", "staple"]]
+        validated_paths = [call[2] for call in application_calls if call[:2] == ["stapler", "validate"]]
+        self.assertEqual(stapled_paths, [str(fixture_root / "RepoPrompt.app"), str(fixture_root / "RepoPrompt.dmg")])
+        self.assertEqual(validated_paths, stapled_paths)
+
+        rejected_result, rejected_calls = run_probe(
+            'TRANSITION_PKG="$FIXTURE_ROOT/rejected.pkg"\n'
+            'printf "fixture package\\n" > "$TRANSITION_PKG"\n'
+            "submit_tip_package_notarization_phase\n",
+            status="Invalid",
+        )
+        self.assertNotEqual(rejected_result.returncode, 0)
+        self.assertIn(f"Apple notarization submission ID: {submission_id}", rejected_result.stdout)
+        self.assertIn("Apple notarization failed for rejected.pkg", rejected_result.stderr)
+        self.assertEqual(
+            [call[:3] for call in rejected_calls if call[:2] == ["notarytool", "log"]],
+            [["notarytool", "log", submission_id]],
+        )
+
+        timeout_result, timeout_calls = run_probe(
+            'TRANSITION_PKG="$FIXTURE_ROOT/timeout.pkg"\n'
+            'printf "fixture package\\n" > "$TRANSITION_PKG"\n'
+            "submit_tip_package_notarization_phase\n",
+            status="In Progress",
+            exit_code=1,
+        )
+        self.assertNotEqual(timeout_result.returncode, 0)
+        self.assertIn(f"Apple notarization submission ID: {submission_id}", timeout_result.stdout)
+        self.assertEqual(
+            [call[:3] for call in timeout_calls if call[:2] == ["notarytool", "log"]],
+            [["notarytool", "log", submission_id]],
+        )
 
     def test_tip_publish_asset_inventory_is_exact(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -5631,8 +5787,7 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             '"BundleOverwriteAction": "upgrade"',
             'productbuild --package "$component_pkg" "$unsigned_product"',
             'productsign --sign "$installer_identity"',
-            'xcrun notarytool submit "$signed_product"',
-            'xcrun stapler staple "$signed_product"',
+            'xcrun stapler staple "$pkg"',
             'xcrun stapler validate "$pkg"',
             'mv "$signed_product" "$output"',
             'diff -qr "$expected_app" "$payload_app"',
@@ -5640,21 +5795,14 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         ):
             self.assertIn(marker, script)
         self.assertNotIn("pkgbuild --analyze", script)
-        self.assertNotIn('xcrun stapler staple "$output"', script)
+        self.assertNotIn("notarytool submit", script)
         self.assertNotIn("local package_infos=()", script)
         self.assertNotIn("plutil -replace 0.", script)
         self.assertLess(
-            script.index('xcrun notarytool submit "$signed_product"'),
-            script.index('xcrun stapler staple "$signed_product"'),
-        )
-        self.assertLess(
-            script.index('xcrun stapler staple "$signed_product"'),
-            script.index('validate_transition_pkg "$signed_product"'),
-        )
-        self.assertLess(
-            script.index('validate_transition_pkg "$signed_product"'),
+            script.index('productsign --sign "$installer_identity"'),
             script.index('mv "$signed_product" "$output"'),
         )
+        self.assertIn('staple)\n        [[ $# -eq 1 ]]', script)
         self.assertNotIn("skip-notarization", script)
         self.assertNotIn("allow-unstapled", script)
         for literal in ("com.repoprompt.ce", "69N6K965SF", "Developer ID Installer: Samuel Baron"):

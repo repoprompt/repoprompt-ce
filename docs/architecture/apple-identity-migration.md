@@ -41,8 +41,9 @@ operator-supplied commit field. GitHub's selected `main` SHA is the candidate, a
 requires that SHA, the workflow definition, the release-tooling checkout, and freshly fetched
 protected `origin/main` to be the same commit.
 
-Automatic and manual runs use one queue without cancelling in-flight release work, and publication
-is serialized. Before any draft mutation and again immediately before publication, the publisher
+Automatic and manual runs use separate single-entry rolling queues without cancelling in-flight
+release work, and publication remains serialized across both lanes. Before any draft mutation and
+again immediately before publication, the publisher
 rechecks protected `main`, validates the authenticated public Tip appcast/manifest, enforces the
 monotonic `P → T → S` state machine while allowing newer same-role builds with exact retained
 manifest bytes, and verifies retained enclosure size/SHA-256 from immutable release assets.
@@ -102,6 +103,14 @@ The protected release job builds a universal anchor from `Scripts/identity_migra
 trusted control-plane checkout. The minimal executable is never launched; it avoids embedding a second
 copy of the main app binary while still giving Security.framework a successor-signed designated
 requirement on both supported architectures.
+
+The transition packaging evidence chain is: validate the successor-signed app, build and
+Installer-sign the final PKG, submit that PKG once, print the accepted Apple submission ID, staple the
+PKG, then validate its ticket, package structure, and byte-identical app payload. Package mode does
+not create a temporary app notarization ZIP or separately staple the embedded app. Application mode
+continues to notarize/staple the app through a temporary ZIP and separately notarize/staple its DMG.
+Failed or non-accepted submissions with an Apple ID automatically emit the corresponding
+`notarytool log`.
 
 The Tip workflow performs the rehearsal under the protected `tip-release` environment. Its cheap
 role-aware credential preflight runs before the secret-free build and checks the policy projection plus
