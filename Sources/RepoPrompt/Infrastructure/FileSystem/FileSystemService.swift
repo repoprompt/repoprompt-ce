@@ -49,11 +49,64 @@ enum FileSystemMutationCompletion {
     }
 }
 
-final class FileSystemServiceFSEventCallbackContext {
-    weak var service: FileSystemService?
+final class FileSystemServiceFSEventCallbackContext: @unchecked Sendable {
+    let deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
 
-    init(service: FileSystemService) {
-        self.service = service
+    private let lock = NSLock()
+    private weak var storedService: FileSystemService?
+
+    init(
+        service: FileSystemService,
+        deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
+    ) {
+        storedService = service
+        self.deliveryGeneration = deliveryGeneration
+    }
+
+    var service: FileSystemService? {
+        lock.withLock { storedService }
+    }
+
+    func detach() {
+        lock.withLock { storedService = nil }
+    }
+}
+
+final class FileSystemServiceFSEventCallbackReleaseHandle: @unchecked Sendable {
+    private let callbackContextPointer: UnsafeMutableRawPointer
+
+    init(callbackContextPointer: UnsafeMutableRawPointer) {
+        self.callbackContextPointer = callbackContextPointer
+    }
+
+    func finish() {
+        Unmanaged<FileSystemServiceFSEventCallbackContext>
+            .fromOpaque(callbackContextPointer)
+            .release()
+    }
+}
+
+final class FileSystemServiceFSEventTeardownHandle: @unchecked Sendable {
+    private let stream: FSEventStreamRef
+    private let callbackContextPointer: UnsafeMutableRawPointer?
+
+    init(
+        stream: FSEventStreamRef,
+        callbackContextPointer: UnsafeMutableRawPointer?
+    ) {
+        self.stream = stream
+        self.callbackContextPointer = callbackContextPointer
+    }
+
+    func finish() {
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        if let callbackContextPointer {
+            Unmanaged<FileSystemServiceFSEventCallbackContext>
+                .fromOpaque(callbackContextPointer)
+                .release()
+        }
     }
 }
 
@@ -64,6 +117,11 @@ actor FileSystemService {
     nonisolated let diagnosticRootToken = UUID()
     nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
     nonisolated let watcherEarlyFilter: FileSystemWatcherEarlyFilter
+    nonisolated let fseventDeliveryBarrier = FSEventAsyncDeliveryBarrier()
+    nonisolated let fseventCallbackQueue = DispatchQueue(
+        label: "com.repoprompt.filesystem.fsevents.\(UUID().uuidString)",
+        qos: .utility
+    )
     static let maxPendingRawEvents = 50000
     static let overflowRescanEventFlags = FSEventStreamEventFlags(
         kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
@@ -243,6 +301,7 @@ actor FileSystemService {
 
     /// The FSEvent stream reference
     var fseventStreamRef: FSEventStreamRef?
+    var fseventStreamGeneration: UInt64 = 0
     /// The last durable FSEvents journal cut. Captured before the initial crawl so
     /// watcher startup can replay mutations that happen while the crawl is running.
     var nextFSEventStreamStartEventID: FSEventStreamEventId
@@ -277,8 +336,6 @@ actor FileSystemService {
     /// Retained FSEvent callback context. The context holds the service weakly so an
     /// un-stopped stream cannot keep the actor alive forever.
     var fseventCallbackContextPointer: UnsafeMutableRawPointer?
-    var seedWatcherActivationFlushInProgress = false
-    var seedWatcherActivationStopRequested = false
 
     /// The in-memory IgnoreRules instance for our path
     var ignoreRules: IgnoreRules

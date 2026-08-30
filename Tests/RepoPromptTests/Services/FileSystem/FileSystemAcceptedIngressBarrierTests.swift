@@ -607,65 +607,62 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         ])
     }
 
-    func testSeedWatcherFlushRunnerCompletesBeforeDeadline() async {
-        let runner = FileSystemSeedWatcherFlushRunner(
-            label: "com.repoprompt.tests.seed-watcher-flush-completes"
+    func testFSEventDeliveryBarrierAcceptsAnAlreadyDeliveredTargetWithoutWaiting() async {
+        let barrier = FSEventAsyncDeliveryBarrier(
+            scheduleDeadline: { _, _ in
+                XCTFail("An already-delivered target must not schedule a deadline")
+            }
         )
+        let generation = barrier.currentGeneration
+        barrier.recordDelivered(eventIDs: [40, 42], generation: generation)
 
-        let attempt = await runner.run(timeoutNanoseconds: NSEC_PER_SEC) {}
+        let delivered = await barrier.waitUntilDelivered(42, generation: generation)
 
-        XCTAssertTrue(attempt.completedBeforeDeadline)
-        await attempt.completion.value
+        XCTAssertTrue(delivered)
     }
 
-    func testSeedWatcherFlushRunnerRejectsConcurrentOperationAfterTimeout() async {
-        let runner = FileSystemSeedWatcherFlushRunner(
-            label: "com.repoprompt.tests.seed-watcher-flush-admission"
+    func testFSEventDeliveryBarrierResumesPendingWaiterBeforeLateDeadline() async {
+        let harness = FSEventDeliveryBarrierTestHarness()
+        let barrier = FSEventAsyncDeliveryBarrier(
+            scheduleDeadline: { _, action in
+                harness.scheduleDeadlineAfterDeliveringTarget(action)
+            }
         )
-        let started = DispatchSemaphore(value: 0)
-        let release = DispatchSemaphore(value: 0)
-        let unexpectedStart = DispatchSemaphore(value: 0)
+        let generation = barrier.currentGeneration
+        harness.install(barrier: barrier, generation: generation, targetEventID: 42)
 
-        let first = await runner.run(timeoutNanoseconds: 20 * NSEC_PER_MSEC) {
-            started.signal()
-            release.wait()
-        }
-        XCTAssertFalse(first.completedBeforeDeadline)
-        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+        let delivered = await barrier.waitUntilDelivered(42, generation: generation)
+        harness.fireScheduledDeadline()
 
-        let secondStart = DispatchTime.now().uptimeNanoseconds
-        let second = await runner.run(timeoutNanoseconds: NSEC_PER_SEC) {
-            unexpectedStart.signal()
-        }
-        let secondElapsed = DispatchTime.now().uptimeNanoseconds - secondStart
-
-        XCTAssertFalse(second.completedBeforeDeadline)
-        XCTAssertLessThan(secondElapsed, 100 * NSEC_PER_MSEC)
-        XCTAssertEqual(unexpectedStart.wait(timeout: .now()), .timedOut)
-        release.signal()
-        await first.completion.value
-        await second.completion.value
+        XCTAssertTrue(delivered)
     }
 
-    func testSeedWatcherFlushRunnerTimesOutWithoutBlockingCaller() async {
-        let runner = FileSystemSeedWatcherFlushRunner(
-            label: "com.repoprompt.tests.seed-watcher-flush-timeout"
+    func testFSEventDeliveryBarrierFailsClosedThroughInjectedDeadlineWithoutSleeping() async {
+        let barrier = FSEventAsyncDeliveryBarrier(
+            scheduleDeadline: { _, action in action() }
         )
-        let started = DispatchSemaphore(value: 0)
-        let release = DispatchSemaphore(value: 0)
-        let start = DispatchTime.now().uptimeNanoseconds
+        let generation = barrier.currentGeneration
 
-        let attempt = await runner.run(timeoutNanoseconds: 20 * NSEC_PER_MSEC) {
-            started.signal()
-            release.wait()
-        }
-        let elapsed = DispatchTime.now().uptimeNanoseconds - start
+        let delivered = await barrier.waitUntilDelivered(42, generation: generation)
 
-        XCTAssertFalse(attempt.completedBeforeDeadline)
-        XCTAssertLessThan(elapsed, 500 * NSEC_PER_MSEC)
-        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
-        release.signal()
-        await attempt.completion.value
+        XCTAssertFalse(delivered)
+    }
+
+    func testFSEventDeliveryBarrierResetRejectsStaleGenerationAndWatermark() async {
+        let barrier = FSEventAsyncDeliveryBarrier(
+            scheduleDeadline: { _, action in action() }
+        )
+        let originalGeneration = barrier.currentGeneration
+        barrier.recordDelivered(eventIDs: [100], generation: originalGeneration)
+        let originalDelivered = await barrier.waitUntilDelivered(90, generation: originalGeneration)
+        XCTAssertTrue(originalDelivered)
+
+        let replacementGeneration = barrier.reset()
+        let staleDelivered = await barrier.waitUntilDelivered(90, generation: originalGeneration)
+        let replacementDelivered = await barrier.waitUntilDelivered(90, generation: replacementGeneration)
+
+        XCTAssertFalse(staleDelivered)
+        XCTAssertFalse(replacementDelivered)
     }
 
     private func makeService(
@@ -752,5 +749,46 @@ private actor AsyncCounter {
 
     func value() -> Int {
         count
+    }
+}
+
+private final class FSEventDeliveryBarrierTestHarness: @unchecked Sendable {
+    private let lock = NSLock()
+    private var barrier: FSEventAsyncDeliveryBarrier?
+    private var generation: FSEventAsyncDeliveryBarrier.Generation?
+    private var targetEventID: FSEventStreamEventId = 0
+    private var scheduledDeadline: (@Sendable () -> Void)?
+
+    func install(
+        barrier: FSEventAsyncDeliveryBarrier,
+        generation: FSEventAsyncDeliveryBarrier.Generation,
+        targetEventID: FSEventStreamEventId
+    ) {
+        lock.withLock {
+            self.barrier = barrier
+            self.generation = generation
+            self.targetEventID = targetEventID
+        }
+    }
+
+    func scheduleDeadlineAfterDeliveringTarget(_ deadline: @escaping @Sendable () -> Void) {
+        let state = lock.withLock { () -> (
+            FSEventAsyncDeliveryBarrier?,
+            FSEventAsyncDeliveryBarrier.Generation?,
+            FSEventStreamEventId
+        ) in
+            scheduledDeadline = deadline
+            return (barrier, generation, targetEventID)
+        }
+        guard let barrier = state.0, let generation = state.1 else { return }
+        barrier.recordDelivered(eventIDs: [state.2], generation: generation)
+    }
+
+    func fireScheduledDeadline() {
+        let deadline = lock.withLock {
+            defer { scheduledDeadline = nil }
+            return scheduledDeadline
+        }
+        deadline?()
     }
 }

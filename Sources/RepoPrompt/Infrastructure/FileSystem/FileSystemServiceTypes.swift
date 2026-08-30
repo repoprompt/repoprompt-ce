@@ -47,6 +47,7 @@ public enum FileSystemDelta: Sendable, Equatable {
 enum FileSystemWatcherActivationError: LocalizedError, Equatable {
     case streamCreationFailed(path: String)
     case streamStartFailed(path: String)
+    case deliveryBarrierTimedOut(path: String)
 
     var errorDescription: String? {
         switch self {
@@ -54,6 +55,8 @@ enum FileSystemWatcherActivationError: LocalizedError, Equatable {
             "Failed to create FSEvent stream for \(path)"
         case let .streamStartFailed(path):
             "Failed to start FSEvent stream for \(path)"
+        case let .deliveryBarrierTimedOut(path):
+            "Timed out waiting for FSEvent stream delivery for \(path)"
         }
     }
 }

@@ -38,7 +38,18 @@ extension FileSystemService {
         }
         try startFSEventStream()
         if let stream = fseventStreamRef {
-            FSEventStreamFlushSync(stream)
+            let streamGeneration = fseventStreamGeneration
+            let deliveryGeneration = fseventDeliveryBarrier.currentGeneration
+            let flushTarget = FSEventStreamFlushAsync(stream)
+            let delivered = await fseventDeliveryBarrier.waitUntilDelivered(
+                flushTarget,
+                generation: deliveryGeneration
+            )
+            guard fseventStreamGeneration == streamGeneration else { return }
+            guard delivered else {
+                stopFSEventStream(expectedGeneration: streamGeneration)
+                throw FileSystemWatcherActivationError.deliveryBarrierTimedOut(path: path)
+            }
         }
         let acceptedCut = captureAcceptedWatcherWatermark()
         _ = await flushPendingEventsNow(throughAcceptedWatcherWatermark: acceptedCut)
@@ -337,8 +348,13 @@ extension FileSystemService {
         guard fseventStreamRef == nil else { return }
 
         watcherIngressMailbox.startAccepting()
+        fseventStreamGeneration &+= 1
+        let deliveryGeneration = fseventDeliveryBarrier.reset()
         fseventCallbackContextPointer = Unmanaged.passRetained(
-            FileSystemServiceFSEventCallbackContext(service: self)
+            FileSystemServiceFSEventCallbackContext(
+                service: self,
+                deliveryGeneration: deliveryGeneration
+            )
         ).toOpaque()
 
         var streamContext = FSEventStreamContext(
@@ -387,7 +403,7 @@ extension FileSystemService {
             throw FileSystemWatcherActivationError.streamCreationFailed(path: path)
         }
 
-        FSEventStreamSetDispatchQueue(stream, .main)
+        FSEventStreamSetDispatchQueue(stream, fseventCallbackQueue)
         #if DEBUG
             let didStart = watcherActivationFailurePointForTesting == .streamStart ? false : FSEventStreamStart(stream)
         #else
@@ -405,37 +421,61 @@ extension FileSystemService {
         fileSystemDebugLog("FSEventStream started for path: \(path) from event ID \(nextFSEventStreamStartEventID)")
     }
 
-    func stopFSEventStream() {
-        if seedWatcherActivationFlushInProgress {
-            seedWatcherActivationStopRequested = true
-            resetWatcherIngressState()
-            return
+    @discardableResult
+    func stopFSEventStream(expectedGeneration: UInt64? = nil) -> Bool {
+        if let expectedGeneration,
+           expectedGeneration != fseventStreamGeneration
+        {
+            return false
         }
-        if let stream = fseventStreamRef {
-            nextFSEventStreamStartEventID = max(
-                nextFSEventStreamStartEventID,
-                FSEventStreamGetLatestEventId(stream)
-            )
-            FSEventStreamStop(stream)
-            FSEventStreamFlushSync(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            fseventStreamRef = nil
+        fseventStreamGeneration &+= 1
+        fseventDeliveryBarrier.reset()
 
+        guard let stream = fseventStreamRef else {
             releaseFSEventCallbackContext()
-
-            fileSystemDebugLog("FSEventStream stopped for path: \(path)")
-        } else {
+            resetWatcherIngressState()
             fileSystemDebugLog("stream could not be stopped")
+            return true
         }
-
+        nextFSEventStreamStartEventID = max(
+            nextFSEventStreamStartEventID,
+            FSEventStreamGetLatestEventId(stream)
+        )
+        let callbackContextPointer = fseventCallbackContextPointer
+        if let callbackContextPointer {
+            Unmanaged<FileSystemServiceFSEventCallbackContext>
+                .fromOpaque(callbackContextPointer)
+                .takeUnretainedValue()
+                .detach()
+        }
+        fseventStreamRef = nil
+        fseventCallbackContextPointer = nil
         resetWatcherIngressState()
+
+        let teardown = FileSystemServiceFSEventTeardownHandle(
+            stream: stream,
+            callbackContextPointer: callbackContextPointer
+        )
+        fseventCallbackQueue.async {
+            teardown.finish()
+        }
+        fileSystemDebugLog("FSEventStream stopped for path: \(path)")
+        return true
     }
 
     private func releaseFSEventCallbackContext() {
         guard let ptr = fseventCallbackContextPointer else { return }
         fseventCallbackContextPointer = nil
-        Unmanaged<FileSystemServiceFSEventCallbackContext>.fromOpaque(ptr).release()
+        let context = Unmanaged<FileSystemServiceFSEventCallbackContext>
+            .fromOpaque(ptr)
+            .takeUnretainedValue()
+        context.detach()
+        let releaseHandle = FileSystemServiceFSEventCallbackReleaseHandle(
+            callbackContextPointer: ptr
+        )
+        fseventCallbackQueue.async {
+            releaseHandle.finish()
+        }
     }
 
     nonisolated static func deepCopySwiftString(_ source: String) -> String {
@@ -537,6 +577,19 @@ extension FileSystemService {
             eventFlags: eventFlags,
             eventIds: eventIds
         ) else { return }
+        let hasWrappedJournal = payload.entries.contains { entry in
+            (entry.flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)) != 0
+        }
+        defer {
+            if hasWrappedJournal {
+                service.fseventDeliveryBarrier.reset(ifCurrent: callbackContext.deliveryGeneration)
+            } else {
+                service.fseventDeliveryBarrier.recordDelivered(
+                    eventIDs: payload.entries.map(\.id),
+                    generation: callbackContext.deliveryGeneration
+                )
+            }
+        }
 
         #if DEBUG
             if payload.count != count {
@@ -559,9 +612,6 @@ extension FileSystemService {
         // A wrapped journal can never be proven safe by path filtering. Preserve
         // the signal so strict seeded replay rejects it even when its path would
         // otherwise be ignored by the immutable early-filter snapshot.
-        let hasWrappedJournal = payload.entries.contains { entry in
-            (entry.flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)) != 0
-        }
         let filterResult = if hasWrappedJournal {
             FileSystemWatcherEarlyFilter.Result(payload: payload, filteredEntryCount: 0)
         } else {
