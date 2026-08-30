@@ -330,16 +330,6 @@ public class AIQueriesService {
         return trimmed.hasPrefix("**") || trimmed.contains("****")
     }
 
-    static func assistantText(for result: AIStreamResult) -> String? {
-        guard result.type == "content" || result.type == "final_content",
-              let text = result.text,
-              !text.isEmpty
-        else {
-            return nil
-        }
-        return text
-    }
-
     static func transportActivityOutput(for result: AIStreamResult) -> ChatStreamOutput? {
         guard result.type == AIStreamResult.transportActivityType else { return nil }
         return ChatStreamOutput(
@@ -464,7 +454,7 @@ public class AIQueriesService {
 
                             var shouldYield = false
 
-                            if let text = Self.assistantText(for: result) {
+                            if let text = result.text, !text.isEmpty {
                                 let yieldText = await self.taskManager.bufferChunk(
                                     text,
                                     for: taskId,

@@ -256,7 +256,6 @@ struct AgentOraclePill: View {
     @State private var copyAllFeedback: CopyAllFeedback?
     @State private var autoScrollEnabled = false
     @State private var openRequestGeneration: UInt64 = 0
-    @State private var showRosterConfiguration = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     @ObservedObject private var settingsStore = GlobalSettingsStore.shared
     private var fontPreset: FontScalePreset {
@@ -345,41 +344,43 @@ struct AgentOraclePill: View {
         #if DEBUG
             let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.oracle")
         #endif
-        let cornerRadius = AgentPillMetrics.cornerRadius()
-        Button {
+        Group {
             if hasAnySessions {
-                openPopover(chatID: nil)
-            } else {
-                showRosterConfiguration = true
-            }
-        } label: {
-            HStack(spacing: 6) {
-                if isStreaming {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .scaleEffect(0.7)
-                } else {
-                    Image(systemName: "brain")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                        .foregroundStyle(.secondary)
+                let cornerRadius = AgentPillMetrics.cornerRadius()
+                Button {
+                    openPopover(chatID: nil)
+                } label: {
+                    HStack(spacing: 6) {
+                        if isStreaming {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .scaleEffect(0.7)
+                        } else {
+                            Image(systemName: "brain")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("Oracles · \(oracleCount)")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: isStreaming ? .semibold : .medium))
+                            .foregroundStyle(isStreaming ? .primary : .secondary)
+                    }
+                    .padding(.horizontal, AgentPillMetrics.horizontalPadding())
+                    .frame(height: AgentPillMetrics.height())
+                    .background(AnyShapeStyle(.ultraThinMaterial))
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .stroke(isStreaming ? Color.purple.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isStreaming ? 1 : 0.5)
+                    )
+                    .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
                 }
-                Text("Oracles · \(oracleCount)")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: isStreaming ? .semibold : .medium))
-                    .foregroundStyle(isStreaming ? .primary : .secondary)
+                .buttonStyle(.plain)
+                .hoverTooltip(isStreaming ? "Oracles are thinking — click to view progress" : "Open Oracle chats for this tab", .top)
+                .animation(.easeInOut(duration: 0.2), value: isStreaming)
+            } else {
+                Color.clear.frame(width: 0, height: 0)
             }
-            .padding(.horizontal, AgentPillMetrics.horizontalPadding())
-            .frame(height: AgentPillMetrics.height())
-            .background(AnyShapeStyle(.ultraThinMaterial))
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(isStreaming ? Color.purple.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isStreaming ? 1 : 0.5)
-            )
-            .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
         }
-        .buttonStyle(.plain)
-        .hoverTooltip(isStreaming ? "Oracles are thinking — click to view progress" : "Open Oracle chats and roster", .top)
-        .animation(.easeInOut(duration: 0.2), value: isStreaming)
         .onReceive(NotificationCenter.default.publisher(for: .showAgentOraclePopover)) { note in
             if let route = AgentOraclePopoverRoute(notificationUserInfo: note.userInfo) {
                 guard route.windowID == windowID,
@@ -403,9 +404,6 @@ struct AgentOraclePill: View {
         .popover(item: $presentedPopover, arrowEdge: .bottom) { presentation in
             oraclePopoverContent(presentation)
         }
-        .popover(isPresented: $showRosterConfiguration, arrowEdge: .bottom) {
-            oracleRosterConfiguration
-        }
         .onChange(of: currentTabID) { _, _ in
             openRequestGeneration &+= 1
             reconcilePresentedSession()
@@ -424,40 +422,6 @@ struct AgentOraclePill: View {
         .onChange(of: activeRunID) { _, _ in
             reconcilePresentedSession()
         }
-    }
-
-    private var oracleRosterConfiguration: some View {
-        let profile = settingsStore.effectiveAgentModelsProfile(
-            workspaceID: oracleViewModel.workspaceManager.activeWorkspaceID
-        )
-        let models = [profile.planningModelRaw] + profile.additionalOracleModelRaws.map(Optional.some)
-        return VStack(alignment: .leading, spacing: 10) {
-            Text("Oracles")
-                .font(.headline)
-            ForEach(Array(models.enumerated()), id: \.offset) { index, model in
-                HStack {
-                    Text(OracleViewModel.oracleLabel(laneIndex: index))
-                        .font(.callout.weight(.medium))
-                    Spacer()
-                    Text(model ?? "Not configured")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            Divider()
-            Button("Open Agent Models Settings") {
-                showRosterConfiguration = false
-                NotificationCenter.default.post(
-                    name: .showAgentModelsSettingsTab,
-                    object: nil,
-                    userInfo: ["windowID": windowID]
-                )
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding(14)
-        .frame(width: 380)
     }
 
     private func groupMemberSessions(for session: ChatSession) -> [ChatSession] {

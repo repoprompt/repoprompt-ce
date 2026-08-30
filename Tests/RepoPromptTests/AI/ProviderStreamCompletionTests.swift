@@ -23,28 +23,6 @@ final class ProviderStreamCompletionTests: XCTestCase {
         XCTAssertFalse(AnthropicProvider.isSuccessfulCompletionStopReason("tool_use"))
     }
 
-    func testAIQueriesBuffersOnlySemanticAssistantText() {
-        XCTAssertEqual(
-            AIQueriesService.assistantText(for: AIStreamResult(type: "content", text: "No.")),
-            "No."
-        )
-        XCTAssertEqual(
-            AIQueriesService.assistantText(for: AIStreamResult(type: "final_content", text: "Final answer")),
-            "Final answer"
-        )
-        XCTAssertNil(
-            AIQueriesService.assistantText(
-                for: AIStreamResult(type: "status", text: "RepoPrompt Agent File Tools Plan")
-            )
-        )
-        XCTAssertNil(
-            AIQueriesService.assistantText(for: AIStreamResult(type: "system", text: "provider diagnostic"))
-        )
-        XCTAssertNil(
-            AIQueriesService.assistantText(for: AIStreamResult(type: "unknown", text: "not assistant text"))
-        )
-    }
-
     func testAIQueriesNormalizesIncompleteTerminationWithoutMarkingSuccess() throws {
         let result = AIStreamResult(
             type: AIStreamResult.incompleteType,
