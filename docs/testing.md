@@ -47,33 +47,20 @@ make dev-test
 make dev-provider-test
 ```
 
-A focused green run is evidence for the named contract, not a substitute for full-suite or CI coverage when the changed boundary is broad. The hosted app-test workflow discovers current methods through `swift test list`, counts methods per suite, assigns suites to four deterministic method-count-weighted LPT shards, and executes each suite in its own XCTest process. That CI mechanism is not a contributor-maintained registry.
+A focused green run is evidence for the named contract, not a substitute for full-suite or CI coverage when the changed boundary is broad. The hosted root-test workflow discovers one current root XCTest population through `swift test list`, counts methods per suite, assigns every discovered suite to one of four deterministic method-count-weighted LPT shards, and executes each suite in its own XCTest process. Root CI has no contract/integration tier split or contributor-maintained registry; provider-package tests remain a separate lane.
 
 ## Codemap-sensitive changes
 
 Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.
 
-For local strict codemap E2E coverage, opt in with either `RPCE_RUN_CODEMAP_E2E=1` or the marker file `/tmp/RepoPromptCE-codemap-e2e-opt-in`:
+Use the retained deterministic CodeMap tests for local coverage:
 
 ```bash
-RPCE_RUN_CODEMAP_E2E=1 make dev-test FILTER=ContextBuilderWorktreeInheritanceTests
-touch /tmp/RepoPromptCE-codemap-e2e-opt-in && make dev-test FILTER=ContextBuilderWorktreeInheritanceTests ; rm /tmp/RepoPromptCE-codemap-e2e-opt-in
+make dev-test FILTER=CodeMapGoldenTests
+make dev-test FILTER=CodeMapArtifactContainerTests
 ```
 
-Run this strict gate when changes touch CodeMap generation, syntax parsing, or Tree-sitter support. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
-
-## Scale-sensitive contract gates
-
-Routine root tests should use lower-cost boundary variants when they still exercise the same spill, merge, streaming, or retained-reader path. High-cardinality contracts remain explicit opt-ins:
-
-```bash
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.GitLoadedRootAuthorityEvidenceTests/testHundredThousandLogicalCandidatesAndTreeRecordsStayByteBoundedWhenEnabled
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootTargetSeedPlanManifestTests/testManifestScaleStreamsOneHundredThousandOrMillionWhenEnabled
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.FileSystemAcceptedIngressBarrierTests/testSyntheticHundredThousandPathReplayWhenEnabled
-```
-
-Use direct `swift test` only for these explicit environment-gated scale checks so the gate reaches the XCTest process. Prefer `make dev-test` for lower-cost routine variants and ordinary focused validation.
+Run these when changes touch CodeMap generation, syntax parsing, artifact storage, or Tree-sitter support. The packaged-app live codemap projection-demand gate is documented later in this guide.
 
 ## Performance and optimization evidence
 
@@ -93,35 +80,6 @@ Record the saved workspace file hash and `git worktree list --porcelain` before 
 4. Recheck `git worktree list --porcelain`, the saved workspace file hash, and workspace catalog count. Require no added worktree, no changed saved workspace, no temporary workspace, and no durable worktree binding. Repeat once with an explicit different existing selector and require only that session's physical root to change.
 
 The Codex Desktop pre-start app-CLI isolation fallback remains in place through this acceptance and the release that contains the fix. Removing or bypassing it is a separate post-release change after the recorded acceptance passes; a failed or unavailable direct-headless check leaves the fallback unchanged.
-
-## Live Agent Mode file-tool performance diagnostic
-
-`Scripts/benchmark_agent_mode_file_tools.py` measures paired `file_search` and `read_file` calls from exactly two concurrent Explore sessions: the normal workspace root and a linked worktree. It requires an already-running RepoPrompt CE DEBUG app and never launches, stops, or relaunches the app.
-
-```bash
-python3 Scripts/benchmark_agent_mode_file_tools.py \
-  --window-id 1 \
-  --marker debugDiagnosticsToolName \
-  --path Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnostics.swift
-```
-
-By default the driver creates a detached temporary worktree and removes it only when it remains clean and both sessions are terminal; pass `--worktree /absolute/path` to use and preserve an existing linked worktree from the same Git common directory. The manifest records the benchmark worktree's SHA and dirty state. Each run writes a private (`0700`), non-overwriting directory under `/tmp/rpce-agent-file-tools/v1/`; use `--output-root` to override it. Artifacts include provenance, raw CLI calls and agent logs, capture/runtime snapshots, `samples.ndjson`, and `summary.json`, and may contain sensitive workspace snippets, so review them before sharing. Samples and exact workload counts/order come from DEBUG capture timelines (`Received` through the `event_completion` `MainActorExited`); start/wait binding metadata independently proves local-versus-worktree route provenance, while compacted agent logs validate only surfaced call arguments and the final response. Latency is report-only and has no arbitrary failure threshold. Harness, tool-count, nonempty-marker, read-success, and cleanup invariants are enforced.
-
-Offline replay performs no CLI, model, or app calls and accepts either a checked-in fixture or a prior artifact directory:
-
-```bash
-python3 Scripts/benchmark_agent_mode_file_tools.py \
-  --replay Scripts/Fixtures/agent-mode-file-tools/v1/paired-success
-```
-
-The checked-in success and negative fixtures are privacy-scrubbed subsets derived from real paired captures. They retain relevant event/stage timing shapes but contain no raw agent prose, user paths, UUIDs, or raw logs.
-
-Pure harness validation:
-
-```bash
-python3 -m py_compile Scripts/benchmark_agent_mode_file_tools.py Scripts/test_agent_mode_file_tools_benchmark.py
-python3 Scripts/test_agent_mode_file_tools_benchmark.py
-```
 
 ## Live large-workspace worktree-startup diagnostic
 
@@ -791,29 +749,6 @@ correctness evidence yields `incomplete`. Any recorded invalid attempt yields
 `fail`; it is never silently excluded from campaign validity. Never infer a gate
 from configured route names, untyped text, generic tool failures, or additional
 valid samples.
-
-### 100k and 1M synthetic hooks
-
-The routine namespace-manifest scale contract uses a lower record count with a
-small batch size so ordinary root-suite timing still exercises exact record/read
-counts, more than 100 initial spill runs, and bounded buffer bytes:
-
-```bash
-make dev-test \
-  FILTER=RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticEntriesRemainWithinConfiguredBatchBytes
-```
-
-The 100K/configured namespace-manifest version uses the same executable oracle
-and remains separate from ordinary root-suite timing:
-
-```bash
-RPCE_RUN_SCALE_TESTS=1 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
-REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=1000000 swift test --filter RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesWhenEnabled
-```
-
-These hooks validate spill/streaming scale, not live Agent Mode latency. The
-live 100k/1M workspace campaign still needs the route, resource, correctness,
-and teardown thresholds above.
 
 Script-only validation, with no app or CLI calls:
 

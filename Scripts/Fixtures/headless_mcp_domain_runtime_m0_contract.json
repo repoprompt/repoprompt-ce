@@ -333,12 +333,7 @@
     "presenter": "WorkspaceApprovalManager",
     "ordering": "single_fifo_active_request",
     "late_response": "ignored",
-    "presenter_loss": "default_deny",
-    "existing_test": {
-      "citation": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay",
-      "source_file": "Tests/RepoPromptTests/MCP/WorkspaceApprovalCancellationTests.swift"
-    },
-    "m4_owner_test": "RepoPromptDomainRuntimeTests.DomainMutationApprovalBrokerTests/testRequestsArePresentedAndSettledInFIFOOrder"
+    "presenter_loss": "default_deny"
   },
   "main_actor": {
     "mcp_local_declaration_count": 42,
@@ -613,10 +608,6 @@
       "post_drain_refresh": "bound_workspace_tab_selection_and_revision_only"
     },
     "request_hops": ["main_actor_scheduled", "main_actor_entered", "main_actor_exited"],
-    "existing_test": {
-      "citation": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
-      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift"
-    },
     "per_tool_source_guarded_hops": {
       "app_settings": ["GlobalSettingsStore"],
       "bind_context": ["WindowRoutingService"],
@@ -684,10 +675,6 @@
       {
         "citation": "RepoPromptTests.JSONRPCBridgeLedgerTests/testCleanEOFAndEOFWithOutstandingWorkAreDistinguished",
         "source_file": "Tests/RepoPromptTests/MCP/Control/JSONRPCBridgeLedgerTests.swift"
-      },
-      {
-        "citation": "RepoPromptTests.ProcessLauncherDescriptorInheritanceTests/testActiveUnixSocketTransportIsNotInheritedAndObservesEOFWhileSpawnedChildRemainsAlive",
-        "source_file": "Tests/RepoPromptTests/MCP/Control/ProcessLauncherDescriptorInheritanceTests.swift"
       }
     ]
   },

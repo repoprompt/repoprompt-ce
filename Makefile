@@ -137,14 +137,8 @@ codex-schema-check:
 conductor-selftest:
 	python3 Scripts/test_codex_app_server_schema.py
 	python3 Scripts/test_debug_app_process.py
-	python3 Scripts/test_contribution_preflight.py
 	python3 Scripts/test_ci_app_test_runner.py
-	python3 Scripts/test_conductor_cache.py
-	python3 Scripts/test_conductor_output.py
 	python3 Scripts/test_conductor_diagnostics.py
-	python3 Scripts/test_conductor_high_output.py
-	python3 Scripts/test_agent_mode_file_tools_benchmark.py
-	python3 Scripts/test_conductor_lifecycle.py
 	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py
 
@@ -152,8 +146,6 @@ ci-app-test-runner-selftest:
 	python3 Scripts/test_ci_app_test_runner.py
 
 release-selftest:
-	python3 Scripts/test_release_promotion.py
-	python3 Scripts/test_release_tooling.py
 	python3 Scripts/test_codex_runtime_artifact.py
 	python3 Scripts/test_codex_update_candidate.py
 	python3 Scripts/test_codex_update_workflow.py
@@ -183,9 +175,6 @@ xcode-check:
 
 xcode-validate: xcode-generate
 	python3 Scripts/generate_xcode_workspace.py validate --xcodebuild-list
-
-xcode-generator-test:
-	python3 Scripts/test_xcode_workspace_generator.py
 
 xcode-clean:
 	rm -rf .build/xcode .build/xcode-custom

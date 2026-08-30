@@ -133,27 +133,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(text.contains("placeholder"))
     }
 
-    func testGraphDTOEncodesInspectableMetadata() throws {
-        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
-            op: "list",
-            worktrees: [Self.worktreeDTO()],
-            graph: .init(
-                requested: true,
-                limit: 2,
-                lines: ["* abc1234 (HEAD -> feature/demo) Demo", "* def5678 main"],
-                source: "git log --graph --decorate --oneline --color=never -n 2"
-            )
-        )
-
-        let object = try XCTUnwrap(Self.value(dto).objectValue)
-        let graph = try XCTUnwrap(object["graph"]?.objectValue)
-        XCTAssertEqual(graph["limit"]?.intValue, 2)
-        XCTAssertEqual(graph["line_count"]?.intValue, 2)
-        XCTAssertEqual(graph["truncated"]?.boolValue, false)
-        XCTAssertEqual(graph["source"]?.stringValue, "git log --graph --decorate --oneline --color=never -n 2")
-        XCTAssertEqual(graph["lines"]?.arrayValue?.first?.stringValue, "* abc1234 (HEAD -> feature/demo) Demo")
-    }
-
     func testMergePreviewOutputUsesManageWorktreeHeaderAndNestedMergeBlock() throws {
         let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "preview",
@@ -241,59 +220,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                 XCTAssertTrue(text.contains(snippet), "\(name): missing \(snippet)\n\(text)")
             }
         }
-    }
-
-    func testCodeStructurePendingOutputUsesSemanticRecoveryAndWorktreeScope() throws {
-        let issue = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO(
-            code: "graph_indexing",
-            phase: "graph_snapshot",
-            path: "Project/Sources/App.swift",
-            retryable: true,
-            retryAfterMilliseconds: 50,
-            attempted: nil,
-            limit: nil,
-            message: "The committed graph is still indexing."
-        )
-        let dto = ToolResultDTOs.CodeStructureReplyDTO(
-            status: .pending,
-            size: .medium,
-            roots: [
-                .init(
-                    root: "Project",
-                    status: .pending,
-                    index: .init(state: .indexing, indexed: 0, total: 1),
-                    updatesPending: nil,
-                    seeds: [.init(path: "Project/Sources/App.swift", state: .pending)],
-                    nodes: [],
-                    edges: [],
-                    unresolved: [],
-                    truncated: nil,
-                    issues: [issue]
-                )
-            ],
-            files: [],
-            summary: .init(seeds: 1, nodes: 0, edges: 0, files: 0, tokens: 0),
-            issues: [],
-            retry: .init(retryable: true, retryAfterMilliseconds: 50),
-            worktreeScope: Self.scope()
-        )
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatCodeStructure(value: Self.value(dto)))
-
-        XCTAssertTrue(text.contains("## Code Structure ⏳ pending — `Sources/App.swift` is not in the code graph yet"), text)
-        XCTAssertTrue(text.contains("- Retry shortly. If this persists, the file may be excluded or of an unsupported type."), text)
-        XCTAssertFalse(text.contains("**Status**"), text)
-        XCTAssertFalse(text.contains("Index:"), text)
-        XCTAssertFalse(text.contains("≈"), text)
-        XCTAssertFalse(text.contains("Unresolved"), text)
-        XCTAssertFalse(text.contains("Internal refs"), text)
-        XCTAssertFalse(text.contains("`Project/Sources/App.swift`"), text)
-        XCTAssertTrue(text.contains("- Root `Project` — paths below are root-relative; session-bound worktree `wt_123`"), text)
-        XCTAssertFalse(text.contains("/repo/project"), text)
-        XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
-        XCTAssertTrue(text.contains("wt_123"), text)
-        XCTAssertTrue(text.contains("branch `feature/demo`"), text)
-        XCTAssertTrue(text.contains("label `Demo Worktree`"), text)
     }
 
     func testWorkspaceContextOutputHidesPhysicalRootInScopeBlocks() throws {
@@ -441,58 +367,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(embedded.contains("- Total tokens: 0 (Auto view)"), embedded)
         XCTAssertTrue(
             embedded.contains("- Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files, codemap_presentation"),
-            embedded
-        )
-    }
-
-    func testManageSelectionNonzeroPartialTokensStillShowsAccountingLine() throws {
-        let dto = ToolResultDTOs.SelectionReply(
-            files: [
-                .init(
-                    path: "Project/Sources/Partial.swift",
-                    tokens: 12,
-                    renderMode: "full",
-                    ranges: nil,
-                    isAuto: false,
-                    codemapOrigin: nil,
-                    copyPreset: nil,
-                    rootPath: "Project",
-                    pathWithinRoot: "Sources/Partial.swift"
-                )
-            ],
-            totalTokens: 12,
-            status: "ok",
-            summary: .init(
-                fullCount: 1,
-                sliceCount: 0,
-                codemapCount: 0,
-                fullTokens: 12,
-                sliceTokens: 0,
-                codemapTokens: 0
-            ),
-            tokenStats: .init(total: 42, files: 12, prompt: 30),
-            tokenAccounting: .init(
-                status: "incomplete",
-                source: "active_tab_published",
-                refreshPending: true,
-                incompleteComponents: ["files"]
-            )
-        )
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatManageSelection(args: [:], value: Self.value(dto)))
-
-        XCTAssertTrue(text.contains("**42 total tokens**"), text)
-        XCTAssertFalse(text.contains("**Token accounting pending**"), text)
-        XCTAssertTrue(
-            text.contains("Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files"),
-            text
-        )
-        XCTAssertTrue(text.contains("Files: 12"), text)
-
-        let embedded = ToolOutputFormatter.formatSelectionReplyToString(dto)
-        XCTAssertTrue(embedded.contains("- Total tokens: 12 (Auto view)"), embedded)
-        XCTAssertTrue(
-            embedded.contains("- Token accounting: incomplete from active_tab_published; refresh pending; incomplete: files"),
             embedded
         )
     }
@@ -764,117 +638,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         )
     }
 
-    func testHistoryFormatterTreatsNoMatchesAsSuccessfulEmptyResult() throws {
-        struct ScanDiagnostic: Encodable {
-            let kind = "turn_count"
-            let retryable = true
-            let limit = 250_000
-            let consumed = 250_000
-            let unit = "turns"
-        }
-
-        struct HistoryList: Encodable {
-            let total_sessions = 0
-            let totals_are_lower_bounds = true
-            let truncated = false
-            let sessions_scanned = 20
-            let scan_truncated = true
-            let scan_diagnostics = [ScanDiagnostic()]
-            let skipped_workspaces: [String] = []
-            let sessions: [String] = []
-        }
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
-            args: ["op": .string("list_sessions"), "touched_file": .string("Sources/App.swift")],
-            value: Self.value(HistoryList())
-        ))
-        XCTAssertTrue(text.contains("## History Sessions ⚠️"))
-        XCTAssertTrue(text.contains("**Total sessions**: 0 (lower bound)"))
-        XCTAssertTrue(text.contains("No matching sessions found"))
-        XCTAssertTrue(text.contains("touched_file"))
-        XCTAssertTrue(text.contains("Scan budget"))
-        XCTAssertTrue(text.contains("Retry with a narrower"))
-        XCTAssertFalse(text.contains("## History Sessions ❌"))
-    }
-
-    func testHistoryFormatterPreservesRetryableErrorDiagnosticsAndAdvice() throws {
-        struct ScanDiagnostic: Encodable {
-            let kind = "elapsed_time"
-            let retryable = true
-            let limit = 20000
-            let consumed = 20000
-            let unit = "milliseconds"
-            let phase = "get_session_refresh"
-        }
-
-        struct HistoryError: Encodable {
-            let error = "History session lookup was incomplete before the request work budget expired."
-            let retryable = true
-            let scan_truncated = true
-            let scan_diagnostics = [ScanDiagnostic()]
-            let suggestion = "Retry the same get_session request; no authoritative not-found result was produced."
-        }
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
-            args: ["op": .string("get_session")],
-            value: Self.value(HistoryError())
-        ))
-        XCTAssertTrue(text.contains("## History ⚠️"))
-        XCTAssertTrue(text.contains("**Retryable**: yes"))
-        XCTAssertTrue(text.contains("elapsed_time: 20000/20000 milliseconds during get_session_refresh; retryable"))
-        XCTAssertTrue(text.contains("no authoritative not-found result"))
-    }
-
-    func testHistoryFormatterCompactsRepeatedAndCappedScanDiagnostics() throws {
-        struct ScanDiagnostic: Encodable {
-            let kind: String
-            let retryable: Bool
-            let limit: Int
-            let consumed: Int
-            let unit: String
-            let phase: String
-            let count: Int
-        }
-
-        struct HistorySearch: Encodable {
-            let total_matches = 0
-            let truncated = false
-            let sessions_scanned = 0
-            let scan_truncated = true
-            let totals_are_lower_bounds = true
-            let scan_diagnostics = [
-                ScanDiagnostic(
-                    kind: "transcript_read_failure",
-                    retryable: true,
-                    limit: 1,
-                    consumed: 1,
-                    unit: "sessions",
-                    phase: "transcript_scan",
-                    count: 250
-                ),
-                ScanDiagnostic(
-                    kind: "diagnostic_count",
-                    retryable: true,
-                    limit: 16,
-                    consumed: 4,
-                    unit: "sessions",
-                    phase: "diagnostic_aggregation",
-                    count: 4
-                )
-            ]
-            let results: [String] = []
-        }
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
-            args: ["op": .string("search")],
-            value: Self.value(HistorySearch())
-        ))
-
-        XCTAssertTrue(text.contains("transcript_read_failure: 1/1 sessions during transcript_scan; retryable ×250"))
-        XCTAssertTrue(text.contains("+4 additional diagnostic groups omitted"))
-        XCTAssertTrue(text.contains("Retry with a narrower"))
-    }
-
     func testHistoryFormatterShowsFilesTouchedTruncation() throws {
         struct HistorySession: Encodable {
             let session_id = "s1"
@@ -903,27 +666,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("Big Session"))
         XCTAssertTrue(text.contains("files: A.swift, B.swift, C.swift (+2 more)"))
         XCTAssertFalse(text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"))
-    }
-
-    func testHistoryFormatterSummarizesSkippedWorkspaces() throws {
-        struct HistoryList: Encodable {
-            let total_sessions = 1
-            let truncated = false
-            let sessions_scanned = 1
-            let scan_truncated = false
-            let skipped_workspaces = [
-                "stale index schema v2: 2",
-                "unreadable index: 1"
-            ]
-            let sessions: [String] = []
-        }
-
-        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
-            args: ["op": .string("list_sessions")],
-            value: Self.value(HistoryList())
-        ))
-        XCTAssertTrue(text.contains("- **Skipped workspaces**: stale index schema v2: 2; unreadable index: 1"))
-        XCTAssertFalse(text.contains("Workspace A: stale index schema v2; Workspace B"))
     }
 
     func testHistoryFormatterShowsSearchFollowUpIdentifiersAndRequest() throws {

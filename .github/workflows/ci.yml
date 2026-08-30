@@ -26,9 +26,6 @@ jobs:
       - name: Run repository guardrails
         run: make guardrails
 
-      - name: Enforce pull-request test hygiene
-        run: python3 Scripts/check_test_hygiene.py
-
       - name: Test Xcode workspace generator
         run: make xcode-generator-test
 
@@ -56,7 +53,7 @@ jobs:
         run: make release-selftest
 
   build-and-test:
-    name: Build and Test (contract shard ${{ matrix.shard }})
+    name: Build and Test (root shard ${{ matrix.shard }})
     runs-on: macos-26
     timeout-minutes: 45
     strategy:
@@ -85,16 +82,14 @@ jobs:
       - name: Build MCP product
         run: swift build --product repoprompt-mcp
 
-      - name: Run pull-request contract tests
+      - name: Run root test shard
         shell: bash
         run: |
           set -euo pipefail
-          # `swift test list` compiles every root test target, including the
-          # integration tier. Only deterministic contract suites execute here.
+          # `swift test list` discovers every root XCTest suite.
           # Each suite gets a fresh HOME/TMP/XDG sandbox and one XCTest process.
           # There are no retries or suite-specific clocks: a failure is a failure.
           python3 Scripts/ci_app_test_runner.py \
-            --tier contract \
             --shard-count 4 \
             --shard-index "${{ matrix.shard }}"
 

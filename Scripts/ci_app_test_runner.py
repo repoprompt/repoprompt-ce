@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic hosted CI runner for RepoPrompt CE XCTest tiers."""
+"""Deterministic hosted CI runner for RepoPrompt CE XCTest suites."""
 
 from __future__ import annotations
 
@@ -12,8 +12,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence, TextIO
-
-from ci_test_policy import ALL_TIER, TIERS, classify_suite, suites_for_tier
 
 XCTEST_BUNDLE_GLOB = "*.xctest"
 CommandExecutor = Callable[[Sequence[str], Path | None, Mapping[str, str]], int]
@@ -176,40 +174,8 @@ def resolve_bundle_selection(
     swift_binary: str,
     cwd: Path | None,
     suites: Sequence[str],
-    explicit_bundle: Path | None,
-    explicit_bundle_name: str | None,
-    disable_bundle_discovery: bool,
 ) -> BundleSelection:
-    if explicit_bundle is not None:
-        return BundleSelection(explicit_bundle, {}, xctest_binary_path())
-    if disable_bundle_discovery:
-        return BundleSelection(None, {}, None)
-
     discovered = discover_test_bundles(swift_binary, cwd)
-    if explicit_bundle_name is not None:
-        requested_name = (
-            explicit_bundle_name
-            if explicit_bundle_name.endswith(".xctest")
-            else f"{explicit_bundle_name}.xctest"
-        )
-        matches = [path for path in discovered.values() if path.name == requested_name]
-        if len(matches) != 1:
-            raise ValueError(
-                f"--test-bundle-name {explicit_bundle_name} did not resolve exactly one bundle"
-            )
-        requested_target = requested_name.removesuffix(".xctest")
-        foreign_suites = [
-            suite
-            for suite in suites
-            if test_target_for_suite(suite) != requested_target
-        ]
-        if foreign_suites:
-            raise ValueError(
-                f"--test-bundle-name {explicit_bundle_name} cannot run suites from "
-                f"other targets: {foreign_suites[:5]}"
-            )
-        return BundleSelection(matches[0], {}, xctest_binary_path())
-
     if not discovered:
         return BundleSelection(None, {}, None)
     if len(discovered) == 1:
@@ -314,11 +280,9 @@ def run_selected_suites(
     cwd: Path | None,
     bundle_selection: BundleSelection,
     sandbox_root: Path,
-    keep_going: bool,
     executor: CommandExecutor = execute_command,
     output: TextIO = sys.stdout,
 ) -> int:
-    failures: list[tuple[str, int]] = []
     for suite in suites:
         command = command_for_suite(
             suite,
@@ -333,65 +297,40 @@ def run_selected_suites(
 
         if return_code == 0:
             continue
-        failures.append((suite, return_code))
         print(
             f"::error::{suite} failed with exit status {return_code}",
             file=output,
             flush=True,
         )
-        if not keep_going:
-            return return_code or 1
-
-    if failures:
-        print("Failed test suites:", file=output)
-        for suite, return_code in failures:
-            print(f"  {suite}: exit {return_code}", file=output)
-        return 1
+        return return_code or 1
     return 0
 
 
-def print_selection(
+def print_selection_summary(
     *,
-    tier: str,
     selection: ShardSelection,
     suite_methods: Mapping[str, Sequence[str]],
     shard_count: int,
     shard_index: int,
-    list_only: bool,
     output: TextIO,
 ) -> None:
     method_count = sum(len(suite_methods[suite]) for suite in selection.suites)
     print(
-        f"Selected {tier} test shard {shard_index}/{shard_count}: "
+        f"Selected test shard {shard_index}/{shard_count}: "
         f"{len(selection.suites)} suites, {method_count} methods; "
         f"all shard method loads={list(selection.method_loads)}",
         file=output,
     )
-    if not list_only:
-        return
-    for suite in selection.suites:
-        decision = classify_suite(suite)
-        print(
-            f"{suite}: {len(suite_methods[suite])} methods; "
-            f"tier={decision.tier}; reason={decision.reason}",
-            file=output,
-        )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run deterministic RepoPrompt CE XCTest contract or integration tiers."
+        description="Run deterministic RepoPrompt CE XCTest suites."
     )
-    parser.add_argument("--tier", choices=TIERS, default="contract")
     parser.add_argument("--swift-binary", default="swift")
     parser.add_argument("--cwd", type=Path, default=None)
-    parser.add_argument("--test-bundle", type=Path, default=None)
-    parser.add_argument("--test-bundle-name", default=None)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=1)
-    parser.add_argument("--no-xctest-bundle", action="store_true")
-    parser.add_argument("--keep-going", action="store_true")
-    parser.add_argument("--list-only", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -411,7 +350,7 @@ def main(argv: Sequence[str]) -> int:
             print(error.stderr, end="", file=sys.stderr)
         return error.returncode or 1
 
-    selected_suites = suites_for_tier(suite_methods, args.tier)
+    selected_suites = tuple(sorted(suite_methods))
     method_counts = {
         suite: len(suite_methods[suite])
         for suite in selected_suites
@@ -426,19 +365,14 @@ def main(argv: Sequence[str]) -> int:
         print(f"::error::{error}")
         return 2
 
-    print_selection(
-        tier=args.tier,
+    print_selection_summary(
         selection=selection,
         suite_methods=suite_methods,
         shard_count=args.shard_count,
         shard_index=args.shard_index,
-        list_only=args.list_only,
         output=sys.stdout,
     )
-    if args.tier != ALL_TIER:
-        excluded_count = len(suite_methods) - len(selected_suites)
-        print(f"Policy excluded {excluded_count} suite(s) from this tier.")
-    if args.list_only or not selection.suites:
+    if not selection.suites:
         return 0
 
     try:
@@ -446,22 +380,18 @@ def main(argv: Sequence[str]) -> int:
             swift_binary=args.swift_binary,
             cwd=args.cwd,
             suites=selection.suites,
-            explicit_bundle=args.test_bundle,
-            explicit_bundle_name=args.test_bundle_name,
-            disable_bundle_discovery=args.no_xctest_bundle,
         )
     except ValueError as error:
         print(f"::error::{error}")
         return 2
 
-    with tempfile.TemporaryDirectory(prefix=f"rpce-{args.tier}-tests-") as directory:
+    with tempfile.TemporaryDirectory(prefix="rpce-tests-") as directory:
         return run_selected_suites(
             selection.suites,
             swift_binary=args.swift_binary,
             cwd=args.cwd,
             bundle_selection=bundle_selection,
             sandbox_root=Path(directory),
-            keep_going=args.keep_going,
         )
 
 

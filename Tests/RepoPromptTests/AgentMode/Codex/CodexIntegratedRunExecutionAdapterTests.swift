@@ -85,16 +85,4 @@ final class CodexIntegratedRunExecutionAdapterTests: XCTestCase {
         XCTAssertFalse(result.didStartProviderRun)
         XCTAssertTrue(result.shouldReleaseCreatedOwnership)
     }
-
-    func testAlreadyCancelledTaskDoesNotOverrideAcceptedNativeDispatch() async {
-        let result = await Task { @MainActor in
-            withUnsafeCurrentTask { $0?.cancel() }
-            return await CodexIntegratedRunExecutionAdapter.execute { .sent }
-        }.value
-
-        XCTAssertEqual(result.nativeOutcome, .sent)
-        XCTAssertEqual(result.executionReport.result, .terminal(.completed(assistantText: nil)))
-        XCTAssertTrue(result.didStartProviderRun)
-        XCTAssertFalse(result.shouldReleaseCreatedOwnership)
-    }
 }

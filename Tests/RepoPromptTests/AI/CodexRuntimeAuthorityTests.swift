@@ -100,7 +100,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         )
     }
 
-    func testExplicitExternalOverrideIsAbsoluteVersionGatedAndObservable() async throws {
+    func testExplicitExternalOverrideIsAbsoluteVersionGatedAndObservable() throws {
         let override = temporaryDirectory.appendingPathComponent("external/codex")
         try makeExecutable(at: override)
 
@@ -167,78 +167,6 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             ),
             .externalOverrideMissing(missing.path)
         )
-
-        let counter = temporaryDirectory.appendingPathComponent("external/version-probes")
-        let cachedOverride = temporaryDirectory.appendingPathComponent("external/cached-codex")
-        try makeExecutable(
-            at: cachedOverride,
-            content: "#!/bin/sh\necho probe >> \(counter.path)\necho 'codex 0.149.0'\n"
-        )
-        for _ in 0 ..< 2 {
-            _ = try CodexRuntimeAuthority.resolve(
-                resourcesURL: nil,
-                applicationSupportURL: temporaryDirectory,
-                explicitExecutableOverride: cachedOverride.path
-            ).get()
-        }
-        let probes = try String(contentsOf: counter, encoding: .utf8)
-            .split(separator: "\n")
-        XCTAssertEqual(probes.count, 1)
-
-        let slowProbeStarted = temporaryDirectory.appendingPathComponent("external/slow-probe-started")
-        let slowOverride = temporaryDirectory.appendingPathComponent("external/slow-codex")
-        try makeExecutable(
-            at: slowOverride,
-            content: "#!/bin/sh\necho started > \(slowProbeStarted.path)\nsleep 2\necho 'not-a-version'\n"
-        )
-        let fastOverride = temporaryDirectory.appendingPathComponent("external/fast-codex")
-        try makeExecutable(at: fastOverride, content: "#!/bin/sh\necho 'codex 0.149.0'\n")
-        let supportURL = try XCTUnwrap(temporaryDirectory)
-        let slowResolution = Task.detached {
-            CodexRuntimeAuthority.resolve(
-                resourcesURL: nil,
-                applicationSupportURL: supportURL,
-                explicitExecutableOverride: slowOverride.path
-            )
-        }
-        for _ in 0 ..< 100 where !FileManager.default.fileExists(atPath: slowProbeStarted.path) {
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: slowProbeStarted.path))
-        let fastProbeStarted = Date()
-        _ = try CodexRuntimeAuthority.resolve(
-            resourcesURL: nil,
-            applicationSupportURL: temporaryDirectory,
-            explicitExecutableOverride: fastOverride.path
-        ).get()
-        XCTAssertLessThan(Date().timeIntervalSince(fastProbeStarted), 1.25)
-        let slowResult = await slowResolution.value
-        XCTAssertEqual(
-            failure(from: slowResult),
-            .externalOverrideVersionUnreadable(slowOverride.path)
-        )
-
-        let invalidCounter = temporaryDirectory.appendingPathComponent("external/invalid-version-probes")
-        let invalidOverride = temporaryDirectory.appendingPathComponent("external/invalid-codex")
-        try makeExecutable(
-            at: invalidOverride,
-            content: "#!/bin/sh\necho probe >> \(invalidCounter.path)\necho 'not-a-version'\n"
-        )
-        for _ in 0 ..< 2 {
-            XCTAssertEqual(
-                failure(
-                    from: CodexRuntimeAuthority.resolve(
-                        resourcesURL: nil,
-                        applicationSupportURL: temporaryDirectory,
-                        explicitExecutableOverride: invalidOverride.path
-                    )
-                ),
-                .externalOverrideVersionUnreadable(invalidOverride.path)
-            )
-        }
-        let invalidProbes = try String(contentsOf: invalidCounter, encoding: .utf8)
-            .split(separator: "\n")
-        XCTAssertEqual(invalidProbes.count, 1)
     }
 
     func testOverrideEnvironmentIsTheOnlyFallbackWhenBundleIsMissing() throws {

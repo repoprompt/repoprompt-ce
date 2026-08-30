@@ -1,6 +1,6 @@
 # Headless MCP domain runtime — M3 read/discovery evidence
 
-Milestone 3 moves the nine read/discovery tool registrations to one Swift 6, AppKit-free owner in `RepoPromptDomainRuntime`. It is stacked on the M2 workspace/context authority and does not add a standalone stdio host.
+Milestone 3 moved the nine read/discovery tool registrations to one Swift 6, AppKit-free owner in `RepoPromptDomainRuntime`. It is stacked on the M2 workspace/context authority and does not add a standalone stdio host. The nine-method count is historical evidence; the current retained `MCPDomainReadToolProviderTests` inventory is four methods.
 
 ## Scope
 
@@ -11,7 +11,7 @@ Milestone 3 moves the nine read/discovery tool registrations to one Swift 6, App
 | `oracle_chat_log`, `history` | same | `MCPOracleToolProvider`, `MCPHistoryToolProvider` | workspace-independent; no MainActor authority capture |
 | Git `status`, `diff`, `log`, `show`, `blame` | same | `MCPGitToolProvider` | workspace/connection remain optional where historically accepted; requested artifact selection and advertisement commit before success |
 
-The app catalog projects `MCPDomainToolDefinition` into the existing `Tool` value at its final registration boundary and retains `MCPWindowToolRuntime` as the freshness/tracing/watchdog execution envelope. The legacy app providers no longer register these nine names. `ToolCatalogSnapshotTests` proves the 24-tool order and every migrated description, annotation, and schema hash are unchanged.
+The app catalog projects `MCPDomainToolDefinition` into the existing `Tool` value at its final registration boundary and retains `MCPWindowToolRuntime` as the freshness/tracing/watchdog execution envelope. The legacy app providers no longer register these nine names. Historical `ToolCatalogSnapshotTests` evidence recorded the unchanged 24-tool order, descriptions, annotations, and schema hashes.
 
 ## Authority and concurrency contract
 
@@ -33,28 +33,15 @@ Each lane assigns monotonic revisions, deduplicates exact operation-ID retries, 
 
 Historical visibility is preserved at the app seam:
 
-- `read_file` / `file_search` await admission to the existing canonical selection queue before the tool replies. `PersistentAgentModeMCPReadFileConnectionTests/testRetainedReadRepliesReturnBeforeWorkspaceContextDrainSettlesAutoSelection` proves the response may precede persistence while the immediate workspace-context consumer blocks on and observes the admitted effect; `MCPToolExecutionWatchdogIntegrationTests/testReadAutoSelectionThenImmediateManageSelectionAddAndGetPreservesCanonicalOwnership` covers the mutation handoff.
+- `read_file` / `file_search` await admission to the existing canonical selection queue before the tool replies. The retained `MCPDomainReadToolProviderTests/testSideEffectCommitCompletesBeforeSuccessfulResponse` covers commit-before-response; deterministic selection and routing tests cover the subsequent consumer handoff.
 - Git artifact selection and advertisement both commit before a successful Git response.
 - A failed/cancelled side effect cannot be normalized into success, poison later effects, or publish a second late success.
 
 ## Parity and evidence
 
-- Frozen catalog parity: `ToolCatalogSnapshotTests/testWindowToolCatalogSignatureMatchesGolden` passes without golden changes.
-- Shared owner/context coverage: all nine `MCPDomainReadToolProviderTests`, including per-family requirements, required-authority fail-closed/release behavior, validation-before-routing, cancellation, and commit-before-response.
-- Awaited authority: `DomainWorkspaceContextAuthorityTests/testAwaitedReadRegistrationRoutesMissingWorkspaceWithoutPersistence` plus the routing refresh test's unrelated-window revision change.
-- Failure recovery and real contention: seven `DomainReadSideEffectCoordinatorTests` cover failed-effect recovery, expired-receipt fail-closed behavior, exact/drain cancellation semantics, same-context selection ordering, and concurrent Git artifact progress.
-- App parity: `MCPCodeStructureWorktreeTests` (9), `WorktreeAPISmokeHarnessTests` (5), and a final combined read/search/history/Git/oracle/watchdog/persistent-connection run (102) all pass with zero failures.
+- Current shared owner/context coverage: four retained `MCPDomainReadToolProviderTests` methods cover per-family requirements, required-authority fail-closed/release behavior, validation-before-routing, and commit-before-response.
+- Earlier catalog, authority, contention, cancellation, and broad parity runs are historical milestone evidence; their dedicated timing and orchestration suites were removed during the test cleanup.
 - Source/MainActor guards: the M0 contract manifest and `source_layout_guardrails.sh` enforce all nine shared definitions, the family requirement mapping, awaited read registration, absence of repeated `validateDomainReadContext`, absence of presentation registration in read resolution, independent effect classes, and non-poisoning effect chaining.
-
-## Bounded latency measurement
-
-`testDirectBackendVersusM3ProviderWrapperLatencyIsBounded` executes 1,000 calls against the same injected no-I/O backend, first directly and then through the M3 provider wrapper. The recorded coordinated sample was:
-
-```text
-M3_READ_LATENCY iterations=1000 direct_backend_ns=110625 provider_wrapper_ns=709083 overhead_per_call_ns=598
-```
-
-This is an honestly bounded, comparable provider-orchestration floor and guards the absolute per-call overhead below 100 µs. It is **not** an M0 EditFlowPerf, live transport, filesystem, or end-to-end sample and is not numerically comparable with `headless-mcp-domain-runtime-m0-editflowperf-baseline.json`; no app relaunch was authorized for this review fix. Real contention is separately deterministic in the same-context blocked-selection/Git-artifact test and the two-backend concurrent-entry test.
 
 ## Explicit exclusions
 

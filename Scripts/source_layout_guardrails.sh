@@ -798,8 +798,6 @@ allowed_tracked_docs=(
   "docs/spec/mcp-domain-canonical-tool-definitions.generated.json"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
-  "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
-  "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )
 existing_tracked_docs=()
 while IFS= read -r path; do
