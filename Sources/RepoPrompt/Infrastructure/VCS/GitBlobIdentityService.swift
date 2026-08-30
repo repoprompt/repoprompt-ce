@@ -15,13 +15,23 @@ actor GitBlobIdentityService {
         let unstable: Bool
     }
 
-    private enum PathSecurityState {
+    private struct PathSecurityAssessment: Equatable {
+        let state: PathSecurityState
+        let crossedNestedRepository: Bool
+
+        init(_ state: PathSecurityState, crossedNestedRepository: Bool = false) {
+            self.state = state
+            self.crossedNestedRepository = crossedNestedRepository
+        }
+    }
+
+    private enum PathSecurityState: Equatable {
         case regular(GitBlobLStatFingerprint)
         case missing
         case symlinkLeaf(GitBlobLStatFingerprint)
         case symlinkComponent
         case nonRegular(GitBlobLStatFingerprint)
-        case repositoryBoundary(GitBlobLStatFingerprint?)
+        case repositoryProbeFailed
     }
 
     private let gitService: GitService
@@ -134,10 +144,16 @@ actor GitBlobIdentityService {
         let preSecurity = relativePaths.map { path in
             pathSecurityState(workspaceRoot: workspaceRoot, relativePath: path)
         }
+        let worktreeMetadataRepositoryPaths = repositoryPaths.indices.compactMap { index -> String? in
+            guard let repositoryPath = repositoryPaths[index],
+                  !preSecurity[index].crossedNestedRepository
+            else { return nil }
+            return repositoryPath
+        }
         let preFileFingerprints = preSecurity.map(Self.fingerprint)
         let preMetadata = Self.repositoryMetadataFingerprint(
             layout: layout,
-            repositoryRelativePaths: requestedRepositoryPaths
+            repositoryRelativePaths: worktreeMetadataRepositoryPaths
         )
         let preLayout = Self.repositoryLayoutFingerprint(layout)
         let preIndexFingerprint = Self.lstatFingerprint(at: layout.gitDir.appendingPathComponent("index"))
@@ -150,18 +166,26 @@ actor GitBlobIdentityService {
         do {
             objectFormat = try await gitService.gitBlobObjectFormat(at: layout.workTreeRoot)
             preConfiguration = try await gitService.gitBlobCheckoutConfiguration(at: layout.workTreeRoot)
-            preAttributes = try await gitService.gitBlobAttributes(
-                at: layout.workTreeRoot,
-                repositoryRelativePaths: requestedRepositoryPaths
-            )
+            preAttributes = if worktreeMetadataRepositoryPaths.isEmpty {
+                [:]
+            } else {
+                try await gitService.gitBlobAttributes(
+                    at: layout.workTreeRoot,
+                    repositoryRelativePaths: worktreeMetadataRepositoryPaths
+                )
+            }
             indexEntries = try await gitService.gitBlobIndexEntries(
                 at: layout.workTreeRoot,
                 repositoryRelativePaths: requestedRepositoryPaths
             )
-            statusRecords = try await gitService.gitBlobStatusRecords(
-                at: layout.workTreeRoot,
-                repositoryRelativePaths: requestedRepositoryPaths
-            )
+            statusRecords = if worktreeMetadataRepositoryPaths.isEmpty {
+                []
+            } else {
+                try await gitService.gitBlobStatusRecords(
+                    at: layout.workTreeRoot,
+                    repositoryRelativePaths: worktreeMetadataRepositoryPaths
+                )
+            }
         } catch GitBlobIdentityError.invalidObjectFormat {
             return Attempt(
                 batch: unsupportedBatch(paths: relativePaths, reason: .invalidObjectFormat),
@@ -189,10 +213,14 @@ actor GitBlobIdentityService {
         let postAttributes: [String: GitBlobPathAttributes]
         do {
             postConfiguration = try await gitService.gitBlobCheckoutConfiguration(at: layout.workTreeRoot)
-            postAttributes = try await gitService.gitBlobAttributes(
-                at: layout.workTreeRoot,
-                repositoryRelativePaths: requestedRepositoryPaths
-            )
+            postAttributes = if worktreeMetadataRepositoryPaths.isEmpty {
+                [:]
+            } else {
+                try await gitService.gitBlobAttributes(
+                    at: layout.workTreeRoot,
+                    repositoryRelativePaths: worktreeMetadataRepositoryPaths
+                )
+            }
         } catch {
             return Attempt(batch: unsupportedBatch(paths: relativePaths, reason: .unsupportedGit), unstable: true)
         }
@@ -204,7 +232,7 @@ actor GitBlobIdentityService {
         let postMetadata = postLayout.map {
             Self.repositoryMetadataFingerprint(
                 layout: $0,
-                repositoryRelativePaths: requestedRepositoryPaths
+                repositoryRelativePaths: worktreeMetadataRepositoryPaths
             )
         } ?? "<unresolved>"
         let postIndexFingerprint = postLayout.flatMap {
@@ -247,7 +275,8 @@ actor GitBlobIdentityService {
                 preWorktree: preFileFingerprints[index],
                 postWorktree: postFileFingerprints[index]
             )
-            if !tokens.isStable { unstable = true }
+            let pathSecurityStable = preSecurity[index] == postSecurity[index]
+            if !tokens.isStable || !pathSecurityStable { unstable = true }
             let entries = (entriesByPath[repositoryPath] ?? []).sorted { $0.stage < $1.stage }
             let record = recordsByPath[repositoryPath]
             let attributes = preAttributes[repositoryPath] ?? .unspecified
@@ -265,6 +294,7 @@ actor GitBlobIdentityService {
                 configuration: preConfiguration,
                 materialization: materialization,
                 security: postSecurity[index],
+                pathSecurityStable: pathSecurityStable,
                 tokens: tokens
             )
         }
@@ -290,9 +320,11 @@ actor GitBlobIdentityService {
                 relativePath: relativePaths[index]
             )
             let fingerprint = Self.fingerprint(security)
-            let outcome: GitBlobIdentityOutcome = switch security {
+            let outcome: GitBlobIdentityOutcome = switch security.state {
             case .regular:
-                .requiresValidatedWorktreeBytes(.nonGit)
+                security.crossedNestedRepository
+                    ? .requiresValidatedWorktreeBytes(.nestedRepository)
+                    : .requiresValidatedWorktreeBytes(.nonGit)
             case .missing:
                 .unavailable(.missing)
             case .symlinkLeaf:
@@ -301,7 +333,7 @@ actor GitBlobIdentityService {
                 .securityExcluded(.symlinkPathComponent)
             case .nonRegular:
                 .unsupported(.nonRegularFile)
-            case .repositoryBoundary:
+            case .repositoryProbeFailed:
                 .unavailable(.repositoryUnavailable)
             }
             return GitBlobIdentityClassification(
@@ -345,7 +377,8 @@ actor GitBlobIdentityService {
         attributes: GitBlobPathAttributes,
         configuration: GitBlobCheckoutConfiguration,
         materialization: GitBlobCheckoutMaterialization,
-        security: PathSecurityState,
+        security: PathSecurityAssessment,
+        pathSecurityStable: Bool,
         tokens: GitBlobValidationTokens
     ) -> GitBlobIdentityClassification {
         let stageZero = entries.first { $0.stage == 0 }
@@ -356,19 +389,23 @@ actor GitBlobIdentityService {
         let intentToAdd = record?.indexOID == zeroOID &&
             stageZero != nil && record?.kind == .ordinary
 
-        let outcome: GitBlobIdentityOutcome = if let stageZero, stageZero.isGitlink {
+        let outcome: GitBlobIdentityOutcome = if security.crossedNestedRepository,
+                                                 case .regular = security.state
+        {
+            .requiresValidatedWorktreeBytes(.nestedRepository)
+        } else if let stageZero, stageZero.isGitlink {
             .unsupported(.gitlink)
         } else if let stageZero, stageZero.isSymlink {
             .securityExcluded(.symlinkLeaf)
         } else {
-            switch security {
+            switch security.state {
             case .symlinkLeaf:
                 .securityExcluded(.symlinkLeaf)
             case .symlinkComponent:
                 .securityExcluded(.symlinkPathComponent)
             case .nonRegular:
                 .unsupported(.nonRegularFile)
-            case .repositoryBoundary:
+            case .repositoryProbeFailed:
                 .unavailable(.repositoryUnavailable)
             case .missing:
                 if skipWorktree, stageZero != nil {
@@ -385,7 +422,7 @@ actor GitBlobIdentityService {
                     .unsupported(.unknownIndexMode)
                 } else if skipWorktree || assumeUnchanged {
                     .requiresValidatedWorktreeBytes(.indexFlag)
-                } else if !tokens.isStable {
+                } else if !tokens.isStable || !pathSecurityStable {
                     .requiresValidatedWorktreeBytes(.changedDuringClassification)
                 } else if case .requiresValidatedWorktreeBytes = materialization {
                     .requiresValidatedWorktreeBytes(.checkoutTransformation)
@@ -568,15 +605,16 @@ actor GitBlobIdentityService {
     private func pathSecurityState(
         workspaceRoot: URL,
         relativePath: String
-    ) -> PathSecurityState {
-        guard Self.isValidRelativePath(relativePath) else { return .missing }
+    ) -> PathSecurityAssessment {
+        guard Self.isValidRelativePath(relativePath) else { return .init(.missing) }
         let components = relativePath.split(separator: "/").map(String.init)
         let rootDescriptor = open(
             workspaceRoot.path,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
         )
-        guard rootDescriptor >= 0 else { return .missing }
+        guard rootDescriptor >= 0 else { return .init(.missing) }
         var directoryDescriptor = rootDescriptor
+        var crossedNestedRepository = false
         defer {
             if directoryDescriptor != rootDescriptor { close(directoryDescriptor) }
             close(rootDescriptor)
@@ -585,46 +623,57 @@ actor GitBlobIdentityService {
         for (index, component) in components.enumerated() {
             var value = stat()
             guard fstatat(directoryDescriptor, component, &value, AT_SYMLINK_NOFOLLOW) == 0 else {
-                return .missing
+                return .init(.missing, crossedNestedRepository: crossedNestedRepository)
             }
             let fingerprint = Self.lstatFingerprint(value)
             let isLeaf = index == components.count - 1
             if fingerprint.isSymbolicLink {
-                return isLeaf ? .symlinkLeaf(fingerprint) : .symlinkComponent
+                let state: PathSecurityState = isLeaf ? .symlinkLeaf(fingerprint) : .symlinkComponent
+                return .init(state, crossedNestedRepository: crossedNestedRepository)
             }
             if isLeaf {
-                return fingerprint.isRegularFile ? .regular(fingerprint) : .nonRegular(fingerprint)
+                let state: PathSecurityState = fingerprint.isRegularFile
+                    ? .regular(fingerprint)
+                    : .nonRegular(fingerprint)
+                return .init(state, crossedNestedRepository: crossedNestedRepository)
             }
-            guard (value.st_mode & S_IFMT) == S_IFDIR else { return .missing }
+            guard (value.st_mode & S_IFMT) == S_IFDIR else {
+                return .init(.missing, crossedNestedRepository: crossedNestedRepository)
+            }
             let nextDescriptor = openat(
                 directoryDescriptor,
                 component,
                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
             )
-            guard nextDescriptor >= 0 else { return .missing }
+            guard nextDescriptor >= 0 else {
+                return .init(.missing, crossedNestedRepository: crossedNestedRepository)
+            }
             var repositoryMarker = stat()
             if fstatat(nextDescriptor, ".git", &repositoryMarker, AT_SYMLINK_NOFOLLOW) == 0 {
-                let fingerprint = Self.lstatFingerprint(repositoryMarker)
-                close(nextDescriptor)
-                return .repositoryBoundary(fingerprint)
-            }
-            let markerError = errno
-            guard markerError == ENOENT else {
-                close(nextDescriptor)
-                return .repositoryBoundary(nil)
+                crossedNestedRepository = true
+            } else {
+                let markerError = errno
+                guard markerError == ENOENT else {
+                    close(nextDescriptor)
+                    return .init(
+                        .repositoryProbeFailed,
+                        crossedNestedRepository: crossedNestedRepository
+                    )
+                }
             }
             if directoryDescriptor != rootDescriptor { close(directoryDescriptor) }
             directoryDescriptor = nextDescriptor
             hooks.afterPathSecurityComponentOpen(components[0 ... index].joined(separator: "/"))
         }
-        return .missing
+        return .init(.missing, crossedNestedRepository: crossedNestedRepository)
     }
 
-    private static func fingerprint(_ state: PathSecurityState) -> GitBlobLStatFingerprint? {
-        switch state {
-        case let .regular(value), let .symlinkLeaf(value), let .nonRegular(value): value
-        case let .repositoryBoundary(value): value
-        case .missing, .symlinkComponent: nil
+    private static func fingerprint(_ assessment: PathSecurityAssessment) -> GitBlobLStatFingerprint? {
+        switch assessment.state {
+        case let .regular(value), let .symlinkLeaf(value), let .nonRegular(value):
+            value
+        case .missing, .symlinkComponent, .repositoryProbeFailed:
+            nil
         }
     }
 
