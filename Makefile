@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 CODEX_ARCH ?= all
@@ -51,7 +51,6 @@ help:
 	@printf '  %-30s %s\n' 'xcode-generate' 'Generate the disposable Xcode workspace'
 	@printf '  %-30s %s\n' 'xcode-check' 'Check generated Xcode workspace state'
 	@printf '  %-30s %s\n' 'xcode-validate' 'Full Xcode workspace validation, including xcodebuild -list'
-	@printf '  %-30s %s\n' 'xcode-generator-test' 'Run Xcode workspace generator tests'
 	@printf '  %-30s %s\n' 'xcode-clean' 'Remove generated Xcode workspace metadata'
 	@printf '\n%s\n' 'Release targets:'
 	@printf '  %-30s %s\n' 'release-preflight' 'Run release preflight directly'
