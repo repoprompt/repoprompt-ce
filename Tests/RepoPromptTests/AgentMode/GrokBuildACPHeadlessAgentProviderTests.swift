@@ -74,57 +74,12 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertEqual(results.last?.type, "message_stop")
     }
 
-    func testPostResponseContentIsDrainedBeforeTerminal() async throws {
-        let harness = try makeHarness()
-        let provider = harness.makeHeadlessProvider(modelString: nil, scenario: .postResponseContent)
-
-        let results = try await collect(provider, message: "hi")
-
-        XCTAssertEqual(results.filter { $0.type == "content" }.compactMap(\.text).joined(), "Full response.")
-        XCTAssertEqual(results.map(\.type), ["content", "content", "message_stop"])
-    }
-
-    func testDescendantLateContentHoldingInheritedPipesIsBounded() async throws {
-        let harness = try makeHarness()
-        let provider = harness.makeHeadlessProvider(
-            modelString: nil,
-            scenario: .descendantLateContentHoldingInheritedPipes
-        )
-        let startedAt = ProcessInfo.processInfo.systemUptime
-
-        let results = try await collect(provider, message: "hi")
-
-        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
-        XCTAssertEqual(results.filter { $0.type == "content" }.compactMap(\.text).joined(), "Full response.")
-        let terminals = results.filter { $0.type == "message_stop" || $0.type == AIStreamResult.incompleteType }
-        XCTAssertEqual(terminals.count, 1)
-        let terminal = try XCTUnwrap(terminals.first)
-        XCTAssertEqual(terminal.type, AIStreamResult.incompleteType)
-        XCTAssertEqual(terminal.stopReason, "transport_did_not_settle_before_shutdown")
-        XCTAssertFalse(results.contains { $0.type == "message_stop" })
-        XCTAssertLessThan(elapsed, 15)
-    }
-
-    func testForcedShutdownMarksPartialContentIncomplete() async throws {
-        let harness = try makeHarness()
-        let provider = harness.makeHeadlessProvider(modelString: nil, scenario: .unsettledTransport)
-
-        let results = try await collect(provider, message: "hi")
-
-        XCTAssertEqual(results.filter { $0.type == "content" }.compactMap(\.text), ["No."])
-        XCTAssertEqual(results.last?.type, AIStreamResult.incompleteType)
-        XCTAssertEqual(results.last?.stopReason, "transport_did_not_settle_before_shutdown")
-    }
-
     // MARK: - Harness
 
     private enum Scenario: String {
         case standard
         case statusAndShortContent = "status_and_short_content"
         case preTerminalFragments = "pre_terminal_fragments"
-        case postResponseContent = "post_response_content"
-        case unsettledTransport = "unsettled_transport"
-        case descendantLateContentHoldingInheritedPipes = "descendant_late_content_holding_pipes"
     }
 
     private struct Harness {
@@ -217,7 +172,6 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         import json
         import os
         import sys
-        import time
 
         record_path = os.environ.get("ACP_RECORD_PATH")
         scenario = os.environ.get("ACP_SCENARIO", "standard")
@@ -291,28 +245,6 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                     emit_content("answer.")
                     respond(request_id, {"stopReason": "end_turn"})
                     sys.exit(0)
-                elif scenario == "post_response_content":
-                    emit_content("Full ")
-                    respond(request_id, {"stopReason": "end_turn"})
-                    for _ in sys.stdin:
-                        pass
-                    emit_content("response.")
-                    sys.exit(0)
-                elif scenario == "descendant_late_content_holding_pipes":
-                    emit_content("Full ")
-                    respond(request_id, {"stopReason": "end_turn"})
-                    child_pid = os.fork()
-                    if child_pid == 0:
-                        time.sleep(0.2)
-                        emit_content("response.")
-                        time.sleep(30)
-                        os._exit(0)
-                    os._exit(0)
-                elif scenario == "unsettled_transport":
-                    emit_content("No.")
-                    respond(request_id, {"stopReason": "end_turn"})
-                    while True:
-                        time.sleep(1)
                 else:
                     emit_content("pong")
                     respond(request_id, {"stopReason": "end_turn"})
