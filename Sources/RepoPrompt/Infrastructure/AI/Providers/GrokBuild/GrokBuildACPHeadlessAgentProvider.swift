@@ -67,8 +67,7 @@ final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
             beforePrompt: { controller, _ in
                 try await Self.applySelectedModelIfNeeded(config: config, controller: controller)
             },
-            approvalPolicy: .declineUnsupported,
-            promptCompletion: .drainTransportBeforeShutdown
+            approvalPolicy: .declineUnsupported
         )
     }
 
