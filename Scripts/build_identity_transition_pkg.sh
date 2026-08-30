@@ -204,13 +204,10 @@ build_transition_pkg() {
     [[ "$installer_identity" == "$SUCCESSOR_INSTALLER_IDENTITY" ]] ||
         fail "Transition Installer identity must match the reviewed policy"
     [[ ! -e "$output" && ! -L "$output" ]] || fail "Refusing to overwrite transition package: $output"
-    for command in codesign diff ditto pkgbuild pkgutil plutil productbuild productsign xcrun; do
+    for command in codesign diff ditto pkgbuild pkgutil plutil productbuild productsign; do
         require_command "$command"
     done
     validate_successor_app "$app" "Transition payload input"
-    [[ -n "${NOTARYTOOL_PRIVATE_KEY:-}" && -n "${NOTARYTOOL_KEY_ID:-}" && -n "${NOTARYTOOL_ISSUER_ID:-}" ]] ||
-        fail "Transition package notarization credentials are incomplete"
-    require_file "$NOTARYTOOL_PRIVATE_KEY"
 
     TMP_DIR="$(mktemp -d)"
     local payload_root="$TMP_DIR/payload-root"
@@ -238,17 +235,18 @@ build_transition_pkg() {
     productbuild --package "$component_pkg" "$unsigned_product"
     productsign --sign "$installer_identity" "$unsigned_product" "$signed_product"
 
-    xcrun notarytool submit "$signed_product" \
-        --key "$NOTARYTOOL_PRIVATE_KEY" \
-        --key-id "$NOTARYTOOL_KEY_ID" \
-        --issuer "$NOTARYTOOL_ISSUER_ID" \
-        --wait --timeout "${NOTARYTOOL_TIMEOUT:-30m}"
-    xcrun stapler staple "$signed_product"
-    validate_transition_pkg "$signed_product" --expected-app "$app"
     [[ -d "$(dirname "$output")" && ! -L "$(dirname "$output")" ]] ||
         fail "Transition package output parent must be a real directory"
     mv "$signed_product" "$output"
-    printf 'OK: created identity-transition package: %s\n' "$output"
+    printf 'OK: built and signed identity-transition package: %s\n' "$output"
+}
+
+staple_transition_pkg() {
+    local pkg="$1"
+    require_command xcrun
+    require_file "$pkg"
+    xcrun stapler staple "$pkg"
+    printf 'OK: stapled identity-transition package: %s\n' "$pkg"
 }
 
 validate_transition_pkg() {
@@ -307,10 +305,14 @@ validate_transition_pkg() {
 
 case "$MODE" in
     build) build_transition_pkg "$@" ;;
+    staple)
+        [[ $# -eq 1 ]] || fail "Usage: $0 staple <transition.pkg>"
+        staple_transition_pkg "$1"
+        ;;
     validate)
         [[ $# -ge 1 ]] || fail "Usage: $0 validate <transition.pkg> [--expected-app <app>] [--expanded-payload-dir <dir>]"
         pkg_path="$1"; shift
         validate_transition_pkg "$pkg_path" "$@"
         ;;
-    *) fail "Usage: $0 build|validate ..." ;;
+    *) fail "Usage: $0 build|staple|validate ..." ;;
 esac

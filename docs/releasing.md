@@ -289,9 +289,10 @@ publisher require the greatest Stable build to remain strictly below the retaine
 Stable to the next integer first would make an unprepared Stable client appear new enough to satisfy
 T's `sparkle:minimumUpdateVersion`, bypassing the credential preparer.
 
-Automatic and manual runs use one concurrency lane and do not cancel in-flight release work, so a
-retry resumes or audits one exact draft instead of abandoning a different tag halfway through
-publication.
+Automatic and manual runs use separate rolling concurrency lanes. Each lane keeps at most one
+queued run and does not cancel in-flight release work; publication remains serialized across both
+lanes by `main-tip-publish`. A retry therefore resumes or audits one exact draft instead of abandoning
+a different tag halfway through publication.
 
 Remote mutation is confined to that protected publication job. Immediately before draft creation
 and again immediately before making a draft public, it rechecks live protected `main`, downloads the
@@ -324,6 +325,15 @@ alias as a second authority. The Tip publishing script fails closed if `TIP_UPDA
 points at the source or stable update repository. Tip artifacts also include a small
 `*-metadata.json` asset recording the source commit, immutable tag, marketing version, and build
 number.
+
+For application enclosures, the signing job retains the explicit application contract: it submits a
+temporary ZIP to notarize the signed app, staples and validates that app, then separately submits,
+staples, and validates the DMG. For a transition package, it signs and validates the embedded app
+without creating that temporary notarization ZIP. The job then exposes separate timed **Build
+package**, **Submit package notarization**, **Staple package**, and **Validate package** steps; the
+final Installer-signed PKG is the only Apple submission in package mode. Every submission prints its
+Apple submission ID. A failed or non-accepted submission with an ID automatically retrieves its
+`notarytool log` before the step fails.
 
 Tip builds use the same Sentry-linked binary and symbolication policy as stable
 releases. The secret-free stage enables Sentry linking and carries release dSYMs

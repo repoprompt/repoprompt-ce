@@ -8,8 +8,14 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: main-tip-channel
-  queue: max
+  group: >-
+    ${{
+      (github.event_name == 'workflow_dispatch' && 'main-tip-dispatch-channel') ||
+      (github.event.workflow_run.conclusion == 'success' && 'main-tip-channel') ||
+      format('main-tip-skipped-{0}', github.run_id)
+    }}
+  queue: single
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -309,9 +315,9 @@ jobs:
           if [[ "$ROLLOUT_ROLE" == "transition" ]]; then
             printf '%s' "$SUCCESSOR_INSTALLER_P12_BASE64" | base64 --decode > "$INSTALLER_CERTIFICATE_PATH" || fail "successor installer P12 write failed"
             security import "$INSTALLER_CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$SUCCESSOR_INSTALLER_P12_PASSWORD" \
-              -T /usr/bin/productbuild -T /usr/bin/security \
+              -T /usr/bin/productbuild -T /usr/bin/productsign -T /usr/bin/security \
               >/dev/null || fail "successor installer P12 import failed"
-            security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild: \
+            security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild:,productsign: \
               -s -k "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH" \
               >/dev/null || fail "successor installer key partition setup failed"
             security find-identity -v -p basic "$PREFLIGHT_KEYCHAIN_PATH" |
@@ -479,8 +485,8 @@ jobs:
             installer_certificate="$RUNNER_TEMP/repoprompt-tip-installer.p12"
             printf '%s' "$SUCCESSOR_INSTALLER_P12_BASE64" | base64 --decode > "$installer_certificate"
             security import "$installer_certificate" -k "$KEYCHAIN_PATH" \
-              -P "$SUCCESSOR_INSTALLER_P12_PASSWORD" -T /usr/bin/productbuild -T /usr/bin/security
-            security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild: \
+              -P "$SUCCESSOR_INSTALLER_P12_PASSWORD" -T /usr/bin/productbuild -T /usr/bin/productsign -T /usr/bin/security
+            security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild:,productsign: \
               -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
             verify_identity basic "$EXPECTED_INSTALLER_IDENTITY" installer
             rm -f "$installer_certificate"
@@ -590,7 +596,7 @@ jobs:
           printf '%s' "$SENTRY_AUTH_TOKEN" > "$SENTRY_TOKEN_FILE"
           chmod 600 "$SENTRY_TOKEN_FILE"
 
-      - name: Sign and notarize staged tip
+      - name: Sign application
         env:
           TIP_COMMIT: ${{ needs.setup.outputs.commit }}
           TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
@@ -608,8 +614,54 @@ jobs:
           REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
           REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token
+          SPARKLE_PRIVATE_KEY: ${{ needs.setup.outputs.installation-type == 'application' && secrets.SPARKLE_PRIVATE_KEY || '' }}
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh sign-application
+
+      - name: Build package
+        if: needs.setup.outputs.installation-type == 'package'
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh build-package
+
+      - name: Submit package notarization
+        if: needs.setup.outputs.installation-type == 'package'
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh submit-package-notarization
+
+      - name: Staple package
+        if: needs.setup.outputs.installation-type == 'package'
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh staple-package
+
+      - name: Validate package
+        if: needs.setup.outputs.installation-type == 'package'
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        run: ./trusted-control-plane/Scripts/main_tip_release.sh sign
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh validate-package
 
       - name: Remove ephemeral keychain
         if: always()
@@ -617,6 +669,7 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/repoprompt-tip.keychain-db" || true
           rm -rf "$RUNNER_TEMP/repoprompt-tip-secrets"
           rm -f "$RUNNER_TEMP/repoprompt-tip.p12"
+          rm -f "$RUNNER_TEMP/repoprompt-tip-installer.p12"
           rm -f "$RUNNER_TEMP/repoprompt-tip-successor.p12"
           rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"
 
