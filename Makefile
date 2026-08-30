@@ -148,6 +148,7 @@ release-selftest:
 	python3 Scripts/test_codex_runtime_artifact.py
 	python3 Scripts/test_codex_update_candidate.py
 	python3 Scripts/test_codex_update_workflow.py
+	./Scripts/test_release_split_metadata_root.sh
 
 release-sync-cli-version:
 	./Scripts/release.sh sync-cli-version
