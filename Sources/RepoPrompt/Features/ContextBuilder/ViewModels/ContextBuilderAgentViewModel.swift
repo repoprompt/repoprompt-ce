@@ -324,9 +324,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         var followUpOracleGroupState = ContextBuilderOracleGroupState()
         var followUpOracleGroupTask: Task<OracleGroupRuntime.Completion, Error>?
 
-        /// Per-tab auto-generate plan setting (loaded from tab config)
-        var autoGeneratePlan: Bool = false
-
         /// Per-tab selected follow-up type for automatic analysis
         var selectedFollowUpType: ContextBuilderFollowUpType = .plan
 
@@ -4572,7 +4569,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let tabContext = OracleViewModel.OracleSendTabContext(
             tabID: tabID,
             workspaceID: originWorkspaceID,
-            origin: .contextBuilder,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
             activationPolicy: .background,

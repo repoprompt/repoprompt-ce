@@ -2,7 +2,7 @@
 
 Oracle groups run one request through an ordered roster of independent Oracle models. The feature preserves the existing single-Oracle path when the roster contains only the primary model.
 
-[`oracle-groups-decisions.md`](oracle-groups-decisions.md) defines the cross-boundary contract. This document explains the current implementation and its ownership boundaries.
+This document explains the current implementation and its ownership boundaries.
 
 ## Product contract
 
@@ -41,32 +41,6 @@ The first version has these non-goals:
 The coordinator handles rosters with two to five lanes. Callers bypass it for N=1.
 
 `OracleGroupRuntime` is the only mutating grouped-turn entry point. Both the app and `repoprompt-mcp --backend headless` call `execute` after they finish surface-specific routing. N=1 never enters the runtime.
-
-## Measured line-count exception
-
-The original rewrite plan forecast a net-negative production core after duplicated lifecycle code moved into `OracleGroupRuntime`. The measured result after Unit 4 is still positive, so this section revises that plan gate explicitly. This is a tracked exception, not a net-negative claim.
-
-Run this command to regenerate the count:
-
-```sh
-git diff --numstat f54d1f8a -- Sources/RepoPrompt/App/AppDomainRuntimeComposition.swift Sources/RepoPrompt/Features/Chat/ViewModels/Oracle/OracleViewModel+Groups.swift Sources/RepoPrompt/Features/ContextBuilder/Models/ContextBuilderOracleGroupState.swift Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift Sources/RepoPromptDomainRuntime/OracleGroupCoordinator.swift Sources/RepoPromptDomainRuntime/OracleGroupRuntime.swift Sources/RepoPromptMCP/DirectHeadlessOracleAdapter.swift
-```
-
-Current count:
-
-| Additions | Deletions | Path |
-| --- | --- | --- |
-| 5 | 0 | `Sources/RepoPrompt/App/AppDomainRuntimeComposition.swift` |
-| 290 | 243 | `Sources/RepoPrompt/Features/Chat/ViewModels/Oracle/OracleViewModel+Groups.swift` |
-| 3 | 128 | `Sources/RepoPrompt/Features/ContextBuilder/Models/ContextBuilderOracleGroupState.swift` |
-| 45 | 17 | `Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift` |
-| 16 | 2 | `Sources/RepoPromptDomainRuntime/OracleGroupCoordinator.swift` |
-| 397 | 0 | `Sources/RepoPromptDomainRuntime/OracleGroupRuntime.swift` |
-| 86 | 187 | `Sources/RepoPromptMCP/DirectHeadlessOracleAdapter.swift` |
-
-Total: +842/-577, net +265.
-
-The excess over forecast comes from correctness obligations that were not optional once grouped execution became the canonical path: typed internal completion for Context Builder, cancellation drain classification, frozen Oracle profile capture, strict settings decode at the persisted boundary, and fail-closed projection identity. Unit 4's deletion audit found no remaining duplicated lifecycle bodies in the app adapter, runtime, or direct-headless adapter. Further deletion would remove the single authority for claim acquisition, prepared-turn publication, post-claim reload, interrupted-turn settlement, lane drain, terminal publication, and claim release, or push that work back into surface adapters.
 
 ## App execution
 

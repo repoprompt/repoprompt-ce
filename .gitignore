@@ -54,8 +54,3 @@ Icon
 .vscode/
 .idea/
 .claude/settings.local.json
-
-# Local audit, patch, and temporary artifacts
-.audit/
-.clawpatch/
-tmp/

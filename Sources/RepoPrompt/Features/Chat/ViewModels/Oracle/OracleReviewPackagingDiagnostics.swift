@@ -4,7 +4,6 @@ import Foundation
 enum OracleSendOrigin: String {
     case askOracle
     case oracleSend
-    case contextBuilder
     case compatibility
 }
 

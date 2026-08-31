@@ -242,8 +242,16 @@ final class OracleGroupContractTests: XCTestCase {
             expected: .invalidFrozenPack
         )
 
-        let pack = try OracleFrozenContextPack(mode: .chat, content: "context")
+        let pack = try OracleFrozenContextPack(
+            mode: .chat,
+            content: "context",
+            provenance: [OracleEvidenceReference(path: "Sources/Feature.swift")]
+        )
         let current = try pack.canonicalData()
+        XCTAssertEqual(
+            String(data: current, encoding: .utf8),
+            #"{"content":"context","mode":"chat","provenance":[{"path":"Sources/Feature.swift"}],"schemaVersion":1}"#
+        )
         let future = try XCTUnwrap(
             String(data: current, encoding: .utf8)?
                 .replacingOccurrences(of: #""schemaVersion":1"#, with: #""schemaVersion":2"#)

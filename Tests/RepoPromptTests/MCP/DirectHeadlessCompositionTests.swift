@@ -70,8 +70,17 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         )
     }
 
-    func testHeadlessOracleCodexExecUsesReadOnlySandbox() {
-        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .oracle)
+    func testDirectHeadlessOracleCodexExecUsesWorkspaceWriteSandbox() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .directOracle)
+
+        XCTAssertEqual(
+            Array(arguments.suffix(5)),
+            ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        )
+    }
+
+    func testGroupedHeadlessOracleCodexExecUsesReadOnlySandbox() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .oracleGroup)
 
         XCTAssertEqual(
             Array(arguments.suffix(5)),
