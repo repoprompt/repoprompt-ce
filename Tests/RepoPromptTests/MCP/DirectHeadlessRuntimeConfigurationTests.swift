@@ -36,11 +36,35 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
                 )
                 XCTAssertEqual(validated["op"]?.stringValue, operation)
             }
+            XCTAssertThrowsError(try DirectHeadlessMCPService.validatedCallArguments(
+                toolName: toolName,
+                arguments: [
+                    "op": .string("start"),
+                    "additional_tools": .array([.string("manage_worktree")])
+                ]
+            ))
         }
         XCTAssertTrue(try DirectHeadlessMCPService.validatedCallArguments(
             toolName: "get_file_tree",
             arguments: [:]
         ).isEmpty)
+    }
+
+    func testAdvertisedAgentSchemaMatchesDirectHeadlessOperations() throws {
+        for toolName in ["agent_run", "agent_explore"] {
+            let definition = try XCTUnwrap(
+                MCPDomainCanonicalToolDefinitions.definitions.first { $0.name == toolName }
+            )
+            let schema = DirectHeadlessMCPService.advertisedInputSchema(for: definition)
+            let properties = try XCTUnwrap(schema.objectValue?["properties"]?.objectValue)
+            XCTAssertEqual(
+                properties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue),
+                ["start", "poll", "wait", "cancel"]
+            )
+            for unsupported in ["messages", "session_ids", "worktree_create", "worktree_branch"] {
+                XCTAssertNil(properties[unsupported], "\(toolName) advertised unsupported \(unsupported)")
+            }
+        }
     }
 
     func testDefaultProfileUsesCanonicalAppStorageAndNeverFallsBackToCWD() throws {
@@ -104,6 +128,28 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
         XCTAssertEqual(locations.workingDirectories, [root.standardizedFileURL.resolvingSymlinksInPath()])
         XCTAssertTrue(locations.usesExplicitProfileDirectory)
         XCTAssertTrue(locations.mayBootstrapIsolatedWorkspace)
+    }
+
+    func testConfiguredGrantOperationsAreExplicitAndProcessLifetimeScoped() throws {
+        let root = temporaryDirectory("configured-grants")
+        let locations = try DirectHeadlessRuntimeLocationResolver.resolve(
+            environment: [
+                "REPOPROMPT_MCP_HEADLESS_GRANT_OPERATIONS":
+                    " context_builder.ai_cost,context_builder.external_process "
+            ],
+            currentDirectory: root,
+            homeDirectory: root,
+            customWorkspaceStoragePath: nil
+        )
+
+        XCTAssertEqual(locations.configuredGrantOperations, [
+            "context_builder.ai_cost",
+            "context_builder.external_process"
+        ])
+        XCTAssertThrowsError(try DirectHeadlessRuntimeLocationResolver.configuredGrantOperations("*"))
+        XCTAssertThrowsError(try DirectHeadlessRuntimeLocationResolver.configuredGrantOperations("context_builder.*"))
+        XCTAssertThrowsError(try DirectHeadlessRuntimeLocationResolver.configuredGrantOperations("missing-action"))
+        XCTAssertThrowsError(try DirectHeadlessRuntimeLocationResolver.configuredGrantOperations("a.b,"))
     }
 
     func testNonDefaultProfileRequiresExplicitDirectory() throws {
@@ -1415,7 +1461,7 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             secondary.alternateWorktree.path
         )
 
-        let partialOverrideID = try await startAgent(
+        let explicitOverrideID = try await startAgent(
             prepared: prepared,
             parentSessionID: parentID,
             arguments: [
@@ -1426,29 +1472,29 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
                 "detach": .bool(true)
             ]
         )
-        let partialOverrideTerminal = await prepared.providerCoordinator.waitAgent(
-            sessionID: partialOverrideID,
+        let explicitOverrideTerminal = await prepared.providerCoordinator.waitAgent(
+            sessionID: explicitOverrideID,
             timeout: 10
         )
-        XCTAssertEqual(partialOverrideTerminal.status, .completed)
+        XCTAssertEqual(explicitOverrideTerminal.status, .completed)
         XCTAssertEqual(
-            Set(partialOverrideTerminal.worktreeBindings.map(\.source)),
+            Set(explicitOverrideTerminal.worktreeBindings.map(\.source)),
             ["direct-headless-session-overlay"]
         )
         XCTAssertEqual(
-            try URL(fileURLWithPath: XCTUnwrap(partialOverrideTerminal.latestAssistantPreview))
+            try URL(fileURLWithPath: XCTUnwrap(explicitOverrideTerminal.latestAssistantPreview))
                 .standardizedFileURL.resolvingSymlinksInPath().path,
             fixture.canonicalRepo.path
         )
-        let partialOverrideSnapshot = try await prepared.context.snapshot(
+        let explicitOverrideSnapshot = try await prepared.context.snapshot(
             connectionID: prepared.connectionID,
-            sessionID: partialOverrideID
+            sessionID: explicitOverrideID
         )
         XCTAssertEqual(
-            partialOverrideSnapshot.roots.map(\.path),
-            [fixture.canonicalRepo.path, secondary.alternateWorktree.path]
+            explicitOverrideSnapshot.roots.map(\.path),
+            [fixture.canonicalRepo.path, secondary.launchWorktree.path]
         )
-        XCTAssertEqual(partialOverrideSnapshot.activeRoot?.path, fixture.canonicalRepo.path)
+        XCTAssertEqual(explicitOverrideSnapshot.activeRoot?.path, fixture.canonicalRepo.path)
 
         let optedOutID = try await startAgent(
             prepared: prepared,

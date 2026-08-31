@@ -35,6 +35,7 @@ actor DirectHeadlessProviderCoordinator {
         let parentSessionID: UUID?
         let worktreeBindings: [DomainAgentRunSnapshot.WorktreeBinding]
         var latestSnapshot: DomainAgentRunSnapshot?
+        let processCancellation: DirectProcessCancellationHandle
         var task: Task<Void, Never>?
     }
 
@@ -76,6 +77,36 @@ actor DirectHeadlessProviderCoordinator {
         }
     }
 
+    func contextBuilderConfiguration() async throws -> (
+        contextBudget: Int,
+        analysisBudget: Int,
+        providerID: String,
+        model: String?
+    ) {
+        await settingsStore.bootstrap()
+        guard case let .integer(contextBudget) = try await settingsStore.effectiveValue(
+            for: "context_builder.context_token_budget"
+        ), case let .integer(analysisBudget) = try await settingsStore.effectiveValue(
+            for: "context_builder.analysis_token_budget"
+        ), case let .string(configuredAgent) = try await settingsStore.effectiveValue(
+            for: "context_builder.agent"
+        ) else {
+            throw MCPError.internalError("Context Builder settings have invalid persisted types.")
+        }
+        let providerID = configuredAgent == "codexExec" ? configuredAgent : "codexExec"
+        let model: String? = switch try await settingsStore.effectiveValue(for: "context_builder.model") {
+        case let .string(value) where !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty: value
+        case .null: nil
+        default: nil
+        }
+        return (contextBudget, analysisBudget, providerID, model)
+    }
+
+    func contextBuilderBudgets() async throws -> (context: Int, analysis: Int) {
+        let configuration = try await contextBuilderConfiguration()
+        return (configuration.contextBudget, configuration.analysisBudget)
+    }
+
     func providerCatalog() -> [ProviderDescriptor] {
         let codex = Self.findExecutable(
             named: environment["REPOPROMPT_CODEX_COMMAND"] ?? "codex",
@@ -106,7 +137,8 @@ actor DirectHeadlessProviderCoordinator {
         model: String?,
         request: DomainPhysicalToolRequest,
         sessionID: UUID? = nil,
-        carrierEnvironment: [String: String]? = nil
+        carrierEnvironment: [String: String]? = nil,
+        cancellationHandle: DirectProcessCancellationHandle? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
         let descriptor = try resolveProvider(providerID)
@@ -122,6 +154,17 @@ actor DirectHeadlessProviderCoordinator {
             sessionID: effectiveSessionID
         )
         let arguments = Self.codexExecArguments(model: model)
+        let progressReporter = DirectHeadlessInvocationProgress.reporter
+        await progressReporter?("Launching \(descriptor.displayName)")
+        let progressTail: DirectCodexProgressTail? = progressReporter.map { reporter in
+            DirectCodexProgressTail(reporter: reporter)
+        }
+        let outputObserver: (@Sendable (Data) -> Void)?
+        if let progressTail {
+            outputObserver = { data in progressTail.consume(data) }
+        } else {
+            outputObserver = nil
+        }
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }
@@ -130,9 +173,12 @@ actor DirectHeadlessProviderCoordinator {
             arguments: arguments,
             input: Data(message.utf8),
             environment: childEnvironment,
-            currentDirectory: snapshot.activeRoot
+            currentDirectory: snapshot.activeRoot,
+            onOutput: outputObserver,
+            cancellationHandle: cancellationHandle
         )
-        return Self.finalAssistantText(from: output)
+        await progressReporter?("Provider process exited successfully")
+        return progressTail?.finalAssistantText() ?? Self.finalAssistantText(from: output)
     }
 
     func startAgent(args: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
@@ -181,6 +227,7 @@ actor DirectHeadlessProviderCoordinator {
             throw MCPError.internalError("agent epoch changed during start")
         }
         let name = args["session_name"]?.stringValue
+        let processCancellation = DirectProcessCancellationHandle()
         let record = AgentRecord(
             registration: registration,
             epoch: epoch,
@@ -191,6 +238,7 @@ actor DirectHeadlessProviderCoordinator {
             parentSessionID: parentSessionID,
             worktreeBindings: rootOverlayPreparation.bindings,
             latestSnapshot: nil,
+            processCancellation: processCancellation,
             task: nil
         )
         var runningRecord = record
@@ -219,7 +267,8 @@ actor DirectHeadlessProviderCoordinator {
                         model: args["model"]?.stringValue,
                         request: capturedRequest,
                         sessionID: sessionID,
-                        carrierEnvironment: capturedCarrierEnvironment
+                        carrierEnvironment: capturedCarrierEnvironment,
+                        cancellationHandle: processCancellation
                     )
                     return .completed(assistantText: text)
                 } catch {
@@ -281,6 +330,7 @@ actor DirectHeadlessProviderCoordinator {
     }
 
     func cancelAgent(sessionID: UUID) async {
+        agents[sessionID]?.processCancellation.cancel()
         agents[sessionID]?.task?.cancel()
     }
 
@@ -389,9 +439,11 @@ actor DirectHeadlessProviderCoordinator {
 
     func shutdown() async {
         isShuttingDown = true
-        let tasks = agents.values.compactMap(\.task)
-        for task in tasks {
-            task.cancel()
+        let records = Array(agents.values)
+        let tasks = records.compactMap(\.task)
+        for record in records {
+            record.processCancellation.cancel()
+            record.task?.cancel()
         }
         for task in tasks {
             await task.value

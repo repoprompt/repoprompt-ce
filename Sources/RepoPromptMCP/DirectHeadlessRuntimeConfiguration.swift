@@ -8,6 +8,7 @@ struct DirectHeadlessRuntimeLocations: Equatable {
     let eventDirectory: URL
     let temporaryDirectory: URL
     let workingDirectories: [URL]
+    let configuredGrantOperations: Set<String>
     let usesExplicitProfileDirectory: Bool
 
     var mayBootstrapIsolatedWorkspace: Bool {
@@ -17,6 +18,7 @@ struct DirectHeadlessRuntimeLocations: Equatable {
 
 enum DirectHeadlessRuntimeLocationError: Error, Equatable {
     case profileDirectoryRequired(String)
+    case invalidGrantOperation(String)
 }
 
 enum DirectHeadlessRuntimeLocationResolver {
@@ -76,8 +78,32 @@ enum DirectHeadlessRuntimeLocationResolver {
             eventDirectory: eventDirectory,
             temporaryDirectory: runtimeTemporaryDirectory,
             workingDirectories: workingDirectories,
+            configuredGrantOperations: try configuredGrantOperations(
+                environment["REPOPROMPT_MCP_HEADLESS_GRANT_OPERATIONS"]
+            ),
             usesExplicitProfileDirectory: usesExplicitProfileDirectory
         )
+    }
+
+    static func configuredGrantOperations(_ rawValue: String?) throws -> Set<String> {
+        guard let rawValue else { return [] }
+        let values = rawValue.split(separator: ",", omittingEmptySubsequences: false)
+        var operations: Set<String> = []
+        for value in values {
+            let operation = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            let components = operation.split(separator: ".", omittingEmptySubsequences: false)
+            guard components.count == 2,
+                  components.allSatisfy({ component in
+                      !component.isEmpty && component.allSatisfy { character in
+                          character.isASCII && (character.isLetter || character.isNumber || character == "_")
+                      }
+                  })
+            else {
+                throw DirectHeadlessRuntimeLocationError.invalidGrantOperation(operation)
+            }
+            operations.insert(operation)
+        }
+        return operations
     }
 
     private static func resolvedWorkingDirectories(_ rawValue: String?) throws -> [URL] {

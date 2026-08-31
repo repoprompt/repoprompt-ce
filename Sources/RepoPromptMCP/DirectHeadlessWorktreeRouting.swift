@@ -62,13 +62,17 @@ enum DirectHeadlessWorktreeRouting {
         let physicalRoots = workingDirectories.map(canonicalPath)
         var physicalWorktreeInventories: [[DirectHeadlessGitWorktree]?] = []
         for physicalRoot in physicalRoots {
-            guard let inventory = try? await listWorktrees(repositoryRoot: physicalRoot),
-                  let physicalWorktree = containingWorktree(for: physicalRoot, in: inventory),
-                  await (try? verifyWorktree(physicalWorktree)) != nil
-            else {
+            guard containsGitMetadata(physicalRoot) else {
                 physicalWorktreeInventories.append(nil)
                 continue
             }
+            let inventory = try await listWorktrees(repositoryRoot: physicalRoot)
+            guard let physicalWorktree = containingWorktree(for: physicalRoot, in: inventory) else {
+                throw MCPError.invalidRequest(
+                    "Git worktree inventory does not contain configured root: \(physicalRoot.path)"
+                )
+            }
+            try await verifyWorktree(physicalWorktree)
             physicalWorktreeInventories.append(inventory)
         }
         var candidates: [DirectHeadlessInitialRoute] = []
@@ -203,6 +207,18 @@ enum DirectHeadlessWorktreeRouting {
         )
     }
 
+    private static func containsGitMetadata(_ root: URL) -> Bool {
+        var candidate = canonicalPath(root)
+        while true {
+            if FileManager.default.fileExists(atPath: candidate.appendingPathComponent(".git").path) {
+                return true
+            }
+            let parent = candidate.deletingLastPathComponent()
+            if parent.path == candidate.path { return false }
+            candidate = parent
+        }
+    }
+
     static func parseSessionSelector(arguments: [String: Value]) throws -> DirectHeadlessSessionSelector {
         let selector = normalized(arguments["worktree"]?.stringValue)
         let worktreeID = normalized(arguments["worktree_id"]?.stringValue)
@@ -228,8 +244,7 @@ enum DirectHeadlessWorktreeRouting {
         let root = canonicalPath(repositoryRoot)
         let commonDirectory = try await gitURL(root: root, arguments: ["rev-parse", "--path-format=absolute", "--git-common-dir"])
         let repositoryID = "gitrepo_\(sha256(commonDirectory.path))"
-        let output = try await DirectProcess.run(
-            "/usr/bin/git",
+        let output = try await DirectProcess.runGit(
             arguments: ["-C", root.path, "worktree", "list", "--porcelain"]
         )
         let records = porcelainRecords(output)
@@ -471,7 +486,7 @@ enum DirectHeadlessWorktreeRouting {
     }
 
     private static func gitURL(root: URL, arguments: [String]) async throws -> URL {
-        let raw = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments)
+        let raw = try await DirectProcess.runGit(arguments: ["-C", root.path] + arguments)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let url = raw.hasPrefix("/")
             ? URL(fileURLWithPath: raw, isDirectory: true)
@@ -518,8 +533,7 @@ enum DirectHeadlessWorktreeRouting {
         }
         let isInsideWorktree: String
         do {
-            isInsideWorktree = try await DirectProcess.run(
-                "/usr/bin/git",
+            isInsideWorktree = try await DirectProcess.runGit(
                 arguments: [
                     "-C", worktree.path.path,
                     "rev-parse", "--is-inside-work-tree"

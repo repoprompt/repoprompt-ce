@@ -9,12 +9,13 @@
             _ = signal(SIGPIPE, SIG_IGN)
 
             do {
-                if DirectHeadlessChildBridge.isRequested() {
+                let arguments = Array(CommandLine.arguments.dropFirst())
+                if DirectHeadlessChildBridge.isRequested(), isServeCommand(arguments) {
                     try await DirectHeadlessChildBridge.run()
                     return
                 }
 
-                switch try command(from: Array(CommandLine.arguments.dropFirst())) {
+                switch try command(from: arguments) {
                 case .serve:
                     try await DirectHeadlessMCPService().run()
                 case .help:
@@ -52,6 +53,10 @@
                     "unsupported Linux headless arguments: \(arguments.joined(separator: " "))"
                 }
             }
+        }
+
+        private static func isServeCommand(_ arguments: [String]) -> Bool {
+            arguments == ["--backend", "headless"] || arguments == ["--backend=headless"]
         }
 
         private static func command(from arguments: [String]) throws -> Command {

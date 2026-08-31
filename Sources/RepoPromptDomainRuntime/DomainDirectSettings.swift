@@ -67,6 +67,8 @@ package enum DomainAppSettingsCatalog {
         DomainSettingDescriptor(key: "models.custom_planning_prompt", group: "models", valueKind: .string, defaultValue: .string(""), description: "Custom Oracle system prompt."),
         enumString("context_builder.agent", "context_builder", "claudeCode", ["claudeCode", "codexExec", "cursor", "openCode", "zaiClaudeCode", "kimiClaudeCode", "customClaudeCompatible"], "CLI agent used by Context Builder."),
         model("context_builder.model", "Model raw identifier used by Context Builder."),
+        integer("context_builder.context_token_budget", "context_builder", 160_000, "Maximum selected-context budget for context-only Context Builder runs."),
+        integer("context_builder.analysis_token_budget", "context_builder", 120_000, "Maximum selected-context budget when Context Builder produces a plan, review, or answer."),
         bool("mcp.show_model_presets", "mcp", true, "Whether MCP model preset recommendations are shown."),
         bool("code_maps.globally_disabled", "code_maps", false, "Whether Code Maps are globally disabled."),
         bool("agent_mode.show_built_in_workflow_cleanup_guidance", "agent_mode", true, "Whether built-in workflows include cleanup guidance."),
@@ -112,6 +114,16 @@ package enum DomainAppSettingsCatalog {
             }
             guard (0 ... 2).contains(number) else { throw DomainDirectSettingsError.invalidValue(descriptor.key) }
         }
+        if descriptor.key == "context_builder.context_token_budget" {
+            guard case let .integer(budget) = value, (10_000 ... 200_000).contains(budget), budget.isMultiple(of: 5_000) else {
+                throw DomainDirectSettingsError.invalidValue(descriptor.key)
+            }
+        }
+        if descriptor.key == "context_builder.analysis_token_budget" {
+            guard case let .integer(budget) = value, (40_000 ... 200_000).contains(budget), budget.isMultiple(of: 5_000) else {
+                throw DomainDirectSettingsError.invalidValue(descriptor.key)
+            }
+        }
     }
 
     private static func bool(_ key: String, _ group: String, _ value: Bool, _ description: String) -> DomainSettingDescriptor {
@@ -120,6 +132,10 @@ package enum DomainAppSettingsCatalog {
 
     private static func enumString(_ key: String, _ group: String, _ value: String, _ allowed: [String], _ description: String) -> DomainSettingDescriptor {
         DomainSettingDescriptor(key: key, group: group, valueKind: .string, defaultValue: .string(value), description: description, allowedValues: allowed.map(DomainSettingValue.string))
+    }
+
+    private static func integer(_ key: String, _ group: String, _ value: Int, _ description: String) -> DomainSettingDescriptor {
+        DomainSettingDescriptor(key: key, group: group, valueKind: .integer, defaultValue: .integer(value), description: description)
     }
 
     private static func model(_ key: String, _ description: String) -> DomainSettingDescriptor {

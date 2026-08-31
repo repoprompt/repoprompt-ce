@@ -156,7 +156,10 @@ actor DirectHeadlessDomainContext {
             name: "inherit_worktree"
         ) ?? true
         let selectorIntent = try DirectHeadlessWorktreeRouting.parseSessionSelector(arguments: arguments)
-        let inheritedOverlay = inherits
+        let hasExplicitSelector = selectorIntent.selector != nil
+            || selectorIntent.worktreeID != nil
+            || selectorIntent.create
+        let inheritedOverlay = inherits && !hasExplicitSelector
             ? sourceSessionID.flatMap { sessionRootOverlays[$0] }
             : nil
         let baseOverlay = inheritedOverlay ?? processSnapshot.rootOverlay

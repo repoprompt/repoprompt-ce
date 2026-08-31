@@ -263,13 +263,74 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("blame requires path") }
                 command = ["blame", "--", path]
             case "diff":
-                command = ["diff", "--no-ext-diff", "--no-textconv", "--color=never"]
+                command = try await gitDiffCommand(args: args, root: root)
             default: throw MCPError.invalidParams("unknown git op: \(op)")
             }
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + command)
+            let output = try await DirectProcess.runGit(arguments: ["-C", root.path] + command)
             outputs.append(.object(["repo_root": .string(root.path), "output": .string(output)]))
         }
         return try .object(["op": .string(op), "repositories": .array(outputs)])
+    }
+
+    private func gitDiffCommand(args: [String: Value], root: URL) async throws -> [String] {
+        let compare = args["compare"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "uncommitted"
+        let lowered = compare.lowercased()
+        var command = ["diff", "--no-ext-diff", "--no-textconv", "--color=never"]
+        let contextLines = max(0, min(args["context_lines"]?.intValue ?? 3, 20))
+        command.append("--unified=\(contextLines)")
+        if args["detect_renames"]?.boolValue == true { command.append("--find-renames") }
+
+        switch args["detail"]?.stringValue?.lowercased() ?? "summary" {
+        case "files": command.append("--name-status")
+        case "summary": command.append("--stat")
+        case "patches", "full": break
+        default: throw MCPError.invalidParams("git diff detail must be summary, files, patches, or full")
+        }
+
+        if lowered == "staged" {
+            command.append("--cached")
+        } else if lowered == "uncommitted" || lowered.isEmpty {
+            // Default git diff already represents tracked uncommitted changes.
+        } else if lowered == "main" || lowered == "trunk" {
+            let candidates = ["origin/main", "origin/master", "main", "master"]
+            guard let base = try await firstResolvableGitRef(candidates, root: root) else {
+                throw MCPError.invalidParams("compare=\"\(compare)\" could not resolve a trunk ref")
+            }
+            command.append("\(base)...HEAD")
+        } else if lowered.hasPrefix("back:"),
+                  let count = Int(lowered.dropFirst("back:".count)),
+                  (1 ... 10_000).contains(count)
+        {
+            command.append("HEAD~\(count)...HEAD")
+        } else {
+            guard !compare.hasPrefix("-") else {
+                throw MCPError.invalidParams("git compare must not begin with '-'")
+            }
+            let revision = lowered.hasPrefix("mergebase:")
+                ? "\(compare.dropFirst("mergebase:".count))...HEAD"
+                : compare
+            command.append(revision)
+        }
+
+        var paths: [String] = []
+        if let path = args["path"]?.stringValue, !path.isEmpty { paths.append(path) }
+        paths.append(contentsOf: args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+        if !paths.isEmpty { command += ["--"] + paths }
+        return command
+    }
+
+    private func firstResolvableGitRef(_ candidates: [String], root: URL) async throws -> String? {
+        for candidate in candidates {
+            do {
+                _ = try await DirectProcess.runGit(
+                    arguments: ["-C", root.path, "rev-parse", "--verify", "\(candidate)^{commit}"]
+                )
+                return candidate
+            } catch {
+                continue
+            }
+        }
+        return nil
     }
 
     func manageWorktree(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -281,10 +342,14 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         let op = args["op"]?.stringValue ?? "list"
         switch op {
         case "list":
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", repo.path, "worktree", "list", "--porcelain"])
+            let output = try await DirectProcess.runGit(
+                arguments: ["-C", repo.path, "worktree", "list", "--porcelain"]
+            )
             return try .object(["op": .string(op), "output": .string(output)])
         case "show":
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", repo.path, "worktree", "list", "--porcelain"])
+            let output = try await DirectProcess.runGit(
+                arguments: ["-C", repo.path, "worktree", "list", "--porcelain"]
+            )
             return try .object(["op": .string(op), "output": .string(output)])
         case "create":
             guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("create requires path") }
@@ -298,7 +363,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             if let branch = args["branch"]?.stringValue { command += ["-b", branch] }
             command.append(url.path)
             if let base = args["base_ref"]?.stringValue { command.append(base) }
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: command)
+            let output = try await DirectProcess.runGit(arguments: command)
             return try .object(["op": .string(op), "path": .string(url.path), "output": .string(output)])
         case "bind", "select":
             let sessionID = try sessionID(args: args, request: request)
@@ -362,8 +427,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 targetRepositoryIdentity: targetRepositoryIdentity,
                 targetWorktreeIdentity: targetWorktreeIdentity
             )
-            let patch = try await DirectProcess.run(
-                "/usr/bin/git",
+            let patch = try await DirectProcess.runGit(
                 arguments: ["-C", target.path, "diff", "--no-ext-diff", "--color=never", "\(targetHead)..\(sourceHead)"]
             )
             return try .object([
@@ -388,8 +452,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 request: request
             )
             let message = args["commit_message"]?.stringValue ?? "Merge headless worktree \(operation.sourceHead.prefix(12))"
-            let output = try await DirectProcess.run(
-                "/usr/bin/git",
+            let output = try await DirectProcess.runGit(
                 arguments: Self.mergeMutationArguments(
                     targetRoot: targets.targetRoot,
                     gitDirectory: targets.targetGitDirectory,
@@ -400,7 +463,9 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             return try .object(["op": .string(op), "operation_id": .string(operation.id.uuidString), "output": .string(output)])
         case "status":
             if let raw = args["operation_id"]?.stringValue, let id = UUID(uuidString: raw), let operation = mergeOperations[id] {
-                let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", operation.targetRoot.path, "status", "--short", "--branch"])
+                let output = try await DirectProcess.runGit(
+                    arguments: ["-C", operation.targetRoot.path, "status", "--short", "--branch"]
+                )
                 return try .object(["op": .string(op), "operation_id": .string(id.uuidString), "output": .string(output)])
             }
             let bindings: [Value] = if let sessionID = try? sessionID(args: args, request: request) {
@@ -424,8 +489,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 request: request
             )
             let command = op == "continue" ? ["merge", "--continue"] : ["merge", "--abort"]
-            let output = try await DirectProcess.run(
-                "/usr/bin/git",
+            let output = try await DirectProcess.runGit(
                 arguments: Self.mergeMutationArguments(
                     targetRoot: targets.targetRoot,
                     gitDirectory: targets.targetGitDirectory,
@@ -627,8 +691,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
     }
 
     private func listedWorktrees(repository: URL) async throws -> [URL] {
-        let output = try await DirectProcess.run(
-            "/usr/bin/git",
+        let output = try await DirectProcess.runGit(
             arguments: ["-C", repository.path, "worktree", "list", "--porcelain"]
         )
         return output.split(separator: "\n").compactMap { line in
@@ -638,7 +701,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
     }
 
     private func gitLine(at root: URL, arguments: [String]) async throws -> String {
-        try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments)
+        try await DirectProcess.runGit(arguments: ["-C", root.path] + arguments)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -708,9 +771,11 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         guard let message = args["message"]?.stringValue, !message.isEmpty else {
             throw MCPError.invalidParams("ask_oracle requires message")
         }
+        let budgets = try await coordinator.contextBuilderBudgets()
+        let oracleMessage = Self.oraclePrompt(message, analysisBudget: budgets.analysis)
         let (id, response) = try await coordinator.createConversation(
             providerID: args["provider"]?.stringValue,
-            message: message,
+            message: oracleMessage,
             model: args["model"]?.stringValue,
             request: request
         )
@@ -730,9 +795,10 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         else {
             throw MCPError.invalidParams("oracle_send requires chat_id and message")
         }
+        let budgets = try await coordinator.contextBuilderBudgets()
         let response = try await coordinator.continueConversation(
             id: id,
-            message: message,
+            message: Self.oraclePrompt(message, analysisBudget: budgets.analysis),
             model: args["model"]?.stringValue,
             request: request
         )
@@ -757,17 +823,76 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         guard let instructions = args["instructions"]?.stringValue, !instructions.isEmpty else {
             throw MCPError.invalidParams("context_builder requires instructions")
         }
+        let responseType = args["response_type"]?.stringValue ?? "clarify"
+        let configuration = try await coordinator.contextBuilderConfiguration()
+        let prompt = Self.contextBuilderPrompt(
+            instructions: instructions,
+            responseType: responseType,
+            contextBudget: configuration.contextBudget,
+            analysisBudget: configuration.analysisBudget
+        )
+        await DirectHeadlessInvocationProgress.report(
+            "Context Builder started (context \(configuration.contextBudget / 1_000)k, analysis \(configuration.analysisBudget / 1_000)k)"
+        )
+        let heartbeat = Task {
+            let clock = ContinuousClock()
+            let started = clock.now
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { return }
+                let elapsed = started.duration(to: clock.now)
+                await DirectHeadlessInvocationProgress.report(
+                    "Context Builder provider active (\(elapsed.components.seconds)s elapsed)"
+                )
+            }
+        }
+        defer { heartbeat.cancel() }
         let (id, response) = try await coordinator.createConversation(
-            providerID: args["provider"]?.stringValue,
-            message: instructions,
-            model: args["model"]?.stringValue,
+            providerID: configuration.providerID,
+            message: prompt,
+            model: configuration.model,
             request: request
         )
+        await DirectHeadlessInvocationProgress.report("Context Builder completed")
         return try .object([
             "chat_id": .string(id.uuidString),
             "response": .string(response),
+            "response_type": .string(responseType),
+            "context_token_budget": .int(configuration.contextBudget),
+            "analysis_token_budget": .int(configuration.analysisBudget),
+            "agent": .string(configuration.providerID),
+            "model": configuration.model.map(Value.string) ?? .null,
             "backend": .string("headless")
         ])
+    }
+
+    nonisolated static func contextBuilderPrompt(
+        instructions: String,
+        responseType: String,
+        contextBudget: Int,
+        analysisBudget: Int
+    ) -> String {
+        """
+        <repoprompt_headless_context_builder>
+        <response_type>\(responseType)</response_type>
+        <context_token_budget>\(contextBudget)</context_token_budget>
+        <analysis_token_budget>\(analysisBudget)</analysis_token_budget>
+        You are the Context Builder worker for this request. Do not invoke context_builder, Oracle, agent_run, agent_explore, or other AI/delegation tools recursively. Build a curated workspace context with read-only shell commands and available non-AI repository tools. The selected code/context payload must not exceed the context token budget. When producing a plan, review, or answer, the complete analysis input must not exceed the analysis token budget. Prefer changed production files plus directly relevant tests, keep command output bounded, and return the requested \(responseType) response.
+        </repoprompt_headless_context_builder>
+
+        \(instructions)
+        """
+    }
+
+    nonisolated static func oraclePrompt(_ message: String, analysisBudget: Int) -> String {
+        """
+        <repoprompt_headless_oracle>
+        <analysis_token_budget>\(analysisBudget)</analysis_token_budget>
+        Keep the complete Oracle analysis context within this hard token maximum.
+        </repoprompt_headless_oracle>
+
+        \(message)
+        """
     }
 
     func requestUserInput(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -1016,6 +1141,37 @@ actor DirectHeadlessHistoryBackend: DomainHistoryCapabilityBackend {
     }
 }
 
+final class DirectProcessCancellationHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+    private var cancelled = false
+
+    func install(_ action: @escaping @Sendable () -> Void) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            action()
+        } else {
+            self.action = action
+            lock.unlock()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let action = action
+        lock.unlock()
+        action?()
+    }
+
+    func clear() {
+        lock.lock()
+        action = nil
+        lock.unlock()
+    }
+}
+
 enum DirectProcess {
     /// Child providers need basic process/configuration context and the explicit private
     /// launch carrier, but must not inherit arbitrary parent credentials or loader controls.
@@ -1071,20 +1227,43 @@ enum DirectProcess {
         return environment
     }
 
+    static func runGit(
+        arguments: [String],
+        currentDirectory: URL? = nil
+    ) async throws -> String {
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+        guard let executable = path.split(separator: ":").map(String.init).map({ directory in
+            URL(fileURLWithPath: directory, isDirectory: true).appendingPathComponent("git").path
+        }).first(where: FileManager.default.isExecutableFile) else {
+            throw MCPError.invalidRequest("Git executable was not found on PATH")
+        }
+        return try await run(
+            executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory
+        )
+    }
+
     static func run(
         _ executable: String,
         arguments: [String],
         input: Data? = nil,
         environment: [String: String] = [:],
-        currentDirectory: URL? = nil
+        currentDirectory: URL? = nil,
+        onOutput: (@Sendable (Data) -> Void)? = nil,
+        cancellationHandle: DirectProcessCancellationHandle? = nil
     ) async throws -> String {
-        try await DirectProcessInvocation(
+        let invocation = DirectProcessInvocation(
             executable: executable,
             arguments: arguments,
             input: input,
             environment: environment,
-            currentDirectory: currentDirectory
-        ).run()
+            currentDirectory: currentDirectory,
+            onOutput: onOutput
+        )
+        cancellationHandle?.install { invocation.requestCancellation() }
+        defer { cancellationHandle?.clear() }
+        return try await invocation.run()
     }
 }
 
@@ -1096,6 +1275,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     private let pipe = Pipe()
     private let inputPipe: Pipe?
     private let input: Data?
+    private let onOutput: (@Sendable (Data) -> Void)?
     private var output = Data()
     private var truncated = false
     private var cancellationRequested = false
@@ -1105,12 +1285,27 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         arguments: [String],
         input: Data?,
         environment overrides: [String: String],
-        currentDirectory: URL?
+        currentDirectory: URL?,
+        onOutput: (@Sendable (Data) -> Void)?
     ) {
         self.input = input
+        self.onOutput = onOutput
         inputPipe = input == nil ? nil : Pipe()
+#if os(Linux)
+        let setsidPath = ["/usr/bin/setsid", "/bin/setsid"].first {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }
+        if let setsidPath {
+            process.executableURL = URL(fileURLWithPath: setsidPath)
+            process.arguments = ["--wait", executable] + arguments
+        } else {
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+        }
+#else
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+#endif
         process.environment = DirectProcess.childEnvironment(overrides: overrides)
         process.currentDirectoryURL = currentDirectory
         process.standardOutput = pipe
@@ -1168,6 +1363,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
 
     private func append(_ data: Data) {
         guard !data.isEmpty else { return }
+        onOutput?(data)
         lock.lock()
         defer { lock.unlock() }
         guard output.count < Self.outputLimit else { truncated = true
@@ -1190,23 +1386,66 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         return cancellationRequested
     }
 
-    private func requestCancellation() {
+    fileprivate func requestCancellation() {
         lock.lock()
         cancellationRequested = true
         let isRunning = process.isRunning
         let pid = process.processIdentifier
         lock.unlock()
         guard isRunning else { return }
-        cancelProcess()
+        let processGroups = cancelProcess()
         if pid > 0 {
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak process] in
-                guard let process, process.isRunning, process.processIdentifier == pid else { return }
-                _ = kill(pid, SIGKILL)
+#if os(Linux)
+                for processGroup in processGroups {
+                    _ = kill(-processGroup, SIGKILL)
+                }
+#endif
+                if let process, process.isRunning, process.processIdentifier == pid {
+                    _ = kill(pid, SIGKILL)
+                }
             }
         }
     }
 
-    private func cancelProcess() {
-        if process.isRunning { process.terminate() }
+    @discardableResult
+    private func cancelProcess() -> [Int32] {
+        guard process.isRunning else { return [] }
+        let pid = process.processIdentifier
+#if os(Linux)
+        let processGroups = Self.descendantProcessGroups(rootPID: pid)
+        for processGroup in processGroups {
+            _ = kill(-processGroup, SIGTERM)
+        }
+        if pid > 0 { _ = kill(pid, SIGTERM) }
+        return processGroups
+#else
+        process.terminate()
+        return []
+#endif
     }
+
+#if os(Linux)
+    private static func descendantProcessGroups(rootPID: Int32) -> [Int32] {
+        guard rootPID > 0 else { return [] }
+        var pending = [rootPID]
+        var visited: Set<Int32> = []
+        var groups: Set<Int32> = []
+        let ownProcessGroup = getpgrp()
+        while let pid = pending.popLast() {
+            guard visited.insert(pid).inserted else { continue }
+            let childrenPath = "/proc/\(pid)/task/\(pid)/children"
+            if let contents = try? String(contentsOfFile: childrenPath, encoding: .utf8) {
+                pending.append(contentsOf: contents.split(whereSeparator: \.isWhitespace).compactMap {
+                    Int32($0)
+                })
+            }
+            let processGroup = getpgid(pid)
+            if processGroup > 0, processGroup != ownProcessGroup {
+                groups.insert(processGroup)
+            }
+        }
+        return groups.sorted()
+    }
+#endif
 }

@@ -25,6 +25,7 @@ actor DirectHeadlessMCPService {
         let childEndpoint: DirectHeadlessChildEndpoint
         let childLaunchCoordinator: DirectHeadlessChildLaunchCoordinator
         let providerCoordinator: DirectHeadlessProviderCoordinator
+        let configuredGrantOperations: Set<String>
     }
 
     struct ConnectionContext {
@@ -85,6 +86,7 @@ actor DirectHeadlessMCPService {
                 restrictedToolNames: [],
                 additionalToolNames: [],
                 ephemeralGrantedOperations: Self.topLevelDefaultMutationOperations
+                    .union(prepared.configuredGrantOperations)
             )
         )
         let transport = MCPStdioServerTransport(
@@ -251,7 +253,8 @@ actor DirectHeadlessMCPService {
                 principal: principal,
                 childEndpoint: childEndpoint,
                 childLaunchCoordinator: childLaunchCoordinator,
-                providerCoordinator: providerCoordinator
+                providerCoordinator: providerCoordinator,
+                configuredGrantOperations: locations.configuredGrantOperations
             )
         } catch {
             _ = await runtime.shutdown()
@@ -292,7 +295,7 @@ actor DirectHeadlessMCPService {
                 return MCP.Tool(
                     name: definition.name,
                     description: Self.advertisedDescription(for: definition),
-                    inputSchema: definition.inputSchema,
+                    inputSchema: Self.advertisedInputSchema(for: definition),
                     annotations: .init(
                         title: projected.title,
                         readOnlyHint: projected.readOnlyHint,
@@ -305,7 +308,7 @@ actor DirectHeadlessMCPService {
             return ListTools.Result(tools: tools)
         }
 
-        await server.withMethodHandler(CallTool.self) { params in
+        await server.withMethodHandler(CallTool.self) { params -> CallTool.Result in
             guard visibleNames.contains(params.name) else {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }
@@ -327,14 +330,32 @@ actor DirectHeadlessMCPService {
                     connection: connection,
                     invocationID: invocationID
                 )
-                let result = try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
-                    invocationID: invocationID,
-                    connectionID: connection.connectionID,
-                    resolution: resolution,
-                    arguments: arguments,
-                    securityContext: security
-                ))
-                return Self.successResult(result)
+                let progressTransport: DirectHeadlessMCPProgressTransport?
+                let reporter: (@Sendable (String) async -> Void)?
+                if let progressToken = params._meta?.progressToken {
+                    let transport = DirectHeadlessMCPProgressTransport(server: server, token: progressToken)
+                    progressTransport = transport
+                    reporter = { message in await transport.send(message) }
+                } else {
+                    progressTransport = nil
+                    reporter = nil
+                }
+                do {
+                    let value = try await DirectHeadlessInvocationProgress.$reporter.withValue(reporter) {
+                        try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
+                            invocationID: invocationID,
+                            connectionID: connection.connectionID,
+                            resolution: resolution,
+                            arguments: arguments,
+                            securityContext: security
+                        ))
+                    }
+                    await progressTransport?.markTerminal()
+                    return Self.successResult(value)
+                } catch {
+                    await progressTransport?.markTerminal()
+                    throw error
+                }
             } catch {
                 return Self.errorResult(String(describing: error))
             }
@@ -353,6 +374,35 @@ actor DirectHeadlessMCPService {
 #else
         return definition.description
 #endif
+    }
+
+    nonisolated static func advertisedInputSchema(
+        for definition: MCPDomainToolDefinition
+    ) -> Value {
+        guard definition.name == "agent_run" || definition.name == "agent_explore",
+              var schema = definition.inputSchema.objectValue,
+              var properties = schema["properties"]?.objectValue
+        else {
+            return definition.inputSchema
+        }
+        properties["op"] = .object([
+            "type": .string("string"),
+            "description": .string("Supported direct-headless operation."),
+            "enum": .array(["start", "poll", "wait", "cancel"].map(Value.string))
+        ])
+        for key in [
+            "_worktree_startup_benchmark_token", "allow_external_worktree_path", "amendment",
+            "answers", "content", "interaction_id", "messages", "meta", "response",
+            "session_ids", "timeout_seconds", "wait", "worktree_base_ref", "worktree_branch",
+            "worktree_create", "worktree_path"
+        ] {
+            properties.removeValue(forKey: key)
+        }
+        schema["properties"] = .object(properties)
+        schema["description"] = .string(
+            "Direct headless supports start with one message and an optional existing worktree selector, plus single-session poll, wait, and cancel."
+        )
+        return .object(schema)
     }
 
     private func servePrivateChild(
@@ -586,6 +636,9 @@ actor DirectHeadlessMCPService {
               supportedOperations.contains(operation)
         else {
             throw MCPError.invalidParams("\(toolName) requires a supported string op")
+        }
+        guard arguments["additional_tools"] == nil else {
+            throw MCPError.invalidParams("\(toolName) does not accept caller-supplied child capabilities")
         }
         return arguments
     }

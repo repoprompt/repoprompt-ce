@@ -3,6 +3,41 @@ import Foundation
 import XCTest
 
 final class DomainDirectSettingsStoreTests: XCTestCase {
+    func testContextBuilderBudgetsHaveAppParityDefaultsAndBoundedPersistence() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DomainDirectSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = DomainDirectSettingsStore(
+            persistence: makePersistence(root: root, profile: "context-builder-budgets"),
+            profileIdentifier: "context-builder-budgets"
+        )
+        await store.bootstrap()
+
+        let defaultContext = try await store.effectiveValue(for: "context_builder.context_token_budget")
+        let defaultAnalysis = try await store.effectiveValue(for: "context_builder.analysis_token_budget")
+        XCTAssertEqual(defaultContext, .integer(160_000))
+        XCTAssertEqual(defaultAnalysis, .integer(120_000))
+        _ = try await store.set(key: "context_builder.context_token_budget", value: .integer(100_000))
+        _ = try await store.set(key: "context_builder.analysis_token_budget", value: .integer(150_000))
+        let configuredContext = try await store.effectiveValue(for: "context_builder.context_token_budget")
+        let configuredAnalysis = try await store.effectiveValue(for: "context_builder.analysis_token_budget")
+        XCTAssertEqual(configuredContext, .integer(100_000))
+        XCTAssertEqual(configuredAnalysis, .integer(150_000))
+
+        do {
+            _ = try await store.set(key: "context_builder.context_token_budget", value: .integer(100_001))
+            XCTFail("Expected a non-step-aligned context budget to be rejected")
+        } catch {
+            XCTAssertEqual(error as? DomainDirectSettingsError, .invalidValue("context_builder.context_token_budget"))
+        }
+        do {
+            _ = try await store.set(key: "context_builder.analysis_token_budget", value: .integer(205_000))
+            XCTFail("Expected an out-of-range analysis budget to be rejected")
+        } catch {
+            XCTAssertEqual(error as? DomainDirectSettingsError, .invalidValue("context_builder.analysis_token_budget"))
+        }
+    }
+
     func testConcurrentColdStartBootstrapWaitsForPersistedSettingsLoad() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("DomainDirectSettingsStoreTests-\(UUID().uuidString)", isDirectory: true)

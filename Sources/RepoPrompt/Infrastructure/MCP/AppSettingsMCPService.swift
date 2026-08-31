@@ -429,6 +429,7 @@ private enum AppSettingValueType: String {
     case boolean
     case string
     case optionalString = "string|null"
+    case integer
     case number
 }
 
@@ -752,8 +753,33 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setCustomPlanningPrompt(requiredString(from: $1)) }
         ),
 
-        // Context Builder agent/model selection only. Behavioral controls remain
-        // globally owned by the app Settings and panel UI.
+        // Context Builder settings share the same global authority as the Settings panel.
+        integerSetting(
+            key: "context_builder.context_token_budget",
+            group: "context_builder",
+            description: "Maximum selected-context budget for context-only Context Builder runs.",
+            range: 10_000 ... 200_000,
+            step: 5_000,
+            read: { .int($0.contextBuilderBehaviorSettings().contextTokenBudget) },
+            write: { store, value in
+                var settings = store.contextBuilderBehaviorSettings()
+                settings.contextTokenBudget = try requiredInt(from: value)
+                store.setContextBuilderBehaviorSettings(settings)
+            }
+        ),
+        integerSetting(
+            key: "context_builder.analysis_token_budget",
+            group: "context_builder",
+            description: "Maximum selected-context budget when Context Builder produces a plan, review, or answer.",
+            range: 40_000 ... 200_000,
+            step: 5_000,
+            read: { .int($0.contextBuilderBehaviorSettings().analysisTokenBudget) },
+            write: { store, value in
+                var settings = store.contextBuilderBehaviorSettings()
+                settings.analysisTokenBudget = try requiredInt(from: value)
+                store.setContextBuilderBehaviorSettings(settings)
+            }
+        ),
         stringEnumSetting(
             key: "context_builder.agent",
             group: "context_builder",
@@ -1111,6 +1137,30 @@ private enum AppSettingsMCPRegistry {
         )
     }
 
+    private static func integerSetting(
+        key: String,
+        group: String,
+        label: String? = nil,
+        description: String,
+        range: ClosedRange<Int>,
+        step: Int,
+        read: @escaping @MainActor (GlobalSettingsStore) -> Value,
+        write: @escaping @MainActor (GlobalSettingsStore, Value) throws -> Void
+    ) -> AppSettingDefinition {
+        AppSettingDefinition(
+            key: key,
+            group: group,
+            valueType: .integer,
+            label: label,
+            description: description,
+            allowedValues: nil,
+            read: read,
+            validate: { value in try validateInteger(value, key: key, range: range, step: step) },
+            write: write,
+            afterWrite: nil
+        )
+    }
+
     private static func numberSetting(
         key: String,
         group: String,
@@ -1224,6 +1274,28 @@ private enum AppSettingsMCPRegistry {
         )
     }
 
+    private static func validateInteger(
+        _ value: Value,
+        key: String,
+        range: ClosedRange<Int>,
+        step: Int
+    ) throws -> Value {
+        let number = try numericValue(value, key: key)
+        guard number.rounded() == number,
+              number >= Double(Int.min),
+              number <= Double(Int.max)
+        else {
+            throw MCPError.invalidParams("Setting '\(key)' requires a whole-number value.")
+        }
+        let integer = Int(number)
+        guard range.contains(integer), integer.isMultiple(of: step) else {
+            throw MCPError.invalidParams(
+                "Setting '\(key)' must be between \(range.lowerBound) and \(range.upperBound) in increments of \(step)."
+            )
+        }
+        return .int(integer)
+    }
+
     private static func validateDouble(_ value: Value, key: String, range: ClosedRange<Double>) throws -> Value {
         let number = try numericValue(value, key: key)
         guard range.contains(number) else {
@@ -1301,6 +1373,13 @@ private enum AppSettingsMCPRegistry {
     private static func optionalString(from value: Value) throws -> String? {
         if case .null = value { return nil }
         return try requiredString(from: value)
+    }
+
+    private static func requiredInt(from value: Value) throws -> Int {
+        guard case let .int(integer) = value else {
+            throw MCPError.invalidParams("Expected normalized integer value.")
+        }
+        return integer
     }
 
     private static func requiredDouble(from value: Value) throws -> Double {

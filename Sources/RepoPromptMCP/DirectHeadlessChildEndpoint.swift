@@ -285,7 +285,7 @@ actor DirectHeadlessChildLaunchCoordinator {
             clientPrincipal: securityContext.principal.stableKey ?? securityContext.principal.displayName,
             providerIdentifier: provider,
             runPurpose: toolName,
-            additionalTools: Set(arguments["additional_tools"]?.arrayValue?.compactMap(\.stringValue) ?? []),
+            additionalTools: [],
             expectedProcessID: nil,
             lifetime: .seconds(60)
         )

@@ -117,6 +117,7 @@ import PackageDescription
                     "main.swift"
                 ],
                 sources: [
+                    "DirectCodexProgressTail.swift",
                     "DirectHeadlessCapabilityBackends.swift",
                     "DirectHeadlessClientIdentity.swift",
                     "DirectHeadlessChildBridge.swift",
@@ -124,6 +125,7 @@ import PackageDescription
                     "DirectHeadlessDomainContext.swift",
                     "DirectHeadlessMCPService.swift",
                     "DirectHeadlessProviderCoordinator.swift",
+                    "DirectHeadlessRequestProgress.swift",
                     "DirectHeadlessRuntimeConfiguration.swift",
                     "DirectHeadlessWorktreeRouting.swift",
                     "DirectHeadlessWorkspaceBackends.swift",
