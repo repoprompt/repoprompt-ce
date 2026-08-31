@@ -145,6 +145,7 @@ ci-app-test-runner-selftest:
 	python3 Scripts/test_ci_app_test_runner.py
 
 release-selftest:
+	python3 Scripts/test_release_tooling.py
 	python3 Scripts/test_codex_runtime_artifact.py
 	python3 Scripts/test_codex_update_candidate.py
 	python3 Scripts/test_codex_update_workflow.py

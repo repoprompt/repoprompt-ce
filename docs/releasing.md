@@ -271,12 +271,16 @@ merging T; advance it again with T and P digests before merging S. Each publishe
 immutable `tip-<shortsha>` tag and the tip-only repository's latest release. Do not mark it as a
 prerelease, because GitHub excludes prereleases from `releases/latest`.
 
-Current checkpoint: verified P is `tip-2f94412e6ab5`, with rollout-manifest SHA-256
-`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. The reviewed declaration
-pins that predecessor and selects T. Protected-main review of the rollout declaration is the release
-authorization boundary: after CI passes, Tip publication is automatic. Do not merge a T or S
-declaration until the isolated runtime proof is approved, including lost-journal recovery and a
-fresh-successor-install policy.
+Current checkpoint: Stable 1.4.0 is the official Stable maximum at build `36`. The previously
+verified P at `tip-2f94412e6ab5` retained build `35.15.18` and rollout-manifest SHA-256
+`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`; it remains historical Tip
+material but cannot safely authorize T because it is below Stable 36. The checked-in declaration is
+reset to a replacement `preparer` with legacy identity, `legacy-preparer` phase, and no predecessors.
+Publish and verify replacement P above Stable 36 (the next Tip encoding begins at `36.0.x`), then
+advance the declaration with its exact manifest digest before merging T. Protected-main review of the
+rollout declaration is the release authorization boundary: after CI passes, Tip publication is
+automatic. Do not merge a T or S declaration until the isolated runtime proof is approved, including
+lost-journal recovery and a fresh-successor-install policy.
 
 Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow reads the published
 stable appcast and combines that stable build with the source commit count. For example, commit

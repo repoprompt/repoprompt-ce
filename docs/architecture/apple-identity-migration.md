@@ -128,10 +128,14 @@ declaration with P's exact manifest digest before merging T. After T is verified
 declaration with both exact predecessor digests before merging S. Successful protected-main CI
 automatically publishes each reviewed role; no second dispatch approval is required.
 
-P was published and independently verified at `tip-2f94412e6ab5`; its retained
-`identity-rollout.json` SHA-256 is
-`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. The checked-in Tip
-declaration now pins that immutable predecessor and selects T.
+Stable 1.4.0 (build `36`) is now the official Stable maximum. The previously verified P at
+`tip-2f94412e6ab5` (build `35.15.18`, with retained `identity-rollout.json` SHA-256
+`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`) remains historical
+Tip material, but its retained build is below Stable 36 and cannot safely authorize T. The
+checked-in Tip declaration is therefore reset to a replacement P: `preparer` role, legacy
+signing identity, `legacy-preparer` phase, and no predecessors. Publish and verify a replacement
+P above Stable 36 (the next Tip encoding begins at `36.0.x`), then advance the declaration with
+its exact manifest digest before merging T.
 
 The workflow capability for T is explicit and deterministic: after a reviewed transition declaration
 reaches protected `main` and CI passes, GitHub selects and publishes that exact commit automatically.
