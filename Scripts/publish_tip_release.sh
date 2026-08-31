@@ -28,7 +28,12 @@ require_file "$APPLE_IDENTITY_POLICY"
 [[ "$TIP_SOURCE_BRANCH" == "main" ]] || fail "Tip publication source branch must remain main"
 [[ "$TIP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "TIP_COMMIT must be a full lowercase Git SHA"
 [[ "$TIP_TAG" =~ ^tip-[0-9a-f]{12}$ ]] || fail "TIP_TAG must be tip-<12 lowercase hex>"
-[[ "$#" -ge 1 ]] || fail "Usage: $0 <release-asset>..."
+[[ "${1:-}" == "--rollout-declaration" && "$#" -ge 2 ]] ||
+    fail "Usage: $0 --rollout-declaration <checked-in-declaration> <release-asset>..."
+ROLLOUT_DECLARATION="$2"
+shift 2
+require_file "$ROLLOUT_DECLARATION"
+[[ "$#" -ge 1 ]] || fail "Usage: $0 --rollout-declaration <checked-in-declaration> <release-asset>..."
 case "$TIP_UPDATE_REPOSITORY" in
     "$TIP_SOURCE_REPOSITORY"|repoprompt/repoprompt-ce-updates)
         fail "Tip publication repository must be separate from source and Stable updates"
@@ -215,8 +220,10 @@ require_live_main() {
 }
 
 LIVE_AUDIT_INDEX=0
+STABLE_AUDIT_INDEX=0
 LIVE_MANIFEST_PATH=""
 LIVE_APPCAST_PATH=""
+STABLE_APPCAST_PATH=""
 fetch_live_tip_rollout() {
     LIVE_AUDIT_INDEX=$((LIVE_AUDIT_INDEX + 1))
     local release_file="$TMP_DIR/live-release-$LIVE_AUDIT_INDEX.json" status report
@@ -386,16 +393,17 @@ PY
 
 audit_stable_tip_floor() {
     local phase="$1"
-    local stable_feed_url stable_appcast
+    local stable_feed_url
+    STABLE_AUDIT_INDEX=$((STABLE_AUDIT_INDEX + 1))
+    STABLE_APPCAST_PATH="$TMP_DIR/stable-floor-$STABLE_AUDIT_INDEX.xml"
     stable_feed_url="$(python3 "$ROLLOUT_TOOL" feed-url \
         --policy "$APPLE_IDENTITY_POLICY" --channel stable)"
-    stable_appcast="$TMP_DIR/stable-floor-$LIVE_AUDIT_INDEX.xml"
     curl --fail --location --silent --show-error \
         --connect-timeout 10 --max-time 30 \
-        "$stable_feed_url" --output "$stable_appcast"
+        "$stable_feed_url" --output "$STABLE_APPCAST_PATH"
     python3 "$ROLLOUT_TOOL" validate-stable-tip-floor \
         --policy "$APPLE_IDENTITY_POLICY" \
-        --stable-appcast "$stable_appcast" \
+        --stable-appcast "$STABLE_APPCAST_PATH" \
         --tip-manifest "$CANDIDATE_MANIFEST" \
         --tip-appcast "$CANDIDATE_APPCAST" ||
         fail "$phase rejected an unsafe Stable/Tip build floor"
@@ -411,6 +419,8 @@ audit_live_rollout_progression() {
         --policy "$APPLE_IDENTITY_POLICY"
         --candidate-manifest "$CANDIDATE_MANIFEST"
         --candidate-appcast "$CANDIDATE_APPCAST"
+        --declaration "$ROLLOUT_DECLARATION"
+        --stable-appcast "$STABLE_APPCAST_PATH"
     )
     if fetch_live_tip_rollout; then
         arguments+=(

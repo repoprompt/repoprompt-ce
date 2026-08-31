@@ -1,9 +1,28 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "channel": "tip",
   "currentRole": "preparer",
   "eligibilityProfile": "tip-identity-dress-rehearsal-v1",
   "expectedMigrationPhase": "legacy-preparer",
   "expectedSigningIdentity": "legacy",
-  "predecessors": []
+  "predecessors": [],
+  "resetAuthority": {
+    "type": "transition-to-replacement-preparer-v1",
+    "liveTip": {
+      "role": "transition",
+      "tag": "tip-57b572038048",
+      "buildNumber": "35.15.39",
+      "rolloutManifestSha256": "c8d28103b5e95370fc0de7df19c34797552e99803228794754bfbfe292e3e421"
+    },
+    "stableEpoch": {
+      "marketingVersion": "1.4.0",
+      "buildNumber": "36"
+    },
+    "retainedPreparer": {
+      "role": "preparer",
+      "tag": "tip-2f94412e6ab5",
+      "buildNumber": "35.15.18",
+      "rolloutManifestSha256": "3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db"
+    }
+  }
 }

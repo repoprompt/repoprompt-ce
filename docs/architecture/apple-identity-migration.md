@@ -128,14 +128,19 @@ declaration with P's exact manifest digest before merging T. After T is verified
 declaration with both exact predecessor digests before merging S. Successful protected-main CI
 automatically publishes each reviewed role; no second dispatch approval is required.
 
-Stable 1.4.0 (build `36`) is now the official Stable maximum. The previously verified P at
-`tip-2f94412e6ab5` (build `35.15.18`, with retained `identity-rollout.json` SHA-256
-`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`) remains historical
-Tip material, but its retained build is below Stable 36 and cannot safely authorize T. The
-checked-in Tip declaration is therefore reset to a replacement P: `preparer` role, legacy
-signing identity, `legacy-preparer` phase, and no predecessors. Publish and verify a replacement
-P above Stable 36 (the next Tip encoding begins at `36.0.x`), then advance the declaration with
-its exact manifest digest before merging T.
+Stable 1.4.0 (build `36`) is now the official Stable epoch. The authenticated live Tip is
+transition tag `tip-57b572038048`, build `35.15.39`, with `identity-rollout.json` SHA-256
+`c8d28103b5e95370fc0de7df19c34797552e99803228794754bfbfe292e3e421`; it retains P
+`tip-2f94412e6ab5` at build `35.15.18`, whose manifest SHA-256 is
+`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. Because that retained P
+is below Stable 36, normal T -> P progression remains forbidden. The schema-2 checked-in Tip
+declaration contains the sole explicit `resetAuthority` for this exact live transition, retained P,
+and Stable epoch. The release tool matches every recorded tag, manifest digest, retained-P fact, and
+Stable epoch fact against the authenticated public files and rejects absent, mismatched, or tampered
+reset data; it does not add a generic progression bypass or silently discard authenticated history.
+The replacement P must be newer than both live Tip `35.15.39` and Stable `36` (the next Tip encoding
+begins at `36.0.x`). After publication, clear the reset authority and advance the declaration with P's
+exact manifest digest before merging T.
 
 The workflow capability for T is explicit and deterministic: after a reviewed transition declaration
 reaches protected `main` and CI passes, GitHub selects and publishes that exact commit automatically.
