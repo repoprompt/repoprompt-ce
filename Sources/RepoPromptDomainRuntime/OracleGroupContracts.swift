@@ -330,11 +330,9 @@ package enum OracleContentReference: Codable, Equatable {
 
 package struct OracleEvidenceReference: Codable, Equatable {
     package let path: String
-    package let contentDigest: String?
 
-    package init(path: String, contentDigest: String? = nil) {
+    package init(path: String) {
         self.path = path
-        self.contentDigest = contentDigest
     }
 }
 

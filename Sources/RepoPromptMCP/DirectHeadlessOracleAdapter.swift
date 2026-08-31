@@ -475,7 +475,7 @@ actor DirectHeadlessOracleAdapter {
                             providerID: invocation.member.model.providerID,
                             model: invocation.member.model.modelID,
                             request: physicalRequest,
-                            purpose: .oracle,
+                            purpose: .oracleGroup,
                             carrierEnvironment: carrier.environment
                         )
                         return OracleLaneExecutionResponse(response: response)

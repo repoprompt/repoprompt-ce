@@ -3665,7 +3665,9 @@ class OracleViewModel: ObservableObject {
     private func handleComposeTabsWillClose(_ tabIDs: Set<UUID>) async {
         for tabID in tabIDs {
             // 1. Cancel headless stream (plan/question generation) for this tab
-            await cancelHeadlessStream(forTabID: tabID)
+            if headlessRuntime.hasActiveStream(for: tabID) {
+                await cancelHeadlessStream(forTabID: tabID)
+            }
 
             // 2. Cancel normal chat streaming sessions associated with this tab
             let sessionsForTab = sessions.filter { $0.composeTabID == tabID }

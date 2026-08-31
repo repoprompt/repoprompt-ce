@@ -1,4 +1,3 @@
-import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -229,30 +228,5 @@ final class OracleLaneMarkdownFormatterTests: XCTestCase {
             turns: [turn]
         )
         return (group, members)
-    }
-
-    private func laneValue(index: Int, response: String) -> Value {
-        .object([
-            "lane_index": .int(index),
-            "role": .string(index == 0 ? "primary" : "additional"),
-            "chat_id": .string("chat-\(index)"),
-            "provider_id": .string("configured-provider-\(index)"),
-            "model_id": .string("configured-model-\(index)"),
-            "status": .string("completed"),
-            "execution_profile": .object([
-                "provider_id": .string("runtime-provider-\(index)"),
-                "model_id": .string("runtime-model-\(index)"),
-                "effective_reasoning_effort": .string(index == 0 ? "high" : "medium")
-            ]),
-            "response": .string(response)
-        ])
-    }
-
-    private func onlyText(_ blocks: [MCP.Tool.Content]) throws -> String {
-        let block = try XCTUnwrap(blocks.first)
-        guard case let .text(text, _, _) = block else {
-            throw XCTSkip("Expected text output")
-        }
-        return text
     }
 }
