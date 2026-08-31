@@ -36,7 +36,6 @@ final class AppDomainRuntimeComposition: Sendable {
 
     let runtime: MCPDomainRuntime
     let oracleConversationStore: DomainOracleConversationStore
-    let oracleGroupClaimManager: OracleGroupClaimManager
     let oracleGroupRuntime: OracleGroupRuntime
 
     static func collectLegacyRuntimeDefaults(from defaults: UserDefaults) -> [String: Data] {
@@ -92,7 +91,7 @@ final class AppDomainRuntimeComposition: Sendable {
             persistence: runtime.persistenceCoordinator,
             identity: runtime.identity
         )
-        oracleGroupClaimManager = OracleGroupClaimManager(
+        let oracleGroupClaimManager = OracleGroupClaimManager(
             persistence: runtime.persistenceCoordinator,
             identity: runtime.identity
         )

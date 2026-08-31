@@ -179,8 +179,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                     authorizations = try await authorizeIfNeeded(
                         toolName: toolName,
                         arguments: arguments,
-                        context: securityContext,
-                        launchPlan: launchPlan
+                        context: securityContext
                     )
                 } catch {
                     if let launchPlan { await revokeChildLaunches?(launchPlan, nil) }
@@ -331,8 +330,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
     private func authorizeIfNeeded(
         toolName: String,
         arguments: [String: Value],
-        context: DomainToolInvocationSecurityContext?,
-        launchPlan: DomainChildLaunchPlan?
+        context: DomainToolInvocationSecurityContext?
     ) async throws -> [DomainMutationAuthorizationSnapshot] {
         let classes = approvalClasses(toolName: toolName, arguments: arguments)
         guard !classes.isEmpty else { return [] }
@@ -343,8 +341,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                 toolName: toolName,
                 action: approvalClass,
                 workspaceID: context?.workspaceID,
-                canonicalRoots: [],
-                metadata: launchPlan?.approvalMetadata ?? [:]
+                canonicalRoots: []
             ))
         }
         return snapshots

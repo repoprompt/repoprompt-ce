@@ -45,7 +45,7 @@ struct ContextBuilderCallCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM, dto: nil)
+        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
     }
 
     private var summary: String {
@@ -207,21 +207,17 @@ struct ContextBuilderResultCard: View {
     private var status: ToolCardStatus {
         if phase == .running || phase == .generatingPlan { return .running }
         if item.toolIsError == true { return .failure }
-
         if let dto {
             switch dto.status?.lowercased() {
             case "error": return .failure
             case "partial", "warning": return .warning
-            case "running", "in_progress", "pending", "success", "completed":
+            case "running", "in_progress", "pending":
                 return .success
+            case "success", "completed": return .success
             default: break
             }
         }
-        return ToolResultStatusResolver.resolve(
-            toolIsError: item.toolIsError,
-            raw: item.toolResultJSON,
-            fallback: .neutral
-        )
+        return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }
 
     private var isExpandable: Bool {
@@ -707,7 +703,7 @@ func contextBuilderFollowUpModelLine(
 @MainActor
 private func contextBuilderCardDetailLine(
     contextBuilderAgentVM: ContextBuilderAgentViewModel,
-    dto: ToolResultDTOs.ContextBuilderDTO?
+    dto: ToolResultDTOs.ContextBuilderDTO? = nil
 ) -> String? {
     var detail = "Context Builder: \(contextBuilderAgentVM.runModelDisplayName)"
     if let followUpType = nonEmptyContextBuilderValue(contextBuilderAgentVM.mcpResponseType) {

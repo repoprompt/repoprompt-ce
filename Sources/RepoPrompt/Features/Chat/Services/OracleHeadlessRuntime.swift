@@ -41,13 +41,7 @@ final class OracleHeadlessRuntime {
     private let cancelStream: CancelStream
     private let cleanupConversation: CleanupConversation
     private let timeout: Duration
-    private var streamIDsByTabID: [UUID: Set<ChatStreamID>] = [:]
-    private var streamIDsByInvocationID: [UUID: Set<ChatStreamID>] = [:]
-    private var invocationIDsByTabID: [UUID: Set<UUID>] = [:]
-    private var tabIDByInvocationID: [UUID: UUID] = [:]
-    private var cancellationGenerationByTabID: [UUID: UInt64] = [:]
-    private var cancellationGenerationByInvocationID: [UUID: UInt64] = [:]
-    private var pendingStreamCountsByTabID: [UUID: Int] = [:]
+    private var streamIDsByTabID: [UUID: ChatStreamID] = [:]
 
     convenience init(aiQueriesService: AIQueriesService) {
         self.init(
@@ -90,33 +84,12 @@ final class OracleHeadlessRuntime {
         message: AIMessage,
         model: AIModel,
         tabID: UUID,
-        invocationID: UUID = UUID(),
         completionPolicy: OracleResponseCompletionPolicy,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws -> Output {
         try Task.checkCancellation()
 
-        let tabCancellationGeneration = cancellationGenerationByTabID[tabID, default: 0]
-        let invocationCancellationGeneration = cancellationGenerationByInvocationID[invocationID, default: 0]
-        invocationIDsByTabID[tabID, default: []].insert(invocationID)
-        tabIDByInvocationID[invocationID] = tabID
-        defer { removeInvocation(invocationID, from: tabID) }
-        pendingStreamCountsByTabID[tabID, default: 0] += 1
-        let streamID: ChatStreamID
-        let stream: AsyncThrowingStream<ChatStreamOutput, Error>
-        do {
-            (streamID, stream) = try await sendPrompt(message, model)
-        } catch {
-            removePendingStream(for: tabID)
-            throw error
-        }
-        removePendingStream(for: tabID)
-        guard cancellationGenerationByTabID[tabID, default: 0] == tabCancellationGeneration,
-              cancellationGenerationByInvocationID[invocationID, default: 0] == invocationCancellationGeneration
-        else {
-            await cancelStream(streamID)
-            throw CancellationError()
-        }
+        let (streamID, stream) = try await sendPrompt(message, model)
         let cleanupHandleBox = OracleHeadlessCleanupHandleBox()
         var completedSuccessfully = false
         defer {
@@ -130,17 +103,9 @@ final class OracleHeadlessRuntime {
             }
         }
 
-        streamIDsByTabID[tabID, default: []].insert(streamID)
-        streamIDsByInvocationID[invocationID, default: []].insert(streamID)
+        streamIDsByTabID[tabID] = streamID
         defer {
-            streamIDsByTabID[tabID]?.remove(streamID)
-            if streamIDsByTabID[tabID]?.isEmpty == true {
-                streamIDsByTabID.removeValue(forKey: tabID)
-            }
-            streamIDsByInvocationID[invocationID]?.remove(streamID)
-            if streamIDsByInvocationID[invocationID]?.isEmpty == true {
-                streamIDsByInvocationID.removeValue(forKey: invocationID)
-            }
+            streamIDsByTabID.removeValue(forKey: tabID)
         }
 
         let timeout = timeout
@@ -228,69 +193,19 @@ final class OracleHeadlessRuntime {
     }
 
     func hasActiveStream(for tabID: UUID) -> Bool {
-        streamIDsByTabID[tabID]?.isEmpty == false
+        streamIDsByTabID[tabID] != nil
     }
 
     func cancelStream(for tabID: UUID) async {
-        cancellationGenerationByTabID[tabID, default: 0] &+= 1
-        let invocationIDs = invocationIDsByTabID[tabID] ?? []
-        for invocationID in invocationIDs {
-            cancellationGenerationByInvocationID[invocationID, default: 0] &+= 1
-            streamIDsByInvocationID.removeValue(forKey: invocationID)
-        }
-        let streamIDs = streamIDsByTabID.removeValue(forKey: tabID) ?? []
-        for streamID in streamIDs {
-            await cancelStream(streamID)
-        }
-    }
-
-    func cancelStream(invocationID: UUID) async {
-        guard tabIDByInvocationID[invocationID] != nil else { return }
-        cancellationGenerationByInvocationID[invocationID, default: 0] &+= 1
-        let streamIDs = streamIDsByInvocationID.removeValue(forKey: invocationID) ?? []
-        if let tabID = tabIDByInvocationID[invocationID] {
-            streamIDsByTabID[tabID]?.subtract(streamIDs)
-            if streamIDsByTabID[tabID]?.isEmpty == true {
-                streamIDsByTabID.removeValue(forKey: tabID)
-            }
-        }
-        for streamID in streamIDs {
-            await cancelStream(streamID)
-        }
+        guard let streamID = streamIDsByTabID.removeValue(forKey: tabID) else { return }
+        await cancelStream(streamID)
     }
 
     func cancelAllStreams() async {
-        let tabIDs = Set(streamIDsByTabID.keys).union(pendingStreamCountsByTabID.keys)
-        for tabID in tabIDs {
-            cancellationGenerationByTabID[tabID, default: 0] &+= 1
-        }
-        for invocationID in tabIDByInvocationID.keys {
-            cancellationGenerationByInvocationID[invocationID, default: 0] &+= 1
-        }
-        let streamIDs = streamIDsByTabID.values.flatMap { Array($0) }
+        let streamIDs = Array(streamIDsByTabID.values)
         streamIDsByTabID.removeAll(keepingCapacity: false)
-        streamIDsByInvocationID.removeAll(keepingCapacity: false)
         for streamID in streamIDs {
             await cancelStream(streamID)
-        }
-    }
-
-    private func removeInvocation(_ invocationID: UUID, from tabID: UUID) {
-        streamIDsByInvocationID.removeValue(forKey: invocationID)
-        cancellationGenerationByInvocationID.removeValue(forKey: invocationID)
-        tabIDByInvocationID.removeValue(forKey: invocationID)
-        invocationIDsByTabID[tabID]?.remove(invocationID)
-        if invocationIDsByTabID[tabID]?.isEmpty == true {
-            invocationIDsByTabID.removeValue(forKey: tabID)
-        }
-    }
-
-    private func removePendingStream(for tabID: UUID) {
-        guard let count = pendingStreamCountsByTabID[tabID] else { return }
-        if count == 1 {
-            pendingStreamCountsByTabID.removeValue(forKey: tabID)
-        } else {
-            pendingStreamCountsByTabID[tabID] = count - 1
         }
     }
 

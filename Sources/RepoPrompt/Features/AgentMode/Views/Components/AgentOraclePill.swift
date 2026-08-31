@@ -121,19 +121,16 @@ enum AgentOraclePillLogic {
     }
 
     static func canCopyAll(_ session: ChatSession) -> Bool {
-        session.oracleGroupID != nil
+        session.oracleGroupID != nil && (session.oracleGroupSize ?? 1) > 1
     }
 
     static func aggregateOracleCount(configuredAdditionalCount: Int, sessions: [ChatSession]) -> Int {
-        let configured = min(max(1 + configuredAdditionalCount, 1), 5)
+        let configured = 1 + configuredAdditionalCount
         guard let latest = sessions.max(by: { $0.savedAt < $1.savedAt }),
-              let groupID = latest.oracleGroupID
+              latest.oracleGroupID != nil
         else { return configured }
-        let projected = sessions
-            .filter { $0.oracleGroupID == groupID }
-            .compactMap(\.oracleGroupSize)
-            .max() ?? 1
-        return max(configured, min(max(projected, 1), 5))
+        let projected = min(max(latest.oracleGroupSize ?? 1, 1), 5)
+        return max(configured, projected)
     }
 
     static func latestStreamingSession(
@@ -360,13 +357,13 @@ struct AgentOraclePill: View {
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                                 .foregroundStyle(.secondary)
                         }
-                        Text("Oracles · \(oracleCount)")
+                        Text(oracleCount > 1 ? "Oracles · \(oracleCount)" : "Oracle")
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: isStreaming ? .semibold : .medium))
                             .foregroundStyle(isStreaming ? .primary : .secondary)
                     }
                     .padding(.horizontal, AgentPillMetrics.horizontalPadding())
                     .frame(height: AgentPillMetrics.height())
-                    .background(AnyShapeStyle(.ultraThinMaterial))
+                    .background(isStreaming ? AnyShapeStyle(.ultraThinMaterial) : AnyShapeStyle(.ultraThinMaterial))
                     .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -375,7 +372,12 @@ struct AgentOraclePill: View {
                     .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
                 }
                 .buttonStyle(.plain)
-                .hoverTooltip(isStreaming ? "Oracles are thinking — click to view progress" : "Open Oracle chats for this tab", .top)
+                .hoverTooltip(
+                    oracleCount > 1
+                        ? (isStreaming ? "Oracles are thinking — click to view progress" : "Open Oracle chats for this tab")
+                        : (isStreaming ? "Oracle is thinking — click to view the live chat" : "Open the latest Oracle chat for this tab"),
+                    .top
+                )
                 .animation(.easeInOut(duration: 0.2), value: isStreaming)
             } else {
                 Color.clear.frame(width: 0, height: 0)

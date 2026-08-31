@@ -10,13 +10,14 @@ actor DirectHeadlessProviderCoordinator {
     ) async -> DomainAgentRunSessionStore.EpochBeginResult
 
     enum ExecutionPurpose {
-        case oracle
+        case directOracle
+        case oracleGroup
         case agent
 
         var sandbox: String {
             switch self {
-            case .oracle: "read-only"
-            case .agent: "workspace-write"
+            case .oracleGroup: "read-only"
+            case .directOracle, .agent: "workspace-write"
             }
         }
     }
@@ -395,7 +396,7 @@ actor DirectHeadlessProviderCoordinator {
             providerID: descriptor.id,
             model: model,
             request: request,
-            purpose: .oracle
+            purpose: .directOracle
         )
         let id = UUID()
         conversations[id] = Conversation(
@@ -423,7 +424,7 @@ actor DirectHeadlessProviderCoordinator {
             providerID: conversation.providerID,
             model: conversation.model,
             request: request,
-            purpose: .oracle
+            purpose: .directOracle
         )
         conversation.messages.append(("user", message))
         conversation.messages.append(("assistant", text))

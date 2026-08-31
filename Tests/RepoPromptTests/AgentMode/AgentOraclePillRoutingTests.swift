@@ -420,6 +420,13 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             name: "Latest Group",
             savedAt: Date(timeIntervalSince1970: 300)
         )
+        let staleSiblingProjection = ChatSession(
+            oracleGroupID: latestGroupID,
+            oracleLaneIndex: 1,
+            oracleGroupSize: 5,
+            name: "Stale Group Sibling",
+            savedAt: Date(timeIntervalSince1970: 200)
+        )
         let invalidProjected = ChatSession(
             oracleGroupID: UUID(),
             oracleLaneIndex: 0,
@@ -438,7 +445,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertEqual(
             AgentOraclePillLogic.aggregateOracleCount(
                 configuredAdditionalCount: 0,
-                sessions: [historical, latestProjected]
+                sessions: [historical, staleSiblingProjection, latestProjected]
             ),
             4
         )
@@ -450,10 +457,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 0, sessions: [invalidProjected]),
             5
         )
-        XCTAssertEqual(
-            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 99, sessions: []),
-            5
-        )
+        XCTAssertFalse(AgentOraclePillLogic.canCopyAll(latestSingle))
+        XCTAssertTrue(AgentOraclePillLogic.canCopyAll(latestProjected))
         XCTAssertEqual(
             (0 ... 4).map(OracleViewModel.oracleLabel(laneIndex:)),
             ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
@@ -1094,7 +1099,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
         let composition = WindowStateCompositionFactory.make(
             windowID: Self.allocateFixtureWindowID(),
-            deferredInitialAgentSystemWorkspaceRefresh: false,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
             sharedMCPService: MCPService()
         )
         await composition.workspaceManager.awaitInitialized()

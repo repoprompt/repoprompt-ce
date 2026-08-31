@@ -88,7 +88,6 @@ package struct DomainMutationAuthorizationSnapshot: Hashable, Sendable {
     package let grantRevision: UInt64?
     package let operation: String
     package let canonicalRoots: Set<String>
-    package let metadata: [String: String]
 }
 
 package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, Sendable {
@@ -174,7 +173,6 @@ package actor DomainMutationPolicyStore {
         action: String,
         workspaceID: UUID? = nil,
         canonicalRoots: Set<String> = [],
-        metadata: [String: String] = [:],
         now: Date = Date()
     ) async throws -> DomainMutationAuthorizationSnapshot {
         if !didBootstrap { await bootstrap() } else { await refreshFromPersistence() }
@@ -204,8 +202,7 @@ package actor DomainMutationPolicyStore {
                 grantID: nil,
                 grantRevision: nil,
                 operation: operation,
-                canonicalRoots: canonicalRoots,
-                metadata: metadata
+                canonicalRoots: canonicalRoots
             )
         }
         guard context.hasAuthoritativeRoutingContext else {
@@ -223,8 +220,7 @@ package actor DomainMutationPolicyStore {
                 grantID: nil,
                 grantRevision: nil,
                 operation: operation,
-                canonicalRoots: canonicalRoots,
-                metadata: metadata
+                canonicalRoots: canonicalRoots
             )
         }
 
@@ -258,8 +254,7 @@ package actor DomainMutationPolicyStore {
             grantID: grant.id,
             grantRevision: grant.revision,
             operation: operation,
-            canonicalRoots: grant.canonicalRoots,
-            metadata: metadata
+            canonicalRoots: grant.canonicalRoots
         )
     }
 

@@ -617,7 +617,7 @@ actor MCPCommandRunner {
             model        (string)        Primary override for explicit new_chat=true only
             mode         (string)        chat|plan|review
               review mode includes git diffs when published via git artifacts
-          Example: oracle_send message="Review this" mode=review new_chat=true
+            Example: oracle_send message="Review this" mode=review new_chat=true
           oracle_utils   (oracle, models, chats)
             op=models                    List available oracle models
             op=sessions                  List recent oracle sessions
