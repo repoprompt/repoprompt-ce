@@ -146,6 +146,8 @@ final class AgentProviderPreferenceSnapshotStore {
                 autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
                 acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
             )
+        case .omp:
+            return AgentProviderRuntimePermissionBinding()
         case .grokBuild:
             let level = effectiveGrokBuildPermissionLevel(profile: profile)
             // For Grok this flag becomes a launch-time `--always-approve` argument in the
@@ -172,6 +174,8 @@ final class AgentProviderPreferenceSnapshotStore {
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .grokBuild(level):
             GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case .omp:
+            break
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -416,6 +420,25 @@ final class AgentProviderPreferenceSnapshotStore {
                         isEnabled: externallyManagedReason == nil
                     )
                 }
+            )
+        case .omp:
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: "Provider Managed",
+                iconName: "shield",
+                isWarning: false,
+                externallyManagedReason: externallyManagedReason ?? "OMP controls its internal tools. RepoPrompt policy applies only to RepoPrompt MCP tools.",
+                options: [
+                    AgentPermissionOptionBinding(
+                        id: .omp,
+                        title: "Provider Managed",
+                        iconName: "shield",
+                        detailText: "OMP controls its internal tools. RepoPrompt policy applies only to RepoPrompt MCP tools.",
+                        isWarning: false,
+                        isSelected: true,
+                        isEnabled: false
+                    )
+                ]
             )
         case .grokBuild:
             let effective = effectiveGrokBuildPermissionLevel(profile: profile)
@@ -668,6 +691,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .cursor: .cursor
         case .grokBuild: .grokBuild
         case .antigravity: .antigravity
+        case .omp: .omp
         }
     }
 

@@ -18,7 +18,7 @@ enum ClaudeCompatiblePluginBridge {
             .kimiClaudeCode
         case .customClaudeCompatible:
             .customClaudeCompatible
-        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .omp:
             nil
         }
     }
@@ -208,7 +208,7 @@ enum ClaudeCompatiblePluginBridge {
             "Claude Code is unavailable."
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             "Claude-compatible backend is not configured."
-        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .omp:
             "Not a Claude-compatible provider."
         }
     }

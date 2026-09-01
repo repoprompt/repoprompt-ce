@@ -239,6 +239,9 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .omp:
+                // OMP owns its internal tool permissions; RepoPrompt exposes no mutable provider preference.
+                break
             case .grokBuild:
                 // Grok full access is a launch-time `--always-approve` flag; it applies to
                 // newly launched processes and never mutates a running controller. The next

@@ -5,6 +5,7 @@ enum ACPProviderID: String, Codable, Hashable {
     case cursor
     case grokBuild
     case antigravity
+    case omp
 }
 
 enum ACPSupportResult: Equatable {
