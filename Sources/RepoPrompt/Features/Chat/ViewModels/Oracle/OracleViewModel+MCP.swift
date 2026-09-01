@@ -1183,7 +1183,7 @@ extension OracleViewModel {
         let selectedModel = modelSelection.model
         let transientImages = tabContext?.transientImages ?? []
         if !transientImages.isEmpty,
-           !OracleImageRouteAdmission.supportsCurrentRoute(selectedModel)
+           !OracleImageRouteAdmission.supports(selectedModel)
         {
             throw ChatToolError.invalidParams(
                 "Image attachments are not supported by the selected Oracle model '\(selectedModel.displayName)' on provider '\(selectedModel.providerType.displayName)'."

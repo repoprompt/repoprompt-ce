@@ -442,9 +442,7 @@ struct MCPOracleToolService {
         guard case let .array(items) = value else {
             throw MCPError.invalidParams("images must be an array of objects.")
         }
-        guard !items.isEmpty else {
-            throw MCPError.invalidParams("images cannot be empty when provided.")
-        }
+        guard !items.isEmpty else { return [] }
         guard items.count <= OracleImageAttachmentLimits.production.maxCount else {
             throw MCPError.invalidParams(
                 "images supports at most \(OracleImageAttachmentLimits.production.maxCount) items."
@@ -465,8 +463,7 @@ struct MCPOracleToolService {
             guard let rawPath = object["path"]?.stringValue else {
                 throw MCPError.invalidParams("images[\(index)].path must be a string.")
             }
-            let path = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !path.isEmpty else {
+            guard !rawPath.isEmpty else {
                 throw MCPError.invalidParams("images[\(index)].path must be a non-empty local file path.")
             }
             let title: String?
@@ -482,7 +479,7 @@ struct MCPOracleToolService {
             } else {
                 title = nil
             }
-            return OracleImageRequest(index: index, path: path, title: title)
+            return OracleImageRequest(index: index, path: rawPath, title: title)
         }
     }
 
@@ -784,24 +781,27 @@ struct MCPOracleToolService {
         let storeRoots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let representedPhysicalPaths = Set(storeRoots.map(\.standardizedFullPath))
         let namespace = lookupContext.exactFileNamespace(storeRoots: storeRoots)
-        var seen: Set<String> = []
-        let projections = namespace.rootBindings
-            .filter { representedPhysicalPaths.contains($0.lookupRoot.standardizedFullPath) }
-            .flatMap { binding in
-                binding.clientRoots.compactMap { clientRoot -> OracleImageRootProjection? in
-                    let projection = OracleImageRootProjection(
-                        logicalRootPath: clientRoot.standardizedFullPath,
-                        physicalRootPath: binding.lookupRoot.standardizedFullPath
-                    )
-                    let key = "\(projection.logicalRootPath)\u{0}\(projection.physicalRootPath)"
-                    return seen.insert(key).inserted ? projection : nil
+        do {
+            var seen: Set<String> = []
+            var projections: [OracleImageRootProjection] = []
+            for binding in namespace.rootBindings
+                where representedPhysicalPaths.contains(binding.lookupRoot.standardizedFullPath)
+            {
+                let physicalRootPath = binding.lookupRoot.standardizedFullPath
+                let logicalRootPaths = [physicalRootPath] + binding.clientRoots.map(\.standardizedFullPath)
+                for logicalRootPath in logicalRootPaths {
+                    let key = "\(logicalRootPath)\u{0}\(physicalRootPath)"
+                    guard seen.insert(key).inserted else { continue }
+                    try projections.append(OracleImageRootProjection.capture(
+                        logicalRootPath: logicalRootPath,
+                        physicalRootPath: physicalRootPath,
+                        index: requests[0].index
+                    ))
                 }
             }
-        let authority = OracleImageWorkspaceAuthority(roots: projections)
-        do {
             return try await OracleImageAttachmentLoader.loadDetached(
                 requests: requests,
-                authority: authority
+                authority: OracleImageWorkspaceAuthority(roots: projections)
             )
         } catch is CancellationError {
             throw CancellationError()
