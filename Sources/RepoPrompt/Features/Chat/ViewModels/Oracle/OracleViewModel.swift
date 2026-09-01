@@ -3145,6 +3145,7 @@ class OracleViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
+        oracleTransientImages: [AITransientImage] = [],
         completionPolicy: OracleResponseCompletionPolicy = .interactive,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
@@ -3277,7 +3278,7 @@ class OracleViewModel: ObservableObject {
                     throw CancellationError()
                 }
 
-                let aiMessage: AIMessage
+                var aiMessage: AIMessage
                 if let overrideAIMessage = overrideAIMessage.flatMap({
                     self.validatedOverrideAIMessage(
                         $0,
@@ -3313,6 +3314,9 @@ class OracleViewModel: ObservableObject {
                         lookupContextOverride: lookupContextOverride,
                         reviewGitContextOverride: reviewGitContextOverride
                     )
+                }
+                if !oracleTransientImages.isEmpty {
+                    aiMessage = aiMessage.replacingTransientImages(oracleTransientImages)
                 }
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
