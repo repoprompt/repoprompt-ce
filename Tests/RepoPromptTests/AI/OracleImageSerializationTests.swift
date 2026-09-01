@@ -18,12 +18,19 @@ final class OracleImageSerializationTests: XCTestCase {
     }
 
     func testRouteAdmissionAllowsOnlyDirectBuiltInAnthropicRoutes() {
+        XCTAssertTrue(OracleImageRouteAdmission.supports(.claude45Haiku))
         XCTAssertTrue(OracleImageRouteAdmission.supports(.claude4Sonnet))
+        XCTAssertTrue(OracleImageRouteAdmission.supports(.claude4SonnetThinking))
+        XCTAssertTrue(OracleImageRouteAdmission.supports(.claude4SonnetThinkingMax))
         XCTAssertTrue(OracleImageRouteAdmission.supports(.claude4Opus))
+        XCTAssertTrue(OracleImageRouteAdmission.supports(.claude4OpusThinking))
 
         XCTAssertFalse(OracleImageRouteAdmission.supports(.gpt5))
         XCTAssertFalse(OracleImageRouteAdmission.supports(
             .openAIServiceTierVariant(base: .gpt5, tier: "flex")
+        ))
+        XCTAssertFalse(OracleImageRouteAdmission.supports(
+            .openAIServiceTierVariant(base: .claude4Sonnet, tier: "flex")
         ))
         XCTAssertFalse(OracleImageRouteAdmission.supports(.openaiCustom(name: "custom")))
         XCTAssertFalse(OracleImageRouteAdmission.supports(.anthropicCustom(name: "custom")))
