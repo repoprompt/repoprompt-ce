@@ -432,10 +432,61 @@ audit_live_rollout_progression() {
     audit_retained_enclosures
 }
 
+# Returns 0 when found, 1 only for a confirmed absence, and 2 on observation error.
 lookup_release() {
-    GH_TOKEN="$TIP_GH_TOKEN" gh api --paginate --slurp \
-        "/repos/$TIP_UPDATE_REPOSITORY/releases?per_page=100" \
-        --jq "flatten | map(select(.tag_name == \"$TIP_TAG\")) | if length == 0 then empty elif length == 1 then .[0] else error(\"duplicate release tag\") end"
+    local output="$1" pages_file status
+    pages_file="$(mktemp "$TMP_DIR/release-pages.XXXXXX")"
+    rm -f "$output"
+    if ! GH_TOKEN="$TIP_GH_TOKEN" gh api --paginate \
+        "/repos/$TIP_UPDATE_REPOSITORY/releases?per_page=100" > "$pages_file"; then
+        rm -f "$pages_file"
+        return 2
+    fi
+    if python3 - "$pages_file" "$output" "$TIP_TAG" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+pages_path, output_path, tag = sys.argv[1:]
+raw = Path(pages_path).read_text(encoding="utf-8")
+decoder = json.JSONDecoder()
+offset = 0
+page_count = 0
+matches = []
+while True:
+    while offset < len(raw) and raw[offset].isspace():
+        offset += 1
+    if offset == len(raw):
+        break
+    try:
+        page, offset = decoder.raw_decode(raw, offset)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"ERROR: malformed paginated release response: {error}")
+    if not isinstance(page, list):
+        raise SystemExit("ERROR: paginated release response must contain JSON arrays")
+    page_count += 1
+    for release in page:
+        if not isinstance(release, dict):
+            raise SystemExit("ERROR: paginated release response contains a malformed release")
+        if release.get("tag_name") == tag:
+            matches.append(release)
+if page_count == 0:
+    raise SystemExit("ERROR: paginated release response contained no JSON pages")
+if len(matches) > 1:
+    raise SystemExit(f"ERROR: duplicate release tag: {tag}")
+if not matches:
+    raise SystemExit(3)
+Path(output_path).write_text(json.dumps(matches[0], separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+    then
+        rm -f "$pages_file"
+        return 0
+    else
+        status=$?
+        rm -f "$pages_file"
+        [[ "$status" == 3 ]] && return 1
+        return 2
+    fi
 }
 
 validate_release_metadata() {
@@ -468,10 +519,16 @@ PY
 }
 
 write_release_json() {
-    local output="$1" value
-    value="$(lookup_release)"
-    [[ -n "$value" ]] || return 1
-    printf '%s\n' "$value" > "$output"
+    local output="$1" status
+    if lookup_release "$output"; then
+        return 0
+    else
+        status=$?
+    fi
+    case "$status" in
+        1) return 1 ;;
+        *) fail "Authenticated Tip release lookup failed" ;;
+    esac
 }
 
 create_draft_if_missing() {

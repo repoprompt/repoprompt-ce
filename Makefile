@@ -146,6 +146,7 @@ ci-app-test-runner-selftest:
 
 release-selftest:
 	python3 Scripts/test_release_tooling.py
+	python3 Scripts/test_publish_tip_release.py
 	python3 Scripts/test_codex_runtime_artifact.py
 	python3 Scripts/test_codex_update_candidate.py
 	python3 Scripts/test_codex_update_workflow.py
