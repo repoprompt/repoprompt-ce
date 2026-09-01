@@ -20,6 +20,11 @@ private extension DomainCommandOrigin {
 
 package enum DomainWorkspaceCommand: Codable, Equatable, Sendable {
     case createWorkspace(DomainWorkspaceDocument)
+    case resolveOrCreateWorkspaceForExactRoot(
+        document: DomainWorkspaceDocument,
+        canonicalRootPath: String,
+        preferredWorkspaceIDs: [UUID]
+    )
     case replaceWorkingDocument(DomainWorkspaceDocument)
     case saveWorkspaceDocument(workspaceID: UUID)
     case deleteWorkspace(workspaceID: UUID)
@@ -77,6 +82,15 @@ package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
         switch command {
         case let .createWorkspace(document):
             components += ["create", document.workspaceID.uuidString, document.fileURL.absoluteString, document.contentDigest]
+        case let .resolveOrCreateWorkspaceForExactRoot(document, canonicalRootPath, preferredWorkspaceIDs):
+            components += [
+                "resolve-or-create-exact-root",
+                document.workspaceID.uuidString,
+                document.fileURL.absoluteString,
+                document.contentDigest,
+                canonicalRootPath,
+            ]
+            components += preferredWorkspaceIDs.map(\.uuidString)
         case let .replaceWorkingDocument(document):
             components += ["replace", document.workspaceID.uuidString, document.fileURL.absoluteString, document.contentDigest]
         case let .saveWorkspaceDocument(workspaceID):

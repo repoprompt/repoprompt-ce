@@ -10880,115 +10880,84 @@ class WorkspaceManagerViewModel: ObservableObject {
             return .created(workspace)
         }
 
-        var authoritySnapshot = await domainWorkspaceAuthorityClient.snapshot()
+        let authoritySnapshot = await domainWorkspaceAuthorityClient.snapshot()
         #if DEBUG
             await persistentFolderOpenDidSnapshotHandlerForTesting?()
         #endif
 
-        for attempt in 0 ... 1 {
-            try Task.checkCancellation()
-            let candidates = try persistentFolderOpenCandidates(from: authoritySnapshot)
-            if let existing = WorkspaceFolderOpenResolver.bestEligibleMatch(
-                forFolderPath: folderURL.path,
+        try Task.checkCancellation()
+        let candidates = try persistentFolderOpenCandidates(from: authoritySnapshot)
+        let preferredWorkspaceIDs = WorkspaceFolderOpenResolver.eligibleMatches(
+            forFolderPath: folderURL.path,
+            in: candidates
+        ).map(\.id)
+        let workspace = WorkspaceModel(
+            name: uniqueWorkspaceName(
+                baseName: folderURL.lastPathComponent,
                 in: candidates
-            ) {
-                prepareAuthoritativeFolderOpenWorkspace(existing, from: authoritySnapshot)
-                return .reused(existing)
-            }
-
-            let workspace = WorkspaceModel(
-                name: uniqueWorkspaceName(
-                    baseName: folderURL.lastPathComponent,
-                    in: candidates
-                ),
-                repoPaths: [folderURL.path]
+            ),
+            repoPaths: [folderURL.path]
+        )
+        let fileURL = workspaceFileURL(for: workspace)
+        guard let canonicalRootPath = WorkspaceRootSetKey(paths: [folderURL.path])
+            .normalizedPaths.first?.lowercased()
+        else {
+            throw PersistentFolderOpenError.invalidFolder
+        }
+        let outcome: DomainCommandOutcome
+        do {
+            outcome = try await domainWorkspaceAuthorityClient.resolveOrCreatePersistentWorkspace(
+                workspace,
+                fileURL: fileURL,
+                canonicalRootPath: canonicalRootPath,
+                preferredWorkspaceIDs: preferredWorkspaceIDs,
+                operationID: UUID()
             )
-            let fileURL = workspaceFileURL(for: workspace)
-            let outcome: DomainCommandOutcome
-            do {
-                outcome = try await domainWorkspaceAuthorityClient.create(
-                    workspace,
-                    fileURL: fileURL,
-                    expectedCatalogRevision: authoritySnapshot.catalogRevision,
-                    operationID: UUID()
-                )
-            } catch {
-                let refreshedSnapshot = await domainWorkspaceAuthorityClient.reloadExternalChanges()
-                let refreshed = try persistentFolderOpenCandidates(from: refreshedSnapshot)
-                if let existing = WorkspaceFolderOpenResolver.bestEligibleMatch(
-                    forFolderPath: folderURL.path,
-                    in: refreshed
-                ) {
-                    prepareAuthoritativeFolderOpenWorkspace(existing, from: refreshedSnapshot)
-                    return .reused(existing)
-                }
-                reportDomainAuthorityFailure(
-                    error,
-                    workspaceID: workspace.id,
-                    operation: "open_folder_create"
-                )
-                throw error
-            }
-
-            if Self.isSuccessfulDomainOutcome(outcome) {
-                applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
-                let canonical: WorkspaceModel
-                let canonicalFileURL: URL
-                if let outcomeWorkspace = outcome.workspace {
-                    do {
-                        canonical = try Self.decodeDomainWorkspaceProjection(
-                            documentBytes: outcomeWorkspace.document.documentBytes,
-                            fileURL: outcomeWorkspace.document.fileURL
-                        )
-                    } catch {
-                        reportDomainProjectionFailure(error)
-                        canonical = workspace
-                    }
-                    canonicalFileURL = outcomeWorkspace.document.fileURL
-                } else {
-                    canonical = workspace
-                    canonicalFileURL = fileURL
-                }
-                domainWorkspaceFileURLsByID[canonical.id] = canonicalFileURL
-                if let index = workspaceIndex(for: canonical.id) {
-                    workspaces[index] = canonical
-                } else {
-                    workspaces.append(canonical)
-                }
-                recordRepoPathBaseline(for: canonical)
-                NotificationCenter.default.post(
-                    name: .workspaceDidCreate,
-                    object: nil,
-                    userInfo: ["workspaceID": canonical.id]
-                )
-                return .created(canonical)
-            }
-
-            let isCatalogConflict = outcome.disposition == .conflict
-                && outcome.errorCode == .stateConflict
-            let refreshedSnapshot = await domainWorkspaceAuthorityClient.reloadExternalChanges()
-            let refreshed = try persistentFolderOpenCandidates(from: refreshedSnapshot)
-            if let existing = WorkspaceFolderOpenResolver.bestEligibleMatch(
-                forFolderPath: folderURL.path,
-                in: refreshed
-            ) {
-                prepareAuthoritativeFolderOpenWorkspace(existing, from: refreshedSnapshot)
-                return .reused(existing)
-            }
-
-            guard isCatalogConflict else {
-                applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
-                reportDomainAuthorityIssue(outcome, operation: "open_folder_create")
-                throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
-            }
-            authoritySnapshot = refreshedSnapshot
-            if attempt == 1 {
-                reportDomainAuthorityIssue(outcome, operation: "open_folder_create")
-                throw PersistentFolderOpenError.authorityConflictUnresolved
-            }
+        } catch {
+            reportDomainAuthorityFailure(
+                error,
+                workspaceID: workspace.id,
+                operation: "open_folder_resolve_or_create"
+            )
+            throw error
         }
 
-        throw PersistentFolderOpenError.authorityConflictUnresolved
+        guard Self.isSuccessfulDomainOutcome(outcome),
+              let outcomeWorkspace = outcome.workspace
+        else {
+            applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
+            reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
+            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
+        }
+
+        let canonical: WorkspaceModel
+        do {
+            canonical = try Self.decodeDomainWorkspaceProjection(
+                documentBytes: outcomeWorkspace.document.documentBytes,
+                fileURL: outcomeWorkspace.document.fileURL
+            )
+        } catch {
+            reportDomainProjectionFailure(error)
+            throw error
+        }
+        applyDomainAuthorityOutcome(outcome, workspaceID: canonical.id)
+        domainWorkspaceFileURLsByID[canonical.id] = outcomeWorkspace.document.fileURL
+        if let index = workspaceIndex(for: canonical.id) {
+            workspaces[index] = canonical
+        } else {
+            workspaces.append(canonical)
+        }
+        recordRepoPathBaseline(for: canonical)
+
+        if canonical.id == workspace.id {
+            NotificationCenter.default.post(
+                name: .workspaceDidCreate,
+                object: nil,
+                userInfo: ["workspaceID": canonical.id]
+            )
+            return .created(canonical)
+        }
+        return .reused(canonical)
     }
 
     private func persistentFolderOpenCandidates(
@@ -11000,24 +10969,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             throw error
         }
         return candidates
-    }
-
-    private func prepareAuthoritativeFolderOpenWorkspace(
-        _ workspace: WorkspaceModel,
-        from snapshot: DomainWorkspaceCatalogSnapshot
-    ) {
-        guard let authoritative = snapshot.workspaces.first(where: {
-            $0.document.workspaceID == workspace.id
-        }) else { return }
-        domainWorkspaceFileURLsByID[workspace.id] = authoritative.document.fileURL
-        applyDomainAuthorityBaseline(
-            workspaceID: workspace.id,
-            revisions: authoritative.revisions,
-            digest: authoritative.document.contentDigest,
-            health: authoritative.health,
-            catalogRevision: snapshot.catalogRevision
-        )
-        recordRepoPathBaseline(for: workspace)
     }
 
     @MainActor

@@ -689,33 +689,34 @@ import XCTest
             })
         }
 
-        func testConcurrentUnmatchedRoutesCreateOneAuthoritativeWorkspace() async throws {
+        func testConcurrentUnmatchedRoutesCreateOneAuthoritativeWorkspaceAndForwardLatePayload() async throws {
             let runtime = try await makeDomainRuntime()
             let firstWindow = await makeWindow(domainRuntime: runtime)
             let secondWindow = await makeWindow(domainRuntime: runtime)
             let folder = try makeFolder(named: "ConcurrentRoutedFolder")
+            let firstFile = folder.appendingPathComponent("First.swift")
+            let secondFile = folder.appendingPathComponent("Second.swift")
+            try Data("let first = true\n".utf8).write(to: firstFile)
+            try Data("let second = true\n".utf8).write(to: secondFile)
             firstWindow.setAutomaticCommandProcessingForTesting(false)
             secondWindow.setAutomaticCommandProcessingForTesting(false)
-            let barrier = WindowFolderOpenTwoPartyBarrier()
-            firstWindow.workspaceManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
-                await barrier.arriveAndWait()
-            }
-            secondWindow.workspaceManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
-                await barrier.arriveAndWait()
-            }
-            let url = try XCTUnwrap(URL(
-                string: "repoprompt-ce://open/\(folder.path)"
+            let firstURL = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?focus=true&files=\(firstFile.path)&prompt=first"
+            ))
+            let secondURL = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?focus=true&files=\(secondFile.path)&prompt=second"
             ))
             let router = AppDeepLinkRouter(windowStatesManager: .shared)
 
-            await router.route(url: url, preferredLegacyWindow: firstWindow)
-            await router.route(url: url, preferredLegacyWindow: secondWindow)
+            await router.route(url: firstURL, preferredLegacyWindow: firstWindow)
+            await router.route(url: secondURL, preferredLegacyWindow: secondWindow)
             XCTAssertEqual(firstWindow.queuedCommandCountForTesting, 1)
             XCTAssertEqual(secondWindow.queuedCommandCountForTesting, 1)
 
-            async let firstProcess: Void = firstWindow.processCommands()
-            async let secondProcess: Void = secondWindow.processCommands()
-            _ = await (firstProcess, secondProcess)
+            await firstWindow.processCommands()
+            await secondWindow.processCommands()
+            XCTAssertEqual(firstWindow.queuedCommandCountForTesting, 1)
+            await firstWindow.processCommands()
 
             let snapshot = await firstWindow.workspaceManager.workspaceRoutingCatalogSnapshot()
             let routingSnapshot = try XCTUnwrap(snapshot)
@@ -724,19 +725,14 @@ import XCTest
             }
             XCTAssertEqual(matches.count, 1)
             XCTAssertEqual(firstWindow.workspaceManager.activeWorkspaceID, matches.first?.id)
-            XCTAssertEqual(secondWindow.workspaceManager.activeWorkspaceID, matches.first?.id)
-            XCTAssertEqual(
-                firstWindow.workspaceManager.workspaces.count(where: {
-                    WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
-                }),
-                1
-            )
-            XCTAssertEqual(
-                secondWindow.workspaceManager.workspaces.count(where: {
-                    WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
-                }),
-                1
-            )
+            XCTAssertEqual(firstWindow.promptManager.promptText, "second")
+            XCTAssertTrue(firstWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == secondFile.path
+            })
+            XCTAssertFalse(firstWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == firstFile.path
+            })
+            XCTAssertNotEqual(secondWindow.promptManager.promptText, "second")
             XCTAssertEqual(firstWindow.queuedCommandCountForTesting, 0)
             XCTAssertEqual(secondWindow.queuedCommandCountForTesting, 0)
         }
@@ -797,11 +793,13 @@ import XCTest
             XCTAssertEqual(WindowStatesManager.shared.pendingURLs, [url])
         }
 
-        func testRouteRetriesOnlyOnceWhenBothWindowsCloseDuringAuthorityAwait() async throws {
+        func testRouteExhaustsLiveWindowsWhenNewerReceiversCloseDuringAuthorityAwait() async throws {
             let runtime = try await makeDomainRuntime()
+            let oldestWindow = await makeWindow(domainRuntime: runtime)
             let retryWindow = await makeWindow(domainRuntime: runtime)
             let targetWindow = await makeWindow(domainRuntime: runtime)
-            let folder = try makeFolder(named: "BothWindowsClosingDuringAuthorityAwait")
+            let folder = try makeFolder(named: "NewerWindowsClosingDuringAuthorityAwait")
+            oldestWindow.setAutomaticCommandProcessingForTesting(false)
             retryWindow.setAutomaticCommandProcessingForTesting(false)
             targetWindow.setAutomaticCommandProcessingForTesting(false)
             retryWindow.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting {
@@ -826,7 +824,13 @@ import XCTest
             XCTAssertTrue(retryWindow.isClosing)
             XCTAssertEqual(targetWindow.queuedCommandCountForTesting, 0)
             XCTAssertEqual(retryWindow.queuedCommandCountForTesting, 0)
-            XCTAssertEqual(WindowStatesManager.shared.pendingURLs, [url])
+            XCTAssertEqual(oldestWindow.queuedCommandCountForTesting, 1)
+            XCTAssertEqual(WindowStatesManager.shared.pendingURLs, [])
+
+            await oldestWindow.processCommands()
+
+            XCTAssertEqual(oldestWindow.promptManager.promptText, "after")
+            XCTAssertEqual(oldestWindow.workspaceManager.activeWorkspace?.repoPaths, [folder.path])
         }
 
         func testFocusedPersistentRouteUsesAlreadyActiveMatchingWindow() async throws {

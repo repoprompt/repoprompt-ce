@@ -1593,6 +1593,7 @@ class WindowState: ObservableObject {
             let existingWorkspace: WorkspaceModel?
             var requiresActiveWorkspaceReload = false
             var shouldCreateLocalEphemeralWorkspace = false
+            var persistentResolutionWasReused = false
             if let resolvedWorkspaceID = queuedCommand.resolvedFolderWorkspaceID,
                let expectedRoot = queuedCommand.expectedFolderRootKey
             {
@@ -1625,6 +1626,9 @@ class WindowState: ObservableObject {
                     )
                     guard !isClosing else { return }
                     existingWorkspace = resolution.workspace
+                    if case .reused = resolution {
+                        persistentResolutionWasReused = true
+                    }
                     if workspaceManager.activeWorkspaceID == resolution.workspace.id {
                         let expectedRoot = WorkspaceRootSetKey(paths: [folderURL.path])
                         let projectedWorkspace = workspaceManager.workspace(withID: resolution.workspace.id)
@@ -1638,15 +1642,32 @@ class WindowState: ObservableObject {
             }
 
             if let existingWorkspace {
-                // Unrouted commands may still focus another window already showing the local winner.
+                // A workspace may become authoritative after this command was queued. Forward the
+                // complete command so the winning window revalidates the ID/root pair and applies
+                // file and prompt payloads instead of dropping them after focus transfer.
+                let expectedRoot = WorkspaceRootSetKey(paths: [folderURL.path])
                 if queuedCommand.resolvedFolderWorkspaceID == nil,
+                   persistentResolutionWasReused,
                    command.focus == true,
                    let wsManager = windowStatesManager,
-                   let existingWindow = wsManager.findWindowState(showing: existingWorkspace.id),
-                   existingWindow !== self
+                   let existingWindow = wsManager.allWindows.first(where: { window in
+                       guard window !== self,
+                             !window.isClosing,
+                             let activeWorkspace = window.workspaceManager.activeWorkspace,
+                             activeWorkspace.id == existingWorkspace.id
+                       else { return false }
+                       return WorkspaceFolderOpenResolver.containsExactRoot(
+                           expectedRoot,
+                           in: activeWorkspace
+                       )
+                   })
                 {
-                    NSApplication.shared.activate(ignoringOtherApps: true)
-                    existingWindow.focusWindowIfPossible()
+                    existingWindow.enqueueCommand(
+                        command,
+                        resolvedFolderWorkspaceID: existingWorkspace.id,
+                        expectedFolderRootKey: expectedRoot,
+                        allowsLocalWorkspaceFallback: false
+                    )
                     return
                 }
 

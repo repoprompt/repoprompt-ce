@@ -149,6 +149,166 @@ import XCTest
             )
         }
 
+        func testConcurrentRootAdditionIsReusedInsteadOfCreatingDuplicateWorkspace() async throws {
+            let runtime = try await makeDomainRuntime()
+            let openingManager = makeManager(domainRuntime: runtime)
+            let mutatingManager = makeManager(domainRuntime: runtime)
+            await openingManager.awaitInitialized()
+            await mutatingManager.awaitInitialized()
+            let existingFolder = try makeFolder(named: "ExistingBeforeRootAddition")
+            let requestedFolder = try makeFolder(named: "AddedDuringFolderOpen")
+            let existing = mutatingManager.createWorkspace(
+                name: "Existing Root Receiver",
+                repoPaths: [existingFolder.path]
+            )
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(2))
+            var existingIsAuthoritative = false
+            while clock.now < deadline {
+                let snapshot = await mutatingManager.workspaceRoutingCatalogSnapshot()
+                existingIsAuthoritative = snapshot?.contains(where: { $0.id == existing.id }) == true
+                if existingIsAuthoritative { break }
+                try await clock.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(existingIsAuthoritative)
+            let mutationGate = WorkspaceRootMutationTestGate()
+            await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired { workspaceID in
+                guard workspaceID == existing.id else { return }
+                await mutationGate.pauseUntilReleased()
+            }
+            defer {
+                Task {
+                    await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired(nil)
+                }
+            }
+
+            async let rootAddition: Void = mutatingManager.addFolder(requestedFolder, to: existing)
+            await mutationGate.waitUntilPaused()
+            async let folderOpen: Void = openingManager.openWorkspace(
+                fromFolderURL: requestedFolder,
+                behavior: .createNewWorkspace
+            )
+            await Task.yield()
+            await mutationGate.release()
+            _ = try await (rootAddition, folderOpen)
+
+            let catalogSnapshot = await openingManager.workspaceRoutingCatalogSnapshot()
+            let snapshot = try XCTUnwrap(catalogSnapshot)
+            let matches = snapshot.filter {
+                WorkspaceFolderOpenResolver.containsExactRoot(requestedFolder.path, in: $0)
+            }
+            XCTAssertEqual(matches.map(\.id), [existing.id])
+            XCTAssertEqual(openingManager.activeWorkspaceID, existing.id)
+        }
+
+        func testReplayedResolveOrCreateReturnsOriginalReusedWorkspace() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "ResolveOrCreateReplay")
+            let existing = manager.createWorkspace(name: "Replay Winner", repoPaths: [folder.path])
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(2))
+            while clock.now < deadline {
+                let snapshot = await manager.workspaceRoutingCatalogSnapshot()
+                if snapshot?.contains(where: { $0.id == existing.id }) == true { break }
+                try await clock.sleep(for: .milliseconds(10))
+            }
+            let client = DomainWorkspaceAuthorityClient(
+                store: runtime.workspaceStore,
+                windowID: -1301
+            )
+            let proposed = WorkspaceModel(name: "Replay Proposed", repoPaths: [folder.path])
+            let proposedFileURL = storageRoot.appendingPathComponent("\(proposed.id.uuidString).json")
+            let canonicalRootPath = try XCTUnwrap(
+                WorkspaceRootSetKey(paths: [folder.path]).normalizedPaths.first
+            ).lowercased()
+            let operationID = UUID()
+
+            let first = try await client.resolveOrCreatePersistentWorkspace(
+                proposed,
+                fileURL: proposedFileURL,
+                canonicalRootPath: canonicalRootPath,
+                preferredWorkspaceIDs: [existing.id],
+                operationID: operationID
+            )
+            let replay = try await client.resolveOrCreatePersistentWorkspace(
+                proposed,
+                fileURL: proposedFileURL,
+                canonicalRootPath: canonicalRootPath,
+                preferredWorkspaceIDs: [existing.id],
+                operationID: operationID
+            )
+
+            XCTAssertEqual(first.disposition, .unchanged)
+            XCTAssertEqual(first.workspace?.document.workspaceID, existing.id)
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.workspace?.document.workspaceID, existing.id)
+        }
+
+        func testConcurrentReplaceRetriesRecheckOperationIDAfterMutationGate() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "ReplaceRetryGate")
+            let existing = manager.createWorkspace(name: "Replace Original", repoPaths: [folder.path])
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(2))
+            var authoritativeWorkspace: DomainWorkspaceSnapshot?
+            while clock.now < deadline {
+                authoritativeWorkspace = await runtime.workspaceStore.workspaceSnapshot(existing.id)
+                if authoritativeWorkspace != nil { break }
+                try await clock.sleep(for: .milliseconds(10))
+            }
+            let authoritative = try XCTUnwrap(authoritativeWorkspace)
+            let client = DomainWorkspaceAuthorityClient(
+                store: runtime.workspaceStore,
+                windowID: -1302
+            )
+            var update = existing
+            update.name = "Replace Applied"
+            var conflictingUpdate = update
+            conflictingUpdate.name = "Replace Collision"
+            let operationID = UUID()
+            let mutationGate = WorkspaceRootMutationTestGate()
+            await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired { workspaceID in
+                guard workspaceID == existing.id else { return }
+                await mutationGate.pauseUntilReleased()
+            }
+            defer {
+                Task {
+                    await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired(nil)
+                }
+            }
+
+            async let first = client.replaceWorking(
+                update,
+                fileURL: authoritative.document.fileURL,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                operationID: operationID
+            )
+            await mutationGate.waitUntilPaused()
+            async let retry = client.replaceWorking(
+                update,
+                fileURL: authoritative.document.fileURL,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                operationID: operationID
+            )
+            await mutationGate.release()
+            let (firstOutcome, retryOutcome) = try await (first, retry)
+            let collision = try await client.replaceWorking(
+                conflictingUpdate,
+                fileURL: authoritative.document.fileURL,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                operationID: operationID
+            )
+
+            XCTAssertEqual(firstOutcome.disposition, .applied)
+            XCTAssertEqual(retryOutcome.disposition, .deduplicated)
+            XCTAssertEqual(collision.disposition, .invalid)
+            XCTAssertEqual(collision.errorCode, .operationIDCollision)
+        }
+
         func testExplicitCreationStillAllowsPersistentDuplicateRoots() async throws {
             let runtime = try await makeDomainRuntime()
             let manager = makeManager(domainRuntime: runtime)
@@ -495,6 +655,36 @@ import XCTest
                 domainBridges.append(domainWorkspacePresentationBridge)
             }
             return composition.workspaceManager
+        }
+    }
+
+    private actor WorkspaceRootMutationTestGate {
+        private var didPause = false
+        private var didRelease = false
+        private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+        func pauseUntilReleased() async {
+            didPause = true
+            pauseWaiters.forEach { $0.resume() }
+            pauseWaiters.removeAll()
+            guard !didRelease else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiter = continuation
+            }
+        }
+
+        func waitUntilPaused() async {
+            guard !didPause else { return }
+            await withCheckedContinuation { continuation in
+                pauseWaiters.append(continuation)
+            }
+        }
+
+        func release() {
+            didRelease = true
+            releaseWaiter?.resume()
+            releaseWaiter = nil
         }
     }
 

@@ -78,6 +78,26 @@ struct DomainWorkspaceAuthorityClient {
         return await executeStable(envelope)
     }
 
+    func resolveOrCreatePersistentWorkspace(
+        _ workspace: WorkspaceModel,
+        fileURL: URL,
+        canonicalRootPath: String,
+        preferredWorkspaceIDs: [UUID],
+        operationID: UUID = UUID()
+    ) async throws -> DomainCommandOutcome {
+        let document = try document(for: workspace, fileURL: fileURL)
+        return await executeStable(.init(
+            operationID: operationID,
+            expectedWorkspaceRevision: 0,
+            origin: .appPresentation(windowID: windowID),
+            command: .resolveOrCreateWorkspaceForExactRoot(
+                document: document,
+                canonicalRootPath: canonicalRootPath,
+                preferredWorkspaceIDs: preferredWorkspaceIDs
+            )
+        ))
+    }
+
     func replaceWorking(
         _ workspace: WorkspaceModel,
         fileURL: URL,

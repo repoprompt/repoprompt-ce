@@ -83,7 +83,7 @@ final class AppDeepLinkRouter {
             command,
             sourceURL: url,
             receivingWindow: targetWindow,
-            remainingWindowRetries: 1
+            attemptedWindowIDs: [targetWindow.windowID]
         )
     }
 
@@ -91,7 +91,7 @@ final class AppDeepLinkRouter {
         _ command: AppCommand,
         sourceURL: URL,
         receivingWindow: WindowState,
-        remainingWindowRetries: Int
+        attemptedWindowIDs: Set<Int>
     ) async {
         guard let folderPath = command.folderPath, !folderPath.isEmpty else {
             receivingWindow.enqueueCommand(command)
@@ -104,7 +104,7 @@ final class AppDeepLinkRouter {
             await rerouteOpenCommand(
                 command,
                 sourceURL: sourceURL,
-                remainingWindowRetries: remainingWindowRetries
+                attemptedWindowIDs: attemptedWindowIDs
             )
             return
         }
@@ -162,7 +162,14 @@ final class AppDeepLinkRouter {
             winningRepresentation.targetWindow
         }
 
-        guard !targetWindow.isClosing else { return }
+        guard !targetWindow.isClosing else {
+            await rerouteOpenCommand(
+                command,
+                sourceURL: sourceURL,
+                attemptedWindowIDs: attemptedWindowIDs.union([targetWindow.windowID])
+            )
+            return
+        }
         targetWindow.enqueueCommand(
             command,
             resolvedFolderWorkspaceID: winner.id,
@@ -174,11 +181,12 @@ final class AppDeepLinkRouter {
     private func rerouteOpenCommand(
         _ command: AppCommand,
         sourceURL: URL,
-        remainingWindowRetries: Int
+        attemptedWindowIDs: Set<Int>
     ) async {
-        guard remainingWindowRetries > 0,
-              let retryWindow = legacyTargetWindow(for: sourceURL)
-        else {
+        guard let retryWindow = legacyTargetWindow(
+            for: sourceURL,
+            excluding: attemptedWindowIDs
+        ) else {
             windowStatesManager.pendingURLs.append(sourceURL)
             return
         }
@@ -186,12 +194,17 @@ final class AppDeepLinkRouter {
             command,
             sourceURL: sourceURL,
             receivingWindow: retryWindow,
-            remainingWindowRetries: remainingWindowRetries - 1
+            attemptedWindowIDs: attemptedWindowIDs.union([retryWindow.windowID])
         )
     }
 
-    private func legacyTargetWindow(for url: URL) -> WindowState? {
-        let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+    private func legacyTargetWindow(
+        for url: URL,
+        excluding attemptedWindowIDs: Set<Int> = []
+    ) -> WindowState? {
+        let liveWindows = windowStatesManager.allWindows.filter {
+            !$0.isClosing && !attemptedWindowIDs.contains($0.windowID)
+        }
         switch Self.legacyWindowPreference(for: url) {
         case .earliest:
             return liveWindows.first

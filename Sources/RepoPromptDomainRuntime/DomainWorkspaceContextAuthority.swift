@@ -36,6 +36,12 @@ package struct DomainWorkspaceStore {
         ) async {
             await authority.testSetBeforeExternalReconciliation(hook)
         }
+
+        package func testSetAfterWorkspaceMutationGateAcquired(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await authority.testSetAfterWorkspaceMutationGateAcquired(hook)
+        }
     #endif
 
     /// Registers the app's current in-memory document as an awaited read authority.
@@ -128,6 +134,7 @@ actor DomainWorkspaceContextAuthority {
 
     #if DEBUG
         private var testBeforeExternalReconciliation: (@Sendable (UUID) async -> Void)?
+    private var testAfterWorkspaceMutationGateAcquired: (@Sendable (UUID) async -> Void)?
     #endif
 
     private enum DirtyExternalRebaseResult {
@@ -391,6 +398,14 @@ actor DomainWorkspaceContextAuthority {
         let outcome: DomainCommandOutcome = switch envelope.command {
         case let .createWorkspace(document):
             await createWorkspace(document, envelope: envelope, fingerprint: fingerprint)
+        case let .resolveOrCreateWorkspaceForExactRoot(document, canonicalRootPath, preferredWorkspaceIDs):
+            await resolveOrCreateWorkspaceForExactRoot(
+                document,
+                canonicalRootPath: canonicalRootPath,
+                preferredWorkspaceIDs: preferredWorkspaceIDs,
+                envelope: envelope,
+                fingerprint: fingerprint
+            )
         case let .replaceWorkingDocument(document):
             await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
         case let .saveWorkspaceDocument(workspaceID):
@@ -445,7 +460,9 @@ actor DomainWorkspaceContextAuthority {
 
     private func rejectsEphemeralPersistence(_ command: DomainWorkspaceCommand) -> Bool {
         switch command {
-        case let .createWorkspace(document), let .replaceWorkingDocument(document):
+        case let .createWorkspace(document),
+             let .resolveOrCreateWorkspaceForExactRoot(document, _, _),
+             let .replaceWorkingDocument(document):
             document.metadata.isEphemeral
         case let .saveWorkspaceDocument(workspaceID),
              let .resolveExternalConflict(workspaceID, _, _):
@@ -457,7 +474,9 @@ actor DomainWorkspaceContextAuthority {
 
     private func commandDocument(_ command: DomainWorkspaceCommand) -> DomainWorkspaceDocument? {
         switch command {
-        case let .createWorkspace(document), let .replaceWorkingDocument(document):
+        case let .createWorkspace(document),
+             let .resolveOrCreateWorkspaceForExactRoot(document, _, _),
+             let .replaceWorkingDocument(document):
             document
         case .saveWorkspaceDocument, .deleteWorkspace, .resolveExternalConflict:
             nil
@@ -544,7 +563,15 @@ actor DomainWorkspaceContextAuthority {
                 disposition: prior.disposition,
                 resultingDigest: prior.resultingDigest
             )
-            return prior.outcome(workspace: workspaceID.flatMap(canonicalWorkspaceSnapshot))
+            let replayWorkspace: DomainWorkspaceSnapshot? = switch envelope.command {
+            case .resolveOrCreateWorkspaceForExactRoot:
+                records.values.first(where: {
+                    $0.document.contentDigest == prior.resultingDigest
+                }).map(makeSnapshot)
+            default:
+                workspaceID.flatMap(canonicalWorkspaceSnapshot)
+            }
+            return prior.outcome(workspace: replayWorkspace)
         }
         return nil
     }
@@ -830,6 +857,12 @@ actor DomainWorkspaceContextAuthority {
             _ hook: (@Sendable (UUID) async -> Void)?
         ) {
             testBeforeExternalReconciliation = hook
+        }
+
+        func testSetAfterWorkspaceMutationGateAcquired(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) {
+            testAfterWorkspaceMutationGateAcquired = hook
         }
     #endif
 
@@ -1213,13 +1246,86 @@ actor DomainWorkspaceContextAuthority {
         return .recoveryPending
     }
 
-    private func createWorkspace(
+    private func resolveOrCreateWorkspaceForExactRoot(
         _ document: DomainWorkspaceDocument,
+        canonicalRootPath: String,
+        preferredWorkspaceIDs: [UUID],
         envelope: DomainWorkspaceCommandEnvelope,
         fingerprint: String
     ) async -> DomainCommandOutcome {
         await acquireCatalogMutation()
         defer { releaseCatalogMutation() }
+
+        if let recorded = await recordedOutcome(for: envelope, fingerprint: fingerprint) {
+            return recorded
+        }
+        guard !canonicalRootPath.isEmpty,
+              document.metadata.repoPaths.contains(where: {
+                  Self.canonicalFolderOpenRootPath($0) == canonicalRootPath
+              })
+        else {
+            return recordTransientOutcome(
+                envelope: envelope,
+                disposition: .invalid,
+                errorCode: .invalidDocument,
+                diagnostic: "folder_open_root_mismatch"
+            )
+        }
+
+        let preferredRanks = Dictionary(
+            uniqueKeysWithValues: preferredWorkspaceIDs.enumerated().map { ($0.element, $0.offset) }
+        )
+        let eligibleMatches = records.values.filter { record in
+            let metadata = record.document.metadata
+            return !metadata.isSystemWorkspace
+                && !metadata.isHiddenInMenus
+                && !metadata.isEphemeral
+                && metadata.repoPaths.contains(where: {
+                    Self.canonicalFolderOpenRootPath($0) == canonicalRootPath
+                })
+        }.sorted { lhs, rhs in
+            let lhsRank = preferredRanks[lhs.document.workspaceID] ?? Int.max
+            let rhsRank = preferredRanks[rhs.document.workspaceID] ?? Int.max
+            if lhsRank != rhsRank {
+                return lhsRank < rhsRank
+            }
+            return lhs.document.workspaceID.uuidString < rhs.document.workspaceID.uuidString
+        }
+        if let existing = eligibleMatches.first {
+            return await unchangedOutcome(envelope, record: existing)
+        }
+
+        return await createWorkspace(
+            document,
+            envelope: envelope,
+            fingerprint: fingerprint,
+            acquireMutationGate: false
+        )
+    }
+
+    private static func canonicalFolderOpenRootPath(_ path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        let normalized = URL(fileURLWithPath: expanded).standardizedFileURL.path
+        guard !normalized.isEmpty else { return nil }
+        return normalized.lowercased()
+    }
+
+    private func createWorkspace(
+        _ document: DomainWorkspaceDocument,
+        envelope: DomainWorkspaceCommandEnvelope,
+        fingerprint: String,
+        acquireMutationGate: Bool = true
+    ) async -> DomainCommandOutcome {
+        if acquireMutationGate {
+            await acquireCatalogMutation()
+        }
+        defer {
+            if acquireMutationGate {
+                releaseCatalogMutation()
+            }
+        }
         if let recorded = await recordedOutcome(for: envelope, fingerprint: fingerprint) {
             return recorded
         }
@@ -1454,6 +1560,15 @@ actor DomainWorkspaceContextAuthority {
         envelope: DomainWorkspaceCommandEnvelope,
         fingerprint: String
     ) async -> DomainCommandOutcome {
+        await acquireCatalogMutation()
+        defer { releaseCatalogMutation() }
+
+        #if DEBUG
+            await testAfterWorkspaceMutationGateAcquired?(document.workspaceID)
+        #endif
+        if let recorded = await recordedOutcome(for: envelope, fingerprint: fingerprint) {
+            return recorded
+        }
         guard document.workspaceID == envelope.workspaceID else {
             return recordTransientOutcome(
                 envelope: envelope,
@@ -2413,6 +2528,7 @@ private extension DomainWorkspaceCommandEnvelope {
     var workspaceID: UUID? {
         switch command {
         case let .createWorkspace(document): document.workspaceID
+        case let .resolveOrCreateWorkspaceForExactRoot(document, _, _): document.workspaceID
         case let .replaceWorkingDocument(document): document.workspaceID
         case let .saveWorkspaceDocument(workspaceID): workspaceID
         case let .deleteWorkspace(workspaceID): workspaceID
