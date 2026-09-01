@@ -79,22 +79,36 @@ final class AppDeepLinkRouter {
             targetWindow.handleIncomingURL(url)
             return
         }
-        await routeOpenCommand(command, receivingWindow: targetWindow)
+        await routeOpenCommand(
+            command,
+            sourceURL: url,
+            receivingWindow: targetWindow,
+            remainingWindowRetries: 1
+        )
     }
 
-    private func routeOpenCommand(_ command: AppCommand, receivingWindow: WindowState) async {
+    private func routeOpenCommand(
+        _ command: AppCommand,
+        sourceURL: URL,
+        receivingWindow: WindowState,
+        remainingWindowRetries: Int
+    ) async {
         guard let folderPath = command.folderPath, !folderPath.isEmpty else {
             receivingWindow.enqueueCommand(command)
             return
         }
 
-        guard let routingCatalog = await receivingWindow.workspaceManager.workspaceRoutingCatalogSnapshot() else {
-            return
-        }
+        let routingCatalog = await receivingWindow.workspaceManager.workspaceRoutingCatalogSnapshot()
         let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
         guard liveWindows.contains(where: { $0 === receivingWindow }) else {
+            await rerouteOpenCommand(
+                command,
+                sourceURL: sourceURL,
+                remainingWindowRetries: remainingWindowRetries
+            )
             return
         }
+        guard let routingCatalog else { return }
         var candidateRepresentations: [UUID: WorkspaceCandidateRepresentation] = [:]
 
         // Persistent candidates come from one runtime-owned catalog snapshot in production.
@@ -157,12 +171,32 @@ final class AppDeepLinkRouter {
         )
     }
 
+    private func rerouteOpenCommand(
+        _ command: AppCommand,
+        sourceURL: URL,
+        remainingWindowRetries: Int
+    ) async {
+        guard remainingWindowRetries > 0,
+              let retryWindow = legacyTargetWindow(for: sourceURL)
+        else {
+            windowStatesManager.pendingURLs.append(sourceURL)
+            return
+        }
+        await routeOpenCommand(
+            command,
+            sourceURL: sourceURL,
+            receivingWindow: retryWindow,
+            remainingWindowRetries: remainingWindowRetries - 1
+        )
+    }
+
     private func legacyTargetWindow(for url: URL) -> WindowState? {
+        let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
         switch Self.legacyWindowPreference(for: url) {
         case .earliest:
-            windowStatesManager.allWindows.first
+            return liveWindows.first
         case .latest:
-            windowStatesManager.latestWindowState
+            return liveWindows.last
         }
     }
 

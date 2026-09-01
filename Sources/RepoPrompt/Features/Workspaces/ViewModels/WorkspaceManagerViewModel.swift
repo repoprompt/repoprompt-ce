@@ -224,6 +224,35 @@ enum WorkspaceOpenBehavior {
     case addToActiveOnly
 }
 
+enum PersistentFolderOpenResolution {
+    case reused(WorkspaceModel)
+    case created(WorkspaceModel)
+
+    var workspace: WorkspaceModel {
+        switch self {
+        case let .reused(workspace), let .created(workspace):
+            workspace
+        }
+    }
+}
+
+private enum PersistentFolderOpenError: LocalizedError {
+    case invalidFolder
+    case authoritySnapshotUnavailable
+    case authorityConflictUnresolved
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidFolder:
+            "The selected folder is unavailable."
+        case .authoritySnapshotUnavailable:
+            "The workspace authority snapshot could not be decoded."
+        case .authorityConflictUnresolved:
+            "The workspace catalog changed before the folder could be opened."
+        }
+    }
+}
+
 struct WorkspaceMenuQuery {
     var includeSystem: Bool = false
     var includeHidden: Bool = false
@@ -455,6 +484,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         private var workspaceActivationLeaseDidAcquireHandlerForTesting:
             (@MainActor (UUID) async -> Void)?
         private var workspaceRoutingAuthorityDidSnapshotHandlerForTesting:
+            (@MainActor () async -> Void)?
+        private var persistentFolderOpenDidSnapshotHandlerForTesting:
             (@MainActor () async -> Void)?
     #endif
 
@@ -3357,6 +3388,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             _ handler: (@MainActor () async -> Void)?
         ) {
             workspaceRoutingAuthorityDidSnapshotHandlerForTesting = handler
+        }
+
+        func setPersistentFolderOpenDidSnapshotHandlerForTesting(
+            _ handler: (@MainActor () async -> Void)?
+        ) {
+            persistentFolderOpenDidSnapshotHandlerForTesting = handler
         }
 
         func setWorkspaceSwitchRecoveryWillBeginHandlerForTesting(
@@ -10818,6 +10855,172 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @MainActor
+    func resolveOrCreatePersistentWorkspace(
+        fromFolderURL url: URL
+    ) async throws -> PersistentFolderOpenResolution {
+        let folderURL = url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            throw PersistentFolderOpenError.invalidFolder
+        }
+
+        guard let domainWorkspaceAuthorityClient else {
+            if let existing = WorkspaceFolderOpenResolver.bestEligibleMatch(
+                forFolderPath: folderURL.path,
+                in: workspaces
+            ) {
+                return .reused(existing)
+            }
+            let workspace = createWorkspace(
+                name: uniqueWorkspaceName(baseName: folderURL.lastPathComponent),
+                repoPaths: [folderURL.path]
+            )
+            return .created(workspace)
+        }
+
+        var authoritySnapshot = await domainWorkspaceAuthorityClient.snapshot()
+        #if DEBUG
+            await persistentFolderOpenDidSnapshotHandlerForTesting?()
+        #endif
+
+        for attempt in 0 ... 1 {
+            try Task.checkCancellation()
+            let candidates = try persistentFolderOpenCandidates(from: authoritySnapshot)
+            if let existing = WorkspaceFolderOpenResolver.bestEligibleMatch(
+                forFolderPath: folderURL.path,
+                in: candidates
+            ) {
+                prepareAuthoritativeFolderOpenWorkspace(existing, from: authoritySnapshot)
+                return .reused(existing)
+            }
+
+            let workspace = WorkspaceModel(
+                name: uniqueWorkspaceName(
+                    baseName: folderURL.lastPathComponent,
+                    in: candidates
+                ),
+                repoPaths: [folderURL.path]
+            )
+            let fileURL = workspaceFileURL(for: workspace)
+            let outcome: DomainCommandOutcome
+            do {
+                outcome = try await domainWorkspaceAuthorityClient.create(
+                    workspace,
+                    fileURL: fileURL,
+                    expectedCatalogRevision: authoritySnapshot.catalogRevision,
+                    operationID: UUID()
+                )
+            } catch {
+                let refreshedSnapshot = await domainWorkspaceAuthorityClient.reloadExternalChanges()
+                let refreshed = try persistentFolderOpenCandidates(from: refreshedSnapshot)
+                if let existing = WorkspaceFolderOpenResolver.bestEligibleMatch(
+                    forFolderPath: folderURL.path,
+                    in: refreshed
+                ) {
+                    prepareAuthoritativeFolderOpenWorkspace(existing, from: refreshedSnapshot)
+                    return .reused(existing)
+                }
+                reportDomainAuthorityFailure(
+                    error,
+                    workspaceID: workspace.id,
+                    operation: "open_folder_create"
+                )
+                throw error
+            }
+
+            if Self.isSuccessfulDomainOutcome(outcome) {
+                applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
+                let canonical: WorkspaceModel
+                let canonicalFileURL: URL
+                if let outcomeWorkspace = outcome.workspace {
+                    do {
+                        canonical = try Self.decodeDomainWorkspaceProjection(
+                            documentBytes: outcomeWorkspace.document.documentBytes,
+                            fileURL: outcomeWorkspace.document.fileURL
+                        )
+                    } catch {
+                        reportDomainProjectionFailure(error)
+                        canonical = workspace
+                    }
+                    canonicalFileURL = outcomeWorkspace.document.fileURL
+                } else {
+                    canonical = workspace
+                    canonicalFileURL = fileURL
+                }
+                domainWorkspaceFileURLsByID[canonical.id] = canonicalFileURL
+                if let index = workspaceIndex(for: canonical.id) {
+                    workspaces[index] = canonical
+                } else {
+                    workspaces.append(canonical)
+                }
+                recordRepoPathBaseline(for: canonical)
+                NotificationCenter.default.post(
+                    name: .workspaceDidCreate,
+                    object: nil,
+                    userInfo: ["workspaceID": canonical.id]
+                )
+                return .created(canonical)
+            }
+
+            let isCatalogConflict = outcome.disposition == .conflict
+                && outcome.errorCode == .stateConflict
+            let refreshedSnapshot = await domainWorkspaceAuthorityClient.reloadExternalChanges()
+            let refreshed = try persistentFolderOpenCandidates(from: refreshedSnapshot)
+            if let existing = WorkspaceFolderOpenResolver.bestEligibleMatch(
+                forFolderPath: folderURL.path,
+                in: refreshed
+            ) {
+                prepareAuthoritativeFolderOpenWorkspace(existing, from: refreshedSnapshot)
+                return .reused(existing)
+            }
+
+            guard isCatalogConflict else {
+                applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
+                reportDomainAuthorityIssue(outcome, operation: "open_folder_create")
+                throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
+            }
+            authoritySnapshot = refreshedSnapshot
+            if attempt == 1 {
+                reportDomainAuthorityIssue(outcome, operation: "open_folder_create")
+                throw PersistentFolderOpenError.authorityConflictUnresolved
+            }
+        }
+
+        throw PersistentFolderOpenError.authorityConflictUnresolved
+    }
+
+    private func persistentFolderOpenCandidates(
+        from snapshot: DomainWorkspaceCatalogSnapshot
+    ) throws -> [WorkspaceModel] {
+        guard let candidates = decodeDomainWorkspaceRoutingSnapshot(snapshot) else {
+            let error = PersistentFolderOpenError.authoritySnapshotUnavailable
+            reportDomainProjectionFailure(error)
+            throw error
+        }
+        return candidates
+    }
+
+    private func prepareAuthoritativeFolderOpenWorkspace(
+        _ workspace: WorkspaceModel,
+        from snapshot: DomainWorkspaceCatalogSnapshot
+    ) {
+        guard let authoritative = snapshot.workspaces.first(where: {
+            $0.document.workspaceID == workspace.id
+        }) else { return }
+        domainWorkspaceFileURLsByID[workspace.id] = authoritative.document.fileURL
+        applyDomainAuthorityBaseline(
+            workspaceID: workspace.id,
+            revisions: authoritative.revisions,
+            digest: authoritative.document.contentDigest,
+            health: authoritative.health,
+            catalogRevision: snapshot.catalogRevision
+        )
+        recordRepoPathBaseline(for: workspace)
+    }
+
+    @MainActor
     func pickFolderAndOpenWorkspace(
         title: String,
         message: String,
@@ -10832,47 +11035,78 @@ class WorkspaceManagerViewModel: ObservableObject {
         fromFolderURL url: URL,
         behavior: WorkspaceOpenBehavior
     ) async throws {
-        let normalizedPath = (url.path as NSString).standardizingPath
         let isFallback = (activeWorkspace == nil || activeWorkspace?.isSystemWorkspace == true)
 
         switch behavior {
         case .addToActiveOrCreateNew:
             if isFallback {
-                let newName = uniqueWorkspaceName(baseName: url.lastPathComponent)
-                let newWS = createWorkspace(name: newName, repoPaths: [normalizedPath])
-                await switchWorkspace(to: newWS, saveState: false)
+                let resolution = try await resolveOrCreatePersistentWorkspace(fromFolderURL: url)
+                switch resolution {
+                case let .reused(workspace):
+                    await activateReusedPersistentFolderWorkspace(
+                        workspace,
+                        folderPath: url.path
+                    )
+                case let .created(workspace):
+                    await switchWorkspace(to: workspace, saveState: false)
+                }
             } else {
                 try await addFolder(url)
             }
         case .createNewWorkspace:
-            if let existingWorkspace = WorkspaceFolderOpenResolver.bestEligibleMatch(
-                forFolderPath: normalizedPath,
-                in: workspaces
-            ) {
-                await requestWorkspaceSwitch(
-                    to: existingWorkspace,
-                    saveState: true,
-                    reason: "openFolderReuse"
+            let resolution = try await resolveOrCreatePersistentWorkspace(fromFolderURL: url)
+            switch resolution {
+            case let .reused(workspace):
+                await activateReusedPersistentFolderWorkspace(
+                    workspace,
+                    folderPath: url.path
                 )
-                return
+            case let .created(workspace):
+                await switchWorkspace(to: workspace, saveState: false, reason: "openFolderCreate")
             }
-
-            let newName = uniqueWorkspaceName(baseName: url.lastPathComponent)
-            let newWS = createWorkspace(name: newName, repoPaths: [normalizedPath])
-            await switchWorkspace(to: newWS, saveState: false, reason: "openFolderCreate")
         case .addToActiveOnly:
             guard !isFallback else { throw WorkspaceOpenError.noActiveWorkspace }
             try await addFolder(url)
         }
     }
 
+    private func activateReusedPersistentFolderWorkspace(
+        _ workspace: WorkspaceModel,
+        folderPath: String
+    ) async {
+        let expectedRoot = WorkspaceRootSetKey(paths: [folderPath])
+        if activeWorkspaceID == workspace.id,
+           self.workspace(withID: workspace.id).map({
+               !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
+           }) ?? true
+        {
+            await reactivateWorkspaceAfterReplacement(
+                workspace,
+                reason: "openFolderReuseAuthorityProjection"
+            )
+        } else {
+            await requestWorkspaceSwitch(
+                to: workspace,
+                saveState: true,
+                reason: "openFolderReuse"
+            )
+        }
+    }
+
     func uniqueWorkspaceName(baseName: String) -> String {
-        if !workspaces.contains(where: { $0.name == baseName }) {
+        uniqueWorkspaceName(baseName: baseName, in: workspaces)
+    }
+
+    private func uniqueWorkspaceName(
+        baseName: String,
+        in candidates: [WorkspaceModel]
+    ) -> String {
+        if !candidates.contains(where: { $0.name == baseName }) {
             return baseName
         }
         var counter = 1
         var attempt = "\(baseName) (\(counter))"
-        while workspaces.contains(where: { $0.name == attempt }) {
+        while candidates.contains(where: { $0.name == attempt }) {
             counter += 1
             attempt = "\(baseName) (\(counter))"
         }

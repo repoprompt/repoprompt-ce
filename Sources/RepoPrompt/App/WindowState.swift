@@ -1592,6 +1592,7 @@ class WindowState: ObservableObject {
 
             let existingWorkspace: WorkspaceModel?
             var requiresActiveWorkspaceReload = false
+            var shouldCreateLocalEphemeralWorkspace = false
             if let resolvedWorkspaceID = queuedCommand.resolvedFolderWorkspaceID,
                let expectedRoot = queuedCommand.expectedFolderRootKey
             {
@@ -1610,12 +1611,30 @@ class WindowState: ObservableObject {
             } else if let resolvedWorkspaceID = queuedCommand.resolvedFolderWorkspaceID {
                 existingWorkspace = workspaceManager.workspace(withID: resolvedWorkspaceID)
                 guard existingWorkspace != nil else { return }
-            } else {
+            } else if shouldBeEphemeral {
                 existingWorkspace = WorkspaceFolderOpenResolver.bestEligibleMatch(
                     forFolderPath: folderURL.path,
                     in: workspaceManager.workspaces,
-                    admittingEphemeral: shouldBeEphemeral
+                    admittingEphemeral: true
                 )
+                shouldCreateLocalEphemeralWorkspace = existingWorkspace == nil
+            } else {
+                do {
+                    let resolution = try await workspaceManager.resolveOrCreatePersistentWorkspace(
+                        fromFolderURL: folderURL
+                    )
+                    guard !isClosing else { return }
+                    existingWorkspace = resolution.workspace
+                    if workspaceManager.activeWorkspaceID == resolution.workspace.id {
+                        let expectedRoot = WorkspaceRootSetKey(paths: [folderURL.path])
+                        let projectedWorkspace = workspaceManager.workspace(withID: resolution.workspace.id)
+                        requiresActiveWorkspaceReload = projectedWorkspace.map {
+                            !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
+                        } ?? true
+                    }
+                } catch {
+                    return
+                }
             }
 
             if let existingWorkspace {
@@ -1649,16 +1668,13 @@ class WindowState: ObservableObject {
                     )
                     didSwitchWorkspace = result.didSwitch
                 }
-            } else {
-                // Create a brand-new workspace
+            } else if shouldCreateLocalEphemeralWorkspace {
                 let nameGuess = folderURL.lastPathComponent
                 let workspaceName = workspaceManager.uniqueWorkspaceName(baseName: nameGuess)
-
-                // Pass ephemeral to createWorkspace
                 let newWS = workspaceManager.createWorkspace(
                     name: workspaceName,
                     repoPaths: [folderURL.path],
-                    ephemeral: shouldBeEphemeral
+                    ephemeral: true
                 )
                 requestedWorkspaceSwitch = true
                 let result = await workspaceManager.requestWorkspaceSwitch(
@@ -1667,6 +1683,8 @@ class WindowState: ObservableObject {
                     reason: "appCommandFolderOpen"
                 )
                 didSwitchWorkspace = result.didSwitch
+            } else {
+                return
             }
         } else if let workspaceName = command.workspaceName, !workspaceName.isEmpty {
             // Look for an existing workspace by name
@@ -1706,6 +1724,7 @@ class WindowState: ObservableObject {
         }
 
         // If we now have an active workspace, apply file selection, prompt text, etc.
+        guard !isClosing else { return }
         if requestedWorkspaceSwitch, !didSwitchWorkspace {
             return
         }
@@ -1729,6 +1748,7 @@ class WindowState: ObservableObject {
 
         if !command.fileList.isEmpty {
             await workspaceFilesViewModel.selectFiles(withPaths: command.fileList)
+            guard !isClosing else { return }
         }
 
         if let prompt = command.promptText, !prompt.isEmpty {

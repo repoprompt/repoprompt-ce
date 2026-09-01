@@ -689,10 +689,64 @@ import XCTest
             })
         }
 
-        func testRouteDoesNotEnqueueAfterReceivingWindowClosesDuringAuthorityAwait() async throws {
+        func testConcurrentUnmatchedRoutesCreateOneAuthoritativeWorkspace() async throws {
             let runtime = try await makeDomainRuntime()
+            let firstWindow = await makeWindow(domainRuntime: runtime)
+            let secondWindow = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "ConcurrentRoutedFolder")
+            firstWindow.setAutomaticCommandProcessingForTesting(false)
+            secondWindow.setAutomaticCommandProcessingForTesting(false)
+            let barrier = WindowFolderOpenTwoPartyBarrier()
+            firstWindow.workspaceManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
+                await barrier.arriveAndWait()
+            }
+            secondWindow.workspaceManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
+                await barrier.arriveAndWait()
+            }
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)"
+            ))
+            let router = AppDeepLinkRouter(windowStatesManager: .shared)
+
+            await router.route(url: url, preferredLegacyWindow: firstWindow)
+            await router.route(url: url, preferredLegacyWindow: secondWindow)
+            XCTAssertEqual(firstWindow.queuedCommandCountForTesting, 1)
+            XCTAssertEqual(secondWindow.queuedCommandCountForTesting, 1)
+
+            async let firstProcess: Void = firstWindow.processCommands()
+            async let secondProcess: Void = secondWindow.processCommands()
+            _ = await (firstProcess, secondProcess)
+
+            let snapshot = await firstWindow.workspaceManager.workspaceRoutingCatalogSnapshot()
+            let routingSnapshot = try XCTUnwrap(snapshot)
+            let matches = routingSnapshot.filter {
+                WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+            }
+            XCTAssertEqual(matches.count, 1)
+            XCTAssertEqual(firstWindow.workspaceManager.activeWorkspaceID, matches.first?.id)
+            XCTAssertEqual(secondWindow.workspaceManager.activeWorkspaceID, matches.first?.id)
+            XCTAssertEqual(
+                firstWindow.workspaceManager.workspaces.count(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+                }),
+                1
+            )
+            XCTAssertEqual(
+                secondWindow.workspaceManager.workspaces.count(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+                }),
+                1
+            )
+            XCTAssertEqual(firstWindow.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(secondWindow.queuedCommandCountForTesting, 0)
+        }
+
+        func testRouteRetriesAnotherWindowWhenReceiverClosesDuringAuthorityAwait() async throws {
+            let runtime = try await makeDomainRuntime()
+            let retryWindow = await makeWindow(domainRuntime: runtime)
             let targetWindow = await makeWindow(domainRuntime: runtime)
             let folder = try makeFolder(named: "ClosingDuringAuthorityAwait")
+            retryWindow.setAutomaticCommandProcessingForTesting(false)
             targetWindow.setAutomaticCommandProcessingForTesting(false)
             targetWindow.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting {
                 targetWindow.beginClose()
@@ -700,6 +754,7 @@ import XCTest
             let url = try XCTUnwrap(URL(
                 string: "repoprompt-ce://open/\(folder.path)?prompt=after"
             ))
+            let pendingCountBeforeRoute = WindowStatesManager.shared.pendingURLs.count
 
             await AppDeepLinkRouter(windowStatesManager: .shared).route(
                 url: url,
@@ -708,7 +763,70 @@ import XCTest
 
             XCTAssertTrue(targetWindow.isClosing)
             XCTAssertEqual(targetWindow.queuedCommandCountForTesting, 0)
-            XCTAssertNotEqual(targetWindow.promptManager.promptText, "after")
+            XCTAssertEqual(retryWindow.queuedCommandCountForTesting, 1)
+            XCTAssertEqual(WindowStatesManager.shared.pendingURLs.count, pendingCountBeforeRoute)
+
+            await retryWindow.processCommands()
+
+            XCTAssertEqual(retryWindow.promptManager.promptText, "after")
+            XCTAssertEqual(retryWindow.workspaceManager.activeWorkspace?.repoPaths, [folder.path])
+        }
+
+        func testRouteRetainsURLWhenLastWindowClosesDuringAuthorityAwait() async throws {
+            let runtime = try await makeDomainRuntime()
+            let targetWindow = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "LastWindowClosingDuringAuthorityAwait")
+            targetWindow.setAutomaticCommandProcessingForTesting(false)
+            targetWindow.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting {
+                targetWindow.beginClose()
+            }
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?prompt=after"
+            ))
+            let originalPendingURLs = WindowStatesManager.shared.pendingURLs
+            WindowStatesManager.shared.pendingURLs = []
+            defer { WindowStatesManager.shared.pendingURLs = originalPendingURLs }
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(
+                url: url,
+                preferredLegacyWindow: targetWindow
+            )
+
+            XCTAssertTrue(targetWindow.isClosing)
+            XCTAssertEqual(targetWindow.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(WindowStatesManager.shared.pendingURLs, [url])
+        }
+
+        func testRouteRetriesOnlyOnceWhenBothWindowsCloseDuringAuthorityAwait() async throws {
+            let runtime = try await makeDomainRuntime()
+            let retryWindow = await makeWindow(domainRuntime: runtime)
+            let targetWindow = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "BothWindowsClosingDuringAuthorityAwait")
+            retryWindow.setAutomaticCommandProcessingForTesting(false)
+            targetWindow.setAutomaticCommandProcessingForTesting(false)
+            retryWindow.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting {
+                retryWindow.beginClose()
+            }
+            targetWindow.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting {
+                targetWindow.beginClose()
+            }
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?prompt=after"
+            ))
+            let originalPendingURLs = WindowStatesManager.shared.pendingURLs
+            WindowStatesManager.shared.pendingURLs = []
+            defer { WindowStatesManager.shared.pendingURLs = originalPendingURLs }
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(
+                url: url,
+                preferredLegacyWindow: targetWindow
+            )
+
+            XCTAssertTrue(targetWindow.isClosing)
+            XCTAssertTrue(retryWindow.isClosing)
+            XCTAssertEqual(targetWindow.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(retryWindow.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(WindowStatesManager.shared.pendingURLs, [url])
         }
 
         func testFocusedPersistentRouteUsesAlreadyActiveMatchingWindow() async throws {
@@ -822,6 +940,41 @@ import XCTest
             XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspaceID, otherWorkspace.id)
             XCTAssertEqual(receivingWindow.promptManager.promptText, "receiving-before")
             XCTAssertNil(receivingWindow.workspaceManager.pendingSwitchConfirmation)
+        }
+
+        func testWindowClosingDuringWorkspaceSwitchAppliesNoPayload() async throws {
+            let window = await makeWindow()
+            let activeFolder = try makeFolder(named: "ClosingSwitchActive")
+            let targetFolder = try makeFolder(named: "ClosingSwitchTarget")
+            let active = window.workspaceManager.createWorkspace(
+                name: "Closing Switch Active",
+                repoPaths: [activeFolder.path]
+            )
+            let target = window.workspaceManager.createWorkspace(
+                name: "Closing Switch Target",
+                repoPaths: [targetFolder.path]
+            )
+            let initialSwitch = await window.workspaceManager.switchWorkspace(
+                to: active,
+                saveState: false,
+                reason: "closingSwitchFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            window.promptManager.promptText = "before"
+            window.workspaceManager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting { workspaceID in
+                if workspaceID == target.id {
+                    window.beginClose()
+                }
+            }
+
+            window.enqueueCommand(folderCommand(
+                folderPath: targetFolder.path,
+                promptText: "after"
+            ))
+            await window.processCommands()
+
+            XCTAssertTrue(window.isClosing)
+            XCTAssertNotEqual(window.promptManager.promptText, "after")
         }
 
         func testCancelledMatchedSwitchCreatesNoReplacementAndAppliesNoPayload() async throws {
@@ -943,6 +1096,21 @@ import XCTest
                 try await clock.sleep(for: .milliseconds(10))
             }
             throw WindowStateOpenFolderCommandTestError.conditionTimedOut
+        }
+    }
+
+    private actor WindowFolderOpenTwoPartyBarrier {
+        private var waiter: CheckedContinuation<Void, Never>?
+
+        func arriveAndWait() async {
+            if let waiter {
+                self.waiter = nil
+                waiter.resume()
+                return
+            }
+            await withCheckedContinuation { continuation in
+                waiter = continuation
+            }
         }
     }
 

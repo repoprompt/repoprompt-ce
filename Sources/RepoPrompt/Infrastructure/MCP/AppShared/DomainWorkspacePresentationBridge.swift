@@ -54,18 +54,20 @@ struct DomainWorkspaceAuthorityClient {
     func create(
         _ workspace: WorkspaceModel,
         fileURL: URL,
+        expectedCatalogRevision: UInt64? = nil,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
         let document = try document(for: workspace, fileURL: fileURL)
         let envelope = DomainWorkspaceCommandEnvelope(
             operationID: operationID,
-            expectedCatalogRevision: nil,
+            expectedCatalogRevision: expectedCatalogRevision,
             expectedWorkspaceRevision: 0,
             origin: .appPresentation(windowID: windowID),
             command: .createWorkspace(document)
         )
         let first = await executeStable(envelope)
-        guard first.disposition == .conflict,
+        guard expectedCatalogRevision == nil,
+              first.disposition == .conflict,
               first.errorCode == .stateConflict,
               first.diagnostic == "durable_create_conflict"
               || first.diagnostic == "catalog_revision_mismatch",

@@ -61,6 +61,118 @@ import XCTest
             XCTAssertFalse(activeWorkspace.isEphemeral)
         }
 
+        func testConcurrentNoMatchOpensShareOneAuthoritativeWorkspace() async throws {
+            let runtime = try await makeDomainRuntime()
+            let firstManager = makeManager(domainRuntime: runtime)
+            let secondManager = makeManager(domainRuntime: runtime)
+            await firstManager.awaitInitialized()
+            await secondManager.awaitInitialized()
+            let folder = try makeFolder(named: "ConcurrentProject")
+            let barrier = TwoPartyAsyncBarrier()
+            firstManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
+                await barrier.arriveAndWait()
+            }
+            secondManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
+                await barrier.arriveAndWait()
+            }
+
+            async let firstOpen: Void = firstManager.openWorkspace(
+                fromFolderURL: folder,
+                behavior: .createNewWorkspace
+            )
+            async let secondOpen: Void = secondManager.openWorkspace(
+                fromFolderURL: folder,
+                behavior: .createNewWorkspace
+            )
+            _ = try await (firstOpen, secondOpen)
+
+            let snapshot = await firstManager.workspaceRoutingCatalogSnapshot()
+            let routingSnapshot = try XCTUnwrap(snapshot)
+            let matches = routingSnapshot.filter {
+                WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+            }
+            XCTAssertEqual(matches.count, 1)
+            XCTAssertEqual(firstManager.activeWorkspaceID, matches.first?.id)
+            XCTAssertEqual(secondManager.activeWorkspaceID, matches.first?.id)
+            XCTAssertEqual(
+                firstManager.workspaces.count(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+                }),
+                1
+            )
+            XCTAssertEqual(
+                secondManager.workspaces.count(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+                }),
+                1
+            )
+        }
+
+        func testUnrelatedCatalogConflictRetriesWithFreshRevision() async throws {
+            let runtime = try await makeDomainRuntime()
+            let openingManager = makeManager(domainRuntime: runtime)
+            let mutatingManager = makeManager(domainRuntime: runtime)
+            await openingManager.awaitInitialized()
+            await mutatingManager.awaitInitialized()
+            let requestedFolder = try makeFolder(named: "RequestedAfterConflict")
+            let unrelatedFolder = try makeFolder(named: "UnrelatedCatalogMutation")
+            openingManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
+                _ = try? await mutatingManager.resolveOrCreatePersistentWorkspace(
+                    fromFolderURL: unrelatedFolder
+                )
+            }
+
+            try await openingManager.openWorkspace(
+                fromFolderURL: requestedFolder,
+                behavior: .createNewWorkspace
+            )
+
+            let snapshot = await openingManager.workspaceRoutingCatalogSnapshot()
+            let routingSnapshot = try XCTUnwrap(snapshot)
+            XCTAssertEqual(
+                routingSnapshot.count(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(requestedFolder.path, in: $0)
+                }),
+                1
+            )
+            XCTAssertEqual(
+                routingSnapshot.count(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(unrelatedFolder.path, in: $0)
+                }),
+                1
+            )
+            XCTAssertTrue(
+                try WorkspaceFolderOpenResolver.containsExactRoot(
+                    requestedFolder.path,
+                    in: XCTUnwrap(openingManager.activeWorkspace)
+                )
+            )
+        }
+
+        func testExplicitCreationStillAllowsPersistentDuplicateRoots() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "IntentionalDuplicateRoot")
+            let first = manager.createWorkspace(name: "Intentional One", repoPaths: [folder.path])
+            let second = manager.createWorkspace(name: "Intentional Two", repoPaths: [folder.path])
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(2))
+            var matches: [WorkspaceModel] = []
+
+            while clock.now < deadline {
+                if let snapshot = await manager.workspaceRoutingCatalogSnapshot() {
+                    matches = snapshot.filter {
+                        WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+                    }
+                    if matches.count == 2 { break }
+                }
+                try await clock.sleep(for: .milliseconds(10))
+            }
+
+            XCTAssertEqual(Set(matches.map(\.id)), [first.id, second.id])
+        }
+
         func testReopeningExistingWorkspacePreservesStateAndInventory() async throws {
             let manager = makeManager()
             await manager.awaitInitialized()
@@ -170,6 +282,46 @@ import XCTest
             XCTAssertEqual(reopened.presets, [preset])
             XCTAssertEqual(reopened.activePresetID, preset.id)
             XCTAssertEqual(reopened.copyPresetId, copyPresetID)
+        }
+
+        func testInteractiveReuseReloadsStaleActiveAuthorityProjection() async throws {
+            let runtime = try await makeDomainRuntime()
+            let authorityManager = makeManager(domainRuntime: runtime)
+            let targetManager = makeManager(domainRuntime: runtime)
+            let targetBridge = try XCTUnwrap(domainBridges.last)
+            await authorityManager.awaitInitialized()
+            await targetManager.awaitInitialized()
+            let originalFolder = try makeFolder(named: "InteractiveStaleOriginal")
+            let requestedFolder = try makeFolder(named: "InteractiveStaleRequested")
+            let workspace = WorkspaceModel(
+                name: "Interactive Stale",
+                repoPaths: [originalFolder.path]
+            )
+            _ = try await authorityManager.saveWorkspaceToFileAsync(workspace)
+            try await waitUntil {
+                targetManager.workspace(withID: workspace.id)?.repoPaths == [originalFolder.path]
+            }
+            let projectedWorkspace = try XCTUnwrap(targetManager.workspace(withID: workspace.id))
+            let initialSwitch = await targetManager.switchWorkspace(
+                to: projectedWorkspace,
+                saveState: false,
+                reason: "interactiveStaleFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            targetBridge.stop()
+            var replacement = workspace
+            replacement.repoPaths = [requestedFolder.path]
+            replacement.dateModified = Date()
+            _ = try await authorityManager.saveWorkspaceToFileAsync(replacement)
+            XCTAssertEqual(targetManager.activeWorkspace?.repoPaths, [originalFolder.path])
+
+            try await targetManager.openWorkspace(
+                fromFolderURL: requestedFolder,
+                behavior: .createNewWorkspace
+            )
+
+            XCTAssertEqual(targetManager.activeWorkspaceID, workspace.id)
+            XCTAssertEqual(targetManager.activeWorkspace?.repoPaths, [requestedFolder.path])
         }
 
         func testActiveMatchedWorkspaceIsSilentNoOp() async throws {
@@ -343,6 +495,21 @@ import XCTest
                 domainBridges.append(domainWorkspacePresentationBridge)
             }
             return composition.workspaceManager
+        }
+    }
+
+    private actor TwoPartyAsyncBarrier {
+        private var waiter: CheckedContinuation<Void, Never>?
+
+        func arriveAndWait() async {
+            if let waiter {
+                self.waiter = nil
+                waiter.resume()
+                return
+            }
+            await withCheckedContinuation { continuation in
+                waiter = continuation
+            }
         }
     }
 
