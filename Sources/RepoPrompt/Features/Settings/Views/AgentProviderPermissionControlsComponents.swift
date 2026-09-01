@@ -90,6 +90,7 @@ struct AgentProviderPermissionLevelSection: View {
         case .openCode: "ACP Session Mode"
         case .cursor: "ACP Auto-Approve"
         case .grokBuild: "Always-Approve Launch"
+        case .omp: "Tool Permissions"
         }
     }
 }
@@ -140,7 +141,7 @@ struct AgentProviderToolsRuntimeDisclosure: View {
         switch providerID {
         case .codex: binding.codexTools != nil
         case .claude: binding.claudeTools != nil
-        case .openCode, .cursor, .grokBuild: false
+        case .openCode, .cursor, .grokBuild, .omp: false
         }
     }
 }
@@ -168,7 +169,7 @@ struct AgentProviderToolsRuntimeControls: View {
                         onApplyMutation: onApplyClaudeToolSettingMutation
                     )
                 }
-            case .openCode, .cursor, .grokBuild:
+            case .openCode, .cursor, .grokBuild, .omp:
                 EmptyView()
             }
         }

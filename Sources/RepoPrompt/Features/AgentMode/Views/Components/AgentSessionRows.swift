@@ -1079,6 +1079,7 @@ extension AgentProviderKind {
         case .openCode: "curlybraces.square"
         case .cursor: "cursorarrow"
         case .grokBuild: "bolt.circle.fill"
+        case .omp: "pi"
         }
     }
 }

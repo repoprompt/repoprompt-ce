@@ -7,6 +7,7 @@ enum AgentModelCatalog {
         let openCodeAvailable: Bool
         let cursorAvailable: Bool
         let grokBuildAvailable: Bool
+        let ompAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
         let customClaudeCompatibleConfigured: Bool
@@ -17,6 +18,7 @@ enum AgentModelCatalog {
             openCodeAvailable: false,
             cursorAvailable: false,
             grokBuildAvailable: false,
+            ompAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
             customClaudeCompatibleConfigured: false
@@ -29,6 +31,7 @@ enum AgentModelCatalog {
                 openCodeAvailable: false,
                 cursorAvailable: cursorAvailable && providers.contains(.cursor),
                 grokBuildAvailable: grokBuildAvailable && providers.contains(.grokBuild),
+                ompAvailable: false,
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured && providers.contains(.claudeCode)
@@ -43,6 +46,7 @@ enum AgentModelCatalog {
                 openCodeAvailable: true,
                 cursorAvailable: false,
                 grokBuildAvailable: false,
+                ompAvailable: false,
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -55,6 +59,7 @@ enum AgentModelCatalog {
             openCodeAvailable: Bool = true,
             cursorAvailable: Bool = false,
             grokBuildAvailable: Bool = false,
+            ompAvailable: Bool = false,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
             customClaudeCompatibleConfigured: Bool = false
@@ -64,6 +69,7 @@ enum AgentModelCatalog {
             self.openCodeAvailable = openCodeAvailable
             self.cursorAvailable = cursorAvailable
             self.grokBuildAvailable = grokBuildAvailable
+            self.ompAvailable = ompAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
             self.customClaudeCompatibleConfigured = customClaudeCompatibleConfigured
@@ -87,6 +93,7 @@ enum AgentModelCatalog {
                 openCodeAvailable: openCodeAvailable || agentKind == .openCode,
                 cursorAvailable: cursorAvailable || agentKind == .cursor,
                 grokBuildAvailable: grokBuildAvailable || agentKind == .grokBuild,
+                ompAvailable: ompAvailable || agentKind == .omp,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured || agentKind == .customClaudeCompatible
@@ -187,14 +194,15 @@ enum AgentModelCatalog {
         .claudeCode,
         .openCode,
         .cursor,
-        .grokBuild
+        .grokBuild,
+        .omp
     ]
 
     static func selectableAgents(
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .omp, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
             .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
     }
 
@@ -226,6 +234,8 @@ enum AgentModelCatalog {
             availability.cursorAvailable
         case .grokBuild:
             availability.grokBuildAvailable
+        case .omp:
+            availability.ompAvailable
         }
     }
 
@@ -238,9 +248,9 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return AgentModel.cursorAuto.rawValue
         }
-        if agentKind == .grokBuild {
-            // Grok's default must never become a discovered session's current model:
-            // "default" sends no model mutation and follows Grok's own configuration.
+        if agentKind == .grokBuild || agentKind == .omp {
+            // Provider-managed default must never become a discovered session's current model:
+            // "default" sends no model mutation and follows the provider's own configuration.
             return AgentModel.defaultModel.rawValue
         }
         if isAgentAvailable(agentKind, availability: availability),
@@ -254,7 +264,7 @@ enum AgentModelCatalog {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
-        case .codexExec, .openCode, .grokBuild:
+        case .codexExec, .openCode, .grokBuild, .omp:
             return AgentModel.defaultModel.rawValue
         }
     }
@@ -344,6 +354,9 @@ enum AgentModelCatalog {
             }
             return fallbacks
         }
+        if agentKind == .omp {
+            return [staticOption(.defaultModel, for: .omp)]
+        }
         if agentKind == .grokBuild {
             let fallback = staticOption(.defaultModel, for: .grokBuild)
             guard let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
@@ -374,7 +387,7 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
-        case .openCode, .cursor, .grokBuild:
+        case .openCode, .cursor, .grokBuild, .omp:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
@@ -401,7 +414,7 @@ enum AgentModelCatalog {
         {
             return true
         }
-        if agentKind == .grokBuild,
+        if agentKind == .grokBuild || agentKind == .omp,
            normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
         {
             return true
@@ -1361,6 +1374,7 @@ enum AgentModelCatalog {
     private static func resolvedACPDiscoveredModels(
         for agentKind: AgentProviderKind
     ) -> ACPDiscoveredSessionModels? {
+        guard agentKind != .omp else { return nil }
         guard let providerID = agentKind.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
               !snapshot.options.isEmpty
@@ -1400,7 +1414,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp:
             nil
         }
     }
@@ -1603,7 +1617,7 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp:
             true
         }
     }

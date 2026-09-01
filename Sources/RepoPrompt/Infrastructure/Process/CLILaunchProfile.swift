@@ -15,6 +15,7 @@ enum CLILaunchProfiles {
         "~/.opencode/bin"
     ]
     static let cursorProviderSpecificPaths: [String] = []
+    static let ompProviderSpecificPaths: [String] = ["~/.bun/bin"]
 
     /// Official Grok Build installer location (`GROK_BIN_DIR` overrides it, but a custom
     /// value is honored through PATH or an explicitly configured absolute command only).
@@ -64,6 +65,12 @@ enum CLILaunchProfiles {
         commandName: "cursor-agent",
         preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
+    )
+
+    static let omp = CLILaunchProfile(
+        commandName: "omp",
+        preferredBasenames: ["omp"],
+        supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(ompProviderSpecificPaths)
     )
 
     static let grokBuild = CLILaunchProfile(

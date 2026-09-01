@@ -172,6 +172,18 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: level.autoApprovesACPToolPermissions ? "Auto-approve: on" : "Auto-approve: off",
                 warnings: warnings
             )
+        case .omp:
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Managed by OMP",
+                shell: "Managed by OMP",
+                externalMCP: "RepoPrompt MCP: run-scoped policy",
+                search: "Managed by OMP",
+                approvalModeDescription: "Provider managed",
+                warnings: []
+            )
         case .grokBuild:
             let level = grokBuildPermissionLevel(profile: profile)
             let warnings = level == .fullAccess
@@ -210,6 +222,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
         case .grokBuild: availability.grokBuildAvailable
+        case .omp: availability.ompAvailable
         }
     }
 

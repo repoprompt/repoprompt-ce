@@ -585,7 +585,7 @@ final class ACPIntegratedAgentModeRunner {
 
                 try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-                try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+                try await applyRequestedSessionModeIfNeeded(runRequest, controller: controller, runID: runID)
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
                 if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
@@ -664,7 +664,7 @@ final class ACPIntegratedAgentModeRunner {
 
                 try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-                try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+                try await applyRequestedSessionModeIfNeeded(runRequest, controller: controller, runID: runID)
 
                 if let deferredLease {
                     let acquired = await deferredLease.acquire()
@@ -806,11 +806,12 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func applyRequestedSessionModeIfNeeded(
-        _ requestedMode: String?,
+        _ runRequest: ACPRunRequest,
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        if let requestedMode = requestedMode?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
+        guard runRequest.agentKind != .omp else { return }
+        if let requestedMode = runRequest.sessionModeID?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
             try await controller.setSessionMode(requestedMode)
         }
     }
@@ -1704,6 +1705,7 @@ final class ACPIntegratedAgentModeRunner {
         agentKind: AgentProviderKind,
         session: AgentTabSession
     ) -> Bool {
+        guard agentKind != .omp else { return false }
         guard let providerID = agentKind.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)
         else {
