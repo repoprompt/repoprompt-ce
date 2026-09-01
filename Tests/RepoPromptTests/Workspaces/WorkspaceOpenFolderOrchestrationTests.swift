@@ -9,6 +9,8 @@ import XCTest
         private var originalStoragePath: String?
         private var storageRoot: URL!
         private var managers: [WorkspaceManagerViewModel] = []
+        private var domainBridges: [DomainWorkspacePresentationBridge] = []
+        private var domainRuntimes: [MCPDomainRuntime] = []
 
         override func setUp() async throws {
             try await super.setUp()
@@ -23,8 +25,14 @@ import XCTest
         }
 
         override func tearDown() async throws {
+            domainBridges.forEach { $0.stop() }
+            domainBridges.removeAll()
             managers.forEach { $0.prepareForWindowClose() }
             managers.removeAll()
+            for runtime in domainRuntimes {
+                _ = await runtime.shutdown()
+            }
+            domainRuntimes.removeAll()
             await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
@@ -95,6 +103,59 @@ import XCTest
 
             try await manager.openWorkspace(
                 fromFolderURL: normalizedVariant,
+                behavior: .createNewWorkspace
+            )
+
+            let reopened = try XCTUnwrap(manager.activeWorkspace)
+            XCTAssertEqual(reopened.id, existing.id)
+            XCTAssertEqual(manager.workspaces.count, countBeforeOpen)
+            XCTAssertEqual(reopened.composeTabs, [preservedTab, secondaryTab])
+            XCTAssertEqual(reopened.activeComposeTabID, preservedTab.id)
+            XCTAssertEqual(reopened.composeTabs.first?.selection.selectedPaths, [selectedFile])
+            XCTAssertEqual(reopened.composeTabs.first?.promptText, "Preserve this prompt")
+            XCTAssertEqual(reopened.currentPromptText, "Preserve this prompt")
+            XCTAssertEqual(reopened.presets, [preset])
+            XCTAssertEqual(reopened.activePresetID, preset.id)
+            XCTAssertEqual(reopened.copyPresetId, copyPresetID)
+        }
+
+        func testReopeningExistingWorkspacePreservesStateThroughDomainAuthority() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "DomainExistingProject")
+            let selectedFile = folder.appendingPathComponent("README.md").path
+            let preservedTab = ComposeTabState(
+                name: "Review",
+                selection: StoredSelection(selectedPaths: [selectedFile]),
+                promptText: "Preserve this prompt"
+            )
+            let secondaryTab = ComposeTabState(name: "Follow-up", promptText: "Second tab")
+            let preset = WorkspacePreset(
+                name: "Review preset",
+                selectedFilePaths: [selectedFile]
+            )
+            let copyPresetID = UUID()
+            let existing = WorkspaceModel(
+                name: "Domain Existing Project",
+                repoPaths: [folder.path],
+                presets: [preset],
+                activePresetID: preset.id,
+                currentPromptText: preservedTab.promptText,
+                copyPresetId: copyPresetID,
+                composeTabs: [preservedTab, secondaryTab],
+                activeComposeTabID: preservedTab.id
+            )
+
+            _ = try await manager.saveWorkspaceToFileAsync(existing)
+            try await waitUntil {
+                manager.workspace(withID: existing.id)?.composeTabs == [preservedTab, secondaryTab]
+            }
+            XCTAssertNotEqual(manager.activeWorkspaceID, existing.id)
+            let countBeforeOpen = manager.workspaces.count
+
+            try await manager.openWorkspace(
+                fromFolderURL: folder,
                 behavior: .createNewWorkspace
             )
 
@@ -234,19 +295,53 @@ import XCTest
             throw WorkspaceOpenFolderOrchestrationTestError.confirmationTimedOut
         }
 
+        private func waitUntil(
+            timeout: Duration = .seconds(2),
+            condition: @escaping @MainActor () -> Bool
+        ) async throws {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while clock.now < deadline {
+                if condition() {
+                    return
+                }
+                try await clock.sleep(for: .milliseconds(10))
+            }
+            throw WorkspaceOpenFolderOrchestrationTestError.conditionTimedOut
+        }
+
         private func makeFolder(named name: String) throws -> URL {
             let folder = storageRoot.appendingPathComponent(name, isDirectory: true)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             return folder
         }
 
-        private func makeManager() -> WorkspaceManagerViewModel {
+        private func makeDomainRuntime() async throws -> MCPDomainRuntime {
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-open-folder-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            domainRuntimes.append(runtime)
+            return runtime
+        }
+
+        private func makeManager(domainRuntime: MCPDomainRuntime? = nil) -> WorkspaceManagerViewModel {
             let composition = WindowStateCompositionFactory.make(
                 windowID: -1300 - Int.random(in: 1 ... 99),
                 deferredInitialAgentSystemWorkspaceRefresh: true,
-                sharedMCPService: MCPService()
+                sharedMCPService: MCPService(),
+                domainRuntime: domainRuntime
             )
             managers.append(composition.workspaceManager)
+            if let domainWorkspacePresentationBridge = composition.domainWorkspacePresentationBridge {
+                domainBridges.append(domainWorkspacePresentationBridge)
+            }
             return composition.workspaceManager
         }
     }
@@ -267,5 +362,6 @@ import XCTest
 
     private enum WorkspaceOpenFolderOrchestrationTestError: Error {
         case confirmationTimedOut
+        case conditionTimedOut
     }
 #endif

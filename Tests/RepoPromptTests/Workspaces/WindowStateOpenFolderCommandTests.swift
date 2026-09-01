@@ -291,11 +291,15 @@ import XCTest
             XCTAssertEqual(winnerWindow.workspaceManager.activeWorkspaceID, winner.id)
         }
 
-        func testRouterUsesFresherCatalogSnapshotAndPreservesResolvedWinner() async throws {
-            let targetWindow = await makeWindow()
-            let sourceWindow = await makeWindow()
+        func testRouterUsesCatalogSnapshotAndPreservesSelectionsAcrossDivergentWindows() async throws {
+            let staleWindow = await makeWindow()
+            let receivingWindow = await makeWindow()
             let staleFolder = try makeFolder(named: "StaleRoot")
             let requestedFolder = try makeFolder(named: "FreshRoot")
+            let staleFile = staleFolder.appendingPathComponent("Stale.swift")
+            let requestedFile = requestedFolder.appendingPathComponent("Fresh.swift")
+            try Data("let stale = true\n".utf8).write(to: staleFile)
+            try Data("let fresh = true\n".utf8).write(to: requestedFile)
             let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000021"))
             let staleActiveSnapshot = WorkspaceModel(
                 id: workspaceID,
@@ -309,32 +313,89 @@ import XCTest
                 name: "Shared Workspace",
                 repoPaths: [requestedFolder.path]
             )
-            targetWindow.workspaceManager.workspaces.append(staleActiveSnapshot)
-            sourceWindow.workspaceManager.workspaces.append(freshCatalogSnapshot)
-            let targetSwitch = await targetWindow.workspaceManager.switchWorkspace(
+            staleWindow.workspaceManager.workspaces.append(staleActiveSnapshot)
+            receivingWindow.workspaceManager.workspaces.append(freshCatalogSnapshot)
+            let staleSwitch = await staleWindow.workspaceManager.switchWorkspace(
                 to: staleActiveSnapshot,
                 saveState: false,
                 reason: "folderCommandStaleActiveFixture"
             )
-            XCTAssertEqual(targetSwitch, .switched)
-            let targetWorkspaceIndex = try XCTUnwrap(
-                targetWindow.workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceID })
+            XCTAssertEqual(staleSwitch, .switched)
+            let staleWorkspaceIndex = try XCTUnwrap(
+                staleWindow.workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceID })
             )
-            targetWindow.workspaceManager.workspaces[targetWorkspaceIndex] = staleActiveSnapshot
-            targetWindow.promptManager.promptText = "target-before"
-            sourceWindow.promptManager.promptText = "source-before"
+            staleWindow.workspaceManager.workspaces[staleWorkspaceIndex] = staleActiveSnapshot
+            await staleWindow.workspaceFilesViewModel.selectFiles(withPaths: [staleFile.path])
+            XCTAssertTrue(staleWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == staleFile.path
+            })
+            staleWindow.promptManager.promptText = "stale-before"
+            receivingWindow.promptManager.promptText = "receiving-before"
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(requestedFolder.path)?focus=true&files=\(requestedFile.path)&prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(url: url)
+            await receivingWindow.processCommands()
+            await staleWindow.processCommands()
+
+            XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspace?.repoPaths, [requestedFolder.path])
+            XCTAssertEqual(receivingWindow.promptManager.promptText, "after")
+            XCTAssertTrue(receivingWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == requestedFile.path
+            })
+            XCTAssertEqual(staleWindow.workspaceManager.activeWorkspace?.repoPaths, [staleFolder.path])
+            XCTAssertEqual(staleWindow.workspaceManager.workspaces.count(where: { $0.id == workspaceID }), 1)
+            XCTAssertEqual(staleWindow.promptManager.promptText, "stale-before")
+            XCTAssertTrue(staleWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == staleFile.path
+            })
+        }
+
+        func testRouterPrefersCatalogRootsOverNewerActiveWorkspaceActivity() async throws {
+            let staleWindow = await makeWindow()
+            let receivingWindow = await makeWindow()
+            let staleFolder = try makeFolder(named: "NewerActivityStaleRoot")
+            let requestedFolder = try makeFolder(named: "OlderTimestampCurrentRoot")
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000022"))
+            let staleActiveSnapshot = WorkspaceModel(
+                id: workspaceID,
+                dateModified: Date(timeIntervalSince1970: 20),
+                name: "Shared Workspace",
+                repoPaths: [staleFolder.path]
+            )
+            let currentCatalogSnapshot = WorkspaceModel(
+                id: workspaceID,
+                dateModified: Date(timeIntervalSince1970: 10),
+                name: "Shared Workspace",
+                repoPaths: [requestedFolder.path]
+            )
+            staleWindow.workspaceManager.workspaces.append(staleActiveSnapshot)
+            receivingWindow.workspaceManager.workspaces.append(currentCatalogSnapshot)
+            let staleSwitch = await staleWindow.workspaceManager.switchWorkspace(
+                to: staleActiveSnapshot,
+                saveState: false,
+                reason: "folderCommandNewerActivityStaleFixture"
+            )
+            XCTAssertEqual(staleSwitch, .switched)
+            let staleWorkspaceIndex = try XCTUnwrap(
+                staleWindow.workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceID })
+            )
+            staleWindow.workspaceManager.workspaces[staleWorkspaceIndex] = staleActiveSnapshot
+            staleWindow.promptManager.promptText = "stale-before"
+            receivingWindow.promptManager.promptText = "receiving-before"
             let url = try XCTUnwrap(URL(
                 string: "repoprompt-ce://open/\(requestedFolder.path)?focus=true&prompt=after"
             ))
 
             await AppDeepLinkRouter(windowStatesManager: .shared).route(url: url)
-            await sourceWindow.processCommands()
-            await targetWindow.processCommands()
+            await receivingWindow.processCommands()
+            await staleWindow.processCommands()
 
-            XCTAssertEqual(sourceWindow.promptManager.promptText, "source-before")
-            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspaceID, workspaceID)
-            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count(where: { $0.id == workspaceID }), 1)
-            XCTAssertEqual(targetWindow.promptManager.promptText, "after")
+            XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspace?.repoPaths, [requestedFolder.path])
+            XCTAssertEqual(receivingWindow.promptManager.promptText, "after")
+            XCTAssertEqual(staleWindow.workspaceManager.activeWorkspace?.repoPaths, [staleFolder.path])
+            XCTAssertEqual(staleWindow.promptManager.promptText, "stale-before")
         }
 
         func testCancelledMatchedSwitchCreatesNoReplacementAndAppliesNoPayload() async throws {

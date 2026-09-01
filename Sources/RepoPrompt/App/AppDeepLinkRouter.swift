@@ -5,7 +5,7 @@ import Foundation
 final class AppDeepLinkRouter {
     private struct WorkspaceCandidateRepresentation {
         let workspace: WorkspaceModel
-        let sourceOrder: Int
+        let targetWindow: WindowState
     }
 
     static let shared = AppDeepLinkRouter()
@@ -90,27 +90,24 @@ final class AppDeepLinkRouter {
         let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
         var candidateRepresentations: [UUID: WorkspaceCandidateRepresentation] = [:]
 
-        func recordCandidate(_ workspace: WorkspaceModel, sourceOrder: Int) {
-            if let current = candidateRepresentations[workspace.id],
-               current.workspace.dateModified > workspace.dateModified
-               || current.workspace.dateModified == workspace.dateModified
-               && current.sourceOrder <= sourceOrder
-            {
-                return
-            }
+        // The receiving catalog is the persistent workspace authority for this route. Active
+        // windows supplement catalog-missing IDs so ephemeral and not-yet-projected workspaces
+        // remain reusable without letting unrelated activity timestamps override root state.
+        for workspace in receivingWindow.workspaceManager.workspaces {
             candidateRepresentations[workspace.id] = WorkspaceCandidateRepresentation(
                 workspace: workspace,
-                sourceOrder: sourceOrder
+                targetWindow: receivingWindow
             )
         }
-
-        for (sourceOrder, window) in liveWindows.enumerated() {
-            if let activeWorkspace = window.workspaceManager.activeWorkspace {
-                recordCandidate(activeWorkspace, sourceOrder: sourceOrder)
+        for window in liveWindows {
+            if let activeWorkspace = window.workspaceManager.activeWorkspace,
+               candidateRepresentations[activeWorkspace.id] == nil
+            {
+                candidateRepresentations[activeWorkspace.id] = WorkspaceCandidateRepresentation(
+                    workspace: activeWorkspace,
+                    targetWindow: window
+                )
             }
-        }
-        for workspace in receivingWindow.workspaceManager.workspaces {
-            recordCandidate(workspace, sourceOrder: liveWindows.count)
         }
 
         let candidates = candidateRepresentations.values.map(\.workspace)
@@ -120,15 +117,16 @@ final class AppDeepLinkRouter {
             in: candidates,
             admittingEphemeral: admitsEphemeral
         ),
-            let targetWindow = liveWindows.first(where: {
-                $0.workspaceManager.activeWorkspaceID == winner.id
-            })
+            let winningRepresentation = candidateRepresentations[winner.id]
         else {
             receivingWindow.enqueueCommand(command)
             return
         }
 
-        targetWindow.enqueueCommand(command, resolvedFolderWorkspaceID: winner.id)
+        winningRepresentation.targetWindow.enqueueCommand(
+            command,
+            resolvedFolderWorkspaceID: winner.id
+        )
     }
 
     private func legacyTargetWindow(for url: URL) -> WindowState? {
