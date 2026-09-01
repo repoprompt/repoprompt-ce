@@ -17,8 +17,16 @@ enum ACPPromptContentBuilder {
         text: String,
         attachments: [AgentImageAttachment]
     ) throws -> [[String: Any]] {
+        try blocks(text: text, attachments: attachments, transientImages: [])
+    }
+
+    static func blocks(
+        text: String,
+        attachments: [AgentImageAttachment],
+        transientImages: [AITransientImage]
+    ) throws -> [[String: Any]] {
         var blocks: [[String: Any]] = []
-        if !text.isEmpty || attachments.isEmpty {
+        if !text.isEmpty || attachments.isEmpty && transientImages.isEmpty {
             blocks.append([
                 "type": "text",
                 "text": text
@@ -29,6 +37,19 @@ enum ACPPromptContentBuilder {
             if let block = try imageBlock(for: attachment) {
                 blocks.append(block)
             }
+        }
+        for image in transientImages {
+            if let title = image.normalizedTitle {
+                blocks.append([
+                    "type": "text",
+                    "text": "Image title: \(title)"
+                ])
+            }
+            blocks.append([
+                "type": "image",
+                "mimeType": image.mediaType.rawValue,
+                "data": image.base64Payload
+            ])
         }
 
         return blocks

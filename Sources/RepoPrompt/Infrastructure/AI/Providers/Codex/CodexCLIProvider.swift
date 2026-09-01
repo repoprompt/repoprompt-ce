@@ -6,6 +6,65 @@ final class CodexCLIProvider: AIProvider {
         let emittedOutput: Bool
     }
 
+    private struct TransientImageLease {
+        let directory: URL
+        let attachments: [AgentImageAttachment]
+
+        static func stage(_ images: [AITransientImage]) async throws -> Self? {
+            guard !images.isEmpty else { return nil }
+            try Task.checkCancellation()
+            let task = Task.detached(priority: .userInitiated) {
+                let directory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("RepoPromptOracleImages-\(UUID().uuidString)", isDirectory: true)
+                do {
+                    try FileManager.default.createDirectory(
+                        at: directory,
+                        withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700]
+                    )
+                    var attachments: [AgentImageAttachment] = []
+                    for (index, image) in images.enumerated() {
+                        try Task.checkCancellation()
+                        let url = directory.appendingPathComponent(
+                            "image-\(index).\(image.preferredFileExtension)",
+                            isDirectory: false
+                        )
+                        try image.bytes.write(to: url, options: .withoutOverwriting)
+                        try FileManager.default.setAttributes(
+                            [.posixPermissions: 0o600],
+                            ofItemAtPath: url.path
+                        )
+                        attachments.append(
+                            AgentImageAttachment(source: .localFile(path: url.path), title: image.normalizedTitle)
+                        )
+                    }
+                    return Self(directory: directory, attachments: attachments)
+                } catch {
+                    try? FileManager.default.removeItem(at: directory)
+                    throw error
+                }
+            }
+
+            do {
+                return try await withTaskCancellationHandler {
+                    try await task.value
+                } onCancel: {
+                    task.cancel()
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Codex could not securely stage Oracle image input in temporary storage."
+                )
+            }
+        }
+
+        func cleanup() {
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
     private struct ReconciledTerminalTurn: Equatable {
         let turnID: String
         let status: CodexNativeSessionController.TurnStatus
@@ -129,9 +188,25 @@ final class CodexCLIProvider: AIProvider {
         _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
     }
 
+    #if DEBUG
+        static func test_withStagedTransientImages(
+            _ images: [AITransientImage],
+            inspect: ([AgentImageAttachment]) throws -> Void
+        ) async throws {
+            let lease = try await TransientImageLease.stage(images)
+            defer { lease?.cleanup() }
+            try inspect(lease?.attachments ?? [])
+        }
+
+        func test_registerActiveStreamTask(_ task: Task<Void, Never>, id: UUID) {
+            registerActiveStreamTask(task, id: id)
+        }
+    #endif
+
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let baseInstructions = buildBaseInstructions(from: aiMessage)
-        let prompt = buildPrompt(from: aiMessage)
+        let transientImages = aiMessage.transientImages
+        let prompt = promptAppendingImageTitles(buildPrompt(from: aiMessage), images: transientImages)
         let requestedModelIdentifier = modelIdentifier(for: model)
         let fallbackReasoningEffort = model.defaultReasoningEffort
         let serviceTier = model.codexServiceTier
@@ -149,9 +224,12 @@ final class CodexCLIProvider: AIProvider {
                 }
 
                 do {
+                    let imageLease = try await TransientImageLease.stage(transientImages)
+                    defer { imageLease?.cleanup() }
                     try await streamViaAppServer(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
+                        images: imageLease?.attachments ?? [],
                         requestedModelIdentifier: requestedModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
@@ -212,10 +290,13 @@ final class CodexCLIProvider: AIProvider {
     }
 
     func dispose() async {
-        cancelActiveStreamTasks()
+        let activeTasks = cancelAndRemoveActiveStreamTasks()
         let activeClients = snapshotActiveRequestClients()
         for client in activeClients {
             await client.stop()
+        }
+        for task in activeTasks {
+            await task.value
         }
     }
 
@@ -304,6 +385,7 @@ final class CodexCLIProvider: AIProvider {
     private func streamViaAppServer(
         baseInstructions: String,
         prompt: String,
+        images: [AgentImageAttachment],
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
@@ -328,6 +410,7 @@ final class CodexCLIProvider: AIProvider {
                     try await runSingleStreamAttempt(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
+                        images: images,
                         requestedModelIdentifier: activeModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
@@ -423,6 +506,7 @@ final class CodexCLIProvider: AIProvider {
     private func runSingleStreamAttempt(
         baseInstructions: String,
         prompt: String,
+        images: [AgentImageAttachment],
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
@@ -464,7 +548,7 @@ final class CodexCLIProvider: AIProvider {
                 )
                 let turnReceipt = try await controller.startUserTurn(
                     text: prompt,
-                    images: [],
+                    images: images,
                     model: selection.model,
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
@@ -1022,6 +1106,14 @@ final class CodexCLIProvider: AIProvider {
         aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private func promptAppendingImageTitles(_ prompt: String, images: [AITransientImage]) -> String {
+        let titles = images.compactMap { image in
+            image.normalizedTitle.map { "Image title: \($0)" }
+        }
+        guard !titles.isEmpty else { return prompt }
+        return ([prompt] + titles).filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
     private func buildPrompt(from aiMessage: AIMessage) -> String {
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         var conversation = ""
@@ -1203,12 +1295,13 @@ final class CodexCLIProvider: AIProvider {
         activeStreamTasksLock.unlock()
     }
 
-    private func cancelActiveStreamTasks() {
+    private func cancelAndRemoveActiveStreamTasks() -> [Task<Void, Never>] {
         activeStreamTasksLock.lock()
         let tasks = Array(activeStreamTasks.values)
         activeStreamTasks.removeAll()
         activeStreamTasksLock.unlock()
         tasks.forEach { $0.cancel() }
+        return tasks
     }
 
     private func registerActiveRequestClient(_ client: CodexAppServerClient, id: UUID) {

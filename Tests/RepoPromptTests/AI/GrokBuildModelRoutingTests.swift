@@ -82,6 +82,66 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
     }
 
+    func testOneShotTextPromptKeepsPromptFileArguments() throws {
+        let arguments = try GrokBuildOneShotHeadlessAgentProvider.test_promptArguments(
+            for: AgentMessage(systemPrompt: "system", userMessage: "text"),
+            promptFilePath: "/tmp/prompt.txt"
+        )
+
+        XCTAssertEqual(Array(arguments.prefix(2)), ["--prompt-file", "/tmp/prompt.txt"])
+        XCTAssertFalse(arguments.contains("--prompt-json"))
+    }
+
+    func testOneShotImagePromptUsesACPShapedPromptJSON() throws {
+        let message = AgentMessage(
+            systemPrompt: "system",
+            userMessage: "inspect",
+            transientImages: [
+                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Diagram")
+            ]
+        )
+        let arguments = try GrokBuildOneShotHeadlessAgentProvider.test_promptArguments(
+            for: message,
+            promptFilePath: "/tmp/prompt.txt"
+        )
+        let jsonIndex = try XCTUnwrap(arguments.firstIndex(of: "--prompt-json"))
+        let json = arguments[jsonIndex + 1]
+        let blocks = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]]
+        )
+
+        XCTAssertFalse(arguments.contains("--prompt-file"))
+        XCTAssertEqual(blocks.first?["type"] as? String, "text")
+        XCTAssertEqual(blocks.first?["text"] as? String, "system\n\ninspect")
+        XCTAssertEqual(blocks.last?["type"] as? String, "image")
+        XCTAssertEqual(blocks.last?["mimeType"] as? String, "image/png")
+        XCTAssertEqual(blocks.last?["data"] as? String, "AQID")
+    }
+
+    func testOneShotImagePromptRejectsUnsafeArgvSize() {
+        let message = AgentMessage(
+            userMessage: "inspect",
+            transientImages: [
+                .init(
+                    bytes: Data(count: GrokBuildOneShotHeadlessAgentProvider.test_promptJSONArgumentByteLimit),
+                    mediaType: .png,
+                    title: nil
+                )
+            ]
+        )
+
+        XCTAssertThrowsError(try GrokBuildOneShotHeadlessAgentProvider.test_promptArguments(
+            for: message,
+            promptFilePath: "/tmp/prompt.txt"
+        )) { error in
+            guard case let AIProviderError.invalidConfiguration(detail) = error else {
+                return XCTFail("Expected actionable provider configuration error, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("safe macOS command-line launch"))
+            XCTAssertTrue(detail.contains("Reduce the number or size of attached images"))
+        }
+    }
+
     func testNonAgentAdapterMapsNonSuccessfulStopsToIncomplete() {
         let incompleteStopReasons = [
             "max_tokens",
