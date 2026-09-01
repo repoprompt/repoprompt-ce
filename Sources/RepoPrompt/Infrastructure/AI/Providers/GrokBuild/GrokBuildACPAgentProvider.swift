@@ -84,7 +84,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
-        // Grok Build 1.0.3 advertises promptCapabilities.image = false over ACP, so v1 is
+        // Grok Build 1.0.5 advertises promptCapabilities.image = false over ACP, so v1 is
         // text-only: reject attachments explicitly instead of silently dropping them.
         guard request.attachments.isEmpty else {
             throw AIProviderError.invalidConfiguration(

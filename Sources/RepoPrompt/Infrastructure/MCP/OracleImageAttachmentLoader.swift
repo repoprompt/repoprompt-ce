@@ -539,16 +539,25 @@ struct OracleImageAttachmentLoader {
 
 enum OracleImageRouteAdmission {
     static func supports(_ model: AIModel) -> Bool {
-        switch model {
-        case .claude45Haiku,
-             .claude4Sonnet,
-             .claude4SonnetThinking,
-             .claude4SonnetThinkingMax,
-             .claude4Opus,
-             .claude4OpusThinking:
+        switch model.providerType {
+        case .anthropic,
+             .openAI,
+             .ollama,
+             .azure,
+             .openRouter,
+             .gemini,
+             .deepseek,
+             .customProvider,
+             .fireworks,
+             .grok,
+             .groq,
+             .zAI,
+             .claudeCode,
+             .codex,
+             .openCode,
+             .cursor,
+             .grokBuild:
             true
-        default:
-            false
         }
     }
 }
