@@ -1,6 +1,20 @@
 import Foundation
 import SwiftOpenAI
 
+enum AIImageMediaType: String, Equatable {
+    case png = "image/png"
+    case jpeg = "image/jpeg"
+    case gif = "image/gif"
+    case webp = "image/webp"
+}
+
+/// Request-scoped Oracle image data. Deliberately non-Codable and path-free.
+struct AITransientImage: Equatable {
+    let bytes: Data
+    let mediaType: AIImageMediaType
+    let title: String?
+}
+
 /// A single conversation entry
 struct ConversationEntry {
     enum Role {
@@ -31,6 +45,9 @@ struct AIMessage {
 
     /// NEW: Full conversation array, user + AI in order
     let conversationMessages: [ConversationEntry]
+
+    /// Request-scoped provider payload. Never copied into persisted chat messages.
+    let transientImages: [AITransientImage]
 
     let temperature: Double?
 
@@ -118,6 +135,7 @@ struct AIMessage {
         fileBlocks: [String] = [],
         gitDiff: String? = nil,
         conversationMessages: [ConversationEntry] = [],
+        transientImages: [AITransientImage] = [],
         temperature: Double?,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
@@ -129,6 +147,7 @@ struct AIMessage {
         self.fileBlocks = fileBlocks
         self.gitDiff = gitDiff
         self.conversationMessages = conversationMessages
+        self.transientImages = transientImages
         self.temperature = temperature
         self.promptSectionsOrder = promptSectionsOrder
         self.disabledPromptSections = disabledPromptSections
@@ -148,10 +167,27 @@ struct AIMessage {
         conversationMessages = [
             ConversationEntry(role: .user, content: userMessage)
         ]
+        transientImages = []
         // Use library defaults for prompt ordering
         promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder
         disabledPromptSections = []
         duplicateUserInstructionsAtTop = false
+    }
+
+    func replacingTransientImages(_ images: [AITransientImage]) -> AIMessage {
+        AIMessage(
+            systemPrompt: systemPrompt,
+            metaPrompts: metaPrompts,
+            fileTree: fileTree,
+            fileBlocks: fileBlocks,
+            gitDiff: gitDiff,
+            conversationMessages: conversationMessages,
+            transientImages: images,
+            temperature: temperature,
+            promptSectionsOrder: promptSectionsOrder,
+            disabledPromptSections: disabledPromptSections,
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
+        )
     }
 
     /// Builds the text block that must be *prepended* to the **final** user
