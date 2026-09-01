@@ -307,6 +307,10 @@ public class APISettingsViewModel: ObservableObject {
     @Published var grokBuildError: String? = nil
     @Published private(set) var availableGrokBuildModelOptions: [AgentModelOption] = []
     private var grokBuildLogCollector: CLIProcessLogCollector?
+    // Oh My Pi CLI / ACP
+    @Published var isOMPConnected: Bool = UserDefaults.standard.bool(forKey: "OMPCLIConnected")
+    @Published var ompError: String? = nil
+    private var ompLogCollector: CLIProcessLogCollector?
 
     /// CLI connection flags are persisted configuration hints, not proof that the provider is
     /// usable in the current process. Context Builder restoration waits for this validation pass
@@ -389,6 +393,7 @@ public class APISettingsViewModel: ObservableObject {
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
             grokBuildAvailable: isGrokBuildConnected,
+            ompAvailable: isOMPConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -420,6 +425,7 @@ public class APISettingsViewModel: ObservableObject {
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
             $isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isOMPConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
@@ -441,6 +447,7 @@ public class APISettingsViewModel: ObservableObject {
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
             grokBuildAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokBuildConnected,
+            ompAvailable: isVerifiedContextBuilderProvider(.omp) && isOMPConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -496,6 +503,8 @@ public class APISettingsViewModel: ObservableObject {
             isCursorConnected
         case .grokBuild:
             isGrokBuildConnected
+        case .omp:
+            isOMPConnected
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -544,7 +553,8 @@ public class APISettingsViewModel: ObservableObject {
             NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
             NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
             NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
-            NotificationCenter.default.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild }
+            NotificationCenter.default.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild },
+            NotificationCenter.default.publisher(for: .ompConnectionChanged).map { _ in AgentProviderKind.omp }
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] provider in
@@ -598,6 +608,7 @@ public class APISettingsViewModel: ObservableObject {
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
         isGrokBuildConnected = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
+        isOMPConnected = UserDefaults.standard.bool(forKey: "OMPCLIConnected")
         if wasGrokBuildConnected != isGrokBuildConnected {
             if isGrokBuildConnected {
                 startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
@@ -1220,6 +1231,7 @@ public class APISettingsViewModel: ObservableObject {
         let shouldValidateOpenCode = isOpenCodeConnected
         let shouldValidateCursor = isCursorConnected
         let shouldValidateGrokBuild = isGrokBuildConnected
+        let shouldValidateOMP = isOMPConnected
 
         let task = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
@@ -1232,7 +1244,8 @@ public class APISettingsViewModel: ObservableObject {
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
             async let grokBuildReady = probeCachedGrokBuildConnection(ifNeeded: shouldValidateGrokBuild)
-            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokBuildReady)
+            async let ompReady = probeCachedOMPConnection(ifNeeded: shouldValidateOMP)
+            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokBuildReady, ompReady)
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
@@ -1244,6 +1257,7 @@ public class APISettingsViewModel: ObservableObject {
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
             applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
             applyContextBuilderProviderValidationResult(readiness.4, provider: .grokBuild)
+            applyContextBuilderProviderValidationResult(readiness.5, provider: .omp)
             if codexPublicationAllowed,
                isCodexConnected,
                isVerifiedContextBuilderProvider(.codexExec)
@@ -1349,6 +1363,15 @@ public class APISettingsViewModel: ObservableObject {
             return true
         }
         return await GrokBuildACPModelPollingService.shared.refreshNow(workspacePath: nil)
+    }
+
+    private func probeCachedOMPConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        do {
+            return try await OMPACPLaunchResolver().probeSupport(for: OMPAgentConfig()) == .supported
+        } catch {
+            return false
+        }
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -3719,6 +3742,104 @@ public class APISettingsViewModel: ObservableObject {
         if clearModels {
             availableCursorModelOptions = []
         }
+    }
+
+    // MARK: - Oh My Pi CLI / ACP
+
+    func testOMPConnection() async throws -> Bool {
+        let collector = CLIProcessLogCollector()
+        collector.append("Oh My Pi CLI connection test started")
+        ompLogCollector = collector
+
+        collector.append("Refreshing login-shell environment cache")
+        await CLIEnvironmentCache.shared.invalidate()
+
+        do {
+            let support = try await OMPACPLaunchResolver().probeSupport(for: OMPAgentConfig())
+            guard support == .supported else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: support.reason ?? "Installed Oh My Pi CLI does not support ACP mode."
+                )
+            }
+            isOMPConnected = true
+            setContextBuilderProviderVerified(.omp, verified: true)
+            ompError = nil
+            UserDefaults.standard.set(true, forKey: "OMPCLIConnected")
+            await updateAvailableModels()
+            collector.append("Oh My Pi CLI marked as connected")
+            ompLogCollector = nil
+            NotificationCenter.default.post(
+                name: .ompConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            return true
+        } catch {
+            collector.append("Connection test threw error: \(error.localizedDescription)")
+            isOMPConnected = false
+            setContextBuilderProviderVerified(.omp, verified: false)
+            ompError = friendlyOMPMessage(for: error)
+            UserDefaults.standard.set(false, forKey: "OMPCLIConnected")
+            await updateAvailableModels()
+            collector.append("User guidance: \(ompError ?? error.localizedDescription)")
+            NotificationCenter.default.post(
+                name: .ompConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            throw error
+        }
+    }
+
+    func disconnectOMP() {
+        isOMPConnected = false
+        setContextBuilderProviderVerified(.omp, verified: false)
+        ompError = nil
+        UserDefaults.standard.set(false, forKey: "OMPCLIConnected")
+        Task {
+            await updateAvailableModels()
+        }
+        NotificationCenter.default.post(
+            name: .ompConnectionChanged,
+            object: nil,
+            userInfo: ["windowID": 0]
+        )
+    }
+
+    private func friendlyOMPMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError,
+           case let .invalidConfiguration(detail) = providerError
+        {
+            return detail
+        }
+        let message = error.localizedDescription
+        let lowered = message.lowercased()
+        if lowered.contains("not installed") || lowered.contains("not found") || lowered.contains("no such file") {
+            return "Oh My Pi CLI was not found. Install it and ensure `omp acp` is available."
+        }
+        if lowered.contains("permission denied") {
+            return "Permission denied. Ensure the `omp` executable is accessible."
+        }
+        return message
+    }
+
+    func hasOMPTrace() -> Bool {
+        ompLogCollector?.isEmpty == false
+    }
+
+    func dumpOMPTrace() throws -> URL {
+        guard let collector = ompLogCollector else {
+            throw CLIProcessLogCollectorError.noEntries
+        }
+        collector.append("Exporting trace to Downloads folder")
+        let exportDate = Date()
+        let url = try collector.writeMarkdownToDownloads(
+            baseFilename: "RepoPrompt-OMPTrace",
+            title: "Oh My Pi CLI Connection Trace",
+            timestamp: exportDate
+        )
+        collector.append("Trace exported to \(url.lastPathComponent)")
+        return url
     }
 
     // MARK: - Grok Build CLI / ACP

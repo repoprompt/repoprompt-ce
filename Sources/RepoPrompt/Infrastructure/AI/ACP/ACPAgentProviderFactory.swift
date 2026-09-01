@@ -33,6 +33,12 @@ enum ACPAgentProviderFactory {
                     modelString: modelString
                 )
             )
+        case .omp:
+            OMPACPAgentProvider(
+                config: OMPAgentConfig(
+                    enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging
+                )
+            )
         case .grokBuild:
             try await GrokBuildACPAgentProvider(
                 config: GrokBuildAgentConfig(
