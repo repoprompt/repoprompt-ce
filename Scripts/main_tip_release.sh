@@ -653,6 +653,7 @@ PYTHON
 
 publish_tip() {
     require_env TIP_GH_TOKEN
+    require_env TIP_SOURCE_GH_TOKEN
     require_env TIP_SOURCE_REPOSITORY
     require_env TIP_SOURCE_BRANCH
     require_file "$PUBLISH_TIP_RELEASE"
@@ -663,6 +664,7 @@ publish_tip() {
     esac
     validate_tip_publish_assets
     TIP_GH_TOKEN="$TIP_GH_TOKEN" \
+    TIP_SOURCE_GH_TOKEN="$TIP_SOURCE_GH_TOKEN" \
     TIP_UPDATE_REPOSITORY="$TIP_UPDATE_REPOSITORY" \
     TIP_SOURCE_REPOSITORY="$TIP_SOURCE_REPOSITORY" \
     TIP_SOURCE_BRANCH="$TIP_SOURCE_BRANCH" \

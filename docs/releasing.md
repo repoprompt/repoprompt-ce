@@ -262,9 +262,11 @@ There is deliberately no commit input. For a manual dispatch, GitHub's selected 
 `github.sha` are the immutable candidate. Setup fetches protected `origin/main` and requires the
 candidate commit, workflow-definition commit, and checked-out release tooling to be that exact live
 commit. A stale browser tab therefore cannot publish an older main commit merely because somebody
-pasted a convincing SHA into a text box. The protected role-aware credential preflight runs before
-the secret-free build and uses an isolated ephemeral keychain without changing the runner user's
-keychain search list.
+pasted a convincing SHA into a text box. Before the secret-free build, the protected role-aware
+credential preflight runs the same authenticated protected-main verifier used at publication
+mutation boundaries. Source reads use the workflow's source-repository token; the separate Tip
+updater token is reserved for updater-repository reads and writes. The signing preflight uses an
+isolated ephemeral keychain without changing the runner user's keychain search list.
 
 After P is reviewed, advance `tip-rollout.json` with its exact `identity-rollout.json` digest before
 merging T; advance it again with T and P digests before merging S. Each published role uses an

@@ -18,6 +18,8 @@ ROOT_DIR = SCRIPT_DIR.parent
 PUBLISHER = SCRIPT_DIR / "publish_tip_release.sh"
 ROLLOUT_TOOL = SCRIPT_DIR / "stable_rollout.py"
 POLICY = SCRIPT_DIR / "apple_identity_policy.json"
+WORKFLOW = ROOT_DIR / ".github" / "workflows" / "main-tip.yml"
+TIP_ORCHESTRATOR = SCRIPT_DIR / "main_tip_release.sh"
 
 COMMIT = "a" * 40
 TAG = "tip-aaaaaaaaaaaa"
@@ -148,7 +150,17 @@ url = urls[-1]
 status = "200"
 
 if url.endswith("/commits/main"):
-    output.write_text(json.dumps({"sha": os.environ["TIP_COMMIT"]}), encoding="utf-8")
+    expected = f"Authorization: Bearer {os.environ['PUBLISHER_EXPECTED_SOURCE_TOKEN']}"
+    authenticated = expected in args
+    state.setdefault("source_lookup_auth", []).append(authenticated)
+    Path(os.environ["PUBLISHER_STUB_STATE"]).write_text(
+        json.dumps(state, indent=2) + "\n", encoding="utf-8"
+    )
+    if authenticated:
+        output.write_text(json.dumps({"sha": os.environ["TIP_COMMIT"]}), encoding="utf-8")
+    else:
+        output.write_text(json.dumps({"message": "fixture authorization denied"}), encoding="utf-8")
+        status = "403"
 elif url == os.environ["PUBLISHER_STABLE_FEED_URL"]:
     shutil.copyfile(os.environ["PUBLISHER_STABLE_APPCAST"], output)
 elif url.endswith("/releases/latest"):
@@ -309,7 +321,13 @@ class PublishTipReleaseTests(unittest.TestCase):
         release["assets"] = records
         return release
 
-    def _run(self, scenario: str, release: dict[str, object] | None) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        scenario: str,
+        release: dict[str, object] | None,
+        *,
+        source_token: str | None = "fixture-source-token",
+    ) -> subprocess.CompletedProcess[str]:
         self.state_path.write_text(
             json.dumps(
                 {
@@ -317,6 +335,7 @@ class PublishTipReleaseTests(unittest.TestCase):
                     "release": release,
                     "lookup_args": [],
                     "mutations": [],
+                    "source_lookup_auth": [],
                 },
                 indent=2,
             )
@@ -332,7 +351,8 @@ class PublishTipReleaseTests(unittest.TestCase):
                 "PUBLISHER_ASSET_DIR": str(self.asset_dir),
                 "PUBLISHER_STABLE_APPCAST": str(self.stable_appcast),
                 "PUBLISHER_STABLE_FEED_URL": policy["sparkle"]["stableFeedURL"],
-                "TIP_GH_TOKEN": "fixture-token",
+                "TIP_GH_TOKEN": "fixture-update-token",
+                "PUBLISHER_EXPECTED_SOURCE_TOKEN": "fixture-source-token",
                 "TIP_UPDATE_REPOSITORY": UPDATE_REPOSITORY,
                 "TIP_SOURCE_REPOSITORY": SOURCE_REPOSITORY,
                 "TIP_SOURCE_BRANCH": "main",
@@ -347,6 +367,10 @@ class PublishTipReleaseTests(unittest.TestCase):
                 "TIP_RELEASE_NOTES": NOTES,
             }
         )
+        if source_token is None:
+            environment.pop("TIP_SOURCE_GH_TOKEN", None)
+        else:
+            environment["TIP_SOURCE_GH_TOKEN"] = source_token
         return subprocess.run(
             [
                 "bash",
@@ -379,6 +403,8 @@ class PublishTipReleaseTests(unittest.TestCase):
         self.assertIn("was already public and is byte-exact", result.stdout)
         state = self._state()
         self.assertEqual(state["mutations"], [])
+        self.assertTrue(state["source_lookup_auth"])
+        self.assertTrue(all(state["source_lookup_auth"]))
         self.assert_compatible_lookup(state)
 
     def test_absent_release_creates_empty_draft_then_reobserves_and_publishes(self) -> None:
@@ -402,6 +428,42 @@ class PublishTipReleaseTests(unittest.TestCase):
         state = self._state()
         self.assertEqual(state["mutations"], [])
         self.assert_compatible_lookup(state)
+
+    def test_missing_source_token_fails_before_remote_lookup_or_mutation(self) -> None:
+        result = self._run("absent", None, source_token=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Missing required environment variable: TIP_SOURCE_GH_TOKEN", result.stderr)
+        state = self._state()
+        self.assertEqual(state["source_lookup_auth"], [])
+        self.assertEqual(state["mutations"], [])
+
+    def test_rejected_source_token_reports_github_error_before_mutation(self) -> None:
+        result = self._run("absent", None, source_token="wrong-source-token")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Protected-main lookup failed with HTTP 403: fixture authorization denied",
+            result.stderr,
+        )
+        state = self._state()
+        self.assertEqual(state["source_lookup_auth"], [False])
+        self.assertEqual(state["mutations"], [])
+
+    def test_workflow_preflight_and_publisher_share_source_authority_contract(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        credential_preflight = workflow.split("\n  credential-preflight:", 1)[1].split(
+            "\n  stage:", 1
+        )[0]
+        publish = workflow.split("\n  publish:", 1)[1]
+        for section in (credential_preflight, publish):
+            self.assertIn("TIP_SOURCE_GH_TOKEN: ${{ github.token }}", section)
+        self.assertIn(
+            './trusted-control-plane/Scripts/verify_tip_source_commit.sh "credential preflight"',
+            credential_preflight,
+        )
+
+        orchestrator = TIP_ORCHESTRATOR.read_text(encoding="utf-8")
+        self.assertIn("require_env TIP_SOURCE_GH_TOKEN", orchestrator)
+        self.assertIn('TIP_SOURCE_GH_TOKEN="$TIP_SOURCE_GH_TOKEN"', orchestrator)
 
     def test_duplicate_tag_across_pages_fails_closed_without_mutation(self) -> None:
         result = self._run("duplicate", self._release())

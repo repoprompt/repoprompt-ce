@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROLLOUT_TOOL="$SCRIPT_DIR/stable_rollout.py"
 APPLE_IDENTITY_POLICY="$SCRIPT_DIR/apple_identity_policy.json"
+SOURCE_COMMIT_VERIFIER="$SCRIPT_DIR/verify_tip_source_commit.sh"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 require_env() { [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"; }
@@ -15,7 +16,7 @@ require_command() { command -v "$1" >/dev/null 2>&1 || fail "Missing required co
 require_file() { [[ -f "$1" && ! -L "$1" ]] || fail "Missing regular non-symlink file: $1"; }
 
 for name in \
-    TIP_GH_TOKEN TIP_UPDATE_REPOSITORY TIP_SOURCE_REPOSITORY TIP_SOURCE_BRANCH \
+    TIP_GH_TOKEN TIP_SOURCE_GH_TOKEN TIP_UPDATE_REPOSITORY TIP_SOURCE_REPOSITORY TIP_SOURCE_BRANCH \
     TIP_COMMIT TIP_TAG TIP_BUILD_NUMBER TIP_PUBLISH_INSTALLATION_TYPE \
     TIP_EXPECTED_ROLLOUT_ROLE TIP_EXPECTED_SIGNING_IDENTITY \
     TIP_EXPECTED_MIGRATION_PHASE TIP_RELEASE_TITLE TIP_RELEASE_NOTES; do
@@ -24,6 +25,7 @@ done
 for command in curl gh python3 shasum; do require_command "$command"; done
 require_file "$ROLLOUT_TOOL"
 require_file "$APPLE_IDENTITY_POLICY"
+require_file "$SOURCE_COMMIT_VERIFIER"
 
 [[ "$TIP_SOURCE_BRANCH" == "main" ]] || fail "Tip publication source branch must remain main"
 [[ "$TIP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "TIP_COMMIT must be a full lowercase Git SHA"
@@ -199,24 +201,8 @@ fetch_json_status() {
     printf '%s\n' "$status"
 }
 
-fetch_live_main() {
-    local response="$TMP_DIR/live-main.json" status
-    status="$(fetch_json_status \
-        "https://api.github.com/repos/$TIP_SOURCE_REPOSITORY/commits/$TIP_SOURCE_BRANCH" \
-        "$response")"
-    [[ "$status" == "200" ]] || fail "Protected-main lookup failed with HTTP $status"
-    python3 - "$response" <<'PY'
-import json, sys
-print(json.load(open(sys.argv[1], encoding="utf-8")).get("sha", ""))
-PY
-}
-
 require_live_main() {
-    local phase="$1" live_main
-    live_main="$(fetch_live_main)"
-    [[ "$live_main" =~ ^[0-9a-f]{40}$ ]] || fail "$phase did not resolve a full live-main SHA"
-    [[ "$live_main" == "$TIP_COMMIT" ]] ||
-        fail "$phase rejected stale Tip candidate: candidate=$TIP_COMMIT live-main=$live_main"
+    "$SOURCE_COMMIT_VERIFIER" "$1"
 }
 
 LIVE_AUDIT_INDEX=0
