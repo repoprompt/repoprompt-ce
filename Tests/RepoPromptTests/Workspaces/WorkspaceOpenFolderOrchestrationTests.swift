@@ -53,14 +53,41 @@ import XCTest
             XCTAssertFalse(activeWorkspace.isEphemeral)
         }
 
-        func testReopeningExistingWorkspaceKeepsInventoryStable() async throws {
+        func testReopeningExistingWorkspacePreservesStateAndInventory() async throws {
             let manager = makeManager()
             await manager.awaitInitialized()
             let folder = try makeFolder(named: "ExistingProject")
-            let existing = manager.createWorkspace(
-                name: "Existing Project",
-                repoPaths: [folder.path]
+            let selectedFile = folder.appendingPathComponent("README.md").path
+            let preservedTab = ComposeTabState(
+                name: "Review",
+                selection: StoredSelection(selectedPaths: [selectedFile]),
+                promptText: "Preserve this prompt"
             )
+            let secondaryTab = ComposeTabState(name: "Follow-up", promptText: "Second tab")
+            let preset = WorkspacePreset(
+                name: "Review preset",
+                selectedFilePaths: [selectedFile]
+            )
+            let copyPresetID = UUID()
+            let existing = WorkspaceModel(
+                name: "Existing Project",
+                repoPaths: [folder.path],
+                presets: [preset],
+                activePresetID: preset.id,
+                currentPromptText: preservedTab.promptText,
+                copyPresetId: copyPresetID,
+                composeTabs: [preservedTab, secondaryTab],
+                activeComposeTabID: preservedTab.id
+            )
+            let workspaceFile = try manager.saveWorkspaceToFile(existing)
+            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceFile)
+            manager.workspaces.append(WorkspaceModel(
+                id: existing.id,
+                dateModified: existing.dateModified,
+                name: existing.name,
+                repoPaths: existing.repoPaths
+            ))
+            XCTAssertNotEqual(manager.activeWorkspaceID, existing.id)
             let countBeforeOpen = manager.workspaces.count
             let normalizedVariant = URL(
                 fileURLWithPath: folder.path + "/../ExistingProject/"
@@ -71,8 +98,17 @@ import XCTest
                 behavior: .createNewWorkspace
             )
 
-            XCTAssertEqual(manager.activeWorkspaceID, existing.id)
+            let reopened = try XCTUnwrap(manager.activeWorkspace)
+            XCTAssertEqual(reopened.id, existing.id)
             XCTAssertEqual(manager.workspaces.count, countBeforeOpen)
+            XCTAssertEqual(reopened.composeTabs, [preservedTab, secondaryTab])
+            XCTAssertEqual(reopened.activeComposeTabID, preservedTab.id)
+            XCTAssertEqual(reopened.composeTabs.first?.selection.selectedPaths, [selectedFile])
+            XCTAssertEqual(reopened.composeTabs.first?.promptText, "Preserve this prompt")
+            XCTAssertEqual(reopened.currentPromptText, "Preserve this prompt")
+            XCTAssertEqual(reopened.presets, [preset])
+            XCTAssertEqual(reopened.activePresetID, preset.id)
+            XCTAssertEqual(reopened.copyPresetId, copyPresetID)
         }
 
         func testActiveMatchedWorkspaceIsSilentNoOp() async throws {

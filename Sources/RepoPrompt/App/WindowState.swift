@@ -283,8 +283,13 @@ class WindowState: ObservableObject {
         case unspecified
     }
 
+    private struct QueuedAppCommand {
+        let command: AppCommand
+        let resolvedFolderWorkspaceID: UUID?
+    }
+
     /// Command queue to store all pending commands
-    private var commandQueue: [AppCommand] = []
+    private var commandQueue: [QueuedAppCommand] = []
 
     /// Lazily scheduled task to coalesce window title updates outside of mutation scopes.
     private var pendingWindowTitleUpdateTask: Task<Void, Never>?
@@ -1166,8 +1171,11 @@ class WindowState: ObservableObject {
         return (decoded as NSString).expandingTildeInPath
     }
 
-    func enqueueCommand(_ command: AppCommand) {
-        commandQueue.append(command)
+    func enqueueCommand(_ command: AppCommand, resolvedFolderWorkspaceID: UUID? = nil) {
+        commandQueue.append(QueuedAppCommand(
+            command: command,
+            resolvedFolderWorkspaceID: resolvedFolderWorkspaceID
+        ))
         // If the workspace manager is already initialized, process now
         if workspaceManager.isInitialized {
             Task { await processCommands() }
@@ -1283,8 +1291,8 @@ class WindowState: ObservableObject {
 
     func processCommands() async {
         while !commandQueue.isEmpty {
-            let command = commandQueue.removeFirst()
-            await handleCommand(command)
+            let queuedCommand = commandQueue.removeFirst()
+            await handleCommand(queuedCommand)
         }
     }
 
@@ -1389,6 +1397,15 @@ class WindowState: ObservableObject {
 
     // MARK: - Handling URL commands
 
+    func decodeOpenCommand(from url: URL) -> AppCommand? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              AppDeepLinkURLScheme.isSupported(components.scheme)
+        else {
+            return nil
+        }
+        return decodeOpenCommand(from: components)
+    }
+
     func handleIncomingURL(_ url: URL) {
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
               AppDeepLinkURLScheme.isSupported(comps.scheme)
@@ -1435,71 +1452,71 @@ class WindowState: ObservableObject {
             return // ← we handled the prompt command
         }
 
-        // Require host == "open" to match canonical repoprompt-ce://open/~/MyProject links
-        guard let host = comps.host?.lowercased(), host == "open" else {
+        guard let command = decodeOpenCommand(from: comps) else {
             return
         }
+        enqueueCommand(command)
+    }
 
-        // Strip leading slash from comps.path if present
-        var rawFolderPath = comps.path
+    private func decodeOpenCommand(from components: URLComponents) -> AppCommand? {
+        guard components.host?.lowercased() == "open" else {
+            return nil
+        }
+
+        var rawFolderPath = components.path
         if rawFolderPath.hasPrefix("/") {
             rawFolderPath.removeFirst()
         }
         let folderPath = rawFolderPath.isEmpty ? nil : decodeAndExpandTilde(rawFolderPath)
 
-        // Extract workspaceName from ?workspace= param
-        let workspaceName = comps.queryItems?
+        let workspaceName = components.queryItems?
             .filter { $0.name == "workspace" }
             .compactMap { $0.value?.trimmingCharacters(in: .whitespaces) }
             .last
 
-        // Extract fileList from ?files= param(s)
-        let fileList: [String] = comps.queryItems?
+        let fileList: [String] = components.queryItems?
             .filter { $0.name == "files" }
             .compactMap(\.value)
             .flatMap { $0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) } }
             .map { decodeAndExpandTilde($0) }
             ?? []
 
-        // Concatenate multiple prompt= params with spaces
-        let promptParts = comps.queryItems?
+        let promptParts = components.queryItems?
             .filter { $0.name == "prompt" }
             .compactMap { $0.value?.removingPercentEncoding }
             ?? []
         let promptText = promptParts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         let finalPrompt = promptText.isEmpty ? nil : promptText
 
-        /// Parse focus, ephemeral, persist flags
         func boolFromQuery(_ name: String) -> Bool? {
-            guard let val = comps.queryItems?.first(where: { $0.name == name })?.value else {
+            guard let value = components.queryItems?.first(where: { $0.name == name })?.value else {
                 return nil
             }
-            let lower = val.lowercased()
-            if lower == "true" || lower == "1" { return true }
-            if lower == "false" || lower == "0" { return false }
-            return nil
+            switch value.lowercased() {
+            case "true", "1":
+                return true
+            case "false", "0":
+                return false
+            default:
+                return nil
+            }
         }
-        let focusFlag = boolFromQuery("focus")
-        let ephemeralFlag = boolFromQuery("ephemeral")
-        let persistFlag = boolFromQuery("persist")
 
-        // Build an AppCommand
-        let command = AppCommand(
+        return AppCommand(
             workspaceName: workspaceName,
             fileList: fileList,
             promptText: finalPrompt,
             folderPath: folderPath,
             newPrompt: nil,
-            focus: focusFlag,
-            ephemeral: ephemeralFlag,
-            persist: persistFlag
+            focus: boolFromQuery("focus"),
+            ephemeral: boolFromQuery("ephemeral"),
+            persist: boolFromQuery("persist")
         )
-
-        enqueueCommand(command)
     }
 
     @MainActor
-    private func handleCommand(_ command: AppCommand) async {
+    private func handleCommand(_ queuedCommand: QueuedAppCommand) async {
+        let command = queuedCommand.command
         // Determine ephemeral once at the start
         let shouldBeEphemeral = (command.ephemeral == true || command.persist == false)
         var requestedWorkspaceSwitch = false
@@ -1545,14 +1562,24 @@ class WindowState: ObservableObject {
                 return
             }
 
-            // Try to find the highest-ranked eligible workspace referencing this folder
-            if let existingWorkspace = WorkspaceFolderOpenResolver.bestEligibleMatch(
-                forFolderPath: folderURL.path,
-                in: workspaceManager.workspaces,
-                admittingEphemeral: shouldBeEphemeral
-            ) {
-                // If focus == true, bring forward another window already showing the winner.
-                if command.focus == true,
+            let existingWorkspace: WorkspaceModel?
+            if let resolvedWorkspaceID = queuedCommand.resolvedFolderWorkspaceID {
+                existingWorkspace = workspaceManager.workspace(withID: resolvedWorkspaceID)
+                guard existingWorkspace != nil else {
+                    return
+                }
+            } else {
+                existingWorkspace = WorkspaceFolderOpenResolver.bestEligibleMatch(
+                    forFolderPath: folderURL.path,
+                    in: workspaceManager.workspaces,
+                    admittingEphemeral: shouldBeEphemeral
+                )
+            }
+
+            if let existingWorkspace {
+                // Unrouted commands may still focus another window already showing the local winner.
+                if queuedCommand.resolvedFolderWorkspaceID == nil,
+                   command.focus == true,
                    let wsManager = windowStatesManager,
                    let existingWindow = wsManager.findWindowState(showing: existingWorkspace.id),
                    existingWindow !== self

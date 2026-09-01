@@ -3,6 +3,11 @@ import Foundation
 
 @MainActor
 final class AppDeepLinkRouter {
+    private struct WorkspaceCandidateRepresentation {
+        let workspace: WorkspaceModel
+        let sourceOrder: Int
+    }
+
     static let shared = AppDeepLinkRouter()
 
     private let windowStatesManager: WindowStatesManager
@@ -69,7 +74,61 @@ final class AppDeepLinkRouter {
             windowStatesManager.pendingURLs.append(url)
             return
         }
-        targetWindow.handleIncomingURL(url)
+        guard let command = targetWindow.decodeOpenCommand(from: url) else {
+            targetWindow.handleIncomingURL(url)
+            return
+        }
+        routeOpenCommand(command, receivingWindow: targetWindow)
+    }
+
+    private func routeOpenCommand(_ command: AppCommand, receivingWindow: WindowState) {
+        guard let folderPath = command.folderPath, !folderPath.isEmpty else {
+            receivingWindow.enqueueCommand(command)
+            return
+        }
+
+        let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+        var candidateRepresentations: [UUID: WorkspaceCandidateRepresentation] = [:]
+
+        func recordCandidate(_ workspace: WorkspaceModel, sourceOrder: Int) {
+            if let current = candidateRepresentations[workspace.id],
+               current.workspace.dateModified > workspace.dateModified
+               || current.workspace.dateModified == workspace.dateModified
+               && current.sourceOrder <= sourceOrder
+            {
+                return
+            }
+            candidateRepresentations[workspace.id] = WorkspaceCandidateRepresentation(
+                workspace: workspace,
+                sourceOrder: sourceOrder
+            )
+        }
+
+        for (sourceOrder, window) in liveWindows.enumerated() {
+            if let activeWorkspace = window.workspaceManager.activeWorkspace {
+                recordCandidate(activeWorkspace, sourceOrder: sourceOrder)
+            }
+        }
+        for workspace in receivingWindow.workspaceManager.workspaces {
+            recordCandidate(workspace, sourceOrder: liveWindows.count)
+        }
+
+        let candidates = candidateRepresentations.values.map(\.workspace)
+        let admitsEphemeral = command.ephemeral == true || command.persist == false
+        guard let winner = WorkspaceFolderOpenResolver.bestEligibleMatch(
+            forFolderPath: folderPath,
+            in: candidates,
+            admittingEphemeral: admitsEphemeral
+        ),
+            let targetWindow = liveWindows.first(where: {
+                $0.workspaceManager.activeWorkspaceID == winner.id
+            })
+        else {
+            receivingWindow.enqueueCommand(command)
+            return
+        }
+
+        targetWindow.enqueueCommand(command, resolvedFolderWorkspaceID: winner.id)
     }
 
     private func legacyTargetWindow(for url: URL) -> WindowState? {
