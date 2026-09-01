@@ -115,6 +115,33 @@ public struct AgentCodexGoalModeMetadata: Codable, Sendable, Equatable {
 
 // MARK: - Agent Chat Item
 
+enum AgentToolArgumentPersistencePolicy {
+    static func sanitizedArgsJSON(toolName: String?, argsJSON: String?) -> String? {
+        guard let argsJSON else { return nil }
+        guard normalizedToolName(toolName) == "ask_oracle" else { return argsJSON }
+        guard let data = argsJSON.data(using: .utf8),
+              var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        guard object.removeValue(forKey: "images") != nil else { return argsJSON }
+        guard JSONSerialization.isValidJSONObject(object),
+              let sanitized = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        else {
+            return nil
+        }
+        return String(data: sanitized, encoding: .utf8)
+    }
+
+    private static func normalizedToolName(_ toolName: String?) -> String? {
+        toolName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .components(separatedBy: "__")
+            .last
+    }
+}
+
 /// A single item in an agent chat transcript (user message, assistant message, tool call, etc.)
 public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public let id: UUID
@@ -134,11 +161,23 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public var toolName: String? {
         didSet {
             toolName = AgentToolNamePolicy.accepted(toolName)
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
         }
     }
 
     public var toolInvocationID: UUID?
-    public var toolArgsJSON: String? // JSON string of tool arguments
+    public var toolArgsJSON: String? {
+        didSet {
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
+        }
+    }
+
     public var toolResultJSON: String? // Tool execution result JSON (for toolResult kind)
     public var toolIsError: Bool?
 
@@ -187,7 +226,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.taggedFileAttachments = taggedFileAttachments
         self.toolName = AgentToolNamePolicy.accepted(toolName)
         self.toolInvocationID = toolInvocationID
-        self.toolArgsJSON = toolArgsJSON
+        self.toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: self.toolName,
+            argsJSON: toolArgsJSON
+        )
         self.toolResultJSON = toolResultJSON
         self.toolIsError = toolIsError
         self.reasoning = reasoning
@@ -221,7 +263,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         taggedFileAttachments = try c.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
         toolName = try AgentToolNamePolicy.accepted(c.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try c.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
-        toolArgsJSON = try c.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        toolArgsJSON = try AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: toolName,
+            argsJSON: c.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        )
         toolResultJSON = try c.decodeIfPresent(String.self, forKey: .toolResultJSON)
         toolIsError = try c.decodeIfPresent(Bool.self, forKey: .toolIsError)
         reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning)

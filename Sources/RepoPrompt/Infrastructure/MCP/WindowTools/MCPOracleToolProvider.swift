@@ -60,6 +60,8 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab. Omit `chat_id` or set `new_chat=true` to start; otherwise `chat_id` continues. The optional `model` override changes only the primary model of a new conversation.
 
+            Optional `images` sends workspace-local PNG, JPEG, GIF, or WebP files to a direct built-in Anthropic Oracle route. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots. URLs, screenshots, relative paths, and external files are rejected. Limits: 10 images, 20 MiB each, 50 MiB total.
+
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
             Use `oracle_chat_log` after compaction to recover recent oracle messages.
@@ -85,6 +87,17 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                     "model": .string(
                         description: "Optional primary-model override for a new conversation; rejected on continuation.",
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
+                    ),
+                    "images": .array(
+                        description: "Optional workspace-local images for direct built-in Anthropic Oracle routes. Each item requires canonical absolute `path` and may include `title`. PNG/JPEG/GIF/WebP only; max 10 images, 20 MiB each, 50 MiB total. URLs and screenshots are unsupported.",
+                        items: .object(
+                            properties: [
+                                "path": .string(description: "Canonical absolute path inside a currently loaded workspace root"),
+                                "title": .string(description: "Optional transient image title", maxLength: 200)
+                            ],
+                            required: ["path"]
+                        ),
+                        maxItems: OracleImageAttachmentLimits.production.maxCount
                     ),
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
