@@ -122,7 +122,7 @@ enum AgentToolArgumentPersistencePolicy {
         guard let data = argsJSON.data(using: .utf8),
               var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return nil
+            return argsJSON.contains("\"images\"") ? nil : argsJSON
         }
         guard object.removeValue(forKey: "images") != nil else { return argsJSON }
         guard JSONSerialization.isValidJSONObject(object),

@@ -7,6 +7,7 @@ import XCTest
 final class OracleImageContractTests: XCTestCase {
     func testParserAcceptsOnlyBoundedPathAndOptionalTitleObjects() throws {
         XCTAssertEqual(try MCPOracleToolService.parseOracleImageRequests(nil), [])
+        XCTAssertEqual(try MCPOracleToolService.parseOracleImageRequests(.array([])), [])
 
         let parsed = try MCPOracleToolService.parseOracleImageRequests(.array([
             .object([
@@ -18,13 +19,12 @@ final class OracleImageContractTests: XCTestCase {
         ]))
 
         XCTAssertEqual(parsed, [
-            .init(index: 0, path: "/workspace/diagram.png", title: "Architecture"),
+            .init(index: 0, path: "  /workspace/diagram.png  ", title: "Architecture"),
             .init(index: 1, path: "/workspace/photo.jpg", title: nil)
         ])
     }
 
-    func testParserRejectsEmptyOversizedAndExpandedAttachmentShapes() {
-        XCTAssertThrowsError(try MCPOracleToolService.parseOracleImageRequests(.array([])))
+    func testParserRejectsOversizedAndExpandedAttachmentShapes() {
         XCTAssertThrowsError(try MCPOracleToolService.parseOracleImageRequests(.array(
             (0 ... 10).map { .object(["path": .string("/workspace/\($0).png")]) }
         )))
@@ -74,7 +74,7 @@ final class OracleImageContractTests: XCTestCase {
         XCTAssertEqual(unrelated.toolArgsJSON, raw)
     }
 
-    func testLateToolNameAndArgumentUpdatesRemainRedacted() throws {
+    func testLateAndPartialToolArgumentsPreserveTextButRedactImages() throws {
         let raw = #"{"message":"inspect","images":[{"path":"/Users/late-secret.png"}]}"#
         var item = AgentChatItem.toolCall(name: "read_file", argsJSON: nil)
         item.toolName = "ask_oracle"
@@ -83,5 +83,10 @@ final class OracleImageContractTests: XCTestCase {
         let sanitized = try XCTUnwrap(item.toolArgsJSON)
         XCTAssertFalse(sanitized.contains("images"))
         XCTAssertFalse(sanitized.contains("late-secret"))
+
+        item.toolArgsJSON = #"{"message":"partial"#
+        XCTAssertEqual(item.toolArgsJSON, #"{"message":"partial"#)
+        item.toolArgsJSON = #"{"images":[{"path":"/Users/partial-secret.png"#
+        XCTAssertNil(item.toolArgsJSON)
     }
 }
