@@ -10733,7 +10733,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             items = items.filter { !$0.isHiddenInMenus }
         }
         if query.sortMostRecentFirst {
-            items = items.sorted { $0.dateModified > $1.dateModified }
+            items = WorkspaceRecentOrdering.sorted(items)
         }
         return items
     }
@@ -10766,9 +10766,21 @@ class WorkspaceManagerViewModel: ObservableObject {
                 try await addFolder(url)
             }
         case .createNewWorkspace:
+            if let existingWorkspace = WorkspaceFolderOpenResolver.bestEligibleMatch(
+                forFolderPath: normalizedPath,
+                in: workspaces
+            ) {
+                await requestWorkspaceSwitch(
+                    to: existingWorkspace,
+                    saveState: true,
+                    reason: "openFolderReuse"
+                )
+                return
+            }
+
             let newName = uniqueWorkspaceName(baseName: url.lastPathComponent)
             let newWS = createWorkspace(name: newName, repoPaths: [normalizedPath])
-            await switchWorkspace(to: newWS, saveState: false)
+            await switchWorkspace(to: newWS, saveState: false, reason: "openFolderCreate")
         case .addToActiveOnly:
             guard !isFallback else { throw WorkspaceOpenError.noActiveWorkspace }
             try await addFolder(url)

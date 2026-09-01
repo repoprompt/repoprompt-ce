@@ -1495,19 +1495,6 @@ class WindowState: ObservableObject {
             persist: persistFlag
         )
 
-        // If we want to focus an existing window for the same folderPath, do that
-        if focusFlag == true, let folderPath {
-            if let wsManager = windowStatesManager,
-               let existingWindow = wsManager.findWindowState(forFolderPath: folderPath),
-               existingWindow !== self
-            {
-                NSApplication.shared.activate(ignoringOtherApps: true)
-                existingWindow.focusWindowIfPossible()
-                existingWindow.enqueueCommand(command)
-                return
-            }
-        }
-
         enqueueCommand(command)
     }
 
@@ -1558,36 +1545,33 @@ class WindowState: ObservableObject {
                 return
             }
 
-            // Try to find an existing workspace referencing this folder
-            if let existingWorkspace = workspaceManager.workspaces.first(where: { ws in
-                ws.repoPaths.contains { repoPath in
-                    let repoURL = URL(fileURLWithPath: (repoPath as NSString).expandingTildeInPath)
-                        .standardizedFileURL
-                    return repoURL == folderURL
-                }
-            }) {
-                // If ephemeral == true, mark existing workspace ephemeral (edge case)
-                if shouldBeEphemeral {
-                    if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existingWorkspace.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
-                    }
-                }
-
-                // If focus == true, attempt to bring up an existing window
-                if command.focus == true {
-                    if let wsManager = windowStatesManager,
-                       let existingWindow = wsManager.findWindowState(showing: existingWorkspace.id)
-                    {
-                        NSApplication.shared.activate(ignoringOtherApps: true)
-                        existingWindow.focusWindowIfPossible()
-                        return
-                    }
+            // Try to find the highest-ranked eligible workspace referencing this folder
+            if let existingWorkspace = WorkspaceFolderOpenResolver.bestEligibleMatch(
+                forFolderPath: folderURL.path,
+                in: workspaceManager.workspaces,
+                admittingEphemeral: shouldBeEphemeral
+            ) {
+                // If focus == true, bring forward another window already showing the winner.
+                if command.focus == true,
+                   let wsManager = windowStatesManager,
+                   let existingWindow = wsManager.findWindowState(showing: existingWorkspace.id),
+                   existingWindow !== self
+                {
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                    existingWindow.focusWindowIfPossible()
+                    return
                 }
 
-                // Switch to the existing workspace in this window
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: existingWorkspace, saveState: true)
-                didSwitchWorkspace = result.didSwitch
+                // An already-active winner is resolved without a redundant switch so payload still applies.
+                if workspaceManager.activeWorkspaceID != existingWorkspace.id {
+                    requestedWorkspaceSwitch = true
+                    let result = await workspaceManager.requestWorkspaceSwitch(
+                        to: existingWorkspace,
+                        saveState: true,
+                        reason: "appCommandFolderOpen"
+                    )
+                    didSwitchWorkspace = result.didSwitch
+                }
             } else {
                 // Create a brand-new workspace
                 let nameGuess = folderURL.lastPathComponent
@@ -1600,7 +1584,11 @@ class WindowState: ObservableObject {
                     ephemeral: shouldBeEphemeral
                 )
                 requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: newWS, saveState: true)
+                let result = await workspaceManager.requestWorkspaceSwitch(
+                    to: newWS,
+                    saveState: true,
+                    reason: "appCommandFolderOpen"
+                )
                 didSwitchWorkspace = result.didSwitch
             }
         } else if let workspaceName = command.workspaceName, !workspaceName.isEmpty {

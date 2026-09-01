@@ -518,17 +518,6 @@ class WindowStatesManager: ObservableObject {
         }
     }
 
-    /// Finds a window that's showing a workspace containing a specific folder
-    func findWindowState(forFolderPath path: String) -> WindowState? {
-        allWindows.first { ws in
-            guard let activeWS = ws.workspaceManager.activeWorkspace else { return false }
-            return activeWS.repoPaths.contains { repoPath in
-                let expanded = (repoPath as NSString).expandingTildeInPath
-                return expanded == (path as NSString).expandingTildeInPath
-            }
-        }
-    }
-
     // MARK: - Programmatic Window Creation
 
     /// Opens a new main window and waits for it to be registered.
