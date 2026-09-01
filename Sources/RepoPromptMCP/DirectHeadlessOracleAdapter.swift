@@ -315,19 +315,17 @@ actor DirectHeadlessOracleAdapter {
                     input: input
                 )
             }
-            if configured.count == 1 {
-                try await provider.validateOracleRoster(configured)
-                let childPlan = try Self.childPlan(runID: runID, roster: configured)
-                return InvocationPlan(
-                    invocationID: invocationID,
-                    runID: runID,
-                    claimID: nil,
-                    input: input,
-                    route: .direct(modelID: configured.primary.modelID, implicitConversationID: nil),
-                    childLaunchPlan: childPlan
-                )
-            }
-            throw AdapterError.unknownChatID
+            let directRoster = try OracleRoster(primary: configured.primary)
+            try await provider.validateOracleRoster(directRoster)
+            let childPlan = try Self.childPlan(runID: runID, roster: directRoster)
+            return InvocationPlan(
+                invocationID: invocationID,
+                runID: runID,
+                claimID: nil,
+                input: input,
+                route: .direct(modelID: directRoster.primary.modelID, implicitConversationID: nil),
+                childLaunchPlan: childPlan
+            )
 
         case .implicitContinuation:
             let configured = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: false))
