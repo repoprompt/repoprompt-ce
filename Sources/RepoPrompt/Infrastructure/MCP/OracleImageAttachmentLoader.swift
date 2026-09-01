@@ -1,4 +1,3 @@
-import CryptoKit
 import Darwin
 import Foundation
 
@@ -8,9 +7,52 @@ struct OracleImageRequest: Equatable {
     let title: String?
 }
 
+struct OracleImageRootIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+    let generation: UInt32
+    let mode: mode_t
+}
+
 struct OracleImageRootProjection: Equatable {
     let logicalRootPath: String
     let physicalRootPath: String
+    let resolvedPhysicalRootPath: String
+    let rootIdentity: OracleImageRootIdentity
+
+    static func capture(
+        logicalRootPath: String,
+        physicalRootPath: String,
+        index: Int
+    ) throws -> OracleImageRootProjection {
+        let logicalRootPath = StandardizedPath.absolute(logicalRootPath)
+        let physicalRootPath = StandardizedPath.absolute(physicalRootPath)
+        let resolvedPhysicalRootPath = StandardizedPath.absolute(
+            URL(fileURLWithPath: physicalRootPath).resolvingSymlinksInPath().path
+        )
+        let descriptor = resolvedPhysicalRootPath.withCString {
+            Darwin.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            throw OracleImageLoadError.missingOrUnreadable(index: index)
+        }
+        defer { Darwin.close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else {
+            throw OracleImageLoadError.missingOrUnreadable(index: index)
+        }
+        return OracleImageRootProjection(
+            logicalRootPath: logicalRootPath,
+            physicalRootPath: physicalRootPath,
+            resolvedPhysicalRootPath: resolvedPhysicalRootPath,
+            rootIdentity: OracleImageRootIdentity(
+                device: info.st_dev,
+                inode: info.st_ino,
+                generation: info.st_gen,
+                mode: info.st_mode
+            )
+        )
+    }
 }
 
 struct OracleImageWorkspaceAuthority: Equatable {
@@ -84,10 +126,6 @@ struct OracleImageAttachmentLoader {
         self.afterFirstRead = afterFirstRead
     }
 
-    static func duplicateDirectoryDescriptor(_ descriptor: Int32) -> Int32 {
-        fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
-    }
-
     static func loadDetached(
         requests: [OracleImageRequest],
         authority: OracleImageWorkspaceAuthority,
@@ -134,6 +172,9 @@ struct OracleImageAttachmentLoader {
             )
             do {
                 let rootIdentity = try descriptorIdentity(rootDescriptor, index: request.index)
+                guard rootIdentity == resolution.expectedRootIdentity else {
+                    throw OracleImageLoadError.unsafePath(index: request.index)
+                }
                 let fileDescriptor = try openFileWithoutSymlinks(
                     from: rootDescriptor,
                     relativePath: resolution.relativePath,
@@ -167,7 +208,6 @@ struct OracleImageAttachmentLoader {
                         rootDescriptor: rootDescriptor,
                         fileDescriptor: fileDescriptor,
                         resolution: resolution,
-                        rootIdentity: rootIdentity,
                         identity: identity,
                         byteCount: byteCount
                     ))
@@ -195,15 +235,6 @@ struct OracleImageAttachmentLoader {
             guard postReadIdentity == item.identity else {
                 throw OracleImageLoadError.changedWhileReading(index: item.request.index)
             }
-            let secondDigest = try hashExactly(
-                descriptor: item.fileDescriptor,
-                byteCount: item.byteCount,
-                index: item.request.index
-            )
-            guard Data(SHA256.hash(data: data)) == secondDigest else {
-                throw OracleImageLoadError.changedWhileReading(index: item.request.index)
-            }
-
             let reopened = try openFileWithoutSymlinks(
                 from: item.rootDescriptor,
                 relativePath: item.resolution.relativePath,
@@ -211,15 +242,7 @@ struct OracleImageAttachmentLoader {
             )
             defer { Darwin.close(reopened) }
             let reopenedIdentity = try fileIdentity(reopened, index: item.request.index)
-            let reopenedRoot = try openTrustedRootDirectory(
-                item.resolution.physicalRootPath,
-                index: item.request.index
-            )
-            defer { Darwin.close(reopenedRoot) }
-            guard reopenedIdentity == item.identity,
-                  try descriptorIdentity(item.rootDescriptor, index: item.request.index) == item.rootIdentity,
-                  try descriptorIdentity(reopenedRoot, index: item.request.index) == item.rootIdentity
-            else {
+            guard reopenedIdentity == item.identity else {
                 throw OracleImageLoadError.changedWhileReading(index: item.request.index)
             }
 
@@ -242,6 +265,7 @@ struct OracleImageAttachmentLoader {
         let physicalRootPath: String
         let physicalFilePath: String
         let relativePath: String
+        let expectedRootIdentity: OracleImageRootIdentity
     }
 
     private struct OpenedImage {
@@ -249,16 +273,8 @@ struct OracleImageAttachmentLoader {
         let rootDescriptor: Int32
         let fileDescriptor: Int32
         let resolution: Resolution
-        let rootIdentity: DescriptorIdentity
         let identity: FileIdentity
         let byteCount: Int
-    }
-
-    private struct DescriptorIdentity: Equatable {
-        let device: dev_t
-        let inode: ino_t
-        let generation: UInt32
-        let mode: mode_t
     }
 
     private struct FileIdentity: Equatable {
@@ -299,20 +315,34 @@ struct OracleImageAttachmentLoader {
         for root in authority.roots {
             let logicalRoot = StandardizedPath.absolute(root.logicalRootPath)
             let physicalRoot = StandardizedPath.absolute(root.physicalRootPath)
+            let resolvedPhysicalRoot = StandardizedPath.absolute(root.resolvedPhysicalRootPath)
             if let relative = relativePath(rawPath, under: logicalRoot) {
                 matches.append((logicalRoot.count, Resolution(
-                    physicalRootPath: physicalRoot,
-                    physicalFilePath: join(root: physicalRoot, relativePath: relative),
-                    relativePath: relative
+                    physicalRootPath: resolvedPhysicalRoot,
+                    physicalFilePath: join(root: resolvedPhysicalRoot, relativePath: relative),
+                    relativePath: relative,
+                    expectedRootIdentity: root.rootIdentity
                 )))
             }
             if logicalRoot != physicalRoot,
                let relative = relativePath(rawPath, under: physicalRoot)
             {
                 matches.append((physicalRoot.count, Resolution(
-                    physicalRootPath: physicalRoot,
-                    physicalFilePath: join(root: physicalRoot, relativePath: relative),
-                    relativePath: relative
+                    physicalRootPath: resolvedPhysicalRoot,
+                    physicalFilePath: join(root: resolvedPhysicalRoot, relativePath: relative),
+                    relativePath: relative,
+                    expectedRootIdentity: root.rootIdentity
+                )))
+            }
+            if resolvedPhysicalRoot != logicalRoot,
+               resolvedPhysicalRoot != physicalRoot,
+               let relative = relativePath(rawPath, under: resolvedPhysicalRoot)
+            {
+                matches.append((resolvedPhysicalRoot.count, Resolution(
+                    physicalRootPath: resolvedPhysicalRoot,
+                    physicalFilePath: join(root: resolvedPhysicalRoot, relativePath: relative),
+                    relativePath: relative,
+                    expectedRootIdentity: root.rootIdentity
                 )))
             }
         }
@@ -357,7 +387,7 @@ struct OracleImageAttachmentLoader {
         guard let filename = components.last else {
             throw OracleImageLoadError.notRegularFile(index: index)
         }
-        var directoryDescriptor = Self.duplicateDirectoryDescriptor(rootDescriptor)
+        var directoryDescriptor = fcntl(rootDescriptor, F_DUPFD_CLOEXEC, 0)
         guard directoryDescriptor >= 0 else {
             throw OracleImageLoadError.missingOrUnreadable(index: index)
         }
@@ -400,12 +430,12 @@ struct OracleImageAttachmentLoader {
         }
     }
 
-    private func descriptorIdentity(_ descriptor: Int32, index: Int) throws -> DescriptorIdentity {
+    private func descriptorIdentity(_ descriptor: Int32, index: Int) throws -> OracleImageRootIdentity {
         var info = stat()
         guard fstat(descriptor, &info) == 0 else {
             throw OracleImageLoadError.changedWhileReading(index: index)
         }
-        return DescriptorIdentity(
+        return OracleImageRootIdentity(
             device: info.st_dev,
             inode: info.st_ino,
             generation: info.st_gen,
@@ -441,7 +471,11 @@ struct OracleImageAttachmentLoader {
             try Task.checkCancellation()
             let count = data.withUnsafeMutableBytes { buffer -> Int in
                 guard let base = buffer.baseAddress else { return 0 }
-                return Darwin.read(descriptor, base.advanced(by: offset), byteCount - offset)
+                return Darwin.read(
+                    descriptor,
+                    base.advanced(by: offset),
+                    min(64 * 1024, byteCount - offset)
+                )
             }
             if count > 0 {
                 offset += count
@@ -451,48 +485,7 @@ struct OracleImageAttachmentLoader {
                 throw OracleImageLoadError.missingOrUnreadable(index: index)
             }
         }
-        try requireEndOfFile(descriptor: descriptor, index: index)
         return data
-    }
-
-    private func hashExactly(descriptor: Int32, byteCount: Int, index: Int) throws -> Data {
-        guard lseek(descriptor, 0, SEEK_SET) >= 0 else {
-            throw OracleImageLoadError.changedWhileReading(index: index)
-        }
-        var hasher = SHA256()
-        var buffer = Data(count: min(64 * 1024, max(byteCount, 1)))
-        var remaining = byteCount
-        while remaining > 0 {
-            try Task.checkCancellation()
-            let requested = min(buffer.count, remaining)
-            let count = buffer.withUnsafeMutableBytes { bytes -> Int in
-                Darwin.read(descriptor, bytes.baseAddress, requested)
-            }
-            if count > 0 {
-                hasher.update(data: buffer.prefix(count))
-                remaining -= count
-            } else if count == 0 {
-                throw OracleImageLoadError.changedWhileReading(index: index)
-            } else if errno != EINTR {
-                throw OracleImageLoadError.missingOrUnreadable(index: index)
-            }
-        }
-        try requireEndOfFile(descriptor: descriptor, index: index)
-        return Data(hasher.finalize())
-    }
-
-    private func requireEndOfFile(descriptor: Int32, index: Int) throws {
-        var extra: UInt8 = 0
-        while true {
-            let count = Darwin.read(descriptor, &extra, 1)
-            if count == 0 { return }
-            if count > 0 {
-                throw OracleImageLoadError.changedWhileReading(index: index)
-            }
-            if errno != EINTR {
-                throw OracleImageLoadError.missingOrUnreadable(index: index)
-            }
-        }
     }
 
     private func detectMediaType(_ data: Data, index: Int) throws -> AIImageMediaType {
@@ -544,25 +537,18 @@ struct OracleImageAttachmentLoader {
     }
 }
 
-private extension Data {
-    func starts(with bytes: [UInt8]) -> Bool {
-        guard count >= bytes.count else { return false }
-        return zip(prefix(bytes.count), bytes).allSatisfy { $0 == $1 }
-    }
-}
-
 enum OracleImageRouteAdmission {
     static func supports(_ model: AIModel) -> Bool {
-        if case let .openAIServiceTierVariant(base, _) = model {
-            return supports(base)
+        switch model {
+        case .claude45Haiku,
+             .claude4Sonnet,
+             .claude4SonnetThinking,
+             .claude4SonnetThinkingMax,
+             .claude4Opus,
+             .claude4OpusThinking:
+            true
+        default:
+            false
         }
-        guard case .anthropicCustom = model else {
-            return model.providerType == .anthropic
-        }
-        return false
-    }
-
-    static func supportsCurrentRoute(_ model: AIModel) -> Bool {
-        supports(model)
     }
 }

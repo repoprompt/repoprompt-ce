@@ -314,7 +314,7 @@ extension OracleViewModel {
                         "Image attachments require every Oracle lane model to be configured; Oracle \(laneIndex + 1) is unavailable."
                     )
                 }
-                guard OracleImageRouteAdmission.supportsCurrentRoute(resolvedModel) else {
+                guard OracleImageRouteAdmission.supports(resolvedModel) else {
                     throw ChatToolError.invalidParams(
                         "Image attachments are not supported by Oracle \(laneIndex + 1)'s model '\(resolvedModel.displayName)' on provider '\(resolvedModel.providerType.displayName)'."
                     )

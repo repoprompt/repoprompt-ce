@@ -96,15 +96,32 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
 
         let trustedRoot = testRoot.appendingPathComponent("trusted-root", isDirectory: true)
         try FileManager.default.createSymbolicLink(at: trustedRoot, withDestinationURL: actualRoot)
+        let pinnedAuthority = try authority(logical: trustedRoot, physical: trustedRoot)
         let images = try OracleImageAttachmentLoader().load(
             requests: [.init(
                 index: 0,
                 path: trustedRoot.appendingPathComponent("image.gif").path,
                 title: nil
             )],
-            authority: authority(logical: trustedRoot, physical: trustedRoot)
+            authority: pinnedAuthority
         )
         XCTAssertEqual(images.first?.bytes, Self.gifData)
+
+        let retargetedRoot = testRoot.appendingPathComponent("retargeted", isDirectory: true)
+        try FileManager.default.createDirectory(at: retargetedRoot, withIntermediateDirectories: true)
+        let retargetedData = Data(Array("GIF87a".utf8) + [2, 0, 1, 0])
+        try retargetedData.write(to: retargetedRoot.appendingPathComponent("image.gif"))
+        try FileManager.default.removeItem(at: trustedRoot)
+        try FileManager.default.createSymbolicLink(at: trustedRoot, withDestinationURL: retargetedRoot)
+        let pinnedImages = try OracleImageAttachmentLoader().load(
+            requests: [.init(
+                index: 0,
+                path: trustedRoot.appendingPathComponent("image.gif").path,
+                title: nil
+            )],
+            authority: pinnedAuthority
+        )
+        XCTAssertEqual(pinnedImages.first?.bytes, Self.gifData)
 
         let realDirectory = actualRoot.appendingPathComponent("real-directory", isDirectory: true)
         try FileManager.default.createDirectory(at: realDirectory, withIntermediateDirectories: true)
@@ -119,7 +136,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
                 path: trustedRoot.appendingPathComponent("linked-directory/nested.gif").path,
                 title: nil
             )],
-            authority: authority(logical: trustedRoot, physical: trustedRoot)
+            authority: pinnedAuthority
         )) { error in
             guard let loadError = error as? OracleImageLoadError else {
                 return XCTFail("Expected OracleImageLoadError, got \(error)")
@@ -131,23 +148,10 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         }
     }
 
-    func testDirectoryDescriptorDuplicationSetsCloseOnExec() {
-        let descriptor = testRoot.path.withCString {
-            Darwin.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        }
-        XCTAssertGreaterThanOrEqual(descriptor, 0)
-        defer { if descriptor >= 0 { Darwin.close(descriptor) } }
-
-        let duplicate = OracleImageAttachmentLoader.duplicateDirectoryDescriptor(descriptor)
-        XCTAssertGreaterThanOrEqual(duplicate, 0)
-        defer { if duplicate >= 0 { Darwin.close(duplicate) } }
-        XCTAssertNotEqual(fcntl(duplicate, F_GETFD) & FD_CLOEXEC, 0)
-    }
-
     func testParentCancellationCancelsDetachedLoad() async throws {
         let imageURL = testRoot.appendingPathComponent("cancel.gif")
         try Self.gifData.write(to: imageURL)
-        let authority = authority(logical: testRoot, physical: testRoot)
+        let authority = try authority(logical: testRoot, physical: testRoot)
         let started = DispatchSemaphore(value: 0)
         let loader = OracleImageAttachmentLoader(afterFirstRead: { _ in
             started.signal()
@@ -254,9 +258,13 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         }
     }
 
-    private func authority(logical: URL, physical: URL) -> OracleImageWorkspaceAuthority {
-        OracleImageWorkspaceAuthority(roots: [
-            .init(logicalRootPath: logical.path, physicalRootPath: physical.path)
+    private func authority(logical: URL, physical: URL) throws -> OracleImageWorkspaceAuthority {
+        try OracleImageWorkspaceAuthority(roots: [
+            .capture(
+                logicalRootPath: logical.path,
+                physicalRootPath: physical.path,
+                index: 0
+            )
         ])
     }
 
