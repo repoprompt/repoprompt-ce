@@ -359,73 +359,12 @@ enum MCPAppPhysicalCapabilityAdapters {
         return true
     }
 
-    struct Execution {
-        let executeOracleUtils: ExecuteTool
-        let executeAskOracle: ExecuteTool
-        let executeOracleSend: ExecuteTool
-        let executeOracleChatLog: ExecuteTool
-        let executeAgentExplore: ExecuteTool
-        let executeAgentRun: ExecuteTool
-        let executeAgentManage: ExecuteTool
-        let requireTargetWindow: RequireTargetWindow
-        let requireCurrentTabContext: RequireCurrentTabContext
-        let requireAgentModeConnection: RequireAgentModeConnection
-        let resolveAgentModeTabID: ResolveAgentModeTabID
-        let resolveContextBuilderTab: ResolveContextBuilderTab
-        let bindTabForConnection: BindTabForConnection
-        let buildTabSelectionReply: BuildTabSelectionReply
-        let sendStageProgress: SendStageProgress
-        let makeOracleExportDestination: MakeOracleExportDestination
-        let resolveDefaultOracleExportPath: ResolveDefaultOracleExportPath
-        let writeGeneratedOracleExportFile: WriteGeneratedOracleExportFile
-        let beforeContextBuilderFinalReviewAuthorization: BeforeContextBuilderFinalReviewAuthorization
-        let didFinalizeContextBuilderReview: DidFinalizeContextBuilderReview
-        let runMCPPlanOrQuestion: RunMCPPlanOrQuestion
+    @propertyWrapper
+    struct ContextBuilderPrelaunchCleanup {
+        let wrappedValue: RunMCPPlanOrQuestion
 
-        init(
-            executeOracleUtils: @escaping ExecuteTool,
-            executeAskOracle: @escaping ExecuteTool,
-            executeOracleSend: @escaping ExecuteTool,
-            executeOracleChatLog: @escaping ExecuteTool,
-            executeAgentExplore: @escaping ExecuteTool,
-            executeAgentRun: @escaping ExecuteTool,
-            executeAgentManage: @escaping ExecuteTool,
-            requireTargetWindow: @escaping RequireTargetWindow,
-            requireCurrentTabContext: @escaping RequireCurrentTabContext,
-            requireAgentModeConnection: @escaping RequireAgentModeConnection,
-            resolveAgentModeTabID: @escaping ResolveAgentModeTabID,
-            resolveContextBuilderTab: @escaping ResolveContextBuilderTab,
-            bindTabForConnection: @escaping BindTabForConnection,
-            buildTabSelectionReply: @escaping BuildTabSelectionReply,
-            sendStageProgress: @escaping SendStageProgress,
-            makeOracleExportDestination: @escaping MakeOracleExportDestination,
-            resolveDefaultOracleExportPath: @escaping ResolveDefaultOracleExportPath,
-            writeGeneratedOracleExportFile: @escaping WriteGeneratedOracleExportFile,
-            beforeContextBuilderFinalReviewAuthorization: @escaping BeforeContextBuilderFinalReviewAuthorization,
-            didFinalizeContextBuilderReview: @escaping DidFinalizeContextBuilderReview,
-            runMCPPlanOrQuestion: @escaping RunMCPPlanOrQuestion
-        ) {
-            self.executeOracleUtils = executeOracleUtils
-            self.executeAskOracle = executeAskOracle
-            self.executeOracleSend = executeOracleSend
-            self.executeOracleChatLog = executeOracleChatLog
-            self.executeAgentExplore = executeAgentExplore
-            self.executeAgentRun = executeAgentRun
-            self.executeAgentManage = executeAgentManage
-            self.requireTargetWindow = requireTargetWindow
-            self.requireCurrentTabContext = requireCurrentTabContext
-            self.requireAgentModeConnection = requireAgentModeConnection
-            self.resolveAgentModeTabID = resolveAgentModeTabID
-            self.resolveContextBuilderTab = resolveContextBuilderTab
-            self.bindTabForConnection = bindTabForConnection
-            self.buildTabSelectionReply = buildTabSelectionReply
-            self.sendStageProgress = sendStageProgress
-            self.makeOracleExportDestination = makeOracleExportDestination
-            self.resolveDefaultOracleExportPath = resolveDefaultOracleExportPath
-            self.writeGeneratedOracleExportFile = writeGeneratedOracleExportFile
-            self.beforeContextBuilderFinalReviewAuthorization = beforeContextBuilderFinalReviewAuthorization
-            self.didFinalizeContextBuilderReview = didFinalizeContextBuilderReview
-            self.runMCPPlanOrQuestion = {
+        init(wrappedValue run: @escaping RunMCPPlanOrQuestion) {
+            wrappedValue = {
                 contextBuilderVM,
                 identity,
                 agentModeSessionID,
@@ -441,7 +380,7 @@ enum MCPAppPhysicalCapabilityAdapters {
                 let capturedSession = contextBuilderVM.sessions[identity.tabID]
                 let baselineGeneration = capturedSession?.followUpOracleGroupState.generation
                 do {
-                    return try await runMCPPlanOrQuestion(
+                    return try await run(
                         contextBuilderVM,
                         identity,
                         agentModeSessionID,
@@ -472,6 +411,30 @@ enum MCPAppPhysicalCapabilityAdapters {
                 }
             }
         }
+    }
+
+    struct Execution {
+        let executeOracleUtils: ExecuteTool
+        let executeAskOracle: ExecuteTool
+        let executeOracleSend: ExecuteTool
+        let executeOracleChatLog: ExecuteTool
+        let executeAgentExplore: ExecuteTool
+        let executeAgentRun: ExecuteTool
+        let executeAgentManage: ExecuteTool
+        let requireTargetWindow: RequireTargetWindow
+        let requireCurrentTabContext: RequireCurrentTabContext
+        let requireAgentModeConnection: RequireAgentModeConnection
+        let resolveAgentModeTabID: ResolveAgentModeTabID
+        let resolveContextBuilderTab: ResolveContextBuilderTab
+        let bindTabForConnection: BindTabForConnection
+        let buildTabSelectionReply: BuildTabSelectionReply
+        let sendStageProgress: SendStageProgress
+        let makeOracleExportDestination: MakeOracleExportDestination
+        let resolveDefaultOracleExportPath: ResolveDefaultOracleExportPath
+        let writeGeneratedOracleExportFile: WriteGeneratedOracleExportFile
+        let beforeContextBuilderFinalReviewAuthorization: BeforeContextBuilderFinalReviewAuthorization
+        let didFinalizeContextBuilderReview: DidFinalizeContextBuilderReview
+        @ContextBuilderPrelaunchCleanup var runMCPPlanOrQuestion: RunMCPPlanOrQuestion
     }
 
     struct Context {
