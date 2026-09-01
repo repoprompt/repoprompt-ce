@@ -47,7 +47,7 @@ struct AIMessage {
     let conversationMessages: [ConversationEntry]
 
     /// Request-scoped provider payload. Never copied into persisted chat messages.
-    let transientImages: [AITransientImage]
+    var transientImages: [AITransientImage]
 
     let temperature: Double?
 
@@ -172,22 +172,6 @@ struct AIMessage {
         promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder
         disabledPromptSections = []
         duplicateUserInstructionsAtTop = false
-    }
-
-    func replacingTransientImages(_ images: [AITransientImage]) -> AIMessage {
-        AIMessage(
-            systemPrompt: systemPrompt,
-            metaPrompts: metaPrompts,
-            fileTree: fileTree,
-            fileBlocks: fileBlocks,
-            gitDiff: gitDiff,
-            conversationMessages: conversationMessages,
-            transientImages: images,
-            temperature: temperature,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
-        )
     }
 
     /// Builds the text block that must be *prepended* to the **final** user
