@@ -63,11 +63,14 @@ A named single-chat continuation is never promoted into a group. A group continu
 - N=1 uses the existing direct conversation backend and writes no group document.
 - N>1 creates or continues a durable group through `OracleGroupRuntime` after the frozen carrier bundle validates. The adapter keeps routing, invocation-plan storage, child launch planning, provider execution, and log projection.
 - A continuation may use any member chat ID. The returned root chat ID is the primary member.
+- A named chat ID that is not a canonical group member stays on the one-lane direct path even when additional models are configured; the direct conversation backend remains authoritative for validating that ID.
 - A roster mismatch fails before provider dispatch.
 - A carrier mismatch fails before claim acquisition or group history mutation.
 - `resolveChildLaunchPlan` rechecks shutdown after planning returns, so a cleared plan cache cannot be reinserted. Partial carrier preparation revokes launch tokens and credential envelopes.
 
 Group ID, lane ID, and claim ID travel together through the credential scope, launch reservation, child environment, token redemption, and child handshake. Partial Oracle launch identity is invalid.
+
+A token-verified grouped child connection exposes only repository-read tools: code structure, file tree, file reads, file search, and Git inspection. The canonical Git surface is read-only (`status`, `diff`, `log`, `show`, and `blame`). Direct one-lane children retain their existing provider policy.
 
 ### Frozen Context Builder input
 

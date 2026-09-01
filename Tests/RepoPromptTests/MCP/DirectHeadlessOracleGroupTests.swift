@@ -129,6 +129,47 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(context["response"] as? String, "response-0-default")
     }
 
+    func testNamedDirectContinuationStaysSingleLaneAfterEnablingGroupedSettings() async throws {
+        let fixture = try Fixture(name: "named-direct-grouped-settings")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let started = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("single direct turn")]
+        )
+        let chatID = try XCTUnwrap(started["chat_id"] as? String)
+        XCTAssertNil(started["oracle_group_id"])
+
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
+        let continued = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "oracle_send",
+            arguments: [
+                "chat_id": .string(chatID),
+                "message": .string("continue direct under grouped settings")
+            ]
+        )
+
+        XCTAssertEqual(continued["chat_id"] as? String, chatID)
+        XCTAssertNil(continued["oracle_group_id"])
+        XCTAssertNil(continued["oracle_results"])
+        XCTAssertEqual(try fixture.calls().map(\.lane), [0, 0])
+        let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
+        let stored = try await prepared.oracleStore.loadMostRecentConversation(owner: owner)
+        XCTAssertNil(stored)
+    }
+
     func testShutdownClearsPreparedDirectPlanWithoutChangingMissingPlanError() async throws {
         let fixture = try Fixture(name: "shutdown-direct-sentinel")
         defer { fixture.cleanup() }

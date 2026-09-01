@@ -468,6 +468,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
             ) async -> Void)?
             let afterOracleArtifactReservationReleased: (@MainActor @Sendable (_ generation: UInt64) async -> Void)?
+            let beforeOracleGroupPackaging: (@MainActor @Sendable () async throws -> Void)?
 
             init(
                 beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?,
@@ -486,7 +487,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 ) async -> Void)? = nil,
                 afterOracleArtifactReservationReleased: (@MainActor @Sendable (
                     _ generation: UInt64
-                ) async -> Void)? = nil
+                ) async -> Void)? = nil,
+                beforeOracleGroupPackaging: (@MainActor @Sendable () async throws -> Void)? = nil
             ) {
                 self.beforeProcessingProviderEvent = beforeProcessingProviderEvent
                 self.providerEventDisposition = providerEventDisposition
@@ -498,6 +500,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 self.committedTabSnapshotCaptured = committedTabSnapshotCaptured
                 self.afterCommittedTabSnapshotCaptured = afterCommittedTabSnapshotCaptured
                 self.afterOracleArtifactReservationReleased = afterOracleArtifactReservationReleased
+                self.beforeOracleGroupPackaging = beforeOracleGroupPackaging
             }
         }
 
@@ -4520,140 +4523,135 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.followUpOracleSessionID = nil
         updateRuntimeBindings(from: session)
 
-        await progressReporter?(.payloadPackaging)
-        try requireCurrentOracleRun(session: session, generation: generation)
-        let aiMessage = try await promptManager.buildHeadlessAIMessage(
-            from: HeadlessContextSnapshot(
-                workspaceID: originWorkspaceID,
-                tabID: tabID,
+        var artifactReservation: OracleArtifactReservation?
+        var artifactReservationReleased = false
+        do {
+            #if DEBUG
+                try await runTestHooks?.beforeOracleGroupPackaging?()
+            #endif
+            await progressReporter?(.payloadPackaging)
+            try requireCurrentOracleRun(session: session, generation: generation)
+            let aiMessage = try await promptManager.buildHeadlessAIMessage(
+                from: HeadlessContextSnapshot(
+                    workspaceID: originWorkspaceID,
+                    tabID: tabID,
+                    promptText: groupPrompt,
+                    selection: selection,
+                    lookupContext: lookupContext,
+                    reviewGitContext: reviewGitContext,
+                    finalReviewAuthorization: finalReviewAuthorization
+                ),
+                model: model,
+                mode: mode,
+                gitScopeOverride: mode == .review ? gitScopeOverride : nil
+            )
+            try requireCurrentOracleRun(session: session, generation: generation)
+            let frozenPack = try await ContextBuilderFrozenOraclePack.make(
+                mode: mode,
+                prompt: groupPrompt,
+                selection: selection,
+                message: aiMessage,
+                store: oracleStore
+            )
+            artifactReservation = frozenPack.reservation
+            try requireCurrentOracleRun(session: session, generation: generation)
+            let packaging = OracleViewModel.OracleSendPackagingContext(
+                sourceTabID: tabID,
+                sourceWorkspaceID: originWorkspaceID,
+                sourceSelectionRevision: workspaceManager?.selectionRevisionForMCP(
+                    workspaceID: originWorkspaceID,
+                    tabID: tabID
+                ) ?? 0,
+                sourceAgentSessionID: agentModeSessionID,
+                sourceAgentRunID: agentModeRunID,
                 promptText: groupPrompt,
                 selection: selection,
                 lookupContext: lookupContext,
                 reviewGitContext: reviewGitContext,
-                finalReviewAuthorization: finalReviewAuthorization
-            ),
-            model: model,
-            mode: mode,
-            gitScopeOverride: mode == .review ? gitScopeOverride : nil
-        )
-        try requireCurrentOracleRun(session: session, generation: generation)
-        let frozenPack = try await ContextBuilderFrozenOraclePack.make(
-            mode: mode,
-            prompt: groupPrompt,
-            selection: selection,
-            message: aiMessage,
-            store: oracleStore
-        )
-        try await requireCurrentOraclePrelaunch(
-            session: session,
-            generation: generation,
-            reservation: frozenPack.reservation,
-            store: oracleStore
-        )
-        let packaging = OracleViewModel.OracleSendPackagingContext(
-            sourceTabID: tabID,
-            sourceWorkspaceID: originWorkspaceID,
-            sourceSelectionRevision: workspaceManager?.selectionRevisionForMCP(
-                workspaceID: originWorkspaceID,
-                tabID: tabID
-            ) ?? 0,
-            sourceAgentSessionID: agentModeSessionID,
-            sourceAgentRunID: agentModeRunID,
-            promptText: groupPrompt,
-            selection: selection,
-            lookupContext: lookupContext,
-            reviewGitContext: reviewGitContext,
-            prebuiltAIMessage: frozenPack.message,
-            provenance: .direct
-        )
-        let tabContext = OracleViewModel.OracleSendTabContext(
-            tabID: tabID,
-            workspaceID: originWorkspaceID,
-            agentModeSessionID: agentModeSessionID,
-            agentModeRunID: agentModeRunID,
-            activationPolicy: .background,
-            packaging: packaging
-        )
-        let callbacks = AppOracleGroupExecutionCallbacks(
-            prepared: { [weak self] groupID, turnID, members in
-                guard let self, let session = sessions[tabID] else { throw CancellationError() }
-                let handles = members.map {
-                    ContextBuilderOracleMemberHandle(
-                        laneID: $0.laneID,
-                        sessionID: $0.memberID.rawValue,
-                        chatID: $0.publicChatID
-                    )
-                }
-                guard session.followUpOracleGroupState.bind(
-                    groupID: groupID,
-                    turnID: turnID,
-                    members: handles,
-                    generation: generation
-                ), let primary = handles.first else { throw CancellationError() }
-                await progressReporter?(.streaming)
-                guard let currentSession = sessions[tabID],
-                      currentSession === session,
-                      session.followUpOracleGroupState.generation == generation,
-                      session.followUpOracleGroupState.groupID == groupID,
-                      session.followUpOracleGroupState.turnID == turnID
-                else { throw CancellationError() }
-                session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
-                    workspaceID: originWorkspaceID,
-                    tabID: tabID,
-                    chatID: primary.chatID
-                )
-                updateRuntimeBindings(from: session)
-            },
-            progress: { [weak self] event in
-                guard let self, let session = sessions[tabID],
-                      session.followUpOracleGroupState.accept(event, generation: generation)
-                else { return }
-                if event.kind == .groupSettled {
-                    await progressReporter?(.messageFinalization)
-                } else if let activity = ContextBuilderOracleGroupProgressProjection.activity(for: event) {
-                    await activityReporter?(activity.0, activity.1)
-                }
-            },
-            laneProgress: { [weak self] laneID, text, reasoning in
-                guard let self, let session = sessions[tabID],
-                      laneID.index == 0,
-                      session.followUpOracleGroupState.acceptsLaneCallback(laneID, generation: generation)
-                else { return }
-                session.backgroundPlanResponseText = text
-                session.backgroundPlanReasoningText = reasoning
-                applyPlanPreview(to: session)
-                requestBackgroundPlanUIRefresh(for: tabID)
-                onProgress?(text, reasoning)
-            }
-        )
-        let args: [String: Value] = [
-            "message": .string(groupPrompt),
-            "mode": .string(mode.mcpModeName),
-            "chat_name": .string(chatName),
-            "new_chat": .bool(true),
-            "model": .string(model.rawValue)
-        ]
-        await progressReporter?(.sessionCreationAndPersist)
-        try await requireCurrentOraclePrelaunch(
-            session: session,
-            generation: generation,
-            reservation: frozenPack.reservation,
-            store: oracleStore
-        )
-        let task = Task { @MainActor in
-            try await oracleViewModel.tool_chatSendWithConfiguredRosterCompletion(
-                args: args,
-                promptVM: promptManager,
-                tabContext: tabContext,
-                frozenInput: frozenPack.input,
-                callbacks: callbacks,
-                capturedProfile: capturedProfile
+                prebuiltAIMessage: frozenPack.message,
+                provenance: .direct
             )
-        }
-        session.followUpOracleGroupTask = task
+            let tabContext = OracleViewModel.OracleSendTabContext(
+                tabID: tabID,
+                workspaceID: originWorkspaceID,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID,
+                activationPolicy: .background,
+                packaging: packaging
+            )
+            let callbacks = AppOracleGroupExecutionCallbacks(
+                prepared: { [weak self] groupID, turnID, members in
+                    guard let self, let session = sessions[tabID] else { throw CancellationError() }
+                    let handles = members.map {
+                        ContextBuilderOracleMemberHandle(
+                            laneID: $0.laneID,
+                            sessionID: $0.memberID.rawValue,
+                            chatID: $0.publicChatID
+                        )
+                    }
+                    guard session.followUpOracleGroupState.bind(
+                        groupID: groupID,
+                        turnID: turnID,
+                        members: handles,
+                        generation: generation
+                    ), let primary = handles.first else { throw CancellationError() }
+                    await progressReporter?(.streaming)
+                    guard let currentSession = sessions[tabID],
+                          currentSession === session,
+                          session.followUpOracleGroupState.generation == generation,
+                          session.followUpOracleGroupState.groupID == groupID,
+                          session.followUpOracleGroupState.turnID == turnID
+                    else { throw CancellationError() }
+                    session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+                        workspaceID: originWorkspaceID,
+                        tabID: tabID,
+                        chatID: primary.chatID
+                    )
+                    updateRuntimeBindings(from: session)
+                },
+                progress: { [weak self] event in
+                    guard let self, let session = sessions[tabID],
+                          session.followUpOracleGroupState.accept(event, generation: generation)
+                    else { return }
+                    if event.kind == .groupSettled {
+                        await progressReporter?(.messageFinalization)
+                    } else if let activity = ContextBuilderOracleGroupProgressProjection.activity(for: event) {
+                        await activityReporter?(activity.0, activity.1)
+                    }
+                },
+                laneProgress: { [weak self] laneID, text, reasoning in
+                    guard let self, let session = sessions[tabID],
+                          laneID.index == 0,
+                          session.followUpOracleGroupState.acceptsLaneCallback(laneID, generation: generation)
+                    else { return }
+                    session.backgroundPlanResponseText = text
+                    session.backgroundPlanReasoningText = reasoning
+                    applyPlanPreview(to: session)
+                    requestBackgroundPlanUIRefresh(for: tabID)
+                    onProgress?(text, reasoning)
+                }
+            )
+            let args: [String: Value] = [
+                "message": .string(groupPrompt),
+                "mode": .string(mode.mcpModeName),
+                "chat_name": .string(chatName),
+                "new_chat": .bool(true),
+                "model": .string(model.rawValue)
+            ]
+            await progressReporter?(.sessionCreationAndPersist)
+            try requireCurrentOracleRun(session: session, generation: generation)
+            let task = Task { @MainActor in
+                try await oracleViewModel.tool_chatSendWithConfiguredRosterCompletion(
+                    args: args,
+                    promptVM: promptManager,
+                    tabContext: tabContext,
+                    frozenInput: frozenPack.input,
+                    callbacks: callbacks,
+                    capturedProfile: capturedProfile
+                )
+            }
+            session.followUpOracleGroupTask = task
 
-        var artifactReservationReleased = false
-        do {
             let completion = try await withTaskCancellationHandler {
                 try await task.value
             } onCancel: {
@@ -4726,9 +4724,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             updateRuntimeBindings(from: session)
             return reply
         } catch {
-            if !artifactReservationReleased {
+            if !artifactReservationReleased, let artifactReservation {
                 try? await oracleStore.releaseArtifactReservation(
-                    frozenPack.reservation,
+                    artifactReservation,
                     removeIfUnreferenced: true
                 )
             }
@@ -4751,23 +4749,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             clearPendingBackgroundPlanUIRefresh(for: tabID)
             applyPlanPreview(to: session)
             updateRuntimeBindings(from: session)
-            throw error
-        }
-    }
-
-    private func requireCurrentOraclePrelaunch(
-        session: TabSession,
-        generation: UInt64,
-        reservation: OracleArtifactReservation,
-        store: DomainOracleConversationStore
-    ) async throws {
-        do {
-            try Task.checkCancellation()
-            guard session.followUpOracleGroupState.generation == generation else {
-                throw CancellationError()
-            }
-        } catch {
-            try? await store.releaseArtifactReservation(reservation, removeIfUnreferenced: true)
             throw error
         }
     }

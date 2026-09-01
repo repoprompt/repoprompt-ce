@@ -4408,7 +4408,8 @@ extension ToolOutputFormatter {
         let payload = OracleLaneMarkdownPayload(lanes: ordered.map { lane in
             let status: OracleLaneMarkdownPayload.Status = switch OracleLaneResultStatus(rawValue: lane.status) {
             case .completed: .completed
-            case .failed, .cancelled: .failed
+            case .failed: .failed
+            case .cancelled: .cancelled
             case nil: .unavailable
             }
             return OracleLaneMarkdownPayload.Lane(
