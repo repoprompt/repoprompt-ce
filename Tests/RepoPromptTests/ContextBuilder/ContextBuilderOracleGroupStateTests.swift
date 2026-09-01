@@ -253,6 +253,59 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func testPrelaunchFailureCleanupClearsOnlyItsOwnedGeneration() {
+        let tabID = UUID()
+        let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
+        session.mcpAgentModelsProfile = AgentModelsSettingsProfile(
+            planningModelRaw: "primary",
+            additionalOracleModelRaws: ["additional"]
+        )
+        session.isBackgroundPlanGenerating = true
+        session.backgroundPlanResponseText = "stale response"
+        session.backgroundPlanReasoningText = "stale reasoning"
+        session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+            workspaceID: UUID(),
+            tabID: tabID,
+            chatID: "stale-chat"
+        )
+
+        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
+        let ownedGeneration = session.followUpOracleGroupState.beginRun()
+        XCTAssertTrue(MCPAppPhysicalCapabilityAdapters.cleanupContextBuilderOraclePrelaunchFailure(
+            session: session,
+            expectedGeneration: ownedGeneration,
+            error: ProbeError.packagingFailed
+        ))
+        XCTAssertFalse(session.isBackgroundPlanGenerating)
+        XCTAssertNil(session.backgroundPlanResponseText)
+        XCTAssertNil(session.backgroundPlanReasoningText)
+        XCTAssertNil(session.generatedAnswerRoute)
+        XCTAssertTrue(session.backgroundPlanError?.contains("packaging failed") == true)
+        XCTAssertNil(session.followUpOracleGroupTask)
+        XCTAssertNil(session.followUpOracleGroupState.groupID)
+        XCTAssertTrue(session.followUpOracleGroupState.members.isEmpty)
+        XCTAssertEqual(session.followUpOracleGroupState.generation, ownedGeneration &+ 1)
+
+        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
+        let predecessorGeneration = session.followUpOracleGroupState.beginRun()
+        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
+        let successorGeneration = session.followUpOracleGroupState.beginRun()
+        session.isBackgroundPlanGenerating = true
+        session.backgroundPlanResponseText = "successor response"
+        session.backgroundPlanError = nil
+
+        XCTAssertFalse(MCPAppPhysicalCapabilityAdapters.cleanupContextBuilderOraclePrelaunchFailure(
+            session: session,
+            expectedGeneration: predecessorGeneration,
+            error: ProbeError.packagingFailed
+        ))
+        XCTAssertEqual(session.followUpOracleGroupState.generation, successorGeneration)
+        XCTAssertTrue(session.isBackgroundPlanGenerating)
+        XCTAssertEqual(session.backgroundPlanResponseText, "successor response")
+        XCTAssertNil(session.backgroundPlanError)
+    }
+
     private typealias Fixture = (
         state: ContextBuilderOracleGroupState,
         generation: UInt64,
@@ -320,5 +373,13 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
                 chatID: "\(prefix)-\(index)"
             )
         }
+    }
+}
+
+private enum ProbeError: LocalizedError {
+    case packagingFailed
+
+    var errorDescription: String? {
+        "packaging failed"
     }
 }
