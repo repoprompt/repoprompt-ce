@@ -9,6 +9,10 @@ final class OpenCodeCLIProvider: AIProvider {
         static func test_makeHeadlessConfig(modelName: String?) -> OpenCodeAgentConfig {
             makeHeadlessConfig(modelName: modelName)
         }
+
+        static func test_makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
+            OpenCodeCLIProvider().makeAgentMessage(from: aiMessage)
+        }
     #endif
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
@@ -130,6 +134,7 @@ final class OpenCodeCLIProvider: AIProvider {
         AgentMessage(
             systemPrompt: aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
             userMessage: buildPrompt(from: aiMessage),
+            transientImages: aiMessage.transientImages,
             resumeSessionID: nil
         )
     }
