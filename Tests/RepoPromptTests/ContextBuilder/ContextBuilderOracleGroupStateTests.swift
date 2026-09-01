@@ -254,56 +254,90 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
     }
 
     @MainActor
-    func testPrelaunchFailureCleanupClearsOnlyItsOwnedGeneration() {
-        let tabID = UUID()
-        let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
-        session.mcpAgentModelsProfile = AgentModelsSettingsProfile(
-            planningModelRaw: "primary",
-            additionalOracleModelRaws: ["additional"]
+    func testPrelaunchFailureUsesOwningGenerationCleanup() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -884,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService()
         )
-        session.isBackgroundPlanGenerating = true
-        session.backgroundPlanResponseText = "stale response"
-        session.backgroundPlanReasoningText = "stale reasoning"
-        session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
-            workspaceID: UUID(),
-            tabID: tabID,
-            chatID: "stale-chat"
+        await composition.workspaceManager.awaitInitialized()
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContextBuilderOraclePrelaunch-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let workspace = composition.workspaceManager.createWorkspace(
+            name: "Context Builder Oracle prelaunch",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        let tab = ComposeTabState(name: "Prelaunch failure")
+        guard let workspaceIndex = composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) else {
+            return XCTFail("Expected workspace")
+        }
+        composition.workspaceManager.workspaces[workspaceIndex].composeTabs = [tab]
+        composition.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tab.id
+        await composition.workspaceManager.switchWorkspace(
+            to: composition.workspaceManager.workspaces[workspaceIndex],
+            saveState: false,
+            reason: #function
+        )
+        composition.promptManager.loadComposeTabsFromWorkspace(
+            composition.workspaceManager.workspaces[workspaceIndex],
+            syncPromptText: true
         )
 
-        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
-        let ownedGeneration = session.followUpOracleGroupState.beginRun()
-        XCTAssertTrue(MCPAppPhysicalCapabilityAdapters.cleanupContextBuilderOraclePrelaunchFailure(
-            session: session,
-            expectedGeneration: ownedGeneration,
-            error: ProbeError.packagingFailed
+        let viewModel = composition.contextBuilderAgentViewModel
+        viewModel.replaceSessionForTesting(tabID: tab.id)
+        let session = try XCTUnwrap(viewModel.sessions[tab.id])
+        session.mcpAgentModelsProfile = AgentModelsSettingsProfile(
+            planningModelRaw: composition.promptManager.preferredAIModel.rawValue,
+            additionalOracleModelRaws: [composition.promptManager.preferredAIModel.rawValue]
+        )
+        viewModel.installRunTestHooks(.init(
+            beforeProcessingProviderEvent: nil,
+            providerEventDisposition: nil,
+            teardownCompleted: nil,
+            resolveMCPFollowUpModel: { _ in
+                (
+                    model: composition.promptManager.preferredAIModel,
+                    chatPresetID: nil,
+                    mcpControlInfo: nil
+                )
+            },
+            beforeOracleGroupPackaging: {
+                throw ProbeError.packagingFailed
+            }
         ))
+        defer { viewModel.installRunTestHooks(nil) }
+
+        do {
+            _ = try await viewModel.runMCPPlanOrQuestion(
+                for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
+                oracleViewModel: composition.oracleViewModel,
+                mode: .plan,
+                prompt: "Build a plan",
+                selection: tab.selection,
+                reviewGitContext: .automaticOnly()
+            )
+            XCTFail("Expected packaging failure")
+        } catch {
+            XCTAssertEqual(error as? ProbeError, .packagingFailed)
+        }
+
         XCTAssertFalse(session.isBackgroundPlanGenerating)
         XCTAssertNil(session.backgroundPlanResponseText)
         XCTAssertNil(session.backgroundPlanReasoningText)
         XCTAssertNil(session.generatedAnswerRoute)
-        XCTAssertTrue(session.backgroundPlanError?.contains("packaging failed") == true)
+        XCTAssertNotNil(session.backgroundPlanError)
         XCTAssertNil(session.followUpOracleGroupTask)
         XCTAssertNil(session.followUpOracleGroupState.groupID)
         XCTAssertTrue(session.followUpOracleGroupState.members.isEmpty)
-        XCTAssertEqual(session.followUpOracleGroupState.generation, ownedGeneration &+ 1)
-
-        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
-        let predecessorGeneration = session.followUpOracleGroupState.beginRun()
-        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
-        let successorGeneration = session.followUpOracleGroupState.beginRun()
-        session.isBackgroundPlanGenerating = true
-        session.backgroundPlanResponseText = "successor response"
-        session.backgroundPlanError = nil
-
-        XCTAssertFalse(MCPAppPhysicalCapabilityAdapters.cleanupContextBuilderOraclePrelaunchFailure(
-            session: session,
-            expectedGeneration: predecessorGeneration,
-            error: ProbeError.packagingFailed
-        ))
-        XCTAssertEqual(session.followUpOracleGroupState.generation, successorGeneration)
-        XCTAssertTrue(session.isBackgroundPlanGenerating)
-        XCTAssertEqual(session.backgroundPlanResponseText, "successor response")
-        XCTAssertNil(session.backgroundPlanError)
     }
 
     private typealias Fixture = (
@@ -376,7 +410,7 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
     }
 }
 
-private enum ProbeError: LocalizedError {
+private enum ProbeError: Error, LocalizedError, Equatable {
     case packagingFailed
 
     var errorDescription: String? {

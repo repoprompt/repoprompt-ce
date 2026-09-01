@@ -37,10 +37,9 @@ enum OracleLaneMarkdownFormatter {
     }
 
     private static func formatLane(_ lane: OracleLaneMarkdownPayload.Lane) -> String {
-        let status = canonicalStatus(for: lane)
         var lines = [
             "### \(OracleRosterContract.displayLabel(laneIndex: lane.laneIndex))",
-            "- Status: \(status.rawValue)",
+            "- Status: \(lane.status.rawValue)",
             "- Provider: \(metadata(lane.providerID))",
             "- Model: \(metadata(lane.modelID))",
             "- Effective effort: \(metadata(lane.effectiveReasoningEffort))",
@@ -63,22 +62,11 @@ enum OracleLaneMarkdownFormatter {
             } else {
                 lines.append("Error: \(message)")
             }
-        } else if status == .unavailable {
+        } else if lane.status == .unavailable {
             lines.append("")
             lines.append("Response unavailable.")
         }
         return lines.joined(separator: "\n")
-    }
-
-    private static func canonicalStatus(
-        for lane: OracleLaneMarkdownPayload.Lane
-    ) -> OracleLaneMarkdownPayload.Status {
-        guard lane.status == .failed,
-              lane.errorCode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "cancelled"
-        else {
-            return lane.status
-        }
-        return .cancelled
     }
 
     private static func metadata(_ value: String?) -> String {

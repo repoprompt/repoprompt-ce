@@ -335,84 +335,6 @@ enum MCPAppPhysicalCapabilityAdapters {
     ) async throws -> String
     typealias LatestTokenBreakdown = @MainActor @Sendable () -> TokenCountingViewModel.TokenBreakdown
 
-    @MainActor
-    @discardableResult
-    static func cleanupContextBuilderOraclePrelaunchFailure(
-        session: ContextBuilderAgentViewModel.TabSession,
-        expectedGeneration: UInt64,
-        error: Error
-    ) -> Bool {
-        guard session.mcpAgentModelsProfile?.additionalOracleModelRaws.isEmpty == false,
-              session.followUpOracleGroupTask == nil,
-              session.followUpOracleGroupState.generation == expectedGeneration,
-              session.isBackgroundPlanGenerating
-        else {
-            return false
-        }
-        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
-        session.followUpOracleGroupTask = nil
-        session.generatedAnswerRoute = nil
-        session.isBackgroundPlanGenerating = false
-        session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
-        session.backgroundPlanResponseText = nil
-        session.backgroundPlanReasoningText = nil
-        return true
-    }
-
-    @propertyWrapper
-    struct ContextBuilderPrelaunchCleanup {
-        let wrappedValue: RunMCPPlanOrQuestion
-
-        init(wrappedValue run: @escaping RunMCPPlanOrQuestion) {
-            wrappedValue = {
-                contextBuilderVM,
-                identity,
-                agentModeSessionID,
-                agentModeRunID,
-                mode,
-                prompt,
-                selection,
-                lookupContext,
-                reviewGitContext,
-                finalReviewAuthorization,
-                progressReporter,
-                activityReporter in
-                let capturedSession = contextBuilderVM.sessions[identity.tabID]
-                let baselineGeneration = capturedSession?.followUpOracleGroupState.generation
-                do {
-                    return try await run(
-                        contextBuilderVM,
-                        identity,
-                        agentModeSessionID,
-                        agentModeRunID,
-                        mode,
-                        prompt,
-                        selection,
-                        lookupContext,
-                        reviewGitContext,
-                        finalReviewAuthorization,
-                        progressReporter,
-                        activityReporter
-                    )
-                } catch {
-                    if let capturedSession,
-                       let baselineGeneration,
-                       let currentSession = contextBuilderVM.sessions[identity.tabID],
-                       currentSession === capturedSession,
-                       MCPAppPhysicalCapabilityAdapters.cleanupContextBuilderOraclePrelaunchFailure(
-                           session: capturedSession,
-                           expectedGeneration: baselineGeneration &+ 2,
-                           error: error
-                       )
-                    {
-                        contextBuilderVM.setBackgroundPlanGenerating(false, forTabID: identity.tabID)
-                    }
-                    throw error
-                }
-            }
-        }
-    }
-
     struct Execution {
         let executeOracleUtils: ExecuteTool
         let executeAskOracle: ExecuteTool
@@ -434,7 +356,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         let writeGeneratedOracleExportFile: WriteGeneratedOracleExportFile
         let beforeContextBuilderFinalReviewAuthorization: BeforeContextBuilderFinalReviewAuthorization
         let didFinalizeContextBuilderReview: DidFinalizeContextBuilderReview
-        @ContextBuilderPrelaunchCleanup var runMCPPlanOrQuestion: RunMCPPlanOrQuestion
+        let runMCPPlanOrQuestion: RunMCPPlanOrQuestion
     }
 
     struct Context {

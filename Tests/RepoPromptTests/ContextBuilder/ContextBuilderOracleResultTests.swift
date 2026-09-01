@@ -68,6 +68,35 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         XCTAssertFalse(askOracleText.contains("Secondary Oracle"))
     }
 
+    func testFormattedGroupPreservesCancelledLaneStatus() throws {
+        let result = try groupResult(
+            status: .partialFailure,
+            lanes: [
+                lane(index: 0, status: .completed, response: "primary answer"),
+                lane(
+                    index: 1,
+                    status: .cancelled,
+                    error: laneError(
+                        code: "cancelled",
+                        message: "Oracle lane was cancelled."
+                    )
+                )
+            ]
+        )
+        let fields = ContextBuilderOracleGroupReply(result: result).toMCPFields()
+        let text = ToolOutputFormatter.formatAskOracle(
+            args: [:],
+            value: .object(fields),
+            emitResources: false
+        ).compactMap { block -> String? in
+            guard case let .text(text, _, _) = block else { return nil }
+            return text
+        }.joined(separator: "\n")
+
+        XCTAssertTrue(text.contains("- Status: Cancelled"), text)
+        XCTAssertFalse(text.contains("- Status: Failed"), text)
+    }
+
     func testFailedOrCancelledPrimaryIsNotPublishable() throws {
         for status in [OracleLaneResultStatus.failed, .cancelled] {
             let reply = try ContextBuilderOracleGroupReply(result: groupResult(
