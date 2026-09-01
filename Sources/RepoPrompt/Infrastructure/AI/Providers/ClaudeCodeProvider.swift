@@ -17,6 +17,7 @@ struct ClaudeCLIOptions {
     var effortLevel: ClaudeCodeEffortLevel?
     var mcpConfigPath: String?
     var systemPromptOverride: String?
+    var inputFormat: String?
     var timeout: TimeInterval?
     var environmentOverrides: [String: String] = [:]
     var removedEnvironmentKeys: Set<String> = []
@@ -40,6 +41,7 @@ struct ClaudeCLIOptions {
         if let permissionMode { tokens.append(contentsOf: ["--permission-mode", permissionMode]) }
         if let model { tokens.append(contentsOf: ["--model", model]) }
         if let systemPromptOverride { tokens.append(contentsOf: ["--system-prompt", systemPromptOverride]) }
+        if let inputFormat { tokens.append(contentsOf: ["--input-format", inputFormat]) }
         if let mcpConfigPath {
             tokens.append(contentsOf: ["--mcp-config", mcpConfigPath])
             // Use strict mode to ignore project-level MCP configs from ~/.claude.json
@@ -152,6 +154,13 @@ final class ClaudeCodeProvider: AIProvider {
         if options.timeout == nil {
             options.timeout = defaultRequestTimeout
         }
+        let stdin: String
+        if aiMessage.transientImages.isEmpty {
+            stdin = prompt
+        } else {
+            options.inputFormat = "stream-json"
+            stdin = try Self.makeStreamJSONInput(prompt: prompt, images: aiMessage.transientImages)
+        }
         let args = options.toTokens()
 
         var attempt = 0
@@ -162,7 +171,7 @@ final class ClaudeCodeProvider: AIProvider {
             do {
                 result = try await runner.run(
                     args: args,
-                    stdin: prompt,
+                    stdin: stdin,
                     outputMode: .auto(.json),
                     timeout: options.timeout,
                     additionalEnvironment: options.additionalEnvironment,
@@ -214,6 +223,36 @@ final class ClaudeCodeProvider: AIProvider {
     }
 
     // MARK: - Private Helpers
+
+    static func makeStreamJSONInput(prompt: String, images: [AITransientImage]) throws -> String {
+        var content: [[String: Any]] = []
+        if !prompt.isEmpty {
+            content.append(["type": "text", "text": prompt])
+        }
+        for image in images {
+            if let title = image.normalizedTitle {
+                content.append(["type": "text", "text": "Image title: \(title)"])
+            }
+            content.append([
+                "type": "image",
+                "source": [
+                    "type": "base64",
+                    "media_type": image.mediaType.rawValue,
+                    "data": image.base64Payload
+                ]
+            ])
+        }
+        let payload: [String: Any] = [
+            "type": "user",
+            "message": ["role": "user", "content": content],
+            "parent_tool_use_id": NSNull()
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        guard let line = String(data: data, encoding: .utf8) else {
+            throw AIProviderError.invalidConfiguration(detail: "Unable to encode Claude image input.")
+        }
+        return line + "\n"
+    }
 
     static func resolveCLIModelSelection(for model: AIModel) throws -> ClaudeCodeCLIModelSelection {
         guard model.providerType == .claudeCode else {
