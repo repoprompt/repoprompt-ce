@@ -200,6 +200,7 @@ final class GrokBuildCLIProvider: AIProvider {
         return AgentMessage(
             systemPrompt: nonAgentSystemPrompt,
             userMessage: buildPrompt(from: aiMessage),
+            transientImages: aiMessage.transientImages,
             resumeSessionID: nil
         )
     }
