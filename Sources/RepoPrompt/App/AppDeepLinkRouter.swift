@@ -6,6 +6,7 @@ final class AppDeepLinkRouter {
     private struct WorkspaceCandidateRepresentation {
         let workspace: WorkspaceModel
         let targetWindow: WindowState
+        let isAuthorityOwned: Bool
     }
 
     static let shared = AppDeepLinkRouter()
@@ -27,7 +28,7 @@ final class AppDeepLinkRouter {
     func route(url: URL, preferredLegacyWindow: WindowState?) async {
         switch AppDeepLinkRoute.parse(url: url) {
         case let .route(.legacyURL(legacyURL)):
-            routeLegacyURL(legacyURL, preferredWindow: preferredLegacyWindow)
+            await routeLegacyURL(legacyURL, preferredWindow: preferredLegacyWindow)
         case let .route(.agentSession(route)):
             await routeAgentSession(route, sourceURL: url)
         case .invalidScopedRoute:
@@ -63,7 +64,7 @@ final class AppDeepLinkRouter {
         await routeAgentSession(route, sourceURL: nil)
     }
 
-    private func routeLegacyURL(_ url: URL, preferredWindow: WindowState?) {
+    private func routeLegacyURL(_ url: URL, preferredWindow: WindowState?) async {
         let targetWindow: WindowState? = if let preferredWindow, !preferredWindow.isClosing {
             preferredWindow
         } else {
@@ -78,25 +79,32 @@ final class AppDeepLinkRouter {
             targetWindow.handleIncomingURL(url)
             return
         }
-        routeOpenCommand(command, receivingWindow: targetWindow)
+        await routeOpenCommand(command, receivingWindow: targetWindow)
     }
 
-    private func routeOpenCommand(_ command: AppCommand, receivingWindow: WindowState) {
+    private func routeOpenCommand(_ command: AppCommand, receivingWindow: WindowState) async {
         guard let folderPath = command.folderPath, !folderPath.isEmpty else {
             receivingWindow.enqueueCommand(command)
             return
         }
 
+        guard let routingCatalog = await receivingWindow.workspaceManager.workspaceRoutingCatalogSnapshot() else {
+            return
+        }
         let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+        guard liveWindows.contains(where: { $0 === receivingWindow }) else {
+            return
+        }
         var candidateRepresentations: [UUID: WorkspaceCandidateRepresentation] = [:]
 
-        // The receiving catalog is the persistent workspace authority for this route. Active
-        // windows supplement catalog-missing IDs so ephemeral and not-yet-projected workspaces
-        // remain reusable without letting unrelated activity timestamps override root state.
-        for workspace in receivingWindow.workspaceManager.workspaces {
+        // Persistent candidates come from one runtime-owned catalog snapshot in production.
+        // Active windows supplement authority-missing IDs so ephemeral and not-yet-published
+        // workspaces remain reusable without turning per-window projections into authority.
+        for workspace in routingCatalog {
             candidateRepresentations[workspace.id] = WorkspaceCandidateRepresentation(
                 workspace: workspace,
-                targetWindow: receivingWindow
+                targetWindow: receivingWindow,
+                isAuthorityOwned: true
             )
         }
         for window in liveWindows {
@@ -105,7 +113,8 @@ final class AppDeepLinkRouter {
             {
                 candidateRepresentations[activeWorkspace.id] = WorkspaceCandidateRepresentation(
                     workspace: activeWorkspace,
-                    targetWindow: window
+                    targetWindow: window,
+                    isAuthorityOwned: false
                 )
             }
         }
@@ -123,9 +132,28 @@ final class AppDeepLinkRouter {
             return
         }
 
-        winningRepresentation.targetWindow.enqueueCommand(
+        let targetWindow: WindowState = if command.focus == true,
+                                           let activeWindow = liveWindows.first(where: { window in
+                                               guard let activeWorkspace = window.workspaceManager.activeWorkspace,
+                                                     activeWorkspace.id == winner.id
+                                               else { return false }
+                                               return WorkspaceFolderOpenResolver.containsExactRoot(
+                                                   folderPath,
+                                                   in: activeWorkspace
+                                               )
+                                           })
+        {
+            activeWindow
+        } else {
+            winningRepresentation.targetWindow
+        }
+
+        guard !targetWindow.isClosing else { return }
+        targetWindow.enqueueCommand(
             command,
-            resolvedFolderWorkspaceID: winner.id
+            resolvedFolderWorkspaceID: winner.id,
+            expectedFolderRootKey: WorkspaceRootSetKey(paths: [folderPath]),
+            allowsLocalWorkspaceFallback: !winningRepresentation.isAuthorityOwned
         )
     }
 

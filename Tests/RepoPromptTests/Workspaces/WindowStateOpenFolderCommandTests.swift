@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -9,6 +10,7 @@ import XCTest
         private var originalStoragePath: String?
         private var storageRoot: URL!
         private var windows: [WindowState] = []
+        private var domainRuntimes: [MCPDomainRuntime] = []
 
         override func setUp() async throws {
             try await super.setUp()
@@ -29,6 +31,10 @@ import XCTest
                 WindowStatesManager.shared.unregisterWindowState(window)
             }
             windows.removeAll()
+            for runtime in domainRuntimes {
+                _ = await runtime.shutdown()
+            }
+            domainRuntimes.removeAll()
             await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
@@ -331,6 +337,7 @@ import XCTest
             })
             staleWindow.promptManager.promptText = "stale-before"
             receivingWindow.promptManager.promptText = "receiving-before"
+            let receivingCountBeforeRoute = receivingWindow.workspaceManager.workspaces.count
             let url = try XCTUnwrap(URL(
                 string: "repoprompt-ce://open/\(requestedFolder.path)?focus=true&files=\(requestedFile.path)&prompt=after"
             ))
@@ -339,7 +346,18 @@ import XCTest
             await receivingWindow.processCommands()
             await staleWindow.processCommands()
 
+            XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspaceID, workspaceID)
             XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspace?.repoPaths, [requestedFolder.path])
+            XCTAssertEqual(receivingWindow.workspaceManager.workspaces.count, receivingCountBeforeRoute)
+            XCTAssertEqual(
+                receivingWindow.workspaceManager.workspaces.count {
+                    WorkspaceFolderOpenResolver.bestEligibleMatch(
+                        forFolderPath: requestedFolder.path,
+                        in: [$0]
+                    ) != nil
+                },
+                1
+            )
             XCTAssertEqual(receivingWindow.promptManager.promptText, "after")
             XCTAssertTrue(receivingWindow.workspaceFilesViewModel.selectedFiles.contains {
                 $0.fullPath == requestedFile.path
@@ -384,6 +402,7 @@ import XCTest
             staleWindow.workspaceManager.workspaces[staleWorkspaceIndex] = staleActiveSnapshot
             staleWindow.promptManager.promptText = "stale-before"
             receivingWindow.promptManager.promptText = "receiving-before"
+            let receivingCountBeforeRoute = receivingWindow.workspaceManager.workspaces.count
             let url = try XCTUnwrap(URL(
                 string: "repoprompt-ce://open/\(requestedFolder.path)?focus=true&prompt=after"
             ))
@@ -392,10 +411,417 @@ import XCTest
             await receivingWindow.processCommands()
             await staleWindow.processCommands()
 
+            XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspaceID, workspaceID)
             XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspace?.repoPaths, [requestedFolder.path])
+            XCTAssertEqual(receivingWindow.workspaceManager.workspaces.count, receivingCountBeforeRoute)
+            XCTAssertEqual(
+                receivingWindow.workspaceManager.workspaces.count {
+                    WorkspaceFolderOpenResolver.bestEligibleMatch(
+                        forFolderPath: requestedFolder.path,
+                        in: [$0]
+                    ) != nil
+                },
+                1
+            )
             XCTAssertEqual(receivingWindow.promptManager.promptText, "after")
             XCTAssertEqual(staleWindow.workspaceManager.activeWorkspace?.repoPaths, [staleFolder.path])
             XCTAssertEqual(staleWindow.promptManager.promptText, "stale-before")
+        }
+
+        func testQueuedResolvedFolderRouteStopsWhenSameWorkspaceIDChangesRoots() async throws {
+            let window = await makeWindow()
+            let requestedFolder = try makeFolder(named: "QueuedExpectedRoot")
+            let replacementFolder = try makeFolder(named: "QueuedReplacementRoot")
+            let selectedFile = requestedFolder.appendingPathComponent("Selected.swift")
+            let payloadFile = requestedFolder.appendingPathComponent("Payload.swift")
+            try Data("let selected = true\n".utf8).write(to: selectedFile)
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000023"))
+            let expectedWorkspace = WorkspaceModel(
+                id: workspaceID,
+                name: "Queued Workspace",
+                repoPaths: [requestedFolder.path]
+            )
+            window.workspaceManager.workspaces.append(expectedWorkspace)
+            let initialSwitch = await window.workspaceManager.switchWorkspace(
+                to: expectedWorkspace,
+                saveState: false,
+                reason: "folderCommandQueuedRootFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            await window.workspaceFilesViewModel.selectFiles(withPaths: [selectedFile.path])
+            window.promptManager.promptText = "before"
+            let countBeforeRoute = window.workspaceManager.workspaces.count
+            window.setAutomaticCommandProcessingForTesting(false)
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(requestedFolder.path)?files=\(payloadFile.path)&prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(url: url)
+            let workspaceIndex = try XCTUnwrap(
+                window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceID })
+            )
+            window.workspaceManager.workspaces[workspaceIndex] = WorkspaceModel(
+                id: workspaceID,
+                name: "Queued Workspace",
+                repoPaths: [replacementFolder.path]
+            )
+            await window.processCommands()
+
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.repoPaths, [replacementFolder.path])
+            XCTAssertEqual(window.workspaceManager.workspaces.count, countBeforeRoute)
+            XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertTrue(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == selectedFile.path
+            })
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+        }
+
+        func testQueuedResolvedFolderRouteUsesSharedAuthorityWhenProjectionIsStale() async throws {
+            let runtime = try await makeDomainRuntime()
+            let authorityWindow = await makeWindow(domainRuntime: runtime)
+            let targetWindow = await makeWindow(domainRuntime: runtime)
+            let requestedFolder = try makeFolder(named: "AuthorityExpectedRoot")
+            let replacementFolder = try makeFolder(named: "AuthorityReplacementRoot")
+            let selectedFile = requestedFolder.appendingPathComponent("Selected.swift")
+            let payloadFile = requestedFolder.appendingPathComponent("Payload.swift")
+            try Data("let selected = true\n".utf8).write(to: selectedFile)
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000027"))
+            let expectedWorkspace = WorkspaceModel(
+                id: workspaceID,
+                name: "Authority Workspace",
+                repoPaths: [requestedFolder.path]
+            )
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(expectedWorkspace)
+            try await waitUntil {
+                targetWindow.workspaceManager.workspace(withID: workspaceID)?.repoPaths == [requestedFolder.path]
+            }
+            let projectedWorkspace = try XCTUnwrap(targetWindow.workspaceManager.workspace(withID: workspaceID))
+            let initialSwitch = await targetWindow.workspaceManager.switchWorkspace(
+                to: projectedWorkspace,
+                saveState: false,
+                reason: "folderCommandAuthorityRootFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            await targetWindow.workspaceFilesViewModel.selectFiles(withPaths: [selectedFile.path])
+            targetWindow.promptManager.promptText = "before"
+            let countBeforeRoute = targetWindow.workspaceManager.workspaces.count
+            targetWindow.setAutomaticCommandProcessingForTesting(false)
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(requestedFolder.path)?files=\(payloadFile.path)&prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(
+                url: url,
+                preferredLegacyWindow: targetWindow
+            )
+            targetWindow.stopDomainWorkspaceProjectionForTesting()
+            var replacementWorkspace = expectedWorkspace
+            replacementWorkspace.repoPaths = [replacementFolder.path]
+            replacementWorkspace.dateModified = Date()
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(replacementWorkspace)
+            let routingCatalog = await targetWindow.workspaceManager.workspaceRoutingCatalogSnapshot()
+            let authoritativeCatalog = try XCTUnwrap(routingCatalog)
+            XCTAssertEqual(
+                authoritativeCatalog.first(where: { $0.id == workspaceID })?.repoPaths,
+                [replacementFolder.path]
+            )
+
+            await targetWindow.processCommands()
+
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspace?.repoPaths, [requestedFolder.path])
+            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count, countBeforeRoute)
+            XCTAssertEqual(targetWindow.promptManager.promptText, "before")
+            XCTAssertTrue(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == selectedFile.path
+            })
+            XCTAssertFalse(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertEqual(
+                targetWindow.workspaceManager.workspaces.count {
+                    $0.id == workspaceID
+                },
+                1
+            )
+        }
+
+        func testResolvedFolderRouteLoadsAuthorityWorkspaceMissingFromTargetProjection() async throws {
+            let runtime = try await makeDomainRuntime()
+            let authorityWindow = await makeWindow(domainRuntime: runtime)
+            let targetWindow = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "AuthorityProjectionLag")
+            let payloadFile = folder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000028"))
+            let workspace = WorkspaceModel(
+                id: workspaceID,
+                name: "Authority Projection Lag",
+                repoPaths: [folder.path]
+            )
+            targetWindow.stopDomainWorkspaceProjectionForTesting()
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(workspace)
+            XCTAssertNil(targetWindow.workspaceManager.workspace(withID: workspaceID))
+            let countBeforeRoute = targetWindow.workspaceManager.workspaces.count
+            targetWindow.setAutomaticCommandProcessingForTesting(false)
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?files=\(payloadFile.path)&prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(
+                url: url,
+                preferredLegacyWindow: targetWindow
+            )
+            await targetWindow.processCommands()
+
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspace?.repoPaths, [folder.path])
+            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count, countBeforeRoute + 1)
+            XCTAssertEqual(targetWindow.promptManager.promptText, "after")
+            XCTAssertTrue(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertEqual(
+                targetWindow.workspaceManager.workspaces.count {
+                    $0.id == workspaceID
+                },
+                1
+            )
+        }
+
+        func testResolvedFolderRouteReloadsActiveWorkspaceWhenAuthorityProjectionIsNewer() async throws {
+            let runtime = try await makeDomainRuntime()
+            let authorityWindow = await makeWindow(domainRuntime: runtime)
+            let targetWindow = await makeWindow(domainRuntime: runtime)
+            let oldFolder = try makeFolder(named: "AuthorityOldActiveRoot")
+            let requestedFolder = try makeFolder(named: "AuthorityNewActiveRoot")
+            let payloadFile = requestedFolder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000029"))
+            let oldWorkspace = WorkspaceModel(
+                id: workspaceID,
+                name: "Authority Active Projection",
+                repoPaths: [oldFolder.path]
+            )
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(oldWorkspace)
+            try await waitUntil {
+                targetWindow.workspaceManager.workspace(withID: workspaceID)?.repoPaths == [oldFolder.path]
+            }
+            let projectedWorkspace = try XCTUnwrap(targetWindow.workspaceManager.workspace(withID: workspaceID))
+            let initialSwitch = await targetWindow.workspaceManager.switchWorkspace(
+                to: projectedWorkspace,
+                saveState: false,
+                reason: "folderCommandAuthorityProjectionLagFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            let countBeforeRoute = targetWindow.workspaceManager.workspaces.count
+            targetWindow.stopDomainWorkspaceProjectionForTesting()
+            var replacementWorkspace = oldWorkspace
+            replacementWorkspace.repoPaths = [requestedFolder.path]
+            replacementWorkspace.dateModified = Date()
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(replacementWorkspace)
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspace?.repoPaths, [oldFolder.path])
+            targetWindow.setAutomaticCommandProcessingForTesting(false)
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(requestedFolder.path)?files=\(payloadFile.path)&prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(
+                url: url,
+                preferredLegacyWindow: targetWindow
+            )
+            await targetWindow.processCommands()
+
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspace?.repoPaths, [requestedFolder.path])
+            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count, countBeforeRoute)
+            XCTAssertEqual(targetWindow.promptManager.promptText, "after")
+            XCTAssertTrue(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count { $0.id == workspaceID }, 1)
+        }
+
+        func testSharedRuntimeFocusedEphemeralRouteReusesLiveWorkspace() async throws {
+            let runtime = try await makeDomainRuntime()
+            let activeWindow = await makeWindow(domainRuntime: runtime)
+            let receivingWindow = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "RuntimeEphemeralReuse")
+            let payloadFile = folder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let workspace = activeWindow.workspaceManager.createWorkspace(
+                name: "Runtime Ephemeral",
+                repoPaths: [folder.path],
+                ephemeral: true
+            )
+            let initialSwitch = await activeWindow.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "folderCommandRuntimeEphemeralFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            let activeCountBeforeRoute = activeWindow.workspaceManager.workspaces.count
+            let receivingCountBeforeRoute = receivingWindow.workspaceManager.workspaces.count
+            activeWindow.setAutomaticCommandProcessingForTesting(false)
+            receivingWindow.setAutomaticCommandProcessingForTesting(false)
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?focus=true&ephemeral=true&files=\(payloadFile.path)&prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(
+                url: url,
+                preferredLegacyWindow: receivingWindow
+            )
+            await activeWindow.processCommands()
+            await receivingWindow.processCommands()
+
+            XCTAssertEqual(activeWindow.workspaceManager.activeWorkspaceID, workspace.id)
+            XCTAssertEqual(activeWindow.workspaceManager.workspaces.count, activeCountBeforeRoute)
+            XCTAssertEqual(receivingWindow.workspaceManager.workspaces.count, receivingCountBeforeRoute)
+            XCTAssertEqual(activeWindow.promptManager.promptText, "after")
+            XCTAssertTrue(activeWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+        }
+
+        func testRouteDoesNotEnqueueAfterReceivingWindowClosesDuringAuthorityAwait() async throws {
+            let runtime = try await makeDomainRuntime()
+            let targetWindow = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "ClosingDuringAuthorityAwait")
+            targetWindow.setAutomaticCommandProcessingForTesting(false)
+            targetWindow.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting {
+                targetWindow.beginClose()
+            }
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(
+                url: url,
+                preferredLegacyWindow: targetWindow
+            )
+
+            XCTAssertTrue(targetWindow.isClosing)
+            XCTAssertEqual(targetWindow.queuedCommandCountForTesting, 0)
+            XCTAssertNotEqual(targetWindow.promptManager.promptText, "after")
+        }
+
+        func testFocusedPersistentRouteUsesAlreadyActiveMatchingWindow() async throws {
+            let activeWindow = await makeWindow()
+            let receivingWindow = await makeWindow()
+            let folder = try makeFolder(named: "FocusedPersistent")
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000024"))
+            let workspace = WorkspaceModel(id: workspaceID, name: "Focused Persistent", repoPaths: [folder.path])
+            activeWindow.workspaceManager.workspaces.append(workspace)
+            receivingWindow.workspaceManager.workspaces.append(workspace)
+            let initialSwitch = await activeWindow.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "folderCommandFocusedPersistentFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            let attachedWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            activeWindow.attachWindow(attachedWindow)
+            attachedWindow.orderOut(nil)
+            defer {
+                attachedWindow.orderOut(nil)
+                activeWindow.attachWindow(nil)
+            }
+            XCTAssertFalse(attachedWindow.isVisible)
+            activeWindow.promptManager.promptText = "active-before"
+            receivingWindow.promptManager.promptText = "receiving-before"
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?focus=true&prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(url: url)
+            await activeWindow.processCommands()
+            await receivingWindow.processCommands()
+
+            XCTAssertEqual(activeWindow.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(activeWindow.promptManager.promptText, "after")
+            XCTAssertEqual(receivingWindow.promptManager.promptText, "receiving-before")
+            XCTAssertTrue(attachedWindow.isVisible)
+        }
+
+        func testNonFocusedPersistentRouteUsesReceivingWindow() async throws {
+            let activeWindow = await makeWindow()
+            let receivingWindow = await makeWindow()
+            let folder = try makeFolder(named: "NonFocusedPersistent")
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000025"))
+            let workspace = WorkspaceModel(id: workspaceID, name: "Non-Focused Persistent", repoPaths: [folder.path])
+            activeWindow.workspaceManager.workspaces.append(workspace)
+            receivingWindow.workspaceManager.workspaces.append(workspace)
+            let initialSwitch = await activeWindow.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "folderCommandNonFocusedPersistentFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            activeWindow.promptManager.promptText = "active-before"
+            receivingWindow.promptManager.promptText = "receiving-before"
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(url: url)
+            await activeWindow.processCommands()
+            await receivingWindow.processCommands()
+
+            XCTAssertEqual(activeWindow.promptManager.promptText, "active-before")
+            XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(receivingWindow.promptManager.promptText, "after")
+        }
+
+        func testFocusedPersistentRouteAvoidsBlockedReceivingWindowSwitch() async throws {
+            let activeWindow = await makeWindow()
+            let receivingWindow = await makeWindow()
+            let folder = try makeFolder(named: "FocusedBlockedReceiving")
+            let otherFolder = try makeFolder(named: "FocusedBlockedOther")
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000026"))
+            let workspace = WorkspaceModel(id: workspaceID, name: "Focused Blocked", repoPaths: [folder.path])
+            let otherWorkspace = WorkspaceModel(name: "Other", repoPaths: [otherFolder.path])
+            activeWindow.workspaceManager.workspaces.append(workspace)
+            receivingWindow.workspaceManager.workspaces.append(contentsOf: [workspace, otherWorkspace])
+            let activeSwitch = await activeWindow.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "folderCommandFocusedBlockedActiveFixture"
+            )
+            XCTAssertEqual(activeSwitch, .switched)
+            let receivingSwitch = await receivingWindow.workspaceManager.switchWorkspace(
+                to: otherWorkspace,
+                saveState: false,
+                reason: "folderCommandFocusedBlockedReceivingFixture"
+            )
+            XCTAssertEqual(receivingSwitch, .switched)
+            let sessionProvider = FolderCommandWorkspaceSwitchSessionProvider()
+            receivingWindow.workspaceManager.registerSwitchSessionProvider(sessionProvider)
+            activeWindow.promptManager.promptText = "active-before"
+            receivingWindow.promptManager.promptText = "receiving-before"
+            let url = try XCTUnwrap(URL(
+                string: "repoprompt-ce://open/\(folder.path)?focus=true&prompt=after"
+            ))
+
+            await AppDeepLinkRouter(windowStatesManager: .shared).route(url: url)
+            await activeWindow.processCommands()
+            await receivingWindow.processCommands()
+
+            XCTAssertEqual(activeWindow.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(activeWindow.promptManager.promptText, "after")
+            XCTAssertEqual(receivingWindow.workspaceManager.activeWorkspaceID, otherWorkspace.id)
+            XCTAssertEqual(receivingWindow.promptManager.promptText, "receiving-before")
+            XCTAssertNil(receivingWindow.workspaceManager.pendingSwitchConfirmation)
         }
 
         func testCancelledMatchedSwitchCreatesNoReplacementAndAppliesNoPayload() async throws {
@@ -451,12 +877,31 @@ import XCTest
             throw WindowStateOpenFolderCommandTestError.conditionTimedOut
         }
 
-        private func makeWindow() async -> WindowState {
-            let window = WindowState()
+        private func makeWindow(domainRuntime: MCPDomainRuntime? = nil) async -> WindowState {
+            let window = if let domainRuntime {
+                WindowState(domainRuntime: domainRuntime)
+            } else {
+                WindowState()
+            }
             WindowStatesManager.shared.registerWindowState(window)
             windows.append(window)
             await window.workspaceManager.awaitInitialized()
             return window
+        }
+
+        private func makeDomainRuntime() async throws -> MCPDomainRuntime {
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "window-folder-command-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            domainRuntimes.append(runtime)
+            return runtime
         }
 
         private func makeFolder(named name: String) throws -> URL {

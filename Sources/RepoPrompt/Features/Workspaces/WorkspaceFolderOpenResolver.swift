@@ -18,6 +18,23 @@ enum WorkspaceRecentOrdering {
 }
 
 enum WorkspaceFolderOpenResolver {
+    nonisolated static func containsExactRoot(
+        _ folderPath: String,
+        in workspace: WorkspaceModel
+    ) -> Bool {
+        containsExactRoot(WorkspaceRootSetKey(paths: [folderPath]), in: workspace)
+    }
+
+    nonisolated static func containsExactRoot(
+        _ expectedRoot: WorkspaceRootSetKey,
+        in workspace: WorkspaceModel
+    ) -> Bool {
+        guard !expectedRoot.isEmpty else { return false }
+        return workspace.repoPaths.contains { rootPath in
+            WorkspaceRootSetKey(paths: [rootPath]) == expectedRoot
+        }
+    }
+
     nonisolated static func eligibleMatches(
         forFolderPath path: String,
         in workspaces: [WorkspaceModel],
@@ -34,10 +51,7 @@ enum WorkspaceFolderOpenResolver {
                 return false
             }
 
-            return workspace.repoPaths.contains { rootPath in
-                let root = WorkspaceRootSetKey(paths: [rootPath])
-                return !root.isEmpty && root == selectedRoot
-            }
+            return containsExactRoot(path, in: workspace)
         }
         return WorkspaceRecentOrdering.sorted(matches)
     }

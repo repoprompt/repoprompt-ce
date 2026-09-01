@@ -286,10 +286,27 @@ class WindowState: ObservableObject {
     private struct QueuedAppCommand {
         let command: AppCommand
         let resolvedFolderWorkspaceID: UUID?
+        let expectedFolderRootKey: WorkspaceRootSetKey?
+        let allowsLocalWorkspaceFallback: Bool
     }
 
     /// Command queue to store all pending commands
     private var commandQueue: [QueuedAppCommand] = []
+    #if DEBUG
+        private var automaticallyProcessesEnqueuedCommands = true
+
+        func setAutomaticCommandProcessingForTesting(_ enabled: Bool) {
+            automaticallyProcessesEnqueuedCommands = enabled
+        }
+
+        var queuedCommandCountForTesting: Int {
+            commandQueue.count
+        }
+
+        func stopDomainWorkspaceProjectionForTesting() {
+            domainWorkspacePresentationBridge?.stop()
+        }
+    #endif
 
     /// Lazily scheduled task to coalesce window title updates outside of mutation scopes.
     private var pendingWindowTitleUpdateTask: Task<Void, Never>?
@@ -1171,11 +1188,21 @@ class WindowState: ObservableObject {
         return (decoded as NSString).expandingTildeInPath
     }
 
-    func enqueueCommand(_ command: AppCommand, resolvedFolderWorkspaceID: UUID? = nil) {
+    func enqueueCommand(
+        _ command: AppCommand,
+        resolvedFolderWorkspaceID: UUID? = nil,
+        expectedFolderRootKey: WorkspaceRootSetKey? = nil,
+        allowsLocalWorkspaceFallback: Bool = false
+    ) {
         commandQueue.append(QueuedAppCommand(
             command: command,
-            resolvedFolderWorkspaceID: resolvedFolderWorkspaceID
+            resolvedFolderWorkspaceID: resolvedFolderWorkspaceID,
+            expectedFolderRootKey: expectedFolderRootKey,
+            allowsLocalWorkspaceFallback: allowsLocalWorkspaceFallback
         ))
+        #if DEBUG
+            guard automaticallyProcessesEnqueuedCommands else { return }
+        #endif
         // If the workspace manager is already initialized, process now
         if workspaceManager.isInitialized {
             Task { await processCommands() }
@@ -1516,6 +1543,7 @@ class WindowState: ObservableObject {
 
     @MainActor
     private func handleCommand(_ queuedCommand: QueuedAppCommand) async {
+        guard !isClosing else { return }
         let command = queuedCommand.command
         // Determine ephemeral once at the start
         let shouldBeEphemeral = (command.ephemeral == true || command.persist == false)
@@ -1563,11 +1591,25 @@ class WindowState: ObservableObject {
             }
 
             let existingWorkspace: WorkspaceModel?
-            if let resolvedWorkspaceID = queuedCommand.resolvedFolderWorkspaceID {
-                existingWorkspace = workspaceManager.workspace(withID: resolvedWorkspaceID)
-                guard existingWorkspace != nil else {
-                    return
+            var requiresActiveWorkspaceReload = false
+            if let resolvedWorkspaceID = queuedCommand.resolvedFolderWorkspaceID,
+               let expectedRoot = queuedCommand.expectedFolderRootKey
+            {
+                existingWorkspace = await workspaceManager.resolvedWorkspaceForFolderRoute(
+                    workspaceID: resolvedWorkspaceID,
+                    expectedRoot: expectedRoot,
+                    allowsLocalWorkspaceFallback: queuedCommand.allowsLocalWorkspaceFallback
+                )
+                guard !isClosing, existingWorkspace != nil else { return }
+                if workspaceManager.activeWorkspaceID == resolvedWorkspaceID {
+                    let projectedWorkspace = workspaceManager.workspace(withID: resolvedWorkspaceID)
+                    requiresActiveWorkspaceReload = projectedWorkspace.map {
+                        !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
+                    } ?? true
                 }
+            } else if let resolvedWorkspaceID = queuedCommand.resolvedFolderWorkspaceID {
+                existingWorkspace = workspaceManager.workspace(withID: resolvedWorkspaceID)
+                guard existingWorkspace != nil else { return }
             } else {
                 existingWorkspace = WorkspaceFolderOpenResolver.bestEligibleMatch(
                     forFolderPath: folderURL.path,
@@ -1589,8 +1631,16 @@ class WindowState: ObservableObject {
                     return
                 }
 
-                // An already-active winner is resolved without a redundant switch so payload still applies.
-                if workspaceManager.activeWorkspaceID != existingWorkspace.id {
+                // An already-active winner normally avoids a redundant switch. If authority is
+                // ahead of this window's projection, reload the authoritative replacement first.
+                if requiresActiveWorkspaceReload {
+                    requestedWorkspaceSwitch = true
+                    let result = await workspaceManager.reactivateWorkspaceAfterReplacement(
+                        existingWorkspace,
+                        reason: "appCommandFolderOpenAuthorityProjection"
+                    )
+                    didSwitchWorkspace = result.didSwitch
+                } else if workspaceManager.activeWorkspaceID != existingWorkspace.id {
                     requestedWorkspaceSwitch = true
                     let result = await workspaceManager.requestWorkspaceSwitch(
                         to: existingWorkspace,
@@ -1659,8 +1709,22 @@ class WindowState: ObservableObject {
         if requestedWorkspaceSwitch, !didSwitchWorkspace {
             return
         }
-        guard workspaceManager.activeWorkspace != nil else {
-            return
+        if let resolvedWorkspaceID = queuedCommand.resolvedFolderWorkspaceID,
+           let expectedRoot = queuedCommand.expectedFolderRootKey
+        {
+            let authoritativeWorkspace = await workspaceManager.resolvedWorkspaceForFolderRoute(
+                workspaceID: resolvedWorkspaceID,
+                expectedRoot: expectedRoot,
+                allowsLocalWorkspaceFallback: queuedCommand.allowsLocalWorkspaceFallback
+            )
+            guard !isClosing,
+                  authoritativeWorkspace != nil,
+                  let activeWorkspace = workspaceManager.activeWorkspace,
+                  activeWorkspace.id == resolvedWorkspaceID,
+                  WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: activeWorkspace)
+            else { return }
+        } else {
+            guard workspaceManager.activeWorkspace != nil else { return }
         }
 
         if !command.fileList.isEmpty {
@@ -1764,9 +1828,8 @@ class WindowState: ObservableObject {
 
     /// Attempts to bring this window to the front if possible
     func focusWindowIfPossible() {
-        // Since WindowState is not an NSWindow, we can only activate the app
-        // The window itself will be brought forward by the system
         NSApplication.shared.activate(ignoringOtherApps: true)
+        nsWindow?.makeKeyAndOrderFront(nil)
     }
 
     @discardableResult

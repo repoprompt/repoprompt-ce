@@ -454,6 +454,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             (@MainActor (UUID) async -> Void)?
         private var workspaceActivationLeaseDidAcquireHandlerForTesting:
             (@MainActor (UUID) async -> Void)?
+        private var workspaceRoutingAuthorityDidSnapshotHandlerForTesting:
+            (@MainActor () async -> Void)?
     #endif
 
     @MainActor
@@ -843,6 +845,77 @@ class WorkspaceManagerViewModel: ObservableObject {
     func workspace(withID id: UUID?) -> WorkspaceModel? {
         guard let id, let idx = workspaceIndexMap[id], workspaces.indices.contains(idx) else { return nil }
         return workspaces[idx]
+    }
+
+    /// Returns one canonical routing snapshot. Production callers read the runtime authority;
+    /// isolated legacy owners use their local catalog. A nil result means authoritative decoding
+    /// failed, so routing must stop rather than infer ownership from a stale projection.
+    func workspaceRoutingCatalogSnapshot() async -> [WorkspaceModel]? {
+        guard let domainWorkspaceAuthorityClient else {
+            return workspaces
+        }
+        let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+        #if DEBUG
+            await workspaceRoutingAuthorityDidSnapshotHandlerForTesting?()
+        #endif
+        return decodeDomainWorkspaceRoutingSnapshot(snapshot)
+    }
+
+    /// Resolves a queued route against the current runtime authority. Canonical state wins over
+    /// transient read overlays; candidates that were explicitly sourced from a live window may
+    /// fall back to that local projection when neither runtime layer owns the workspace.
+    func resolvedWorkspaceForFolderRoute(
+        workspaceID: UUID,
+        expectedRoot: WorkspaceRootSetKey,
+        allowsLocalWorkspaceFallback: Bool
+    ) async -> WorkspaceModel? {
+        let workspace: WorkspaceModel?
+        if let domainWorkspaceAuthorityClient {
+            let canonicalSnapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(workspaceID)
+            let snapshot: DomainWorkspaceSnapshot? = if let canonicalSnapshot {
+                canonicalSnapshot
+            } else {
+                await domainWorkspaceAuthorityClient.workspaceSnapshot(workspaceID)
+            }
+            if let snapshot {
+                do {
+                    workspace = try Self.decodeDomainWorkspaceProjection(
+                        documentBytes: snapshot.document.documentBytes,
+                        fileURL: snapshot.document.fileURL
+                    )
+                } catch {
+                    Self.logger.error("Domain workspace route decode failed: \(error.localizedDescription, privacy: .public)")
+                    return nil
+                }
+            } else if allowsLocalWorkspaceFallback {
+                workspace = self.workspace(withID: workspaceID)
+            } else {
+                workspace = nil
+            }
+        } else {
+            workspace = self.workspace(withID: workspaceID)
+        }
+
+        guard let workspace,
+              WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: workspace)
+        else { return nil }
+        return workspace
+    }
+
+    private func decodeDomainWorkspaceRoutingSnapshot(
+        _ snapshot: DomainWorkspaceCatalogSnapshot
+    ) -> [WorkspaceModel]? {
+        do {
+            return try snapshot.workspaces.map {
+                try Self.decodeDomainWorkspaceProjection(
+                    documentBytes: $0.document.documentBytes,
+                    fileURL: $0.document.fileURL
+                )
+            }
+        } catch {
+            Self.logger.error("Domain workspace routing snapshot decode failed: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
     }
 
     /// Returns the current index for a workspace ID, validating the cached map.
@@ -3278,6 +3351,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             _ handler: (@MainActor (UUID) async -> Void)?
         ) {
             workspaceActivationLeaseDidAcquireHandlerForTesting = handler
+        }
+
+        func setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting(
+            _ handler: (@MainActor () async -> Void)?
+        ) {
+            workspaceRoutingAuthorityDidSnapshotHandlerForTesting = handler
         }
 
         func setWorkspaceSwitchRecoveryWillBeginHandlerForTesting(
