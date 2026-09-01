@@ -154,24 +154,31 @@ enum DirectHeadlessChildBridge {
         }
     }
 
-    private static func writeAll(_ data: Data, to fd: Int32) throws {
-        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
-        var written = 0
-        while written < data.count {
-            let count = data.withUnsafeBytes { raw -> Int in
-                guard let base = raw.baseAddress else { return 0 }
-                return Darwin.write(fd, base.advanced(by: written), data.count - written)
+    static func writeAll(
+        _ data: Data,
+        to fd: Int32,
+        stallTimeout: TimeInterval = 5
+    ) throws {
+        do {
+            try NonBlockingFDWriter.writeAll(
+                data,
+                to: fd,
+                stallTimeout: stallTimeout
+            )
+        } catch let error as NonBlockingFDWriteError {
+            switch error {
+            case .cancelled:
+                throw CancellationError()
+            case .localTimeout:
+                throw BridgeError.writeTimeout
+            case .brokenPipe:
+                throw BridgeError.write(errno: EPIPE)
+            case let .fcntlFailed(errorNumber),
+                 let .pollFailed(errorNumber):
+                throw BridgeError.write(errno: errorNumber)
+            case let .writeFailed(errorNumber, _, _):
+                throw BridgeError.write(errno: errorNumber)
             }
-            if count > 0 {
-                written += count
-                continue
-            }
-            if count < 0, errno == EINTR { continue }
-            if count < 0, errno != EAGAIN, errno != EWOULDBLOCK {
-                throw BridgeError.write(errno: errno)
-            }
-            guard ContinuousClock().now < deadline else { throw BridgeError.writeTimeout }
-            usleep(10000)
         }
     }
 }
