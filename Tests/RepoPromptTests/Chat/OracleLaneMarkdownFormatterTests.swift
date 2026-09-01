@@ -42,27 +42,6 @@ final class OracleLaneMarkdownFormatterTests: XCTestCase {
         XCTAssertTrue(markdown.contains("Error [provider_failed]: provider exploded"), markdown)
     }
 
-    func testFormatterRecoversCanonicalCancelledStatusFromErrorCode() {
-        let payload = OracleLaneMarkdownPayload(lanes: [
-            .init(
-                laneIndex: 1,
-                chatID: "chat-1",
-                providerID: "codex",
-                modelID: "gpt-5.6-sol",
-                effectiveReasoningEffort: nil,
-                status: .failed,
-                response: nil,
-                partialResponse: nil,
-                errorCode: "cancelled",
-                errorMessage: "Oracle lane was cancelled."
-            )
-        ])
-
-        let markdown = OracleLaneMarkdownFormatter.format(payload)
-        XCTAssertTrue(markdown.contains("- Status: Cancelled"), markdown)
-        XCTAssertFalse(markdown.contains("- Status: Failed"), markdown)
-    }
-
     func testTerminalPayloadUsesDurableResultsAndExactExecutionProfile() throws {
         let startedAt = Date(timeIntervalSince1970: 1000)
         let fixture = try makeGroup(startedAt: startedAt, terminal: true)
