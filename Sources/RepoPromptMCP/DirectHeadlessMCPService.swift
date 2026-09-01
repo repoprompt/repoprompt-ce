@@ -45,6 +45,14 @@ actor DirectHeadlessMCPService {
         "prompt.select_preset"
     ]
 
+    static let oracleGroupChildAllowedToolNames: Set<String> = [
+        MCPWindowToolName.getCodeStructure,
+        MCPWindowToolName.getFileTree,
+        MCPWindowToolName.readFile,
+        MCPWindowToolName.search,
+        MCPWindowToolName.git
+    ]
+
     private let logger: Logger
     private let environment: [String: String]
     private let currentDirectory: URL
@@ -411,7 +419,10 @@ actor DirectHeadlessMCPService {
             connectionGeneration: accepted.binding.registration.generation,
             principal: principal,
             policyProfile: Self.childPolicyProfile(providerIdentifier: handshake.providerIdentifier),
-            restrictedToolNames: accepted.restrictedTools,
+            restrictedToolNames: Self.childRestrictedToolNames(
+                base: accepted.restrictedTools,
+                oracleGroupID: accepted.oracleGroupID
+            ),
             additionalToolNames: accepted.additionalTools,
             ephemeralGrantedOperations: []
         )
@@ -508,6 +519,17 @@ actor DirectHeadlessMCPService {
         if normalized.contains("cursor") { return .agentModeCursorEngineer }
         if normalized.contains("grok") { return .agentModeGrokBuildEngineer }
         return .agentModeGenericEngineer
+    }
+
+    nonisolated static func childRestrictedToolNames(
+        base: Set<String>,
+        oracleGroupID: OracleGroupID?
+    ) -> Set<String> {
+        guard oracleGroupID != nil else { return base }
+        return base.union(
+            Set(MCPDomainToolCatalog.orderedToolNames)
+                .subtracting(oracleGroupChildAllowedToolNames)
+        )
     }
 
     func teardown(_ prepared: PreparedRuntime) async {
