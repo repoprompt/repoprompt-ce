@@ -335,6 +335,30 @@ enum MCPAppPhysicalCapabilityAdapters {
     ) async throws -> String
     typealias LatestTokenBreakdown = @MainActor @Sendable () -> TokenCountingViewModel.TokenBreakdown
 
+    @MainActor
+    @discardableResult
+    static func cleanupContextBuilderOraclePrelaunchFailure(
+        session: ContextBuilderAgentViewModel.TabSession,
+        expectedGeneration: UInt64,
+        error: Error
+    ) -> Bool {
+        guard session.mcpAgentModelsProfile?.additionalOracleModelRaws.isEmpty == false,
+              session.followUpOracleGroupTask == nil,
+              session.followUpOracleGroupState.generation == expectedGeneration,
+              session.isBackgroundPlanGenerating
+        else {
+            return false
+        }
+        _ = session.followUpOracleGroupState.invalidateAndTakeMembers()
+        session.followUpOracleGroupTask = nil
+        session.generatedAnswerRoute = nil
+        session.isBackgroundPlanGenerating = false
+        session.backgroundPlanError = error is CancellationError ? nil : error.asFriendlyString()
+        session.backgroundPlanResponseText = nil
+        session.backgroundPlanReasoningText = nil
+        return true
+    }
+
     struct Execution {
         let executeOracleUtils: ExecuteTool
         let executeAskOracle: ExecuteTool
@@ -357,6 +381,97 @@ enum MCPAppPhysicalCapabilityAdapters {
         let beforeContextBuilderFinalReviewAuthorization: BeforeContextBuilderFinalReviewAuthorization
         let didFinalizeContextBuilderReview: DidFinalizeContextBuilderReview
         let runMCPPlanOrQuestion: RunMCPPlanOrQuestion
+
+        init(
+            executeOracleUtils: @escaping ExecuteTool,
+            executeAskOracle: @escaping ExecuteTool,
+            executeOracleSend: @escaping ExecuteTool,
+            executeOracleChatLog: @escaping ExecuteTool,
+            executeAgentExplore: @escaping ExecuteTool,
+            executeAgentRun: @escaping ExecuteTool,
+            executeAgentManage: @escaping ExecuteTool,
+            requireTargetWindow: @escaping RequireTargetWindow,
+            requireCurrentTabContext: @escaping RequireCurrentTabContext,
+            requireAgentModeConnection: @escaping RequireAgentModeConnection,
+            resolveAgentModeTabID: @escaping ResolveAgentModeTabID,
+            resolveContextBuilderTab: @escaping ResolveContextBuilderTab,
+            bindTabForConnection: @escaping BindTabForConnection,
+            buildTabSelectionReply: @escaping BuildTabSelectionReply,
+            sendStageProgress: @escaping SendStageProgress,
+            makeOracleExportDestination: @escaping MakeOracleExportDestination,
+            resolveDefaultOracleExportPath: @escaping ResolveDefaultOracleExportPath,
+            writeGeneratedOracleExportFile: @escaping WriteGeneratedOracleExportFile,
+            beforeContextBuilderFinalReviewAuthorization: @escaping BeforeContextBuilderFinalReviewAuthorization,
+            didFinalizeContextBuilderReview: @escaping DidFinalizeContextBuilderReview,
+            runMCPPlanOrQuestion: @escaping RunMCPPlanOrQuestion
+        ) {
+            self.executeOracleUtils = executeOracleUtils
+            self.executeAskOracle = executeAskOracle
+            self.executeOracleSend = executeOracleSend
+            self.executeOracleChatLog = executeOracleChatLog
+            self.executeAgentExplore = executeAgentExplore
+            self.executeAgentRun = executeAgentRun
+            self.executeAgentManage = executeAgentManage
+            self.requireTargetWindow = requireTargetWindow
+            self.requireCurrentTabContext = requireCurrentTabContext
+            self.requireAgentModeConnection = requireAgentModeConnection
+            self.resolveAgentModeTabID = resolveAgentModeTabID
+            self.resolveContextBuilderTab = resolveContextBuilderTab
+            self.bindTabForConnection = bindTabForConnection
+            self.buildTabSelectionReply = buildTabSelectionReply
+            self.sendStageProgress = sendStageProgress
+            self.makeOracleExportDestination = makeOracleExportDestination
+            self.resolveDefaultOracleExportPath = resolveDefaultOracleExportPath
+            self.writeGeneratedOracleExportFile = writeGeneratedOracleExportFile
+            self.beforeContextBuilderFinalReviewAuthorization = beforeContextBuilderFinalReviewAuthorization
+            self.didFinalizeContextBuilderReview = didFinalizeContextBuilderReview
+            self.runMCPPlanOrQuestion = {
+                contextBuilderVM,
+                identity,
+                agentModeSessionID,
+                agentModeRunID,
+                mode,
+                prompt,
+                selection,
+                lookupContext,
+                reviewGitContext,
+                finalReviewAuthorization,
+                progressReporter,
+                activityReporter in
+                let capturedSession = contextBuilderVM.sessions[identity.tabID]
+                let baselineGeneration = capturedSession?.followUpOracleGroupState.generation
+                do {
+                    return try await runMCPPlanOrQuestion(
+                        contextBuilderVM,
+                        identity,
+                        agentModeSessionID,
+                        agentModeRunID,
+                        mode,
+                        prompt,
+                        selection,
+                        lookupContext,
+                        reviewGitContext,
+                        finalReviewAuthorization,
+                        progressReporter,
+                        activityReporter
+                    )
+                } catch {
+                    if let capturedSession,
+                       let baselineGeneration,
+                       let currentSession = contextBuilderVM.sessions[identity.tabID],
+                       currentSession === capturedSession,
+                       MCPAppPhysicalCapabilityAdapters.cleanupContextBuilderOraclePrelaunchFailure(
+                           session: capturedSession,
+                           expectedGeneration: baselineGeneration &+ 2,
+                           error: error
+                       )
+                    {
+                        contextBuilderVM.setBackgroundPlanGenerating(false, forTabID: identity.tabID)
+                    }
+                    throw error
+                }
+            }
+        }
     }
 
     struct Context {
