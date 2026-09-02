@@ -74,6 +74,7 @@ enum AgentModel: String, CaseIterable, Codable {
     case gpt54MiniHigh = "gpt-5.4-mini-high"
 
     // Claude Code models
+    case claudeFable = "fable"
     case claudeSonnet = "sonnet"
     case claudeOpus = "opus"
     case claudeHaiku = "haiku"
@@ -150,6 +151,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt54MiniLow: "GPT-5.4 Mini Low"
         case .gpt54MiniMedium: "GPT-5.4 Mini Medium"
         case .gpt54MiniHigh: "GPT-5.4 Mini High"
+        case .claudeFable: "Fable Latest"
         case .claudeSonnet: "Sonnet Latest"
         case .claudeOpus: "Opus Latest"
         case .claudeHaiku: "Haiku Latest"
@@ -218,6 +220,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt54MiniLow: "Fast GPT-5.4 Mini. Good for quick exploration and lookups."
         case .gpt54MiniMedium: "GPT-5.4 Mini with balanced reasoning. Best exploration sub-agent for context gathering."
         case .gpt54MiniHigh: "GPT-5.4 Mini with deep reasoning. Good for complex exploration and analysis."
+        case .claudeFable: "Latest Claude Fable model for demanding reasoning and long-horizon agentic work."
         case .claudeSonnet: "Balanced speed and capability. Good for general coding, analysis, and everyday work."
         case .claudeOpus: "Most capable Opus-tier model. Best for open-ended tasks, architecture, and complex reasoning."
         case .claudeHaiku: "Fast and lightweight. Good for exploration, quick edits, and mapping codebases."
@@ -293,7 +296,7 @@ enum AgentModel: String, CaseIterable, Codable {
             // latest aliases come first, then pinned full IDs by descending version.
             [
                 .defaultModel,
-                .claudeFable51, .claudeFable5,
+                .claudeFable, .claudeFable51, .claudeFable5,
                 .claudeOpus1m,
                 .claudeOpus, .claudeOpus5, .claudeOpus48, .claudeOpus47, .claudeOpus46, .claudeOpus45,
                 .claudeSonnet, .claudeSonnet5, .claudeSonnet46, .claudeSonnet45,
@@ -572,7 +575,7 @@ enum AgentModel: String, CaseIterable, Codable {
             [.fast, .exploration, .engineering]
         case .gpt56SolHigh:
             [.complex, .engineering, .pair]
-        case .claudeFable51, .claudeFable5, .claudeOpus5:
+        case .claudeFable, .claudeFable51, .claudeFable5, .claudeOpus5:
             [.complex, .engineering, .pair, .extendedContext]
         case .claudeSonnet5:
             [.balanced, .engineering, .extendedContext]
@@ -587,7 +590,7 @@ enum AgentModel: String, CaseIterable, Codable {
     /// Returns `nil` for models where the context window is unknown or unverified.
     var contextWindowTokens: Int? {
         switch self {
-        case .claudeFable51, .claudeFable5, .claudeSonnet5, .claudeOpus5, .claudeOpus48, .claudeOpus1m, .glm52_1m:
+        case .claudeFable, .claudeFable51, .claudeFable5, .claudeSonnet5, .claudeOpus5, .claudeOpus48, .claudeOpus1m, .glm52_1m:
             1_000_000
         case .claudeSonnet, .claudeOpus, .claudeHaiku,
              .claudeSonnet46, .claudeSonnet45,
