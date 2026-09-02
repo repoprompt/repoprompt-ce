@@ -5,12 +5,6 @@ struct OMPACPAgentProvider: ACPAgentProvider {
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: OMPACPLaunchResolver
 
-    #if DEBUG
-        var test_config: OMPAgentConfig {
-            config
-        }
-    #endif
-
     init(
         config: OMPAgentConfig,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
@@ -58,7 +52,7 @@ struct OMPACPAgentProvider: ACPAgentProvider {
         return try ACPSessionConfiguration(
             mode: mode,
             workingDirectory: standardizedWorkingDirectory(from: request.workspacePath),
-            mcpServers: config.includeRepoPromptMCPServer ? [repoPromptMCPConfiguration] : []
+            mcpServers: [repoPromptMCPConfiguration]
         )
     }
 

@@ -173,6 +173,18 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         XCTAssertNil(globalNotification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey])
     }
 
+    func testContextBuilderFallbackNeverImplicitlySelectsOMP() {
+        let onlyOMP = AgentModelCatalog.AvailabilityContext.none.assumingAvailable(.omp)
+
+        let selection = AutoRecommendationEngine.resolveContextBuilderSelection(
+            persistedAgentRaw: nil,
+            persistedModelRaw: nil,
+            availability: onlyOMP
+        )
+
+        XCTAssertNil(selection)
+    }
+
     func testContextBuilderRecommendationWritesTargetWorkspaceProfileOnly() throws {
         let fixture = try makeFixture()
         let workspaceID = UUID()
