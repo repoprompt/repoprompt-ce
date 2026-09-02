@@ -580,20 +580,43 @@ private struct ContextBuilderOracleLaneRows: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             ForEach(lanes, id: \.laneIndex) { lane in
-                let effortSuffix = lane.effectiveReasoningEffort.map { " • effort \($0)" } ?? ""
-                let chatSuffix = lane.chatID.map { " • \($0)" } ?? ""
-                Text("\(lane.label): \(lane.status) • \(lane.modelID)\(effortSuffix)\(chatSuffix)")
-                    .font(.system(size: 10, weight: lane.laneIndex == 0 ? .medium : .regular))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(
-                        "\(lane.label), \(lane.status), model \(lane.modelID)"
-                            + (lane.effectiveReasoningEffort.map { ", effort \($0)" } ?? "")
-                            + (lane.chatID.map { ", chat \($0)" } ?? "")
-                    )
+                ContextBuilderOracleLaneRow(lane: lane)
             }
         }
+    }
+}
+
+private struct ContextBuilderOracleLaneRow: View {
+    let lane: ContextBuilderOracleLaneSummary
+
+    private var titleText: String {
+        let effortSuffix = lane.effectiveReasoningEffort.map { " • effort \($0)" } ?? ""
+        let chatSuffix = lane.chatID.map { " • \($0)" } ?? ""
+        return "\(lane.label): \(lane.status) • \(lane.modelID)\(effortSuffix)\(chatSuffix)"
+    }
+
+    private var accessibilityText: String {
+        var text = "\(lane.label), \(lane.status), model \(lane.modelID)"
+        if let effort = lane.effectiveReasoningEffort {
+            text += ", effort \(effort)"
+        }
+        if let chatID = lane.chatID {
+            text += ", chat \(chatID)"
+        }
+        return text
+    }
+
+    private var titleFont: Font {
+        .system(size: 10, weight: lane.laneIndex == 0 ? .medium : .regular)
+    }
+
+    var body: some View {
+        Text(verbatim: titleText)
+            .font(titleFont)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: accessibilityText))
     }
 }
 
