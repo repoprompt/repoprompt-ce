@@ -6,15 +6,17 @@ final class CodexCLIProviderDisposalTests: XCTestCase {
     func testDisposeAwaitsCancelledBridgeTaskCleanup() async {
         let provider = CodexCLIProvider()
         let gate = DisposalGate()
-        let bridgeTask = Task {
-            await withTaskCancellationHandler {
-                await gate.waitForRelease()
-            } onCancel: {
-                Task { await gate.markCancelled() }
+        let bridgeTask = provider.test_registerActiveStreamTask(id: UUID()) {
+            Task {
+                await withTaskCancellationHandler {
+                    await gate.waitForRelease()
+                } onCancel: {
+                    Task { await gate.markCancelled() }
+                }
+                await gate.markBridgeFinished()
             }
-            await gate.markBridgeFinished()
         }
-        provider.test_registerActiveStreamTask(bridgeTask, id: UUID())
+        XCTAssertNotNil(bridgeTask)
 
         let disposalTask = Task {
             await provider.dispose()
@@ -29,6 +31,33 @@ final class CodexCLIProviderDisposalTests: XCTestCase {
         await disposalTask.value
         let bridgeFinished = await gate.bridgeFinished
         XCTAssertTrue(bridgeFinished)
+    }
+
+    func testRegistrationAfterDisposeIsRefusedWithoutStartingTask() async {
+        let provider = CodexCLIProvider()
+        await provider.dispose()
+        let invocation = InvocationFlag()
+
+        let task = provider.test_registerActiveStreamTask(id: UUID()) {
+            invocation.markInvoked()
+            return Task {}
+        }
+
+        XCTAssertNil(task)
+        XCTAssertFalse(invocation.wasInvoked)
+    }
+}
+
+private final class InvocationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var invoked = false
+
+    var wasInvoked: Bool {
+        lock.withLock { invoked }
+    }
+
+    func markInvoked() {
+        lock.withLock { invoked = true }
     }
 }
 
