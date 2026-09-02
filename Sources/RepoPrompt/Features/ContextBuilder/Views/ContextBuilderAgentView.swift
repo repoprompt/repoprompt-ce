@@ -167,9 +167,10 @@ struct ContextBuilderAgentView: View {
         }
     }
 
-    /// The model that will be used for plan generation
+    /// The primary Oracle model that will be used for follow-up generation.
     private var planModelName: String {
-        oracleViewModel.promptViewModel.preferredAIModel.displayName
+        let rawValue = oracleViewModel.promptViewModel.planningModelName
+        return AIModel.fromModelName(rawValue)?.displayName ?? "Select an Oracle model"
     }
 
     /// Text describing what MCP will do after Context Builder completes
@@ -428,13 +429,13 @@ struct ContextBuilderAgentView: View {
     /// Inline model picker for plan generation
     private var planModelPicker: some View {
         OptimizedModelPicker(
-            selection: $oracleViewModel.promptViewModel.preferredModel,
+            selection: $oracleViewModel.promptViewModel.planningModelName,
             availableModels: oracleViewModel.promptViewModel.availableModels,
             font: .callout,
             widthStyle: .flexible()
         )
         .disabled(isContextBuilderRunningForTab)
-        .hoverTooltip("Model for \(selectedFollowUpType.buttonLabel.lowercased()) generation")
+        .hoverTooltip("Primary Oracle for \(selectedFollowUpType.buttonLabel.lowercased()) generation. Additional Oracles come from Agent Models.")
     }
 
     /// Inline follow-up type picker (Plan/Review/Question)

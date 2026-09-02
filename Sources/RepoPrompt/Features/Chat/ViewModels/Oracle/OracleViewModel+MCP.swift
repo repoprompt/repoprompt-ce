@@ -170,7 +170,8 @@ extension OracleViewModel {
 
     /// 1) Presets OFF: use the configured MCP Oracle planning model.
     /// 2) Presets ON & no presets exist: use the configured MCP Oracle planning model.
-    /// 3) Presets ON & presets exist: use a compatible available preset; if none available, fail loudly.
+    /// 3) A captured planning-model override remains authoritative unless a model was explicitly requested.
+    /// 4) Otherwise, presets ON & presets exist: use a compatible available preset; if none are available, fail loudly.
     @MainActor
     private func selectModel(
         modelParam: String?,
@@ -311,7 +312,19 @@ extension OracleViewModel {
             )
         }
 
-        // B.2: Model presets exist → use compatible preset, then fallback if needed
+        // B.2: Model presets exist → preserve a captured Oracle primary unless explicitly overridden.
+        if modelParam == nil, planningModelRawOverride != nil {
+            let planningModel = try strictPlanningModel()
+            let resolvedPreset = resolveChatPreset(for: mode, from: nil)
+            let info = resolvedPreset.name ?? infoLine(reason: "MCP Oracle Model", model: planningModel)
+            return .init(
+                model: planningModel,
+                mcpControlInfo: info,
+                isAutoSelected: true,
+                chatPresetID: resolvedPreset.id
+            )
+        }
+
         let supporting: [ModelPreset] = effectivePresets.filteredForMode(mode)
         var available: [ModelPreset] = []
         for p in supporting {
@@ -382,10 +395,10 @@ extension OracleViewModel {
         mode: String,
         modelParam: String? = nil,
         workspaceID: UUID? = nil,
-        planningModelRawOverride: String? = nil
+        planningModelRawOverride: String? = nil,
+        allPresetsOverride: [ModelPreset]? = nil
     ) async throws -> (model: AIModel, chatPresetID: UUID?, mcpControlInfo: String?) {
-        let presetsManager = ModelPresetsManager.shared
-        let allPresets = presetsManager.allPresets()
+        let allPresets = allPresetsOverride ?? ModelPresetsManager.shared.allPresets()
         let selection = try await selectModel(
             modelParam: modelParam,
             mode: mode,
