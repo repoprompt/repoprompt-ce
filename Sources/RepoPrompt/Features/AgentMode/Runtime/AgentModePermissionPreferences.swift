@@ -48,7 +48,6 @@ enum AgentModePermissionPreferences {
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) -> AgentProviderPermissionLevelID {
-        if providerID == .omp { return .omp }
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
             return secureStore.providerSubagentPermissionLevel(for: providerID)
         }
@@ -61,7 +60,6 @@ enum AgentModePermissionPreferences {
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) {
-        guard providerID != .omp else { return }
         let normalizedLevel = level.providerID == providerID
             ? level
             : AgentProviderPermissionLevelID.subagentDefault(for: providerID)

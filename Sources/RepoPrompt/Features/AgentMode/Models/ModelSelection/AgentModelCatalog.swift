@@ -264,9 +264,9 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return AgentModel.cursorAuto.rawValue
         }
-        if agentKind == .grokBuild {
-            // Grok's default must never become a discovered session's current model:
-            // "default" sends no model mutation and follows Grok's own configuration.
+        if agentKind == .grokBuild || agentKind == .omp {
+            // Provider-managed defaults must never become a discovered session's current
+            // model: "default" sends no mutation and follows the provider configuration.
             return AgentModel.defaultModel.rawValue
         }
         if agentKind == .antigravity {
@@ -366,8 +366,8 @@ enum AgentModelCatalog {
         if agentKind == .antigravity {
             return resolvedACPDiscoveredModels(for: .antigravity)?.options ?? []
         }
-        if agentKind == .grokBuild {
-            let fallback = staticOption(.defaultModel, for: .grokBuild)
+        if agentKind == .grokBuild || agentKind == .omp {
+            let fallback = staticOption(.defaultModel, for: agentKind)
             guard let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
                   !discoveredOptions.isEmpty
             else {
@@ -418,7 +418,7 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return CursorAIModelCatalog.contains(modelRaw: normalized)
         }
-        if agentKind == .grokBuild,
+        if agentKind == .grokBuild || agentKind == .omp,
            normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
         {
             return true
@@ -1378,7 +1378,6 @@ enum AgentModelCatalog {
     private static func resolvedACPDiscoveredModels(
         for agentKind: AgentProviderKind
     ) -> ACPDiscoveredSessionModels? {
-        guard agentKind != .omp else { return nil }
         guard let providerID = agentKind.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
               !snapshot.options.isEmpty

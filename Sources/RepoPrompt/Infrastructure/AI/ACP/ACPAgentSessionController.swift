@@ -725,9 +725,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .omp:
-            return
-        case .openCode, .cursor, .grokBuild, .antigravity:
+        case .openCode, .cursor, .grokBuild, .antigravity, .omp:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
