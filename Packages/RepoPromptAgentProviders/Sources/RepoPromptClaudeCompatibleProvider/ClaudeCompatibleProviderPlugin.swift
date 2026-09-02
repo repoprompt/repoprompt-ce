@@ -258,13 +258,13 @@ public enum ClaudeCompatibleModelCatalog {
         StaticModel(
             rawValue: fable51Raw,
             displayName: "Fable 5.1",
-            description: "Claude Fable 5.1. Anthropic's newest and most capable model for demanding reasoning and long-horizon agentic work.",
+            description: "Pinned Claude Fable 5.1 with 1M context for demanding reasoning and long-horizon agentic work. Requires Claude Code 2.1.255 or newer.",
             supportsXHigh: true
         ),
         StaticModel(
             rawValue: fable5Raw,
             displayName: "Fable 5",
-            description: "Claude Fable 5. Anthropic's most capable widely released model for demanding reasoning and long-horizon agentic work.",
+            description: "Pinned Claude Fable 5 with 1M context for demanding reasoning and long-horizon agentic work.",
             supportsXHigh: true
         ),
         StaticModel(
