@@ -167,6 +167,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(claude.options.first?.isPlaceholderDefault, true)
         XCTAssertEqual(claude.options.map(\.rawValue), [
             "default",
+            "claude-fable-5-1",
             "claude-fable-5",
             "opus[1m]",
             "opus",
