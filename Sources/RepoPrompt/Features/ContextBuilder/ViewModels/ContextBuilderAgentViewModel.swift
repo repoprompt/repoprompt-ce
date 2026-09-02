@@ -5257,6 +5257,23 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let reviewGitContext = mode == .review
             ? await promptManager.freezePromptGitReviewContext(tabID: tabID, base: "HEAD")
             : .automaticOnly()
+        let model: AIModel
+        switch promptManager.mcpOraclePlanningModelResolution() {
+        case let .configured(configuredModel):
+            model = configuredModel
+        case .unconfigured:
+            throw ContextBuilderGenerationError.oracleModelUnavailable(
+                "Select an Oracle model in Agent Models before generating a follow-up."
+            )
+        case let .invalid(rawValue):
+            throw ContextBuilderGenerationError.oracleModelUnavailable(
+                "The configured Oracle model '\(rawValue)' is invalid. Select a valid model in Agent Models."
+            )
+        case let .unavailable(unavailableModel):
+            throw ContextBuilderGenerationError.oracleModelUnavailable(
+                "The configured Oracle model '\(unavailableModel.displayName)' is unavailable. Check its provider settings."
+            )
+        }
 
         return try await runFollowUpOracleStream(
             for: tabID,
@@ -5267,7 +5284,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             selection: selection,
             reviewGitContext: reviewGitContext,
             chatName: chatName ?? defaultChatName,
-            model: promptManager.preferredAIModel,
+            model: model,
             chatPresetID: nil,
             onProgress: onProgress
         )
@@ -5756,6 +5773,7 @@ enum ContextBuilderGenerationError: LocalizedError {
     case missingTab
     case missingWorkspace
     case missingMCPAgentModelsProfile
+    case oracleModelUnavailable(String)
     case askUserAlreadyPending
 
     var errorDescription: String? {
@@ -5764,6 +5782,7 @@ enum ContextBuilderGenerationError: LocalizedError {
         case .missingTab: "Unable to locate the Context Builder tab."
         case .missingWorkspace: "Unable to locate the Context Builder workspace."
         case .missingMCPAgentModelsProfile: "Context Builder MCP follow-up is missing its captured Agent Models profile."
+        case let .oracleModelUnavailable(message): message
         case .askUserAlreadyPending: "ask_user is already waiting for a response in this Context Builder session."
         }
     }
