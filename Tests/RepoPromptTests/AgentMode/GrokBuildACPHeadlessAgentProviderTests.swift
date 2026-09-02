@@ -47,7 +47,8 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 
     /// grok CLI >= 1.0.17 advertises modern `configOptions` alongside the legacy `models`
-    /// block. The direct provider parser must still win so effort variants survive.
+    /// block, and may later push configOptions-only `config_option_update` snapshots. The
+    /// direct provider parser must win and stay in charge so effort variants survive.
     func testConfigOptionsAlongsideModelsKeepsDirectEffortVariants() async throws {
         let harness = try makeHarness(advertiseConfigOptions: true)
         let provider = harness.makeHeadlessProvider(modelString: AgentModel.defaultModel.rawValue)
@@ -198,6 +199,15 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
             elif method == "session/set_model":
                 respond(request_id, {"_meta": {"model": {"Ok": params.get("modelId")}}})
             elif method == "session/prompt":
+                if ADVERTISE_CONFIG_OPTIONS:
+                    # grok may later push a configOptions-only snapshot; it must not demote the direct path.
+                    print(json.dumps({
+                        "jsonrpc": "2.0", "method": "session/update",
+                        "params": {"sessionId": session_id, "update": {
+                            "sessionUpdate": "config_option_update",
+                            "configOptions": [{"id": "model", "category": "model", "type": "select", "currentValue": "grok-4.6",
+                                               "options": [{"value": "grok-4.6", "name": "Grok 4.6"}, {"value": "grok-4.5", "name": "Grok 4.5"}]}]}}
+                    }), flush=True)
                 print(json.dumps({
                     "jsonrpc": "2.0", "method": "session/update",
                     "params": {"sessionId": session_id, "update": {
