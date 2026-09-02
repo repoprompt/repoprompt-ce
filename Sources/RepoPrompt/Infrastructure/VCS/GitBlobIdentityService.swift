@@ -685,7 +685,7 @@ actor GitBlobIdentityService {
 
     private static func lstatFingerprint(_ value: stat) -> GitBlobLStatFingerprint {
         GitBlobLStatFingerprint(
-            device: UInt64(value.st_dev),
+            device: safeDeviceID(value.st_dev),
             inode: UInt64(value.st_ino),
             mode: UInt16(value.st_mode),
             size: Int64(value.st_size),

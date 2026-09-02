@@ -73,7 +73,7 @@ private final class FileSystemSeededInventoryChangeSpillStore: @unchecked Sendab
               status.st_size >= 0
         else { return nil }
         return FileSystemSeededInventorySpillIdentity(
-            device: UInt64(status.st_dev),
+            device: safeDeviceID(status.st_dev),
             inode: UInt64(status.st_ino),
             byteCount: UInt64(status.st_size),
             modificationSeconds: Int64(status.st_mtimespec.tv_sec),
