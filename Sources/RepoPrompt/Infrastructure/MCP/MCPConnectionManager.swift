@@ -6504,8 +6504,10 @@ actor ServerNetworkManager {
         MCPBindingResolver(
             collectMatchesForContextID: { contextID in
                 await MainActor.run {
+                    // One-shot context IDs share bind_context's active-workspace authority
+                    // Inactive stored workspaces are not routable candidates
                     WindowStatesManager.shared.allWindows.compactMap { windowState in
-                        guard let candidate = windowState.workspaceManager.storedBindingCandidate(forContextID: contextID) else {
+                        guard let candidate = windowState.workspaceManager.bindingCandidate(forContextID: contextID) else {
                             return nil
                         }
                         return MCPContextBindingMatch(

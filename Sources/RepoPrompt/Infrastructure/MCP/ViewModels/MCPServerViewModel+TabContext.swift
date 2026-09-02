@@ -3089,7 +3089,23 @@ extension MCPServerViewModel {
                 bound: bound
             ) {
                 if let explicitHint, !Self.hint(explicitHint, matches: bound) {
-                    throw MCPError.invalidParams("Explicit tab context hint for \(toolName) targets tab \(explicitHint.tabID), but this connection is already bound to tab \(bound.tabID). Clear or intentionally rebind the connection before targeting a different tab context.")
+                    var conflicts: [String] = []
+                    if explicitHint.tabID != bound.tabID {
+                        conflicts.append("context_id hint=\(explicitHint.tabID), bound=\(bound.tabID)")
+                    }
+                    if let workspaceID = explicitHint.workspaceID, workspaceID != bound.workspaceID {
+                        conflicts.append(
+                            "workspace_id hint=\(workspaceID), bound=\(bound.workspaceID?.uuidString ?? "none")"
+                        )
+                    }
+                    if let windowID = explicitHint.windowID, windowID != bound.windowID {
+                        conflicts.append("window_id hint=\(windowID), bound=\(bound.windowID)")
+                    }
+                    throw MCPError.invalidParams(
+                        "Explicit tab context hint for \(toolName) conflicts with this connection's authoritative " +
+                            "tab-context binding: \(conflicts.joined(separator: "; ")); clear or intentionally rebind " +
+                            "the connection before targeting a different tab context."
+                    )
                 }
                 if let hinted = resolvedWindowID {
                     if let existing = presentationWindowByConnection[connectionID], existing != hinted {
