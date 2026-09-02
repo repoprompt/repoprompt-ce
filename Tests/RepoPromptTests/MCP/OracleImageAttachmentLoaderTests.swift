@@ -258,13 +258,54 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         }
     }
 
+    func testPhysicalRootCapturePinsEveryAliasToOneIdentity() throws {
+        let originalRoot = testRoot.appendingPathComponent("original", isDirectory: true)
+        let retargetedRoot = testRoot.appendingPathComponent("retargeted", isDirectory: true)
+        try FileManager.default.createDirectory(at: originalRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: retargetedRoot, withIntermediateDirectories: true)
+        try Self.gifData.write(to: originalRoot.appendingPathComponent("image.gif"))
+        let replacement = Data(Array("GIF87a".utf8) + [2, 0, 1, 0])
+        try replacement.write(to: retargetedRoot.appendingPathComponent("image.gif"))
+
+        let trustedRoot = testRoot.appendingPathComponent("trusted-root", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: trustedRoot, withDestinationURL: originalRoot)
+        let capture = try OracleImagePhysicalRootCapture.capture(
+            physicalRootPath: trustedRoot.path,
+            index: 0
+        )
+        let firstAlias = testRoot.appendingPathComponent("alias-a", isDirectory: true)
+        let firstProjection = capture.projection(logicalRootPath: firstAlias.path)
+
+        try FileManager.default.removeItem(at: trustedRoot)
+        try FileManager.default.createSymbolicLink(at: trustedRoot, withDestinationURL: retargetedRoot)
+        let secondAlias = testRoot.appendingPathComponent("alias-b", isDirectory: true)
+        let secondProjection = capture.projection(logicalRootPath: secondAlias.path)
+
+        XCTAssertEqual(firstProjection.rootIdentity, secondProjection.rootIdentity)
+        XCTAssertEqual(firstProjection.resolvedPhysicalRootPath, secondProjection.resolvedPhysicalRootPath)
+
+        let images = try OracleImageAttachmentLoader().load(
+            requests: [
+                .init(index: 0, path: firstAlias.appendingPathComponent("image.gif").path, title: nil),
+                .init(index: 1, path: secondAlias.appendingPathComponent("image.gif").path, title: nil),
+                .init(index: 2, path: trustedRoot.appendingPathComponent("image.gif").path, title: nil)
+            ],
+            authority: OracleImageWorkspaceAuthority(roots: [
+                firstProjection,
+                secondProjection,
+                capture.projection(logicalRootPath: trustedRoot.path)
+            ])
+        )
+        XCTAssertEqual(images.map(\.bytes), [Self.gifData, Self.gifData, Self.gifData])
+    }
+
     private func authority(logical: URL, physical: URL) throws -> OracleImageWorkspaceAuthority {
-        try OracleImageWorkspaceAuthority(roots: [
-            .capture(
-                logicalRootPath: logical.path,
-                physicalRootPath: physical.path,
-                index: 0
-            )
+        let capture = try OracleImagePhysicalRootCapture.capture(
+            physicalRootPath: physical.path,
+            index: 0
+        )
+        return OracleImageWorkspaceAuthority(roots: [
+            capture.projection(logicalRootPath: logical.path)
         ])
     }
 

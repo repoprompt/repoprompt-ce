@@ -14,18 +14,15 @@ struct OracleImageRootIdentity: Equatable {
     let mode: mode_t
 }
 
-struct OracleImageRootProjection: Equatable {
-    let logicalRootPath: String
+struct OracleImagePhysicalRootCapture: Equatable {
     let physicalRootPath: String
     let resolvedPhysicalRootPath: String
     let rootIdentity: OracleImageRootIdentity
 
     static func capture(
-        logicalRootPath: String,
         physicalRootPath: String,
         index: Int
-    ) throws -> OracleImageRootProjection {
-        let logicalRootPath = StandardizedPath.absolute(logicalRootPath)
+    ) throws -> OracleImagePhysicalRootCapture {
         let physicalRootPath = StandardizedPath.absolute(physicalRootPath)
         let resolvedPhysicalRootPath = StandardizedPath.absolute(
             URL(fileURLWithPath: physicalRootPath).resolvingSymlinksInPath().path
@@ -41,8 +38,7 @@ struct OracleImageRootProjection: Equatable {
         guard fstat(descriptor, &info) == 0 else {
             throw OracleImageLoadError.missingOrUnreadable(index: index)
         }
-        return OracleImageRootProjection(
-            logicalRootPath: logicalRootPath,
+        return OracleImagePhysicalRootCapture(
             physicalRootPath: physicalRootPath,
             resolvedPhysicalRootPath: resolvedPhysicalRootPath,
             rootIdentity: OracleImageRootIdentity(
@@ -53,6 +49,22 @@ struct OracleImageRootProjection: Equatable {
             )
         )
     }
+
+    func projection(logicalRootPath: String) -> OracleImageRootProjection {
+        OracleImageRootProjection(
+            logicalRootPath: StandardizedPath.absolute(logicalRootPath),
+            physicalRootPath: physicalRootPath,
+            resolvedPhysicalRootPath: resolvedPhysicalRootPath,
+            rootIdentity: rootIdentity
+        )
+    }
+}
+
+struct OracleImageRootProjection: Equatable {
+    let logicalRootPath: String
+    let physicalRootPath: String
+    let resolvedPhysicalRootPath: String
+    let rootIdentity: OracleImageRootIdentity
 }
 
 struct OracleImageWorkspaceAuthority: Equatable {
@@ -555,9 +567,10 @@ enum OracleImageRouteAdmission {
              .claudeCode,
              .codex,
              .openCode,
-             .cursor,
-             .grokBuild:
+             .cursor:
             true
+        case .grokBuild:
+            false
         }
     }
 }

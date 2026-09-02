@@ -65,6 +65,41 @@ final class CodexCLIProvider: AIProvider {
         }
     }
 
+    private final class ActiveStreamTaskStore: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isAccepting = true
+        private var tasks: [UUID: Task<Void, Never>] = [:]
+
+        /// `start` must only construct a task; it runs while the non-reentrant lock is held.
+        func register(
+            id: UUID,
+            start: () -> Task<Void, Never>
+        ) -> Task<Void, Never>? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard isAccepting else { return nil }
+            let task = start()
+            tasks[id] = task
+            return task
+        }
+
+        func remove(_ id: UUID) {
+            lock.lock()
+            tasks.removeValue(forKey: id)
+            lock.unlock()
+        }
+
+        func closeAndCancelAll() -> [Task<Void, Never>] {
+            lock.lock()
+            isAccepting = false
+            let activeTasks = Array(tasks.values)
+            tasks.removeAll()
+            lock.unlock()
+            activeTasks.forEach { $0.cancel() }
+            return activeTasks
+        }
+    }
+
     private struct ReconciledTerminalTurn: Equatable {
         let turnID: String
         let status: CodexNativeSessionController.TurnStatus
@@ -153,8 +188,7 @@ final class CodexCLIProvider: AIProvider {
     <codex reminder>You are operating in text only mode. No tool calls are permitted, as they will result in task failure. You must carefully read the system prompt, attached files and user message, and format your response as specified. Think carefully through your response and then answer comprehensively to address the user's task, specified in <user_instructions>.</codex reminder>
     """
 
-    private let activeStreamTasksLock = NSLock()
-    private var activeStreamTasks: [UUID: Task<Void, Never>] = [:]
+    private let activeStreamTasks = ActiveStreamTaskStore()
     private let activeRequestClientsLock = NSLock()
     private var activeRequestClients: [UUID: CodexAppServerClient] = [:]
 
@@ -198,8 +232,11 @@ final class CodexCLIProvider: AIProvider {
             try inspect(lease?.attachments ?? [])
         }
 
-        func test_registerActiveStreamTask(_ task: Task<Void, Never>, id: UUID) {
-            registerActiveStreamTask(task, id: id)
+        func test_registerActiveStreamTask(
+            id: UUID,
+            start: () -> Task<Void, Never>
+        ) -> Task<Void, Never>? {
+            activeStreamTasks.register(id: id, start: start)
         }
     #endif
 
@@ -213,38 +250,44 @@ final class CodexCLIProvider: AIProvider {
 
         return AsyncThrowingStream { continuation in
             let streamID = UUID()
-            let bridgeTask = Task { [weak self] in
-                defer {
-                    self?.unregisterActiveStreamTask(streamID)
-                    self?.unregisterActiveRequestClient(streamID)
-                }
-                guard let self else {
-                    continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Codex provider was released before streaming started."))
-                    return
-                }
+            guard let bridgeTask = activeStreamTasks.register(id: streamID, start: {
+                Task { [weak self] in
+                    defer {
+                        self?.activeStreamTasks.remove(streamID)
+                        self?.unregisterActiveRequestClient(streamID)
+                    }
+                    guard let self else {
+                        continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Codex provider was released before streaming started."))
+                        return
+                    }
 
-                do {
-                    let imageLease = try await TransientImageLease.stage(transientImages)
-                    defer { imageLease?.cleanup() }
-                    try await streamViaAppServer(
-                        baseInstructions: baseInstructions,
-                        prompt: prompt,
-                        images: imageLease?.attachments ?? [],
-                        requestedModelIdentifier: requestedModelIdentifier,
-                        fallbackReasoningEffort: fallbackReasoningEffort,
-                        serviceTier: serviceTier,
-                        requestID: streamID,
-                        continuation: continuation
-                    )
-                    continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish(throwing: CancellationError())
-                } catch {
-                    continuation.finish(throwing: error)
+                    do {
+                        let imageLease = try await TransientImageLease.stage(transientImages)
+                        defer { imageLease?.cleanup() }
+                        try await streamViaAppServer(
+                            baseInstructions: baseInstructions,
+                            prompt: prompt,
+                            images: imageLease?.attachments ?? [],
+                            requestedModelIdentifier: requestedModelIdentifier,
+                            fallbackReasoningEffort: fallbackReasoningEffort,
+                            serviceTier: serviceTier,
+                            requestID: streamID,
+                            continuation: continuation
+                        )
+                        continuation.finish()
+                    } catch is CancellationError {
+                        continuation.finish(throwing: CancellationError())
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
                 }
+            }) else {
+                continuation.finish(throwing: AIProviderError.invalidConfiguration(
+                    detail: "Codex provider was disposed before streaming started."
+                ))
+                return
             }
 
-            registerActiveStreamTask(bridgeTask, id: streamID)
             continuation.onTermination = { @Sendable _ in
                 bridgeTask.cancel()
             }
@@ -290,7 +333,7 @@ final class CodexCLIProvider: AIProvider {
     }
 
     func dispose() async {
-        let activeTasks = cancelAndRemoveActiveStreamTasks()
+        let activeTasks = activeStreamTasks.closeAndCancelAll()
         let activeClients = snapshotActiveRequestClients()
         for client in activeClients {
             await client.stop()
@@ -1281,27 +1324,6 @@ final class CodexCLIProvider: AIProvider {
             cost: nil,
             cleanupHandle: cleanupHandle
         )
-    }
-
-    private func registerActiveStreamTask(_ task: Task<Void, Never>, id: UUID) {
-        activeStreamTasksLock.lock()
-        activeStreamTasks[id] = task
-        activeStreamTasksLock.unlock()
-    }
-
-    private func unregisterActiveStreamTask(_ id: UUID) {
-        activeStreamTasksLock.lock()
-        activeStreamTasks.removeValue(forKey: id)
-        activeStreamTasksLock.unlock()
-    }
-
-    private func cancelAndRemoveActiveStreamTasks() -> [Task<Void, Never>] {
-        activeStreamTasksLock.lock()
-        let tasks = Array(activeStreamTasks.values)
-        activeStreamTasks.removeAll()
-        activeStreamTasksLock.unlock()
-        tasks.forEach { $0.cancel() }
-        return tasks
     }
 
     private func registerActiveRequestClient(_ client: CodexAppServerClient, id: UUID) {
