@@ -206,7 +206,7 @@ final class AgentModeProviderBindingService {
                 // Claude launch settings are revalidated immediately before dispatch.
                 // Avoid an eager untracked shutdown that could race a newly started run.
                 break
-            case .openCode:
+            case .openCode, .omp:
                 let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
                 guard let sessionModeID = runtime.acpSessionModeID,
                       session.runState.isActive,
@@ -239,9 +239,6 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
-            case .omp:
-                // OMP owns its internal tool permissions; RepoPrompt exposes no mutable provider preference.
-                break
             case .grokBuild:
                 // Grok full access is a launch-time `--always-approve` flag; it applies to
                 // newly launched processes and never mutates a running controller. The next

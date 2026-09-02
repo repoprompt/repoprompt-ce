@@ -316,7 +316,10 @@ final class AgentRuntimeProviderService {
             }
             return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         case .omp:
-            let config = OMPAgentConfig(enableDebugLogging: Self.enableDebugLogging)
+            let config = OMPAgentConfig(
+                enableDebugLogging: Self.enableDebugLogging,
+                modelString: modelString
+            )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created OMPACPHeadlessAgentProvider")
             }

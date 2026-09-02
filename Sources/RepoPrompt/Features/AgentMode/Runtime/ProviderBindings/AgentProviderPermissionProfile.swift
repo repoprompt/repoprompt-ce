@@ -155,11 +155,24 @@ extension AgentProviderPermissionProfile {
         }
     }
 
+    func ompPermissionLevel(
+        userConfigured: OMPAgentToolPreferences.PermissionLevel = OMPAgentToolPreferences.permissionLevel()
+    ) -> OMPAgentToolPreferences.PermissionLevel {
+        switch self {
+        case .userConfigured: userConfigured
+        case .mcpSafeDefaults: .providerManaged
+        case let .providerOverride(.omp(level)): level
+        case .providerOverride: .providerManaged
+        }
+    }
+
     func acpSessionModeID(for agent: AgentProviderKind) -> String? {
         switch agent {
         case .openCode:
             openCodeSessionModeID
-        case .cursor, .grokBuild, .omp:
+        case .omp:
+            ompPermissionLevel().sessionModeID
+        case .cursor, .grokBuild:
             nil
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil
