@@ -234,6 +234,7 @@ public enum ClaudeCompatibleModelCatalog {
     private static let haikuRaw = "haiku"
     private static let sonnetRaw = "sonnet"
     private static let opusRaw = "opus"
+    private static let fable51Raw = "claude-fable-5-1"
     private static let fable5Raw = "claude-fable-5"
     private static let opus1mRaw = "opus[1m]"
     private static let opus5Raw = "claude-opus-5"
@@ -247,6 +248,12 @@ public enum ClaudeCompatibleModelCatalog {
     private static let haiku45Raw = "claude-haiku-4-5"
 
     private static let claudeModels: [StaticModel] = [
+        StaticModel(
+            rawValue: fable51Raw,
+            displayName: "Fable 5.1",
+            description: "Claude Fable 5.1. Anthropic's newest and most capable model for demanding reasoning and long-horizon agentic work.",
+            supportsXHigh: true
+        ),
         StaticModel(
             rawValue: fable5Raw,
             displayName: "Fable 5",
