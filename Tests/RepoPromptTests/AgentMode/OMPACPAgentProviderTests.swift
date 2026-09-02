@@ -109,15 +109,16 @@ final class OMPACPAgentProviderTests: XCTestCase {
         XCTAssertNotNil(provider as? OMPACPAgentProvider)
     }
 
-    func testHeadlessFactoryReturnsOMPProviderWithoutModelConfiguration() {
+    func testHeadlessFactoryCarriesSelectedOMPModel() throws {
         let provider = AgentRuntimeProviderService.shared.makeProvider(
             for: .omp,
-            modelString: "ignored-model"
+            modelString: "openai-codex/gpt-5.6-luna"
         )
-        XCTAssertNotNil(provider as? OMPACPHeadlessAgentProvider)
+        let ompProvider = try XCTUnwrap(provider as? OMPACPHeadlessAgentProvider)
+        XCTAssertEqual(ompProvider.test_config.modelString, "openai-codex/gpt-5.6-luna")
     }
 
-    func testCatalogExposesOnlyProviderManagedDefaultModel() {
+    func testCatalogExposesStickyDefaultAndDiscoveredModels() {
         AgentACPModelRegistry.shared.test_reset(providerID: .omp)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .omp) }
 
@@ -139,12 +140,12 @@ final class OMPACPAgentProviderTests: XCTestCase {
         let availability = AgentModelCatalog.AvailabilityContext(ompAvailable: true)
         let options = AgentModelCatalog.options(for: .omp, availability: availability)
 
-        XCTAssertEqual(options.map(\.rawValue), [AgentModel.defaultModel.rawValue])
+        XCTAssertEqual(options.map(\.rawValue), [AgentModel.defaultModel.rawValue, "discovered-omp-model"])
         XCTAssertEqual(
             AgentModelCatalog.defaultModelRaw(for: .omp, availability: availability),
             AgentModel.defaultModel.rawValue
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             AgentModelCatalog.isValid(
                 rawModel: "discovered-omp-model",
                 for: .omp,
@@ -161,6 +162,16 @@ final class OMPACPAgentProviderTests: XCTestCase {
         XCTAssertTrue(AgentModelCatalog.isAgentAvailable(.omp, availability: availability))
     }
 
+    func testCatalogFallsBackToDefaultBeforeOMPDiscovery() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .omp)
+        let availability = AgentModelCatalog.AvailabilityContext(ompAvailable: true)
+
+        XCTAssertEqual(
+            AgentModelCatalog.options(for: .omp, availability: availability).map(\.rawValue),
+            [AgentModel.defaultModel.rawValue]
+        )
+    }
+
     func testTaskLabelsDoNotSelectProviderManagedOMPImplicitly() {
         let onlyOMP = AgentModelCatalog.AvailabilityContext.none.assumingAvailable(.omp)
         for label in AgentModelCatalog.taskLabels {
@@ -168,19 +179,73 @@ final class OMPACPAgentProviderTests: XCTestCase {
         }
     }
 
-    func testPermissionBindingIsInformationalAndProviderManaged() {
-        XCTAssertEqual(AgentProviderPermissionLevelID.options(for: .omp), [.omp])
-        XCTAssertEqual(AgentProviderPermissionLevelID.subagentDefault(for: .omp), .omp)
-        XCTAssertEqual(AgentProviderPermissionLevelID.omp.subagentRawValue, "providerManaged")
+    func testSessionModeBindingExposesDefaultAndPlan() {
+        XCTAssertEqual(
+            AgentProviderPermissionLevelID.options(for: .omp),
+            [.omp(.providerManaged), .omp(.plan)]
+        )
+        XCTAssertEqual(AgentProviderPermissionLevelID.subagentDefault(for: .omp), .omp(.providerManaged))
+        XCTAssertEqual(AgentProviderPermissionLevelID.omp(.providerManaged).subagentRawValue, "providerManaged")
+        XCTAssertEqual(AgentProviderPermissionLevelID.omp(.plan).subagentRawValue, "plan")
+        XCTAssertEqual(
+            AgentProviderPermissionLevelID(providerID: .omp, subagentRawValue: "plan"),
+            .omp(.plan)
+        )
         XCTAssertTrue(ACPPermissionOptionPolicy.isAutoSelectable(optionID: "allow-once", for: .omp))
     }
 
     @MainActor
-    func testMCPSafeDefaultsLeaveOMPRuntimePermissionsProviderManaged() {
+    func testMCPSafeDefaultsUseOMPDefaultSessionModeWithoutApprovalChanges() {
         let runtimePermission = AgentProviderPreferenceSnapshotStore()
             .runtimePermission(for: .omp, profile: .mcpSafeDefaults)
 
-        XCTAssertEqual(runtimePermission, AgentProviderRuntimePermissionBinding())
+        XCTAssertEqual(runtimePermission.acpSessionModeID, "default")
+        XCTAssertFalse(runtimePermission.autoApproveAllACPToolPermissions)
+        XCTAssertFalse(runtimePermission.acceptsPendingACPApprovalWhenActivated)
+    }
+
+    @MainActor
+    func testOMPPlanOverrideUsesPlanSessionMode() {
+        let runtimePermission = AgentProviderPreferenceSnapshotStore()
+            .runtimePermission(for: .omp, profile: .providerOverride(.omp(.plan)))
+
+        XCTAssertEqual(runtimePermission.acpSessionModeID, "plan")
+        XCTAssertFalse(runtimePermission.autoApproveAllACPToolPermissions)
+        XCTAssertFalse(runtimePermission.acceptsPendingACPApprovalWhenActivated)
+    }
+
+    @MainActor
+    func testForeignOMPOverrideFallsBackToDefaultSessionMode() {
+        let runtimePermission = AgentProviderPreferenceSnapshotStore()
+            .runtimePermission(for: .omp, profile: .providerOverride(.grokBuild(.fullAccess)))
+
+        XCTAssertEqual(runtimePermission.acpSessionModeID, "default")
+    }
+
+    func testOMPSessionModePreferencePersists() throws {
+        let suiteName = "OMPACPAgentProviderTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertEqual(OMPAgentToolPreferences.permissionLevel(defaults: defaults), .providerManaged)
+        OMPAgentToolPreferences.setPermissionLevel(.plan, defaults: defaults)
+        XCTAssertEqual(OMPAgentToolPreferences.permissionLevel(defaults: defaults), .plan)
+    }
+
+    @MainActor
+    func testOMPSessionModePreferenceFlowsThroughUserConfiguredBinding() throws {
+        let suiteName = "OMPACPAgentProviderTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AgentProviderPreferenceSnapshotStore(defaults: defaults)
+
+        store.setPermissionLevel(.omp(.plan))
+
+        XCTAssertEqual(
+            store.runtimePermission(for: .omp, profile: .userConfigured).acpSessionModeID,
+            "plan"
+        )
+        XCTAssertEqual(store.revision(for: .omp), 1)
     }
 
     func testObservedOMPMCPClientIdentityMatchesRoutingHint() {

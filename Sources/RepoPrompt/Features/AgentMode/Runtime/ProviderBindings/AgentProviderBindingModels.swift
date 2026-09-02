@@ -19,7 +19,7 @@ enum AgentProviderPermissionLevelID: Hashable {
     case openCode(OpenCodeAgentToolPreferences.PermissionLevel)
     case cursor(CursorAgentToolPreferences.PermissionLevel)
     case grokBuild(GrokBuildAgentToolPreferences.PermissionLevel)
-    case omp
+    case omp(OMPAgentToolPreferences.PermissionLevel)
 
     var providerID: AgentProviderBindingID {
         switch self {
@@ -51,7 +51,7 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .grokBuild:
             .grokBuild(.managedDefault)
         case .omp:
-            .omp
+            .omp(.providerManaged)
         }
     }
 
@@ -68,7 +68,7 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .grokBuild:
             GrokBuildAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grokBuild)
         case .omp:
-            [.omp]
+            OMPAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.omp)
         }
     }
 
@@ -91,8 +91,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             guard let level = GrokBuildAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .grokBuild(level)
         case .omp:
-            guard raw == "providerManaged" else { return nil }
-            self = .omp
+            guard let level = OMPAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            self = .omp(level)
         }
     }
 
@@ -108,8 +108,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.rawValue
         case let .grokBuild(level):
             level.rawValue
-        case .omp:
-            "providerManaged"
+        case let .omp(level):
+            level.rawValue
         }
     }
 
@@ -125,8 +125,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.displayName
         case let .grokBuild(level):
             level.displayName
-        case .omp:
-            "Provider Managed"
+        case let .omp(level):
+            level.displayName
         }
     }
 
@@ -142,8 +142,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.iconName
         case let .grokBuild(level):
             level.iconName
-        case .omp:
-            "shield"
+        case let .omp(level):
+            level.iconName
         }
     }
 
@@ -159,8 +159,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .grokBuild(level):
             level.detailText
-        case .omp:
-            "OMP controls its internal tools. RepoPrompt policy applies only to RepoPrompt MCP tools."
+        case let .omp(level):
+            level.detailText
         }
     }
 
