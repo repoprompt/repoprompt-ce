@@ -77,15 +77,27 @@ struct DomainDeletionTombstone: Codable {
     let version: Int
     let workspaceID: UUID
     let fileURL: URL
+    let retainedOperations: [DomainRecordedOperation]?
     let operation: DomainRecordedOperation
     let deletedAt: Date
 
-    init(workspaceID: UUID, fileURL: URL, operation: DomainRecordedOperation, deletedAt: Date) {
+    init(
+        workspaceID: UUID,
+        fileURL: URL,
+        retainedOperations: [DomainRecordedOperation] = [],
+        operation: DomainRecordedOperation,
+        deletedAt: Date
+    ) {
         version = Self.schemaVersion
         self.workspaceID = workspaceID
         self.fileURL = fileURL
+        self.retainedOperations = retainedOperations.isEmpty ? nil : retainedOperations
         self.operation = operation
         self.deletedAt = deletedAt
+    }
+
+    var recordedOperations: [DomainRecordedOperation] {
+        (retainedOperations ?? []) + [operation]
     }
 }
 
@@ -934,7 +946,7 @@ package struct DomainPersistenceCoordinator {
                 return DomainPersistenceBootstrap(
                     workspaces: [],
                     unavailableWorkspaces: [],
-                    deletedOperations: deletionTombstones.map(\.operation),
+                    deletedOperations: deletionTombstones.flatMap(\.recordedOperations),
                     deletedWorkspaceIDs: deletedIDs,
                     health: .degradedReadOnly(reason: "workspace_index_decode_failed"),
                     catalogRevision: 0
@@ -994,7 +1006,7 @@ package struct DomainPersistenceCoordinator {
         return DomainPersistenceBootstrap(
             workspaces: loaded,
             unavailableWorkspaces: unavailable,
-            deletedOperations: deletionTombstones.map(\.operation),
+            deletedOperations: deletionTombstones.flatMap(\.recordedOperations),
             deletedWorkspaceIDs: deletedIDs,
             health: globalHealth,
             catalogRevision: catalog?.revision ?? 0
@@ -1631,6 +1643,7 @@ package struct DomainPersistenceCoordinator {
                 let tombstone = DomainDeletionTombstone(
                     workspaceID: document.workspaceID,
                     fileURL: document.fileURL,
+                    retainedOperations: current.operations,
                     operation: operation,
                     deletedAt: now
                 )
@@ -1728,10 +1741,12 @@ package struct DomainPersistenceCoordinator {
         return DomainDeletionTombstone(
             workspaceID: tombstone.workspaceID,
             fileURL: tombstone.fileURL,
+            retainedOperations: tombstone.retainedOperations ?? [],
             operation: DomainRecordedOperation(
                 fingerprint: operation.fingerprint,
                 recordedAt: operation.recordedAt,
-                outcome: outcome
+                outcome: outcome,
+                resultingWorkspaceID: operation.resultingWorkspaceID
             ),
             deletedAt: tombstone.deletedAt
         )

@@ -164,6 +164,7 @@ actor DomainWorkspaceContextAuthority {
     /// never persist ephemeral/test workspaces. A later command invalidates the overlay.
     private var readRegistrations: [UUID: DomainWorkspaceSnapshot] = [:]
     private var unavailableWorkspaces: [UUID: DomainPersistenceBootstrap.UnavailableWorkspace] = [:]
+    private var deletedWorkspaceIDs: Set<UUID> = []
     private var globalOperations = BoundedDomainOperationIndex(capacity: maximumGlobalOperations)
     private var health: DomainAuthorityHealth = .writable
     private var catalogRevision: UInt64 = 0
@@ -202,6 +203,7 @@ actor DomainWorkspaceContextAuthority {
         let durableOperations = loaded.deletedOperations
             + loaded.workspaces.flatMap(\.operations)
         globalOperations.replace(with: durableOperations)
+        deletedWorkspaceIDs = loaded.deletedWorkspaceIDs
         unavailableWorkspaces = Dictionary(uniqueKeysWithValues: loaded.unavailableWorkspaces.map {
             ($0.workspaceID, $0)
         })
@@ -398,11 +400,10 @@ actor DomainWorkspaceContextAuthority {
         let outcome: DomainCommandOutcome = switch envelope.command {
         case let .createWorkspace(document):
             await createWorkspace(document, envelope: envelope, fingerprint: fingerprint)
-        case let .resolveOrCreateWorkspaceForExactRoot(document, canonicalRootPath, preferredWorkspaceIDs):
+        case let .resolveOrCreateWorkspaceForExactRoot(document, canonicalRootPath):
             await resolveOrCreateWorkspaceForExactRoot(
                 document,
                 canonicalRootPath: canonicalRootPath,
-                preferredWorkspaceIDs: preferredWorkspaceIDs,
                 envelope: envelope,
                 fingerprint: fingerprint
             )
@@ -461,7 +462,7 @@ actor DomainWorkspaceContextAuthority {
     private func rejectsEphemeralPersistence(_ command: DomainWorkspaceCommand) -> Bool {
         switch command {
         case let .createWorkspace(document),
-             let .resolveOrCreateWorkspaceForExactRoot(document, _, _),
+             let .resolveOrCreateWorkspaceForExactRoot(document, _),
              let .replaceWorkingDocument(document):
             document.metadata.isEphemeral
         case let .saveWorkspaceDocument(workspaceID),
@@ -475,7 +476,7 @@ actor DomainWorkspaceContextAuthority {
     private func commandDocument(_ command: DomainWorkspaceCommand) -> DomainWorkspaceDocument? {
         switch command {
         case let .createWorkspace(document),
-             let .resolveOrCreateWorkspaceForExactRoot(document, _, _),
+             let .resolveOrCreateWorkspaceForExactRoot(document, _),
              let .replaceWorkingDocument(document):
             document
         case .saveWorkspaceDocument, .deleteWorkspace, .resolveExternalConflict:
@@ -536,7 +537,11 @@ actor DomainWorkspaceContextAuthority {
                 disposition: prior.disposition,
                 resultingDigest: prior.resultingDigest
             )
-            return prior.outcome(workspace: makeSnapshot(record))
+            return replayOutcome(
+                prior,
+                command: envelope.command,
+                fallbackWorkspace: makeSnapshot(record)
+            )
         }
         if let prior = globalOperations[envelope.operationID] {
             guard prior.fingerprint == fingerprint else {
@@ -563,17 +568,69 @@ actor DomainWorkspaceContextAuthority {
                 disposition: prior.disposition,
                 resultingDigest: prior.resultingDigest
             )
-            let replayWorkspace: DomainWorkspaceSnapshot? = switch envelope.command {
-            case .resolveOrCreateWorkspaceForExactRoot:
-                records.values.first(where: {
-                    $0.document.contentDigest == prior.resultingDigest
-                }).map(makeSnapshot)
-            default:
-                workspaceID.flatMap(canonicalWorkspaceSnapshot)
-            }
-            return prior.outcome(workspace: replayWorkspace)
+            return replayOutcome(
+                prior,
+                command: envelope.command,
+                fallbackWorkspace: workspaceID.flatMap(canonicalWorkspaceSnapshot)
+            )
         }
         return nil
+    }
+
+    private func replayOutcome(
+        _ prior: DomainRecordedOperation,
+        command: DomainWorkspaceCommand,
+        fallbackWorkspace: DomainWorkspaceSnapshot?
+    ) -> DomainCommandOutcome {
+        guard case .resolveOrCreateWorkspaceForExactRoot = command,
+              prior.disposition == .applied || prior.disposition == .unchanged
+        else {
+            return prior.outcome(workspace: fallbackWorkspace)
+        }
+
+        if let resultingWorkspaceID = prior.resultingWorkspaceID {
+            if let record = records[resultingWorkspaceID] {
+                return prior.outcome(workspace: makeSnapshot(record))
+            }
+            return unavailableReplayOutcome(
+                prior,
+                diagnostic: deletedWorkspaceIDs.contains(resultingWorkspaceID)
+                    ? "recorded_result_workspace_deleted"
+                    : "recorded_result_workspace_unavailable"
+            )
+        }
+
+        // Pre-result-identity journals can only recover by digest. UUID ordering keeps the
+        // compatibility fallback deterministic if legacy data contains ambiguous matches.
+        let legacyWorkspace = records.values
+            .filter { $0.document.contentDigest == prior.resultingDigest }
+            .sorted { $0.document.workspaceID.uuidString < $1.document.workspaceID.uuidString }
+            .first
+            .map(makeSnapshot)
+        if let legacyWorkspace {
+            return prior.outcome(workspace: legacyWorkspace)
+        }
+        return unavailableReplayOutcome(
+            prior,
+            diagnostic: "legacy_recorded_result_workspace_unavailable"
+        )
+    }
+
+    private func unavailableReplayOutcome(
+        _ prior: DomainRecordedOperation,
+        diagnostic: String
+    ) -> DomainCommandOutcome {
+        DomainCommandOutcome(
+            operationID: prior.operationID,
+            disposition: .failed,
+            before: prior.before,
+            after: prior.after,
+            catalogRevision: catalogRevision,
+            resultingDigest: prior.resultingDigest,
+            errorCode: .workspaceUnavailable,
+            diagnostic: diagnostic,
+            workspace: nil
+        )
     }
 
     func reloadExternalChanges() async -> DomainExternalReloadActivity {
@@ -615,6 +672,7 @@ actor DomainWorkspaceContextAuthority {
             let previousHealth = health
             health = durableCatalog.health
             catalogRevision = max(catalogRevision, durableCatalog.catalogRevision)
+            deletedWorkspaceIDs = durableCatalog.deletedWorkspaceIDs
             for operation in durableCatalog.deletedOperations
                 + durableCatalog.workspaces.flatMap(\.operations)
             {
@@ -1249,7 +1307,6 @@ actor DomainWorkspaceContextAuthority {
     private func resolveOrCreateWorkspaceForExactRoot(
         _ document: DomainWorkspaceDocument,
         canonicalRootPath: String,
-        preferredWorkspaceIDs: [UUID],
         envelope: DomainWorkspaceCommandEnvelope,
         fingerprint: String
     ) async -> DomainCommandOutcome {
@@ -1272,9 +1329,6 @@ actor DomainWorkspaceContextAuthority {
             )
         }
 
-        let preferredRanks = Dictionary(
-            uniqueKeysWithValues: preferredWorkspaceIDs.enumerated().map { ($0.element, $0.offset) }
-        )
         let eligibleMatches = records.values.filter { record in
             let metadata = record.document.metadata
             return !metadata.isSystemWorkspace
@@ -1284,12 +1338,20 @@ actor DomainWorkspaceContextAuthority {
                     Self.canonicalFolderOpenRootPath($0) == canonicalRootPath
                 })
         }.sorted { lhs, rhs in
-            let lhsRank = preferredRanks[lhs.document.workspaceID] ?? Int.max
-            let rhsRank = preferredRanks[rhs.document.workspaceID] ?? Int.max
-            if lhsRank != rhsRank {
-                return lhsRank < rhsRank
+            let lhsMetadata = lhs.document.metadata
+            let rhsMetadata = rhs.document.metadata
+            if lhsMetadata.dateModified != rhsMetadata.dateModified {
+                return lhsMetadata.dateModified > rhsMetadata.dateModified
             }
-            return lhs.document.workspaceID.uuidString < rhs.document.workspaceID.uuidString
+            let lhsFoldedName = lhsMetadata.name.lowercased()
+            let rhsFoldedName = rhsMetadata.name.lowercased()
+            if lhsFoldedName != rhsFoldedName {
+                return lhsFoldedName < rhsFoldedName
+            }
+            if lhsMetadata.name != rhsMetadata.name {
+                return lhsMetadata.name < rhsMetadata.name
+            }
+            return lhsMetadata.workspaceID.uuidString < rhsMetadata.workspaceID.uuidString
         }
         if let existing = eligibleMatches.first {
             return await unchangedOutcome(envelope, record: existing)
@@ -1375,7 +1437,8 @@ actor DomainWorkspaceContextAuthority {
         let recorded = DomainRecordedOperation(
             fingerprint: fingerprint,
             recordedAt: Date(),
-            outcome: provisional
+            outcome: provisional,
+            resultingWorkspaceID: document.workspaceID
         )
         do {
             let persisted = try await persistence.persistCreated(
@@ -1403,6 +1466,7 @@ actor DomainWorkspaceContextAuthority {
                 fileMetadata: .missing
             )
             records[document.workspaceID] = record
+            deletedWorkspaceIDs.remove(document.workspaceID)
             globalOperations.insert(recorded)
             let outcome = DomainCommandOutcome(
                 operationID: envelope.operationID,
@@ -1504,6 +1568,7 @@ actor DomainWorkspaceContextAuthority {
                 now: operation.recordedAt
             )
             records.removeValue(forKey: workspaceID)
+            deletedWorkspaceIDs.insert(workspaceID)
             catalogRevision = deleted.catalogRevision
             let cleanupDiagnostic = deleted.tombstone.operation.diagnostic
             let outcome = DomainCommandOutcome(
@@ -1518,7 +1583,8 @@ actor DomainWorkspaceContextAuthority {
             globalOperations.insert(DomainRecordedOperation(
                 fingerprint: fingerprint,
                 recordedAt: operation.recordedAt,
-                outcome: outcome
+                outcome: outcome,
+                resultingWorkspaceID: operation.resultingWorkspaceID
             ))
             publish(
                 kind: .workspaceDeleted,
@@ -2195,6 +2261,7 @@ actor DomainWorkspaceContextAuthority {
         if refreshed.workspaceIsDeleted {
             records.removeValue(forKey: workspaceID)
             unavailableWorkspaces.removeValue(forKey: workspaceID)
+            deletedWorkspaceIDs.insert(workspaceID)
             return
         }
         guard let workspace = refreshed.workspace else {
@@ -2216,6 +2283,7 @@ actor DomainWorkspaceContextAuthority {
         } else {
             nil
         }
+        deletedWorkspaceIDs.remove(workspaceID)
         records[workspaceID] = WorkspaceRecord(
             document: workspace.document,
             savedDigest: workspace.savedDigest,
@@ -2528,7 +2596,7 @@ private extension DomainWorkspaceCommandEnvelope {
     var workspaceID: UUID? {
         switch command {
         case let .createWorkspace(document): document.workspaceID
-        case let .resolveOrCreateWorkspaceForExactRoot(document, _, _): document.workspaceID
+        case let .resolveOrCreateWorkspaceForExactRoot(document, _): document.workspaceID
         case let .replaceWorkingDocument(document): document.workspaceID
         case let .saveWorkspaceDocument(workspaceID): workspaceID
         case let .deleteWorkspace(workspaceID): workspaceID

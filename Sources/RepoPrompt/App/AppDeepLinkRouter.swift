@@ -108,7 +108,15 @@ final class AppDeepLinkRouter {
             )
             return
         }
-        guard let routingCatalog else { return }
+        guard let routingCatalog else {
+            receivingWindow.enqueueCommand(
+                command,
+                folderRoute: .unresolved(
+                    expectedRoot: WorkspaceRootSetKey(paths: [folderPath])
+                )
+            )
+            return
+        }
         var candidateRepresentations: [UUID: WorkspaceCandidateRepresentation] = [:]
 
         // Persistent candidates come from one runtime-owned catalog snapshot in production.
@@ -142,7 +150,12 @@ final class AppDeepLinkRouter {
         ),
             let winningRepresentation = candidateRepresentations[winner.id]
         else {
-            receivingWindow.enqueueCommand(command)
+            receivingWindow.enqueueCommand(
+                command,
+                folderRoute: .unresolved(
+                    expectedRoot: WorkspaceRootSetKey(paths: [folderPath])
+                )
+            )
             return
         }
 
@@ -170,12 +183,16 @@ final class AppDeepLinkRouter {
             )
             return
         }
-        targetWindow.enqueueCommand(
-            command,
-            resolvedFolderWorkspaceID: winner.id,
-            expectedFolderRootKey: WorkspaceRootSetKey(paths: [folderPath]),
-            allowsLocalWorkspaceFallback: !winningRepresentation.isAuthorityOwned
-        )
+        let expectedRoot = WorkspaceRootSetKey(paths: [folderPath])
+        let folderRoute: FolderRouteState = if winningRepresentation.isAuthorityOwned {
+            .authorityExactRoot(expectedRoot: expectedRoot)
+        } else {
+            .liveWindowSupplement(
+                workspaceID: winner.id,
+                expectedRoot: expectedRoot
+            )
+        }
+        targetWindow.enqueueCommand(command, folderRoute: folderRoute)
     }
 
     private func rerouteOpenCommand(

@@ -892,47 +892,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         return decodeDomainWorkspaceRoutingSnapshot(snapshot)
     }
 
-    /// Resolves a queued route against the current runtime authority. Canonical state wins over
-    /// transient read overlays; candidates that were explicitly sourced from a live window may
-    /// fall back to that local projection when neither runtime layer owns the workspace.
-    func resolvedWorkspaceForFolderRoute(
-        workspaceID: UUID,
-        expectedRoot: WorkspaceRootSetKey,
-        allowsLocalWorkspaceFallback: Bool
-    ) async -> WorkspaceModel? {
-        let workspace: WorkspaceModel?
-        if let domainWorkspaceAuthorityClient {
-            let canonicalSnapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(workspaceID)
-            let snapshot: DomainWorkspaceSnapshot? = if let canonicalSnapshot {
-                canonicalSnapshot
-            } else {
-                await domainWorkspaceAuthorityClient.workspaceSnapshot(workspaceID)
-            }
-            if let snapshot {
-                do {
-                    workspace = try Self.decodeDomainWorkspaceProjection(
-                        documentBytes: snapshot.document.documentBytes,
-                        fileURL: snapshot.document.fileURL
-                    )
-                } catch {
-                    Self.logger.error("Domain workspace route decode failed: \(error.localizedDescription, privacy: .public)")
-                    return nil
-                }
-            } else if allowsLocalWorkspaceFallback {
-                workspace = self.workspace(withID: workspaceID)
-            } else {
-                workspace = nil
-            }
-        } else {
-            workspace = self.workspace(withID: workspaceID)
-        }
-
-        guard let workspace,
-              WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: workspace)
-        else { return nil }
-        return workspace
-    }
-
     private func decodeDomainWorkspaceRoutingSnapshot(
         _ snapshot: DomainWorkspaceCatalogSnapshot
     ) -> [WorkspaceModel]? {
@@ -10887,10 +10846,6 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         try Task.checkCancellation()
         let candidates = try persistentFolderOpenCandidates(from: authoritySnapshot)
-        let preferredWorkspaceIDs = WorkspaceFolderOpenResolver.eligibleMatches(
-            forFolderPath: folderURL.path,
-            in: candidates
-        ).map(\.id)
         let workspace = WorkspaceModel(
             name: uniqueWorkspaceName(
                 baseName: folderURL.lastPathComponent,
@@ -10910,7 +10865,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspace,
                 fileURL: fileURL,
                 canonicalRootPath: canonicalRootPath,
-                preferredWorkspaceIDs: preferredWorkspaceIDs,
                 operationID: UUID()
             )
         } catch {

@@ -22,8 +22,7 @@ package enum DomainWorkspaceCommand: Codable, Equatable, Sendable {
     case createWorkspace(DomainWorkspaceDocument)
     case resolveOrCreateWorkspaceForExactRoot(
         document: DomainWorkspaceDocument,
-        canonicalRootPath: String,
-        preferredWorkspaceIDs: [UUID]
+        canonicalRootPath: String
     )
     case replaceWorkingDocument(DomainWorkspaceDocument)
     case saveWorkspaceDocument(workspaceID: UUID)
@@ -82,7 +81,7 @@ package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
         switch command {
         case let .createWorkspace(document):
             components += ["create", document.workspaceID.uuidString, document.fileURL.absoluteString, document.contentDigest]
-        case let .resolveOrCreateWorkspaceForExactRoot(document, canonicalRootPath, preferredWorkspaceIDs):
+        case let .resolveOrCreateWorkspaceForExactRoot(document, canonicalRootPath):
             components += [
                 "resolve-or-create-exact-root",
                 document.workspaceID.uuidString,
@@ -90,7 +89,6 @@ package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
                 document.contentDigest,
                 canonicalRootPath,
             ]
-            components += preferredWorkspaceIDs.map(\.uuidString)
         case let .replaceWorkingDocument(document):
             components += ["replace", document.workspaceID.uuidString, document.fileURL.absoluteString, document.contentDigest]
         case let .saveWorkspaceDocument(workspaceID):
@@ -187,10 +185,16 @@ struct DomainRecordedOperation: Codable, Equatable, Sendable {
     let after: DomainRevisionState?
     let catalogRevision: UInt64
     let resultingDigest: String?
+    let resultingWorkspaceID: UUID?
     let errorCode: DomainCommandErrorCode?
     let diagnostic: String?
 
-    init(fingerprint: String, recordedAt: Date, outcome: DomainCommandOutcome) {
+    init(
+        fingerprint: String,
+        recordedAt: Date,
+        outcome: DomainCommandOutcome,
+        resultingWorkspaceID: UUID? = nil
+    ) {
         operationID = outcome.operationID
         self.fingerprint = fingerprint
         self.recordedAt = recordedAt
@@ -199,6 +203,7 @@ struct DomainRecordedOperation: Codable, Equatable, Sendable {
         after = outcome.after
         catalogRevision = outcome.catalogRevision
         resultingDigest = outcome.resultingDigest
+        self.resultingWorkspaceID = resultingWorkspaceID ?? outcome.workspace?.document.workspaceID
         errorCode = outcome.errorCode
         diagnostic = outcome.diagnostic
     }

@@ -108,18 +108,76 @@ import XCTest
             )
         }
 
-        func testUnrelatedCatalogConflictRetriesWithFreshRevision() async throws {
+        func testInteractiveOpenUsesCurrentAuthorityRecentOrderingAfterSnapshot() async throws {
             let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1301)
+            let requestedFolder = try makeFolder(named: "CurrentAuthorityOrdering")
+            let secondaryFolder = try makeFolder(named: "CurrentAuthorityOrderingSecondary")
+            let older = try WorkspaceModel(
+                id: workspaceID(10),
+                dateModified: Date(timeIntervalSinceReferenceDate: 100),
+                name: "Older",
+                repoPaths: [requestedFolder.path]
+            )
+            try await createAuthorityWorkspace(older, using: client)
+
             let openingManager = makeManager(domainRuntime: runtime)
-            let mutatingManager = makeManager(domainRuntime: runtime)
             await openingManager.awaitInitialized()
-            await mutatingManager.awaitInitialized()
-            let requestedFolder = try makeFolder(named: "RequestedAfterConflict")
-            let unrelatedFolder = try makeFolder(named: "UnrelatedCatalogMutation")
+
+            let commonDate = Date(timeIntervalSinceReferenceDate: 200)
+            let hidden = try WorkspaceModel(
+                id: workspaceID(7),
+                dateModified: Date(timeIntervalSinceReferenceDate: 400),
+                name: "Hidden",
+                repoPaths: [requestedFolder.path],
+                isHiddenInMenus: true
+            )
+            let system = try WorkspaceModel(
+                id: workspaceID(6),
+                dateModified: Date(timeIntervalSinceReferenceDate: 300),
+                name: "System",
+                repoPaths: [requestedFolder.path],
+                isSystemWorkspace: true
+            )
+            let foldedNameLater = try WorkspaceModel(
+                id: workspaceID(5),
+                dateModified: commonDate,
+                name: "beta",
+                repoPaths: [requestedFolder.path]
+            )
+            let exactNameLater = try WorkspaceModel(
+                id: workspaceID(4),
+                dateModified: commonDate,
+                name: "alpha",
+                repoPaths: [requestedFolder.path]
+            )
+            let uuidLater = try WorkspaceModel(
+                id: workspaceID(2),
+                dateModified: commonDate,
+                name: "Alpha",
+                repoPaths: [requestedFolder.path]
+            )
+            let expectedWinner = try WorkspaceModel(
+                id: workspaceID(1),
+                dateModified: commonDate,
+                name: "Alpha",
+                repoPaths: [secondaryFolder.path, requestedFolder.path]
+            )
+            let insertedAfterSnapshot = [
+                hidden,
+                system,
+                foldedNameLater,
+                exactNameLater,
+                uuidLater,
+                expectedWinner
+            ]
             openingManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
-                _ = try? await mutatingManager.resolveOrCreatePersistentWorkspace(
-                    fromFolderURL: unrelatedFolder
-                )
+                for workspace in insertedAfterSnapshot {
+                    _ = try? await client.create(
+                        workspace,
+                        fileURL: self.authorityWorkspaceFileURL(workspace.id)
+                    )
+                }
             }
 
             try await openingManager.openWorkspace(
@@ -127,25 +185,24 @@ import XCTest
                 behavior: .createNewWorkspace
             )
 
-            let snapshot = await openingManager.workspaceRoutingCatalogSnapshot()
-            let routingSnapshot = try XCTUnwrap(snapshot)
+            let catalogSnapshot = await openingManager.workspaceRoutingCatalogSnapshot()
+            let snapshot = try XCTUnwrap(catalogSnapshot)
+            let exactRootMatches = snapshot.filter {
+                WorkspaceFolderOpenResolver.containsExactRoot(requestedFolder.path, in: $0)
+            }
             XCTAssertEqual(
-                routingSnapshot.count(where: {
-                    WorkspaceFolderOpenResolver.containsExactRoot(requestedFolder.path, in: $0)
-                }),
-                1
+                Set(exactRootMatches.map(\.id)),
+                Set(([older] + insertedAfterSnapshot).map(\.id)),
+                "Folder-open reuse must not create a third workspace from the stale caller snapshot"
             )
+            XCTAssertEqual(openingManager.activeWorkspaceID, expectedWinner.id)
             XCTAssertEqual(
-                routingSnapshot.count(where: {
-                    WorkspaceFolderOpenResolver.containsExactRoot(unrelatedFolder.path, in: $0)
-                }),
-                1
-            )
-            XCTAssertTrue(
-                try WorkspaceFolderOpenResolver.containsExactRoot(
-                    requestedFolder.path,
-                    in: XCTUnwrap(openingManager.activeWorkspace)
-                )
+                WorkspaceFolderOpenResolver.bestEligibleMatch(
+                    forFolderPath: requestedFolder.path,
+                    in: exactRootMatches
+                )?.id,
+                expectedWinner.id,
+                "The runtime winner must match the complete Recent Workspaces ordering"
             )
         }
 
@@ -201,49 +258,134 @@ import XCTest
             XCTAssertEqual(openingManager.activeWorkspaceID, existing.id)
         }
 
-        func testReplayedResolveOrCreateReturnsOriginalReusedWorkspace() async throws {
+        func testReplayedResolveOrCreateReturnsOriginalWorkspaceAfterResultDigestChanges() async throws {
             let runtime = try await makeDomainRuntime()
-            let manager = makeManager(domainRuntime: runtime)
-            await manager.awaitInitialized()
-            let folder = try makeFolder(named: "ResolveOrCreateReplay")
-            let existing = manager.createWorkspace(name: "Replay Winner", repoPaths: [folder.path])
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(2))
-            while clock.now < deadline {
-                let snapshot = await manager.workspaceRoutingCatalogSnapshot()
-                if snapshot?.contains(where: { $0.id == existing.id }) == true { break }
-                try await clock.sleep(for: .milliseconds(10))
-            }
-            let client = DomainWorkspaceAuthorityClient(
-                store: runtime.workspaceStore,
-                windowID: -1301
-            )
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1302)
+            let folder = try makeFolder(named: "ResolveOrCreateReplayMutation")
+            let existing = WorkspaceModel(name: "Replay Winner", repoPaths: [folder.path])
+            try await createAuthorityWorkspace(existing, using: client)
             let proposed = WorkspaceModel(name: "Replay Proposed", repoPaths: [folder.path])
-            let proposedFileURL = storageRoot.appendingPathComponent("\(proposed.id.uuidString).json")
-            let canonicalRootPath = try XCTUnwrap(
-                WorkspaceRootSetKey(paths: [folder.path]).normalizedPaths.first
-            ).lowercased()
+            let canonicalRootPath = try canonicalRootPath(folder)
             let operationID = UUID()
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath,
+                operationID: operationID,
+                windowID: -1302
+            )
 
-            let first = try await client.resolveOrCreatePersistentWorkspace(
-                proposed,
-                fileURL: proposedFileURL,
-                canonicalRootPath: canonicalRootPath,
-                preferredWorkspaceIDs: [existing.id],
-                operationID: operationID
+            let first = await runtime.workspaceStore.execute(envelope)
+            let originalDigest = try XCTUnwrap(first.resultingDigest)
+            let currentSnapshot = await runtime.workspaceStore.workspaceSnapshot(existing.id)
+            let current = try XCTUnwrap(currentSnapshot)
+            var updated = existing
+            updated.name = "Replay Winner Updated"
+            updated.dateModified = Date()
+            let mutation = try await client.replaceWorking(
+                updated,
+                fileURL: current.document.fileURL,
+                expectedWorkspaceRevision: current.revisions.workingRevision
             )
-            let replay = try await client.resolveOrCreatePersistentWorkspace(
-                proposed,
-                fileURL: proposedFileURL,
-                canonicalRootPath: canonicalRootPath,
-                preferredWorkspaceIDs: [existing.id],
-                operationID: operationID
-            )
+            XCTAssertEqual(mutation.disposition, .applied)
+            XCTAssertNotEqual(mutation.resultingDigest, originalDigest)
+
+            let replay = await runtime.workspaceStore.execute(envelope)
 
             XCTAssertEqual(first.disposition, .unchanged)
             XCTAssertEqual(first.workspace?.document.workspaceID, existing.id)
             XCTAssertEqual(replay.disposition, .deduplicated)
             XCTAssertEqual(replay.workspace?.document.workspaceID, existing.id)
+            XCTAssertEqual(replay.workspace?.document.contentDigest, mutation.resultingDigest)
+            XCTAssertEqual(replay.resultingDigest, originalDigest)
+        }
+
+        func testReplayedResolveOrCreateReturnsWorkspaceUnavailableAfterResultDeletion() async throws {
+            let profileIdentifier = "workspace-open-folder-deleted-replay-\(UUID().uuidString)"
+            let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1303)
+            let folder = try makeFolder(named: "ResolveOrCreateReplayDeletion")
+            let existing = WorkspaceModel(name: "Deleted Replay Winner", repoPaths: [folder.path])
+            try await createAuthorityWorkspace(existing, using: client)
+            let proposed = WorkspaceModel(name: "Deleted Replay Proposed", repoPaths: [folder.path])
+            let canonicalRootPath = try canonicalRootPath(folder)
+            let operationID = UUID()
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath,
+                operationID: operationID,
+                windowID: -1303
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            let currentSnapshot = await runtime.workspaceStore.workspaceSnapshot(existing.id)
+            let current = try XCTUnwrap(currentSnapshot)
+            let catalog = await client.snapshot()
+            let deletion = await client.delete(
+                workspaceID: existing.id,
+                expectedCatalogRevision: catalog.catalogRevision,
+                expectedWorkspaceRevision: current.revisions.workingRevision
+            )
+            XCTAssertEqual(deletion.disposition, .applied)
+
+            let replay = await runtime.workspaceStore.execute(envelope)
+            let replayAgain = await runtime.workspaceStore.execute(envelope)
+
+            XCTAssertEqual(replay.disposition, .failed)
+            XCTAssertEqual(replay.errorCode, .workspaceUnavailable)
+            XCTAssertEqual(replay.diagnostic, "recorded_result_workspace_deleted")
+            XCTAssertNil(replay.workspace)
+            XCTAssertEqual(replay.resultingDigest, first.resultingDigest)
+            XCTAssertEqual(replayAgain, replay, "Unavailable replay must not overwrite the original successful operation")
+
+            _ = await runtime.shutdown()
+            domainRuntimes.removeAll { $0 === runtime }
+            let restarted = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let replayAfterRestart = await restarted.workspaceStore.execute(envelope)
+            let restartedCatalog = await restarted.workspaceStore.snapshot()
+
+            XCTAssertEqual(replayAfterRestart.disposition, .failed)
+            XCTAssertEqual(replayAfterRestart.errorCode, .workspaceUnavailable)
+            XCTAssertEqual(replayAfterRestart.diagnostic, "recorded_result_workspace_deleted")
+            XCTAssertNil(replayAfterRestart.workspace)
+            XCTAssertFalse(restartedCatalog.workspaces.contains(where: {
+                $0.document.workspaceID == proposed.id
+            }))
+        }
+
+        func testLegacyResolveOrCreateReplayUsesDigestFallbackWhenResultIdentityIsMissing() async throws {
+            let profileIdentifier = "workspace-open-folder-legacy-\(UUID().uuidString)"
+            let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1304)
+            let folder = try makeFolder(named: "ResolveOrCreateLegacyReplay")
+            let existing = WorkspaceModel(name: "Legacy Replay Winner", repoPaths: [folder.path])
+            try await createAuthorityWorkspace(existing, using: client)
+            let proposed = WorkspaceModel(name: "Legacy Replay Proposed", repoPaths: [folder.path])
+            let canonicalRootPath = try canonicalRootPath(folder)
+            let operationID = UUID()
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath,
+                operationID: operationID,
+                windowID: -1304
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            XCTAssertEqual(first.workspace?.document.workspaceID, existing.id)
+            let journalURL = try workingJournalURL(workspaceID: existing.id)
+            _ = await runtime.shutdown()
+            domainRuntimes.removeAll { $0 === runtime }
+            try removeResultingWorkspaceID(
+                operationID: operationID,
+                expectedWorkspaceID: existing.id,
+                from: journalURL
+            )
+
+            let restarted = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let replay = await restarted.workspaceStore.execute(envelope)
+
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.workspace?.document.workspaceID, existing.id)
+            XCTAssertEqual(replay.resultingDigest, first.resultingDigest)
         }
 
         func testConcurrentReplaceRetriesRecheckOperationIDAfterMutationGate() async throws {
@@ -628,10 +770,103 @@ import XCTest
             return folder
         }
 
-        private func makeDomainRuntime() async throws -> MCPDomainRuntime {
+        private func workspaceID(_ suffix: Int) throws -> UUID {
+            try XCTUnwrap(UUID(uuidString: String(
+                format: "00000000-0000-0000-0000-%012d",
+                suffix
+            )))
+        }
+
+        private func canonicalRootPath(_ folder: URL) throws -> String {
+            try XCTUnwrap(
+                WorkspaceRootSetKey(paths: [folder.path]).normalizedPaths.first
+            ).lowercased()
+        }
+
+        private func authorityWorkspaceFileURL(_ workspaceID: UUID) -> URL {
+            storageRoot.appendingPathComponent("\(workspaceID.uuidString).json")
+        }
+
+        private func resolveOrCreateEnvelope(
+            _ workspace: WorkspaceModel,
+            canonicalRootPath: String,
+            operationID: UUID,
+            windowID: Int
+        ) throws -> DomainWorkspaceCommandEnvelope {
+            let document = try DomainWorkspaceDocument.decode(
+                documentBytes: JSONEncoder().encode(workspace),
+                fileURL: authorityWorkspaceFileURL(workspace.id)
+            )
+            return DomainWorkspaceCommandEnvelope(
+                operationID: operationID,
+                expectedWorkspaceRevision: 0,
+                origin: .appPresentation(windowID: windowID),
+                command: .resolveOrCreateWorkspaceForExactRoot(
+                    document: document,
+                    canonicalRootPath: canonicalRootPath
+                )
+            )
+        }
+
+        private func createAuthorityWorkspace(
+            _ workspace: WorkspaceModel,
+            using client: DomainWorkspaceAuthorityClient
+        ) async throws {
+            let outcome = try await client.create(
+                workspace,
+                fileURL: authorityWorkspaceFileURL(workspace.id)
+            )
+            XCTAssertEqual(outcome.disposition, .applied)
+            XCTAssertEqual(outcome.workspace?.document.workspaceID, workspace.id)
+        }
+
+        private func workingJournalURL(workspaceID: UUID) throws -> URL {
+            let runtimeState = storageRoot.appendingPathComponent("runtime-state", isDirectory: true)
+            guard let enumerator = FileManager.default.enumerator(
+                at: runtimeState,
+                includingPropertiesForKeys: nil
+            ) else {
+                throw WorkspaceOpenFolderOrchestrationTestError.journalNotFound
+            }
+            for case let url as URL in enumerator
+                where url.lastPathComponent == "\(workspaceID.uuidString).json"
+                && url.deletingLastPathComponent().lastPathComponent == "working-journals"
+            {
+                return url
+            }
+            throw WorkspaceOpenFolderOrchestrationTestError.journalNotFound
+        }
+
+        private func removeResultingWorkspaceID(
+            operationID: UUID,
+            expectedWorkspaceID: UUID,
+            from journalURL: URL
+        ) throws {
+            let data = try Data(contentsOf: journalURL)
+            var journal = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any]
+            )
+            var operations = try XCTUnwrap(journal["operations"] as? [[String: Any]])
+            let operationIndex = try XCTUnwrap(operations.firstIndex(where: {
+                $0["operationID"] as? String == operationID.uuidString
+            }))
+            XCTAssertEqual(
+                operations[operationIndex]["resultingWorkspaceID"] as? String,
+                expectedWorkspaceID.uuidString,
+                "New operation records must persist the stable result identity"
+            )
+            operations[operationIndex].removeValue(forKey: "resultingWorkspaceID")
+            journal["operations"] = operations
+            let legacyData = try JSONSerialization.data(withJSONObject: journal, options: [.sortedKeys])
+            try legacyData.write(to: journalURL, options: .atomic)
+        }
+
+        private func makeDomainRuntime(
+            profileIdentifier: String = "workspace-open-folder-\(UUID().uuidString)"
+        ) async throws -> MCPDomainRuntime {
             let runtime = MCPDomainRuntime(configuration: .init(
                 mode: .app,
-                profileIdentifier: "workspace-open-folder-\(UUID().uuidString)",
+                profileIdentifier: profileIdentifier,
                 storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
                 workspaceStorageDirectory: storageRoot,
                 eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
@@ -720,5 +955,6 @@ import XCTest
     private enum WorkspaceOpenFolderOrchestrationTestError: Error {
         case confirmationTimedOut
         case conditionTimedOut
+        case journalNotFound
     }
 #endif

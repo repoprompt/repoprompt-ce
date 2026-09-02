@@ -149,16 +149,16 @@ import XCTest
                 let window = await makeWindow()
                 let folder = try makeFolder(named: "NoMatch-\(testCase.name)")
                 let countBeforeCommand = window.workspaceManager.workspaces.count
+                window.setAutomaticCommandProcessingForTesting(false)
 
                 window.enqueueCommand(folderCommand(
                     folderPath: folder.path,
                     ephemeral: testCase.ephemeral,
                     persist: testCase.persist
                 ))
+                await window.processCommands()
 
-                try await waitUntil {
-                    window.workspaceManager.activeWorkspace?.repoPaths == [folder.path]
-                }
+                XCTAssertEqual(window.workspaceManager.activeWorkspace?.repoPaths, [folder.path], testCase.name)
                 let created = try XCTUnwrap(window.workspaceManager.activeWorkspace)
                 XCTAssertEqual(window.workspaceManager.workspaces.count, countBeforeCommand + 1, testCase.name)
                 XCTAssertEqual(created.isEphemeral, testCase.expectsEphemeral, testCase.name)
@@ -230,6 +230,73 @@ import XCTest
                 window.workspaceManager.pendingWorkspaceSwitchBlockedNotice?.message,
                 "Cannot switch workspaces while refresh is in progress."
             )
+        }
+
+        func testQueuedOpenReportsBlockedSwitchWithoutDuplicateCreationOrApplyingPayload() async throws {
+            let runtime = try await makeDomainRuntime()
+            let window = await makeWindow(domainRuntime: runtime)
+            let activeFolder = try makeFolder(named: "BlockedUnmatchedActive")
+            let targetFolder = try makeFolder(named: "BlockedUnmatchedTarget")
+            let payloadFile = targetFolder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let active = window.workspaceManager.createWorkspace(
+                name: "Blocked Unmatched Active",
+                repoPaths: [activeFolder.path]
+            )
+            let initialSwitch = await window.workspaceManager.switchWorkspace(
+                to: active,
+                saveState: false,
+                reason: "blockedUnmatchedFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            window.promptManager.promptText = "before"
+            let storedPromptTitle = "Blocked Folder Stored Prompt \(UUID().uuidString)"
+            window.workspaceManager.isRefreshing = true
+            defer { window.workspaceManager.isRefreshing = false }
+            window.setAutomaticCommandProcessingForTesting(false)
+            var completions: [AppCommandExecutionResult] = []
+            window.enqueueCommand(
+                folderCommand(
+                    folderPath: targetFolder.path,
+                    fileList: [payloadFile.path],
+                    promptText: "after",
+                    newPrompt: (storedPromptTitle, "blocked stored prompt")
+                ),
+                folderRoute: .unresolved(
+                    expectedRoot: WorkspaceRootSetKey(paths: [targetFolder.path])
+                )
+            ) { completions.append($0) }
+
+            await window.processCommands()
+
+            XCTAssertEqual(completions, [.failed(.workspaceSwitchBlocked)])
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, active.id)
+            XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertFalse(window.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
+            let firstSnapshot = await window.workspaceManager.workspaceRoutingCatalogSnapshot()
+            let firstCatalog = try XCTUnwrap(firstSnapshot)
+            let firstMatches = firstCatalog.filter {
+                WorkspaceFolderOpenResolver.containsExactRoot(targetFolder.path, in: $0)
+            }
+            XCTAssertEqual(firstMatches.count, 1)
+
+            await window.processCommands()
+
+            let secondSnapshot = await window.workspaceManager.workspaceRoutingCatalogSnapshot()
+            let secondCatalog = try XCTUnwrap(secondSnapshot)
+            XCTAssertEqual(
+                secondCatalog.count {
+                    WorkspaceFolderOpenResolver.containsExactRoot(targetFolder.path, in: $0)
+                },
+                1
+            )
+            XCTAssertEqual(completions, [.failed(.workspaceSwitchBlocked)])
         }
 
         func testRouterRoutesEphemeralFolderPayloadToProcessWideWinner() async throws {
@@ -428,59 +495,130 @@ import XCTest
             XCTAssertEqual(staleWindow.promptManager.promptText, "stale-before")
         }
 
-        func testQueuedResolvedFolderRouteStopsWhenSameWorkspaceIDChangesRoots() async throws {
-            let window = await makeWindow()
-            let requestedFolder = try makeFolder(named: "QueuedExpectedRoot")
-            let replacementFolder = try makeFolder(named: "QueuedReplacementRoot")
-            let selectedFile = requestedFolder.appendingPathComponent("Selected.swift")
+        func testQueuedOpenReResolvesCurrentAuthorityWinnerAndPreservesPayload() async throws {
+            let runtime = try await makeDomainRuntime()
+            let authorityWindow = await makeWindow(domainRuntime: runtime)
+            let targetWindow = await makeWindow(domainRuntime: runtime)
+            let requestedFolder = try makeFolder(named: "QueuedCurrentWinner")
+            let replacementFolder = try makeFolder(named: "QueuedFormerWinnerRoot")
             let payloadFile = requestedFolder.appendingPathComponent("Payload.swift")
-            try Data("let selected = true\n".utf8).write(to: selectedFile)
             try Data("let payload = true\n".utf8).write(to: payloadFile)
-            let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000023"))
-            let expectedWorkspace = WorkspaceModel(
-                id: workspaceID,
-                name: "Queued Workspace",
+            let formerWinnerID = try XCTUnwrap(
+                UUID(uuidString: "00000000-0000-0000-0000-000000000023")
+            )
+            let currentWinnerID = try XCTUnwrap(
+                UUID(uuidString: "00000000-0000-0000-0000-000000000024")
+            )
+            let finalWinnerID = try XCTUnwrap(
+                UUID(uuidString: "00000000-0000-0000-0000-000000000025")
+            )
+            let formerWinner = WorkspaceModel(
+                id: formerWinnerID,
+                dateModified: Date(timeIntervalSince1970: 10),
+                name: "Former Winner",
                 repoPaths: [requestedFolder.path]
             )
-            window.workspaceManager.workspaces.append(expectedWorkspace)
-            let initialSwitch = await window.workspaceManager.switchWorkspace(
-                to: expectedWorkspace,
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(formerWinner)
+            try await waitUntil {
+                targetWindow.workspaceManager.workspace(withID: formerWinnerID)?.repoPaths == [requestedFolder.path]
+            }
+            let projectedFormerWinner = try XCTUnwrap(
+                targetWindow.workspaceManager.workspace(withID: formerWinnerID)
+            )
+            let initialSwitch = await targetWindow.workspaceManager.switchWorkspace(
+                to: projectedFormerWinner,
                 saveState: false,
-                reason: "folderCommandQueuedRootFixture"
+                reason: "queuedCurrentWinnerFixture"
             )
             XCTAssertEqual(initialSwitch, .switched)
-            await window.workspaceFilesViewModel.selectFiles(withPaths: [selectedFile.path])
-            window.promptManager.promptText = "before"
-            let countBeforeRoute = window.workspaceManager.workspaces.count
-            window.setAutomaticCommandProcessingForTesting(false)
-            let url = try XCTUnwrap(URL(
-                string: "repoprompt-ce://open/\(requestedFolder.path)?files=\(payloadFile.path)&prompt=after"
-            ))
-
-            await AppDeepLinkRouter(windowStatesManager: .shared).route(url: url)
-            let workspaceIndex = try XCTUnwrap(
-                window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceID })
+            targetWindow.promptManager.promptText = "before"
+            targetWindow.setAutomaticCommandProcessingForTesting(false)
+            let command = folderCommand(
+                folderPath: requestedFolder.path,
+                fileList: [payloadFile.path],
+                promptText: "after",
+                newPrompt: ("Re-resolved Stored Prompt \(UUID().uuidString)", "retry payload")
             )
-            window.workspaceManager.workspaces[workspaceIndex] = WorkspaceModel(
-                id: workspaceID,
-                name: "Queued Workspace",
-                repoPaths: [replacementFolder.path]
-            )
-            await window.processCommands()
+            var completions: [AppCommandExecutionResult] = []
+            targetWindow.enqueueCommand(
+                command,
+                folderRoute: .authorityExactRoot(
+                    expectedRoot: WorkspaceRootSetKey(paths: [requestedFolder.path])
+                )
+            ) { completions.append($0) }
 
-            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID)
-            XCTAssertEqual(window.workspaceManager.activeWorkspace?.repoPaths, [replacementFolder.path])
-            XCTAssertEqual(window.workspaceManager.workspaces.count, countBeforeRoute)
-            XCTAssertEqual(window.promptManager.promptText, "before")
-            XCTAssertTrue(window.workspaceFilesViewModel.selectedFiles.contains {
-                $0.fullPath == selectedFile.path
-            })
-            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+            targetWindow.stopDomainWorkspaceProjectionForTesting()
+            var movedFormerWinner = formerWinner
+            movedFormerWinner.repoPaths = [replacementFolder.path]
+            movedFormerWinner.dateModified = Date(timeIntervalSince1970: 20)
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(movedFormerWinner)
+            let currentWinner = WorkspaceModel(
+                id: currentWinnerID,
+                dateModified: Date(timeIntervalSince1970: 30),
+                name: "Current Winner",
+                repoPaths: [requestedFolder.path]
+            )
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(currentWinner)
+            let finalWinner = WorkspaceModel(
+                id: finalWinnerID,
+                dateModified: Date(timeIntervalSince1970: 40),
+                name: "Final Winner",
+                repoPaths: [requestedFolder.path]
+            )
+            var didChangeRouteDuringActivation = false
+            targetWindow.workspaceManager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting {
+                workspaceID in
+                guard workspaceID == currentWinnerID,
+                      !didChangeRouteDuringActivation
+                else { return }
+                didChangeRouteDuringActivation = true
+                var movedCurrentWinner = currentWinner
+                movedCurrentWinner.repoPaths = [replacementFolder.path]
+                movedCurrentWinner.dateModified = Date(timeIntervalSince1970: 35)
+                _ = try? await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(
+                    movedCurrentWinner
+                )
+                _ = try? await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(finalWinner)
+            }
+
+            await targetWindow.processCommands()
+
+            XCTAssertTrue(didChangeRouteDuringActivation)
+            XCTAssertEqual(completions, [.completed(workspaceID: finalWinnerID)])
+            XCTAssertEqual(targetWindow.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspaceID, finalWinnerID)
+            XCTAssertEqual(targetWindow.promptManager.promptText, "after")
+            XCTAssertTrue(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
                 $0.fullPath == payloadFile.path
             })
+            let storedPrompt = try XCTUnwrap(targetWindow.promptManager.storedPrompts.first {
+                $0.title == command.newPrompt?.title
+            })
+            XCTAssertEqual(storedPrompt.content, command.newPrompt?.content)
+            XCTAssertTrue(targetWindow.promptManager.selectedPromptIDs.contains(storedPrompt.id))
+            XCTAssertEqual(
+                targetWindow.promptManager.storedPrompts.count { $0.title == storedPrompt.title },
+                1
+            )
+            let routingSnapshot = await targetWindow.workspaceManager.workspaceRoutingCatalogSnapshot()
+            let routingCatalog = try XCTUnwrap(routingSnapshot)
+            XCTAssertEqual(
+                routingCatalog.first(where: { $0.id == formerWinnerID })?.repoPaths,
+                [replacementFolder.path]
+            )
+            XCTAssertEqual(
+                routingCatalog.first(where: { $0.id == currentWinnerID })?.repoPaths,
+                [replacementFolder.path]
+            )
+            XCTAssertEqual(
+                routingCatalog.filter {
+                    WorkspaceFolderOpenResolver.containsExactRoot(requestedFolder.path, in: $0)
+                }.map(\.id),
+                [finalWinnerID]
+            )
         }
 
-        func testQueuedResolvedFolderRouteUsesSharedAuthorityWhenProjectionIsStale() async throws {
+        func testQueuedLiveSupplementDoesNotOverrideAuthorityOwnedID() async throws {
             let runtime = try await makeDomainRuntime()
             let authorityWindow = await makeWindow(domainRuntime: runtime)
             let targetWindow = await makeWindow(domainRuntime: runtime)
@@ -500,7 +638,9 @@ import XCTest
             try await waitUntil {
                 targetWindow.workspaceManager.workspace(withID: workspaceID)?.repoPaths == [requestedFolder.path]
             }
-            let projectedWorkspace = try XCTUnwrap(targetWindow.workspaceManager.workspace(withID: workspaceID))
+            let projectedWorkspace = try XCTUnwrap(
+                targetWindow.workspaceManager.workspace(withID: workspaceID)
+            )
             let initialSwitch = await targetWindow.workspaceManager.switchWorkspace(
                 to: projectedWorkspace,
                 saveState: false,
@@ -511,13 +651,17 @@ import XCTest
             targetWindow.promptManager.promptText = "before"
             let countBeforeRoute = targetWindow.workspaceManager.workspaces.count
             targetWindow.setAutomaticCommandProcessingForTesting(false)
-            let url = try XCTUnwrap(URL(
-                string: "repoprompt-ce://open/\(requestedFolder.path)?files=\(payloadFile.path)&prompt=after"
-            ))
-
-            await AppDeepLinkRouter(windowStatesManager: .shared).route(
-                url: url,
-                preferredLegacyWindow: targetWindow
+            let command = folderCommand(
+                folderPath: requestedFolder.path,
+                fileList: [payloadFile.path],
+                promptText: "after"
+            )
+            targetWindow.enqueueCommand(
+                command,
+                folderRoute: .liveWindowSupplement(
+                    workspaceID: workspaceID,
+                    expectedRoot: WorkspaceRootSetKey(paths: [requestedFolder.path])
+                )
             )
             targetWindow.stopDomainWorkspaceProjectionForTesting()
             var replacementWorkspace = expectedWorkspace
@@ -533,19 +677,21 @@ import XCTest
 
             await targetWindow.processCommands()
 
-            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertNotEqual(targetWindow.workspaceManager.activeWorkspaceID, workspaceID)
             XCTAssertEqual(targetWindow.workspaceManager.activeWorkspace?.repoPaths, [requestedFolder.path])
-            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count, countBeforeRoute)
-            XCTAssertEqual(targetWindow.promptManager.promptText, "before")
-            XCTAssertTrue(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
+            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count, countBeforeRoute + 1)
+            XCTAssertEqual(targetWindow.promptManager.promptText, "after")
+            XCTAssertFalse(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
                 $0.fullPath == selectedFile.path
             })
-            XCTAssertFalse(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
+            XCTAssertTrue(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
                 $0.fullPath == payloadFile.path
             })
+            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count { $0.id == workspaceID }, 1)
+            let updatedCatalog = await targetWindow.workspaceManager.workspaceRoutingCatalogSnapshot()
             XCTAssertEqual(
-                targetWindow.workspaceManager.workspaces.count {
-                    $0.id == workspaceID
+                updatedCatalog?.count {
+                    WorkspaceFolderOpenResolver.containsExactRoot(requestedFolder.path, in: $0)
                 },
                 1
             )
@@ -645,6 +791,89 @@ import XCTest
                 $0.fullPath == payloadFile.path
             })
             XCTAssertEqual(targetWindow.workspaceManager.workspaces.count { $0.id == workspaceID }, 1)
+        }
+
+        func testInactiveLocalEphemeralWorkspaceIsReused() async throws {
+            let window = await makeWindow()
+            let folder = try makeFolder(named: "InactiveLocalEphemeral")
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Inactive Local Ephemeral",
+                repoPaths: [folder.path],
+                ephemeral: true
+            )
+            let countBeforeCommand = window.workspaceManager.workspaces.count
+            window.setAutomaticCommandProcessingForTesting(false)
+
+            window.enqueueCommand(folderCommand(folderPath: folder.path, ephemeral: true))
+            await window.processCommands()
+
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
+            XCTAssertEqual(window.workspaceManager.workspaces.count, countBeforeCommand)
+        }
+
+        func testNonFocusedEphemeralRouteForwardsToOwningWindow() async throws {
+            let ownerWindow = await makeWindow()
+            let receivingWindow = await makeWindow()
+            let folder = try makeFolder(named: "NonFocusedEphemeralOwner")
+            let payloadFile = folder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let workspace = ownerWindow.workspaceManager.createWorkspace(
+                name: "Non-Focused Ephemeral Owner",
+                repoPaths: [folder.path],
+                ephemeral: true
+            )
+            let initialSwitch = await ownerWindow.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "nonFocusedEphemeralOwnerFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            ownerWindow.promptManager.promptText = "owner-before"
+            receivingWindow.promptManager.promptText = "receiving-before"
+            let storedPromptTitle = "Forwarded Stored Prompt \(UUID().uuidString)"
+            ownerWindow.setAutomaticCommandProcessingForTesting(false)
+            receivingWindow.setAutomaticCommandProcessingForTesting(false)
+            var completions: [AppCommandExecutionResult] = []
+            receivingWindow.enqueueCommand(
+                folderCommand(
+                    folderPath: folder.path,
+                    fileList: [payloadFile.path],
+                    promptText: "after",
+                    newPrompt: (storedPromptTitle, "forwarded stored prompt"),
+                    ephemeral: true
+                )
+            ) { completions.append($0) }
+
+            await receivingWindow.processCommands()
+            XCTAssertEqual(receivingWindow.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(ownerWindow.queuedCommandCountForTesting, 1)
+            XCTAssertEqual(completions, [])
+            XCTAssertFalse(ownerWindow.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
+            await ownerWindow.processCommands()
+
+            XCTAssertEqual(ownerWindow.workspaceManager.activeWorkspaceID, workspace.id)
+            XCTAssertEqual(ownerWindow.promptManager.promptText, "after")
+            XCTAssertTrue(ownerWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertEqual(receivingWindow.promptManager.promptText, "receiving-before")
+            XCTAssertFalse(receivingWindow.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            let storedPrompts = ownerWindow.promptManager.storedPrompts.filter {
+                $0.title == storedPromptTitle
+            }
+            XCTAssertEqual(storedPrompts.count, 1)
+            XCTAssertEqual(storedPrompts.first?.content, "forwarded stored prompt")
+            let forwardedStoredPrompt = try XCTUnwrap(storedPrompts.first)
+            XCTAssertTrue(ownerWindow.promptManager.selectedPromptIDs.contains(forwardedStoredPrompt.id))
+            XCTAssertEqual(completions, [.completed(workspaceID: workspace.id)])
+
+            await receivingWindow.processCommands()
+            await ownerWindow.processCommands()
+            XCTAssertEqual(completions, [.completed(workspaceID: workspace.id)])
         }
 
         func testSharedRuntimeFocusedEphemeralRouteReusesLiveWorkspace() async throws {
@@ -970,21 +1199,58 @@ import XCTest
                     window.beginClose()
                 }
             }
+            window.setAutomaticCommandProcessingForTesting(false)
+            var completions: [AppCommandExecutionResult] = []
 
-            window.enqueueCommand(folderCommand(
-                folderPath: targetFolder.path,
-                promptText: "after"
-            ))
+            window.enqueueCommand(
+                folderCommand(
+                    folderPath: targetFolder.path,
+                    promptText: "after"
+                )
+            ) { completions.append($0) }
             await window.processCommands()
 
             XCTAssertTrue(window.isClosing)
             XCTAssertNotEqual(window.promptManager.promptText, "after")
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(completions, [.failed(.windowClosed)])
+
+            await window.processCommands()
+            XCTAssertEqual(completions, [.failed(.windowClosed)])
+        }
+
+        func testWindowCloseCompletesPendingCommandsExactlyOnce() async throws {
+            let window = await makeWindow()
+            let firstFolder = try makeFolder(named: "ClosingPendingFirst")
+            let secondFolder = try makeFolder(named: "ClosingPendingSecond")
+            window.setAutomaticCommandProcessingForTesting(false)
+            var firstCompletions: [AppCommandExecutionResult] = []
+            var secondCompletions: [AppCommandExecutionResult] = []
+            window.enqueueCommand(folderCommand(folderPath: firstFolder.path)) {
+                firstCompletions.append($0)
+            }
+            window.enqueueCommand(folderCommand(folderPath: secondFolder.path)) {
+                secondCompletions.append($0)
+            }
+
+            window.beginClose()
+
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(firstCompletions, [.failed(.windowClosed)])
+            XCTAssertEqual(secondCompletions, [.failed(.windowClosed)])
+
+            await window.processCommands()
+            window.beginClose()
+            XCTAssertEqual(firstCompletions, [.failed(.windowClosed)])
+            XCTAssertEqual(secondCompletions, [.failed(.windowClosed)])
         }
 
         func testCancelledMatchedSwitchCreatesNoReplacementAndAppliesNoPayload() async throws {
             let window = await makeWindow()
             let activeFolder = try makeFolder(named: "CancelledActive")
             let targetFolder = try makeFolder(named: "CancelledTarget")
+            let payloadFile = targetFolder.appendingPathComponent("CancelledPayload.swift")
+            try Data("let cancelled = true\n".utf8).write(to: payloadFile)
             let active = window.workspaceManager.createWorkspace(
                 name: "Cancelled Active",
                 repoPaths: [activeFolder.path]
@@ -1001,23 +1267,41 @@ import XCTest
             XCTAssertEqual(initialSwitch, .switched)
             let countBeforeCommand = window.workspaceManager.workspaces.count
             window.promptManager.promptText = "before"
+            let storedPromptTitle = "Cancelled Stored Prompt \(UUID().uuidString)"
             let sessionProvider = FolderCommandWorkspaceSwitchSessionProvider()
             window.workspaceManager.registerSwitchSessionProvider(sessionProvider)
+            var completions: [AppCommandExecutionResult] = []
 
-            window.enqueueCommand(folderCommand(
-                folderPath: targetFolder.path,
-                promptText: "after"
-            ))
+            window.enqueueCommand(
+                folderCommand(
+                    folderPath: targetFolder.path,
+                    fileList: [payloadFile.path],
+                    promptText: "after",
+                    newPrompt: (storedPromptTitle, "cancelled stored prompt")
+                )
+            ) { completions.append($0) }
             let confirmation = try await waitForPendingSwitchConfirmation(in: window.workspaceManager)
             window.workspaceManager.resolveSwitchConfirmation(id: confirmation.id, allow: false)
             try await waitUntil {
                 window.workspaceManager.pendingSwitchConfirmation == nil
+                    && completions == [.cancelled]
             }
 
             XCTAssertEqual(window.workspaceManager.activeWorkspaceID, active.id)
             XCTAssertEqual(window.workspaceManager.workspaces.count, countBeforeCommand)
             XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertFalse(window.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
             XCTAssertNil(window.workspaceManager.pendingWorkspaceSwitchBlockedNotice)
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(completions, [.cancelled])
+
+            await window.processCommands()
+            XCTAssertEqual(completions, [.cancelled])
         }
 
         private func waitForPendingSwitchConfirmation(
@@ -1035,11 +1319,13 @@ import XCTest
         }
 
         private func makeWindow(domainRuntime: MCPDomainRuntime? = nil) async -> WindowState {
-            let window = if let domainRuntime {
-                WindowState(domainRuntime: domainRuntime)
-            } else {
-                WindowState()
-            }
+            let promptStorage = PromptStorage(
+                fileURL: storageRoot.appendingPathComponent("SavedPrompts.json")
+            )
+            let window = WindowState(
+                domainRuntime: domainRuntime,
+                storedPromptPersistence: StoredPromptPersistenceService(storage: promptStorage)
+            )
             WindowStatesManager.shared.registerWindowState(window)
             windows.append(window)
             await window.workspaceManager.awaitInitialized()
@@ -1071,6 +1357,7 @@ import XCTest
             folderPath: String,
             fileList: [String] = [],
             promptText: String? = nil,
+            newPrompt: (title: String, content: String)? = nil,
             focus: Bool? = nil,
             ephemeral: Bool? = nil,
             persist: Bool? = nil
@@ -1080,7 +1367,7 @@ import XCTest
                 fileList: fileList,
                 promptText: promptText,
                 folderPath: folderPath,
-                newPrompt: nil,
+                newPrompt: newPrompt,
                 focus: focus,
                 ephemeral: ephemeral,
                 persist: persist
