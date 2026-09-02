@@ -1367,11 +1367,7 @@ public class APISettingsViewModel: ObservableObject {
 
     private func probeCachedOMPConnection(ifNeeded: Bool) async -> Bool {
         guard ifNeeded else { return false }
-        do {
-            return try await OMPACPLaunchResolver().probeSupport(for: OMPAgentConfig()) == .supported
-        } catch {
-            return false
-        }
+        return await (try? OMPACPLaunchResolver().probeSupport(for: OMPAgentConfig())) == .supported
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -3765,7 +3761,6 @@ public class APISettingsViewModel: ObservableObject {
             setContextBuilderProviderVerified(.omp, verified: true)
             ompError = nil
             UserDefaults.standard.set(true, forKey: "OMPCLIConnected")
-            await updateAvailableModels()
             collector.append("Oh My Pi CLI marked as connected")
             ompLogCollector = nil
             NotificationCenter.default.post(
@@ -3775,13 +3770,13 @@ public class APISettingsViewModel: ObservableObject {
             )
             return true
         } catch {
-            collector.append("Connection test threw error: \(error.localizedDescription)")
+            let message = friendlyOMPMessage(for: error)
+            collector.append("Connection test threw error: \(message)")
             isOMPConnected = false
             setContextBuilderProviderVerified(.omp, verified: false)
-            ompError = friendlyOMPMessage(for: error)
+            ompError = message
             UserDefaults.standard.set(false, forKey: "OMPCLIConnected")
-            await updateAvailableModels()
-            collector.append("User guidance: \(ompError ?? error.localizedDescription)")
+            collector.append("User guidance: \(message)")
             NotificationCenter.default.post(
                 name: .ompConnectionChanged,
                 object: nil,
@@ -3796,9 +3791,6 @@ public class APISettingsViewModel: ObservableObject {
         setContextBuilderProviderVerified(.omp, verified: false)
         ompError = nil
         UserDefaults.standard.set(false, forKey: "OMPCLIConnected")
-        Task {
-            await updateAvailableModels()
-        }
         NotificationCenter.default.post(
             name: .ompConnectionChanged,
             object: nil,
@@ -3812,15 +3804,7 @@ public class APISettingsViewModel: ObservableObject {
         {
             return detail
         }
-        let message = error.localizedDescription
-        let lowered = message.lowercased()
-        if lowered.contains("not installed") || lowered.contains("not found") || lowered.contains("no such file") {
-            return "Oh My Pi CLI was not found. Install it and ensure `omp acp` is available."
-        }
-        if lowered.contains("permission denied") {
-            return "Permission denied. Ensure the `omp` executable is accessible."
-        }
-        return message
+        return error.localizedDescription
     }
 
     func hasOMPTrace() -> Bool {

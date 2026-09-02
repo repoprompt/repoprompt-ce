@@ -5,14 +5,7 @@ final class OMPACPHeadlessAgentProvider: HeadlessAgentProvider {
     typealias ProviderFactory = @Sendable (_ config: OMPAgentConfig) -> any ACPAgentProvider
     typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
 
-    private let config: OMPAgentConfig
     private let bridge: ACPHeadlessAgentProviderBridge
-
-    #if DEBUG
-        var test_config: OMPAgentConfig {
-            config
-        }
-    #endif
 
     init(
         config: OMPAgentConfig,
@@ -26,7 +19,6 @@ final class OMPACPHeadlessAgentProvider: HeadlessAgentProvider {
             )
         }
     ) {
-        self.config = config
         let resolvedProviderFactory = providerFactory ?? { config in
             OMPACPAgentProvider(config: config)
         }
