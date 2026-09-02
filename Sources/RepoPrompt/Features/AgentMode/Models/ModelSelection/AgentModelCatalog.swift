@@ -248,9 +248,9 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return AgentModel.cursorAuto.rawValue
         }
-        if agentKind == .grokBuild || agentKind == .omp {
-            // Provider-managed default must never become a discovered session's current model:
-            // "default" sends no model mutation and follows the provider's own configuration.
+        if agentKind == .grokBuild {
+            // Grok's default must never become a discovered session's current model:
+            // "default" sends no model mutation and follows Grok's own configuration.
             return AgentModel.defaultModel.rawValue
         }
         if isAgentAvailable(agentKind, availability: availability),
@@ -354,9 +354,6 @@ enum AgentModelCatalog {
             }
             return fallbacks
         }
-        if agentKind == .omp {
-            return [staticOption(.defaultModel, for: .omp)]
-        }
         if agentKind == .grokBuild {
             let fallback = staticOption(.defaultModel, for: .grokBuild)
             guard let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
@@ -414,7 +411,7 @@ enum AgentModelCatalog {
         {
             return true
         }
-        if agentKind == .grokBuild || agentKind == .omp,
+        if agentKind == .grokBuild,
            normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
         {
             return true

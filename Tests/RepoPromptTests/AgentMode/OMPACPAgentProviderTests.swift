@@ -1,11 +1,9 @@
 import Foundation
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class OMPACPAgentProviderTests: XCTestCase {
-    private func makeProvider(
-        includeRepoPromptMCPServer: Bool = true
-    ) throws -> (OMPACPAgentProvider, URL) {
+    private func makeProvider() throws -> (OMPACPAgentProvider, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OMPACPAgentProviderTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -15,8 +13,7 @@ final class OMPACPAgentProviderTests: XCTestCase {
         let provider = OMPACPAgentProvider(
             config: OMPAgentConfig(
                 commandName: executable.path,
-                additionalPathHints: [],
-                includeRepoPromptMCPServer: includeRepoPromptMCPServer
+                additionalPathHints: []
             )
         )
         return (provider, directory)
@@ -60,22 +57,25 @@ final class OMPACPAgentProviderTests: XCTestCase {
         XCTAssertEqual(session.mcpServers, [.repoPrompt])
     }
 
-    func testConnectionProbeConfigurationCanDisableMCPInjection() throws {
-        let (provider, directory) = try makeProvider(includeRepoPromptMCPServer: false)
-        let session = try provider.makeSessionConfiguration(
-            for: makeRequest(workspacePath: directory.path),
-            mcpServer: .repoPrompt
-        )
-        XCTAssertTrue(session.mcpServers.isEmpty)
-    }
-
     func testPromptUsesStandardACPTextAndImageBlocks() throws {
         let (provider, directory) = try makeProvider()
+        let imageData = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))
+        let imageURL = directory.appendingPathComponent("pixel.png")
+        try imageData.write(to: imageURL)
         let first = try provider.buildPromptBlocks(
             for: AgentMessage(systemPrompt: "SYS", userMessage: "USER"),
-            request: makeRequest(workspacePath: directory.path)
+            request: makeRequest(
+                workspacePath: directory.path,
+                attachments: [AgentImageAttachment(source: .localFile(path: imageURL.path), title: "pixel.png")]
+            )
         )
-        XCTAssertEqual(first.first?["text"] as? String, "SYS\n\nUSER")
+        XCTAssertEqual(first.count, 2)
+        XCTAssertEqual(first[0]["type"] as? String, "text")
+        XCTAssertEqual(first[0]["text"] as? String, "SYS\n\nUSER")
+        XCTAssertEqual(first[1]["type"] as? String, "image")
+        XCTAssertEqual(first[1]["mimeType"] as? String, "image/png")
+        XCTAssertEqual(first[1]["data"] as? String, imageData.base64EncodedString())
+        XCTAssertEqual(first[1]["uri"] as? String, imageURL.absoluteString)
 
         let followUp = try provider.buildPromptBlocks(
             for: AgentMessage(systemPrompt: "SYS", userMessage: "NEXT"),
@@ -114,15 +114,50 @@ final class OMPACPAgentProviderTests: XCTestCase {
             for: .omp,
             modelString: "ignored-model"
         )
-        let ompProvider = provider as? OMPACPHeadlessAgentProvider
-        XCTAssertNotNil(ompProvider)
-        XCTAssertEqual(ompProvider?.test_config.commandName, "omp")
+        XCTAssertNotNil(provider as? OMPACPHeadlessAgentProvider)
     }
 
     func testCatalogExposesOnlyProviderManagedDefaultModel() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .omp)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .omp) }
+
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: "discovered-omp-model",
+                        displayName: "Discovered OMP Model",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: true
+                    )
+                ],
+                currentModelRaw: "discovered-omp-model"
+            ),
+            for: .omp
+        ))
         let availability = AgentModelCatalog.AvailabilityContext(ompAvailable: true)
         let options = AgentModelCatalog.options(for: .omp, availability: availability)
+
         XCTAssertEqual(options.map(\.rawValue), [AgentModel.defaultModel.rawValue])
+        XCTAssertEqual(
+            AgentModelCatalog.defaultModelRaw(for: .omp, availability: availability),
+            AgentModel.defaultModel.rawValue
+        )
+        XCTAssertFalse(
+            AgentModelCatalog.isValid(
+                rawModel: "discovered-omp-model",
+                for: .omp,
+                availability: availability
+            )
+        )
+        XCTAssertTrue(
+            AgentModelCatalog.isValid(
+                rawModel: AgentModel.defaultModel.rawValue,
+                for: .omp,
+                availability: availability
+            )
+        )
         XCTAssertTrue(AgentModelCatalog.isAgentAvailable(.omp, availability: availability))
     }
 
@@ -138,6 +173,14 @@ final class OMPACPAgentProviderTests: XCTestCase {
         XCTAssertEqual(AgentProviderPermissionLevelID.subagentDefault(for: .omp), .omp)
         XCTAssertEqual(AgentProviderPermissionLevelID.omp.subagentRawValue, "providerManaged")
         XCTAssertTrue(ACPPermissionOptionPolicy.isAutoSelectable(optionID: "allow-once", for: .omp))
+    }
+
+    @MainActor
+    func testMCPSafeDefaultsLeaveOMPRuntimePermissionsProviderManaged() {
+        let runtimePermission = AgentProviderPreferenceSnapshotStore()
+            .runtimePermission(for: .omp, profile: .mcpSafeDefaults)
+
+        XCTAssertEqual(runtimePermission, AgentProviderRuntimePermissionBinding())
     }
 
     func testObservedOMPMCPClientIdentityMatchesRoutingHint() {

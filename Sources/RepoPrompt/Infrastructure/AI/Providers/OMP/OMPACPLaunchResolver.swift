@@ -20,7 +20,6 @@ struct OMPACPResolvedLaunch: Equatable {
     let command: String
     let arguments: [String]
     let additionalPathHints: [String]
-    let environment: [String: String]
     let executableIdentity: ExecutableFileIdentity
 }
 
@@ -179,7 +178,6 @@ final class OMPACPLaunchResolver: @unchecked Sendable {
             ),
             configuredCommand: configuredCommand,
             additionalPathHints: effectiveHints,
-            environment: environment,
             shellEnvironmentSource: launchEnvironment.shellEnvironmentSource
         )
     }
@@ -198,8 +196,7 @@ final class OMPACPLaunchResolver: @unchecked Sendable {
             return try validatedLaunch(
                 entryPath: CommandPathResolver.expandPath(configuredCommand, environment: environment),
                 configuredCommand: configuredCommand,
-                additionalPathHints: effectiveHints,
-                environment: environment
+                additionalPathHints: effectiveHints
             )
         } catch {
             // Explicit-path failures intentionally keep their specific errors
@@ -235,7 +232,6 @@ final class OMPACPLaunchResolver: @unchecked Sendable {
         entryPath: String,
         configuredCommand: String,
         additionalPathHints: [String],
-        environment: [String: String],
         preserveValidationError: Bool = false
     ) throws -> OMPACPResolvedLaunch {
         guard entryPath.hasPrefix("/"),
@@ -259,7 +255,6 @@ final class OMPACPLaunchResolver: @unchecked Sendable {
             command: identity.canonicalPath,
             arguments: OMPACPLaunchCandidate.ompACP.launchArguments,
             additionalPathHints: additionalPathHints,
-            environment: environment,
             executableIdentity: identity
         )
     }
@@ -302,7 +297,6 @@ final class OMPACPLaunchResolver: @unchecked Sendable {
         candidates: [String],
         configuredCommand: String,
         additionalPathHints: [String],
-        environment: [String: String],
         shellEnvironmentSource: ShellEnvironmentSource?
     ) throws -> OMPACPResolvedLaunch {
         var failures: [String] = []
@@ -312,7 +306,6 @@ final class OMPACPLaunchResolver: @unchecked Sendable {
                     entryPath: candidate,
                     configuredCommand: configuredCommand,
                     additionalPathHints: additionalPathHints,
-                    environment: environment,
                     preserveValidationError: true
                 )
             } catch {

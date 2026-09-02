@@ -389,19 +389,20 @@ final class AgentProviderPreferenceSnapshotStore {
                 }
             )
         case .omp:
+            let level = AgentProviderPermissionLevelID.omp
             return AgentPermissionChromeBinding(
                 providerID: providerID,
-                displayName: "Provider Managed",
-                iconName: "shield",
-                isWarning: false,
-                externallyManagedReason: externallyManagedReason ?? "OMP controls its internal tools. RepoPrompt policy applies only to RepoPrompt MCP tools.",
+                displayName: level.displayName,
+                iconName: level.iconName,
+                isWarning: level.isWarning,
+                externallyManagedReason: level.detailText,
                 options: [
                     AgentPermissionOptionBinding(
-                        id: .omp,
-                        title: "Provider Managed",
-                        iconName: "shield",
-                        detailText: "OMP controls its internal tools. RepoPrompt policy applies only to RepoPrompt MCP tools.",
-                        isWarning: false,
+                        id: level,
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
                         isSelected: true,
                         isEnabled: false
                     )
