@@ -23,6 +23,11 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
                 contextID: UUID()
             )
             let activeTarget = workspace(name: "Active Target", root: rootURL.path, contextID: contextID)
+            let replacementActive = workspace(
+                name: "Replacement Active",
+                root: rootURL.appendingPathComponent("replacement").path,
+                contextID: UUID()
+            )
             let orderedWindows = [makeWindowInstance(), makeWindowInstance()].sorted { $0.windowID < $1.windowID }
             let staleWindow = orderedWindows[0]
             let targetWindow = orderedWindows[1]
@@ -63,6 +68,26 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
                 "_rawJSON": .bool(true)
             ])
             XCTAssertNotEqual(routedResult.isError, true, toolText(routedResult))
+
+            try await configureWindow(
+                targetWindow,
+                activeWorkspace: replacementActive,
+                savedWorkspaces: [activeTarget]
+            )
+            XCTAssertEqual(targetWindow.workspaceManager.activeWorkspaceID, replacementActive.id)
+
+            let routedAfterWorkspaceSwitch = try await connection.client.callTool(
+                name: "workspace_context",
+                arguments: [
+                    "context_id": .string(contextID.uuidString),
+                    "_rawJSON": .bool(true)
+                ]
+            )
+            XCTAssertNotEqual(
+                routedAfterWorkspaceSwitch.isError,
+                true,
+                toolText(routedAfterWorkspaceSwitch)
+            )
 
             let statusResult = try await connection.client.callTool(name: "bind_context", arguments: [
                 "op": .string("status"),
