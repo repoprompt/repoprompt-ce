@@ -2496,7 +2496,10 @@ actor ACPAgentSessionController {
 
     private func applyDiscoveredSessionModels(from response: [String: Any]) {
         let parsed: ACPDiscoveredSessionModels?
-        switch parseModernModelSnapshot(from: response) {
+        // ponytail: grok CLI >= 1.0.17 sends `configOptions` next to its legacy `models` block;
+        // only the direct provider parser carries Grok's effort wire values, so let it win.
+        let hasDirectModels = provider is ACPDirectSessionModelProvider && response["models"] != nil
+        switch hasDirectModels ? .absent : parseModernModelSnapshot(from: response) {
         case let .valid(configID, models):
             sessionModelConfigOptionID = configID
             sessionModelDirectSelectionSupported = false

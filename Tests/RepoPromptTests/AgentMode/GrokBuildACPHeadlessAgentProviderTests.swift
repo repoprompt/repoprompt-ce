@@ -46,6 +46,17 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertTrue(harness.recordedMethods("session/prompt").isEmpty)
     }
 
+    /// grok CLI >= 1.0.17 advertises modern `configOptions` alongside the legacy `models`
+    /// block. The direct provider parser must still win so effort variants survive.
+    func testConfigOptionsAlongsideModelsKeepsDirectEffortVariants() async throws {
+        let harness = try makeHarness(advertiseConfigOptions: true)
+        let provider = harness.makeHeadlessProvider(modelString: AgentModel.defaultModel.rawValue)
+        try await drain(provider, message: "hi")
+        let raws = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.options.map(\.rawValue) ?? []
+        XCTAssertTrue(raws.contains("grok-4.6-xhigh"), "expected direct effort variants, got \(raws)")
+        XCTAssertTrue(raws.contains("grok-4.6-low"), "expected direct effort variants, got \(raws)")
+    }
+
     func testFullAccessIntentReachesLaunchRequest() {
         let config = GrokBuildAgentConfig(alwaysApproveTools: true)
         let provider = GrokBuildACPHeadlessAgentProvider(config: config)
@@ -120,7 +131,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         await provider.dispose()
     }
 
-    private func makeHarness() throws -> Harness {
+    private func makeHarness(advertiseConfigOptions: Bool = false) throws -> Harness {
         let workspace = try makeTestDirectory(name: "GrokBuildACPHeadlessTests")
         let recordURL = workspace.appendingPathComponent("requests.jsonl")
         let script = #"""
@@ -131,6 +142,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
 
         record_path = os.environ.get("ACP_RECORD_PATH")
         session_id = "grok-headless-session"
+        ADVERTISE_CONFIG_OPTIONS = __ADVERTISE_CONFIG_OPTIONS__
 
         if "--help" in sys.argv:
             print("Usage: grok agent [OPTIONS] [COMMAND]\n\nCommands:\n  stdio    Run the agent over stdio")
@@ -166,13 +178,23 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                     "authMethods": []
                 })
             elif method == "session/new":
-                respond(request_id, {"sessionId": session_id, "models": {
+                result = {"sessionId": session_id, "models": {
                     "currentModelId": "grok-4.6",
                     "availableModels": [
                         {"modelId": "grok-4.6", "name": "Grok 4.6"},
                         {"modelId": "grok-4.5", "name": "Grok 4.5"}
                     ]
-                }})
+                }}
+                if ADVERTISE_CONFIG_OPTIONS:
+                    efforts = [{"id": e, "value": e, "default": e == "high"} for e in ["xhigh", "high", "medium", "low"]]
+                    result["models"]["availableModels"][0]["_meta"] = {
+                        "supportsReasoningEffort": True, "reasoningEffort": "xhigh", "reasoningEfforts": efforts}
+                    result["configOptions"] = [
+                        {"id": "model", "category": "model", "type": "select", "currentValue": "grok-4.6",
+                         "options": [{"value": "grok-4.6", "name": "Grok 4.6"}, {"value": "grok-4.5", "name": "Grok 4.5"}]},
+                        {"id": "reasoning_effort", "category": "thought_level", "type": "select", "currentValue": "xhigh",
+                         "options": [{"value": e} for e in ["xhigh", "high", "medium", "low"]]}]
+                respond(request_id, result)
             elif method == "session/set_model":
                 respond(request_id, {"_meta": {"model": {"Ok": params.get("modelId")}}})
             elif method == "session/prompt":
@@ -185,7 +207,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
                 respond(request_id, {"stopReason": "end_turn"})
             elif request_id is not None:
                 respond(request_id, {})
-        """# + "\n"
+        """#.replacingOccurrences(of: "__ADVERTISE_CONFIG_OPTIONS__", with: advertiseConfigOptions ? "True" : "False") + "\n"
         let scriptURL = workspace.appendingPathComponent("grok")
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
