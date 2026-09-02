@@ -8,6 +8,10 @@ import RepoPromptDomainRuntime
 final class MCPOracleToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .oracle
 
+    static let askOracleImageUsageDescription = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots. Unsupported transports, URLs, screenshots, relative paths, and external files are rejected before a message is sent. Limits: \(OracleImageAttachmentLimits.production.maxCount) images, \(OracleImageAttachmentLimits.production.maxBytesPerImage / 1_048_576) MiB each, \(OracleImageAttachmentLimits.production.maxTotalBytes / 1_048_576) MiB total."
+
+    static let askOracleImagesArgumentDescription = "Optional workspace-local PNG/JPEG/GIF/WebP images for transports that support image input. Each item requires canonical absolute `path` and may include transient `title`. Unsupported transports, URLs, and screenshots are rejected. Max \(OracleImageAttachmentLimits.production.maxCount) images, \(OracleImageAttachmentLimits.production.maxBytesPerImage / 1_048_576) MiB each, \(OracleImageAttachmentLimits.production.maxTotalBytes / 1_048_576) MiB total."
+
     private let runtime: MCPAppToolBinder
     private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
@@ -60,7 +64,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab. Omit `chat_id` or set `new_chat=true` to start; otherwise `chat_id` continues. The optional `model` override changes only the primary model of a new conversation.
 
-            Optional `images` sends workspace-local PNG, JPEG, GIF, or WebP files to a direct built-in Anthropic Oracle route. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots. URLs, screenshots, relative paths, and external files are rejected. Limits: 10 images, 20 MiB each, 50 MiB total.
+            \(Self.askOracleImageUsageDescription)
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
@@ -89,7 +93,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
                     "images": .array(
-                        description: "Optional workspace-local images for direct built-in Anthropic Oracle routes. Each item requires canonical absolute `path` and may include `title`. PNG/JPEG/GIF/WebP only; max 10 images, 20 MiB each, 50 MiB total. URLs and screenshots are unsupported.",
+                        description: Self.askOracleImagesArgumentDescription,
                         items: .object(
                             properties: [
                                 "path": .string(description: "Canonical absolute path inside a currently loaded workspace root"),

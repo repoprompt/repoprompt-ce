@@ -1,8 +1,8 @@
 import Foundation
 
-/// Prompt-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
+/// Text-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
 /// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented
-/// one-shot JSON CLI and preserves the existing trusted Grok executable preflight.
+/// one-shot prompt-file CLI and rejects images before launch.
 final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     typealias APIKeyProvider = @Sendable () async throws -> String?
 
@@ -11,9 +11,6 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     private let requestTimeout: TimeInterval
     private let apiKeyProvider: APIKeyProvider
     private let activeRuns = ActiveGrokBuildOneShotRunStore()
-
-    /// Leaves roughly half of macOS's 1 MiB ARG_MAX for environment and other arguments.
-    private static let maxPromptJSONArgumentBytes = 512 * 1024
 
     init(
         config: GrokBuildAgentConfig,
@@ -30,16 +27,11 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     }
 
     #if DEBUG
-        static var test_promptJSONArgumentByteLimit: Int {
-            maxPromptJSONArgumentBytes
-        }
-
         static func test_promptArguments(
-            for message: AgentMessage,
             promptFilePath: String = "/tmp/prompt.txt"
-        ) throws -> [String] {
-            try GrokBuildOneShotCLIOptions(
-                prompt: promptArgument(from: message, promptFilePath: promptFilePath),
+        ) -> [String] {
+            GrokBuildOneShotCLIOptions(
+                promptFilePath: promptFilePath,
                 model: nil,
                 effort: nil
             ).toTokens()
@@ -53,6 +45,11 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         guard message.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build one-shot requests cannot resume a previous session."
+            )
+        }
+        guard message.transientImages.isEmpty else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Grok Build one-shot requests do not accept image attachments. Choose an image-capable Oracle model or remove the images and retry."
             )
         }
 
@@ -125,13 +122,11 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
 
         let promptURL = promptDirectory.appendingPathComponent("prompt.txt")
         let prompt = Self.promptText(from: message)
-        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !message.transientImages.isEmpty else {
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AIProviderError.invalidResponse(detail: "Grok Build prompt is empty")
         }
-        if message.transientImages.isEmpty {
-            try prompt.write(to: promptURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: promptURL.path)
-        }
+        try prompt.write(to: promptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: promptURL.path)
 
         let processConfig = CLIProcessConfiguration(
             command: launch.command,
@@ -154,8 +149,8 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         }
         try Task.checkCancellation()
 
-        let arguments = try GrokBuildOneShotCLIOptions(
-            prompt: Self.promptArgument(from: message, promptFilePath: promptURL.path),
+        let arguments = GrokBuildOneShotCLIOptions(
+            promptFilePath: promptURL.path,
             model: selection.model,
             effort: selection.effort
         ).toTokens()
@@ -287,40 +282,6 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         return systemPrompt + "\n\n" + userMessage
     }
 
-    private static func promptArgument(
-        from message: AgentMessage,
-        promptFilePath: String
-    ) throws -> GrokBuildOneShotPromptArgument {
-        guard !message.transientImages.isEmpty else {
-            return .file(promptFilePath)
-        }
-
-        let blocks = try ACPPromptContentBuilder.blocks(
-            text: promptText(from: message),
-            attachments: [],
-            transientImages: message.transientImages
-        )
-        let data: Data
-        do {
-            data = try JSONSerialization.data(withJSONObject: blocks, options: [.sortedKeys])
-        } catch {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build could not encode the Oracle image prompt as JSON."
-            )
-        }
-        guard data.count <= maxPromptJSONArgumentBytes else {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build image prompt is too large for a safe macOS command-line launch (\(data.count) bytes; limit \(maxPromptJSONArgumentBytes) bytes). Reduce the number or size of attached images and retry."
-            )
-        }
-        guard let json = String(data: data, encoding: .utf8) else {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build could not encode the Oracle image prompt as UTF-8 JSON."
-            )
-        }
-        return .json(json)
-    }
-
     private static func resolveModelSelection(
         modelString: String?,
         snapshot: ACPDiscoveredSessionModels?
@@ -414,11 +375,6 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     }
 }
 
-private enum GrokBuildOneShotPromptArgument {
-    case file(String)
-    case json(String)
-}
-
 private struct GrokBuildOneShotCLIOptions {
     static let disallowedTools = ["read_file", "search_tool", "use_tool"]
 
@@ -440,17 +396,12 @@ private struct GrokBuildOneShotCLIOptions {
         "MCPTool"
     ]
 
-    var prompt: GrokBuildOneShotPromptArgument
+    var promptFilePath: String
     var model: String?
     var effort: String?
 
     func toTokens() -> [String] {
-        var tokens: [String] = switch prompt {
-        case let .file(path):
-            ["--prompt-file", path]
-        case let .json(json):
-            ["--prompt-json", json]
-        }
+        var tokens = ["--prompt-file", promptFilePath]
         tokens += [
             "--output-format", "json",
             "--verbatim",
