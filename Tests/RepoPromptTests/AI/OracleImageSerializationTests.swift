@@ -37,12 +37,12 @@ final class OracleImageSerializationTests: XCTestCase {
             .claudeCodeSonnet,
             .codexCustom(name: "codex"),
             .openCodeCustom(name: "opencode"),
-            .cursorCustom(name: "cursor"),
-            .grokBuildCustom(name: "grok")
+            .cursorCustom(name: "cursor")
         ]
         for model in models {
             XCTAssertTrue(OracleImageRouteAdmission.supports(model), "Expected \(model) to admit images")
         }
+        XCTAssertFalse(OracleImageRouteAdmission.supports(.grokBuildCustom(name: "grok")))
     }
 
     func testOpenAITextOnlyMessagesRemainScalar() throws {

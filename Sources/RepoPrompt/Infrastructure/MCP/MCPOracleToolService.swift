@@ -783,20 +783,27 @@ struct MCPOracleToolService {
         let namespace = lookupContext.exactFileNamespace(storeRoots: storeRoots)
         do {
             var seen: Set<String> = []
+            var capturesByPhysicalRootPath: [String: OracleImagePhysicalRootCapture] = [:]
             var projections: [OracleImageRootProjection] = []
             for binding in namespace.rootBindings
                 where representedPhysicalPaths.contains(binding.lookupRoot.standardizedFullPath)
             {
                 let physicalRootPath = binding.lookupRoot.standardizedFullPath
+                let capture: OracleImagePhysicalRootCapture
+                if let existing = capturesByPhysicalRootPath[physicalRootPath] {
+                    capture = existing
+                } else {
+                    capture = try OracleImagePhysicalRootCapture.capture(
+                        physicalRootPath: physicalRootPath,
+                        index: requests[0].index
+                    )
+                    capturesByPhysicalRootPath[physicalRootPath] = capture
+                }
                 let logicalRootPaths = [physicalRootPath] + binding.clientRoots.map(\.standardizedFullPath)
                 for logicalRootPath in logicalRootPaths {
                     let key = "\(logicalRootPath)\u{0}\(physicalRootPath)"
                     guard seen.insert(key).inserted else { continue }
-                    try projections.append(OracleImageRootProjection.capture(
-                        logicalRootPath: logicalRootPath,
-                        physicalRootPath: physicalRootPath,
-                        index: requests[0].index
-                    ))
+                    projections.append(capture.projection(logicalRootPath: logicalRootPath))
                 }
             }
             return try await OracleImageAttachmentLoader.loadDetached(
