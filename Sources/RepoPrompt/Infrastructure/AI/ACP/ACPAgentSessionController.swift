@@ -675,7 +675,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor, .grokBuild, .omp:
+        case .openCode, .cursor, .grokBuild, .omp, .devin:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -2109,6 +2109,7 @@ actor ACPAgentSessionController {
         }
         if error is CursorACPLaunchResolutionError || error is OpenCodeACPLaunchResolutionError
             || error is OMPACPLaunchResolutionError
+            || error is DevinACPLaunchResolutionError
         {
             return "launch_resolution"
         }
@@ -2942,7 +2943,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .omp:
+        case .openCode, .cursor, .omp, .devin:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
@@ -2993,7 +2994,7 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode, .grokBuild, .omp:
+        case .openCode, .grokBuild, .omp, .devin:
             // Grok full access is provider-native (`grok agent --always-approve stdio`); the
             // controller never auto-selects permission options for it.
             return nil
@@ -3047,7 +3048,7 @@ actor ACPAgentSessionController {
                 .optionID("allow_once"),
                 .kind("allow_once")
             ]
-        case .grokBuild, .omp:
+        case .grokBuild, .omp, .devin:
             // Strict RepoPrompt MCP auto-approval is per-request: never select a provider-wide
             // or session-scoped option here.
             [
@@ -3252,6 +3253,8 @@ actor ACPAgentSessionController {
                 "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
             case .omp:
                 "RP_OMP_ACP_RAW_CAPTURE_PATH"
+            case .devin:
+                "RP_DEVIN_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)

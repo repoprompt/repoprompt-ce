@@ -1023,6 +1023,7 @@ extension AgentProviderKind {
         case .cursor: "cursorarrow"
         case .grokBuild: "bolt.circle.fill"
         case .omp: "pi"
+        case .devin: "terminal.fill"
         }
     }
 }

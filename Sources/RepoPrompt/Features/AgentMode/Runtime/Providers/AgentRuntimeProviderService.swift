@@ -42,6 +42,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case cursor
     case grokBuild
     case omp
+    case devin
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
@@ -51,6 +52,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let openCodeMCPClientID = "opencode"
     static let cursorMCPClientID = "cursor"
     static let ompMCPClientID = "omp-coding-agent"
+    /// Devin's built-in Rust MCP client reports this exact initialize name.
+    static let devinMCPClientID = "rmcp"
     /// Grok Build presents `grok-shell-<injected server name>` (e.g. `grok-shell-RepoPromptCE`)
     /// to MCP servers. The hint must equal that exact registered name: the pending run-scoped
     /// tab-context store keys are raw client names (no family canonicalization), so a
@@ -72,6 +75,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "grok"
         case .omp:
             "omp"
+        case .devin:
+            "devin"
         }
     }
 
@@ -89,6 +94,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "Grok Build"
         case .omp:
             "Oh My Pi"
+        case .devin:
+            "Devin"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -112,6 +119,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.grokBuildMCPClientID
         case .omp:
             Self.ompMCPClientID
+        case .devin:
+            Self.devinMCPClientID
         }
     }
 
@@ -125,6 +134,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .grokBuild
         case .omp:
             .omp
+        case .devin:
+            .devin
         case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             nil
         }
@@ -134,7 +145,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor, .grokBuild, .omp:
+        case .codexExec, .openCode, .cursor, .grokBuild, .omp, .devin:
             false
         }
     }
@@ -145,7 +156,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .devin:
             true
         }
     }
@@ -154,7 +165,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .cursor, .grokBuild:
             false
-        case .claudeCode, .codexExec, .openCode, .omp, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .omp, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .devin:
             true
         }
     }
@@ -174,6 +185,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "xAI Grok Build ACP agent. Uses Grok Build's ACP runtime (`grok agent stdio`) and injects RepoPrompt MCP tools through ACP session configuration."
         case .omp:
             return "Installed Oh My Pi ACP agent. OMP owns authentication, provider and model selection, fallbacks, memory, compaction, and internal tools; RepoPrompt injects its MCP tools."
+        case .devin:
+            return "Installed Devin ACP agent for interactive Agent Mode. Devin owns authentication, model selection, modes, and internal tools; RepoPrompt injects its MCP tools."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -210,6 +223,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "grok_build_acp"
         case .omp:
             "omp_acp"
+        case .devin:
+            "devin_acp"
         }
     }
 
@@ -223,7 +238,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor, .grokBuild, .omp:
+        case .codexExec, .openCode, .cursor, .grokBuild, .omp, .devin:
             nil
         }
     }
@@ -324,6 +339,10 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created OMPACPHeadlessAgentProvider")
             }
             return OMPACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+        case .devin:
+            return UnsupportedHeadlessAgentProvider(
+                reason: "Devin CLI is currently supported only in interactive Agent Mode."
+            )
         case .grokBuild:
             let config = GrokBuildAgentConfig(
                 enableDebugLogging: Self.enableDebugLogging,

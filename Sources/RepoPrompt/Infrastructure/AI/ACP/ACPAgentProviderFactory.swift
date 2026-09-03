@@ -39,6 +39,12 @@ enum ACPAgentProviderFactory {
                     enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging
                 )
             )
+        case .devin:
+            DevinACPAgentProvider(
+                config: DevinAgentConfig(
+                    enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging
+                )
+            )
         case .grokBuild:
             try await GrokBuildACPAgentProvider(
                 config: GrokBuildAgentConfig(
