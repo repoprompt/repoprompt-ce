@@ -4639,8 +4639,10 @@ enum AgentTranscriptIO {
         let keyPaths = Array(NSOrderedSet(array: toolExecutions.flatMap(\.keyPaths))) as? [String] ?? []
         let allToolNames = toolNameCounts.isEmpty ? toolNames : Array(toolNameCounts.keys.sorted())
         let narration = latestCollapsedNarrationText(from: activities)
-        let shortNarration = narration.map {
-            $0.count > 120 ? String($0.prefix(120)) + "…" : $0
+        let shortNarration: String? = narration.flatMap {
+            let sanitized = $0.sanitizedForDisplay
+            guard !sanitized.isEmpty else { return nil }
+            return sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized
         }
         let toolGroups = ClusterToolCategory.buildGroups(toolNames: allToolNames, counts: toolNameCounts)
         let summary = AgentTranscriptClusterSummary(
@@ -7752,7 +7754,8 @@ enum AgentTranscriptProjectionBuilder {
         let containsWarning = toolExecutions.contains { $0.status == .warning }
         let narration = latestNarrationText(from: rows)
         let shortNarration: String? = if let narration, !narration.isEmpty {
-            narration.count > 120 ? String(narration.prefix(120)) + "…" : narration
+            let sanitized = narration.sanitizedForDisplay
+            if sanitized.isEmpty { nil } else { sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized }
         } else {
             nil
         }
