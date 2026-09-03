@@ -350,21 +350,55 @@ struct AgentModelsSettingsView: View {
 
     private var oracleSection: some View {
         settingsCard {
-            sectionHeader(title: "Oracle Model", subtitle: "Used by ask_oracle, oracle_send, plan/review, and Context Builder analysis.")
+            sectionHeader(
+                title: "Oracle Models",
+                subtitle: "Choose a primary Oracle and up to four additional models. Grouped requests run each model independently and keep results separate in roster order."
+            )
 
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(0 ..< viewModel.oracleCount, id: \.self) { index in
+                    oracleRow(at: index)
+                }
+
+                Button {
+                    viewModel.addOracle()
+                } label: {
+                    Label("Add Oracle", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!viewModel.canAddOracle)
+                .hoverTooltip(
+                    viewModel.canAddOracle
+                        ? "Add another Oracle model."
+                        : "Choose an Oracle first, or remove an Oracle to stay within the five-model limit."
+                )
+            }
+        }
+    }
+
+    private func oracleRow(at index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 12) {
+                Text(viewModel.oracleLabel(at: index))
+                    .font(.callout.weight(.medium))
+                    .frame(width: 112, alignment: .leading)
+
                 AIModelDropdown(
                     promptViewModel: promptVM,
                     showSettingsPopover: $showSettingsPopover,
                     windowID: windowID,
                     useBorderlessStyle: false,
                     isInGeneralSettings: true,
-                    destination: viewModel.oracleModelDestination
+                    destination: index == 0
+                        ? viewModel.oracleModelDestination
+                        : viewModel.additionalOracleModelDestination(at: index - 1)
                 )
 
                 Spacer(minLength: 0)
 
-                if viewModel.showsRecommendationActions,
+                if index == 0,
+                   viewModel.showsRecommendationActions,
                    let recommendedName = viewModel.recommendedOracleModelName,
                    !viewModel.isOracleRecommendationSatisfied
                 {
@@ -377,6 +411,14 @@ struct AgentModelsSettingsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                } else if index > 0 {
+                    Button(role: .destructive) {
+                        viewModel.removeOracle(at: index - 1)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .hoverTooltip("Remove \(viewModel.oracleLabel(at: index))")
                 }
             }
 
@@ -384,10 +426,11 @@ struct AgentModelsSettingsView: View {
                 Image(systemName: "cpu")
                     .foregroundColor(.secondary)
                     .font(.caption)
-                Text("Using: \(viewModel.currentOracleModelName)")
+                Text("Using: \(viewModel.oracleModelName(at: index))")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+            .padding(.leading, 124)
         }
     }
 

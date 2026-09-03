@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - Oracle Pill
@@ -110,8 +111,26 @@ enum AgentOraclePillLogic {
         in sessions: [ChatSession],
         streamingSessionIDs: Set<UUID>
     ) -> ChatSession? {
-        latestStreamingSession(in: sessions, streamingSessionIDs: streamingSessionIDs)
+        guard let latest = latestStreamingSession(in: sessions, streamingSessionIDs: streamingSessionIDs)
             ?? sessions.max(by: { $0.savedAt < $1.savedAt })
+        else { return nil }
+        guard let groupID = latest.oracleGroupID else { return latest }
+        return sessions.first(where: {
+            $0.oracleGroupID == groupID && $0.oracleLaneIndex == 0
+        }) ?? latest
+    }
+
+    static func canCopyAll(_ session: ChatSession) -> Bool {
+        session.oracleGroupID != nil && (session.oracleGroupSize ?? 1) > 1
+    }
+
+    static func aggregateOracleCount(configuredAdditionalCount: Int, sessions: [ChatSession]) -> Int {
+        let configured = 1 + configuredAdditionalCount
+        guard let latest = sessions.max(by: { $0.savedAt < $1.savedAt }),
+              latest.oracleGroupID != nil
+        else { return configured }
+        let projected = min(max(latest.oracleGroupSize ?? 1, 1), 5)
+        return max(configured, projected)
     }
 
     static func latestStreamingSession(
@@ -176,6 +195,35 @@ enum AgentOraclePillLogic {
         guard matches.count == 1 else { return nil }
         return matches[0]
     }
+
+    enum LaneDotState: Equatable {
+        case streaming
+        case failed
+        case completed
+    }
+
+    static func lastAssistantContent(
+        liveMessages: [AIChatMessage],
+        storedMessages: [StoredMessage]
+    ) -> String? {
+        if let last = liveMessages.last(where: { !$0.isUser }) {
+            return last.content
+        }
+        return storedMessages.last(where: { !$0.isUser })?.rawText
+    }
+
+    static func assistantContentIndicatesFailure(_ content: String?) -> Bool {
+        guard let content else { return false }
+        if content.contains("\n--\nError:\n") { return true }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("Error:")
+    }
+
+    static func laneDotState(isStreaming: Bool, lastAssistantContent: String?) -> LaneDotState {
+        if isStreaming { return .streaming }
+        if assistantContentIndicatesFailure(lastAssistantContent) { return .failed }
+        return .completed
+    }
 }
 
 /// Pill that appears when there are oracle chat sessions for the current tab.
@@ -195,10 +243,18 @@ struct AgentOraclePill: View {
         let actionPolicy: ChatTranscriptActionPolicy
     }
 
+    private enum CopyAllFeedback: String {
+        case copying = "Copying…"
+        case copied = "Copied!"
+        case failed = "Copy Failed"
+    }
+
     @State private var presentedPopover: PopoverPresentation?
+    @State private var copyAllFeedback: CopyAllFeedback?
     @State private var autoScrollEnabled = false
     @State private var openRequestGeneration: UInt64 = 0
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var settingsStore = GlobalSettingsStore.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -221,8 +277,28 @@ struct AgentOraclePill: View {
         )
     }
 
+    private var currentTabSessions: [ChatSession] {
+        currentTabID.map(oracleViewModel.sessions(forTabID:)) ?? []
+    }
+
+    private var oracleCount: Int {
+        let workspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
+        let configuredAdditional = settingsStore
+            .effectiveAgentModelsProfile(workspaceID: workspaceID)
+            .additionalOracleModelRaws.count
+        return AgentOraclePillLogic.aggregateOracleCount(
+            configuredAdditionalCount: configuredAdditional,
+            sessions: currentTabSessions
+        )
+    }
+
     private var isStreaming: Bool {
         guard let latestTabSession else { return false }
+        if let groupID = latestTabSession.oracleGroupID {
+            return currentTabSessions.contains {
+                $0.oracleGroupID == groupID && oracleViewModel.streamingSessions.contains($0.id)
+            }
+        }
         return oracleViewModel.streamingSessions.contains(latestTabSession.id)
     }
 
@@ -241,6 +317,20 @@ struct AgentOraclePill: View {
             return "Latest tab chat"
         }
         return session.name
+    }
+
+    private func laneDotColor(for session: ChatSession) -> Color {
+        switch AgentOraclePillLogic.laneDotState(
+            isStreaming: oracleViewModel.streamingSessions.contains(session.id),
+            lastAssistantContent: AgentOraclePillLogic.lastAssistantContent(
+                liveMessages: oracleViewModel.messagesSnapshot(for: session.id),
+                storedMessages: session.messages
+            )
+        ) {
+        case .streaming: Color.purple
+        case .failed: Color.red
+        case .completed: Color.green
+        }
     }
 
     private var hasAnySessions: Bool {
@@ -267,7 +357,7 @@ struct AgentOraclePill: View {
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                                 .foregroundStyle(.secondary)
                         }
-                        Text("Oracle")
+                        Text(oracleCount > 1 ? "Oracles · \(oracleCount)" : "Oracle")
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: isStreaming ? .semibold : .medium))
                             .foregroundStyle(isStreaming ? .primary : .secondary)
                     }
@@ -282,7 +372,12 @@ struct AgentOraclePill: View {
                     .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
                 }
                 .buttonStyle(.plain)
-                .hoverTooltip(isStreaming ? "Oracle is thinking — click to view the live chat" : "Open the latest Oracle chat for this tab", .top)
+                .hoverTooltip(
+                    oracleCount > 1
+                        ? (isStreaming ? "Oracles are thinking — click to view progress" : "Open Oracle chats for this tab")
+                        : (isStreaming ? "Oracle is thinking — click to view the live chat" : "Open the latest Oracle chat for this tab"),
+                    .top
+                )
                 .animation(.easeInOut(duration: 0.2), value: isStreaming)
             } else {
                 Color.clear.frame(width: 0, height: 0)
@@ -331,6 +426,13 @@ struct AgentOraclePill: View {
         }
     }
 
+    private func groupMemberSessions(for session: ChatSession) -> [ChatSession] {
+        guard let groupID = session.oracleGroupID else { return [] }
+        return currentTabSessions
+            .filter { $0.oracleGroupID == groupID }
+            .sorted { ($0.oracleLaneIndex ?? .max) < ($1.oracleLaneIndex ?? .max) }
+    }
+
     @ViewBuilder
     private func oraclePopoverContent(_ presentation: PopoverPresentation) -> some View {
         // Popover dimensions scale so chat messages don't feel cramped at
@@ -355,6 +457,47 @@ struct AgentOraclePill: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                if let session = presentedSession(for: presentation),
+                   AgentOraclePillLogic.canCopyAll(session)
+                {
+                    Button(copyAllFeedback?.rawValue ?? "Copy All") {
+                        copyAllLanes(containing: session)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(copyAllFeedback == .copying)
+                }
+            }
+
+            if let presented = presentedSession(for: presentation) {
+                let members = groupMemberSessions(for: presented)
+                if members.count > 1 {
+                    HStack(spacing: 6) {
+                        ForEach(members) { member in
+                            let laneIndex = member.oracleLaneIndex ?? 0
+                            Button {
+                                openRequestGeneration &+= 1
+                                present(
+                                    sessionID: member.id,
+                                    isExplicit: presentation.isExplicit,
+                                    actionPolicy: presentation.actionPolicy,
+                                    generation: openRequestGeneration
+                                )
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Circle()
+                                        .fill(laneDotColor(for: member))
+                                        .frame(width: 6, height: 6)
+                                    Text(OracleViewModel.oracleLabel(laneIndex: laneIndex))
+                                        .lineLimit(1)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .hoverTooltip(member.oracleModelRaw ?? "Oracle model")
+                        }
+                    }
+                }
             }
 
             ChatMessagesView(
@@ -371,6 +514,27 @@ struct AgentOraclePill: View {
         }
         .padding(14)
         .frame(width: popoverWidth)
+    }
+
+    private func copyAllLanes(containing session: ChatSession) {
+        copyAllFeedback = .copying
+        Task { @MainActor in
+            let feedback: CopyAllFeedback
+            do {
+                let payload = try await oracleViewModel.oracleGroupCopyPayload(containing: session)
+                let markdown = OracleLaneMarkdownFormatter.format(payload)
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                feedback = pasteboard.setString(markdown, forType: .string) ? .copied : .failed
+            } catch {
+                feedback = .failed
+            }
+            copyAllFeedback = feedback
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if copyAllFeedback == feedback {
+                copyAllFeedback = nil
+            }
+        }
     }
 
     private func reconcilePresentedSession() {

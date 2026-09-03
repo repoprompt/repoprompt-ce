@@ -185,7 +185,7 @@ package struct DomainPersistenceDataSnapshot: Sendable {
     }
 }
 
-private final class DomainBlockingCancellation: Sendable {
+package final class DomainBlockingCancellation: Sendable {
     private let state = OSAllocatedUnfairLock(initialState: false)
 
     func cancel() {
@@ -199,7 +199,7 @@ private final class DomainBlockingCancellation: Sendable {
     }
 }
 
-private enum DomainBlockingIO {
+package enum DomainBlockingIO {
     static func run<T: Sendable>(
         _ operation: @escaping @Sendable (DomainBlockingCancellation) throws -> T
     ) async throws -> T {
@@ -348,6 +348,10 @@ package struct DomainPersistenceCoordinator {
             .appendingPathComponent("DomainRuntime", isDirectory: true)
             .appendingPathComponent("v1", isDirectory: true)
             .appendingPathComponent("\(safe)-\(digest)", isDirectory: true)
+    }
+
+    package var oracleStorageRoot: URL {
+        runtimeRoot.appendingPathComponent("oracle", isDirectory: true)
     }
 
     private var journalDirectory: URL { runtimeRoot.appendingPathComponent("working-journals", isDirectory: true) }
@@ -2045,7 +2049,7 @@ package struct DomainPersistenceCoordinator {
     }
 }
 
-private enum DomainPersistenceLock {
+package enum DomainPersistenceLock {
     private static let waitTimeoutNanoseconds: UInt64 = 2_000_000_000
     private static let retryDelayMicroseconds: useconds_t = 10000
 

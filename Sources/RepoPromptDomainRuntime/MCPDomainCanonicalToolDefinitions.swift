@@ -1072,6 +1072,114 @@ package enum MCPDomainCanonicalToolDefinitions {
                 isEnabledByDefault: definition.isEnabledByDefault
             )
         }
+        if definition.name == MCPGlobalToolName.appSettings,
+           case var .object(schema) = definition.inputSchema,
+           case var .object(properties)? = schema["properties"]
+        {
+            properties["value"] = .object([
+                "anyOf": .array([
+                    .object(["type": .string("boolean")]),
+                    .object(["type": .string("integer")]),
+                    .object(["type": .string("number")]),
+                    .object(["type": .string("string")]),
+                    .object([
+                        "type": .string("array"),
+                        "description": .string("Ordered Oracle roster additions (maximum four model identifiers)."),
+                        "maxItems": .int(OracleRosterContract.maximumAdditionalCount),
+                        "items": .object([
+                            "type": .string("string"),
+                            "maxLength": .int(OracleRosterContract.maximumModelIdentifierLength)
+                        ])
+                    ]),
+                    .object(["type": .string("null")])
+                ])
+            ])
+            schema["properties"] = .object(properties)
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description
+                    .replacingOccurrences(
+                        of: "`set` and `options` take one `key`.",
+                        with: "`set` and `options` take one `key`. `models.additional_oracle_models` is an ordered string array with at most four entries."
+                    )
+                    .replacingOccurrences(
+                        of: "- `{\"op\":\"set\",\"key\":\"models.planning_model\",\"value\":null}`",
+                        with: "- `{\"op\":\"set\",\"key\":\"models.planning_model\",\"value\":null}`\n- `{\"op\":\"set\",\"key\":\"models.additional_oracle_models\",\"value\":[\"openai/gpt-5.2\",\"anthropic/claude-opus-4-6\"]}`"
+                    ),
+                inputSchema: .object(schema),
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+        if definition.name == MCPWindowToolName.askOracle,
+           case var .object(schema) = definition.inputSchema,
+           case var .object(properties)? = schema["properties"]
+        {
+            properties["model"] = .object([
+                "type": .string("string"),
+                "description": .string("Optional model override for a new conversation. Changes the primary model only and is rejected on continuation."),
+                "maxLength": .int(OracleRosterContract.maximumModelIdentifierLength)
+            ])
+            properties["new_chat"] = .object([
+                "type": .string("boolean"),
+                "description": .string("Start a new conversation. Omitted chat_id also selects the start route; false with chat_id continues that conversation.")
+            ])
+            schema["properties"] = .object(properties)
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description + " Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
+                inputSchema: .object(schema),
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+        if definition.name == MCPWindowToolName.oracleSend,
+           case var .object(schema) = definition.inputSchema,
+           case var .object(properties)? = schema["properties"]
+        {
+            properties["chat_id"] = .object([
+                "type": .string("string"),
+                "description": .string("Continue a specific chat in the current tab or context. Omit to resume the selected or most recent eligible conversation.")
+            ])
+            properties["new_chat"] = .object([
+                "type": .string("boolean"),
+                "description": .string("Set true to force a new conversation. When false or omitted without chat_id, resume the selected or most recent eligible conversation.")
+            ])
+            properties["model"] = .object([
+                "type": .string("string"),
+                "description": .string("Optional primary-model override for an explicit new_chat=true start; rejected on continuation."),
+                "maxLength": .int(OracleRosterContract.maximumModelIdentifierLength)
+            ])
+            schema["properties"] = .object(properties)
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description.replacingOccurrences(
+                    of: "Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode.",
+                    with: "Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode. When `chat_id` and `new_chat` are omitted, the resolved tab resumes its selected eligible conversation, falling back to the most recent eligible conversation. Set `new_chat=true` to force a new conversation; `model` is valid only for that explicit start."
+                ),
+                inputSchema: .object(schema),
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+        if definition.name == MCPWindowToolName.contextBuilder,
+           case var .object(schema) = definition.inputSchema,
+           case var .object(properties)? = schema["properties"]
+        {
+            properties["context_pack_ref"] = .object([
+                "type": .string("string"),
+                "pattern": .string("^oracle-pack:sha256:[0-9a-f]{64}$"),
+                "description": .string("Direct-headless only: canonical reference to a resolvable persisted frozen Context Builder package. Raw multi-Oracle instructions remain rejected with context_pack_required.")
+            ])
+            schema["properties"] = .object(properties)
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description + " Direct grouped execution accepts only a canonical resolvable context_pack_ref; raw multi-Oracle instructions still require a frozen package.",
+                inputSchema: .object(schema),
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
         guard definition.name == MCPGlobalToolName.bindContext,
               case var .object(schema) = definition.inputSchema,
               case var .object(properties)? = schema["properties"]
