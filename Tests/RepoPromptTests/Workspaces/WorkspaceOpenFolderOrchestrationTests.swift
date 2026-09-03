@@ -388,30 +388,160 @@ import XCTest
             XCTAssertEqual(replay.resultingDigest, first.resultingDigest)
         }
 
-        func testConcurrentReplaceRetriesRecheckOperationIDAfterMutationGate() async throws {
-            let runtime = try await makeDomainRuntime()
-            let manager = makeManager(domainRuntime: runtime)
-            await manager.awaitInitialized()
-            let folder = try makeFolder(named: "ReplaceRetryGate")
-            let existing = manager.createWorkspace(name: "Replace Original", repoPaths: [folder.path])
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(2))
-            var authoritativeWorkspace: DomainWorkspaceSnapshot?
-            while clock.now < deadline {
-                authoritativeWorkspace = await runtime.workspaceStore.workspaceSnapshot(existing.id)
-                if authoritativeWorkspace != nil { break }
-                try await clock.sleep(for: .milliseconds(10))
-            }
-            let authoritative = try XCTUnwrap(authoritativeWorkspace)
-            let client = DomainWorkspaceAuthorityClient(
-                store: runtime.workspaceStore,
-                windowID: -1302
+        func testLegacyRawDocumentFingerprintReplaysAfterRestart() async throws {
+            let goldenWorkspaceID = try XCTUnwrap(
+                UUID(uuidString: "22222222-2222-2222-2222-222222222222")
             )
-            var update = existing
-            update.name = "Replace Applied"
-            var conflictingUpdate = update
-            conflictingUpdate.name = "Replace Collision"
+            let goldenOperationID = try XCTUnwrap(
+                UUID(uuidString: "11111111-1111-1111-1111-111111111111")
+            )
+            let goldenBytes = Data(
+                "{\"id\":\"22222222-2222-2222-2222-222222222222\",\"schemaVersion\":1,\"name\":\"Legacy Golden\",\"repoPaths\":[]}".utf8
+            )
+            let goldenDocument = try DomainWorkspaceDocument.decode(
+                documentBytes: goldenBytes,
+                fileURL: URL(fileURLWithPath: "/tmp/legacy-fingerprint-workspace.json")
+            )
+            let goldenEnvelope = replaceEnvelope(
+                document: goldenDocument,
+                expectedWorkspaceRevision: 7,
+                operationID: goldenOperationID,
+                windowID: -1305
+            )
+            XCTAssertEqual(
+                goldenEnvelope.legacyFingerprint,
+                "285208fcaa7ab0c042f79a56455492edcf22a09fd8548de3079d4e1a4e7c29f8",
+                "The compatibility fingerprint must remain byte-for-byte identical to the pre-change algorithm"
+            )
+            XCTAssertEqual(goldenDocument.workspaceID, goldenWorkspaceID)
+
+            let profileIdentifier = "workspace-open-folder-legacy-fingerprint-\(UUID().uuidString)"
+            let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1305)
+            let folder = try makeFolder(named: "ResolveOrCreateLegacyFingerprintReplay")
+            let existing = WorkspaceModel(name: "Legacy Fingerprint Winner", repoPaths: [folder.path])
+            try await createAuthorityWorkspace(existing, using: client)
+            let proposed = WorkspaceModel(name: "Legacy Fingerprint Proposed", repoPaths: [folder.path])
             let operationID = UUID()
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath(folder),
+                operationID: operationID,
+                windowID: -1305
+            )
+            XCTAssertNotEqual(
+                envelope.fingerprint,
+                envelope.legacyFingerprint,
+                "The compatibility fixture must distinguish canonical and legacy fingerprint formats"
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            XCTAssertEqual(first.disposition, .unchanged)
+            XCTAssertEqual(first.workspace?.document.workspaceID, existing.id)
+            let journalURL = try workingJournalURL(workspaceID: existing.id)
+            _ = await runtime.shutdown()
+            domainRuntimes.removeAll { $0 === runtime }
+            try replaceOperationFingerprint(
+                operationID: operationID,
+                expectedFingerprint: envelope.fingerprint,
+                replacementFingerprint: envelope.legacyFingerprint,
+                in: journalURL
+            )
+
+            let restarted = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let replay = await restarted.workspaceStore.execute(envelope)
+            let diagnostics = """
+            canonicalFingerprint=\(envelope.fingerprint)
+            legacyFingerprint=\(envelope.legacyFingerprint)
+            documentIdentity=\(envelope.documentIdentity ?? "nil")
+            replay=\(describe(replay))
+            """
+
+            XCTAssertEqual(replay.disposition, .deduplicated, diagnostics)
+            XCTAssertEqual(replay.workspace?.document.workspaceID, existing.id, diagnostics)
+            XCTAssertEqual(replay.resultingDigest, first.resultingDigest, diagnostics)
+        }
+
+        func testConcurrentSemanticReplaceRetriesDeduplicateAfterMutationGate() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1302)
+            let folder = try makeFolder(named: "ReplaceRetryGate")
+            let existing = WorkspaceModel(name: "Replace Original", repoPaths: [folder.path])
+            try await createAuthorityWorkspace(existing, using: client)
+            let snapshot = await runtime.workspaceStore.workspaceSnapshot(existing.id)
+            let authoritative = try XCTUnwrap(snapshot)
+            let operationID = UUID()
+            let firstDocument = try orderedDocument(
+                workspaceID: existing.id,
+                name: "Replace Applied",
+                fileURL: authoritative.document.fileURL,
+                idFirst: true
+            )
+            let retryDocument = try orderedDocument(
+                workspaceID: existing.id,
+                name: "Replace Applied",
+                fileURL: authoritative.document.fileURL,
+                idFirst: false
+            )
+            let collisionDocument = try orderedDocument(
+                workspaceID: existing.id,
+                name: "Replace Collision",
+                fileURL: authoritative.document.fileURL,
+                idFirst: false
+            )
+            let firstEnvelope = replaceEnvelope(
+                document: firstDocument,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                operationID: operationID
+            )
+            let retryEnvelope = replaceEnvelope(
+                document: retryDocument,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                operationID: operationID
+            )
+            let collisionEnvelope = replaceEnvelope(
+                document: collisionDocument,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                operationID: operationID
+            )
+            let identityDiagnostics = """
+            operationID=\(operationID.uuidString)
+            firstFingerprint=\(firstEnvelope.fingerprint)
+            retryFingerprint=\(retryEnvelope.fingerprint)
+            collisionFingerprint=\(collisionEnvelope.fingerprint)
+            firstDocumentIdentity=\(firstEnvelope.documentIdentity ?? "nil")
+            retryDocumentIdentity=\(retryEnvelope.documentIdentity ?? "nil")
+            collisionDocumentIdentity=\(collisionEnvelope.documentIdentity ?? "nil")
+            firstRawDigest=\(firstDocument.contentDigest)
+            retryRawDigest=\(retryDocument.contentDigest)
+            collisionRawDigest=\(collisionDocument.contentDigest)
+            """
+            XCTAssertNotEqual(
+                firstDocument.contentDigest,
+                retryDocument.contentDigest,
+                "Test inputs must use distinct JSON byte orderings.\n\(identityDiagnostics)"
+            )
+            XCTAssertEqual(
+                firstEnvelope.documentIdentity,
+                retryEnvelope.documentIdentity,
+                "Equivalent JSON documents must have one semantic identity.\n\(identityDiagnostics)"
+            )
+            XCTAssertEqual(
+                firstEnvelope.fingerprint,
+                retryEnvelope.fingerprint,
+                "Equivalent retry envelopes must have one canonical fingerprint.\n\(identityDiagnostics)"
+            )
+            XCTAssertNotEqual(
+                firstEnvelope.documentIdentity,
+                collisionEnvelope.documentIdentity,
+                "A semantic document change must change document identity.\n\(identityDiagnostics)"
+            )
+            XCTAssertNotEqual(
+                firstEnvelope.fingerprint,
+                collisionEnvelope.fingerprint,
+                "A semantic document change must remain an operation-ID collision.\n\(identityDiagnostics)"
+            )
+
             let mutationGate = WorkspaceRootMutationTestGate()
             await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired { workspaceID in
                 guard workspaceID == existing.id else { return }
@@ -423,32 +553,170 @@ import XCTest
                 }
             }
 
-            async let first = client.replaceWorking(
-                update,
-                fileURL: authoritative.document.fileURL,
-                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
-                operationID: operationID
-            )
+            async let first = runtime.workspaceStore.execute(firstEnvelope)
             await mutationGate.waitUntilPaused()
-            async let retry = client.replaceWorking(
-                update,
-                fileURL: authoritative.document.fileURL,
-                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
-                operationID: operationID
-            )
+            async let retry = runtime.workspaceStore.execute(retryEnvelope)
             await mutationGate.release()
-            let (firstOutcome, retryOutcome) = try await (first, retry)
-            let collision = try await client.replaceWorking(
-                conflictingUpdate,
-                fileURL: authoritative.document.fileURL,
-                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
-                operationID: operationID
-            )
+            let (firstOutcome, retryOutcome) = await (first, retry)
+            let collision = await runtime.workspaceStore.execute(collisionEnvelope)
+            let outcomeDiagnostics = """
+            \(identityDiagnostics)
+            firstOutcome=\(describe(firstOutcome))
+            retryOutcome=\(describe(retryOutcome))
+            collisionOutcome=\(describe(collision))
+            """
 
-            XCTAssertEqual(firstOutcome.disposition, .applied)
-            XCTAssertEqual(retryOutcome.disposition, .deduplicated)
-            XCTAssertEqual(collision.disposition, .invalid)
-            XCTAssertEqual(collision.errorCode, .operationIDCollision)
+            XCTAssertEqual(firstOutcome.disposition, .applied, outcomeDiagnostics)
+            XCTAssertEqual(retryOutcome.disposition, .deduplicated, outcomeDiagnostics)
+            XCTAssertEqual(retryOutcome.resultingDigest, firstOutcome.resultingDigest, outcomeDiagnostics)
+            XCTAssertEqual(collision.disposition, .invalid, outcomeDiagnostics)
+            XCTAssertEqual(collision.errorCode, .operationIDCollision, outcomeDiagnostics)
+            XCTAssertEqual(collision.diagnostic, "operation_id_reused_with_different_command", outcomeDiagnostics)
+        }
+
+        func testDistinctArbitraryPrecisionNumbersRemainOperationIDCollisions() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1303)
+            let folder = try makeFolder(named: "ArbitraryPrecisionNumberCollision")
+            let existing = WorkspaceModel(name: "Number Original", repoPaths: [folder.path])
+            try await createAuthorityWorkspace(existing, using: client)
+
+            let cases = [
+                (
+                    label: "outside Decimal exponent range",
+                    first: "1e128",
+                    second: "2e128"
+                ),
+                (
+                    label: "beyond Decimal coefficient precision",
+                    first: "12345678901234567890123456789012345678901",
+                    second: "12345678901234567890123456789012345678902"
+                )
+            ]
+
+            for testCase in cases {
+                let snapshot = await runtime.workspaceStore.workspaceSnapshot(existing.id)
+                let authoritative = try XCTUnwrap(snapshot)
+                let operationID = UUID()
+                let firstDocument = try numberedDocument(
+                    workspaceID: existing.id,
+                    name: testCase.label,
+                    fileURL: authoritative.document.fileURL,
+                    numberToken: testCase.first
+                )
+                let collisionDocument = try numberedDocument(
+                    workspaceID: existing.id,
+                    name: testCase.label,
+                    fileURL: authoritative.document.fileURL,
+                    numberToken: testCase.second
+                )
+                let firstEnvelope = replaceEnvelope(
+                    document: firstDocument,
+                    expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                    operationID: operationID
+                )
+                let collisionEnvelope = replaceEnvelope(
+                    document: collisionDocument,
+                    expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                    operationID: operationID
+                )
+                let identityDiagnostics = """
+                case=\(testCase.label)
+                firstNumber=\(testCase.first)
+                secondNumber=\(testCase.second)
+                firstDocumentIdentity=\(firstEnvelope.documentIdentity ?? "nil")
+                secondDocumentIdentity=\(collisionEnvelope.documentIdentity ?? "nil")
+                firstFingerprint=\(firstEnvelope.fingerprint)
+                secondFingerprint=\(collisionEnvelope.fingerprint)
+                """
+                XCTAssertNotEqual(
+                    firstEnvelope.documentIdentity,
+                    collisionEnvelope.documentIdentity,
+                    "Distinct arbitrary-precision values must not collapse.\n\(identityDiagnostics)"
+                )
+                XCTAssertNotEqual(
+                    firstEnvelope.fingerprint,
+                    collisionEnvelope.fingerprint,
+                    "Distinct arbitrary-precision values must retain collision detection.\n\(identityDiagnostics)"
+                )
+
+                let first = await runtime.workspaceStore.execute(firstEnvelope)
+                let collision = await runtime.workspaceStore.execute(collisionEnvelope)
+                let outcomeDiagnostics = """
+                \(identityDiagnostics)
+                firstOutcome=\(describe(first))
+                collisionOutcome=\(describe(collision))
+                """
+                XCTAssertEqual(first.disposition, .applied, outcomeDiagnostics)
+                XCTAssertEqual(collision.disposition, .invalid, outcomeDiagnostics)
+                XCTAssertEqual(collision.errorCode, .operationIDCollision, outcomeDiagnostics)
+                XCTAssertEqual(
+                    collision.diagnostic,
+                    "operation_id_reused_with_different_command",
+                    outcomeDiagnostics
+                )
+            }
+        }
+
+        func testDuplicateJSONMembersRemainOperationIDCollisions() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1304)
+            let folder = try makeFolder(named: "DuplicateJSONMemberCollision")
+            let existing = WorkspaceModel(name: "Duplicate Member Original", repoPaths: [folder.path])
+            try await createAuthorityWorkspace(existing, using: client)
+            let snapshot = await runtime.workspaceStore.workspaceSnapshot(existing.id)
+            let authoritative = try XCTUnwrap(snapshot)
+            let operationID = UUID()
+            let duplicateDocument = try duplicatedMemberDocument(
+                workspaceID: existing.id,
+                fileURL: authoritative.document.fileURL,
+                includesDuplicate: true
+            )
+            let singleDocument = try duplicatedMemberDocument(
+                workspaceID: existing.id,
+                fileURL: authoritative.document.fileURL,
+                includesDuplicate: false
+            )
+            let duplicateEnvelope = replaceEnvelope(
+                document: duplicateDocument,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                operationID: operationID,
+                windowID: -1304
+            )
+            let singleEnvelope = replaceEnvelope(
+                document: singleDocument,
+                expectedWorkspaceRevision: authoritative.revisions.workingRevision,
+                operationID: operationID,
+                windowID: -1304
+            )
+            let diagnostics = """
+            duplicateDocumentIdentity=\(duplicateEnvelope.documentIdentity ?? "nil")
+            singleDocumentIdentity=\(singleEnvelope.documentIdentity ?? "nil")
+            duplicateFingerprint=\(duplicateEnvelope.fingerprint)
+            singleFingerprint=\(singleEnvelope.fingerprint)
+            duplicateRawDigest=\(duplicateDocument.contentDigest)
+            singleRawDigest=\(singleDocument.contentDigest)
+            """
+
+            XCTAssertNotEqual(duplicateDocument.contentDigest, singleDocument.contentDigest, diagnostics)
+            XCTAssertNotEqual(duplicateEnvelope.documentIdentity, singleEnvelope.documentIdentity, diagnostics)
+            XCTAssertNotEqual(duplicateEnvelope.fingerprint, singleEnvelope.fingerprint, diagnostics)
+
+            let first = await runtime.workspaceStore.execute(duplicateEnvelope)
+            let collision = await runtime.workspaceStore.execute(singleEnvelope)
+            let outcomeDiagnostics = """
+            \(diagnostics)
+            firstOutcome=\(describe(first))
+            collisionOutcome=\(describe(collision))
+            """
+            XCTAssertEqual(first.disposition, .applied, outcomeDiagnostics)
+            XCTAssertEqual(collision.disposition, .invalid, outcomeDiagnostics)
+            XCTAssertEqual(collision.errorCode, .operationIDCollision, outcomeDiagnostics)
+            XCTAssertEqual(
+                collision.diagnostic,
+                "operation_id_reused_with_different_command",
+                outcomeDiagnostics
+            )
         }
 
         func testExplicitCreationStillAllowsPersistentDuplicateRoots() async throws {
@@ -787,6 +1055,71 @@ import XCTest
             storageRoot.appendingPathComponent("\(workspaceID.uuidString).json")
         }
 
+        private func orderedDocument(
+            workspaceID: UUID,
+            name: String,
+            fileURL: URL,
+            idFirst: Bool
+        ) throws -> DomainWorkspaceDocument {
+            let encodedName = try String(decoding: JSONEncoder().encode(name), as: UTF8.self)
+            let json = if idFirst {
+                "{\"id\":\"\(workspaceID.uuidString)\",\"schemaVersion\":1,\"name\":\(encodedName),\"repoPaths\":[],\"semanticProbe\":{\"number\":1.0,\"text\":\"line\\nquote\\\"\",\"nested\":{\"b\":true,\"a\":null}}}"
+            } else {
+                "{\"semanticProbe\":{\"nested\":{\"a\":null,\"b\":true},\"text\":\"line\\u000Aquote\\\"\",\"number\":1e0},\"repoPaths\":[],\"name\":\(encodedName),\"schemaVersion\":1,\"id\":\"\(workspaceID.uuidString)\"}"
+            }
+            return try DomainWorkspaceDocument.decode(
+                documentBytes: Data(json.utf8),
+                fileURL: fileURL
+            )
+        }
+
+        private func numberedDocument(
+            workspaceID: UUID,
+            name: String,
+            fileURL: URL,
+            numberToken: String
+        ) throws -> DomainWorkspaceDocument {
+            let encodedName = try String(decoding: JSONEncoder().encode(name), as: UTF8.self)
+            let json = "{\"id\":\"\(workspaceID.uuidString)\",\"schemaVersion\":1,\"name\":\(encodedName),\"repoPaths\":[],\"semanticProbe\":{\"number\":\(numberToken)}}"
+            return try DomainWorkspaceDocument.decode(
+                documentBytes: Data(json.utf8),
+                fileURL: fileURL
+            )
+        }
+
+        private func duplicatedMemberDocument(
+            workspaceID: UUID,
+            fileURL: URL,
+            includesDuplicate: Bool
+        ) throws -> DomainWorkspaceDocument {
+            let semanticProbe = includesDuplicate
+                ? "{\"number\":1,\"number\":2}"
+                : "{\"number\":2}"
+            let json = "{\"id\":\"\(workspaceID.uuidString)\",\"schemaVersion\":1,\"name\":\"Duplicate Member Applied\",\"repoPaths\":[],\"semanticProbe\":\(semanticProbe)}"
+            return try DomainWorkspaceDocument.decode(
+                documentBytes: Data(json.utf8),
+                fileURL: fileURL
+            )
+        }
+
+        private func replaceEnvelope(
+            document: DomainWorkspaceDocument,
+            expectedWorkspaceRevision: UInt64,
+            operationID: UUID,
+            windowID: Int = -1302
+        ) -> DomainWorkspaceCommandEnvelope {
+            DomainWorkspaceCommandEnvelope(
+                operationID: operationID,
+                expectedWorkspaceRevision: expectedWorkspaceRevision,
+                origin: .appPresentation(windowID: windowID),
+                command: .replaceWorkingDocument(document)
+            )
+        }
+
+        private func describe(_ outcome: DomainCommandOutcome) -> String {
+            "disposition=\(outcome.disposition.rawValue),error=\(outcome.errorCode?.rawValue ?? "nil"),diagnostic=\(outcome.diagnostic ?? "nil"),digest=\(outcome.resultingDigest ?? "nil")"
+        }
+
         private func resolveOrCreateEnvelope(
             _ workspace: WorkspaceModel,
             canonicalRootPath: String,
@@ -835,6 +1168,31 @@ import XCTest
                 return url
             }
             throw WorkspaceOpenFolderOrchestrationTestError.journalNotFound
+        }
+
+        private func replaceOperationFingerprint(
+            operationID: UUID,
+            expectedFingerprint: String,
+            replacementFingerprint: String,
+            in journalURL: URL
+        ) throws {
+            let data = try Data(contentsOf: journalURL)
+            var journal = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any]
+            )
+            var operations = try XCTUnwrap(journal["operations"] as? [[String: Any]])
+            let operationIndex = try XCTUnwrap(operations.firstIndex(where: {
+                $0["operationID"] as? String == operationID.uuidString
+            }))
+            XCTAssertEqual(
+                operations[operationIndex]["fingerprint"] as? String,
+                expectedFingerprint,
+                "The fixture must rewrite the intended canonical operation record"
+            )
+            operations[operationIndex]["fingerprint"] = replacementFingerprint
+            journal["operations"] = operations
+            let legacyData = try JSONSerialization.data(withJSONObject: journal, options: [.sortedKeys])
+            try legacyData.write(to: journalURL, options: .atomic)
         }
 
         private func removeResultingWorkspaceID(

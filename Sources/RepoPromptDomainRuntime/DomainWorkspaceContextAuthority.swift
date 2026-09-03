@@ -349,6 +349,7 @@ actor DomainWorkspaceContextAuthority {
         {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .invalidDocument,
                 diagnostic: diagnostic
@@ -357,6 +358,7 @@ actor DomainWorkspaceContextAuthority {
         if rejectsEphemeralPersistence(envelope.command) {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .invalidDocument,
                 diagnostic: "ephemeral_workspace_not_persistable"
@@ -365,6 +367,7 @@ actor DomainWorkspaceContextAuthority {
         if let workspaceID, unavailableWorkspaces[workspaceID] != nil {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .readOnly,
                 errorCode: .runtimeReadOnlyDegraded,
                 diagnostic: "workspace_document_unavailable"
@@ -373,6 +376,7 @@ actor DomainWorkspaceContextAuthority {
         guard health.acceptsMutations else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .readOnly,
                 errorCode: .runtimeReadOnlyDegraded,
                 diagnostic: "runtime_authority_not_writable"
@@ -381,6 +385,7 @@ actor DomainWorkspaceContextAuthority {
         if let expected = envelope.expectedCatalogRevision, expected != catalogRevision {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "catalog_revision_mismatch"
@@ -391,6 +396,7 @@ actor DomainWorkspaceContextAuthority {
         {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .stateConflict,
                 diagnostic: "fail_closed_requires_workspace_revision"
@@ -508,7 +514,10 @@ actor DomainWorkspaceContextAuthority {
         if let record = workspaceID.flatMap({ records[$0] }),
            let prior = record.operationIndex[envelope.operationID]
         {
-            guard prior.fingerprint == fingerprint else {
+            guard envelope.matchesRecordedFingerprint(
+                prior.fingerprint,
+                canonicalFingerprint: fingerprint
+            ) else {
                 return collisionOutcome(envelope.operationID, workspace: makeSnapshot(record))
             }
             if (prior.disposition == .applied || prior.disposition == .unchanged),
@@ -544,7 +553,10 @@ actor DomainWorkspaceContextAuthority {
             )
         }
         if let prior = globalOperations[envelope.operationID] {
-            guard prior.fingerprint == fingerprint else {
+            guard envelope.matchesRecordedFingerprint(
+                prior.fingerprint,
+                canonicalFingerprint: fingerprint
+            ) else {
                 return collisionOutcome(envelope.operationID, workspace: nil)
             }
             if (prior.disposition == .applied || prior.disposition == .unchanged),
@@ -1323,6 +1335,7 @@ actor DomainWorkspaceContextAuthority {
         else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .invalidDocument,
                 diagnostic: "folder_open_root_mismatch"
@@ -1354,7 +1367,7 @@ actor DomainWorkspaceContextAuthority {
             return lhsMetadata.workspaceID.uuidString < rhsMetadata.workspaceID.uuidString
         }
         if let existing = eligibleMatches.first {
-            return await unchangedOutcome(envelope, record: existing)
+            return await unchangedOutcome(envelope, fingerprint: fingerprint, record: existing)
         }
 
         return await createWorkspace(
@@ -1394,6 +1407,7 @@ actor DomainWorkspaceContextAuthority {
         if let expected = envelope.expectedCatalogRevision, expected != catalogRevision {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "catalog_revision_mismatch"
@@ -1401,10 +1415,11 @@ actor DomainWorkspaceContextAuthority {
         }
         if let existing = records[document.workspaceID] {
             if existing.document.contentDigest == document.contentDigest {
-                return await unchangedOutcome(envelope, record: existing)
+                return await unchangedOutcome(envelope, fingerprint: fingerprint, record: existing)
             }
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "workspace_already_exists"
@@ -1413,6 +1428,7 @@ actor DomainWorkspaceContextAuthority {
         guard envelope.expectedWorkspaceRevision == nil || envelope.expectedWorkspaceRevision == 0 else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "workspace_does_not_exist_at_expected_revision"
@@ -1525,6 +1541,7 @@ actor DomainWorkspaceContextAuthority {
         if let expected = envelope.expectedCatalogRevision, expected != catalogRevision {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .stateConflict,
                 diagnostic: "catalog_revision_mismatch"
@@ -1533,13 +1550,14 @@ actor DomainWorkspaceContextAuthority {
         guard let record = records[workspaceID] else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .workspaceUnavailable,
                 diagnostic: "workspace_not_found"
             )
         }
         guard record.health.acceptsMutations else {
-            return healthRejectionOutcome(envelope, record: record)
+            return healthRejectionOutcome(envelope, fingerprint: fingerprint, record: record)
         }
         if let expected = envelope.expectedWorkspaceRevision,
            expected != record.revisions.workingRevision
@@ -1638,6 +1656,7 @@ actor DomainWorkspaceContextAuthority {
         guard document.workspaceID == envelope.workspaceID else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .invalidDocument,
                 diagnostic: "workspace_identity_mismatch"
@@ -1648,7 +1667,7 @@ actor DomainWorkspaceContextAuthority {
         while let current = records[document.workspaceID] {
             var record = current
             guard record.health.acceptsMutations else {
-                return healthRejectionOutcome(envelope, record: record)
+                return healthRejectionOutcome(envelope, fingerprint: fingerprint, record: record)
             }
             if isDurableReplay,
                record.document.metadata.consolidatedIntoWorkspaceID
@@ -1686,7 +1705,7 @@ actor DomainWorkspaceContextAuthority {
                 }
             }
             guard record.document.contentDigest != document.contentDigest else {
-                return await unchangedOutcome(envelope, record: record)
+                return await unchangedOutcome(envelope, fingerprint: fingerprint, record: record)
             }
 
             let changedContextID = changedContextIDs.count == 1 ? changedContextIDs.first : nil
@@ -1816,6 +1835,7 @@ actor DomainWorkspaceContextAuthority {
 
         return recordTransientOutcome(
             envelope: envelope,
+            fingerprint: fingerprint,
             disposition: .invalid,
             errorCode: .workspaceUnavailable,
             diagnostic: "workspace_requires_explicit_create_command"
@@ -1833,13 +1853,14 @@ actor DomainWorkspaceContextAuthority {
         guard var record = records[workspaceID] else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .workspaceUnavailable,
                 diagnostic: "workspace_not_found"
             )
         }
         guard record.health.acceptsMutations else {
-            return healthRejectionOutcome(envelope, record: record)
+            return healthRejectionOutcome(envelope, fingerprint: fingerprint, record: record)
         }
         if validateExpectedRevision,
            let expected = envelope.expectedWorkspaceRevision,
@@ -1848,7 +1869,7 @@ actor DomainWorkspaceContextAuthority {
             return conflictOutcome(envelope, record: record, diagnostic: "workspace_revision_mismatch")
         }
         guard record.revisions.dirtyRevision != nil else {
-            return await unchangedOutcome(envelope, record: record)
+            return await unchangedOutcome(envelope, fingerprint: fingerprint, record: record)
         }
         let before = record.revisions
         let after = DomainRevisionState(
@@ -1921,6 +1942,7 @@ actor DomainWorkspaceContextAuthority {
                 case .failed:
                     return healthRejectionOutcome(
                         envelope,
+                        fingerprint: fingerprint,
                         record: records[workspaceID] ?? record
                     )
                 }
@@ -1984,6 +2006,7 @@ actor DomainWorkspaceContextAuthority {
                 case .failed:
                     return healthRejectionOutcome(
                         envelope,
+                        fingerprint: fingerprint,
                         record: records[workspaceID] ?? record
                     )
                 }
@@ -2001,7 +2024,7 @@ actor DomainWorkspaceContextAuthority {
                     revisions: current.revisions,
                     diagnostic: "external_workspace_decode_failed"
                 )
-                return healthRejectionOutcome(envelope, record: current)
+                return healthRejectionOutcome(envelope, fingerprint: fingerprint, record: current)
             case let .unchanged(metadata), let .missing(metadata):
                 current.fileMetadata = metadata
                 records[workspaceID] = current
@@ -2055,6 +2078,7 @@ actor DomainWorkspaceContextAuthority {
         else {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .invalid,
                 errorCode: .workspaceUnavailable,
                 diagnostic: "workspace_has_no_external_conflict"
@@ -2075,6 +2099,7 @@ actor DomainWorkspaceContextAuthority {
         {
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .conflict,
                 errorCode: .protectedAgentIdentityConflict,
                 diagnostic: diagnostic
@@ -2304,6 +2329,7 @@ actor DomainWorkspaceContextAuthority {
 
     private func healthRejectionOutcome(
         _ envelope: DomainWorkspaceCommandEnvelope,
+        fingerprint: String,
         record: WorkspaceRecord
     ) -> DomainCommandOutcome {
         let disposition: DomainCommandDisposition
@@ -2313,6 +2339,7 @@ actor DomainWorkspaceContextAuthority {
         case .writable:
             return recordTransientOutcome(
                 envelope: envelope,
+                fingerprint: fingerprint,
                 disposition: .failed,
                 errorCode: .persistenceFailure,
                 diagnostic: "unexpected_writable_health_rejection"
@@ -2332,6 +2359,7 @@ actor DomainWorkspaceContextAuthority {
         }
         return recordTransientOutcome(
             envelope: envelope,
+            fingerprint: fingerprint,
             disposition: disposition,
             errorCode: errorCode,
             diagnostic: diagnostic
@@ -2419,6 +2447,7 @@ actor DomainWorkspaceContextAuthority {
 
     private func unchangedOutcome(
         _ envelope: DomainWorkspaceCommandEnvelope,
+        fingerprint: String,
         record original: WorkspaceRecord
     ) async -> DomainCommandOutcome {
         var record = original
@@ -2432,7 +2461,7 @@ actor DomainWorkspaceContextAuthority {
             workspace: makeSnapshot(record)
         )
         let operation = DomainRecordedOperation(
-            fingerprint: envelope.fingerprint,
+            fingerprint: fingerprint,
             recordedAt: Date(),
             outcome: outcome
         )
@@ -2496,6 +2525,7 @@ actor DomainWorkspaceContextAuthority {
 
     private func recordTransientOutcome(
         envelope: DomainWorkspaceCommandEnvelope,
+        fingerprint: String,
         disposition: DomainCommandDisposition,
         errorCode: DomainCommandErrorCode,
         diagnostic: String
@@ -2513,7 +2543,7 @@ actor DomainWorkspaceContextAuthority {
             workspace: workspace
         )
         globalOperations.insert(DomainRecordedOperation(
-            fingerprint: envelope.fingerprint,
+            fingerprint: fingerprint,
             recordedAt: Date(),
             outcome: outcome
         ))
