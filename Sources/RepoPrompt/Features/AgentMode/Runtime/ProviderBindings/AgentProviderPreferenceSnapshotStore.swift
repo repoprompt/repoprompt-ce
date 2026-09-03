@@ -135,6 +135,9 @@ final class AgentProviderPreferenceSnapshotStore {
                 autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
                 acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
             )
+        case .omp:
+            let level = effectiveOMPPermissionLevel(profile: profile)
+            return AgentProviderRuntimePermissionBinding(acpSessionModeID: level.sessionModeID)
         case .grokBuild:
             let level = effectiveGrokBuildPermissionLevel(profile: profile)
             // For Grok this flag becomes a launch-time `--always-approve` argument in the
@@ -159,6 +162,8 @@ final class AgentProviderPreferenceSnapshotStore {
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .grokBuild(level):
             GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .omp(level):
+            OMPAgentToolPreferences.setPermissionLevel(level, defaults: defaults)
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -379,6 +384,26 @@ final class AgentProviderPreferenceSnapshotStore {
                         iconName: level.iconName,
                         detailText: level.detailText,
                         isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
+        case .omp:
+            let effective = effectiveOMPPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: false,
+                externallyManagedReason: externallyManagedReason,
+                options: OMPAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .omp(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: false,
                         isSelected: level == effective,
                         isEnabled: externallyManagedReason == nil
                     )
@@ -612,6 +637,14 @@ final class AgentProviderPreferenceSnapshotStore {
         }
     }
 
+    private func effectiveOMPPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> OMPAgentToolPreferences.PermissionLevel {
+        profile.ompPermissionLevel(
+            userConfigured: OMPAgentToolPreferences.permissionLevel(defaults: defaults)
+        )
+    }
+
     private static func representativeAgent(for providerID: AgentProviderBindingID) -> AgentProviderKind {
         switch providerID {
         case .codex: .codexExec
@@ -619,6 +652,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .openCode: .openCode
         case .cursor: .cursor
         case .grokBuild: .grokBuild
+        case .omp: .omp
         }
     }
 

@@ -380,6 +380,8 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.cursor)
             case .grokBuild:
                 enabledRecommendationProviders.contains(.grokBuild)
+            case .omp:
+                false
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
             }

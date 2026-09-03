@@ -41,6 +41,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case openCode
     case cursor
     case grokBuild
+    case omp
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
@@ -49,6 +50,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let codexMCPClientID = "codex-mcp-client"
     static let openCodeMCPClientID = "opencode"
     static let cursorMCPClientID = "cursor"
+    static let ompMCPClientID = "omp-coding-agent"
     /// Grok Build presents `grok-shell-<injected server name>` (e.g. `grok-shell-RepoPromptCE`)
     /// to MCP servers. The hint must equal that exact registered name: the pending run-scoped
     /// tab-context store keys are raw client names (no family canonicalization), so a
@@ -68,6 +70,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "cursor-agent"
         case .grokBuild:
             "grok"
+        case .omp:
+            "omp"
         }
     }
 
@@ -83,6 +87,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "Cursor CLI"
         case .grokBuild:
             "Grok Build"
+        case .omp:
+            "Oh My Pi"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -104,6 +110,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.cursorMCPClientID
         case .grokBuild:
             Self.grokBuildMCPClientID
+        case .omp:
+            Self.ompMCPClientID
         }
     }
 
@@ -115,6 +123,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .cursor
         case .grokBuild:
             .grokBuild
+        case .omp:
+            .omp
         case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             nil
         }
@@ -124,7 +134,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor, .grokBuild:
+        case .codexExec, .openCode, .cursor, .grokBuild, .omp:
             false
         }
     }
@@ -135,7 +145,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
         }
     }
@@ -144,7 +154,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .cursor, .grokBuild:
             false
-        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .omp, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
         }
     }
@@ -162,6 +172,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "Cursor CLI ACP agent. Uses Cursor's ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
         case .grokBuild:
             return "xAI Grok Build ACP agent. Uses Grok Build's ACP runtime (`grok agent stdio`) and injects RepoPrompt MCP tools through ACP session configuration."
+        case .omp:
+            return "Installed Oh My Pi ACP agent. OMP owns authentication, provider and model selection, fallbacks, memory, compaction, and internal tools; RepoPrompt injects its MCP tools."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -196,6 +208,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "cursor_acp"
         case .grokBuild:
             "grok_build_acp"
+        case .omp:
+            "omp_acp"
         }
     }
 
@@ -209,7 +223,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor, .grokBuild:
+        case .codexExec, .openCode, .cursor, .grokBuild, .omp:
             nil
         }
     }
@@ -301,6 +315,15 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
             }
             return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+        case .omp:
+            let config = OMPAgentConfig(
+                enableDebugLogging: Self.enableDebugLogging,
+                modelString: modelString
+            )
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created OMPACPHeadlessAgentProvider")
+            }
+            return OMPACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         case .grokBuild:
             let config = GrokBuildAgentConfig(
                 enableDebugLogging: Self.enableDebugLogging,
