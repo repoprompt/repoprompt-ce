@@ -1436,8 +1436,8 @@ enum HistoryMCPToolService {
         }
         if let sortKeys { sortKeys(&orderedKeys) }
 
-        return orderedKeys.map { key in
-            let sessionsInGroup = grouped[key]!
+        return orderedKeys.compactMap { key in
+            guard let sessionsInGroup = grouped[key] else { return nil }
             let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
             let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.itemCount }
             let totalToolCalls = sessionsInGroup.reduce(0) { $0 + $1.record.toolCallCount }
