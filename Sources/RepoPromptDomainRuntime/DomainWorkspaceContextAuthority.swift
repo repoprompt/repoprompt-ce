@@ -514,10 +514,7 @@ actor DomainWorkspaceContextAuthority {
         if let record = workspaceID.flatMap({ records[$0] }),
            let prior = record.operationIndex[envelope.operationID]
         {
-            guard envelope.matchesRecordedFingerprint(
-                prior.fingerprint,
-                canonicalFingerprint: fingerprint
-            ) else {
+            guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: makeSnapshot(record))
             }
             if (prior.disposition == .applied || prior.disposition == .unchanged),
@@ -553,10 +550,7 @@ actor DomainWorkspaceContextAuthority {
             )
         }
         if let prior = globalOperations[envelope.operationID] {
-            guard envelope.matchesRecordedFingerprint(
-                prior.fingerprint,
-                canonicalFingerprint: fingerprint
-            ) else {
+            guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: nil)
             }
             if (prior.disposition == .applied || prior.disposition == .unchanged),

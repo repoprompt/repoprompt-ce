@@ -24,6 +24,14 @@ struct DomainWorkspaceFailClosedSaveOutcome {
     }
 }
 
+private enum DomainWorkspaceModelEncoder {
+    static func encode(_ workspace: WorkspaceModel) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(workspace)
+    }
+}
+
 /// Revisioned app-process client for the runtime-owned workspace/context authority.
 /// It is the only production persistence dependency injected into a workspace manager.
 struct DomainWorkspaceAuthorityClient {
@@ -204,7 +212,7 @@ struct DomainWorkspaceAuthorityClient {
     }
 
     private func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
-        let bytes = try JSONEncoder().encode(workspace)
+        let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
         return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
     }
 

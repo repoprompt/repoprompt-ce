@@ -1861,6 +1861,21 @@ class WindowState: ObservableObject {
             }
         }
 
+        guard let payloadAdmissionWorkspace = workspaceManager.activeWorkspace,
+              payloadAdmissionWorkspace.id == target.workspace.id,
+              WorkspaceFolderOpenResolver.bestEligibleMatch(
+                  forFolderPath: folderURL.path,
+                  in: [payloadAdmissionWorkspace],
+                  admittingEphemeral: shouldBeEphemeral
+              )?.id == target.workspace.id
+        else {
+            return retryOrTerminal(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
         guard applyStoredPromptIfNeeded(queuedCommand.command) else {
             return .terminal(.failed(.payloadApplicationFailed))
         }

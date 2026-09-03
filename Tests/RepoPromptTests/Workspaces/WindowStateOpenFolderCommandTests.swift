@@ -618,6 +618,171 @@ import XCTest
             )
         }
 
+        func testFinalPayloadAdmissionRetriesThenFailsWhenActiveWorkspaceChangesAfterAuthoritySnapshot() async throws {
+            let runtime = try await makeDomainRuntime()
+            let authorityWindow = await makeWindow(domainRuntime: runtime)
+            let window = await makeWindow(domainRuntime: runtime)
+            let targetFolder = try makeFolder(named: "FinalAdmissionActiveTarget")
+            let alternateFolder = try makeFolder(named: "FinalAdmissionActiveAlternate")
+            let payloadFile = targetFolder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let target = WorkspaceModel(
+                name: "Final Admission Active Target",
+                repoPaths: [targetFolder.path]
+            )
+            let alternate = WorkspaceModel(
+                name: "Final Admission Active Alternate",
+                repoPaths: [alternateFolder.path]
+            )
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(target)
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(alternate)
+            try await waitUntil {
+                window.workspaceManager.workspace(withID: target.id) != nil
+                    && window.workspaceManager.workspace(withID: alternate.id) != nil
+            }
+            let projectedAlternate = try XCTUnwrap(
+                window.workspaceManager.workspace(withID: alternate.id)
+            )
+            let initialSwitch = await window.workspaceManager.switchWorkspace(
+                to: projectedAlternate,
+                saveState: false,
+                reason: "finalPayloadAdmissionActiveWorkspaceFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            window.promptManager.promptText = "before"
+            window.setAutomaticCommandProcessingForTesting(false)
+            window.stopDomainWorkspaceProjectionForTesting()
+            let storedPromptTitle = "Final Admission Active Stored Prompt \(UUID().uuidString)"
+            var completions: [AppCommandExecutionResult] = []
+            window.enqueueCommand(
+                folderCommand(
+                    folderPath: targetFolder.path,
+                    fileList: [payloadFile.path],
+                    promptText: "after",
+                    newPrompt: (storedPromptTitle, "must not be stored")
+                )
+            ) { completions.append($0) }
+
+            var snapshotRaceCount = 0
+            window.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting {
+                guard window.workspaceManager.activeWorkspaceID == target.id,
+                      let currentAlternate = window.workspaceManager.workspace(withID: alternate.id)
+                else {
+                    return
+                }
+                snapshotRaceCount += 1
+                let switchResult = await window.workspaceManager.switchWorkspace(
+                    to: currentAlternate,
+                    saveState: false,
+                    reason: "finalPayloadAdmissionActiveWorkspaceRace"
+                )
+                XCTAssertEqual(switchResult, .switched)
+            }
+
+            await window.processCommands()
+
+            XCTAssertEqual(snapshotRaceCount, 2)
+            XCTAssertEqual(completions, [.failed(.routeChangedAfterRetry)])
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, alternate.id)
+            XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertFalse(window.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
+
+            await window.processCommands()
+            XCTAssertEqual(snapshotRaceCount, 2)
+            XCTAssertEqual(completions, [.failed(.routeChangedAfterRetry)])
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertFalse(window.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
+        }
+
+        func testFinalPayloadAdmissionRetriesThenFailsWhenTargetBecomesHiddenAfterAuthoritySnapshot() async throws {
+            let runtime = try await makeDomainRuntime()
+            let authorityWindow = await makeWindow(domainRuntime: runtime)
+            let window = await makeWindow(domainRuntime: runtime)
+            let targetFolder = try makeFolder(named: "FinalAdmissionHiddenTarget")
+            let payloadFile = targetFolder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let target = WorkspaceModel(
+                name: "Final Admission Hidden Target",
+                repoPaths: [targetFolder.path]
+            )
+            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(target)
+            try await waitUntil {
+                window.workspaceManager.workspace(withID: target.id) != nil
+            }
+            let projectedTarget = try XCTUnwrap(window.workspaceManager.workspace(withID: target.id))
+            let initialSwitch = await window.workspaceManager.switchWorkspace(
+                to: projectedTarget,
+                saveState: false,
+                reason: "finalPayloadAdmissionHiddenTargetFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+            window.promptManager.promptText = "before"
+            window.setAutomaticCommandProcessingForTesting(false)
+            window.stopDomainWorkspaceProjectionForTesting()
+            let storedPromptTitle = "Final Admission Hidden Stored Prompt \(UUID().uuidString)"
+            var completions: [AppCommandExecutionResult] = []
+            window.enqueueCommand(
+                folderCommand(
+                    folderPath: targetFolder.path,
+                    fileList: [payloadFile.path],
+                    promptText: "after",
+                    newPrompt: (storedPromptTitle, "must not be stored")
+                )
+            ) { completions.append($0) }
+
+            var snapshotRaceCount = 0
+            window.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting {
+                guard window.workspaceManager.activeWorkspaceID == target.id,
+                      let activeIndex = window.workspaceManager.workspaces.firstIndex(where: {
+                          $0.id == target.id
+                      })
+                else {
+                    return
+                }
+                snapshotRaceCount += 1
+                window.workspaceManager.workspaces[activeIndex].isHiddenInMenus = true
+            }
+
+            await window.processCommands()
+
+            XCTAssertEqual(snapshotRaceCount, 2)
+            XCTAssertEqual(completions, [.failed(.routeChangedAfterRetry)])
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, target.id)
+            XCTAssertTrue(try XCTUnwrap(window.workspaceManager.activeWorkspace).isHiddenInMenus)
+            XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertFalse(window.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
+
+            await window.processCommands()
+            XCTAssertEqual(snapshotRaceCount, 2)
+            XCTAssertEqual(completions, [.failed(.routeChangedAfterRetry)])
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertFalse(window.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
+        }
+
         func testQueuedHiddenLiveSupplementRevalidatesBeforePayloadAdmission() async throws {
             try await assertQueuedPersistentLiveSupplementRevalidatesCandidate(
                 named: "HiddenLiveSupplement"
