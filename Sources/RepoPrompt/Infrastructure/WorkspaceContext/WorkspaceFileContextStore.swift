@@ -2622,6 +2622,38 @@ actor WorkspaceFileContextStore {
             self.pathSearchIndex = pathSearchIndex
             self.appliedIndexGeneration = appliedIndexGeneration
         }
+
+        init(
+            projectionNeutralRetagging source: RootCatalogShard,
+            key: RootCatalogShardKey,
+            root: WorkspaceRootRecord
+        ) {
+            precondition(key.rootID == source.key.rootID)
+            precondition(key.lifetimeID == source.key.lifetimeID)
+            precondition(key.canonicalConfigurationIdentity == source.key.canonicalConfigurationIdentity)
+            precondition(source.key.topologyGeneration != UInt64.max)
+            precondition(key.topologyGeneration == source.key.topologyGeneration + 1)
+            precondition(root.id == key.rootID)
+            precondition(root.standardizedFullPath == key.canonicalConfigurationIdentity.canonicalPath)
+
+            self.key = key
+            self.root = root
+            files = source.files
+            projectionFiles = source.projectionFiles
+            projectionFileIndexByID = source.projectionFileIndexByID
+            folders = source.folders
+            entries = source.entries
+            pathSearchIndex = source.pathSearchIndex?.applyingPatch(
+                identity: WorkspaceSearchRootPathIndexIdentity(
+                    rootID: key.rootID,
+                    lifetimeID: key.lifetimeID,
+                    topologyGeneration: key.topologyGeneration
+                ),
+                entries: source.entries,
+                changedFileIDs: []
+            )
+            appliedIndexGeneration = source.appliedIndexGeneration
+        }
     }
 
     private struct CodemapGraphIndexCatalogShardBuildSnapshot: @unchecked Sendable {
@@ -7733,24 +7765,10 @@ actor WorkspaceFileContextStore {
             return
         }
 
-        let retaggedPathSearchIndex = previousShard.pathSearchIndex?.applyingPatch(
-            identity: WorkspaceSearchRootPathIndexIdentity(
-                rootID: currentKey.rootID,
-                lifetimeID: currentKey.lifetimeID,
-                topologyGeneration: currentKey.topologyGeneration
-            ),
-            entries: previousShard.entries,
-            changedFileIDs: []
-        )
         let retaggedShard = RootCatalogShard(
+            projectionNeutralRetagging: previousShard,
             key: currentKey,
-            root: state.root,
-            files: previousShard.files,
-            precomputedProjectionFiles: previousShard.projectionFiles,
-            folders: previousShard.folders,
-            entries: previousShard.entries,
-            pathSearchIndex: retaggedPathSearchIndex,
-            appliedIndexGeneration: previousShard.appliedIndexGeneration
+            root: state.root
         )
         var publication = publishedRootCatalogShardsByRootID
         publication[root.id] = retaggedShard
