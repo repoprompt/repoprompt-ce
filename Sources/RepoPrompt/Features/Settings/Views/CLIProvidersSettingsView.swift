@@ -54,6 +54,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isAntigravityInstalled = false
     @State private var isAntigravityExpanded = false
     @State private var isLoadingOMP = false
+    @State private var isLoadingDevin = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
@@ -61,6 +62,7 @@ struct CLIProvidersSettingsView: View {
     @State private var showCursorTraceDump = false
     @State private var showGrokBuildTraceDump = false
     @State private var showOMPTraceDump = false
+    @State private var showDevinTraceDump = false
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
 
@@ -79,6 +81,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCursorExpanded: Bool = false
     @State private var isGrokBuildExpanded: Bool = false
     @State private var isOMPExpanded: Bool = false
+    @State private var isDevinExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -99,6 +102,7 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isCursorConnected
             || viewModel.isGrokBuildConnected
             || viewModel.isOMPConnected
+            || viewModel.isDevinConnected
     }
 
     private var codexStatusText: String? {
@@ -132,6 +136,7 @@ struct CLIProvidersSettingsView: View {
                         .fontWeight(.semibold)
 
                     Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Oh My Pi to leverage your existing subscriptions — OpenCode can also proxy any API key.")
+                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Devin to leverage your existing subscriptions — OpenCode can also proxy any API key.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -161,6 +166,7 @@ struct CLIProvidersSettingsView: View {
                 grokBuildCard
                 antigravityCard
                 ompCard
+                devinCard
             }
             .padding(16)
         }
@@ -218,6 +224,13 @@ struct CLIProvidersSettingsView: View {
                     primaryButton: .default(Text("Save Trace to Downloads"), action: dumpOMPTrace),
                     secondaryButton: .cancel(Text("OK"), action: { showOMPTraceDump = false })
                 )
+            } else if showDevinTraceDump, viewModel.hasDevinTrace() {
+                Alert(
+                    title: Text("CLI Provider Management"),
+                    message: Text(alertMessage),
+                    primaryButton: .default(Text("Save Trace to Downloads"), action: dumpDevinTrace),
+                    secondaryButton: .cancel(Text("OK"), action: { showDevinTraceDump = false })
+                )
             } else {
                 Alert(
                     title: Text("CLI Provider Management"),
@@ -233,6 +246,7 @@ struct CLIProvidersSettingsView: View {
                 showOpenCodeTraceDump = false
                 showCursorTraceDump = false
                 showOMPTraceDump = false
+                showDevinTraceDump = false
                 showCodexSignOutConfirmation = false
             }
         }
@@ -2326,6 +2340,73 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    // MARK: - Devin CLI / ACP card
+
+    private var devinCard: some View {
+        providerCard(
+            title: "Devin",
+            subtitle: "Uses the installed `devin acp` runtime for interactive Agent Mode. Devin keeps authority over authentication, models, modes, and built-in tools.",
+            infoURL: "https://docs.devin.ai/cli/acp/zed",
+            isConnected: viewModel.isDevinConnected,
+            isExpanded: $isDevinExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isDevinConnected {
+                    HStack(spacing: 8) {
+                        Button(action: testDevinConnection) {
+                            if isLoadingDevin {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingDevin)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: disconnectDevin) {
+                            Text("Disconnect")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text("Models are discovered live from `devin acp`.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: testDevinConnection) {
+                            if isLoadingDevin {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingDevin)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.devinError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Install and authenticate Devin separately, then ensure `devin acp` is available.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Cursor CLI / ACP card
 
     private var cursorCard: some View {
@@ -2935,6 +3016,57 @@ struct CLIProvidersSettingsView: View {
         viewModel.disconnectOMP()
         alertMessage = "Disconnected Oh My Pi"
         showOMPTraceDump = false
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testDevinConnection() {
+        isLoadingDevin = true
+        Task {
+            do {
+                let ok = try await viewModel.testDevinConnection()
+                await MainActor.run {
+                    isLoadingDevin = false
+                    if ok {
+                        alertMessage = "Devin connected. Devin will use its configured provider and model."
+                        showDevinTraceDump = false
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingDevin = false
+                    alertMessage = viewModel.devinError ?? error.asFriendlyString()
+                    showDevinTraceDump = viewModel.hasDevinTrace()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func dumpDevinTrace() {
+        do {
+            let url = try viewModel.dumpDevinTrace()
+            alertMessage = "Trace saved to Downloads/\(url.lastPathComponent)."
+        } catch let error as CLIProcessLogCollectorError {
+            switch error {
+            case .noEntries:
+                alertMessage = "No trace data is available to export yet."
+            case .downloadsDirectoryUnavailable:
+                alertMessage = "Unable to locate the Downloads folder."
+            }
+        } catch {
+            alertMessage = "Failed to export trace: \(error.localizedDescription)"
+        }
+        showDevinTraceDump = false
+        showAlert = true
+    }
+
+    private func disconnectDevin() {
+        viewModel.disconnectDevin()
+        alertMessage = "Disconnected Devin"
+        showDevinTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
     }

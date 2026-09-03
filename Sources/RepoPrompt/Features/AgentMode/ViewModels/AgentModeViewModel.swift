@@ -5404,7 +5404,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .omp:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .omp, .devin:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -17108,7 +17108,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor, .antigravity:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
-        case .codexExec, .grokBuild, .omp:
+        case .codexExec, .grokBuild, .omp, .devin:
             return text
         }
     }
