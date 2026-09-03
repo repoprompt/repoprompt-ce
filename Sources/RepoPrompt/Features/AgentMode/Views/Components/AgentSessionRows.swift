@@ -56,6 +56,8 @@ struct AgentSessionRow: View {
     @State private var showDeleteConfirmation = false
     @State private var renameText = ""
 
+    // MARK: - Context Menu Snapshot
+
     /// Snapshot of the conditions that control context menu item visibility,
     /// captured on hover. Using a snapshot prevents AppKit from observing a
     /// mid-layout item-count change (which triggers an NSRangeException when
@@ -352,11 +354,11 @@ struct AgentSessionRow: View {
                 }
                 .disabled(!sessionIDCopyAction.isEnabled)
 
-                if menuSnapshot.isInteractionEnabled && menuSnapshot.hasOnStash {
+                if menuSnapshot.isInteractionEnabled, menuSnapshot.hasOnStash {
                     Button(stashActionLabel, action: { onStash?() })
                 }
 
-                if menuSnapshot.hasAttentionRunState && menuSnapshot.hasOnDismissAttention {
+                if menuSnapshot.hasAttentionRunState, menuSnapshot.hasOnDismissAttention {
                     Button(dismissAttentionActionLabel, action: { onDismissAttention?() })
                 }
 
@@ -829,6 +831,8 @@ struct AgentStashedSessionRow: View {
     @State private var isHovered = false
     @State private var isRestoreHovered = false
     @State private var isDeleteHovered = false
+
+    // MARK: - Context Menu Snapshot
 
     /// Snapshot of conditions controlling context menu item visibility, captured
     /// on hover to prevent NSRangeException from AppKit measuring stale item counts.
