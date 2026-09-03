@@ -7753,11 +7753,10 @@ enum AgentTranscriptProjectionBuilder {
         let containsFailure = toolExecutions.contains { $0.status == .failed || $0.status == .cancelled }
         let containsWarning = toolExecutions.contains { $0.status == .warning }
         let narration = latestNarrationText(from: rows)
-        let shortNarration: String? = if let narration, !narration.isEmpty {
-            let sanitized = narration.sanitizedForDisplay
-            if sanitized.isEmpty { nil } else { sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized }
-        } else {
-            nil
+        let shortNarration: String? = narration.flatMap {
+            let sanitized = $0.sanitizedForDisplay
+            guard !sanitized.isEmpty else { return nil }
+            return sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized
         }
         let allToolNames = toolNameCounts.isEmpty ? Array(toolNames) : Array(toolNameCounts.keys.sorted())
         let toolGroups = ClusterToolCategory.buildGroups(toolNames: allToolNames, counts: toolNameCounts)
