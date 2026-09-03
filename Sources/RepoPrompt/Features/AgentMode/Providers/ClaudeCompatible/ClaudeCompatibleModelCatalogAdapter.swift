@@ -362,7 +362,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp, .devin:
             nil
         }
     }

@@ -184,6 +184,18 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: "Provider managed",
                 warnings: []
             )
+        case .devin:
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Managed by Devin",
+                shell: "Managed by Devin",
+                externalMCP: "RepoPrompt MCP: run-scoped policy",
+                search: "Managed by Devin",
+                approvalModeDescription: "Provider managed",
+                warnings: []
+            )
         case .grokBuild:
             let level = grokBuildPermissionLevel(profile: profile)
             let warnings = level == .fullAccess
@@ -223,6 +235,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .cursor: availability.cursorAvailable
         case .grokBuild: availability.grokBuildAvailable
         case .omp: availability.ompAvailable
+        case .devin: availability.devinAvailable
         }
     }
 

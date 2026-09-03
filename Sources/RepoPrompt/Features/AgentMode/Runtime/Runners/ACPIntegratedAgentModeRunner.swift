@@ -821,6 +821,7 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID
     ) async throws {
         guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor || runRequest.agentKind == .grokBuild || runRequest.agentKind == .omp else { return }
+        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor || runRequest.agentKind == .grokBuild || runRequest.agentKind == .devin else { return }
         guard let model = runRequest.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame

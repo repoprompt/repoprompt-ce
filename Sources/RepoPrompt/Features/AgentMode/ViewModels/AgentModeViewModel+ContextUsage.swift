@@ -6,7 +6,7 @@ extension AgentModeViewModel {
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             claudeContextUsageEstimator
-        case .codexExec, .openCode, .cursor, .grokBuild, .omp:
+        case .codexExec, .openCode, .cursor, .grokBuild, .omp, .devin:
             nil
         }
     }
