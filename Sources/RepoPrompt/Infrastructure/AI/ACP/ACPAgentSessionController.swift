@@ -2495,10 +2495,21 @@ actor ACPAgentSessionController {
     }
 
     private func applyDiscoveredSessionModels(from response: [String: Any]) {
+        // A configOptions-only update carries no replacement for a live direct-model snapshot.
+        // Preserve both its session authority and the provider-owned effort wire state instead
+        // of routing the incomplete response through the direct parser as `.absent`.
+        if provider is ACPDirectSessionModelProvider,
+           response["models"] == nil,
+           sessionModelDirectSelectionSupported,
+           sessionModelSnapshotHasLiveAuthority
+        {
+            return
+        }
+
         let parsed: ACPDiscoveredSessionModels?
         // ponytail: grok CLI >= 1.0.17 sends `configOptions` next to its legacy `models` block;
         // only the direct provider parser carries Grok's effort wire values, so let it win and
-        // stay on the direct path for later `config_option_update` snapshots that omit `models`.
+        // keep the provider on the direct path when no live snapshot has been established yet.
         let useDirectParser = provider is ACPDirectSessionModelProvider
             && (response["models"] != nil || sessionModelDirectSelectionSupported)
         switch useDirectParser ? .absent : parseModernModelSnapshot(from: response) {

@@ -58,6 +58,45 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         XCTAssertTrue(raws.contains("grok-4.6-low"), "expected direct effort variants, got \(raws)")
     }
 
+    func testConfigOptionsOnlyUpdatePreservesLiveDirectEffortSelection() async throws {
+        let harness = try makeHarness(advertiseConfigOptions: true)
+        let config = GrokBuildAgentConfig(
+            commandName: harness.scriptPath,
+            additionalPathHints: [],
+            modelString: "grok-4.6-low",
+            includeRepoPromptMCPServer: false
+        )
+        let provider = EnvForwardingGrokProvider(
+            config: config,
+            extraEnvironment: ["ACP_RECORD_PATH": harness.recordURL.path]
+        )
+        let request = ACPRunRequest(
+            agentKind: .grokBuild,
+            modelString: config.modelString,
+            workspacePath: harness.workspace.path,
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+
+        do {
+            _ = try await controller.bootstrap()
+            try await controller.prompt(AgentMessage(userMessage: "hi"), request: request)
+            try await controller.setSessionModel("grok-4.6-low")
+            await controller.shutdown()
+        } catch {
+            await controller.shutdown()
+            throw error
+        }
+
+        let setModelCalls = harness.recordedMethods("session/set_model")
+        XCTAssertEqual(setModelCalls.count, 1)
+        XCTAssertEqual(setModelCalls.first?["modelId"] as? String, "grok-4.6")
+        let meta = setModelCalls.first?["_meta"] as? [String: Any]
+        XCTAssertEqual(meta?["reasoningEffort"] as? String, "low")
+    }
+
     func testFullAccessIntentReachesLaunchRequest() {
         let config = GrokBuildAgentConfig(alwaysApproveTools: true)
         let provider = GrokBuildACPHeadlessAgentProvider(config: config)
