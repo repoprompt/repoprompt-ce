@@ -75,6 +75,7 @@ actor WorkspaceSearchService {
         private var debugLastEntryCount = 0
         private var searchDidCaptureGenerationHandler: (@Sendable (UInt64?) async -> Void)?
         private var catalogChangeWillHandleHandler: (@Sendable (WorkspaceSearchCatalogChangeEvent) async -> Void)?
+        private var projectionNeutralGenerationDidCommitHandler: (@Sendable (UInt64) async -> Void)?
         private var automaticRebuildDidStartHandler: (@Sendable (UInt64) async -> Void)?
         private var automaticRebuildDidCommitHandler: (@Sendable (UInt64) async -> Void)?
     #endif
@@ -142,6 +143,12 @@ actor WorkspaceSearchService {
             catalogChangeWillHandleHandler = handler
         }
 
+        func setProjectionNeutralGenerationDidCommitHandler(
+            _ handler: (@Sendable (UInt64) async -> Void)?
+        ) {
+            projectionNeutralGenerationDidCommitHandler = handler
+        }
+
         func setAutomaticRebuildDidStartHandler(
             _ handler: (@Sendable (UInt64) async -> Void)?
         ) {
@@ -200,7 +207,7 @@ actor WorkspaceSearchService {
         boundRootScope = rootScope
         let epoch = bindingEpoch
 
-        let stream = await store.searchCatalogChangeEvents()
+        let stream = await store.searchCatalogChangeEvents(rootScope: rootScope)
         guard isCurrentBinding(store: store, rootScope: rootScope, epoch: epoch),
               freshnessListenerSerial == listenerSerial
         else { return }
@@ -438,6 +445,19 @@ actor WorkspaceSearchService {
         {
             return
         }
+        if event.kind == .generationAdvancedWithoutProjectionChange {
+            guard event.catalogGeneration == catalogGeneration else {
+                // A later catalog event is already buffered. Let that event either commit the
+                // newest projection-neutral generation or schedule the required rebuild.
+                return
+            }
+            if advanceReadyIndexGenerationWithoutProjectionRebuild(to: catalogGeneration) {
+                #if DEBUG
+                    await projectionNeutralGenerationDidCommitHandler?(catalogGeneration)
+                #endif
+                return
+            }
+        }
         if catalogGeneration == pendingRebuildGeneration || catalogGeneration == activeRebuildGeneration {
             return
         }
@@ -447,6 +467,28 @@ actor WorkspaceSearchService {
             targetGeneration: catalogGeneration,
             debounceNanoseconds: debounceNanoseconds
         )
+    }
+
+    private func advanceReadyIndexGenerationWithoutProjectionRebuild(to generation: UInt64) -> Bool {
+        guard currentRefreshFlightToken == nil,
+              pendingRebuildGeneration == nil,
+              activeRebuildGeneration == nil,
+              currentSnapshotGeneration != nil,
+              currentIndexedGeneration != nil
+        else { return false }
+
+        currentSnapshotGeneration = generation
+        currentIndexedGeneration = generation
+        if let diagnostics = currentDiagnostics {
+            currentDiagnostics = WorkspaceCatalogDiagnostics(
+                generation: generation,
+                rootScope: diagnostics.rootScope,
+                rootCount: diagnostics.rootCount,
+                folderCount: diagnostics.folderCount,
+                fileCount: diagnostics.fileCount
+            )
+        }
+        return true
     }
 
     private func isCurrentBinding(

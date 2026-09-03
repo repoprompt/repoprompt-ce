@@ -90,26 +90,40 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         let root = try makeTemporaryRoot(name: "ManagedOnlySearchFreshness")
         let visibleURL = root.appendingPathComponent("Sources/VisibleTarget.swift")
         let ignoredURL = root.appendingPathComponent("HiddenIgnoredTarget.ignored")
+        let secondIgnoredURL = root.appendingPathComponent("SecondHiddenTarget.ignored")
         try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
         try write("visible", to: visibleURL)
         try write("hidden", to: ignoredURL)
+        try write("second hidden", to: secondIgnoredURL)
 
         let store = WorkspaceFileContextStore()
-        _ = try await store.loadRoot(path: root.path)
+        let rootRecord = try await store.loadRoot(path: root.path)
         let initialSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
         XCTAssertFalse(initialSnapshot.files.contains { $0.standardizedFullPath == ignoredURL.path })
+        let initialStoreWork = await store.storeWorkDiagnosticsSnapshot()
+        let initialRootShard = try XCTUnwrap(
+            initialStoreWork.rootCatalogShards.roots.first { $0.rootID == rootRecord.id }
+        )
+        let appliedIndexStream = await store.appliedIndexEvents()
+        var appliedIndexIterator = appliedIndexStream.makeAsyncIterator()
 
         let service = WorkspaceSearchService()
-        let rebuildCommitted = expectation(description: "managed-only catalog generation rebuilt")
+        let generationCommitted = expectation(description: "projection-neutral catalog generation committed")
+        let neutralEventGate = TestAsyncGate()
+        let finalRebuildCommitted = TestAsyncSignal()
         addTeardownBlock {
+            await service.setProjectionNeutralGenerationDidCommitHandler(nil)
+            await service.setCatalogChangeWillHandleHandler(nil)
             await service.setAutomaticRebuildDidCommitHandler(nil)
+            await neutralEventGate.open()
             await service.stopKeepingFresh()
         }
 
         await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
         await service.rebuildIndex(from: initialSnapshot)
-        await service.setAutomaticRebuildDidCommitHandler { _ in
-            rebuildCommitted.fulfill()
+        let initialSearchWork = await service.workDiagnosticsSnapshot()
+        await service.setProjectionNeutralGenerationDidCommitHandler { _ in
+            generationCommitted.fulfill()
         }
 
         let materialization = try await store.materializeExplicitlyRequestedFile(
@@ -123,7 +137,8 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         let materializedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
         XCTAssertNotEqual(materializedGeneration, initialSnapshot.generation)
 
-        await fulfillment(of: [rebuildCommitted], timeout: 2)
+        await fulfillment(of: [generationCommitted], timeout: 2)
+        await service.setProjectionNeutralGenerationDidCommitHandler(nil)
 
         let visibleResult = await service.search("VisibleTarget", limit: 10)
         XCTAssertTrue(visibleResult.isIndexReady)
@@ -139,6 +154,66 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         XCTAssertFalse(ignoredResult.isStale)
         XCTAssertEqual(ignoredResult.indexedGeneration, materializedGeneration)
         XCTAssertTrue(ignoredResult.results.isEmpty)
+        let searchDiagnostics = await service.diagnostics
+        XCTAssertEqual(searchDiagnostics?.generation, materializedGeneration)
+
+        let finalSearchWork = await service.workDiagnosticsSnapshot()
+        XCTAssertEqual(finalSearchWork.rebuildCount, initialSearchWork.rebuildCount)
+        let finalStoreWork = await store.storeWorkDiagnosticsSnapshot()
+        let finalRootShard = try XCTUnwrap(
+            finalStoreWork.rootCatalogShards.roots.first { $0.rootID == rootRecord.id }
+        )
+        XCTAssertEqual(finalRootShard.buildCount, initialRootShard.buildCount)
+        XCTAssertEqual(finalRootShard.authoritativeRebuildCount, initialRootShard.authoritativeRebuildCount)
+        XCTAssertEqual(finalRootShard.lastAppliedIndexGeneration, initialRootShard.lastAppliedIndexGeneration)
+        XCTAssertEqual(
+            finalRootShard.fallbackReasonCounts[.fullResync, default: 0],
+            initialRootShard.fallbackReasonCounts[.fullResync, default: 0]
+        )
+
+        await service.setCatalogChangeWillHandleHandler { event in
+            guard event.kind == .generationAdvancedWithoutProjectionChange else { return }
+            await neutralEventGate.wait()
+        }
+        let secondMaterialization = try await store.materializeExplicitlyRequestedFile(
+            secondIgnoredURL.path,
+            rootScope: .visibleWorkspace
+        )
+        guard case .materialized = secondMaterialization else {
+            return XCTFail("Expected second ignored file to materialize as a managed-only record")
+        }
+        await neutralEventGate.waitUntilEntered()
+
+        let sentinelRelativePath = "Sources/AppliedIndexSentinel.swift"
+        try write("sentinel", to: root.appendingPathComponent(sentinelRelativePath))
+        await store.replayObservedFileSystemDeltas(
+            rootID: rootRecord.id,
+            deltas: [.fileAdded(sentinelRelativePath)]
+        )
+        let finalGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        await service.setAutomaticRebuildDidCommitHandler { generation in
+            guard generation == finalGeneration else { return }
+            await finalRebuildCommitted.signal()
+        }
+
+        let firstAppliedIndexValue = await appliedIndexIterator.next()
+        let firstAppliedIndexEvent = try XCTUnwrap(firstAppliedIndexValue)
+        XCTAssertFalse(firstAppliedIndexEvent.requiresFullResync)
+        XCTAssertEqual(
+            firstAppliedIndexEvent.upsertedFiles.map(\.standardizedRelativePath),
+            [sentinelRelativePath]
+        )
+
+        await neutralEventGate.open()
+        await finalRebuildCommitted.wait()
+
+        let sentinelResult = await service.search("AppliedIndexSentinel", limit: 10)
+        XCTAssertTrue(sentinelResult.isIndexReady)
+        XCTAssertFalse(sentinelResult.isStale)
+        XCTAssertEqual(sentinelResult.indexedGeneration, finalGeneration)
+        XCTAssertEqual(sentinelResult.results.map(\.standardizedRelativePath), [sentinelRelativePath])
+        let secondIgnoredResult = await service.search("SecondHiddenTarget", limit: 10)
+        XCTAssertTrue(secondIgnoredResult.results.isEmpty)
     }
 
     func testRemovedRootCannotBeResurrectedByDelayedLoadRefresh() async throws {

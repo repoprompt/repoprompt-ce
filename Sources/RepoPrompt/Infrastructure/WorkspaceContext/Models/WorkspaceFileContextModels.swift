@@ -651,6 +651,9 @@ enum WorkspaceSearchCatalogChangeKind: Equatable {
     case rootLoaded
     case rootUnloaded
     case appliedIndex
+
+    /// The catalog generation advanced without changing the discoverable search projection.
+    case generationAdvancedWithoutProjectionChange
 }
 
 struct WorkspaceSearchCatalogChangeEvent: Equatable {
@@ -658,7 +661,35 @@ struct WorkspaceSearchCatalogChangeEvent: Equatable {
     let rootPath: String
     let rootLifetimeID: UUID?
     let rootAppliedIndexGeneration: UInt64?
+    let catalogGeneration: UInt64?
     let kind: WorkspaceSearchCatalogChangeKind
+
+    init(
+        rootID: UUID,
+        rootPath: String,
+        rootLifetimeID: UUID?,
+        rootAppliedIndexGeneration: UInt64?,
+        catalogGeneration: UInt64? = nil,
+        kind: WorkspaceSearchCatalogChangeKind
+    ) {
+        self.rootID = rootID
+        self.rootPath = rootPath
+        self.rootLifetimeID = rootLifetimeID
+        self.rootAppliedIndexGeneration = rootAppliedIndexGeneration
+        self.catalogGeneration = catalogGeneration
+        self.kind = kind
+    }
+
+    func stamped(catalogGeneration: UInt64) -> Self {
+        Self(
+            rootID: rootID,
+            rootPath: rootPath,
+            rootLifetimeID: rootLifetimeID,
+            rootAppliedIndexGeneration: rootAppliedIndexGeneration,
+            catalogGeneration: catalogGeneration,
+            kind: kind
+        )
+    }
 }
 
 struct WorkspaceAppliedIndexBatchEvent: Equatable {
