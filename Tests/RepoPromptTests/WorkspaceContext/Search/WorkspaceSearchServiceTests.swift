@@ -98,8 +98,11 @@ final class WorkspaceSearchServiceTests: XCTestCase {
 
         let store = WorkspaceFileContextStore()
         let rootRecord = try await store.loadRoot(path: root.path)
-        let initialSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        XCTAssertFalse(initialSnapshot.files.contains { $0.standardizedFullPath == ignoredURL.path })
+        var initialSnapshot: WorkspaceSearchCatalogSnapshot? = await store.searchCatalogSnapshot(
+            rootScope: .visibleWorkspace
+        )
+        let initialGeneration = try XCTUnwrap(initialSnapshot).generation
+        XCTAssertFalse(try XCTUnwrap(initialSnapshot).files.contains { $0.standardizedFullPath == ignoredURL.path })
         let initialStoreWork = await store.storeWorkDiagnosticsSnapshot()
         let initialRootShard = try XCTUnwrap(
             initialStoreWork.rootCatalogShards.roots.first { $0.rootID == rootRecord.id }
@@ -120,7 +123,8 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         }
 
         await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
-        await service.rebuildIndex(from: initialSnapshot)
+        try await service.rebuildIndex(from: XCTUnwrap(initialSnapshot))
+        initialSnapshot = nil
         let initialSearchWork = await service.workDiagnosticsSnapshot()
         await service.setProjectionNeutralGenerationDidCommitHandler { _ in
             generationCommitted.fulfill()
@@ -135,7 +139,7 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         }
         XCTAssertEqual(file.standardizedFullPath, ignoredURL.path)
         let materializedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        XCTAssertNotEqual(materializedGeneration, initialSnapshot.generation)
+        XCTAssertNotEqual(materializedGeneration, initialGeneration)
 
         await fulfillment(of: [generationCommitted], timeout: 2)
         await service.setProjectionNeutralGenerationDidCommitHandler(nil)
@@ -184,7 +188,7 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         }
         await neutralEventGate.waitUntilEntered()
 
-        let sentinelRelativePath = "Sources/AppliedIndexSentinel.swift"
+        let sentinelRelativePath = "AppliedIndexSentinel.swift"
         try write("sentinel", to: root.appendingPathComponent(sentinelRelativePath))
         await store.replayObservedFileSystemDeltas(
             rootID: rootRecord.id,
@@ -214,6 +218,18 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         XCTAssertEqual(sentinelResult.results.map(\.standardizedRelativePath), [sentinelRelativePath])
         let secondIgnoredResult = await service.search("SecondHiddenTarget", limit: 10)
         XCTAssertTrue(secondIgnoredResult.results.isEmpty)
+
+        let postAppliedStoreWork = await store.storeWorkDiagnosticsSnapshot()
+        let postAppliedRootShard = try XCTUnwrap(
+            postAppliedStoreWork.rootCatalogShards.roots.first { $0.rootID == rootRecord.id }
+        )
+        XCTAssertEqual(postAppliedRootShard.buildCount, finalRootShard.buildCount + 1)
+        XCTAssertEqual(postAppliedRootShard.patchCount, finalRootShard.patchCount + 1)
+        XCTAssertEqual(postAppliedRootShard.authoritativeRebuildCount, finalRootShard.authoritativeRebuildCount)
+        XCTAssertEqual(postAppliedRootShard.fallbackCount, finalRootShard.fallbackCount)
+        XCTAssertEqual(postAppliedRootShard.fallbackReasonCounts, finalRootShard.fallbackReasonCounts)
+        XCTAssertEqual(postAppliedRootShard.lastAppliedIndexGeneration, firstAppliedIndexEvent.generation)
+        XCTAssertFalse(postAppliedRootShard.deltaStateDirty)
     }
 
     func testRemovedRootCannotBeResurrectedByDelayedLoadRefresh() async throws {
