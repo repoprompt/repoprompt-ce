@@ -1513,7 +1513,7 @@ class WindowState: ObservableObject {
     ) {
         if case let .failed(failure) = result {
             Self.commandLogger.error(
-                "App command failed folder=\(queuedCommand.command.folderPath ?? "<none>", privacy: .public) route=\(queuedCommand.folderRoute.logLabel, privacy: .public) reason=\(failure.rawValue, privacy: .public)"
+                "App command failed route=\(queuedCommand.folderRoute.logLabel, privacy: .public) reason=\(failure.rawValue, privacy: .public)"
             )
         }
         queuedCommand.completion?(result)
@@ -1817,7 +1817,11 @@ class WindowState: ObservableObject {
 
         guard let activeWorkspace = workspaceManager.activeWorkspace,
               activeWorkspace.id == target.workspace.id,
-              WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: activeWorkspace)
+              WorkspaceFolderOpenResolver.bestEligibleMatch(
+                  forFolderPath: folderURL.path,
+                  in: [activeWorkspace],
+                  admittingEphemeral: shouldBeEphemeral
+              )?.id == target.workspace.id
         else {
             return retryOrTerminal(
                 queuedCommand,
@@ -1905,7 +1909,10 @@ class WindowState: ObservableObject {
                 )
             }
             guard let localWorkspace = workspaceManager.workspace(withID: workspaceID),
-                  WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: localWorkspace)
+                  WorkspaceFolderOpenResolver.bestEligibleMatch(
+                      forFolderPath: folderURL.path,
+                      in: [localWorkspace]
+                  )?.id == workspaceID
             else {
                 return retryFolderResolution(
                     queuedCommand,
