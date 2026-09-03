@@ -8,6 +8,7 @@ enum AgentModelCatalog {
         let cursorAvailable: Bool
         let grokBuildAvailable: Bool
         let ompAvailable: Bool
+        let devinAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
         let customClaudeCompatibleConfigured: Bool
@@ -19,6 +20,7 @@ enum AgentModelCatalog {
             cursorAvailable: false,
             grokBuildAvailable: false,
             ompAvailable: false,
+            devinAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
             customClaudeCompatibleConfigured: false
@@ -32,6 +34,7 @@ enum AgentModelCatalog {
                 cursorAvailable: cursorAvailable && providers.contains(.cursor),
                 grokBuildAvailable: grokBuildAvailable && providers.contains(.grokBuild),
                 ompAvailable: false,
+                devinAvailable: false,
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured && providers.contains(.claudeCode)
@@ -47,6 +50,7 @@ enum AgentModelCatalog {
                 cursorAvailable: false,
                 grokBuildAvailable: false,
                 ompAvailable: false,
+                devinAvailable: false,
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -60,6 +64,7 @@ enum AgentModelCatalog {
             cursorAvailable: Bool = false,
             grokBuildAvailable: Bool = false,
             ompAvailable: Bool = false,
+            devinAvailable: Bool = false,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
             customClaudeCompatibleConfigured: Bool = false
@@ -70,6 +75,7 @@ enum AgentModelCatalog {
             self.cursorAvailable = cursorAvailable
             self.grokBuildAvailable = grokBuildAvailable
             self.ompAvailable = ompAvailable
+            self.devinAvailable = devinAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
             self.customClaudeCompatibleConfigured = customClaudeCompatibleConfigured
@@ -94,6 +100,7 @@ enum AgentModelCatalog {
                 cursorAvailable: cursorAvailable || agentKind == .cursor,
                 grokBuildAvailable: grokBuildAvailable || agentKind == .grokBuild,
                 ompAvailable: ompAvailable || agentKind == .omp,
+                devinAvailable: devinAvailable || agentKind == .devin,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured || agentKind == .customClaudeCompatible
@@ -195,14 +202,15 @@ enum AgentModelCatalog {
         .openCode,
         .cursor,
         .grokBuild,
-        .omp
+        .omp,
+        .devin
     ]
 
     static func selectableAgents(
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .omp, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .omp, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
             .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
     }
 
@@ -236,6 +244,8 @@ enum AgentModelCatalog {
             availability.grokBuildAvailable
         case .omp:
             availability.ompAvailable
+        case .devin:
+            availability.devinAvailable
         }
     }
 
@@ -264,7 +274,7 @@ enum AgentModelCatalog {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
-        case .codexExec, .openCode, .grokBuild, .omp:
+        case .codexExec, .openCode, .grokBuild, .omp, .devin:
             return AgentModel.defaultModel.rawValue
         }
     }
@@ -384,7 +394,7 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
-        case .openCode, .cursor, .grokBuild, .omp:
+        case .openCode, .cursor, .grokBuild, .omp, .devin:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
@@ -411,7 +421,7 @@ enum AgentModelCatalog {
         {
             return true
         }
-        if agentKind == .grokBuild || agentKind == .omp,
+        if agentKind == .grokBuild || agentKind == .omp || agentKind == .devin,
            normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
         {
             return true
@@ -1410,7 +1420,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp, .devin:
             nil
         }
     }
@@ -1613,7 +1623,7 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .omp, .devin:
             true
         }
     }
@@ -1969,7 +1979,7 @@ enum AgentModelCatalog {
     static func discoveryAgents(
         availability: AvailabilityContext = .current
     ) -> [DiscoveryAgent] {
-        AgentProviderKind.allCases.map { agent in
+        AgentProviderKind.allCases.filter { $0 != .devin }.map { agent in
             discoveryAgent(agent, availability: availability)
         }
     }
