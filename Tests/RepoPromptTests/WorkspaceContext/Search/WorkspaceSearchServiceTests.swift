@@ -86,6 +86,61 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         XCTAssertEqual(Set(result.results.map(\.rootID)), [recordA.id, recordB.id])
     }
 
+    func testManagedOnlyMaterializationConvergesFreshnessWithoutBecomingSearchable() async throws {
+        let root = try makeTemporaryRoot(name: "ManagedOnlySearchFreshness")
+        let visibleURL = root.appendingPathComponent("Sources/VisibleTarget.swift")
+        let ignoredURL = root.appendingPathComponent("HiddenIgnoredTarget.ignored")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        try write("visible", to: visibleURL)
+        try write("hidden", to: ignoredURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let initialSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertFalse(initialSnapshot.files.contains { $0.standardizedFullPath == ignoredURL.path })
+
+        let service = WorkspaceSearchService()
+        let rebuildCommitted = expectation(description: "managed-only catalog generation rebuilt")
+        addTeardownBlock {
+            await service.setAutomaticRebuildDidCommitHandler(nil)
+            await service.stopKeepingFresh()
+        }
+
+        await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        await service.rebuildIndex(from: initialSnapshot)
+        await service.setAutomaticRebuildDidCommitHandler { _ in
+            rebuildCommitted.fulfill()
+        }
+
+        let materialization = try await store.materializeExplicitlyRequestedFile(
+            ignoredURL.path,
+            rootScope: .visibleWorkspace
+        )
+        guard case let .materialized(file) = materialization else {
+            return XCTFail("Expected ignored file to materialize as a managed-only record")
+        }
+        XCTAssertEqual(file.standardizedFullPath, ignoredURL.path)
+        let materializedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        XCTAssertNotEqual(materializedGeneration, initialSnapshot.generation)
+
+        await fulfillment(of: [rebuildCommitted], timeout: 2)
+
+        let visibleResult = await service.search("VisibleTarget", limit: 10)
+        XCTAssertTrue(visibleResult.isIndexReady)
+        XCTAssertFalse(visibleResult.isStale)
+        XCTAssertEqual(visibleResult.indexedGeneration, materializedGeneration)
+        XCTAssertEqual(visibleResult.snapshotGeneration, materializedGeneration)
+        XCTAssertNil(visibleResult.pendingGeneration)
+        XCTAssertEqual(visibleResult.observedGeneration, materializedGeneration)
+        XCTAssertEqual(visibleResult.results.map(\.standardizedFullPath), [visibleURL.path])
+
+        let ignoredResult = await service.search("HiddenIgnoredTarget", limit: 10)
+        XCTAssertTrue(ignoredResult.isIndexReady)
+        XCTAssertFalse(ignoredResult.isStale)
+        XCTAssertEqual(ignoredResult.indexedGeneration, materializedGeneration)
+        XCTAssertTrue(ignoredResult.results.isEmpty)
+    }
+
     func testRemovedRootCannotBeResurrectedByDelayedLoadRefresh() async throws {
         let rootA = try makeTemporaryRoot(name: "DelayedLoadRemovalRootA")
         let rootB = try makeTemporaryRoot(name: "DelayedLoadRemovalRootB")
