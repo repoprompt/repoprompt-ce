@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Retry-safe Tip publication. Every remote mutation is reconciled by observing
-# exact release state; protected main and the public P -> T -> S ladder are
-# rechecked immediately before a draft becomes public.
+# exact release state; protected-main ancestry and the public P -> T -> S ladder
+# are rechecked immediately before a draft becomes public.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROLLOUT_TOOL="$SCRIPT_DIR/stable_rollout.py"
@@ -201,8 +201,8 @@ fetch_json_status() {
     printf '%s\n' "$status"
 }
 
-require_live_main() {
-    "$SOURCE_COMMIT_VERIFIER" "$1"
+require_main_lineage() {
+    "$SOURCE_COMMIT_VERIFIER" --allow-ancestor "$1"
 }
 
 LIVE_AUDIT_INDEX=0
@@ -505,7 +505,32 @@ PY
 }
 
 write_release_json() {
-    local output="$1" status
+    local output="$1" status release_id="" direct_output
+    if [[ -f "$output" ]]; then
+        release_id="$(python3 - "$output" <<'PY'
+import json
+import sys
+
+try:
+    release = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(0)
+release_id = release.get("id") if isinstance(release, dict) else None
+if isinstance(release_id, int):
+    print(release_id)
+PY
+)"
+    fi
+    if [[ -n "$release_id" ]]; then
+        direct_output="$(mktemp "$TMP_DIR/release-by-id.XXXXXX")"
+        if ! GH_TOKEN="$TIP_GH_TOKEN" gh api \
+            "/repos/$TIP_UPDATE_REPOSITORY/releases/$release_id" > "$direct_output"; then
+            rm -f "$direct_output"
+            fail "Authenticated Tip release lookup by id failed"
+        fi
+        mv "$direct_output" "$output"
+        return 0
+    fi
     if lookup_release "$output"; then
         return 0
     else
@@ -522,17 +547,19 @@ create_draft_if_missing() {
     if write_release_json "$release_file"; then
         return 0
     fi
-    require_live_main "pre-draft creation"
-    if ! GH_TOKEN="$TIP_GH_TOKEN" gh release create "$TIP_TAG" \
-        --repo "$TIP_UPDATE_REPOSITORY" \
-        --target "$TIP_SOURCE_BRANCH" \
-        --draft \
-        --title "$TIP_RELEASE_TITLE" \
-        --notes "$TIP_RELEASE_NOTES"; then
+    require_main_lineage "pre-draft creation"
+    if ! GH_TOKEN="$TIP_GH_TOKEN" gh api --method POST \
+        "/repos/$TIP_UPDATE_REPOSITORY/releases" \
+        -f tag_name="$TIP_TAG" \
+        -f target_commitish="$TIP_SOURCE_BRANCH" \
+        -f name="$TIP_RELEASE_TITLE" \
+        -f body="$TIP_RELEASE_NOTES" \
+        -F draft=true \
+        -F prerelease=false > "$release_file"; then
         write_release_json "$release_file" || fail "Unable to create or reconcile Tip release draft"
         return 0
     fi
-    write_release_json "$release_file" || fail "Created Tip draft is not observable"
+    validate_release_metadata "$release_file" draft
 }
 
 download_authenticated_asset() {
@@ -592,7 +619,8 @@ PY
 }
 
 upload_missing_assets() {
-    local release_file="$1" names_file="$TMP_DIR/remote-names"
+    local release_file="$1" names_file="$TMP_DIR/remote-names" release_id
+    release_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$release_file")"
     python3 - "$release_file" > "$names_file" <<'PY'
 import json
 import sys
@@ -600,14 +628,27 @@ release = json.load(open(sys.argv[1], encoding="utf-8"))
 for asset in release.get("assets", []):
     print(asset.get("name", ""))
 PY
-    local path name
+    local path name encoded_name upload_response upload_status
     for path in "${ASSETS[@]}"; do
         name="$(basename "$path")"
         if grep -Fx "$name" "$names_file" >/dev/null; then
             continue
         fi
-        if ! GH_TOKEN="$TIP_GH_TOKEN" gh release upload "$TIP_TAG" "$path" \
-            --repo "$TIP_UPDATE_REPOSITORY"; then
+        encoded_name="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$name")"
+        upload_response="$(mktemp "$TMP_DIR/upload-response.XXXXXX")"
+        upload_status="$(curl --location --silent --show-error \
+            --connect-timeout 10 --max-time 1800 \
+            --request POST \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'Content-Type: application/octet-stream' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --header "Authorization: Bearer $TIP_GH_TOKEN" \
+            --data-binary "@$path" \
+            --output "$upload_response" --write-out '%{http_code}' \
+            "https://uploads.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/$release_id/assets?name=$encoded_name")" ||
+            upload_status="000"
+        rm -f "$upload_response"
+        if [[ "$upload_status" != "201" ]]; then
             write_release_json "$release_file" || fail "Unable to reconcile Tip asset upload: $name"
             audit_authenticated_release_assets "$release_file" true
             grep -Fx "$name" <(python3 - "$release_file" <<'PY'
@@ -615,7 +656,7 @@ import json,sys
 for asset in json.load(open(sys.argv[1], encoding="utf-8")).get("assets", []):
     print(asset.get("name", ""))
 PY
-) >/dev/null || fail "Tip asset upload failed: $name"
+) >/dev/null || fail "Tip asset upload failed with HTTP $upload_status: $name"
         fi
         write_release_json "$release_file" || fail "Tip release draft disappeared after uploading $name"
     done
@@ -624,7 +665,7 @@ PY
 publish_draft() {
     local release_file="$1" release_id
     release_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$release_file")"
-    require_live_main "final pre-publication"
+    require_main_lineage "final pre-publication"
     audit_live_rollout_progression "final pre-publication"
     if ! GH_TOKEN="$TIP_GH_TOKEN" gh api --method PATCH \
         "/repos/$TIP_UPDATE_REPOSITORY/releases/$release_id" \
@@ -695,7 +736,7 @@ PY
 }
 
 validate_candidate_bindings
-require_live_main "publication setup"
+require_main_lineage "publication setup"
 audit_live_rollout_progression "publication setup"
 release_file="$TMP_DIR/release.json"
 create_draft_if_missing "$release_file"

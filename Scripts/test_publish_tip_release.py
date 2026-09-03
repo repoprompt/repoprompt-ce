@@ -22,6 +22,7 @@ WORKFLOW = ROOT_DIR / ".github" / "workflows" / "main-tip.yml"
 TIP_ORCHESTRATOR = SCRIPT_DIR / "main_tip_release.sh"
 
 COMMIT = "a" * 40
+ADVANCED_COMMIT = "b" * 40
 TAG = "tip-aaaaaaaaaaaa"
 SOURCE_REPOSITORY = "repoprompt/repoprompt-ce"
 UPDATE_REPOSITORY = "repoprompt/repoprompt-ce-tip-updates"
@@ -29,7 +30,6 @@ TITLE = "RepoPrompt CE Tip fixture"
 NOTES = "Hermetic publisher regression fixture."
 
 GH_STUB = r'''#!/usr/bin/env python3
-import hashlib
 import json
 import os
 import sys
@@ -45,25 +45,20 @@ def save():
     state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
-def option(name):
-    return args[args.index(name) + 1]
-
-
-def asset_record(path):
-    data = path.read_bytes()
-    name = path.name
-    index = len(state["release"]["assets"]) + 1
-    return {
-        "name": name,
-        "state": "uploaded",
-        "url": f"https://api.github.com/repos/{os.environ['TIP_UPDATE_REPOSITORY']}/releases/assets/{index}",
-        "browser_download_url": (
-            f"https://github.com/{os.environ['TIP_UPDATE_REPOSITORY']}"
-            f"/releases/download/{os.environ['TIP_TAG']}/{name}"
-        ),
-        "size": len(data),
-        "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
-    }
+def form_fields():
+    values = {}
+    index = 0
+    while index < len(args) - 1:
+        flag = args[index]
+        if flag not in {"-f", "-F"}:
+            index += 1
+            continue
+        key, value = args[index + 1].split("=", 1)
+        if flag == "-F" and value in {"true", "false"}:
+            value = value == "true"
+        values[key] = value
+        index += 2
+    return values
 
 
 if not os.environ.get("GH_TOKEN"):
@@ -71,6 +66,8 @@ if not os.environ.get("GH_TOKEN"):
 
 if args[:2] == ["api", "--paginate"]:
     state["lookup_args"].append(args)
+    if "create" in state["mutations"]:
+        state["tag_list_lookups_after_create"] += 1
     save()
     if state["scenario"] == "lookup-error":
         print("fixture lookup failure", file=sys.stderr)
@@ -88,6 +85,32 @@ if args[:2] == ["api", "--paginate"]:
         print(json.dumps([release]))
     raise SystemExit(0)
 
+if args[:3] == ["api", "--method", "POST"]:
+    expected_path = f"/repos/{os.environ['TIP_UPDATE_REPOSITORY']}/releases"
+    if args[3] != expected_path:
+        raise SystemExit(f"unexpected fixture release creation path: {args[3]}")
+    if state.get("release") is not None:
+        raise SystemExit("fixture release already exists")
+    fields = form_fields()
+    state["mutations"].append("create")
+    state["release"] = {
+        "id": 101,
+        "tag_name": fields["tag_name"],
+        "target_commitish": fields["target_commitish"],
+        "name": fields["name"],
+        "body": fields["body"],
+        "draft": fields["draft"],
+        "prerelease": fields["prerelease"],
+        "assets": [],
+    }
+    save()
+    print(json.dumps(state["release"]))
+    raise SystemExit(0)
+
+if args[:2] == ["api", f"/repos/{os.environ['TIP_UPDATE_REPOSITORY']}/releases/101"]:
+    print(json.dumps(state["release"]))
+    raise SystemExit(0)
+
 if args and args[0] == "api" and "Accept: application/octet-stream" in args:
     api_url = args[-1]
     for asset in state["release"]["assets"]:
@@ -95,32 +118,6 @@ if args and args[0] == "api" and "Accept: application/octet-stream" in args:
             sys.stdout.buffer.write((asset_dir / asset["name"]).read_bytes())
             raise SystemExit(0)
     raise SystemExit(f"unknown fixture asset API URL: {api_url}")
-
-if args[:2] == ["release", "create"]:
-    if state.get("release") is not None:
-        raise SystemExit("fixture release already exists")
-    state["mutations"].append("create")
-    state["release"] = {
-        "id": 101,
-        "tag_name": args[2],
-        "target_commitish": option("--target"),
-        "name": option("--title"),
-        "body": option("--notes"),
-        "draft": True,
-        "prerelease": False,
-        "assets": [],
-    }
-    save()
-    print("fixture draft created")
-    raise SystemExit(0)
-
-if args[:2] == ["release", "upload"]:
-    path = Path(args[3])
-    state["mutations"].append(f"upload:{path.name}")
-    state["release"]["assets"].append(asset_record(path))
-    save()
-    print("fixture asset uploaded")
-    raise SystemExit(0)
 
 if args[:3] == ["api", "--method", "PATCH"]:
     state["mutations"].append("publish")
@@ -133,6 +130,7 @@ raise SystemExit(f"unsupported gh invocation: {args!r}")
 '''
 
 CURL_STUB = r'''#!/usr/bin/env python3
+import hashlib
 import json
 import os
 import shutil
@@ -149,7 +147,34 @@ if not urls:
 url = urls[-1]
 status = "200"
 
-if url.endswith("/commits/main"):
+if url.startswith("https://uploads.github.com/"):
+    expected = f"Authorization: Bearer {os.environ['TIP_GH_TOKEN']}"
+    if expected not in args:
+        raise SystemExit("fixture asset upload was not authenticated")
+    path = Path(args[args.index("--data-binary") + 1].removeprefix("@"))
+    data = path.read_bytes()
+    name = path.name
+    index = len(state["release"]["assets"]) + 1
+    state["mutations"].append(f"upload:{name}")
+    state["release"]["assets"].append(
+        {
+            "name": name,
+            "state": "uploaded",
+            "url": f"https://api.github.com/repos/{os.environ['TIP_UPDATE_REPOSITORY']}/releases/assets/{index}",
+            "browser_download_url": (
+                f"https://github.com/{os.environ['TIP_UPDATE_REPOSITORY']}"
+                f"/releases/download/{os.environ['TIP_TAG']}/{name}"
+            ),
+            "size": len(data),
+            "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+        }
+    )
+    Path(os.environ["PUBLISHER_STUB_STATE"]).write_text(
+        json.dumps(state, indent=2) + "\n", encoding="utf-8"
+    )
+    output.write_text(json.dumps(state["release"]["assets"][-1]), encoding="utf-8")
+    status = "201"
+elif url.endswith("/commits/main"):
     expected = f"Authorization: Bearer {os.environ['PUBLISHER_EXPECTED_SOURCE_TOKEN']}"
     authenticated = expected in args
     state.setdefault("source_lookup_auth", []).append(authenticated)
@@ -157,10 +182,30 @@ if url.endswith("/commits/main"):
         json.dumps(state, indent=2) + "\n", encoding="utf-8"
     )
     if authenticated:
-        output.write_text(json.dumps({"sha": os.environ["TIP_COMMIT"]}), encoding="utf-8")
+        output.write_text(json.dumps({"sha": os.environ["PUBLISHER_LIVE_MAIN"]}), encoding="utf-8")
     else:
         output.write_text(json.dumps({"message": "fixture authorization denied"}), encoding="utf-8")
         status = "403"
+elif "/compare/" in url:
+    expected = f"Authorization: Bearer {os.environ['PUBLISHER_EXPECTED_SOURCE_TOKEN']}"
+    authenticated = expected in args
+    state.setdefault("source_lookup_auth", []).append(authenticated)
+    Path(os.environ["PUBLISHER_STUB_STATE"]).write_text(
+        json.dumps(state, indent=2) + "\n", encoding="utf-8"
+    )
+    if not authenticated:
+        output.write_text(json.dumps({"message": "fixture authorization denied"}), encoding="utf-8")
+        status = "403"
+    elif state["scenario"] == "diverged-source":
+        output.write_text(
+            json.dumps({"status": "diverged", "merge_base_commit": {"sha": "c" * 40}}),
+            encoding="utf-8",
+        )
+    else:
+        output.write_text(
+            json.dumps({"status": "ahead", "merge_base_commit": {"sha": os.environ["TIP_COMMIT"]}}),
+            encoding="utf-8",
+        )
 elif url == os.environ["PUBLISHER_STABLE_FEED_URL"]:
     shutil.copyfile(os.environ["PUBLISHER_STABLE_APPCAST"], output)
 elif url.endswith("/releases/latest"):
@@ -327,6 +372,7 @@ class PublishTipReleaseTests(unittest.TestCase):
         release: dict[str, object] | None,
         *,
         source_token: str | None = "fixture-source-token",
+        live_main: str = COMMIT,
     ) -> subprocess.CompletedProcess[str]:
         self.state_path.write_text(
             json.dumps(
@@ -336,6 +382,7 @@ class PublishTipReleaseTests(unittest.TestCase):
                     "lookup_args": [],
                     "mutations": [],
                     "source_lookup_auth": [],
+                    "tag_list_lookups_after_create": 0,
                 },
                 indent=2,
             )
@@ -353,6 +400,7 @@ class PublishTipReleaseTests(unittest.TestCase):
                 "PUBLISHER_STABLE_FEED_URL": policy["sparkle"]["stableFeedURL"],
                 "TIP_GH_TOKEN": "fixture-update-token",
                 "PUBLISHER_EXPECTED_SOURCE_TOKEN": "fixture-source-token",
+                "PUBLISHER_LIVE_MAIN": live_main,
                 "TIP_UPDATE_REPOSITORY": UPDATE_REPOSITORY,
                 "TIP_SOURCE_REPOSITORY": SOURCE_REPOSITORY,
                 "TIP_SOURCE_BRANCH": "main",
@@ -419,7 +467,39 @@ class PublishTipReleaseTests(unittest.TestCase):
         )
         self.assertEqual(state["mutations"][-1], "publish")
         self.assertFalse(state["release"]["draft"])
+        self.assertEqual(state["tag_list_lookups_after_create"], 0)
         self.assert_compatible_lookup(state)
+
+    def test_existing_empty_draft_resumes_by_release_id_and_publishes(self) -> None:
+        release = self._release(draft=True)
+        release["assets"] = []
+        result = self._run("existing", release)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self._state()
+        self.assertNotIn("create", state["mutations"])
+        self.assertEqual(
+            sorted(value for value in state["mutations"] if value.startswith("upload:")),
+            sorted(f"upload:{path.name}" for path in self.assets),
+        )
+        self.assertEqual(state["mutations"][-1], "publish")
+        self.assertFalse(state["release"]["draft"])
+
+    def test_candidate_may_publish_after_main_advances_when_it_remains_an_ancestor(self) -> None:
+        result = self._run("absent", None, live_main=ADVANCED_COMMIT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("remains an ancestor of protected main", result.stdout)
+        state = self._state()
+        self.assertEqual(state["mutations"][0], "create")
+        self.assertEqual(state["mutations"][-1], "publish")
+        self.assertTrue(all(state["source_lookup_auth"]))
+
+    def test_candidate_outside_live_main_ancestry_fails_before_mutation(self) -> None:
+        result = self._run("diverged-source", None, live_main=ADVANCED_COMMIT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside protected-main ancestry", result.stderr)
+        state = self._state()
+        self.assertEqual(state["mutations"], [])
+        self.assertTrue(all(state["source_lookup_auth"]))
 
     def test_lookup_command_failure_fails_closed_before_draft_creation(self) -> None:
         result = self._run("lookup-error", None)
@@ -464,6 +544,8 @@ class PublishTipReleaseTests(unittest.TestCase):
         orchestrator = TIP_ORCHESTRATOR.read_text(encoding="utf-8")
         self.assertIn("require_env TIP_SOURCE_GH_TOKEN", orchestrator)
         self.assertIn('TIP_SOURCE_GH_TOKEN="$TIP_SOURCE_GH_TOKEN"', orchestrator)
+        publisher = PUBLISHER.read_text(encoding="utf-8")
+        self.assertIn('"$SOURCE_COMMIT_VERIFIER" --allow-ancestor "$1"', publisher)
 
     def test_duplicate_tag_across_pages_fails_closed_without_mutation(self) -> None:
         result = self._run("duplicate", self._release())

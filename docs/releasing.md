@@ -303,15 +303,21 @@ T's `sparkle:minimumUpdateVersion`, bypassing the credential preparer.
 Automatic and manual runs use separate rolling concurrency lanes. Each lane keeps at most one
 queued run and does not cancel in-flight release work; publication remains serialized across both
 lanes by `main-tip-publish`. A retry therefore resumes or audits one exact draft instead of abandoning
-a different tag halfway through publication.
+a different tag halfway through publication. Setup and credential preflight require the candidate to
+be the exact protected-main head before expensive work starts. If `main` advances while that work is
+running, publication may finish only while the candidate remains in authenticated protected-main
+ancestry. The monotonic build and rollout-progression checks still reject an older candidate when a
+newer Tip has already become public, while the newest queued run converges the feed on current `main`.
 
 Remote mutation is confined to that protected publication job. Immediately before draft creation
-and again immediately before making a draft public, it rechecks live protected `main`, downloads the
-public Tip manifest/appcast, proves that the candidate either rolls the current role or advances one
-step through `P → T → S` with exact retained history, and audits every retained enclosure against
-GitHub's published size and SHA-256. Rolling P retains no predecessor, rolling T retains the exact
-authenticated P, and rolling S retains the exact authenticated T and P. Existing drafts are resumed
-only when their metadata and uploaded bytes exactly match;
+and again immediately before making a draft public, it proves the candidate is still on live
+protected-main ancestry, downloads the public Tip manifest/appcast, proves that the candidate either
+rolls the current role or advances one step through `P → T → S` with exact retained history, and
+audits every retained enclosure against GitHub's published size and SHA-256. Rolling P retains no
+predecessor, rolling T retains the exact authenticated P, and rolling S retains the exact authenticated
+T and P. Draft creation consumes and validates GitHub's synchronous release response so publication
+does not depend on the new draft immediately appearing in paginated list results. Existing drafts are
+resumed only when their metadata and uploaded bytes exactly match;
 missing assets are added without overwriting anything. After publication, every public asset is
 downloaded anonymously and compared byte-for-byte with the signed local inventory, and the release
 must be the repository's latest. The update-repository token is not available to setup, staging, or
