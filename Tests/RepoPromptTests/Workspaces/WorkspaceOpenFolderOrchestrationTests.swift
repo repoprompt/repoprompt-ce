@@ -452,18 +452,34 @@ import XCTest
 
             let operationID = UUID()
             let expectedRevision = authoritative.revisions.workingRevision
-            let first = try await client.replaceWorking(
+            let mutationGate = WorkspaceRootMutationTestGate()
+            await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired { workspaceID in
+                guard workspaceID == stableWorkspaceID else { return }
+                await mutationGate.pauseUntilReleased()
+            }
+            defer {
+                Task {
+                    await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired(nil)
+                }
+            }
+
+            async let firstRequest = client.replaceWorking(
                 firstModel,
                 fileURL: authoritative.document.fileURL,
                 expectedWorkspaceRevision: expectedRevision,
                 operationID: operationID
             )
-            let replay = try await client.replaceWorking(
+            await mutationGate.waitUntilPaused()
+            async let replayRequest = client.replaceWorking(
                 equalModel,
                 fileURL: authoritative.document.fileURL,
                 expectedWorkspaceRevision: expectedRevision,
                 operationID: operationID
             )
+            await Task.yield()
+            await mutationGate.release()
+            let (first, replay) = try await (firstRequest, replayRequest)
+            let mutationGateEntryCount = await mutationGate.entryCount()
 
             func sortedWorkspaceBytes(_ workspace: WorkspaceModel) throws -> Data {
                 let encoder = JSONEncoder()
@@ -494,6 +510,11 @@ import XCTest
             XCTAssertEqual(replay.disposition, .deduplicated)
             XCTAssertEqual(replay.resultingDigest, first.resultingDigest)
             XCTAssertEqual(replay.workspace?.document.contentDigest, first.resultingDigest)
+            XCTAssertEqual(
+                mutationGateEntryCount,
+                2,
+                "Both equal replacements must reach the mutation gate before replay deduplication"
+            )
 
             var changedModel = firstModel
             changedModel.name = "Changed Replacement"
@@ -955,8 +976,10 @@ import XCTest
         private var didRelease = false
         private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
         private var releaseWaiter: CheckedContinuation<Void, Never>?
+        private var entries = 0
 
         func pauseUntilReleased() async {
+            entries += 1
             didPause = true
             pauseWaiters.forEach { $0.resume() }
             pauseWaiters.removeAll()
@@ -977,6 +1000,10 @@ import XCTest
             didRelease = true
             releaseWaiter?.resume()
             releaseWaiter = nil
+        }
+
+        func entryCount() -> Int {
+            entries
         }
     }
 
