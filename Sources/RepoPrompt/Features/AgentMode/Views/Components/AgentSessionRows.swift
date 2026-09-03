@@ -55,6 +55,26 @@ struct AgentSessionRow: View {
     @State private var showRenameAlert = false
     @State private var showDeleteConfirmation = false
     @State private var renameText = ""
+
+    /// Snapshot of the conditions that control context menu item visibility,
+    /// captured on hover. Using a snapshot prevents AppKit from observing a
+    /// mid-layout item-count change (which triggers an NSRangeException when
+    /// NSContextMenuImpl measures row heights for items that were just removed).
+    private struct ContextMenuSnapshot {
+        var isInteractionEnabled: Bool
+        var showsSelectionPresentation: Bool
+        var hasAttentionRunState: Bool
+        var hasOnStash: Bool
+        var hasOnDismissAttention: Bool
+    }
+    @State private var menuSnapshot = ContextMenuSnapshot(
+        isInteractionEnabled: true,
+        showsSelectionPresentation: false,
+        hasAttentionRunState: false,
+        hasOnStash: false,
+        hasOnDismissAttention: false
+    )
+
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -316,8 +336,8 @@ struct AgentSessionRow: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
-            if !showsSelectionPresentation {
-                if isInteractionEnabled {
+            if !menuSnapshot.showsSelectionPresentation {
+                if menuSnapshot.isInteractionEnabled {
                     Button("Select chat", action: toggleSelection)
 
                     Divider()
@@ -332,22 +352,33 @@ struct AgentSessionRow: View {
                 }
                 .disabled(!sessionIDCopyAction.isEnabled)
 
-                if isInteractionEnabled, let onStash {
-                    Button(stashActionLabel, action: onStash)
+                if menuSnapshot.isInteractionEnabled && menuSnapshot.hasOnStash {
+                    Button(stashActionLabel, action: { onStash?() })
                 }
 
-                if attentionRunState != nil, let onDismissAttention {
-                    Button(dismissAttentionActionLabel, action: onDismissAttention)
+                if menuSnapshot.hasAttentionRunState && menuSnapshot.hasOnDismissAttention {
+                    Button(dismissAttentionActionLabel, action: { onDismissAttention?() })
                 }
 
-                if isInteractionEnabled {
+                if menuSnapshot.isInteractionEnabled {
                     Divider()
 
                     Button(deleteActionLabel, role: .destructive, action: requestDeleteConfirmation)
                 }
             }
         }
-        .onHover { isHovered = $0 }
+        .onHover { hovered in
+            isHovered = hovered
+            if hovered {
+                menuSnapshot = ContextMenuSnapshot(
+                    isInteractionEnabled: isInteractionEnabled,
+                    showsSelectionPresentation: showsSelectionPresentation,
+                    hasAttentionRunState: attentionRunState != nil,
+                    hasOnStash: onStash != nil,
+                    hasOnDismissAttention: onDismissAttention != nil
+                )
+            }
+        }
         .onTapGesture(perform: handleRowTap)
         .focusable()
         .onKeyPress(.space) {
@@ -798,6 +829,18 @@ struct AgentStashedSessionRow: View {
     @State private var isHovered = false
     @State private var isRestoreHovered = false
     @State private var isDeleteHovered = false
+
+    /// Snapshot of conditions controlling context menu item visibility, captured
+    /// on hover to prevent NSRangeException from AppKit measuring stale item counts.
+    private struct ContextMenuSnapshot {
+        var isInteractionEnabled: Bool
+        var showsSelectionPresentation: Bool
+    }
+    @State private var menuSnapshot = ContextMenuSnapshot(
+        isInteractionEnabled: true,
+        showsSelectionPresentation: false
+    )
+
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -946,8 +989,8 @@ struct AgentStashedSessionRow: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
-            if !showsSelectionPresentation {
-                if isInteractionEnabled {
+            if !menuSnapshot.showsSelectionPresentation {
+                if menuSnapshot.isInteractionEnabled {
                     Button("Select chat", action: toggleSelection)
                     Divider()
                     Button(restoreActionLabel, action: onRestore)
@@ -956,13 +999,21 @@ struct AgentStashedSessionRow: View {
                     sessionIDCopyAction.perform()
                 }
                 .disabled(!sessionIDCopyAction.isEnabled)
-                if isInteractionEnabled {
+                if menuSnapshot.isInteractionEnabled {
                     Divider()
                     Button(deleteActionLabel, role: .destructive, action: onDelete)
                 }
             }
         }
-        .onHover { isHovered = $0 }
+        .onHover { hovered in
+            isHovered = hovered
+            if hovered {
+                menuSnapshot = ContextMenuSnapshot(
+                    isInteractionEnabled: isInteractionEnabled,
+                    showsSelectionPresentation: showsSelectionPresentation
+                )
+            }
+        }
         .onTapGesture(perform: handleRowTap)
         .focusable()
         .onKeyPress(.space) {
