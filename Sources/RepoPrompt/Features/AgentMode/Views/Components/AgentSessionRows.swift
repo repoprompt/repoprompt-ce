@@ -69,6 +69,7 @@ struct AgentSessionRow: View {
         var hasOnStash: Bool
         var hasOnDismissAttention: Bool
     }
+
     @State private var menuSnapshot = ContextMenuSnapshot(
         isInteractionEnabled: true,
         showsSelectionPresentation: false,
@@ -840,6 +841,7 @@ struct AgentStashedSessionRow: View {
         var isInteractionEnabled: Bool
         var showsSelectionPresentation: Bool
     }
+
     @State private var menuSnapshot = ContextMenuSnapshot(
         isInteractionEnabled: true,
         showsSelectionPresentation: false
