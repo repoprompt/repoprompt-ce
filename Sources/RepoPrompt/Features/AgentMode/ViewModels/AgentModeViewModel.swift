@@ -271,6 +271,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     @Published var draftRestorationEvent: DraftRestorationEvent? = nil
     @Published private(set) var codexDynamicModels: [CodexAppServerClient.RemoteModel] = []
+    /// Pre-computed collapsed Codex model options. Rebuilt whenever `codexDynamicModels`
+    /// changes so the expensive collapse/regex work never runs on the SwiftUI render path.
+    private(set) var cachedCollapsedCodexOptions: [AgentModelOption] = []
     @Published private(set) var acpDynamicModelRevision: Int = 0
     @Published private(set) var availableAgents: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
 
@@ -1216,12 +1219,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func reasoningEffortOptionsForCurrentSelection() -> [CodexReasoningEffort] {
-        codexCoordinator.reasoningEffortOptions(forModelRaw: selectedModelRaw, agentKind: selectedAgent)
+        codexCoordinator.reasoningEffortOptions(
+            forModelRaw: selectedModelRaw,
+            agentKind: selectedAgent,
+            precomputedOptions: cachedCollapsedCodexOptions.isEmpty ? nil : cachedCollapsedCodexOptions
+        )
     }
 
     func updateCodexDynamicModels(_ models: [CodexAppServerClient.RemoteModel]) {
         if codexDynamicModels != models {
             codexDynamicModels = models
+            // Rebuild the collapsed option cache eagerly (off the render path) so
+            // that reasoningEffortOptionsForCurrentSelection() is cheap in SwiftUI bodies.
+            cachedCollapsedCodexOptions = codexCoordinator.modelOptions(
+                for: .codexExec,
+                codexDynamicModels: models
+            )
             syncComposerUIState()
         }
         // Note: Registry updates are owned exclusively by CodexModelPollingService.

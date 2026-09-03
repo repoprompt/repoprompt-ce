@@ -1946,9 +1946,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return effort.displayName
     }
 
-    func reasoningEffortOptions(forModelRaw rawModel: String, agentKind: AgentProviderKind) -> [CodexReasoningEffort] {
+    func reasoningEffortOptions(
+        forModelRaw rawModel: String,
+        agentKind: AgentProviderKind,
+        precomputedOptions: [AgentModelOption]? = nil
+    ) -> [CodexReasoningEffort] {
         guard agentKind == .codexExec else { return [] }
-        let options = modelOptions(for: .codexExec)
+        let options = precomputedOptions ?? modelOptions(for: .codexExec)
         let normalizedRaw = Self.normalizedCodexSelectionModelRaw(from: rawModel)
         let option = options.first(where: {
             $0.rawValue.caseInsensitiveCompare(normalizedRaw) == .orderedSame
@@ -2105,7 +2109,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    /// Cache for `codexDisplayName(forBaseModel:)` — the function is pure so results
+    /// can be reused across all renders without any invalidation logic.
+    private static let _codexDisplayNameCacheLock = NSLock()
+    private static var _codexDisplayNameCache: [String: String] = [:]
+
     private static func codexDisplayName(forBaseModel rawModel: String) -> String {
+        _codexDisplayNameCacheLock.lock()
+        if let cached = _codexDisplayNameCache[rawModel] {
+            _codexDisplayNameCacheLock.unlock()
+            return cached
+        }
+        _codexDisplayNameCacheLock.unlock()
+
         let trimmed = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return rawModel }
         let normalized = trimmed
@@ -2134,6 +2150,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             with: "GPT-$1",
             options: .regularExpression
         )
+
+        _codexDisplayNameCacheLock.lock()
+        _codexDisplayNameCache[rawModel] = output
+        _codexDisplayNameCacheLock.unlock()
+
         return output
     }
 
