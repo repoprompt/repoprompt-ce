@@ -2887,6 +2887,9 @@ actor WorkspaceFileContextStore {
     ] = [:]
     private var fileSystemDeltaContinuations: [UUID: AsyncStream<WorkspaceFileSystemDeltaEvent>.Continuation] = [:]
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
+    private var searchCatalogChangeContinuations: [
+        UUID: AsyncStream<WorkspaceSearchCatalogChangeEvent>.Continuation
+    ] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
     private var sliceRebaseSourceEntries: [SliceRebaseSourceCacheKey: SliceRebaseSourceCacheEntry] = [:]
     private var sliceRebaseSourceEstimatedBytes = 0
@@ -3116,6 +3119,9 @@ actor WorkspaceFileContextStore {
         for continuation in appliedIndexContinuations.values {
             continuation.finish()
         }
+        for continuation in searchCatalogChangeContinuations.values {
+            continuation.finish()
+        }
     }
 
     func roots() -> [WorkspaceRootRecord] {
@@ -3162,6 +3168,20 @@ actor WorkspaceFileContextStore {
 
     private func removeAppliedIndexContinuation(id: UUID) {
         appliedIndexContinuations.removeValue(forKey: id)
+    }
+
+    func searchCatalogChangeEvents() -> AsyncStream<WorkspaceSearchCatalogChangeEvent> {
+        let streamID = UUID()
+        return AsyncStream { continuation in
+            searchCatalogChangeContinuations[streamID] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeSearchCatalogChangeContinuation(id: streamID) }
+            }
+        }
+    }
+
+    private func removeSearchCatalogChangeContinuation(id: UUID) {
+        searchCatalogChangeContinuations.removeValue(forKey: id)
     }
 
     func startWatchingRoot(id rootID: UUID) async throws {
@@ -6184,10 +6204,25 @@ actor WorkspaceFileContextStore {
         // Canonical batches are the only delta authority for search shards. Raw FSEvents first
         // mutate the store indexes and can never patch a published shard directly.
         applyAppliedIndexEventToRootCatalogShard(event)
+        if !event.isRootUnload {
+            publishSearchCatalogChangeEvent(WorkspaceSearchCatalogChangeEvent(
+                rootID: event.rootID,
+                rootPath: event.rootPath,
+                rootLifetimeID: event.rootLifetimeID,
+                rootAppliedIndexGeneration: event.generation,
+                kind: .appliedIndex
+            ))
+        }
         #if DEBUG
             Self.activePublicationInvalidationRecorder?.appliedIndexEventYieldCount += 1
         #endif
         for continuation in appliedIndexContinuations.values {
+            continuation.yield(event)
+        }
+    }
+
+    private func publishSearchCatalogChangeEvent(_ event: WorkspaceSearchCatalogChangeEvent) {
+        for continuation in searchCatalogChangeContinuations.values {
             continuation.yield(event)
         }
     }
@@ -10507,6 +10542,13 @@ actor WorkspaceFileContextStore {
             reason: .rootLoad,
             affectedRootIDs: [root.id]
         )
+        publishSearchCatalogChangeEvent(WorkspaceSearchCatalogChangeEvent(
+            rootID: root.id,
+            rootPath: root.standardizedFullPath,
+            rootLifetimeID: state.lifetimeID,
+            rootAppliedIndexGeneration: appliedIndexGenerationsByRootID[root.id],
+            kind: .rootLoaded
+        ))
         if root.kind == .sessionWorktree,
            WorktreeStartupFeatureFlags.current().observeDiffSeededWorktreeStartup
         {
@@ -10831,6 +10873,15 @@ actor WorkspaceFileContextStore {
         for entry in statesToUnload {
             rootIDsByStandardizedPath.removeValue(forKey: entry.state.root.standardizedFullPath)
             rootLoadConfigurationsByPath.removeValue(forKey: entry.state.root.standardizedFullPath)
+        }
+        for entry in statesToUnload {
+            publishSearchCatalogChangeEvent(WorkspaceSearchCatalogChangeEvent(
+                rootID: entry.rootID,
+                rootPath: entry.state.root.standardizedFullPath,
+                rootLifetimeID: entry.state.lifetimeID,
+                rootAppliedIndexGeneration: appliedIndexGenerationsByRootID[entry.rootID],
+                kind: .rootUnloaded
+            ))
         }
         #if DEBUG
             WorkspaceRestorePerfLog.event(

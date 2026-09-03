@@ -647,6 +647,20 @@ struct WorkspaceSliceRebaseSourceSnapshot: Equatable {
     let modificationTime: Double
 }
 
+enum WorkspaceSearchCatalogChangeKind: Equatable {
+    case rootLoaded
+    case rootUnloaded
+    case appliedIndex
+}
+
+struct WorkspaceSearchCatalogChangeEvent: Equatable {
+    let rootID: UUID
+    let rootPath: String
+    let rootLifetimeID: UUID?
+    let rootAppliedIndexGeneration: UInt64?
+    let kind: WorkspaceSearchCatalogChangeKind
+}
+
 struct WorkspaceAppliedIndexBatchEvent: Equatable {
     let rootID: UUID
     let rootPath: String
