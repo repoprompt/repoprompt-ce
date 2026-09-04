@@ -144,6 +144,37 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
 }
 
 enum SecureStorageAccountCatalog {
+    /// Frozen inventory copied by the version-2 Apple identity migration preparer.
+    /// New secure-storage accounts must not expand this list: once a bridge is
+    /// committed, that bridge remains the canonical backend and creates later
+    /// accounts with the committed manifest's authenticated ACL.
+    static let identityMigrationV2Accounts: [SecureStorageAccount] = [
+        .anthropicAPI,
+        .openAIAPI,
+        .geminiAPI,
+        .openRouterAPI,
+        .ollamaURL,
+        .azureAPI,
+        .deepSeekAPI,
+        .customProviderAPI,
+        .fireworksAPI,
+        .grokAPI,
+        .groqAPI,
+        .claudeCodeAPI,
+        .codexCLIAPI,
+        .openCodeCLIAPI,
+        .cursorCLIAPI,
+        .zAIAPI,
+        .claudeCompatibleKimiAPIKey,
+        .claudeCompatibleCustomAPIKey,
+        .agentPermissionSubagentDocument,
+        .agentPermissionCodexDocument,
+        .agentPermissionClaudeDocument,
+        .agentPermissionOpenCodeDocument,
+        .agentPermissionCursorDocument,
+        .agentPermissionGrokBuildDocument
+    ]
+
     static let providerAndCLIAccounts: [SecureStorageAccount] = [
         .anthropicAPI,
         .openAIAPI,

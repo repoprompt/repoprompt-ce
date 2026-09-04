@@ -2622,6 +2622,38 @@ actor WorkspaceFileContextStore {
             self.pathSearchIndex = pathSearchIndex
             self.appliedIndexGeneration = appliedIndexGeneration
         }
+
+        init(
+            projectionNeutralRetagging source: RootCatalogShard,
+            key: RootCatalogShardKey,
+            root: WorkspaceRootRecord
+        ) {
+            precondition(key.rootID == source.key.rootID)
+            precondition(key.lifetimeID == source.key.lifetimeID)
+            precondition(key.canonicalConfigurationIdentity == source.key.canonicalConfigurationIdentity)
+            precondition(source.key.topologyGeneration != UInt64.max)
+            precondition(key.topologyGeneration == source.key.topologyGeneration + 1)
+            precondition(root.id == key.rootID)
+            precondition(root.standardizedFullPath == key.canonicalConfigurationIdentity.canonicalPath)
+
+            self.key = key
+            self.root = root
+            files = source.files
+            projectionFiles = source.projectionFiles
+            projectionFileIndexByID = source.projectionFileIndexByID
+            folders = source.folders
+            entries = source.entries
+            pathSearchIndex = source.pathSearchIndex?.applyingPatch(
+                identity: WorkspaceSearchRootPathIndexIdentity(
+                    rootID: key.rootID,
+                    lifetimeID: key.lifetimeID,
+                    topologyGeneration: key.topologyGeneration
+                ),
+                entries: source.entries,
+                changedFileIDs: []
+            )
+            appliedIndexGeneration = source.appliedIndexGeneration
+        }
     }
 
     private struct CodemapGraphIndexCatalogShardBuildSnapshot: @unchecked Sendable {
@@ -2887,6 +2919,12 @@ actor WorkspaceFileContextStore {
     ] = [:]
     private var fileSystemDeltaContinuations: [UUID: AsyncStream<WorkspaceFileSystemDeltaEvent>.Continuation] = [:]
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
+    private var searchCatalogChangeContinuations: [
+        UUID: (
+            rootScope: WorkspaceLookupRootScope,
+            continuation: AsyncStream<WorkspaceSearchCatalogChangeEvent>.Continuation
+        )
+    ] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
     private var sliceRebaseSourceEntries: [SliceRebaseSourceCacheKey: SliceRebaseSourceCacheEntry] = [:]
     private var sliceRebaseSourceEstimatedBytes = 0
@@ -3116,6 +3154,9 @@ actor WorkspaceFileContextStore {
         for continuation in appliedIndexContinuations.values {
             continuation.finish()
         }
+        for subscription in searchCatalogChangeContinuations.values {
+            subscription.continuation.finish()
+        }
     }
 
     func roots() -> [WorkspaceRootRecord] {
@@ -3162,6 +3203,22 @@ actor WorkspaceFileContextStore {
 
     private func removeAppliedIndexContinuation(id: UUID) {
         appliedIndexContinuations.removeValue(forKey: id)
+    }
+
+    func searchCatalogChangeEvents(
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+    ) -> AsyncStream<WorkspaceSearchCatalogChangeEvent> {
+        let streamID = UUID()
+        return AsyncStream { continuation in
+            searchCatalogChangeContinuations[streamID] = (rootScope, continuation)
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeSearchCatalogChangeContinuation(id: streamID) }
+            }
+        }
+    }
+
+    private func removeSearchCatalogChangeContinuation(id: UUID) {
+        searchCatalogChangeContinuations.removeValue(forKey: id)
     }
 
     func startWatchingRoot(id rootID: UUID) async throws {
@@ -6184,12 +6241,39 @@ actor WorkspaceFileContextStore {
         // Canonical batches are the only delta authority for search shards. Raw FSEvents first
         // mutate the store indexes and can never patch a published shard directly.
         applyAppliedIndexEventToRootCatalogShard(event)
+        if !event.isRootUnload {
+            publishSearchCatalogChangeEvent(WorkspaceSearchCatalogChangeEvent(
+                rootID: event.rootID,
+                rootPath: event.rootPath,
+                rootLifetimeID: event.rootLifetimeID,
+                rootAppliedIndexGeneration: event.generation,
+                kind: .appliedIndex
+            ))
+        }
         #if DEBUG
             Self.activePublicationInvalidationRecorder?.appliedIndexEventYieldCount += 1
         #endif
         for continuation in appliedIndexContinuations.values {
             continuation.yield(event)
         }
+    }
+
+    private func publishSearchCatalogChangeEvent(_ event: WorkspaceSearchCatalogChangeEvent) {
+        for subscription in searchCatalogChangeContinuations.values {
+            subscription.continuation.yield(event.stamped(
+                catalogGeneration: scopedSnapshotGeneration(scope: subscription.rootScope)
+            ))
+        }
+    }
+
+    private func publishProjectionNeutralCatalogGenerationChange(root: WorkspaceRootRecord) {
+        publishSearchCatalogChangeEvent(WorkspaceSearchCatalogChangeEvent(
+            rootID: root.id,
+            rootPath: root.standardizedFullPath,
+            rootLifetimeID: rootStatesByID[root.id]?.lifetimeID,
+            rootAppliedIndexGeneration: nil,
+            kind: .generationAdvancedWithoutProjectionChange
+        ))
     }
 
     private func nextAppliedIndexGeneration(forRootID rootID: UUID) -> UInt64 {
@@ -7585,12 +7669,23 @@ actor WorkspaceFileContextStore {
         rootSeedSearchShadowsByRootID.removeValue(forKey: rootID)?.control.invalidate()
     }
 
+    private func retainPublishedRootCatalogShard(_ shard: RootCatalogShard) {
+        rootCatalogShardWeakReferencesByRootID[shard.key.rootID, default: []]
+            .append(WeakRootCatalogShardReference(shard))
+        #if DEBUG
+            let liveCount = liveRootCatalogShards(rootID: shard.key.rootID).count
+            rootCatalogShardMaxLiveGenerationCountsByRootID[shard.key.rootID] = max(
+                rootCatalogShardMaxLiveGenerationCountsByRootID[shard.key.rootID] ?? 0,
+                liveCount
+            )
+        #endif
+    }
+
     private func registerPublishedRootCatalogShard(
         _ shard: RootCatalogShard,
         kind: RootCatalogShardBuildKind
     ) {
-        rootCatalogShardWeakReferencesByRootID[shard.key.rootID, default: []]
-            .append(WeakRootCatalogShardReference(shard))
+        retainPublishedRootCatalogShard(shard)
         #if DEBUG
             rootCatalogShardBuildCountsByRootID[shard.key.rootID, default: 0] += 1
             switch kind {
@@ -7611,11 +7706,6 @@ actor WorkspaceFileContextStore {
             case .reused, nil:
                 break
             }
-            let liveCount = liveRootCatalogShards(rootID: shard.key.rootID).count
-            rootCatalogShardMaxLiveGenerationCountsByRootID[shard.key.rootID] = max(
-                rootCatalogShardMaxLiveGenerationCountsByRootID[shard.key.rootID] ?? 0,
-                liveCount
-            )
         #endif
     }
 
@@ -7642,6 +7732,48 @@ actor WorkspaceFileContextStore {
             return false
         }
         return true
+    }
+
+    private func retagPublishedRootCatalogShardForProjectionNeutralGeneration(
+        root: WorkspaceRootRecord,
+        materializedFileID: UUID
+    ) {
+        // The topology authority advanced, so any one-shot seeded shadow is no longer current.
+        invalidateRootSeedSearchShadow(rootID: root.id)
+
+        guard managedOnlyFileIDs.contains(materializedFileID),
+              let state = rootStatesByID[root.id],
+              state.root.standardizedFullPath == root.standardizedFullPath,
+              let currentKey = rootCatalogShardKey(for: state.root),
+              let previousShard = publishedRootCatalogShardsByRootID[root.id],
+              let deltaState = rootCatalogShardDeltaStatesByRootID[root.id],
+              deltaState.lifetimeID == state.lifetimeID,
+              !deltaState.isDirty,
+              previousShard.key.rootID == root.id,
+              previousShard.key.lifetimeID == state.lifetimeID,
+              previousShard.root.id == root.id,
+              previousShard.root.standardizedFullPath == root.standardizedFullPath,
+              previousShard.key.canonicalConfigurationIdentity == currentKey.canonicalConfigurationIdentity,
+              previousShard.key.topologyGeneration != UInt64.max,
+              currentKey.topologyGeneration == previousShard.key.topologyGeneration + 1,
+              previousShard.appliedIndexGeneration == deltaState.lastAppliedIndexGeneration,
+              appliedIndexGenerationsByRootID[root.id] == deltaState.lastAppliedIndexGeneration,
+              canPublishAnotherRootCatalogShard(rootID: root.id)
+        else {
+            // Leave the stale publication intact. The next snapshot or applied batch will
+            // conservatively replace it from current authority.
+            return
+        }
+
+        let retaggedShard = RootCatalogShard(
+            projectionNeutralRetagging: previousShard,
+            key: currentKey,
+            root: state.root
+        )
+        var publication = publishedRootCatalogShardsByRootID
+        publication[root.id] = retaggedShard
+        publishedRootCatalogShardsByRootID = publication
+        retainPublishedRootCatalogShard(retaggedShard)
     }
 
     private func applyAppliedIndexEventToRootCatalogShard(_ event: WorkspaceAppliedIndexBatchEvent) {
@@ -10507,6 +10639,13 @@ actor WorkspaceFileContextStore {
             reason: .rootLoad,
             affectedRootIDs: [root.id]
         )
+        publishSearchCatalogChangeEvent(WorkspaceSearchCatalogChangeEvent(
+            rootID: root.id,
+            rootPath: root.standardizedFullPath,
+            rootLifetimeID: state.lifetimeID,
+            rootAppliedIndexGeneration: appliedIndexGenerationsByRootID[root.id],
+            kind: .rootLoaded
+        ))
         if root.kind == .sessionWorktree,
            WorktreeStartupFeatureFlags.current().observeDiffSeededWorktreeStartup
         {
@@ -10831,6 +10970,15 @@ actor WorkspaceFileContextStore {
         for entry in statesToUnload {
             rootIDsByStandardizedPath.removeValue(forKey: entry.state.root.standardizedFullPath)
             rootLoadConfigurationsByPath.removeValue(forKey: entry.state.root.standardizedFullPath)
+        }
+        for entry in statesToUnload {
+            publishSearchCatalogChangeEvent(WorkspaceSearchCatalogChangeEvent(
+                rootID: entry.rootID,
+                rootPath: entry.state.root.standardizedFullPath,
+                rootLifetimeID: entry.state.lifetimeID,
+                rootAppliedIndexGeneration: appliedIndexGenerationsByRootID[entry.rootID],
+                kind: .rootUnloaded
+            ))
         }
         #if DEBUG
             WorkspaceRestorePerfLog.event(
@@ -17599,7 +17747,13 @@ actor WorkspaceFileContextStore {
                 "eligible file exists on disk but the workspace catalog did not return a record: \(standardizedRelativePath)"
             )
         }
-        if !managedOnly {
+        if managedOnly {
+            retagPublishedRootCatalogShardForProjectionNeutralGeneration(
+                root: state.root,
+                materializedFileID: file.id
+            )
+            publishProjectionNeutralCatalogGenerationChange(root: state.root)
+        } else {
             publishAppliedIndexEvent(
                 root: state.root,
                 upsertedFiles: [file],

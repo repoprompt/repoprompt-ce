@@ -1,92 +1,33 @@
 #!/usr/bin/env python3
-"""Hosted CI app-test runner for RepoPrompt CE.
-
-The GitHub macOS runner executes root XCTest suites one XCTest class at a time.
-This keeps hosted CI bounded without changing stable local validation.
-"""
+"""Deterministic hosted CI runner for RepoPrompt CE XCTest suites."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
-import re
-import signal
 import subprocess
 import sys
-import threading
-import time
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence, TextIO
 
-DEFAULT_SUITE_TIMEOUT_SECONDS = 180.0
-DEFAULT_SILENT_TIMEOUT_RETRIES = 1
-DEFAULT_SILENT_STARTUP_SECONDS = 60.0
-XCTEST_FAILURE_RE = re.compile(r"^.*:\d+(?::\d+)?:\s+error:\s+-\[[^\]]+\]\s+:")
-XCTEST_STARTED_RE = re.compile(r"^Test Case '-\[(?P<test>[^\]]+)\]' started\.$")
-TIMEOUT_EXIT_CODE = 124
 XCTEST_BUNDLE_GLOB = "*.xctest"
-METHOD_ISOLATED_SUITES = frozenset({"RepoPromptTests.WorktreeAPISmokeHarnessTests"})
+CommandExecutor = Callable[[Sequence[str], Path | None, Mapping[str, str]], int]
 
 
 @dataclass(frozen=True)
-class OutputSnapshot:
-    output_seen: bool
-    first_failure_line: str | None
-    last_started_test: str | None
-
-
-@dataclass
-class OutputState:
-    output_seen: threading.Event = field(default_factory=threading.Event)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    first_failure_line: str | None = None
-    last_started_test: str | None = None
-
-    def observe(self, line: str) -> None:
-        self.output_seen.set()
-        started_test = parse_started_test(line)
-        failure_line = line.rstrip("\n") if is_xctest_failure_line(line) else None
-        if started_test is None and failure_line is None:
-            return
-
-        with self.lock:
-            if started_test is not None:
-                self.last_started_test = started_test
-            if failure_line is not None and self.first_failure_line is None:
-                self.first_failure_line = failure_line
-
-    def snapshot(self) -> OutputSnapshot:
-        with self.lock:
-            return OutputSnapshot(
-                output_seen=self.output_seen.is_set(),
-                first_failure_line=self.first_failure_line,
-                last_started_test=self.last_started_test,
-            )
+class ShardSelection:
+    suites: tuple[str, ...]
+    method_loads: tuple[int, ...]
 
 
 @dataclass(frozen=True)
-class SuiteRunResult:
-    suite: str
-    state: str
-    exit_code: int
-    elapsed_seconds: float
-    output_seen: bool
-    first_failure_line: str | None
-    last_started_test: str | None
-    timed_out_after_seconds: float | None
-    attempts: int
-
-
-def is_xctest_failure_line(line: str) -> bool:
-    return XCTEST_FAILURE_RE.match(line.rstrip("\n")) is not None
-
-
-def parse_started_test(line: str) -> str | None:
-    match = XCTEST_STARTED_RE.match(line.rstrip("\n"))
-    if match is None:
-        return None
-    return match.group("test")
+class BundleSelection:
+    package_bundle: Path | None
+    target_bundles: Mapping[str, Path]
+    xctest_binary: tuple[str, ...] | None
 
 
 def parse_suite_methods(list_output: str) -> dict[str, tuple[str, ...]]:
@@ -105,547 +46,18 @@ def parse_suite_methods(list_output: str) -> dict[str, tuple[str, ...]]:
     }
 
 
-def parse_suite_method_counts(list_output: str) -> dict[str, int]:
-    return {
-        suite: len(methods)
-        for suite, methods in parse_suite_methods(list_output).items()
-    }
-
-
-def list_suite_methods(swift_binary: str, cwd: Path | None) -> dict[str, tuple[str, ...]]:
-    listed = subprocess.run(
+def list_suite_methods(
+    swift_binary: str,
+    cwd: Path | None,
+) -> dict[str, tuple[str, ...]]:
+    result = subprocess.run(
         [swift_binary, "test", "list"],
         check=True,
         capture_output=True,
         cwd=cwd,
         text=True,
     )
-    return parse_suite_methods(listed.stdout)
-
-
-def list_suites(swift_binary: str, cwd: Path | None) -> dict[str, int]:
-    return {
-        suite: len(methods)
-        for suite, methods in list_suite_methods(swift_binary, cwd).items()
-    }
-
-
-def discover_test_bundle(
-    swift_binary: str,
-    cwd: Path | None,
-    bundle_name: str | None = None,
-) -> Path | None:
-    """Find the built XCTest bundle so suites can run via ``xcrun xctest`` directly.
-
-    ``swift test --skip-build --filter`` re-resolves the package and re-plans the
-    build on every invocation. On hosted macOS runners that per-invocation
-    overhead can wedge silently before XCTest prints anything, burning the silent
-    startup budget. Running ``xcrun xctest -XCTest <suite> <bundle>`` directly
-    skips swift's process management entirely and starts producing XCTest output
-    immediately.
-
-    Fails if multiple candidate bundles are found and no exact bundle name was
-    requested, since silently picking the first sorted bundle could run suites
-    against the wrong test target.
-    """
-    try:
-        show_bin = subprocess.run(
-            [swift_binary, "build", "--show-bin-path"],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    bin_path = Path(show_bin.stdout.strip())
-    if not bin_path.is_dir():
-        return None
-    candidates = sorted(bin_path.glob(XCTEST_BUNDLE_GLOB))
-    if bundle_name:
-        requested = bundle_name if bundle_name.endswith(".xctest") else f"{bundle_name}.xctest"
-        candidates = [candidate for candidate in candidates if candidate.name == requested]
-    if not candidates:
-        return None
-    if len(candidates) > 1:
-        raise ValueError(
-            f"Multiple XCTest bundles found under {bin_path}; refusing to pick one "
-            f"ambiguously: {[str(c) for c in candidates]}"
-        )
-    return candidates[0]
-
-
-def discover_test_bundles(swift_binary: str, cwd: Path | None) -> dict[str, Path]:
-    """Return built XCTest bundles keyed by SwiftPM test target name."""
-    try:
-        show_bin = subprocess.run(
-            [swift_binary, "build", "--show-bin-path"],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return {}
-    bin_path = Path(show_bin.stdout.strip())
-    if not bin_path.is_dir():
-        return {}
-    return {
-        candidate.name.removesuffix(".xctest"): candidate
-        for candidate in sorted(bin_path.glob(XCTEST_BUNDLE_GLOB))
-    }
-
-
-def package_test_bundle(discovered: dict[str, Path]) -> Path | None:
-    """Return SwiftPM's combined package XCTest bundle when it is unambiguous."""
-    package_bundles = [
-        path
-        for name, path in discovered.items()
-        if name.endswith("PackageTests")
-    ]
-    if len(package_bundles) == 1:
-        return package_bundles[0]
-    return None
-
-
-def target_bundles_for_suites(discovered: dict[str, Path], suites: Sequence[str]) -> dict[str, Path] | None:
-    """Return exact target bundles when every selected suite target is covered.
-
-    Stale bundles from restored SwiftPM caches are ignored; only bundle names
-    matching the currently selected suite targets are routed per-target.
-    """
-    targets = {test_target_for_suite(suite) for suite in suites}
-    matching = {target: discovered[target] for target in sorted(targets) if target in discovered}
-    if targets and set(matching) == targets:
-        return matching
-    return None
-
-
-def test_target_for_suite(suite: str) -> str:
-    return suite.split(".", 1)[0]
-
-
-def bundle_for_suite(suite: str, test_bundles: dict[str, Path] | None) -> Path | None:
-    if not test_bundles:
-        return None
-    return test_bundles.get(test_target_for_suite(suite))
-
-
-def xctest_binary_path() -> list[str]:
-    """Return a command prefix for invoking xctest.
-
-    Prefers the resolved path from ``xcrun --find xctest``. If that fails,
-    falls back to ``["xcrun", "xctest"]`` so the invocation is still
-    ``xcrun xctest -XCTest <suite> <bundle>`` rather than the invalid
-    ``xcrun -XCTest ...``.
-    """
-    try:
-        result = subprocess.run(
-            ["xcrun", "--find", "xctest"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        path = result.stdout.strip()
-        if path:
-            return [path]
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    return ["xcrun", "xctest"]
-
-
-def descendant_process_groups(root_pid: int) -> set[int]:
-    try:
-        process_list = subprocess.run(
-            ["ps", "-axo", "pid=,ppid="],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return set()
-
-    children: dict[int, list[int]] = {}
-    for line in process_list.stdout.splitlines():
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        try:
-            pid = int(parts[0])
-            parent = int(parts[1])
-        except ValueError:
-            continue
-        children.setdefault(parent, []).append(pid)
-
-    pending = [root_pid]
-    process_ids: set[int] = set()
-    while pending:
-        process_id = pending.pop()
-        if process_id in process_ids:
-            continue
-        process_ids.add(process_id)
-        pending.extend(children.get(process_id, []))
-
-    groups: set[int] = set()
-    for process_id in process_ids:
-        try:
-            groups.add(os.getpgid(process_id))
-        except (OSError, PermissionError, ProcessLookupError):
-            pass
-    groups.discard(os.getpgrp())
-    return groups
-
-
-def signal_process_groups(groups: Iterable[int], sent_signal: signal.Signals) -> None:
-    for group in groups:
-        try:
-            os.killpg(group, sent_signal)
-        except (OSError, PermissionError, ProcessLookupError):
-            pass
-
-
-def live_process_groups(groups: Iterable[int]) -> set[int]:
-    live: set[int] = set()
-    for group in groups:
-        try:
-            os.killpg(group, 0)
-        except (OSError, PermissionError, ProcessLookupError):
-            continue
-        live.add(group)
-    return live
-
-
-def process_groups_for_cleanup(root_pid: int, descendant_groups: Iterable[int]) -> set[int]:
-    own_group = os.getpgrp()
-    groups = set(descendant_groups)
-    try:
-        root_group = os.getpgid(root_pid)
-        if root_group != own_group:
-            groups.add(root_group)
-    except (OSError, PermissionError, ProcessLookupError):
-        pass
-    groups.discard(own_group)
-    return groups
-
-
-def stop_process_tree(process: subprocess.Popen[str]) -> None:
-    groups = process_groups_for_cleanup(process.pid, descendant_process_groups(process.pid))
-    signal_process_groups(groups, signal.SIGTERM)
-
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        process.poll()
-        if process.returncode is not None:
-            break
-        groups = live_process_groups(groups)
-        if not groups:
-            break
-        time.sleep(0.1)
-
-    process.poll()
-    if process.returncode is None:
-        signal_process_groups(groups, signal.SIGKILL)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-
-
-def create_suite_process(
-    suite: str,
-    *,
-    swift_binary: str,
-    cwd: Path | None,
-    test_bundle: Path | None = None,
-    xctest_binary: list[str] | None = None,
-) -> subprocess.Popen[str]:
-    if test_bundle is not None:
-        xctest_prefix = xctest_binary if xctest_binary is not None else ["xcrun", "xctest"]
-        return subprocess.Popen(
-            [*xctest_prefix, "-XCTest", suite, str(test_bundle)],
-            cwd=cwd,
-            start_new_session=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-    return subprocess.Popen(
-        [swift_binary, "test", "--skip-build", "--filter", suite],
-        cwd=cwd,
-        start_new_session=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-
-def relay_output(process: subprocess.Popen[str], state: OutputState, output: TextIO) -> None:
-    stream = process.stdout
-    if stream is None:
-        return
-    for line in stream:
-        state.observe(line)
-        output.write(line)
-        output.flush()
-
-
-def run_suite_attempt(
-    suite: str,
-    *,
-    timeout_seconds: float,
-    attempt: int,
-    process_factory: Callable[[str], subprocess.Popen[str]],
-    stop_process_tree_func: Callable[[subprocess.Popen[str]], None] = stop_process_tree,
-    output: TextIO = sys.stdout,
-    poll_interval_seconds: float = 0.1,
-    silent_startup_seconds: float | None = None,
-    cancellation_event: threading.Event | None = None,
-) -> SuiteRunResult:
-    start = time.monotonic()
-    deadline = start + timeout_seconds
-    silent_deadline = start + silent_startup_seconds if silent_startup_seconds is not None else None
-    state = OutputState()
-    process = process_factory(suite)
-    relay = threading.Thread(target=relay_output, args=(process, state, output), daemon=True)
-    relay.start()
-
-    while True:
-        return_code = process.poll()
-        if return_code is not None:
-            relay.join(timeout=10)
-            snapshot = state.snapshot()
-            elapsed = time.monotonic() - start
-            if return_code != 0 or snapshot.first_failure_line is not None:
-                return SuiteRunResult(
-                    suite=suite,
-                    state="failed",
-                    exit_code=return_code if return_code != 0 else 1,
-                    elapsed_seconds=elapsed,
-                    output_seen=snapshot.output_seen,
-                    first_failure_line=snapshot.first_failure_line,
-                    last_started_test=snapshot.last_started_test,
-                    timed_out_after_seconds=None,
-                    attempts=attempt,
-                )
-            return SuiteRunResult(
-                suite=suite,
-                state="passed",
-                exit_code=0,
-                elapsed_seconds=elapsed,
-                output_seen=snapshot.output_seen,
-                first_failure_line=None,
-                last_started_test=snapshot.last_started_test,
-                timed_out_after_seconds=None,
-                attempts=attempt,
-            )
-
-        if cancellation_event is not None and cancellation_event.is_set():
-            stop_process_tree_func(process)
-            relay.join(timeout=10)
-            snapshot = state.snapshot()
-            return SuiteRunResult(
-                suite=suite,
-                state="cancelled",
-                exit_code=130,
-                elapsed_seconds=time.monotonic() - start,
-                output_seen=snapshot.output_seen,
-                first_failure_line=snapshot.first_failure_line,
-                last_started_test=snapshot.last_started_test,
-                timed_out_after_seconds=None,
-                attempts=attempt,
-            )
-
-        now = time.monotonic()
-        # A hosted runner can wedge Swift's cooperative executor before XCTest prints
-        # anything. Kill the silent process early (before the full suite timeout) so the
-        # retry fires sooner instead of burning the whole suite budget on a hung startup.
-        if (
-            silent_deadline is not None
-            and now >= silent_deadline
-            and not state.output_seen.is_set()
-        ):
-            stop_process_tree_func(process)
-            relay.join(timeout=10)
-            snapshot = state.snapshot()
-            elapsed = now - start
-            return SuiteRunResult(
-                suite=suite,
-                state="timed_out",
-                exit_code=TIMEOUT_EXIT_CODE,
-                elapsed_seconds=elapsed,
-                output_seen=snapshot.output_seen,
-                first_failure_line=snapshot.first_failure_line,
-                last_started_test=snapshot.last_started_test,
-                timed_out_after_seconds=elapsed,
-                attempts=attempt,
-            )
-
-        if now >= deadline:
-            stop_process_tree_func(process)
-            relay.join(timeout=10)
-            snapshot = state.snapshot()
-            return SuiteRunResult(
-                suite=suite,
-                state="timed_out",
-                exit_code=TIMEOUT_EXIT_CODE,
-                elapsed_seconds=time.monotonic() - start,
-                output_seen=snapshot.output_seen,
-                first_failure_line=snapshot.first_failure_line,
-                last_started_test=snapshot.last_started_test,
-                timed_out_after_seconds=timeout_seconds,
-                attempts=attempt,
-            )
-
-        time.sleep(min(poll_interval_seconds, max(deadline - time.monotonic(), 0.0)))
-
-
-def run_suite(
-    suite: str,
-    *,
-    timeout_seconds: float,
-    silent_timeout_retries: int,
-    process_factory: Callable[[str], subprocess.Popen[str]],
-    stop_process_tree_func: Callable[[subprocess.Popen[str]], None] = stop_process_tree,
-    output: TextIO = sys.stdout,
-    poll_interval_seconds: float = 0.1,
-    silent_startup_seconds: float | None = None,
-    cancellation_event: threading.Event | None = None,
-) -> SuiteRunResult:
-    max_attempts = silent_timeout_retries + 1
-    for attempt in range(1, max_attempts + 1):
-        result = run_suite_attempt(
-            suite,
-            timeout_seconds=timeout_seconds,
-            attempt=attempt,
-            process_factory=process_factory,
-            stop_process_tree_func=stop_process_tree_func,
-            output=output,
-            poll_interval_seconds=poll_interval_seconds,
-            silent_startup_seconds=silent_startup_seconds,
-            cancellation_event=cancellation_event,
-        )
-        if result.state == "timed_out" and not result.output_seen and attempt < max_attempts:
-            silent_seconds = (
-                silent_startup_seconds if silent_startup_seconds is not None else timeout_seconds
-            )
-            print(
-                f"::warning::{suite} produced no output for {silent_seconds:g}s; "
-                f"retrying once (attempt {attempt + 1}/{max_attempts})",
-                flush=True,
-                file=output,
-            )
-            continue
-        return result
-
-    raise AssertionError("unreachable: suite retry loop did not return")
-
-
-def format_last_started(last_started_test: str | None) -> str:
-    return last_started_test if last_started_test is not None else "unknown"
-
-
-def report_suite_result(result: SuiteRunResult, output: TextIO) -> None:
-    if result.state == "passed":
-        retry_note = f" after {result.attempts} attempts" if result.attempts > 1 else ""
-        print(f"{result.suite} passed in {result.elapsed_seconds:.1f}s{retry_note}", flush=True, file=output)
-        return
-
-    if result.state == "timed_out":
-        print(
-            f"::error::{result.suite} timed out after {result.timed_out_after_seconds:g}s; "
-            f"elapsed={result.elapsed_seconds:.1f}s; "
-            f"last_started_test={format_last_started(result.last_started_test)}; "
-            f"output_seen={str(result.output_seen).lower()}",
-            flush=True,
-            file=output,
-        )
-        return
-
-    if result.state == "cancelled":
-        print(
-            f"::warning::{result.suite} cancelled after another suite failed; "
-            f"elapsed={result.elapsed_seconds:.1f}s; "
-            f"last_started_test={format_last_started(result.last_started_test)}",
-            flush=True,
-            file=output,
-        )
-        return
-
-    if result.first_failure_line is not None:
-        print(
-            f"::error::{result.suite} failed; "
-            f"elapsed={result.elapsed_seconds:.1f}s; "
-            f"last_started_test={format_last_started(result.last_started_test)}",
-            flush=True,
-            file=output,
-        )
-        print(f"First XCTest issue: {result.first_failure_line}", flush=True, file=output)
-        return
-
-    print(
-        f"::error::{result.suite} exited with status {result.exit_code}; "
-        f"elapsed={result.elapsed_seconds:.1f}s; "
-        f"last_started_test={format_last_started(result.last_started_test)}",
-        flush=True,
-        file=output,
-    )
-
-
-def run_and_report_single_suite(
-    suite: str,
-    *,
-    timeout_seconds: float,
-    silent_timeout_retries: int,
-    swift_binary: str,
-    cwd: Path | None,
-    output: TextIO,
-    silent_startup_seconds: float | None,
-    test_bundle: Path | None,
-    test_bundles: dict[str, Path] | None,
-    xctest_binary: list[str] | None,
-) -> SuiteRunResult:
-    selected_bundle = test_bundle if test_bundle is not None else bundle_for_suite(suite, test_bundles)
-    if test_bundles is not None and selected_bundle is None:
-        print(
-            f"::error::No XCTest bundle found for suite target {test_target_for_suite(suite)} "
-            f"while routing {suite}; available bundles: {sorted(test_bundles)}",
-            flush=True,
-            file=output,
-        )
-        return SuiteRunResult(
-            suite=suite,
-            state="failed",
-            exit_code=1,
-            elapsed_seconds=0.0,
-            output_seen=False,
-            first_failure_line=None,
-            last_started_test=None,
-            timed_out_after_seconds=None,
-            attempts=0,
-        )
-
-    print(f"::group::{suite}", flush=True, file=output)
-    process_factory = lambda selected_suite: create_suite_process(  # noqa: E731
-        selected_suite,
-        swift_binary=swift_binary,
-        cwd=cwd,
-        test_bundle=selected_bundle,
-        xctest_binary=xctest_binary,
-    )
-    result = run_suite(
-        suite,
-        timeout_seconds=timeout_seconds,
-        silent_timeout_retries=silent_timeout_retries,
-        process_factory=process_factory,
-        output=output,
-        silent_startup_seconds=silent_startup_seconds,
-    )
-    report_suite_result(result, output)
-    print("::endgroup::", flush=True, file=output)
-    return result
+    return parse_suite_methods(result.stdout)
 
 
 def validate_shard_args(shard_count: int, shard_index: int) -> None:
@@ -658,19 +70,27 @@ def validate_shard_args(shard_count: int, shard_index: int) -> None:
 def assign_suites_to_shards(
     method_counts: Mapping[str, int],
     shard_count: int,
-) -> tuple[list[list[str]], list[int]]:
+) -> tuple[tuple[tuple[str, ...], ...], tuple[int, ...]]:
     if shard_count <= 0:
-        raise ValueError("--shard-count must be greater than zero")
+        raise ValueError("shard_count must be greater than zero")
 
-    shards = [[] for _ in range(shard_count)]
+    shards: list[list[str]] = [[] for _ in range(shard_count)]
     loads = [0 for _ in range(shard_count)]
-    for suite, method_count in sorted(method_counts.items(), key=lambda item: (-item[1], item[0])):
+    ordered_suites = sorted(
+        method_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    for suite, method_count in ordered_suites:
         if method_count <= 0:
             raise ValueError(f"discovered suite {suite} has no test methods")
         shard = min(range(shard_count), key=lambda index: (loads[index], index))
         shards[shard].append(suite)
         loads[shard] += method_count
-    return shards, loads
+
+    return (
+        tuple(tuple(sorted(shard)) for shard in shards),
+        tuple(loads),
+    )
 
 
 def select_shard(
@@ -678,249 +98,302 @@ def select_shard(
     *,
     shard_count: int,
     shard_index: int,
-) -> tuple[list[str], list[int]]:
+) -> ShardSelection:
     validate_shard_args(shard_count, shard_index)
     shards, loads = assign_suites_to_shards(method_counts, shard_count)
-    return shards[shard_index - 1], loads
+    return ShardSelection(shards[shard_index - 1], loads)
 
 
-def run_all_suites(
-    suites: Iterable[str],
-    *,
-    timeout_seconds: float,
-    silent_timeout_retries: int,
+def test_target_for_suite(suite: str) -> str:
+    return suite.split(".", 1)[0]
+
+
+def discover_test_bundles(
     swift_binary: str,
     cwd: Path | None,
-    output: TextIO = sys.stdout,
-    silent_startup_seconds: float | None = None,
-    test_bundle: Path | None = None,
-    test_bundles: dict[str, Path] | None = None,
-    xctest_binary: list[str] | None = None,
-    method_counts: Mapping[str, int] | None = None,
-    suite_methods: Mapping[str, Sequence[str]] | None = None,
-    shard_count: int = 1,
-    shard_index: int = 1,
-) -> int:
-    suite_list = sorted(set(suites))
-    discovered_counts = {
-        suite: (method_counts.get(suite, 1) if method_counts is not None else 1)
-        for suite in suite_list
-    }
+) -> dict[str, Path]:
     try:
-        selected_suites, shard_loads = select_shard(
-            discovered_counts,
-            shard_count=shard_count,
-            shard_index=shard_index,
-        )
-    except ValueError as error:
-        print(f"::error::{error}", flush=True, file=output)
-        return 1
-
-    selected_method_count = sum(discovered_counts[suite] for suite in selected_suites)
-    print(
-        f"Selected app test shard {shard_index}/{shard_count}: "
-        f"{len(selected_suites)} suites, {selected_method_count} methods; "
-        f"all shard method loads={shard_loads}",
-        flush=True,
-        file=output,
-    )
-    if test_bundle is not None:
-        print(f"Using xcrun xctest bundle: {test_bundle}", flush=True, file=output)
-    elif test_bundles:
-        print(
-            f"Using xcrun xctest bundles by suite target: {', '.join(sorted(test_bundles))}",
-            flush=True,
-            file=output,
-        )
-
-    if test_bundle is None and test_bundles is not None:
-        for suite in selected_suites:
-            if bundle_for_suite(suite, test_bundles) is not None:
-                continue
-            print(
-                f"::error::No XCTest bundle found for suite target {test_target_for_suite(suite)} "
-                f"while routing {suite}; available bundles: {sorted(test_bundles)}",
-                flush=True,
-                file=output,
-            )
-            return 1
-
-    execution_units: list[str] = []
-    for suite in selected_suites:
-        if suite not in METHOD_ISOLATED_SUITES:
-            execution_units.append(suite)
-            continue
-        methods = tuple(suite_methods.get(suite, ())) if suite_methods is not None else ()
-        if not methods:
-            print(
-                f"::error::Method-isolated suite {suite} has no discovered methods.",
-                flush=True,
-                file=output,
-            )
-            return 1
-        print(
-            f"Method-isolating {suite}: {len(methods)} fresh XCTest processes",
-            flush=True,
-            file=output,
-        )
-        execution_units.extend(methods)
-
-    passed_results: list[SuiteRunResult] = []
-    failed_results: list[SuiteRunResult] = []
-    for suite in execution_units:
-        result = run_and_report_single_suite(
-            suite,
-            timeout_seconds=timeout_seconds,
-            silent_timeout_retries=silent_timeout_retries,
-            swift_binary=swift_binary,
+        result = subprocess.run(
+            [swift_binary, "build", "--show-bin-path"],
+            check=True,
+            capture_output=True,
             cwd=cwd,
-            output=output,
-            silent_startup_seconds=silent_startup_seconds,
-            test_bundle=test_bundle,
-            test_bundles=test_bundles,
-            xctest_binary=xctest_binary,
+            text=True,
         )
-        if result.state == "cancelled":
-            return result.exit_code
-        if result.state == "passed":
-            passed_results.append(result)
-        else:
-            failed_results.append(result)
+    except (OSError, subprocess.CalledProcessError):
+        return {}
 
-    if passed_results:
-        print("Slowest app test suites:", flush=True, file=output)
-        for result in sorted(
-            passed_results,
-            key=lambda candidate: (-candidate.elapsed_seconds, candidate.suite),
-        )[:10]:
-            print(f"  {result.elapsed_seconds:6.1f}s  {result.suite}", flush=True, file=output)
+    bin_path = Path(result.stdout.strip())
+    if not bin_path.is_dir():
+        return {}
+    return {
+        path.name.removesuffix(".xctest"): path
+        for path in sorted(bin_path.glob(XCTEST_BUNDLE_GLOB))
+    }
 
-    if failed_results:
+
+def package_test_bundle(discovered: Mapping[str, Path]) -> Path | None:
+    matches = [
+        path
+        for name, path in discovered.items()
+        if name.endswith("PackageTests")
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def target_bundles_for_suites(
+    discovered: Mapping[str, Path],
+    suites: Iterable[str],
+) -> dict[str, Path]:
+    targets = {test_target_for_suite(suite) for suite in suites}
+    return {
+        target: discovered[target]
+        for target in sorted(targets)
+        if target in discovered
+    }
+
+
+def xctest_binary_path() -> tuple[str, ...]:
+    try:
+        result = subprocess.run(
+            ["xcrun", "--find", "xctest"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        path = result.stdout.strip()
+        if path:
+            return (path,)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return ("xcrun", "xctest")
+
+
+def resolve_bundle_selection(
+    *,
+    swift_binary: str,
+    cwd: Path | None,
+    suites: Sequence[str],
+) -> BundleSelection:
+    discovered = discover_test_bundles(swift_binary, cwd)
+    if not discovered:
+        return BundleSelection(None, {}, None)
+    if len(discovered) == 1:
+        return BundleSelection(next(iter(discovered.values())), {}, xctest_binary_path())
+
+    package_bundle = package_test_bundle(discovered)
+    if package_bundle is not None:
+        return BundleSelection(package_bundle, {}, xctest_binary_path())
+
+    target_bundles = target_bundles_for_suites(discovered, suites)
+    missing_targets = sorted(
+        {
+            test_target_for_suite(suite)
+            for suite in suites
+            if test_target_for_suite(suite) not in target_bundles
+        }
+    )
+    if missing_targets:
+        raise ValueError(
+            f"missing XCTest bundles for selected targets: {missing_targets}; "
+            f"available bundles: {sorted(discovered)}"
+        )
+    return BundleSelection(None, target_bundles, xctest_binary_path())
+
+
+def bundle_for_suite(
+    suite: str,
+    selection: BundleSelection,
+) -> Path | None:
+    if selection.package_bundle is not None:
+        return selection.package_bundle
+    return selection.target_bundles.get(test_target_for_suite(suite))
+
+
+def command_for_suite(
+    suite: str,
+    *,
+    swift_binary: str,
+    bundle_selection: BundleSelection,
+) -> tuple[str, ...]:
+    bundle = bundle_for_suite(suite, bundle_selection)
+    if bundle is not None:
+        xctest_binary = bundle_selection.xctest_binary or ("xcrun", "xctest")
+        return (*xctest_binary, "-XCTest", suite, str(bundle))
+    return (swift_binary, "test", "--skip-build", "--filter", suite)
+
+
+def isolated_suite_environment(
+    sandbox_root: Path,
+    suite: str,
+    base_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    digest = hashlib.sha256(suite.encode("utf-8")).hexdigest()[:16]
+    suite_root = sandbox_root / digest
+    home = suite_root / "home"
+    temporary = suite_root / "tmp"
+    config = suite_root / "config"
+    cache = suite_root / "cache"
+    data = suite_root / "data"
+    for directory in (home, temporary, config, cache, data):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    environment = dict(base_environment or os.environ)
+    environment.update(
+        {
+            "HOME": str(home),
+            "CFFIXED_USER_HOME": str(home),
+            "TMPDIR": str(temporary),
+            "TMP": str(temporary),
+            "TEMP": str(temporary),
+            "XDG_CONFIG_HOME": str(config),
+            "XDG_CACHE_HOME": str(cache),
+            "XDG_DATA_HOME": str(data),
+            "REPOPROMPT_TEST_SANDBOX_ROOT": str(suite_root),
+            "NSUnbufferedIO": "YES",
+        }
+    )
+    return environment
+
+
+def execute_command(
+    command: Sequence[str],
+    cwd: Path | None,
+    environment: Mapping[str, str],
+) -> int:
+    try:
+        return subprocess.run(
+            list(command),
+            check=False,
+            cwd=cwd,
+            env=dict(environment),
+        ).returncode
+    except OSError as error:
+        print(f"Unable to launch {command[0]}: {error}", file=sys.stderr)
+        return 127
+
+
+def run_selected_suites(
+    suites: Sequence[str],
+    *,
+    swift_binary: str,
+    cwd: Path | None,
+    bundle_selection: BundleSelection,
+    sandbox_root: Path,
+    executor: CommandExecutor = execute_command,
+    output: TextIO = sys.stdout,
+) -> int:
+    for suite in suites:
+        command = command_for_suite(
+            suite,
+            swift_binary=swift_binary,
+            bundle_selection=bundle_selection,
+        )
+        environment = isolated_suite_environment(sandbox_root, suite)
+        print(f"::group::{suite}", file=output, flush=True)
+        print(f"sandbox={environment['REPOPROMPT_TEST_SANDBOX_ROOT']}", file=output)
+        return_code = executor(command, cwd, environment)
+        print("::endgroup::", file=output, flush=True)
+
+        if return_code == 0:
+            continue
         print(
-            f"::error::App test shard {shard_index}/{shard_count} completed with "
-            f"{len(failed_results)} failed suite(s).",
-            flush=True,
+            f"::error::{suite} failed with exit status {return_code}",
             file=output,
+            flush=True,
         )
-        print("Failed app test suites:", flush=True, file=output)
-        for result in failed_results:
-            print(
-                f"  {result.suite}: {result.state} "
-                f"(exit={result.exit_code}, elapsed={result.elapsed_seconds:.1f}s)",
-                flush=True,
-                file=output,
-            )
-        return 1
+        return return_code or 1
     return 0
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run RepoPrompt CE app XCTest suites for hosted CI.")
-    parser.add_argument("--suite-timeout-seconds", type=float, default=DEFAULT_SUITE_TIMEOUT_SECONDS)
-    parser.add_argument("--silent-timeout-retries", type=int, default=DEFAULT_SILENT_TIMEOUT_RETRIES)
-    parser.add_argument(
-        "--silent-startup-seconds",
-        type=float,
-        default=DEFAULT_SILENT_STARTUP_SECONDS,
-        help="Kill and retry a suite that produces no output within this many seconds, "
-        "instead of waiting the full suite timeout.",
+def print_selection_summary(
+    *,
+    selection: ShardSelection,
+    suite_methods: Mapping[str, Sequence[str]],
+    shard_count: int,
+    shard_index: int,
+    output: TextIO,
+) -> None:
+    method_count = sum(len(suite_methods[suite]) for suite in selection.suites)
+    print(
+        f"Selected test shard {shard_index}/{shard_count}: "
+        f"{len(selection.suites)} suites, {method_count} methods; "
+        f"all shard method loads={list(selection.method_loads)}",
+        file=output,
+    )
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run deterministic RepoPrompt CE XCTest suites."
     )
     parser.add_argument("--swift-binary", default="swift")
     parser.add_argument("--cwd", type=Path, default=None)
-    parser.add_argument(
-        "--test-bundle",
-        type=Path,
-        default=None,
-        help="Path to the built .xctest bundle. When provided, suites run via "
-        "xcrun xctest directly instead of swift test --skip-build --filter, "
-        "avoiding swift's per-invocation package resolution overhead.",
-    )
-    parser.add_argument(
-        "--test-bundle-name",
-        default=None,
-        help="Exact built .xctest bundle name to auto-select when multiple bundles exist, "
-        "for example RepoPromptTests.xctest.",
-    )
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=1)
-    parser.add_argument(
-        "--no-xctest-bundle",
-        action="store_true",
-        default=False,
-        help="Disable automatic test bundle discovery and force swift test --filter.",
-    )
     return parser.parse_args(argv)
 
 
-def main(argv: list[str]) -> int:
+def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     try:
+        validate_shard_args(args.shard_count, args.shard_index)
         suite_methods = list_suite_methods(args.swift_binary, args.cwd)
-        method_counts = {suite: len(methods) for suite, methods in suite_methods.items()}
+    except ValueError as error:
+        print(f"::error::{error}")
+        return 2
     except subprocess.CalledProcessError as error:
-        print(f"::error::swift test list failed with status {error.returncode}", flush=True)
+        print(f"::error::swift test list failed with status {error.returncode}")
         if error.stdout:
             print(error.stdout, end="")
         if error.stderr:
             print(error.stderr, end="", file=sys.stderr)
-        return error.returncode
+        return error.returncode or 1
 
-    suites = list(method_counts)
+    selected_suites = tuple(sorted(suite_methods))
+    method_counts = {
+        suite: len(suite_methods[suite])
+        for suite in selected_suites
+    }
     try:
-        validate_shard_args(args.shard_count, args.shard_index)
+        selection = select_shard(
+            method_counts,
+            shard_count=args.shard_count,
+            shard_index=args.shard_index,
+        )
     except ValueError as error:
-        print(f"::error::{error}", flush=True)
-        return 1
+        print(f"::error::{error}")
+        return 2
 
-    test_bundle = args.test_bundle
-    test_bundles: dict[str, Path] | None = None
-    if test_bundle is None and not args.no_xctest_bundle:
-        if args.test_bundle_name:
-            requested_target = args.test_bundle_name.removesuffix(".xctest")
-            mismatched = [suite for suite in suites if test_target_for_suite(suite) != requested_target]
-            if mismatched:
-                print(
-                    f"::error::--test-bundle-name {args.test_bundle_name} cannot run suites "
-                    f"from other targets: {mismatched[:5]}",
-                    flush=True,
-                )
-                return 1
-            test_bundle = discover_test_bundle(args.swift_binary, args.cwd, args.test_bundle_name)
-            if test_bundle is None:
-                print(
-                    f"::error::--test-bundle-name {args.test_bundle_name} did not match any built XCTest bundle",
-                    flush=True,
-                )
-                return 1
-        else:
-            discovered = discover_test_bundles(args.swift_binary, args.cwd)
-            if len(discovered) == 1:
-                test_bundle = next(iter(discovered.values()))
-            elif discovered:
-                test_bundle = package_test_bundle(discovered)
-                if test_bundle is None:
-                    test_bundles = target_bundles_for_suites(discovered, suites)
-                if test_bundle is None and test_bundles is None:
-                    test_bundles = discovered
-    xctest_binary = xctest_binary_path() if test_bundle is not None or test_bundles else None
-
-    return run_all_suites(
-        suites,
-        timeout_seconds=args.suite_timeout_seconds,
-        silent_timeout_retries=args.silent_timeout_retries,
-        swift_binary=args.swift_binary,
-        cwd=args.cwd,
-        output=sys.stdout,
-        silent_startup_seconds=args.silent_startup_seconds,
-        test_bundle=test_bundle,
-        test_bundles=test_bundles,
-        xctest_binary=xctest_binary,
-        method_counts=method_counts,
+    print_selection_summary(
+        selection=selection,
         suite_methods=suite_methods,
         shard_count=args.shard_count,
         shard_index=args.shard_index,
+        output=sys.stdout,
     )
+    if not selection.suites:
+        return 0
+
+    try:
+        bundle_selection = resolve_bundle_selection(
+            swift_binary=args.swift_binary,
+            cwd=args.cwd,
+            suites=selection.suites,
+        )
+    except ValueError as error:
+        print(f"::error::{error}")
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="rpce-tests-") as directory:
+        return run_selected_suites(
+            selection.suites,
+            swift_binary=args.swift_binary,
+            cwd=args.cwd,
+            bundle_selection=bundle_selection,
+            sandbox_root=Path(directory),
+        )
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:]))

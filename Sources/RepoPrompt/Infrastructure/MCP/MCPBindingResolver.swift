@@ -35,7 +35,7 @@ struct MCPBindingResolver {
         }
     }
 
-    let collectMatchesForContextID: (UUID) async -> [MCPContextBindingMatch]
+    let collectMatchesForContextID: (UUID, UUID) async -> [MCPContextBindingMatch]
     let collectMatchesForWorkingDirs: ([String]) async -> [MCPContextBindingMatch]
     let collectActiveMatchForWindowID: (Int) async -> MCPContextBindingMatch?
     let existingWindowIDForConnection: (UUID) async -> Int?
@@ -87,10 +87,10 @@ struct MCPBindingResolver {
         let matches: [MCPContextBindingMatch]
         if let explicitContextID {
             sourceDescription = "context_id '\(explicitContextID.uuidString)'"
-            matches = await collectMatchesForContextID(explicitContextID)
+            matches = await collectMatchesForContextID(connectionID, explicitContextID)
         } else if let legacyTabID {
             sourceDescription = "_tabID '\(legacyTabID.uuidString)'"
-            matches = await collectMatchesForContextID(legacyTabID)
+            matches = await collectMatchesForContextID(connectionID, legacyTabID)
         } else if !workingDirs.isEmpty {
             sourceDescription = "working_dirs [\(workingDirs.joined(separator: ", "))]"
             matches = await collectMatchesForWorkingDirs(workingDirs)

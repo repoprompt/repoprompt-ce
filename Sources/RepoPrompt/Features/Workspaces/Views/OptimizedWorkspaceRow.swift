@@ -3,7 +3,7 @@ import SwiftUI
 /// Optimized workspace row that minimizes re-renders
 struct OptimizedWorkspaceRow: View {
     let workspace: WorkspaceModel
-    let onSwitch: () -> Void
+    let onSwitch: (() -> Void)?
     let onRename: () -> Void
     let onToggleHidden: () -> Void
     let onDelete: () -> Void
@@ -22,12 +22,14 @@ struct OptimizedWorkspaceRow: View {
 
                 Spacer()
 
-                // Switch to workspace
-                Button(action: onSwitch) {
-                    Image(systemName: "arrow.right.circle")
+                if let onSwitch {
+                    // Switch to workspace
+                    Button(action: onSwitch) {
+                        Image(systemName: "arrow.right.circle")
+                    }
+                    .buttonStyle(CustomButtonStyle())
+                    .hoverTooltip("Switch to workspace")
                 }
-                .buttonStyle(CustomButtonStyle())
-                .hoverTooltip("Switch to workspace")
 
                 // Rename
                 Button(action: onRename) {

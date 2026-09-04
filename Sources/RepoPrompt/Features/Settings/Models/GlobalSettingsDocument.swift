@@ -593,6 +593,10 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var codexGoalSupportEnabled: Bool?
         var codexReasoningSummariesEnabled: Bool?
         var codexMemoriesEnabled: Bool?
+        var codexAppsEnabled: Bool?
+        var codexPluginsEnabled: Bool?
+        var codexMCPElicitationEnabled: Bool?
+        var codexToolSuggestionsEnabled: Bool?
         var codexHookApprovalStrictModeEnabled: Bool?
         var codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]?
         var providerConversationCleanupAction: String?
@@ -610,6 +614,10 @@ struct GlobalScalarPreferences: Codable, Equatable {
             codexGoalSupportEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
             codexMemoriesEnabled: Bool? = nil,
+            codexAppsEnabled: Bool? = nil,
+            codexPluginsEnabled: Bool? = nil,
+            codexMCPElicitationEnabled: Bool? = nil,
+            codexToolSuggestionsEnabled: Bool? = nil,
             codexHookApprovalStrictModeEnabled: Bool? = nil,
             codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]? = nil,
             providerConversationCleanupAction: String? = nil,
@@ -626,6 +634,10 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
             self.codexMemoriesEnabled = codexMemoriesEnabled
+            self.codexAppsEnabled = codexAppsEnabled
+            self.codexPluginsEnabled = codexPluginsEnabled
+            self.codexMCPElicitationEnabled = codexMCPElicitationEnabled
+            self.codexToolSuggestionsEnabled = codexToolSuggestionsEnabled
             self.codexHookApprovalStrictModeEnabled = codexHookApprovalStrictModeEnabled
             self.codexHookApprovalStrictModeWorkspaceOverrides = codexHookApprovalStrictModeWorkspaceOverrides
             self.providerConversationCleanupAction = providerConversationCleanupAction

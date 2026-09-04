@@ -88,7 +88,7 @@ enum FileContentFingerprintReader {
         #endif
 
         return FileContentFingerprint(
-            deviceID: UInt64(info.st_dev),
+            deviceID: safeDeviceID(info.st_dev),
             fileNumber: UInt64(info.st_ino),
             byteSize: Int64(info.st_size),
             modificationSeconds: Int64(modificationTime.tv_sec),

@@ -47,7 +47,7 @@ struct WorkspaceCodemapPathFingerprintClient {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         return GitBlobLStatFingerprint(
-            device: UInt64(value.st_dev),
+            device: safeDeviceID(value.st_dev),
             inode: UInt64(value.st_ino),
             mode: UInt16(value.st_mode),
             size: Int64(value.st_size),

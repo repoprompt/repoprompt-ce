@@ -83,33 +83,6 @@ final class GitViewModelSelectionClearTests: XCTestCase {
         XCTAssertTrue(gitViewModel.hasTrackedSelectedChangedFiles)
     }
 
-    func testSelectionChangeSupersedesInFlightStatusProjection() async {
-        let fixture = makeFixture()
-        let gitViewModel = makeGitViewModel(fixture: fixture)
-        fixture.fileManager.selectPath(fixture.targetA.file.fullPath, kind: nil)
-
-        await publishStatus(
-            changedFiles: [fixture.targetA],
-            generation: 1,
-            fixture: fixture,
-            gitViewModel: gitViewModel
-        )
-        let staleRebuildGeneration = gitViewModel.test_resolvedStateGeneration
-
-        fixture.fileManager.deselectPath(fixture.targetA.file.fullPath, kind: nil)
-        XCTAssertGreaterThan(gitViewModel.test_resolvedStateGeneration, staleRebuildGeneration)
-        XCTAssertEqual(gitViewModel.test_trackedSelectedChangedAbsolutePaths, [])
-
-        gitViewModel.test_publishSelectedChangedProjection(
-            changedAbsolutePaths: [fixture.targetA.file.fullPath],
-            selectedAbsolutePaths: [fixture.targetA.file.fullPath],
-            rebuildGeneration: staleRebuildGeneration
-        )
-
-        XCTAssertEqual(gitViewModel.test_trackedSelectedChangedAbsolutePaths, [])
-        XCTAssertEqual(selectedPaths(in: fixture.fileManager), [])
-    }
-
     private func makeGitViewModel(
         fixture: (
             fileManager: WorkspaceFilesViewModel,

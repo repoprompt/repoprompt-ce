@@ -43,11 +43,11 @@ the closed app's version history.
 
 ## Bundled Codex artifact
 
-Debug and release packaging include the complete official OpenAI Codex 0.147.0
+Debug and release packaging include the complete official OpenAI Codex 0.149.0
 standalone package. The authority is the repository-owned
 [`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
-official [`rust-v0.147.0` release](https://github.com/openai/codex/releases/tag/rust-v0.147.0),
-the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-package_SHA256SUMS),
+official [`rust-v0.149.0` release](https://github.com/openai/codex/releases/tag/rust-v0.149.0),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.149.0/codex-package_SHA256SUMS),
 both macOS package assets, their complete extracted layouts, file hashes,
 architectures, and primary executable signing identities. The upstream release
 publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
@@ -98,7 +98,7 @@ rejects this policy, stop rather than silently re-signing the upstream payload.
 The bundled package is RepoPrompt's default Codex runtime authority; runtime
 selection never falls through to the user's shell `PATH`. Advanced users may set
 one explicit absolute external override with `REPOPROMPT_CODEX_EXECUTABLE`.
-RepoPrompt rejects overrides older than 0.147.0, matching the bundled runtime and
+RepoPrompt rejects overrides older than 0.149.0, matching the bundled runtime and
 the documented app-server contract floor. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
@@ -124,7 +124,7 @@ To diagnose acquisition independently of a build, run:
 python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
-  --package .build/codex-runtime/0.147.0/aarch64-apple-darwin
+  --package .build/codex-runtime/0.149.0/aarch64-apple-darwin
 python3 Scripts/codex_runtime_artifact.py stage-bundle \
   --arch all \
   --cache-root .build/codex-runtime \
@@ -146,8 +146,8 @@ does not edit or replace `Vendor/Codex/manifest.json`. Select exactly one explic
 stable version/tag, or opt in explicitly to GitHub's latest stable release:
 
 ```bash
-make codex-update-candidate CODEX_CANDIDATE_VERSION=0.148.0
-make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.148.0
+make codex-update-candidate CODEX_CANDIDATE_VERSION=0.150.0
+make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.150.0
 make codex-update-candidate CODEX_CANDIDATE_LATEST=1
 ```
 
@@ -169,13 +169,13 @@ inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
 The official output directory contains a proposed `candidate-manifest.json`,
 `candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
 checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
-0.147.0 pin remains authoritative
+0.149.0 pin remains authoritative
 until a maintainer reviews and deliberately applies a complete rotation change.
 
-The known-good rollback for the 0.147.0 rotation is verified Codex 0.145.0
-(`rust-v0.145.0`; arm64 package archive SHA-256
-`ece937169d4c9e910d60826a6ea4ae7848a16c089403d122e70e7da4ac41ba34`, x86_64
-package archive SHA-256 `9d402c9ca814655fddc07b548d7086491c0afcebe1f746cdeba1045fd6f62646`).
+The known-good rollback for the 0.149.0 rotation is verified Codex 0.147.0
+(`rust-v0.147.0`; arm64 package archive SHA-256
+`17b2984eb22b607e3d0c25728252fc90f510e476bad39a6d9f45cdb1aa685432`, x86_64
+package archive SHA-256 `d91e59133daf923bc45d76e3da4af8ae9ef62a0231da18488da0cd573b6e9d63`).
 After a reviewed rotation, roll back by reverting the complete rotation change and
 rebuilding from the restored manifest rather than mixing old and new authority files.
 
@@ -235,46 +235,122 @@ Stable: https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/down
 Tip:    https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/latest/download/appcast.xml
 ```
 
-The initial Tip channel shares the CE Sparkle EdDSA key and Developer ID identity
-with stable releases, but it publishes only to the separate tip update
-repository. Tip workflows must never write to `repoprompt-ce-updates`, must not
-use `v*` tags, and must not feed into `Promote Release`. Stable promotion remains
-the only path that updates the stable appcast.
+The Tip channel uses the same CE Sparkle EdDSA key and the same application/feed contract as
+stable, but publishes only to the separate tip update repository. It is currently the controlled
+`P → T → S` identity-transition rehearsal:
 
-`Publish Tip` runs after successful CI on `main` and can also be dispatched
-manually. It stages the tip source without secrets, signs and notarizes without
-executing packaged app/helper code, runs the PR #441 hardened packaged smoke on a
-fresh no-secret runner, then publishes a normal GitHub release in the dedicated
-tip update repository using an immutable tag shaped like `tip-<shortsha>`. The
-release is marked latest inside the tip-only repository so GitHub's
-`releases/latest/download/appcast.xml` URL resolves for opted-in clients. Do not
-mark the tip release as a prerelease: GitHub excludes prereleases from
-`releases/latest`.
+| Role | Application identity | Artifact | Feed contents |
+| --- | --- | --- | --- |
+| P / `preparer` | Legacy | ZIP, `legacy-preparer` phase | P only |
+| T / `transition` | Successor | Notarized successor-Installer-signed PKG | T and retained P |
+| S / `successor` | Successor | Notarized ZIP/DMG | S, retained T, and retained P |
 
-Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow
-reads the currently published stable appcast and combines that stable build with
-the source commit count. For example, commit sequence `795` on stable build `28`
-becomes Tip build `28.7.95`: it is newer than stable `28`, while stable `29`
-still supersedes it. This keeps Stable and Tip in one monotonic Sparkle version
-space without forcing stable releases to adopt repository-sized build numbers.
-The source commit count must remain at or below `9999`; replace this encoding
-before the repository reaches that limit.
+`tip-rollout.json` is the checked-in authority for the current role, expected identity, migration
+phase, predecessor manifest digests, and any schema-2 reset authority. Every role uses the same Tip
+feed URL and `appcast.xml` asset, with retained top-level entries in that appcast; there are no
+transition/successor sibling feeds and no Sparkle-key change. Tip workflows must never write to
+`repoprompt-ce-updates` or use `v*` tags, and must not feed into `Promote Release`. Stable promotion
+remains the only path that updates the stable appcast.
 
-The workflow uses GitHub concurrency to allow one active and one pending run.
-New successful `main` runs replace an older pending run while an active signing
-or notarization run finishes. Before compiling, it uses the workflow's read-only
-`github.token` to check for a complete release for the immutable `tip-<shortsha>`
-tag and skips an already-published commit. The protected update-repository token
-remains confined to the publishing job.
+`Publish Tip` runs automatically after successful CI on protected `main`. Every checked-in rollout
+role follows the complete build, sign, notarize, smoke, and publish path; a role changes the artifact
+and identity policy but never suppresses the release or produces a successful no-publication run.
+Manual dispatch remains a recovery path and takes no operator-supplied release inputs. It derives the
+rollout role and identity policy from the checked-in declaration on protected `main`.
 
-Configure a protected GitHub Actions environment named `tip-release`. It can use
-the same Developer ID, provisioning, notarization, and Sparkle secrets as stable
-initially, but it needs a separate `TIP_UPDATE_REPOSITORY_TOKEN` scoped only to
-the tip update repository. Optionally set repository variable
-`TIP_UPDATE_REPOSITORY`; it defaults to `repoprompt/repoprompt-ce-tip-updates`.
-The publishing script fails closed if this variable points at the source repo or
-the stable update repo. Tip artifacts also include a small `*-metadata.json` asset
-recording the source commit, immutable tag, marketing version, and build number.
+There is deliberately no commit input. For a manual dispatch, GitHub's selected `main` ref and
+`github.sha` are the immutable candidate. Setup fetches protected `origin/main` and requires the
+candidate commit, workflow-definition commit, and checked-out release tooling to be that exact live
+commit. A stale browser tab therefore cannot publish an older main commit merely because somebody
+pasted a convincing SHA into a text box. Before the secret-free build, the protected role-aware
+credential preflight runs the same authenticated protected-main verifier used at publication
+mutation boundaries. Source reads use the workflow's source-repository token; the separate Tip
+updater token is reserved for updater-repository reads and writes. The signing preflight uses an
+isolated ephemeral keychain without changing the runner user's keychain search list.
+
+After P is reviewed, advance `tip-rollout.json` with its exact `identity-rollout.json` digest before
+merging T; advance it again with T and P digests before merging S. Each published role uses an
+immutable `tip-<shortsha>` tag and the tip-only repository's latest release. Do not mark it as a
+prerelease, because GitHub excludes prereleases from `releases/latest`.
+
+Current checkpoint: Stable 1.4.0 is the official Stable epoch at build `36`. The authenticated live Tip
+is transition tag `tip-57b572038048`, build `35.15.39`, with rollout-manifest SHA-256
+`c8d28103b5e95370fc0de7df19c34797552e99803228794754bfbfe292e3e421`; it retains preparer
+`tip-2f94412e6ab5` at build `35.15.18`, whose rollout-manifest SHA-256 is
+`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. That retained P is below
+Stable 36, so it cannot safely authorize a transition. The checked-in Tip declaration is schema 2
+and carries the sole explicit `resetAuthority` for this exact live transition, retained P, and Stable
+epoch. `stable_rollout.py` rejects the T -> P regression unless every recorded tag, manifest digest,
+retained-P fact, and Stable epoch fact matches the authenticated public files; no missing, mismatched,
+or tampered reset data can act as a procedural bypass. The replacement P must also be newer than both
+live Tip `35.15.39` and Stable `36` (the next Tip encoding begins at `36.0.x`). After P is published,
+clear the reset authority and advance the declaration with P's exact manifest digest before merging T.
+Protected-main review of the rollout declaration is the release authorization boundary: after CI passes,
+Tip publication is automatic. Do not merge a T or S declaration until the isolated runtime proof is
+approved, including lost-journal recovery and a fresh-successor-install policy.
+
+Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow reads the published
+stable appcast and combines that stable build with the source commit count. For example, commit
+sequence `795` on stable build `28` becomes Tip build `28.7.95`: it is newer than stable `28`, while
+stable `29` still supersedes it. The source commit count must remain at or below `9999`; replace this
+encoding before the repository reaches that limit.
+
+During T and S, that normal Stable supersession must be deliberately paused: setup and the final
+publisher require the greatest Stable build to remain strictly below the retained P build. Advancing
+Stable to the next integer first would make an unprepared Stable client appear new enough to satisfy
+T's `sparkle:minimumUpdateVersion`, bypassing the credential preparer.
+
+Automatic and manual runs use separate rolling concurrency lanes. Each lane keeps at most one
+queued run and does not cancel in-flight release work; publication remains serialized across both
+lanes by `main-tip-publish`. A retry therefore resumes or audits one exact draft instead of abandoning
+a different tag halfway through publication. Setup and credential preflight require the candidate to
+be the exact protected-main head before expensive work starts. If `main` advances while that work is
+running, publication may finish only while the candidate remains in authenticated protected-main
+ancestry. The monotonic build and rollout-progression checks still reject an older candidate when a
+newer Tip has already become public, while the newest queued run converges the feed on current `main`.
+
+Remote mutation is confined to that protected publication job. Immediately before draft creation
+and again immediately before making a draft public, it proves the candidate is still on live
+protected-main ancestry, downloads the public Tip manifest/appcast, proves that the candidate either
+rolls the current role or advances one step through `P → T → S` with exact retained history, and
+audits every retained enclosure against GitHub's published size and SHA-256. Rolling P retains no
+predecessor, rolling T retains the exact authenticated P, and rolling S retains the exact authenticated
+T and P. Draft creation consumes and validates GitHub's synchronous release response so publication
+does not depend on the new draft immediately appearing in paginated list results. Existing drafts are
+resumed only when their metadata and uploaded bytes exactly match;
+missing assets are added without overwriting anything. After publication, every public asset is
+downloaded anonymously and compared byte-for-byte with the signed local inventory, and the release
+must be the repository's latest. The update-repository token is not available to setup, staging, or
+smoke jobs.
+
+Configure protected GitHub Actions environments named `release` and `tip-release`, with maintainer
+approval and protected-branch restrictions. Before the rehearsal, store this one-time identity
+inventory in both environments:
+
+| Material | Legacy/preparer selection | Transition/successor selection |
+| --- | --- | --- |
+| Application P12/password | `DEVELOPER_ID_APPLICATION_P12_BASE64` / `DEVELOPER_ID_APPLICATION_P12_PASSWORD` | `SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64` / `SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD` |
+| Provisioning profile | `REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64` | `SUCCESSOR_REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64` |
+| Notarytool private key/key ID/issuer | `NOTARYTOOL_PRIVATE_KEY_BASE64` / `NOTARYTOOL_KEY_ID` / `NOTARYTOOL_ISSUER_ID` | `SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64` / `SUCCESSOR_NOTARYTOOL_KEY_ID` / `SUCCESSOR_NOTARYTOOL_ISSUER_ID` |
+| Transition Installer P12/password | not used | `SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64` / `SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_PASSWORD` |
+
+Also retain `CI_KEYCHAIN_PASSWORD`, `SPARKLE_PRIVATE_KEY`, the Sentry credentials/configuration,
+and the environment-specific update-repository token. The workflows derive application and Installer
+identity labels from `Scripts/apple_identity_policy.json` through `stable_rollout.py
+packaging-context`; do not configure `SIGN_IDENTITY`, `SUCCESSOR_SIGN_IDENTITY`, or an installer-name
+alias as a second authority. The Tip publishing script fails closed if `TIP_UPDATE_REPOSITORY`
+points at the source or stable update repository. Tip artifacts also include a small
+`*-metadata.json` asset recording the source commit, immutable tag, marketing version, and build
+number.
+
+For application enclosures, the signing job retains the explicit application contract: it submits a
+temporary ZIP to notarize the signed app, staples and validates that app, then separately submits,
+staples, and validates the DMG. For a transition package, it signs and validates the embedded app
+without creating that temporary notarization ZIP. The job then exposes separate timed **Build
+package**, **Submit package notarization**, **Staple package**, and **Validate package** steps; the
+final Installer-signed PKG is the only Apple submission in package mode. Every submission prints its
+Apple submission ID. A failed or non-accepted submission with an ID automatically retrieves its
+`notarytool log` before the step fails.
 
 Tip builds use the same Sentry-linked binary and symbolication policy as stable
 releases. The secret-free stage enables Sentry linking and carries release dSYMs
@@ -542,19 +618,11 @@ Sentry event detail:
 Relaunch the app once without the argument so the SDK can flush the cached native
 crash report.
 
-The optional `SIGN_IDENTITY` environment variable defaults to:
-
-```text
-Developer ID Application: Eric Provencher (648A27MST5)
-```
-
-The provisioning profile must authorize:
-
-```text
-648A27MST5.com.pvncher.repoprompt.ce
-```
-
-The release script validates that identifier before signing.
+Official workflows do not take an application or Installer identity label from a GitHub Actions
+string variable. They derive the expected labels from `Scripts/apple_identity_policy.json` through
+`stable_rollout.py packaging-context`, then validate the imported identity in the ephemeral keychain
+before signing. The selected provisioning profile must match the role-selected bundle/team pair; the
+release tooling validates that identifier before signing.
 
 `PUBLIC_UPDATE_REPOSITORY_TOKEN` is intentionally separate from the workflow's
 source-repository `github.token`. Keep its repository scope narrow: the

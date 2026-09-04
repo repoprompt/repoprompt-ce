@@ -35,7 +35,6 @@ docs/designs/
 docs/references/
 docs/reviews/
 docs/plans/*
-!docs/plans/test-coverage-value-audit-2026-05-29.md
 
 # Python cache artifacts
 __pycache__/

@@ -10,7 +10,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.3.0"
+let CLI_VERSION = "1.4.0"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -2553,8 +2553,8 @@ private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
 }
 
 /// Parses command line arguments to determine CLI mode
-func parseCLIMode() -> CLIMode {
-    let args = CommandLine.arguments.dropFirst() // Skip executable name
+func parseCLIMode(arguments: [String] = CommandLine.arguments) -> CLIMode {
+    let args = arguments.dropFirst() // Skip executable name
     var hasNonBackendUserArgs = false
     if args.first == "policy" {
         return .policyAdministration(Array(args.dropFirst()))
@@ -2797,12 +2797,14 @@ func parseCLIMode() -> CLIMode {
         case "--tab", "-t":
             i = args.index(after: i)
             if i < args.endIndex {
+                interactiveOptions.tabID = args[i]
                 execOptions.tabID = args[i]
             }
 
         case "--context-id":
             i = args.index(after: i)
             if i < args.endIndex {
+                interactiveOptions.contextID = args[i]
                 execOptions.contextID = args[i]
             }
 
@@ -3424,7 +3426,7 @@ func printVersion() {
     print("\(cliDisplayCommand()) (repoprompt-mcp) \(CLI_VERSION)")
 }
 
-private let repoPromptCEReleaseBundleIdentifier = "com.pvncher.repoprompt.ce"
+private let repoPromptCEReleaseBundleIdentifier = "com.repoprompt.ce"
 private let repoPromptCEDebugBundleIdentifier = "com.pvncher.repoprompt.ce.debug"
 private let repoPromptCEBundleIdentifier: String = {
     #if DEBUG

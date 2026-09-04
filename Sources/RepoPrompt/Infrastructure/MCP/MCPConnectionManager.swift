@@ -6502,10 +6502,40 @@ actor ServerNetworkManager {
 
     private var bindingResolver: MCPBindingResolver {
         MCPBindingResolver(
-            collectMatchesForContextID: { contextID in
+            collectMatchesForContextID: { connectionID, contextID in
                 await MainActor.run {
-                    WindowStatesManager.shared.allWindows.compactMap { windowState in
-                        guard let candidate = windowState.workspaceManager.storedBindingCandidate(forContextID: contextID) else {
+                    let windows = WindowStatesManager.shared.allWindows
+                    let bindingSnapshots = windows.map { windowState in
+                        (
+                            windowState: windowState,
+                            binding: windowState.mcpServer.connectionBindingSnapshot(forConnection: connectionID)
+                        )
+                    }
+                    let authoritativeBinding = bindingSnapshots.first {
+                        $0.binding.explicitlyBound && $0.binding.runID == nil
+                    } ?? bindingSnapshots.first {
+                        $0.binding.runID != nil
+                    }
+
+                    // Preserve an exact authoritative connection binding before active-workspace discovery
+                    if let authoritativeBinding,
+                       authoritativeBinding.binding.tabID == contextID,
+                       let tabID = authoritativeBinding.binding.tabID,
+                       let workspaceID = authoritativeBinding.binding.workspaceID,
+                       let workspaceName = authoritativeBinding.binding.workspaceName
+                    {
+                        return [MCPContextBindingMatch(
+                            windowID: authoritativeBinding.windowState.windowID,
+                            tabID: tabID,
+                            workspaceID: workspaceID,
+                            workspaceName: workspaceName,
+                            repoPaths: authoritativeBinding.binding.repoPaths
+                        )]
+                    }
+
+                    // Unbound one-shot context IDs share bind_context's active-workspace authority
+                    return windows.compactMap { windowState in
+                        guard let candidate = windowState.workspaceManager.bindingCandidate(forContextID: contextID) else {
                             return nil
                         }
                         return MCPContextBindingMatch(

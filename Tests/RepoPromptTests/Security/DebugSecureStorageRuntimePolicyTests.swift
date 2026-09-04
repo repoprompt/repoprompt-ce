@@ -72,6 +72,76 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
         )
     }
 
+    func testSuccessorIdentityRequiresExactMarkerAndSignaturePairing() {
+        let successor = RuntimeCodeSigningInfo.synthetic(
+            codeIdentifier: RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier,
+            teamIdentifier: RuntimeCodeSigningPolicy.successorSigningTeamIdentifier,
+            validatedDomains: [.successorDeveloperID]
+        )
+        let legacy = RuntimeCodeSigningInfo.synthetic(
+            codeIdentifier: RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
+            teamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier,
+            validatedDomains: [.developerID]
+        )
+
+        assertDecision(
+            marker: "successor-developer-id",
+            debugMarker: nil,
+            signingInfo: successor,
+            expectedDomain: .successorOfficialDeveloperID
+        )
+
+        // Cross-pairings between markers and signatures must fail closed.
+        let mismatches: [(String, RuntimeCodeSigningInfo)] = [
+            ("successor-developer-id", legacy),
+            ("developer-id", successor),
+            ("successor-developer-id", RuntimeCodeSigningInfo.synthetic(
+                codeIdentifier: RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier,
+                teamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier,
+                validatedDomains: [.successorDeveloperID]
+            )),
+            ("successor-developer-id", RuntimeCodeSigningInfo.synthetic(
+                codeIdentifier: RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier,
+                teamIdentifier: RuntimeCodeSigningPolicy.successorSigningTeamIdentifier,
+                validatedDomains: [.developerID]
+            )),
+            ("successor-developer-id", RuntimeCodeSigningInfo.synthetic(
+                codeIdentifier: RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier,
+                teamIdentifier: RuntimeCodeSigningPolicy.successorSigningTeamIdentifier,
+                isAdHoc: true,
+                validatedDomains: [.successorDeveloperID]
+            ))
+        ]
+        for (marker, signingInfo) in mismatches {
+            assertDecision(
+                marker: marker,
+                debugMarker: nil,
+                signingInfo: signingInfo,
+                expectedDomain: .ephemeral,
+                expectedReason: .markerSignatureMismatch
+            )
+        }
+    }
+
+    func testSuccessorDomainStaysEphemeralUntilBridgeOverrideAndAcceptsOverride() {
+        let decision = RuntimeSecureStorageDecision(
+            domain: .successorOfficialDeveloperID,
+            rejectionReason: nil
+        )
+
+        // Without a committed-bridge override the successor identity must not
+        // fall back to the legacy Keychain service.
+        XCTAssertTrue(
+            SecureKeyValueStorageFactory.selection(for: decision).backend === EphemeralSecureKeyValueStore.shared
+        )
+
+        XCTAssertTrue(SecureKeyValueStorageFactory.officialOverrideApplies(to: .officialDeveloperID))
+        XCTAssertTrue(SecureKeyValueStorageFactory.officialOverrideApplies(to: .successorOfficialDeveloperID))
+        XCTAssertFalse(SecureKeyValueStorageFactory.officialOverrideApplies(to: .localSelfSigned))
+        XCTAssertFalse(SecureKeyValueStorageFactory.officialOverrideApplies(to: .appleDevelopmentDebug))
+        XCTAssertFalse(SecureKeyValueStorageFactory.officialOverrideApplies(to: .ephemeral))
+    }
+
     func testRejectedModesExhaustivelyFailClosedToEphemeralStorage() {
         let official = RuntimeCodeSigningInfo.synthetic(
             codeIdentifier: RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
@@ -198,8 +268,15 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
         XCTAssertEqual(RuntimeCodeSigningPolicy.developerIDBundleIdentifier, "com.pvncher.repoprompt.ce")
         XCTAssertEqual(RuntimeCodeSigningPolicy.appleDevelopmentDebugBundleIdentifier, "com.pvncher.repoprompt.ce.debug")
         XCTAssertEqual(RuntimeCodeSigningPolicy.signingTeamIdentifier, "648A27MST5")
+        XCTAssertEqual(RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier, "com.repoprompt.ce")
+        XCTAssertEqual(RuntimeCodeSigningPolicy.successorSigningTeamIdentifier, "69N6K965SF")
         XCTAssertTrue(RuntimeCodeSigningPolicy.developerIDRequirement.contains("1.2.840.113635.100.6.1.13"))
         XCTAssertTrue(RuntimeCodeSigningPolicy.appleDevelopmentDebugRequirement.contains("1.2.840.113635.100.6.1.12"))
+        XCTAssertTrue(RuntimeCodeSigningPolicy.successorDeveloperIDRequirement.contains("1.2.840.113635.100.6.1.13"))
+        XCTAssertEqual(
+            RuntimeCodeSigningPolicy.successorDeveloperIDRequirement,
+            "anchor apple generic and identifier \"com.repoprompt.ce\" and certificate leaf[subject.OU] = \"69N6K965SF\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+        )
     }
 
     private func assertDecision(

@@ -36,15 +36,32 @@ STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
 RELEASE_TAG="${RELEASE_TAG:-}"
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-repoprompt/repoprompt-ce}"
 PUBLIC_UPDATE_REPOSITORY="${PUBLIC_UPDATE_REPOSITORY:-repoprompt/repoprompt-ce-updates}"
-DOWNLOAD_URL_PREFIX="${DOWNLOAD_URL_PREFIX:-https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/download/$RELEASE_TAG/}"
 EXPECTED_FEED_URL="https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml"
 SPARKLE_FRAMEWORK_INFO="$ROOT_DIR/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework/Versions/B/Resources/Info.plist"
 TMP_DIR=""
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
+STABLE_ROLLOUT_TOOL="$CONTROL_PLANE_SCRIPTS_DIR/stable_rollout.py"
+APPLE_IDENTITY_POLICY="$CONTROL_PLANE_SCRIPTS_DIR/apple_identity_policy.json"
+ROLLOUT_DECLARATION="$APPROVED_SOURCE_ROOT/release-rollout.json"
+ROLLOUT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-stable-rollout.json"
+SIGN_UPDATE="$TRUSTED_ROOT/Vendor/Sparkle/bin/sign_update"
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
+}
+
+# release.sh builds legacy/preparer application artifacts only. The reviewed
+# release-rollout.json declaration is the single role authority: transition or
+# successor declarations, sibling predecessors, and the successor identity all
+# fail here before signing or GitHub mutation.
+require_dormant_rollout_declaration() {
+    require_file "$ROLLOUT_DECLARATION"
+    require_file "$APPLE_IDENTITY_POLICY"
+    require_file "$STABLE_ROLLOUT_TOOL"
+    python3 "$STABLE_ROLLOUT_TOOL" workflow-guard \
+        --declaration "$ROLLOUT_DECLARATION" \
+        --policy "$APPLE_IDENTITY_POLICY"
 }
 
 require_command() {
@@ -107,6 +124,7 @@ run_preflight() {
     require_file "$ROOT_DIR/Vendor/Sparkle/PROVENANCE.md"
     require_file "$ROOT_DIR/Vendor/Sparkle/SHA256SUMS"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/embedded_provisioning_profile.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/build_swiftpm_release_products.sh"
@@ -132,8 +150,10 @@ run_preflight() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
     require_file "$TRUSTED_ROOT/Vendor/Sparkle/INSTALLED_MANIFEST.tsv"
-    require_file "$TRUSTED_ROOT/Vendor/Sparkle/bin/generate_appcast"
+    require_file "$SIGN_UPDATE"
     require_file "$SPARKLE_FRAMEWORK_INFO"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh"
+    require_dormant_rollout_declaration
 
     local sparkle_version feed_url
     sparkle_version="$(plutil -extract CFBundleShortVersionString raw "$SPARKLE_FRAMEWORK_INFO")"
@@ -693,15 +713,24 @@ publish_staged_release() {
     xcrun stapler staple "$DMG"
     xcrun stapler validate "$DMG"
 
-    local appcast_dir="$TMP_DIR/appcast"
-    mkdir -p "$appcast_dir"
-    cp "$UPDATE_ZIP" "$appcast_dir/"
-    printf '%s' "$SPARKLE_PRIVATE_KEY" |
-        "$TRUSTED_ROOT/Vendor/Sparkle/bin/generate_appcast" \
-            --ed-key-file - \
-            --download-url-prefix "$DOWNLOAD_URL_PREFIX" \
-            -o "$APPCAST" \
-            "$appcast_dir"
+    local enclosure_signature
+    enclosure_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" |
+        "$SIGN_UPDATE" --ed-key-file - -p "$UPDATE_ZIP" |
+        tr -d '\r\n')"
+    [[ -n "$enclosure_signature" ]] || fail "Unable to produce the Sparkle EdDSA signature for the update archive"
+    python3 "$STABLE_ROLLOUT_TOOL" generate \
+        --declaration "$ROLLOUT_DECLARATION" \
+        --policy "$APPLE_IDENTITY_POLICY" \
+        --version-env "$ROOT_DIR/version.env" \
+        --release-tag "$RELEASE_TAG" \
+        --release-commit "$RELEASE_COMMIT" \
+        --migration-phase "${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}" \
+        --allowed-roles legacy,preparer \
+        --enclosure "$UPDATE_ZIP" \
+        --enclosure-signature "$enclosure_signature" \
+        --app-artifact-manifest "$FINAL_ARTIFACT_MANIFEST" \
+        --appcast-output "$APPCAST" \
+        --manifest-output "$ROLLOUT_MANIFEST"
 
     (
         cd "$DIST_DIR"
@@ -710,6 +739,7 @@ publish_staged_release() {
             "$(basename "$DMG")" \
             "$(basename "$APPCAST")" \
             "$(basename "$FINAL_ARTIFACT_MANIFEST")" \
+            "$(basename "$ROLLOUT_MANIFEST")" \
             > "$(basename "$CHECKSUMS")"
     )
 
@@ -721,6 +751,7 @@ publish_staged_release() {
         "$APPCAST"
         "$CHECKSUMS"
         "$FINAL_ARTIFACT_MANIFEST"
+        "$ROLLOUT_MANIFEST"
         --verify-tag
         --title "$DISPLAY_NAME $MARKETING_VERSION"
         --generate-notes

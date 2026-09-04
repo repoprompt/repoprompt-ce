@@ -2,6 +2,7 @@ import Foundation
 
 enum RuntimeCodeSigningDomain: Hashable {
     case developerID
+    case successorDeveloperID
     case appleDevelopmentDebug
     case localSelfSigned
 }
@@ -53,6 +54,7 @@ struct RuntimeCodeSigningInfo: Equatable {
 
 enum RuntimeSecureStorageDomain: Equatable {
     case officialDeveloperID
+    case successorOfficialDeveloperID
     case localSelfSigned
     case appleDevelopmentDebug
     case ephemeral
@@ -106,6 +108,8 @@ enum RuntimeCodeSigningPolicy {
     static let developerIDBundleIdentifier = "com.pvncher.repoprompt.ce"
     static let appleDevelopmentDebugBundleIdentifier = "com.pvncher.repoprompt.ce.debug"
     static let signingTeamIdentifier = "648A27MST5"
+    static let successorDeveloperIDBundleIdentifier = "com.repoprompt.ce"
+    static let successorSigningTeamIdentifier = "69N6K965SF"
     static let localSelfSignedCertificateName = "RepoPrompt CE Local Self-Signed Code Signing"
 
     static let developerIDRequirement =
@@ -113,6 +117,9 @@ enum RuntimeCodeSigningPolicy {
 
     static let appleDevelopmentDebugRequirement =
         "anchor apple generic and identifier \"\(appleDevelopmentDebugBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(signingTeamIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.12] exists"
+
+    static let successorDeveloperIDRequirement =
+        "anchor apple generic and identifier \"\(successorDeveloperIDBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(successorSigningTeamIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
 
     private static let signingModePlistKey = "RepoPromptSigningMode"
     private static let debugStoragePlistKey = "RepoPromptDebugSecureStorageBackend"
@@ -195,6 +202,16 @@ enum RuntimeCodeSigningPolicy {
                 return ephemeral(.markerSignatureMismatch)
             }
             return RuntimeSecureStorageDecision(domain: .officialDeveloperID, rejectionReason: nil)
+        case "successor-developer-id":
+            guard matches(
+                signingInfo,
+                domain: .successorDeveloperID,
+                identifier: successorDeveloperIDBundleIdentifier,
+                teamIdentifier: successorSigningTeamIdentifier
+            ) else {
+                return ephemeral(.markerSignatureMismatch)
+            }
+            return RuntimeSecureStorageDecision(domain: .successorOfficialDeveloperID, rejectionReason: nil)
         case "local-self-signed":
             guard let localSigningContext else {
                 return ephemeral(.localIdentityRegistryUnavailable)

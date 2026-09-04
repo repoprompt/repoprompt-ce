@@ -68,6 +68,13 @@ struct SystemSettingsView: View {
                                 closeAction?()
                             }
                             .buttonStyle(.bordered)
+                            .disabled(!sparkleManager.canCheckForUpdates)
+                        }
+
+                        if let message = sparkleManager.updatesDisabledMessage {
+                            Label(message, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
                         }
 
                         // Install button (only when update is available)

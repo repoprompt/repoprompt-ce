@@ -251,6 +251,7 @@ enum GitBlobValidatedWorktreeReason: String, Codable, Hashable {
     case indexFlag
     case checkoutTransformation
     case changedDuringClassification
+    case nestedRepository
     case generatedOrExplicit
 }
 

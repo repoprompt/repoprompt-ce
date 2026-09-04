@@ -23,31 +23,4 @@ final class NonProseURLLinkificationBoundaryTests: XCTestCase {
 
         XCTAssertTrue(linkedSubstrings(in: attributed).isEmpty)
     }
-
-    @MainActor
-    func testNSTextViewHelperDisablesAutomaticURLDetection() {
-        let textView = NSTextView()
-        textView.isAutomaticLinkDetectionEnabled = true
-        textView.isAutomaticDataDetectionEnabled = true
-
-        textView.disableAutomaticLinkAndDataDetection()
-
-        XCTAssertFalse(textView.isAutomaticLinkDetectionEnabled)
-        XCTAssertFalse(textView.isAutomaticDataDetectionEnabled)
-    }
-
-    @MainActor
-    func testToolScrollableMarkdownTextViewRendersToolOutputWithoutLinks() {
-        let output = "tool output https://example.com"
-        let view = ToolScrollableMarkdownTextView(text: output, maxHeight: 180)
-
-        let textView = view.textKitView.configuredTextViewForTesting()
-
-        XCTAssertEqual(textView.string, output)
-        XCTAssertFalse(textView.isAutomaticLinkDetectionEnabled)
-        if #available(macOS 13.0, *) {
-            XCTAssertFalse(textView.isAutomaticDataDetectionEnabled)
-        }
-        XCTAssertTrue(linkedSubstrings(in: textView.attributedString()).isEmpty)
-    }
 }

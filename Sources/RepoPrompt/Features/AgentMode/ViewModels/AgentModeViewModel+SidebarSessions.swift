@@ -590,6 +590,12 @@ extension AgentModeViewModel {
             return cached.projection
         }
 
+        let existingSelectionIdentities = Set(
+            composeTabs.map { AgentSidebarSelectionIdentity.active(tabID: $0.id) }
+                + stashedTabs.map {
+                    AgentSidebarSelectionIdentity.archived(stashedTabID: $0.id, tabID: $0.tab.id)
+                }
+        )
         let canonicalRows = buildSidebarSessions(
             for: composeTabs,
             workspaceID: workspaceID,
@@ -640,6 +646,7 @@ extension AgentModeViewModel {
                 in: canonicalRows,
                 searchText: sidebarSnapshot.searchText
             ),
+            existingSelectionIdentities: existingSelectionIdentities,
             renderedSelectionOrder: renderedSelectionOrder
         )
         sidebarListProjectionCache = (key, projection)

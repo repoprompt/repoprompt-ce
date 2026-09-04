@@ -53,13 +53,20 @@ actor SecureStorageRepairService {
     }
 
     static func makeForCurrentRuntime() -> SecureStorageRepairService? {
-        guard SecureKeyValueStorageFactory.currentDecision().domain == .officialDeveloperID else {
-            return nil
-        }
-        return SecureStorageRepairService(
+        makeForRuntime(
+            decision: SecureKeyValueStorageFactory.currentDecision(),
             legacyStore: KeychainService.legacyRepairSource(),
-            targetStore: KeychainService.officialV2Shared
+            targetStore: SecureKeyValueStorageFactory.defaultBackend()
         )
+    }
+
+    static func makeForRuntime(
+        decision: RuntimeSecureStorageDecision,
+        legacyStore: SecureKeyValueStorageBackend,
+        targetStore: SecureKeyValueStorageBackend
+    ) -> SecureStorageRepairService? {
+        guard decision.domain == .officialDeveloperID else { return nil }
+        return SecureStorageRepairService(legacyStore: legacyStore, targetStore: targetStore)
     }
 
     func scan() -> [SecureStorageRepairRecord] {

@@ -169,6 +169,15 @@ final class AgentTabSession: ObservableObject {
     var isMCPInstructionDispatchInProgress: Bool = false
     /// Whether this session was originally created by an MCP client.
     var isMCPOriginated: Bool = false
+    /// Lifetime classification for sessions created, controlled, parented, or pending activation through MCP.
+    /// A nonzero activation generation remains authoritative after live control is released.
+    var isMCPRelated: Bool {
+        parentSessionID != nil
+            || mcpControlContext != nil
+            || isMCPOriginated
+            || mcpControlActivationGeneration != 0
+    }
+
     /// Persisted logical-root to worktree bindings for this Agent session.
     var worktreeBindings: [AgentSessionWorktreeBinding] = []
     /// Persisted resumable worktree-merge operations for this Agent session.
@@ -565,6 +574,7 @@ final class AgentTabSession: ObservableObject {
         var goalSupportEnabled: Bool
         var reasoningSummariesEnabled: Bool
         var memoriesEnabled: Bool
+        var capabilities: CodexCapabilitySettings = .disabled
     }
 
     var pendingCodexComputerUseActivation: AgentModeViewModel.CodexComputerUseActivation?

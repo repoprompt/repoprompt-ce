@@ -1187,11 +1187,51 @@ actor InteractiveMCPClientSession {
         return CallTool.Result(content: [.text("Local window/context selection cleared.")], isError: false)
     }
 
-    func bindContextID(_ contextID: String, windowID: Int? = nil) async throws -> CallTool.Result {
+    func establishStartupRouting(contextID: String?, tabID: String?, windowID: Int?) async throws {
+        if let contextID {
+            let result = try await bindContextID(
+                contextID,
+                windowID: windowID,
+                requestRawJSON: true
+            )
+            let binding = try confirmedBinding(from: result)
+            guard binding.contextID?.uuidString.caseInsensitiveCompare(contextID) == .orderedSame else {
+                throw InteractiveSessionError.handshakeFailed(
+                    reason: "bind_context returned a different context than requested"
+                )
+            }
+            return
+        }
+
+        if let tabID {
+            let result = try await bindTab(
+                selector: tabID,
+                windowID: windowID,
+                requestRawJSON: true
+            )
+            let binding = try confirmedBinding(from: result)
+            guard let selectedContextID,
+                  binding.contextID?.uuidString.caseInsensitiveCompare(selectedContextID) == .orderedSame
+            else {
+                throw InteractiveSessionError.handshakeFailed(
+                    reason: "bind_context returned a different context than the selected tab"
+                )
+            }
+        }
+    }
+
+    func bindContextID(
+        _ contextID: String,
+        windowID: Int? = nil,
+        requestRawJSON: Bool = false
+    ) async throws -> CallTool.Result {
         var args: [String: Value] = [
             "op": .string("bind"),
             "context_id": .string(contextID)
         ]
+        if requestRawJSON {
+            args["_rawJSON"] = .bool(true)
+        }
         if let windowID {
             args["window_id"] = .int(windowID)
         }
@@ -1223,14 +1263,22 @@ actor InteractiveMCPClientSession {
         return result
     }
 
-    func bindTab(selector: String, windowID: Int? = nil) async throws -> CallTool.Result {
+    func bindTab(
+        selector: String,
+        windowID: Int? = nil,
+        requestRawJSON: Bool = false
+    ) async throws -> CallTool.Result {
         let trimmed = selector.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw InteractiveSessionError.handshakeFailed(reason: "Empty context selector")
         }
 
         if let contextID = UUID(uuidString: trimmed) {
-            return try await bindContextID(contextID.uuidString, windowID: windowID)
+            return try await bindContextID(
+                contextID.uuidString,
+                windowID: windowID,
+                requestRawJSON: requestRawJSON
+            )
         }
 
         let preferredWindowID = windowID ?? selectedWindowID
@@ -1266,7 +1314,11 @@ actor InteractiveMCPClientSession {
             throw InteractiveSessionError.handshakeFailed(reason: "Ambiguous compose tab '\(trimmed)': \(details). Re-run with -w or use a context_id.")
         }
 
-        return try await bindContextID(match.tab.contextID.uuidString, windowID: match.windowID)
+        return try await bindContextID(
+            match.tab.contextID.uuidString,
+            windowID: match.windowID,
+            requestRawJSON: requestRawJSON
+        )
     }
 
     func bindingStatus() async throws -> BindContextBinding {
@@ -1300,6 +1352,17 @@ actor InteractiveMCPClientSession {
         }
         let data = Data(text.utf8)
         return try JSONDecoder().decode(BindContextResponse.self, from: data)
+    }
+
+    private func confirmedBinding(from result: CallTool.Result) throws -> BindContextBinding {
+        guard result.isError != true else {
+            let reason = result.content.compactMap {
+                if case let .text(text, _, _) = $0 { return text }
+                return nil
+            }.first ?? "bind_context failed"
+            throw InteractiveSessionError.handshakeFailed(reason: reason)
+        }
+        return try decodeBindContextResponse(from: result).binding
     }
 
     // MARK: - Bootstrap Handshake

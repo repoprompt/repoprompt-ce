@@ -271,6 +271,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     @Published var draftRestorationEvent: DraftRestorationEvent? = nil
     @Published private(set) var codexDynamicModels: [CodexAppServerClient.RemoteModel] = []
+    /// Pre-computed collapsed Codex model options. Rebuilt whenever `codexDynamicModels`
+    /// changes so the expensive collapse/regex work never runs on the SwiftUI render path.
+    private(set) var cachedCollapsedCodexOptions: [AgentModelOption] = []
     @Published private(set) var acpDynamicModelRevision: Int = 0
     @Published private(set) var availableAgents: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
 
@@ -707,7 +710,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_sidebarListProjectionBuildCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
-        private var test_composeTabRemovalTeardownObserver: (@MainActor (UUID) -> Void)?
+        private var test_composeTabRemovalTeardownObserver: (@MainActor (UUID) async -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?,
@@ -757,7 +760,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
-        func test_setComposeTabRemovalTeardownObserver(_ observer: @escaping @MainActor (UUID) -> Void) {
+        func test_setComposeTabRemovalTeardownObserver(_ observer: @escaping @MainActor (UUID) async -> Void) {
             test_composeTabRemovalTeardownObserver = observer
         }
 
@@ -1216,12 +1219,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func reasoningEffortOptionsForCurrentSelection() -> [CodexReasoningEffort] {
-        codexCoordinator.reasoningEffortOptions(forModelRaw: selectedModelRaw, agentKind: selectedAgent)
+        codexCoordinator.reasoningEffortOptions(
+            forModelRaw: selectedModelRaw,
+            agentKind: selectedAgent,
+            precomputedOptions: cachedCollapsedCodexOptions.isEmpty ? nil : cachedCollapsedCodexOptions
+        )
     }
 
     func updateCodexDynamicModels(_ models: [CodexAppServerClient.RemoteModel]) {
         if codexDynamicModels != models {
             codexDynamicModels = models
+            // Rebuild the collapsed option cache eagerly (off the render path) so
+            // that reasoningEffortOptionsForCurrentSelection() is cheap in SwiftUI bodies.
+            cachedCollapsedCodexOptions = codexCoordinator.modelOptions(
+                for: .codexExec,
+                codexDynamicModels: models
+            )
             syncComposerUIState()
         }
         // Note: Registry updates are owned exclusively by CodexModelPollingService.
@@ -1649,7 +1662,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return FileManager.default.temporaryDirectory
         }
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled in
+        let providerBindingService = AgentModeProviderBindingService()
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities in
             let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false)
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
@@ -1657,6 +1671,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
                 shellToolEnabled: permissionProfile.codexBashToolEnabled(),
                 suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
+                capabilitiesProvider: { capabilities },
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
                 memoriesEnabledProvider: { CodexMemories.isEnabled },
@@ -1720,6 +1735,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexControllerFactory: codexControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
             shouldManageCodexTooling: true,
+            codexCapabilitiesForLaunch: { isMCPRelated in
+                providerBindingService.codexCapabilitiesForLaunch(isMCPRelated: isMCPRelated)
+            },
             codexHookApprovalSettings: GlobalSettingsStore.shared,
             activeToolQuery: { [weak mcpServer] runID in
                 mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
@@ -1754,7 +1772,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexCoordinator: codexCoordinator,
             claudeCoordinator: claudeCoordinator
         )
-        providerBindingService = AgentModeProviderBindingService()
+        self.providerBindingService = providerBindingService
         codexCoordinator.setActiveAgentRunWaitDrain { [weak self] runID, runAttemptID, source, steeringMessage in
             guard let self, let mcpServer = self.mcpServer else { return true }
             return await mcpServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
@@ -1858,6 +1876,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
+            testCodexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
             testCodexActiveAgentRunWaitQuery: CodexAgentRunWaitQuery? = nil,
             testCodexActiveAgentRunWaitDrain: CodexAgentRunWaitDrain? = nil,
             testCodexLeaseRoutingTimeoutMs: Int? = nil,
@@ -1887,7 +1906,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
             workspacePathProvider = codexWorkspacePathProvider
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
-                ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _ in
+                ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
                 }
             self.headlessProviderFactory = headlessProviderFactory
@@ -1918,6 +1937,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 codexControllerFactory: codexControllerFactory,
                 connectionPolicyInstaller: connectionPolicyInstaller,
                 shouldManageCodexTooling: shouldManageCodexTooling,
+                codexCapabilitiesForLaunch: testCodexCapabilitiesForLaunch,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
                 codexHookApprovalSettings: testCodexHookApprovalSettingsProvider ?? GlobalSettingsStore.shared,
                 activeToolQuery: testCodexActiveToolQuery
@@ -12451,7 +12471,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         for tabID in orderedRuntimeCleanupTabIDs {
             #if DEBUG
-                test_composeTabRemovalTeardownObserver?(tabID)
+                if let test_composeTabRemovalTeardownObserver {
+                    await test_composeTabRemovalTeardownObserver(tabID)
+                }
             #endif
             let capturedSession = capturedSessionsByTabID[tabID] ?? nil
             let boundID = capturedBoundSessionIDByTabID[tabID] ?? nil

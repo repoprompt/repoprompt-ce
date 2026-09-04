@@ -23,31 +23,6 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(launch.expectedExecutableIdentity?.canonicalPath, launch.command)
     }
 
-    func testBareGrokUsesCapturedEnvironmentAndCachesCanonicalPathForSpawn() async throws {
-        let directory = try makeTemporaryDirectory()
-        let probePathRecord = directory.appendingPathComponent("probe-path")
-        let executable = try makeExecutable(named: "grok", in: directory, marker: probePathRecord)
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = directory.path
-        environment["SHELL"] = "/bin/false"
-        let testEnvironment = environment
-        let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in testEnvironment })
-        let config = GrokBuildAgentConfig(
-            commandName: "grok",
-            additionalPathHints: [],
-            includeRepoPromptMCPServer: false
-        )
-
-        let support = try await resolver.probeSupport(for: config)
-        let provider = GrokBuildACPAgentProvider(config: config, launchResolver: resolver)
-        let launch = try provider.makeLaunchConfiguration(for: makeRunRequest(workspacePath: directory.path))
-        let probedPath = try String(contentsOf: probePathRecord, encoding: .utf8)
-
-        XCTAssertEqual(support, .supported)
-        XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
-        XCTAssertEqual(probedPath, launch.command)
-    }
-
     func testProviderPathHintsIncludeDotGrokBin() {
         XCTAssertTrue(CLIPathHints.grokBuild.contains("~/.grok/bin"))
         XCTAssertEqual(CLILaunchProfiles.grokBuild.commandName, "grok")

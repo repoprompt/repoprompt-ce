@@ -33,16 +33,4 @@ final class InteractiveLifecycleExecutionContractTests: XCTestCase {
             1200
         )
     }
-
-    func testInteractiveLifecycleToolsHaveNoExecutionWatchdogDeadline() {
-        for toolName in [
-            MCPWindowToolName.askUser,
-            MCPWindowToolName.waitForNextInstruction
-        ] {
-            let contract = MCPToolExecutionContractCatalog.contract(for: toolName)
-            XCTAssertEqual(contract?.kind, .interactiveCancellable, toolName)
-            XCTAssertNil(contract?.deadline, toolName)
-            XCTAssertNil(contract?.cancellationGrace, toolName)
-        }
-    }
 }

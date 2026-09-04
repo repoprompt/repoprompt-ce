@@ -45,13 +45,39 @@ enum AgentSidebarBulkActionKind: String, Equatable {
     case stash
     case pin
     case unpin
+
+    var rowProgressAccessibilityLabel: String {
+        switch self {
+        case .delete: "Deleting chat"
+        case .stash: "Stashing chat"
+        case .pin: "Pinning chat"
+        case .unpin: "Unpinning chat"
+        }
+    }
+}
+
+enum AgentSidebarBulkActionOrigin: Equatable {
+    case selection
+    case command
+}
+
+enum AgentSidebarCommandProgressPlacement: Equatable {
+    case row
+    case archivedHeader
 }
 
 struct AgentSidebarBulkActionOperation: Equatable {
     let token: UUID
     let workspaceID: UUID
     let kind: AgentSidebarBulkActionKind
-    let targetCount: Int
+    let origin: AgentSidebarBulkActionOrigin
+    let presentationTargets: Set<AgentSidebarSelectionIdentity>
+    let commandProgressPlacement: AgentSidebarCommandProgressPlacement?
+    var commandRowProgressRetired = false
+
+    var targetCount: Int {
+        presentationTargets.count
+    }
 }
 
 struct AgentSidebarBulkActionNotice: Equatable {
@@ -74,8 +100,50 @@ struct AgentSidebarSelectionState: Equatable {
     var notice: AgentSidebarBulkActionNotice?
     var revision = 0
 
-    var isSelectionMode: Bool {
-        !selectedIdentities.isEmpty || inFlightAction != nil
+    var showsSelectionPresentation: Bool {
+        !selectedIdentities.isEmpty || inFlightAction?.origin == .selection
+    }
+
+    var isMutationInFlight: Bool {
+        inFlightAction != nil
+    }
+
+    func commandRowProgressOperation(
+        for identity: AgentSidebarSelectionIdentity,
+        workspaceID: UUID?
+    ) -> AgentSidebarBulkActionOperation? {
+        guard let operation = inFlightAction,
+              operation.origin == .command,
+              operation.workspaceID == workspaceID,
+              operation.commandProgressPlacement == .row,
+              !operation.commandRowProgressRetired,
+              operation.presentationTargets.contains(identity)
+        else { return nil }
+        return operation
+    }
+
+    func commandFallbackProgressOperation(
+        existingIdentities: Set<AgentSidebarSelectionIdentity>,
+        renderedIdentities: Set<AgentSidebarSelectionIdentity>,
+        workspaceID: UUID?
+    ) -> AgentSidebarBulkActionOperation? {
+        guard let operation = inFlightAction,
+              operation.origin == .command,
+              operation.workspaceID == workspaceID,
+              operation.commandProgressPlacement == .row,
+              !operation.commandRowProgressRetired,
+              !operation.presentationTargets.isDisjoint(with: existingIdentities),
+              operation.presentationTargets.isDisjoint(with: renderedIdentities)
+        else { return nil }
+        return operation
+    }
+
+    var archivedHeaderCommandProgressOperation: AgentSidebarBulkActionOperation? {
+        guard let operation = inFlightAction,
+              operation.origin == .command,
+              operation.commandProgressPlacement == .archivedHeader
+        else { return nil }
+        return operation
     }
 
     mutating func handle(
@@ -91,7 +159,7 @@ struct AgentSidebarSelectionState: Equatable {
 
         switch gesture {
         case .primary:
-            guard isSelectionMode else { return .activate }
+            guard !selectedIdentities.isEmpty else { return .activate }
             selectedIdentities = [identity]
             anchor = identity
         case .toggle:

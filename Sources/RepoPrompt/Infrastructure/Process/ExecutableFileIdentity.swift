@@ -32,7 +32,7 @@ struct ExecutableFileIdentity: Equatable {
 
         return ExecutableFileIdentity(
             canonicalPath: canonicalPath,
-            device: UInt64(info.st_dev),
+            device: safeDeviceID(info.st_dev),
             inode: UInt64(info.st_ino),
             size: Int64(info.st_size),
             modificationSeconds: Int64(info.st_mtimespec.tv_sec),

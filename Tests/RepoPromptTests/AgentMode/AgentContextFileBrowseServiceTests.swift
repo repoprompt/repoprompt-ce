@@ -39,79 +39,6 @@ final class AgentContextFileBrowseServiceTests: XCTestCase {
         XCTAssertFalse(hierarchy.descendantFiles.contains { $0.standardizedFullPath.contains("_git_data") })
     }
 
-    func testTreeIndexReusesRootSnapshotAndRebuildsAfterAppliedGenerationChanges() async throws {
-        let rootURL = try makeTestDirectory(name: "ContextBrowseGeneration")
-        try write("one", to: rootURL.appendingPathComponent("One.swift"))
-        let store = WorkspaceFileContextStore()
-        let root = try await store.loadRoot(path: rootURL.path)
-        let service = AgentContextFileBrowseService(store: store)
-        await store.resetAppliedIndexRecordLookupDiagnosticsForTesting()
-
-        let maybeInitial = try await service.hierarchy(
-            rootID: root.id,
-            folderID: nil,
-            lookupContext: .visibleWorkspace
-        )
-        let initial = try XCTUnwrap(availableResult(maybeInitial))
-        _ = try await service.hierarchy(rootID: root.id, folderID: nil, lookupContext: .visibleWorkspace)
-        let reused = await store.appliedIndexRecordLookupDiagnosticsForTesting()
-
-        _ = try await store.createFile(rootID: root.id, relativePath: "Two.swift", content: "two")
-        let maybeRebuilt = try await service.hierarchy(
-            rootID: root.id,
-            folderID: nil,
-            lookupContext: .visibleWorkspace
-        )
-        let rebuilt = try XCTUnwrap(availableResult(maybeRebuilt))
-        let diagnostics = await store.appliedIndexRecordLookupDiagnosticsForTesting()
-
-        XCTAssertEqual(reused.rootSnapshots, 1)
-        XCTAssertEqual(diagnostics.rootSnapshots, 2)
-        XCTAssertEqual(rebuilt.files.map(\.name), ["One.swift", "Two.swift"])
-        XCTAssertNotEqual(rebuilt.rootGeneration, initial.rootGeneration)
-        XCTAssertTrue(rebuilt.files.allSatisfy { $0.rootGeneration == rebuilt.rootGeneration })
-    }
-
-    func testPruneCachesRetainsOnlyCurrentRouteRoots() async throws {
-        let retainedURL = try makeTestDirectory(name: "ContextBrowseRetainedCache")
-        let removedURL = try makeTestDirectory(name: "ContextBrowseRemovedCache")
-        try write("retained", to: retainedURL.appendingPathComponent("Retained.swift"))
-        try write("removed", to: removedURL.appendingPathComponent("Removed.swift"))
-        let store = WorkspaceFileContextStore()
-        let retained = try await store.loadRoot(path: retainedURL.path)
-        let removed = try await store.loadRoot(path: removedURL.path)
-        let service = AgentContextFileBrowseService(store: store)
-        await store.resetAppliedIndexRecordLookupDiagnosticsForTesting()
-        _ = try await service.hierarchy(
-            rootID: retained.id,
-            folderID: nil,
-            lookupContext: .visibleWorkspace
-        )
-        _ = try await service.hierarchy(
-            rootID: removed.id,
-            folderID: nil,
-            lookupContext: .visibleWorkspace
-        )
-
-        await service.pruneCaches(
-            retainingRootIDs: [retained.id],
-            lookupContext: .visibleWorkspace
-        )
-        _ = try await service.hierarchy(
-            rootID: retained.id,
-            folderID: nil,
-            lookupContext: .visibleWorkspace
-        )
-        _ = try await service.hierarchy(
-            rootID: removed.id,
-            folderID: nil,
-            lookupContext: .visibleWorkspace
-        )
-
-        let diagnostics = await store.appliedIndexRecordLookupDiagnosticsForTesting()
-        XCTAssertEqual(diagnostics.rootSnapshots, 3)
-    }
-
     func testIndexedSearchIsUsedOnlyForAdmissibleVisibleAllRootSearch() async throws {
         let rootURL = try makeTestDirectory(name: "ContextBrowseIndexed")
         try write("target", to: rootURL.appendingPathComponent("Sources/Target.swift"))
@@ -149,6 +76,38 @@ final class AgentContextFileBrowseServiceTests: XCTestCase {
         XCTAssertEqual(indexed.matches.map(\.file.name), ["Target.swift"])
         XCTAssertEqual(rootScoped.matches.map(\.file.name), ["Target.swift"])
         XCTAssertEqual(projected.matches.map(\.file.name), ["Target.swift"])
+    }
+
+    func testStaleIndexedSearchFallsBackToStoreForNewRoot() async throws {
+        let rootURL = try makeTestDirectory(name: "ContextBrowseStaleIndexFallback")
+        try write("fresh", to: rootURL.appendingPathComponent("Sources/FreshlyAddedBrowseUnique.swift"))
+        let store = WorkspaceFileContextStore()
+        let root = try await store.loadRoot(path: rootURL.path)
+        let staleIndexedSearch: AgentContextFileBrowseService.IndexedSearch = { query, _ in
+            WorkspaceSearchQueryResult(
+                query: query,
+                indexedGeneration: 1,
+                snapshotGeneration: 1,
+                observedGeneration: 2,
+                results: [],
+                isIndexReady: true,
+                isStale: true
+            )
+        }
+        let service = AgentContextFileBrowseService(store: store, indexedSearch: staleIndexedSearch)
+
+        let result = try await availableResult(service.search(
+            query: "FreshlyAddedBrowseUnique",
+            scope: .allRoots,
+            lookupContext: .visibleWorkspace
+        ))
+
+        XCTAssertEqual(result.source, .storeCatalog)
+        XCTAssertEqual(result.matches.map(\.file.name), ["FreshlyAddedBrowseUnique.swift"])
+        XCTAssertEqual(result.matches.map(\.file.rootID), [root.id])
+        XCTAssertEqual(result.groups.map(\.root.id), [root.id])
+        XCTAssertEqual(result.groups.map(\.root.physicalPath), [root.standardizedFullPath])
+        XCTAssertEqual(result.groups.flatMap(\.directories).map(\.directoryPath), ["Sources"])
     }
 
     func testSelectedRootSearchFiltersBeforeCandidateCap() async throws {

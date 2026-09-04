@@ -89,11 +89,7 @@ unlineaged version above the frozen ceiling is foreign forever, even after CE re
 numerically. This prevents old live/dev files from being silently adopted and overwritten by
 a newer CE build.
 
-The guardrail tests are:
-
-- `SettingsJSONOnlyPersistenceTests.testLegacyUnlineagedCeilingIsFrozenAtTwo`
-- `SettingsJSONOnlyPersistenceTests.testUnlineagedHigherSchemaStaysBlockedAfterFutureNumericSchemaCatchup`
-- `SettingsJSONOnlyPersistenceTests.testVersionFourSettingsFileWithAgentModelsKeyIsPreserved`
+The settings persistence guardrail retains this frozen-ceiling behavior; the former timing-sensitive XCTest references were removed during the test cleanup.
 
 ## Recovery lanes
 

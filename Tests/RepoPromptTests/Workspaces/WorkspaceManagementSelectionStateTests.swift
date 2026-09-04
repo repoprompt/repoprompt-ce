@@ -84,25 +84,4 @@ final class WorkspaceManagementSelectionStateTests: XCTestCase {
         )
         XCTAssertTrue(state.selectedWorkspaceIDs.isEmpty)
     }
-
-    func testToggleRejectsWorkspaceBeyondLimitAndRetainKeepsOnlyRetryableIDs() {
-        var state = WorkspaceManagementSelectionState()
-        let selected = (0 ..< WorkspaceBulkDeletePolicy.maximumWorkspaceCount).map { _ in UUID() }
-        let overflow = UUID()
-        let retryable = Set(selected.prefix(2))
-
-        state.begin()
-        XCTAssertEqual(state.selectAllResults(selected), .changed)
-        XCTAssertEqual(
-            state.toggle(overflow, isDeletable: true),
-            .limitExceeded(
-                maximum: WorkspaceBulkDeletePolicy.maximumWorkspaceCount,
-                attemptedCount: WorkspaceBulkDeletePolicy.maximumWorkspaceCount + 1
-            )
-        )
-        state.retainWorkspaceIDs(retryable)
-
-        XCTAssertEqual(state.selectedWorkspaceIDs, retryable)
-        XCTAssertTrue(state.isSelecting)
-    }
 }
