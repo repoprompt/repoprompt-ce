@@ -713,11 +713,13 @@ enum AgentModelCatalog {
             return "\(baseDisplayName) \(serviceTier.capitalized)"
         }
 
+        let discoveredBases = CodexDynamicModelStore.reservedBaseIDs()
         let entries = modelOptions.map { option -> Entry in
             let specifier = CodexModelSpecifier(raw: option.rawValue)
             let normalizedRaw = option.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let baseModelID = CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: normalizedRaw)
-            let reasoningEffort = specifier.reasoningEffort ?? effortFromDisplayName(option.displayName)
+            let reasoningEffort = discoveredBases.contains(normalizedRaw.lowercased())
+                ? nil : specifier.reasoningEffort ?? effortFromDisplayName(option.displayName)
             let groupDisplayName = displayNameForBaseModel(
                 baseModelID: baseModelID,
                 fallbackDisplayName: option.displayName

@@ -349,6 +349,7 @@ public class APISettingsViewModel: ObservableObject {
 
     // ── Model-list fetch tasks (one per provider) ───────────────────────────
     private var openAIModelsTask: Task<Void, Never>?
+    private var anthropicModelsTask: Task<Void, Never>?
     private var deepSeekModelsTask: Task<Void, Never>?
     private var fireworksModelsTask: Task<Void, Never>?
     private var grokModelsTask: Task<Void, Never>? // NEW
@@ -539,6 +540,12 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func installCLIConnectionObservers() {
+        NotificationCenter.default.publisher(for: .providerModelCatalogDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { await self?.updateAvailableModels() }
+            }
+            .store(in: &cliConnectionCancellables)
         Publishers.MergeMany([
             NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
             NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
@@ -1056,6 +1063,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     func prepareForWindowClose() {
+        anthropicModelsTask?.cancel()
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
         initialLoadTask?.cancel()
@@ -1087,6 +1095,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     deinit {
+        anthropicModelsTask?.cancel()
         initialLoadTask?.cancel()
         openAIModelsTask?.cancel()
         deepSeekModelsTask?.cancel()
@@ -1405,6 +1414,7 @@ public class APISettingsViewModel: ObservableObject {
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ── 0. Cancel previous background fetches ───────────────────────────────
+        anthropicModelsTask?.cancel()
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
         deepSeekModelsTask?.cancel()
@@ -1566,6 +1576,7 @@ public class APISettingsViewModel: ObservableObject {
         // ----------------------------------------------------------------
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
         if isOpenAIKeyValid { openAIModelsTask = Task { await self.updateOpenAIModels() } }
+        if isAnthropicKeyValid { anthropicModelsTask = Task { await self.updateAnthropicModels() } }
         if isDeepSeekKeyValid { deepSeekModelsTask = Task { await self.updateDeepSeekModels() } }
         if isFireworksKeyValid { fireworksModelsTask = Task { await self.updateFireworksModels() } }
         if isGrokKeyValid { grokModelsTask = Task { await self.updateGrokModels() } }
@@ -1949,6 +1960,8 @@ public class APISettingsViewModel: ObservableObject {
             case .anthropic:
                 anthropicApiKey = trimmedKey
                 isAnthropicKeyValid = true
+                anthropicModelsTask?.cancel()
+                anthropicModelsTask = Task { await self.updateAnthropicModels() }
                 seedPreferredComposeModelIfMissing(AIModel.claude4Sonnet, reason: "api_settings.validate_key.default_seed.anthropic")
             case .openAI:
                 openAIApiKey = trimmedKey
@@ -3955,6 +3968,21 @@ public class APISettingsViewModel: ObservableObject {
 
     // MARK: - Remote-model fetch helpers
 
+    private func updateAnthropicModels() async {
+        let key = anthropicApiKey
+        guard isAnthropicKeyValid, !key.isEmpty else { return }
+        do {
+            let records = try await AnthropicModelCatalog.fetch(apiKey: key)
+            guard !Task.isCancelled, !hasPreparedForWindowClose, key == anthropicApiKey, isAnthropicKeyValid else { return }
+            if AnthropicModelCatalog.save(records) {
+                NotificationCenter.default.post(name: .providerModelCatalogDidChange, object: nil)
+            }
+            await updateAvailableModels()
+        } catch {
+            // Preserve the last usable catalogue and the user's selections.
+        }
+    }
+
     // SEARCH-HELPER: OpenAI Base URL, Custom Base URL, Normalization
     private func normalizedOpenAIBaseURL(_ raw: String) -> String {
         let (base, _) = normalizedOpenAIBaseURLAndVersion(raw)
@@ -4096,21 +4124,17 @@ public class APISettingsViewModel: ObservableObject {
     #endif
 
     private func updateGrokModels() async {
-        guard isGrokKeyValid else { return }
+        let key = grokApiKey
+        guard isGrokKeyValid, !key.isEmpty else { return }
         do {
-            // GrokProvider inherits from OpenAIProvider, so CustomOpenAIProvider can be used for model listing
-            // if Grok's /models endpoint is OpenAI-compatible.
-            let provider = CustomOpenAIProvider(
-                baseURL: "https://api.x.ai/v1", // Grok API base URL for models
-                apiKey: grokApiKey,
-                defaultModel: "grok-3-mini-beta", // A known Grok model
-                defaultTemperature: 0.7
-            )
-            let models = try await provider.getAvailableModels()
-            await MainActor.run { availableGrokModels = models }
+            let models = try await GrokModelCatalog.fetch(apiKey: key)
+            guard !Task.isCancelled, !hasPreparedForWindowClose, key == grokApiKey, isGrokKeyValid else { return }
+            availableGrokModels = models
+            if GrokModelCatalog.save(models) {
+                NotificationCenter.default.post(name: .providerModelCatalogDidChange, object: nil)
+            }
         } catch {
-            await MainActor.run { availableGrokModels = [] }
-            print("Error fetching Grok models: \(error.asFriendlyString())")
+            // Keep the last usable snapshot on a failed or superseded refresh.
         }
         await updateAvailableModels()
     }

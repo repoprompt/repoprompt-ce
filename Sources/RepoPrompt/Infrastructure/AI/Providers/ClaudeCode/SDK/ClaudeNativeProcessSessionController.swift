@@ -654,6 +654,14 @@ final actor ClaudeNativeProcessSessionController {
 
         let snapshot = Self.parseInitializeResponseSnapshot(from: initializeResult)
         initializeResponseSnapshot = snapshot
+        if activeLaunchEnvironmentSignature?.backend == .defaultClaude,
+           let modelsJSON = snapshot.modelsJSON,
+           ClaudeDynamicModelStore.update(json: modelsJSON)
+        {
+            await MainActor.run {
+                NotificationCenter.default.post(name: .providerModelCatalogDidChange, object: nil)
+            }
+        }
 
         if config.enableDebugLogging {
             print("[ClaudeNativeSession] initialize response keys: \(initializeResult.keys.sorted())")
@@ -689,7 +697,8 @@ final actor ClaudeNativeProcessSessionController {
             : effectiveEffortLevel
         let request = Self.buildApplyFlagSettingsRequest(
             model: launchEnvironment.effectiveModel,
-            effortLevel: requestEffortLevel
+            effortLevel: requestEffortLevel,
+            useDiscoveredCapabilities: launchEnvironment.backend == .defaultClaude
         )
         return (launchEnvironment, request)
     }
@@ -709,9 +718,20 @@ final actor ClaudeNativeProcessSessionController {
     private func applyInitialFlagSettingsIfNeeded() async throws {
         while true {
             let requestGeneration = flagSettingsRequestGeneration
-            guard let request = initialFlagSettingsRequest else {
+            guard var request = initialFlagSettingsRequest else {
                 hasCompletedInitialFlagSettings = true
                 return
+            }
+            // initialize can advertise capabilities after the initial intent was built.
+            if activeLaunchEnvironmentSignature?.backend == .defaultClaude,
+               let settings = request["settings"] as? [String: Any],
+               let filtered = Self.buildApplyFlagSettingsRequest(
+                   model: settings["model"] as? String,
+                   effortLevel: ClaudeCodeEffortLevel.parse(settings["effortLevel"] as? String),
+                   useDiscoveredCapabilities: true
+               )
+            {
+                request = filtered
             }
             let flagSettingsResult = try await sendControlRequest(request: request)
             writeRawEventLogRecord(kind: "session.flagSettingsApplied", payload: [
@@ -746,12 +766,19 @@ final actor ClaudeNativeProcessSessionController {
         launchEnvironment.suppressesEffortSettings
     }
 
-    private static func buildApplyFlagSettingsRequest(model: String?, effortLevel: ClaudeCodeEffortLevel?) -> [String: Any]? {
+    private static func buildApplyFlagSettingsRequest(
+        model: String?,
+        effortLevel: ClaudeCodeEffortLevel?,
+        useDiscoveredCapabilities: Bool = false
+    ) -> [String: Any]? {
         var settings: [String: Any] = [:]
         if let model = normalizedFlagSettingsModel(model) {
             settings["model"] = model
         }
-        if let effortLevel {
+        let resolvedEffort = useDiscoveredCapabilities
+            ? ClaudeDynamicModelStore.effort(effortLevel, forModel: model)
+            : effortLevel
+        if let effortLevel = resolvedEffort {
             settings["effortLevel"] = effortLevel.rawValue
         }
         guard !settings.isEmpty else { return nil }

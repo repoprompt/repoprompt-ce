@@ -22,7 +22,15 @@ enum ClaudeCodeAIModelCatalog {
         .low, .medium, .high, .xhigh, .max
     ]
 
-    private static let modelDefinitions: [ModelDefinition] = [
+    private static var modelDefinitions: [ModelDefinition] {
+        let discovered = ClaudeDynamicModelStore.records().map {
+            ModelDefinition(runtimeModelRaw: $0.value, displayName: $0.displayName, supportedEfforts: $0.efforts)
+        }
+        let identities = Set(discovered.map { $0.runtimeModelRaw.lowercased() })
+        return discovered + fallbackDefinitions.filter { !identities.contains($0.runtimeModelRaw.lowercased()) }
+    }
+
+    private static let fallbackDefinitions: [ModelDefinition] = [
         ModelDefinition(runtimeModelRaw: "fable", displayName: "Fable Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-fable-5-1", displayName: "Fable 5.1", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
@@ -283,6 +291,9 @@ enum ClaudeCodeAIModelCatalog {
         guard let raw else { return nil }
         let normalized = normalizedSpecifier(raw)
         guard !normalized.isEmpty else { return nil }
+        if let record = ClaudeDynamicModelStore.record(for: normalized) {
+            return ModelDefinition(runtimeModelRaw: record.value, displayName: record.displayName, supportedEfforts: record.efforts)
+        }
         return modelDefinitions.first {
             $0.runtimeModelRaw.caseInsensitiveCompare(normalized) == .orderedSame
         }

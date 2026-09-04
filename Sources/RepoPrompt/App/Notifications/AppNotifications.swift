@@ -1,6 +1,7 @@
 import Foundation
 
 extension Notification.Name {
+    static let providerModelCatalogDidChange = Notification.Name("providerModelCatalogDidChange")
     static let showAPISettingsTab = Notification.Name("showAPISettingsTab")
     /// General request to open/focus the dedicated Settings window (Appearance / current tab).
     /// `object` should be the WindowState to target; when omitted, the focused/latest window is used.

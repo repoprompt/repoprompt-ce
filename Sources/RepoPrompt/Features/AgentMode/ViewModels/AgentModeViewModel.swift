@@ -2576,6 +2576,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func setupObservers() {
+        NotificationCenter.default.publisher(for: .providerModelCatalogDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
         guard let promptManager else { return }
         installPromptManagerCascadeResolvers(promptManager)
         installAgentSessionLifecycleProjectionAuthority()

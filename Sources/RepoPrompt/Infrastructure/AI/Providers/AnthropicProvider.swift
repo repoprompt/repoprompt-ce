@@ -3,9 +3,26 @@ import SwiftAnthropic
 
 class AnthropicProvider: AIProvider {
     private let service: AnthropicService
+    private let apiKey: String
+    private let betaHeaders: [String]
 
     init(apiKey: String, betaHeaders: [String] = ["messages-2023-12-15", "prompt-caching-2024-07-31", "output-128k-2025-02-19"]) {
+        self.apiKey = apiKey
+        self.betaHeaders = betaHeaders
         service = AnthropicServiceFactory.service(apiKey: apiKey, betaHeaders: betaHeaders)
+    }
+
+    private func advertisedCapabilities(for model: AIModel?) -> (effort: ClaudeCodeEffortLevel?, adaptive: Bool)? {
+        guard let model else { return nil }
+        switch model {
+        case let .anthropicCustomReasoning(name, effort):
+            return (effort, AnthropicModelCatalog.record(for: name)?.adaptiveThinking ?? false)
+        case let .anthropicCustom(name):
+            guard let record = AnthropicModelCatalog.record(for: name) else { return nil }
+            return (nil, record.adaptiveThinking)
+        default:
+            return nil
+        }
     }
 
     static func isSuccessfulCompletionStopReason(_ stopReason: String) -> Bool {
@@ -81,7 +98,12 @@ class AnthropicProvider: AIProvider {
         let thinkingBudget: Int
         var overrideMaxTokens = 8192
 
-        if modelName.hasSuffix("-thinking-max") {
+        let capabilities = advertisedCapabilities(for: model)
+        if capabilities != nil {
+            baseModelName = modelName
+            isThinkingMode = false
+            thinkingBudget = 0
+        } else if modelName.hasSuffix("-thinking-max") {
             baseModelName = String(modelName.dropLast("-thinking-max".count))
             isThinkingMode = true
             thinkingBudget = 32000
@@ -112,7 +134,7 @@ class AnthropicProvider: AIProvider {
 
         var temperature: Double? = 0
         // Skip temperature setting for thinking models
-        if isThinkingMode {
+        if isThinkingMode || capabilities?.adaptive == true {
             temperature = nil
         }
         // Apply user-defined temperature if override is enabled (for non-thinking models)
@@ -131,7 +153,14 @@ class AnthropicProvider: AIProvider {
             thinking: isThinkingMode ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
         )
 
-        let stream = try await service.streamMessage(parameters)
+        let stream: AsyncThrowingStream<MessageStreamResponse, Error>
+        if let capabilities {
+            let request = try AnthropicModelRequest(parameters: parameters, effort: capabilities.effort, adaptiveThinking: capabilities.adaptive)
+                .request(apiKey: apiKey, betaHeaders: betaHeaders)
+            stream = try await service.fetchStream(type: MessageStreamResponse.self, with: request, debugEnabled: false)
+        } else {
+            stream = try await service.streamMessage(parameters)
+        }
 
         return AsyncThrowingStream { continuation in
             Task {
@@ -246,7 +275,11 @@ class AnthropicProvider: AIProvider {
         let thinkingBudget: Int
         var overrideMaxTokens = maxTokens ?? 4096
 
-        if modelName.hasSuffix("-thinking-max") {
+        if advertisedCapabilities(for: model) != nil {
+            baseModelName = modelName
+            isThinkingMode = false
+            thinkingBudget = 0
+        } else if modelName.hasSuffix("-thinking-max") {
             baseModelName = String(modelName.dropLast("-thinking-max".count))
             isThinkingMode = true
             thinkingBudget = 32000
@@ -270,10 +303,10 @@ class AnthropicProvider: AIProvider {
         }
 
         let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
-        return try await completeMessage(aiMessage, model: anthropicModel, maxTokens: overrideMaxTokens, isThinkingMode: isThinkingMode, thinkingBudget: thinkingBudget)
+        return try await completeMessage(aiMessage, model: anthropicModel, maxTokens: overrideMaxTokens, isThinkingMode: isThinkingMode, thinkingBudget: thinkingBudget, selectedModel: model)
     }
 
-    private func completeMessage(_ aiMessage: AIMessage, model: SwiftAnthropic.Model, maxTokens: Int? = nil, isThinkingMode: Bool = false, thinkingBudget: Int = 0) async throws -> AICompletionResult {
+    private func completeMessage(_ aiMessage: AIMessage, model: SwiftAnthropic.Model, maxTokens: Int? = nil, isThinkingMode: Bool = false, thinkingBudget: Int = 0, selectedModel: AIModel? = nil) async throws -> AICompletionResult {
         guard !aiMessage.systemPrompt.isEmpty else {
             throw AIProviderError.invalidSystemPrompt
         }
@@ -290,7 +323,14 @@ class AnthropicProvider: AIProvider {
             thinking: isThinkingMode ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
         )
 
-        let response = try await service.createMessage(parameters)
+        let response: MessageResponse
+        if let capabilities = advertisedCapabilities(for: selectedModel) {
+            let request = try AnthropicModelRequest(parameters: parameters, effort: capabilities.effort, adaptiveThinking: capabilities.adaptive)
+                .request(apiKey: apiKey, betaHeaders: betaHeaders)
+            response = try await service.fetch(type: MessageResponse.self, with: request, debugEnabled: false)
+        } else {
+            response = try await service.createMessage(parameters)
+        }
 
         let text = response.content.compactMap { contentItem in
             switch contentItem {

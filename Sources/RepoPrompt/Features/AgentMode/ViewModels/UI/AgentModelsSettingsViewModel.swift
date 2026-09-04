@@ -540,6 +540,14 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     private func observeNotifications() {
+        apiSettingsVM.$availableModels
+            .dropFirst()
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        notificationCenter.publisher(for: .providerModelCatalogDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
         notificationCenter.publisher(for: .recommendationsShouldRefresh)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refresh() }

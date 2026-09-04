@@ -491,7 +491,7 @@ struct ClaudeAgentToolPreferences {
 
 // MARK: - Claude Code Effort Level
 
-enum ClaudeCodeEffortLevel: String, CaseIterable {
+public enum ClaudeCodeEffortLevel: String, CaseIterable, Codable {
     // Ordered highest → lowest so UI pickers and variant menus list the
     // strongest effort first. `allCases` drives both `AgentInputBar`'s Claude
     // effort picker and `claudeEffortSortRank` in `AgentModelCatalog`.

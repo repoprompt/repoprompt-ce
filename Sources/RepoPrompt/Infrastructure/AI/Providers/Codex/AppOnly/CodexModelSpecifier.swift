@@ -18,9 +18,46 @@ struct CodexModelSpecifier: Equatable {
         self.serviceTier = self.baseModel == nil ? nil : serviceTier
     }
 
-    init(raw: String?) {
+    init(raw: String?, records: [CodexDynamicModelRecord] = CodexDynamicModelStore.resolutionRecords()) {
+        if let resolved = Self.discoveredModel(raw, records: records) {
+            self = resolved
+            return
+        }
         let parts = Self.splitLegacyModelID(raw)
         self.init(baseModel: parts.baseModel, reasoningEffort: parts.reasoningEffort, serviceTier: parts.serviceTier)
+    }
+
+    private static func discoveredModel(_ raw: String?, records: [CodexDynamicModelRecord]) -> Self? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty, raw.lowercased() != "default" else { return nil }
+        // An exact advertised model always wins over an effort-looking family suffix.
+        if let record = records.first(where: {
+            $0.id.caseInsensitiveCompare(raw) == .orderedSame || $0.model.caseInsensitiveCompare(raw) == .orderedSame
+        }) {
+            return Self(baseModel: record.model.isEmpty ? record.id : record.model, reasoningEffort: nil)
+        }
+        for record in records {
+            let model = record.model.isEmpty ? record.id : record.model
+            let identities = Set([record.id, model])
+            let efforts = record.supportedReasoningEfforts.map(\.reasoningEffort) + [record.defaultReasoningEffort].compactMap(\.self)
+            for identity in identities {
+                for effort in efforts.compactMap(ReasoningEffort.parse) {
+                    if "\(identity)-\(effort.rawValue)".caseInsensitiveCompare(raw) == .orderedSame {
+                        return Self(baseModel: model, reasoningEffort: effort)
+                    }
+                    if CodexServiceTierVariantCatalog.isFastEligible(baseModelID: model),
+                       "\(identity)-fast-\(effort.rawValue)".caseInsensitiveCompare(raw) == .orderedSame
+                    {
+                        return Self(baseModel: model, reasoningEffort: effort, serviceTier: "fast")
+                    }
+                }
+                if CodexServiceTierVariantCatalog.isFastEligible(baseModelID: model),
+                   "\(identity)-fast".caseInsensitiveCompare(raw) == .orderedSame
+                {
+                    return Self(baseModel: model, reasoningEffort: nil, serviceTier: "fast")
+                }
+            }
+        }
+        return nil
     }
 
     static func splitLegacyModelID(_ raw: String?) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {

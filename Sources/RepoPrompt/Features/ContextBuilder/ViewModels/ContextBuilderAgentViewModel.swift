@@ -937,6 +937,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         // Reload agent/model when recommendations are applied
+        NotificationCenter.default.publisher(for: .providerModelCatalogDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
         NotificationCenter.default.publisher(for: .recommendationsDidApply)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in

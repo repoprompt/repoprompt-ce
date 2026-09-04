@@ -169,6 +169,7 @@ public enum AIModel: Equatable, Hashable {
     case openaiCustomResponses(name: String)
     case openaiCustomReasoning(name: String, effort: CodexReasoningEffort)
     case anthropicCustom(name: String)
+    case anthropicCustomReasoning(name: String, effort: ClaudeCodeEffortLevel)
     case geminiCustom(name: String)
     case deepseekCustom(name: String)
     case fireworksCustom(name: String)
@@ -517,6 +518,8 @@ public enum AIModel: Equatable, Hashable {
             return "\(ClaudeCodeAIModelCatalog.rawPrefix)\(ClaudeCodeAIModelCatalog.normalizedSpecifier(specifier))"
         case let .anthropicCustom(n):
             return "anthropic_custom_\(n)"
+        case let .anthropicCustomReasoning(n, effort):
+            return "anthropic_reasoning_\(effort.rawValue)__\(n)"
         case let .geminiCustom(n):
             return "gemini_custom_\(n)"
         case let .deepseekCustom(n):
@@ -562,7 +565,10 @@ public enum AIModel: Equatable, Hashable {
         if case let .openaiCustomResponses(n) = self { return "\(n)" }
         if case let .openaiCustomReasoning(n, effort) = self { return "\(n) \(effort.displayName)" }
         if case let .claudeCodeModel(specifier) = self { return ClaudeCodeAIModelCatalog.displayName(for: specifier) }
-        if case let .anthropicCustom(n) = self { return "\(n)" }
+        if case let .anthropicCustom(n) = self { return AnthropicModelCatalog.record(for: n)?.displayName ?? n }
+        if case let .anthropicCustomReasoning(n, effort) = self {
+            return "\(AnthropicModelCatalog.record(for: n)?.displayName ?? n) \(effort.displayName)"
+        }
         if case let .geminiCustom(n) = self { return "\(n)" }
         if case let .deepseekCustom(n) = self { return "\(n)" }
         if case let .fireworksCustom(n) = self { return "\(n)" }
@@ -654,7 +660,7 @@ public enum AIModel: Equatable, Hashable {
             return .ollama
         case .openaiCustom, .openaiCustomResponses, .openaiCustomReasoning:
             return .openAI
-        case .anthropicCustom: return .anthropic
+        case .anthropicCustom, .anthropicCustomReasoning: return .anthropic
         case .geminiCustom: return .gemini
         case .deepseekCustom: return .deepseek
         case .fireworksCustom: return .fireworks
@@ -709,6 +715,8 @@ public enum AIModel: Equatable, Hashable {
             return n
         case let .claudeCodeModel(specifier):
             return ClaudeModelSpecifier(raw: specifier).runtimeModelParam ?? ""
+        case let .anthropicCustomReasoning(n, _):
+            return n
         case let .anthropicCustom(n),
              let .geminiCustom(n),
              let .deepseekCustom(n),
@@ -1019,7 +1027,7 @@ public enum AIModel: Equatable, Hashable {
              .openaiCustom(_),
              .openaiCustomResponses(_),
              .openaiCustomReasoning(_, _),
-             .anthropicCustom(_),
+             .anthropicCustom(_), .anthropicCustomReasoning,
              .geminiCustom(_),
              .deepseekCustom(_),
              .fireworksCustom(_),
@@ -1132,6 +1140,8 @@ public enum AIModel: Equatable, Hashable {
         case let .claudeCodeModel(specifier):
             return ClaudeModelSpecifier(raw: specifier).explicitEffortLevel?.rawValue
         case let .openaiCustomReasoning(_, effort):
+            return effort.rawValue
+        case let .anthropicCustomReasoning(_, effort):
             return effort.rawValue
         default: return nil
         }
@@ -1246,6 +1256,15 @@ public enum AIModel: Equatable, Hashable {
                 return nil
             }
         }
+        if normalizedRawValue.hasPrefix("anthropic_reasoning_") {
+            let rest = String(normalizedRawValue.dropFirst("anthropic_reasoning_".count))
+            if let separator = rest.range(of: "__"),
+               let effort = ClaudeCodeEffortLevel.parse(String(rest[..<separator.lowerBound]))
+            {
+                return .anthropicCustomReasoning(name: String(rest[separator.upperBound...]), effort: effort)
+            }
+            return nil
+        }
         if normalizedRawValue.hasPrefix("codex_custom_") {
             return .codexCustom(name: String(normalizedRawValue.dropFirst("codex_custom_".count)))
         }
@@ -1332,7 +1351,12 @@ public enum AIModel: Equatable, Hashable {
         let models: [AIModel]
         switch provider {
         case .anthropic:
-            models = Array(modelGroups[ProviderIndex.anthropic])
+            let fallback = Array(modelGroups[ProviderIndex.anthropic])
+            let knownNames = Set(fallback.map(\.modelName))
+            models = fallback + AnthropicModelCatalog.models().filter {
+                if case .anthropicCustomReasoning = $0 { return true }
+                return !knownNames.contains($0.modelName)
+            }
         case .openAI:
             models = Array(modelGroups[ProviderIndex.openAI])
         case .gemini:
@@ -1357,7 +1381,9 @@ public enum AIModel: Equatable, Hashable {
         case .fireworks: // <-- Add Fireworks case
             models = Array(modelGroups[ProviderIndex.fireworks])
         case .grok: // <-- Add Grok case
-            models = Array(modelGroups[ProviderIndex.grok])
+            let fallback = Array(modelGroups[ProviderIndex.grok])
+            let knownNames = Set(fallback.map(\.modelName))
+            models = fallback + GrokModelCatalog.names().filter { !knownNames.contains($0) }.map { .grokCustom(name: $0) }
         case .groq: // <-- Add Groq case
             models = Array(modelGroups[ProviderIndex.groq])
         case .zAI:
@@ -1611,7 +1637,7 @@ public enum AIModel: Equatable, Hashable {
 
     static func codexBaseDisplayName(for baseModelID: String, fallbackDisplayName: String) -> String {
         if let storeLabel = CodexDynamicModelStore.displayName(forModelID: baseModelID) {
-            let normalizedStoreLabel = normalizedCodexBaseLabel(storeLabel)
+            let normalizedStoreLabel = storeLabel.trimmingCharacters(in: .whitespacesAndNewlines)
             if !normalizedStoreLabel.isEmpty {
                 return codexPreviewDisplayAlias(for: normalizedStoreLabel) ?? normalizedStoreLabel
             }
@@ -1944,7 +1970,11 @@ public enum AIModel: Equatable, Hashable {
     static func allModels() -> [AIModel] {
         var models: [AIModel] = []
         for (providerIndex, group) in modelGroups.enumerated() {
-            if providerIndex == ProviderIndex.claudeCode {
+            if providerIndex == ProviderIndex.anthropic {
+                models.append(contentsOf: modelsForProvider(.anthropic))
+            } else if providerIndex == ProviderIndex.grok {
+                models.append(contentsOf: modelsForProvider(.grok))
+            } else if providerIndex == ProviderIndex.claudeCode {
                 models.append(contentsOf: ClaudeCodeAIModelCatalog.modelsForPicker())
             } else if providerIndex == ProviderIndex.codex {
                 models.append(contentsOf: codexModelsForPicker())
@@ -1970,6 +2000,7 @@ public enum AIModel: Equatable, Hashable {
         case openaiCustomResponses(name: String)
         case openaiCustomReasoning(name: String, effort: CodexReasoningEffort)
         case anthropicCustom(name: String)
+        case anthropicCustomReasoning(name: String, effort: ClaudeCodeEffortLevel)
         case geminiCustom(name: String)
         case deepseekCustom(name: String)
         case fireworksCustom(name: String)
@@ -2115,6 +2146,8 @@ public enum AIModel: Equatable, Hashable {
             .openaiCustomReasoning(name: name, effort: effort)
         case let .anthropicCustom(name):
             .anthropicCustom(name: name)
+        case let .anthropicCustomReasoning(name, effort):
+            .anthropicCustomReasoning(name: name, effort: effort)
         case let .geminiCustom(name):
             .geminiCustom(name: name)
         case let .deepseekCustom(name):

@@ -90,6 +90,7 @@ enum CodexDynamicModelMapper {
     static func options(from records: [CodexDynamicModelRecord]) -> [CodexDynamicModelOption] {
         var options: [CodexDynamicModelOption] = []
         var seen = Set<String>()
+        let advertisedIDs = CodexDynamicModelStore.reservedBaseIDs().union(records.flatMap { [$0.id.lowercased(), $0.model.lowercased()] })
 
         for record in records {
             let baseID = normalizeID(record.id)
@@ -101,7 +102,10 @@ enum CodexDynamicModelMapper {
                 fallbackID: baseID
             )
             let baseDescription = record.description.trimmingCharacters(in: .whitespacesAndNewlines)
-            let effortEntries = normalizedEfforts(for: record, fallbackDescription: baseDescription)
+            // A saved base identity cannot also denote a newly generated effort choice.
+            let effortEntries = normalizedEfforts(for: record, fallbackDescription: baseDescription).filter {
+                !advertisedIDs.contains("\(baseID)-\($0.effort.rawValue)".lowercased())
+            }
 
             if effortEntries.isEmpty {
                 appendOption(
@@ -161,6 +165,9 @@ enum CodexDynamicModelMapper {
         let normalizedID = normalizeID(id)
         let lookupID = normalizedID.lowercased()
         guard !lookupID.isEmpty else { return nil }
+        if let record = records.first(where: { $0.id.lowercased() == lookupID || $0.model.lowercased() == lookupID }) {
+            return formatBaseDisplayName(record.displayName, fallbackModel: record.model, fallbackID: record.id)
+        }
 
         for record in records {
             let baseID = normalizeID(record.id)
@@ -311,7 +318,7 @@ enum CodexDynamicModelMapper {
 }
 
 enum CodexDynamicModelStore {
-    private static let storageKey = "CodexDynamicModelRecords"
+    private static let cache = ProviderModelDiscoveryCache<CodexDynamicModelRecord>(key: "CodexDynamicModelRecords", identity: { $0.id })
 
     static func canonicalRecords(from models: [CodexAppServerClient.RemoteModel]) -> [CodexDynamicModelRecord] {
         models
@@ -321,13 +328,19 @@ enum CodexDynamicModelStore {
 
     static func save(_ models: [CodexAppServerClient.RemoteModel], defaults: UserDefaults = .standard) {
         let records = canonicalRecords(from: models)
-        guard let data = try? JSONEncoder().encode(records) else { return }
-        defaults.set(data, forKey: storageKey)
+        cache.save(records, defaults: defaults)
     }
 
     static func load(defaults: UserDefaults = .standard) -> [CodexDynamicModelRecord] {
-        guard let data = defaults.data(forKey: storageKey) else { return [] }
-        return (try? JSONDecoder().decode([CodexDynamicModelRecord].self, from: data)) ?? []
+        cache.current(defaults: defaults)
+    }
+
+    static func resolutionRecords(defaults: UserDefaults = .standard) -> [CodexDynamicModelRecord] {
+        cache.remembered(defaults: defaults)
+    }
+
+    static func reservedBaseIDs(defaults: UserDefaults = .standard) -> Set<String> {
+        Set(resolutionRecords(defaults: defaults).flatMap { [$0.id.lowercased(), $0.model.lowercased()] })
     }
 
     static func modelOptions(defaults: UserDefaults = .standard) -> [CodexDynamicModelOption] {
@@ -335,7 +348,7 @@ enum CodexDynamicModelStore {
     }
 
     static func displayName(forModelID id: String, defaults: UserDefaults = .standard) -> String? {
-        CodexDynamicModelMapper.displayName(forModelID: id, records: load(defaults: defaults))
+        CodexDynamicModelMapper.displayName(forModelID: id, records: resolutionRecords(defaults: defaults))
     }
 
     private static func canonicalRecord(from model: CodexAppServerClient.RemoteModel) -> CodexDynamicModelRecord? {
@@ -477,6 +490,7 @@ enum CodexAIModelCatalog {
     private static func synthesizedFastAIModels(from models: [AIModel]) -> [AIModel] {
         var synthesized: [AIModel] = []
         var seen = Set(models.map { $0.modelName.lowercased() })
+        seen.formUnion(CodexDynamicModelStore.reservedBaseIDs())
 
         for model in models {
             guard case let .codexCustom(name) = model else { continue }

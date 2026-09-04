@@ -92,6 +92,7 @@ final class AgentCodexModelRegistry {
     private func synthesizedFastAgentOptions(from options: [AgentModelOption]) -> [AgentModelOption] {
         var synthesized: [AgentModelOption] = []
         var seen = Set(options.map { $0.rawValue.lowercased() })
+        seen.formUnion(CodexDynamicModelStore.reservedBaseIDs())
 
         for option in options where !option.isPlaceholderDefault {
             let specifier = CodexModelSpecifier(raw: option.rawValue)
@@ -105,7 +106,7 @@ final class AgentCodexModelRegistry {
 
             synthesized.append(AgentModelOption(
                 rawValue: fastID,
-                displayName: fastDisplayName(for: option, reasoningEffort: specifier.reasoningEffort),
+                displayName: fastDisplayName(for: option, baseModel: baseModel, reasoningEffort: specifier.reasoningEffort),
                 description: fastDescription(for: option.description),
                 isPlaceholderDefault: false,
                 isProviderDefault: false,
@@ -117,8 +118,8 @@ final class AgentCodexModelRegistry {
         return synthesized
     }
 
-    private func fastDisplayName(for option: AgentModelOption, reasoningEffort: CodexReasoningEffort?) -> String {
-        let baseLabel = AIModel.stripCodexReasoningSuffix(from: option.displayName)
+    private func fastDisplayName(for option: AgentModelOption, baseModel: String, reasoningEffort: CodexReasoningEffort?) -> String {
+        let baseLabel = AIModel.codexBaseDisplayName(for: baseModel, fallbackDisplayName: option.displayName)
         let fastLabel = baseLabel.range(of: " fast", options: [.caseInsensitive, .backwards]) == nil
             ? "\(baseLabel) Fast"
             : baseLabel

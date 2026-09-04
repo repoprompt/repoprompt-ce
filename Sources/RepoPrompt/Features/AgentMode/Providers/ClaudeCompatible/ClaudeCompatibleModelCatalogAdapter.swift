@@ -187,6 +187,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         {
             return false
         }
+        if agentKind == .claudeCode, ClaudeDynamicModelStore.record(for: baseModel) != nil { return true }
         guard let known = AgentModel.resolvedModel(forRaw: baseModel, agentKind: agentKind) else { return false }
         guard known.isValidFor(agentKind) else { return false }
         return known.isAvailable
@@ -197,6 +198,9 @@ enum ClaudeCompatibleModelCatalogAdapter {
         isSupportedForBaseModelRaw baseModelRaw: String?,
         agentKind: AgentProviderKind?
     ) -> Bool {
+        if agentKind == .claudeCode, let record = ClaudeDynamicModelStore.record(for: baseModelRaw) {
+            return record.efforts.contains(effort)
+        }
         if let agentKind, compatibleBackendModelBehavior(for: agentKind) == .noModel {
             return false
         }
@@ -222,10 +226,35 @@ enum ClaudeCompatibleModelCatalogAdapter {
         agentKind: AgentProviderKind,
         includeClaudeEffortVariants: Bool
     ) -> ClaudeCompatiblePluginModelCatalogSnapshot {
-        ClaudeCompatibleProviderRuntimeBridge.modelCatalogSnapshot(
+        let fallback = ClaudeCompatibleProviderRuntimeBridge.modelCatalogSnapshot(
             pluginID: pluginID,
             backendConfig: compatibleBackendConfig(for: agentKind),
             includeEffortVariants: includeClaudeEffortVariants
+        )
+        guard agentKind == .claudeCode else { return fallback }
+        let records = ClaudeDynamicModelStore.records()
+        guard !records.isEmpty else { return fallback }
+        let discovered = records.flatMap { record -> [ClaudeCompatiblePluginModelOption] in
+            let efforts: [ClaudeCodeEffortLevel?] = includeClaudeEffortVariants && !record.efforts.isEmpty
+                ? record.efforts.map(\.self) : [nil]
+            return efforts.map { effort in
+                ClaudeCompatiblePluginModelOption(
+                    rawValue: effort.map { ClaudeModelSpecifier.encodedRaw(baseModelRaw: record.value, effort: $0) } ?? record.value,
+                    displayName: record.displayName + (effort.map { " \($0.displayName)" } ?? ""),
+                    description: record.description,
+                    isPlaceholderDefault: false,
+                    isProviderDefault: false,
+                    supportedEffortLevels: record.efforts.map(\.rawValue)
+                )
+            }
+        }
+        let identities = Set(records.map { $0.value.lowercased() })
+        return ClaudeCompatiblePluginModelCatalogSnapshot(
+            pluginID: fallback.pluginID,
+            defaultModelRaw: fallback.defaultModelRaw,
+            options: discovered + fallback.options.filter {
+                !identities.contains(ClaudeModelSpecifier(raw: $0.rawValue).baseModel?.lowercased() ?? "")
+            }
         )
     }
 
