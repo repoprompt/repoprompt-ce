@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Regression coverage for the Tip Stable-build floor and reset authority."""
+"""Regression coverage for release packaging and rollout tooling."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 ROLLOUT_TOOL = SCRIPT_DIR / "stable_rollout.py"
 POLICY = SCRIPT_DIR / "apple_identity_policy.json"
+PROFILE_TOOL = SCRIPT_DIR / "embedded_provisioning_profile.py"
 
 
 class StableTipFloorTests(unittest.TestCase):
@@ -358,6 +360,85 @@ class StableTipFloorTests(unittest.TestCase):
                 with self.subTest(case=label):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(diagnostic, result.stderr)
+
+
+class EmbeddedProvisioningProfileTests(unittest.TestCase):
+    def run_tool(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(PROFILE_TOOL), *arguments],
+            cwd=ROOT_DIR,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+
+    def test_install_normalizes_owner_only_source_to_deployed_readable_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "release.provisionprofile"
+            destination = root / "RepoPrompt.app" / "Contents" / "embedded.provisionprofile"
+            payload = b"fixture provisioning profile\n"
+            source.write_bytes(payload)
+            source.chmod(0o600)
+
+            result = self.run_tool("install", str(source), str(destination))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o644)
+            self.assertNotEqual(destination.stat().st_mode & stat.S_IROTH, 0)
+            self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o600)
+
+    def test_install_replaces_destination_symlink_without_mutating_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "release.provisionprofile"
+            target = root / "protected-target"
+            destination = root / "RepoPrompt.app" / "Contents" / "embedded.provisionprofile"
+            source.write_bytes(b"fixture provisioning profile\n")
+            source.chmod(0o600)
+            target.write_bytes(b"protected target\n")
+            target.chmod(0o600)
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(target)
+
+            result = self.run_tool("install", str(source), str(destination))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o644)
+            self.assertEqual(target.read_bytes(), b"protected target\n")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_validate_rejects_sealed_profile_unreadable_by_non_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "embedded.provisionprofile"
+            profile.write_bytes(b"fixture provisioning profile\n")
+            profile.chmod(0o600)
+
+            result = self.run_tool("validate", str(profile))
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must use deployed-readable mode 0644, got 0600", result.stderr)
+
+    def test_every_release_signing_path_installs_and_validates_profile_before_distribution(self) -> None:
+        cases = (
+            ("package_app.sh", 'phase "Signing app bundle"'),
+            ("sign_staged_release.sh", "sign_path() {"),
+        )
+        for filename, signing_marker in cases:
+            source = (SCRIPT_DIR / filename).read_text(encoding="utf-8")
+            install = source.index('embedded_provisioning_profile.py" install')
+            validate = source.index('embedded_provisioning_profile.py" validate')
+            strict_verification = source.rindex('codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"')
+            with self.subTest(script=filename):
+                self.assertLess(install, source.index(signing_marker))
+                self.assertGreater(validate, strict_verification)
+                self.assertNotIn(
+                    'cp "$REPOPROMPT_PROVISIONING_PROFILE"',
+                    source,
+                )
 
 
 if __name__ == "__main__":
