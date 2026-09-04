@@ -4,9 +4,15 @@ import Foundation
 @MainActor
 final class AppDeepLinkRouter {
     private struct WorkspaceCandidateRepresentation {
+        enum Source {
+            case authority
+            case pendingPersistentPublication(PendingPersistentWorkspacePublication)
+            case ephemeralLiveWindow
+        }
+
         let workspace: WorkspaceModel
         let targetWindow: WindowState
-        let isAuthorityOwned: Bool
+        let source: Source
     }
 
     static let shared = AppDeepLinkRouter()
@@ -117,32 +123,48 @@ final class AppDeepLinkRouter {
             )
             return
         }
+        let expectedRoot = WorkspaceRootSetKey(paths: [folderPath])
+        let admitsEphemeral = command.ephemeral == true || command.persist == false
         var candidateRepresentations: [UUID: WorkspaceCandidateRepresentation] = [:]
 
-        // Persistent candidates come from one runtime-owned catalog snapshot in production.
-        // Active windows supplement authority-missing IDs so ephemeral and not-yet-published
-        // workspaces remain reusable without turning per-window projections into authority.
+        // Persistent candidates come from one runtime-owned catalog snapshot. An authority-absent
+        // persistent model is visible only while its exact creation task has a retained publication
+        // token; live-window supplementation is otherwise restricted to ephemeral workspaces.
         for workspace in routingCatalog {
             candidateRepresentations[workspace.id] = WorkspaceCandidateRepresentation(
                 workspace: workspace,
                 targetWindow: receivingWindow,
-                isAuthorityOwned: true
+                source: .authority
             )
         }
         for window in liveWindows {
-            if let activeWorkspace = window.workspaceManager.activeWorkspace,
+            for workspace in window.workspaceManager.workspaces
+                where !workspace.isEphemeral && candidateRepresentations[workspace.id] == nil
+            {
+                guard let publication = window.workspaceManager.pendingPersistentWorkspacePublication(
+                    workspaceID: workspace.id,
+                    exactRoot: expectedRoot
+                ) else { continue }
+                candidateRepresentations[workspace.id] = WorkspaceCandidateRepresentation(
+                    workspace: workspace,
+                    targetWindow: window,
+                    source: .pendingPersistentPublication(publication)
+                )
+            }
+            if admitsEphemeral,
+               let activeWorkspace = window.workspaceManager.activeWorkspace,
+               activeWorkspace.isEphemeral,
                candidateRepresentations[activeWorkspace.id] == nil
             {
                 candidateRepresentations[activeWorkspace.id] = WorkspaceCandidateRepresentation(
                     workspace: activeWorkspace,
                     targetWindow: window,
-                    isAuthorityOwned: false
+                    source: .ephemeralLiveWindow
                 )
             }
         }
 
         let candidates = candidateRepresentations.values.map(\.workspace)
-        let admitsEphemeral = command.ephemeral == true || command.persist == false
         guard let winner = WorkspaceFolderOpenResolver.bestEligibleMatch(
             forFolderPath: folderPath,
             in: candidates,
@@ -159,16 +181,18 @@ final class AppDeepLinkRouter {
             return
         }
 
-        let targetWindow: WindowState = if command.focus == true,
-                                           let activeWindow = liveWindows.first(where: { window in
-                                               guard let activeWorkspace = window.workspaceManager.activeWorkspace,
-                                                     activeWorkspace.id == winner.id
-                                               else { return false }
-                                               return WorkspaceFolderOpenResolver.containsExactRoot(
-                                                   folderPath,
-                                                   in: activeWorkspace
-                                               )
-                                           })
+        let targetWindow: WindowState = if case .pendingPersistentPublication = winningRepresentation.source {
+            winningRepresentation.targetWindow
+        } else if command.focus == true,
+                  let activeWindow = liveWindows.first(where: { window in
+                      guard let activeWorkspace = window.workspaceManager.activeWorkspace,
+                            activeWorkspace.id == winner.id
+                      else { return false }
+                      return WorkspaceFolderOpenResolver.containsExactRoot(
+                          folderPath,
+                          in: activeWorkspace
+                      )
+                  })
         {
             activeWindow
         } else {
@@ -183,11 +207,13 @@ final class AppDeepLinkRouter {
             )
             return
         }
-        let expectedRoot = WorkspaceRootSetKey(paths: [folderPath])
-        let folderRoute: FolderRouteState = if winningRepresentation.isAuthorityOwned {
+        let folderRoute: FolderRouteState = switch winningRepresentation.source {
+        case .authority:
             .authorityExactRoot(expectedRoot: expectedRoot)
-        } else {
-            .liveWindowSupplement(
+        case let .pendingPersistentPublication(publication):
+            .pendingPersistentPublication(publication)
+        case .ephemeralLiveWindow:
+            .ephemeralLiveWindowSupplement(
                 workspaceID: winner.id,
                 expectedRoot: expectedRoot
             )

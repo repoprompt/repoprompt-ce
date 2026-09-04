@@ -46,6 +46,27 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
         XCTAssertEqual(ids(WorkspaceFolderOpenResolver.eligibleMatches(forFolderPath: "/tmp/selected", in: [workspace])), [workspace.id])
     }
 
+    func testConsolidatedVisibleMatchIsExcluded() {
+        let canonicalID = UUID()
+        let eligible = makeWorkspace(id: 1, name: "Eligible", paths: ["/tmp/selected"], modified: 1)
+        let retired = makeWorkspace(
+            id: 2,
+            name: "Retired but visible",
+            paths: ["/tmp/selected"],
+            modified: 2,
+            consolidatedIntoWorkspaceID: canonicalID
+        )
+
+        XCTAssertEqual(
+            ids(WorkspaceFolderOpenResolver.eligibleMatches(
+                forFolderPath: "/tmp/selected",
+                in: [retired, eligible]
+            )),
+            [eligible.id]
+        )
+        XCTAssertTrue(WorkspaceFolderOpenResolver.containsExactRoot("/tmp/selected", in: retired))
+    }
+
     func testSystemHiddenAndEphemeralMatchesAreExcluded() {
         let eligible = makeWorkspace(id: 1, name: "Eligible", paths: ["/tmp/selected"], modified: 1)
         let system = makeWorkspace(id: 2, name: "System", paths: ["/tmp/selected"], modified: 4, system: true)
@@ -133,7 +154,8 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
         modified: TimeInterval = 0,
         system: Bool = false,
         hidden: Bool = false,
-        ephemeral: Bool = false
+        ephemeral: Bool = false,
+        consolidatedIntoWorkspaceID: UUID? = nil
     ) -> WorkspaceModel {
         WorkspaceModel(
             id: UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", id))!,
@@ -143,7 +165,8 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
             lastUsed: Date(timeIntervalSince1970: 0),
             isSystemWorkspace: system,
             ephemeralFlag: ephemeral,
-            isHiddenInMenus: hidden
+            isHiddenInMenus: hidden,
+            consolidatedIntoWorkspaceID: consolidatedIntoWorkspaceID
         )
     }
 

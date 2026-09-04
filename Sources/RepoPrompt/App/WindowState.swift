@@ -104,7 +104,8 @@ enum FolderRouteState: Equatable {
     case notRequested
     case unresolved(expectedRoot: WorkspaceRootSetKey)
     case authorityExactRoot(expectedRoot: WorkspaceRootSetKey)
-    case liveWindowSupplement(workspaceID: UUID, expectedRoot: WorkspaceRootSetKey)
+    case pendingPersistentPublication(PendingPersistentWorkspacePublication)
+    case ephemeralLiveWindowSupplement(workspaceID: UUID, expectedRoot: WorkspaceRootSetKey)
 
     var expectedRoot: WorkspaceRootSetKey? {
         switch self {
@@ -112,8 +113,19 @@ enum FolderRouteState: Equatable {
             nil
         case let .unresolved(expectedRoot),
              let .authorityExactRoot(expectedRoot),
-             let .liveWindowSupplement(_, expectedRoot):
+             let .ephemeralLiveWindowSupplement(_, expectedRoot):
             expectedRoot
+        case let .pendingPersistentPublication(publication):
+            publication.expectedRoot
+        }
+    }
+
+    var routedPersistentResolution: PersistentFolderOpenProvenance? {
+        switch self {
+        case .authorityExactRoot, .pendingPersistentPublication:
+            .reused
+        case .notRequested, .unresolved, .ephemeralLiveWindowSupplement:
+            nil
         }
     }
 
@@ -125,8 +137,10 @@ enum FolderRouteState: Equatable {
             "unresolved"
         case .authorityExactRoot:
             "authorityExactRoot"
-        case .liveWindowSupplement:
-            "liveWindowSupplement"
+        case .pendingPersistentPublication:
+            "pendingPersistentPublication"
+        case .ephemeralLiveWindowSupplement:
+            "ephemeralLiveWindowSupplement"
         }
     }
 }
@@ -141,8 +155,14 @@ enum AppCommandExecutionFailure: String, Equatable {
     case payloadApplicationFailed
 }
 
+enum AppCommandPartialSuccessReason: Equatable {
+    case cancelled
+    case failed(AppCommandExecutionFailure)
+}
+
 enum AppCommandExecutionResult: Equatable {
     case completed(workspaceID: UUID?)
+    case partialSuccess(workspaceID: UUID, reason: AppCommandPartialSuccessReason)
     case failed(AppCommandExecutionFailure)
     case cancelled
 }
@@ -340,6 +360,8 @@ class WindowState: ObservableObject {
         var canonicalReresolutionAttempts: Int
         var attemptedWindowIDs: Set<Int>
         var forwardingCount: Int
+        var persistentResolution: PersistentFolderOpenProvenance?
+        var durableCreationCommit: DurablePersistentWorkspaceCreationCommit?
         let completion: AppCommandCompletion?
     }
 
@@ -359,6 +381,14 @@ class WindowState: ObservableObject {
         let workspace: WorkspaceModel
         let source: FolderTargetSource
         let requiresActivationReload: Bool
+        let persistentResolution: PersistentFolderOpenProvenance?
+        let durableCreationCommit: DurablePersistentWorkspaceCreationCommit?
+    }
+
+    private struct DurablePersistentWorkspaceCreationCommit: Equatable {
+        let workspaceID: UUID
+        let expectedRoot: WorkspaceRootSetKey
+        let operationID: UUID
     }
 
     private struct FolderCandidateRepresentation {
@@ -369,7 +399,15 @@ class WindowState: ObservableObject {
     @MainActor
     private enum FolderTargetSource {
         case authority
-        case liveWindow(WindowState)
+        case pendingPersistentPublication(PendingPersistentWorkspacePublication)
+        case ephemeralLiveWindow(WindowState)
+
+        var permitsLocalEphemeralAdmission: Bool {
+            if case .ephemeralLiveWindow = self {
+                return true
+            }
+            return false
+        }
 
         func route(
             workspaceID: UUID,
@@ -378,8 +416,10 @@ class WindowState: ObservableObject {
             switch self {
             case .authority:
                 .authorityExactRoot(expectedRoot: expectedRoot)
-            case .liveWindow:
-                .liveWindowSupplement(
+            case let .pendingPersistentPublication(publication):
+                .pendingPersistentPublication(publication)
+            case .ephemeralLiveWindow:
+                .ephemeralLiveWindowSupplement(
                     workspaceID: workspaceID,
                     expectedRoot: expectedRoot
                 )
@@ -398,6 +438,7 @@ class WindowState: ObservableObject {
     private var activeQueuedCommandID: UUID?
     #if DEBUG
         private var automaticallyProcessesEnqueuedCommands = true
+        private var persistentFolderCreationCommitDidRecordHandlerForTesting: ((UUID) -> Void)?
 
         func setAutomaticCommandProcessingForTesting(_ enabled: Bool) {
             automaticallyProcessesEnqueuedCommands = enabled
@@ -405,6 +446,12 @@ class WindowState: ObservableObject {
 
         var queuedCommandCountForTesting: Int {
             commandQueue.count
+        }
+
+        func setPersistentFolderCreationCommitDidRecordHandlerForTesting(
+            _ handler: ((UUID) -> Void)?
+        ) {
+            persistentFolderCreationCommitDidRecordHandlerForTesting = handler
         }
 
         func stopDomainWorkspaceProjectionForTesting() {
@@ -1332,6 +1379,8 @@ class WindowState: ObservableObject {
             canonicalReresolutionAttempts: 0,
             attemptedWindowIDs: [windowID],
             forwardingCount: 0,
+            persistentResolution: folderRoute.routedPersistentResolution,
+            durableCreationCommit: nil,
             completion: completion
         )
         enqueueQueuedCommand(queuedCommand)
@@ -1511,12 +1560,111 @@ class WindowState: ObservableObject {
         _ queuedCommand: QueuedAppCommand,
         with result: AppCommandExecutionResult
     ) {
-        if case let .failed(failure) = result {
+        let reportedResult = commandResult(
+            result,
+            accountingFor: queuedCommand.durableCreationCommit
+        )
+        let persistentResolutionLabel = switch queuedCommand.persistentResolution {
+        case .created:
+            "created"
+        case .reused:
+            "reused"
+        case nil:
+            "none"
+        }
+        switch reportedResult {
+        case let .failed(failure):
             Self.commandLogger.error(
-                "App command failed route=\(queuedCommand.folderRoute.logLabel, privacy: .public) reason=\(failure.rawValue, privacy: .public)"
+                "App command failed route=\(queuedCommand.folderRoute.logLabel, privacy: .public) resolution=\(persistentResolutionLabel, privacy: .public) reason=\(failure.rawValue, privacy: .public)"
+            )
+        case let .partialSuccess(workspaceID, reason):
+            let reasonLabel = switch reason {
+            case .cancelled:
+                "cancelled"
+            case let .failed(failure):
+                failure.rawValue
+            }
+            Self.commandLogger.warning(
+                "App command partially succeeded route=\(queuedCommand.folderRoute.logLabel, privacy: .public) resolution=\(persistentResolutionLabel, privacy: .public) workspaceID=\(workspaceID.uuidString, privacy: .public) reason=\(reasonLabel, privacy: .public)"
+            )
+        case .completed, .cancelled:
+            break
+        }
+        queuedCommand.completion?(reportedResult)
+    }
+
+    private func commandResult(
+        _ result: AppCommandExecutionResult,
+        accountingFor creationCommit: DurablePersistentWorkspaceCreationCommit?
+    ) -> AppCommandExecutionResult {
+        guard let creationCommit else { return result }
+        return switch result {
+        case .completed, .partialSuccess:
+            result
+        case .cancelled:
+            .partialSuccess(
+                workspaceID: creationCommit.workspaceID,
+                reason: .cancelled
+            )
+        case let .failed(failure):
+            .partialSuccess(
+                workspaceID: creationCommit.workspaceID,
+                reason: .failed(failure)
             )
         }
-        queuedCommand.completion?(result)
+    }
+
+    private func recordResolvedFolderTarget(
+        _ target: ResolvedFolderTarget,
+        forCommandID commandID: UUID
+    ) {
+        guard let index = commandQueue.firstIndex(where: { $0.id == commandID }) else { return }
+        recordPersistentResolution(
+            target.persistentResolution,
+            durableCreationCommit: target.durableCreationCommit,
+            at: index
+        )
+    }
+
+    private func recordPersistentFolderResolution(
+        _ resolution: PersistentFolderOpenResolutionDetails,
+        expectedRoot: WorkspaceRootSetKey,
+        forCommandID commandID: UUID
+    ) -> DurablePersistentWorkspaceCreationCommit? {
+        let creationCommit: DurablePersistentWorkspaceCreationCommit? =
+            if resolution.provenance == .created, resolution.creationCommitted {
+                DurablePersistentWorkspaceCreationCommit(
+                    workspaceID: resolution.workspace.id,
+                    expectedRoot: expectedRoot,
+                    operationID: resolution.operationID
+                )
+            } else {
+                nil
+            }
+        guard let index = commandQueue.firstIndex(where: { $0.id == commandID }) else {
+            return creationCommit
+        }
+        recordPersistentResolution(
+            resolution.provenance,
+            durableCreationCommit: creationCommit,
+            at: index
+        )
+        return creationCommit
+    }
+
+    private func recordPersistentResolution(
+        _ persistentResolution: PersistentFolderOpenProvenance?,
+        durableCreationCommit: DurablePersistentWorkspaceCreationCommit?,
+        at commandIndex: Int
+    ) {
+        if persistentResolution == .created
+            || commandQueue[commandIndex].persistentResolution == nil
+        {
+            commandQueue[commandIndex].persistentResolution = persistentResolution
+        }
+        if commandQueue[commandIndex].durableCreationCommit == nil {
+            commandQueue[commandIndex].durableCreationCommit = durableCreationCommit
+        }
     }
 
     @MainActor
@@ -1780,6 +1928,7 @@ class WindowState: ObservableObject {
         switch resolution {
         case let .resolved(resolvedTarget):
             target = resolvedTarget
+            recordResolvedFolderTarget(target, forCommandID: queuedCommand.id)
         case let .retry(folderRoute):
             return .retry(folderRoute)
         case let .terminal(result):
@@ -1816,12 +1965,7 @@ class WindowState: ObservableObject {
         }
 
         guard let activeWorkspace = workspaceManager.activeWorkspace,
-              activeWorkspace.id == target.workspace.id,
-              WorkspaceFolderOpenResolver.bestEligibleMatch(
-                  forFolderPath: folderURL.path,
-                  in: [activeWorkspace],
-                  admittingEphemeral: shouldBeEphemeral
-              )?.id == target.workspace.id
+              activeWorkspace.id == target.workspace.id
         else {
             return retryOrTerminal(
                 queuedCommand,
@@ -1829,8 +1973,21 @@ class WindowState: ObservableObject {
                 failure: .routeChangedAfterRetry
             )
         }
+        let admitsLocalEphemeralTarget = activeWorkspace.isEphemeral
+            && target.source.permitsLocalEphemeralAdmission
+        guard WorkspaceFolderOpenResolver.bestEligibleMatch(
+            forFolderPath: folderURL.path,
+            in: [activeWorkspace],
+            admittingEphemeral: admitsLocalEphemeralTarget
+        )?.id == target.workspace.id else {
+            return retryOrTerminal(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
 
-        if !shouldBeEphemeral {
+        if !admitsLocalEphemeralTarget {
             guard let routingCatalog = await workspaceManager.workspaceRoutingCatalogSnapshot() else {
                 return .terminal(.failed(.authorityFailure))
             }
@@ -1841,18 +1998,16 @@ class WindowState: ObservableObject {
                 forFolderPath: folderURL.path,
                 in: routingCatalog
             )
-            if case .authority = target.source {
-                guard currentAuthorityWinner?.id == target.workspace.id else {
-                    return retryOrTerminal(
-                        queuedCommand,
-                        expectedRoot: expectedRoot,
-                        failure: .routeChangedAfterRetry
-                    )
-                }
-            } else if currentAuthorityWinner.map({ $0.id != target.workspace.id }) == true
-                || currentAuthorityWinner == nil
-                && routingCatalog.contains(where: { $0.id == target.workspace.id })
-            {
+            guard let authoritativeTarget = routingCatalog.first(where: {
+                $0.id == target.workspace.id
+            }),
+                WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeTarget),
+                WorkspaceFolderOpenResolver.bestEligibleMatch(
+                    forFolderPath: folderURL.path,
+                    in: [authoritativeTarget]
+                )?.id == target.workspace.id,
+                currentAuthorityWinner?.id == target.workspace.id
+            else {
                 return retryOrTerminal(
                     queuedCommand,
                     expectedRoot: expectedRoot,
@@ -1866,7 +2021,8 @@ class WindowState: ObservableObject {
               WorkspaceFolderOpenResolver.bestEligibleMatch(
                   forFolderPath: folderURL.path,
                   in: [payloadAdmissionWorkspace],
-                  admittingEphemeral: shouldBeEphemeral
+                  admittingEphemeral: payloadAdmissionWorkspace.isEphemeral
+                      && target.source.permitsLocalEphemeralAdmission
               )?.id == target.workspace.id
         else {
             return retryOrTerminal(
@@ -1888,6 +2044,14 @@ class WindowState: ObservableObject {
         expectedRoot: WorkspaceRootSetKey,
         shouldBeEphemeral: Bool
     ) async -> FolderTargetResolution {
+        if case let .pendingPersistentPublication(publication) = queuedCommand.folderRoute {
+            return await resolvePendingPersistentFolderTarget(
+                publication,
+                for: queuedCommand,
+                folderURL: folderURL,
+                expectedRoot: expectedRoot
+            )
+        }
         if shouldBeEphemeral {
             return await resolveEphemeralFolderTarget(
                 folderURL: folderURL,
@@ -1904,43 +2068,100 @@ class WindowState: ObservableObject {
                 folderURL: folderURL,
                 expectedRoot: expectedRoot
             )
-        case let .liveWindowSupplement(workspaceID, _):
-            guard let routingCatalog = await workspaceManager.workspaceRoutingCatalogSnapshot() else {
-                return .terminal(.failed(.authorityFailure))
-            }
-            if let interruption = commandInterruptionResult() {
-                return .terminal(interruption)
-            }
-            if routingCatalog.contains(where: { $0.id == workspaceID })
-                || WorkspaceFolderOpenResolver.bestEligibleMatch(
-                    forFolderPath: folderURL.path,
-                    in: routingCatalog
-                ) != nil
-            {
-                return await resolvePersistentFolderTarget(
-                    for: queuedCommand,
-                    folderURL: folderURL,
-                    expectedRoot: expectedRoot
-                )
-            }
-            guard let localWorkspace = workspaceManager.workspace(withID: workspaceID),
-                  WorkspaceFolderOpenResolver.bestEligibleMatch(
-                      forFolderPath: folderURL.path,
-                      in: [localWorkspace]
-                  )?.id == workspaceID
+        case .pendingPersistentPublication:
+            return retryFolderResolution(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        case .ephemeralLiveWindowSupplement:
+            return retryFolderResolution(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .workspaceUnavailable
+            )
+        }
+    }
+
+    private func resolvePendingPersistentFolderTarget(
+        _ publication: PendingPersistentWorkspacePublication,
+        for queuedCommand: QueuedAppCommand,
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey
+    ) async -> FolderTargetResolution {
+        guard publication.expectedRoot == expectedRoot else {
+            return retryFolderResolution(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
+        do {
+            let outcome = try await publication.join()
+            guard outcome.disposition == .applied
+                || outcome.disposition == .unchanged
+                || outcome.disposition == .deduplicated
             else {
                 return retryFolderResolution(
                     queuedCommand,
                     expectedRoot: expectedRoot,
-                    failure: .workspaceUnavailable
+                    failure: .authorityFailure
                 )
             }
-            return .resolved(ResolvedFolderTarget(
-                workspace: localWorkspace,
-                source: .liveWindow(self),
-                requiresActivationReload: false
-            ))
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch {
+            return retryFolderResolution(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .authorityFailure
+            )
         }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        guard let routingCatalog = await workspaceManager.workspaceRoutingCatalogSnapshot() else {
+            return retryFolderResolution(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .authorityFailure
+            )
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+        guard let authoritativeWorkspace = routingCatalog.first(where: {
+            $0.id == publication.workspaceID
+        }),
+            WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeWorkspace),
+            WorkspaceFolderOpenResolver.bestEligibleMatch(
+                forFolderPath: folderURL.path,
+                in: [authoritativeWorkspace]
+            )?.id == publication.workspaceID,
+            WorkspaceFolderOpenResolver.bestEligibleMatch(
+                forFolderPath: folderURL.path,
+                in: routingCatalog
+            )?.id == publication.workspaceID
+        else {
+            return retryFolderResolution(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
+        return .resolved(ResolvedFolderTarget(
+            workspace: authoritativeWorkspace,
+            source: .pendingPersistentPublication(publication),
+            requiresActivationReload: workspaceManager.activeWorkspace.map {
+                $0.id == authoritativeWorkspace.id
+                    && !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
+            } ?? false,
+            persistentResolution: .reused,
+            durableCreationCommit: nil
+        ))
     }
 
     private func resolvePersistentFolderTarget(
@@ -1950,9 +2171,21 @@ class WindowState: ObservableObject {
     ) async -> FolderTargetResolution {
         let activeWorkspaceBeforeResolution = workspaceManager.activeWorkspace
         do {
-            let resolution = try await workspaceManager.resolveOrCreatePersistentWorkspace(
+            let resolution = try await workspaceManager.resolveOrCreatePersistentWorkspaceWithProvenance(
                 fromFolderURL: folderURL
             )
+            let durableCreationCommit = recordPersistentFolderResolution(
+                resolution,
+                expectedRoot: expectedRoot,
+                forCommandID: queuedCommand.id
+            )
+            #if DEBUG
+                if let durableCreationCommit {
+                    persistentFolderCreationCommitDidRecordHandlerForTesting?(
+                        durableCreationCommit.workspaceID
+                    )
+                }
+            #endif
             if let interruption = commandInterruptionResult() {
                 return .terminal(interruption)
             }
@@ -1970,7 +2203,9 @@ class WindowState: ObservableObject {
                 requiresActivationReload: activeWorkspaceBeforeResolution.map {
                     $0.id == workspace.id
                         && !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
-                } ?? false
+                } ?? false,
+                persistentResolution: resolution.provenance,
+                durableCreationCommit: durableCreationCommit
             ))
         } catch is CancellationError {
             return .terminal(.cancelled)
@@ -2002,7 +2237,7 @@ class WindowState: ObservableObject {
         for workspace in routingCatalog {
             representations[workspace.id] = FolderCandidateRepresentation(
                 workspace: workspace,
-                source: .authority
+                source: workspace.isEphemeral ? .ephemeralLiveWindow(self) : .authority
             )
         }
         for workspace in workspaceManager.workspaces
@@ -2010,17 +2245,18 @@ class WindowState: ObservableObject {
         {
             representations[workspace.id] = FolderCandidateRepresentation(
                 workspace: workspace,
-                source: .liveWindow(self)
+                source: .ephemeralLiveWindow(self)
             )
         }
         let liveWindows = (windowStatesManager?.allWindows ?? [self]).filter { !$0.isClosing }
         for window in liveWindows {
             if let activeWorkspace = window.workspaceManager.activeWorkspace,
+               activeWorkspace.isEphemeral,
                representations[activeWorkspace.id] == nil
             {
                 representations[activeWorkspace.id] = FolderCandidateRepresentation(
                     workspace: activeWorkspace,
-                    source: .liveWindow(window)
+                    source: .ephemeralLiveWindow(window)
                 )
             }
         }
@@ -2037,7 +2273,9 @@ class WindowState: ObservableObject {
                 requiresActivationReload: workspaceManager.activeWorkspace.map {
                     $0.id == winner.id
                         && !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
-                } ?? false
+                } ?? false,
+                persistentResolution: nil,
+                durableCreationCommit: nil
             ))
         }
 
@@ -2048,8 +2286,10 @@ class WindowState: ObservableObject {
         )
         return .resolved(ResolvedFolderTarget(
             workspace: workspace,
-            source: .liveWindow(self),
-            requiresActivationReload: false
+            source: .ephemeralLiveWindow(self),
+            requiresActivationReload: false,
+            persistentResolution: nil,
+            durableCreationCommit: nil
         ))
     }
 
@@ -2080,7 +2320,7 @@ class WindowState: ObservableObject {
         expectedRoot: WorkspaceRootSetKey,
         queuedCommand: QueuedAppCommand
     ) -> CommandHandlingOutcome? {
-        if case let .liveWindow(owningWindow) = target.source,
+        if case let .ephemeralLiveWindow(owningWindow) = target.source,
            owningWindow !== self
         {
             guard !owningWindow.isClosing else {

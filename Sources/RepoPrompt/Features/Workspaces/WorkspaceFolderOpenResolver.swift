@@ -46,6 +46,7 @@ enum WorkspaceFolderOpenResolver {
         let matches = workspaces.filter { workspace in
             guard !workspace.isSystemWorkspace,
                   !workspace.isHiddenInMenus,
+                  workspace.consolidatedIntoWorkspaceID == nil,
                   !workspace.isEphemeral || admittingEphemeral
             else {
                 return false

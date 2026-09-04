@@ -125,6 +125,12 @@ enum DomainExternalDocumentProbe {
     case cancelled
 }
 
+enum DomainSavedConsolidationMarkerStatus: Sendable {
+    case unmarked
+    case marked
+    case unreadable
+}
+
 struct DomainPersistenceBootstrap {
     struct Workspace {
         let document: DomainWorkspaceDocument
@@ -653,6 +659,31 @@ package struct DomainPersistenceCoordinator {
                 operation: operation,
                 now: now
             )
+        }
+    }
+
+    func savedConsolidationMarkerStatus(
+        for document: DomainWorkspaceDocument
+    ) async throws -> DomainSavedConsolidationMarkerStatus {
+        try await DomainBlockingIO.run { cancellation in
+            let worker = blockingWorker(cancellation)
+            try cancellation.check()
+            guard let savedBytes = try? Data(contentsOf: document.fileURL) else {
+                try cancellation.check()
+                return .unreadable
+            }
+            try cancellation.check()
+            guard let savedDocument = worker.decodeWorkspaceDocument(
+                savedBytes,
+                fileURL: document.fileURL,
+                expectedWorkspaceID: document.workspaceID
+            ) else {
+                return .unreadable
+            }
+            try cancellation.check()
+            return savedDocument.metadata.consolidatedIntoWorkspaceID == nil
+                ? .unmarked
+                : .marked
         }
     }
 

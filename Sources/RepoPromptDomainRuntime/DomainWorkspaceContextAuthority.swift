@@ -635,7 +635,8 @@ actor DomainWorkspaceContextAuthority {
             resultingDigest: prior.resultingDigest,
             errorCode: .workspaceUnavailable,
             diagnostic: diagnostic,
-            workspace: nil
+            workspace: nil,
+            exactRootResolution: prior.exactRootResolution
         )
     }
 
@@ -1336,7 +1337,7 @@ actor DomainWorkspaceContextAuthority {
             )
         }
 
-        let eligibleMatches = records.values.filter { record in
+        let matchingRecords = records.values.filter { record in
             let metadata = record.document.metadata
             return !metadata.isSystemWorkspace
                 && !metadata.isHiddenInMenus
@@ -1344,7 +1345,29 @@ actor DomainWorkspaceContextAuthority {
                 && metadata.repoPaths.contains(where: {
                     Self.canonicalFolderOpenRootPath($0) == canonicalRootPath
                 })
-        }.sorted { lhs, rhs in
+        }
+        var eligibleMatches: [WorkspaceRecord] = []
+        var hasRecoveryBlockedMatch = false
+        for record in matchingRecords {
+            let metadata = record.document.metadata
+            guard metadata.consolidatedIntoWorkspaceID == nil else { continue }
+            guard record.revisions.dirtyRevision != nil else {
+                eligibleMatches.append(record)
+                continue
+            }
+            do {
+                switch try await persistence.savedConsolidationMarkerStatus(for: record.document) {
+                case .unmarked:
+                    eligibleMatches.append(record)
+                case .marked, .unreadable:
+                    hasRecoveryBlockedMatch = true
+                }
+            } catch {
+                return persistenceFailureOutcome(envelope, record: nil, error: error)
+            }
+        }
+
+        eligibleMatches.sort { lhs, rhs in
             let lhsMetadata = lhs.document.metadata
             let rhsMetadata = rhs.document.metadata
             if lhsMetadata.dateModified != rhsMetadata.dateModified {
@@ -1361,14 +1384,39 @@ actor DomainWorkspaceContextAuthority {
             return lhsMetadata.workspaceID.uuidString < rhsMetadata.workspaceID.uuidString
         }
         if let existing = eligibleMatches.first {
-            return await unchangedOutcome(envelope, fingerprint: fingerprint, record: existing)
+            return await unchangedOutcome(
+                envelope,
+                fingerprint: fingerprint,
+                record: existing,
+                exactRootResolution: .reused
+            )
+        }
+        if hasRecoveryBlockedMatch {
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .conflict,
+                errorCode: .stateConflict,
+                diagnostic: "exact_root_restoration_incomplete",
+                exactRootResolution: .recoveryBlocked
+            )
+        }
+        guard records[document.workspaceID] == nil else {
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .conflict,
+                errorCode: .stateConflict,
+                diagnostic: "exact_root_workspace_id_collision"
+            )
         }
 
         return await createWorkspace(
             document,
             envelope: envelope,
             fingerprint: fingerprint,
-            acquireMutationGate: false
+            acquireMutationGate: false,
+            exactRootResolution: .created
         )
     }
 
@@ -1385,7 +1433,8 @@ actor DomainWorkspaceContextAuthority {
         _ document: DomainWorkspaceDocument,
         envelope: DomainWorkspaceCommandEnvelope,
         fingerprint: String,
-        acquireMutationGate: Bool = true
+        acquireMutationGate: Bool = true,
+        exactRootResolution: DomainExactRootResolution? = nil
     ) async -> DomainCommandOutcome {
         if acquireMutationGate {
             await acquireCatalogMutation()
@@ -1442,7 +1491,8 @@ actor DomainWorkspaceContextAuthority {
             before: nil,
             after: revisions,
             catalogRevision: catalogRevision &+ 1,
-            resultingDigest: document.contentDigest
+            resultingDigest: document.contentDigest,
+            exactRootResolution: exactRootResolution
         )
         let recorded = DomainRecordedOperation(
             fingerprint: fingerprint,
@@ -1485,7 +1535,8 @@ actor DomainWorkspaceContextAuthority {
                 after: record.revisions,
                 catalogRevision: catalogRevision,
                 resultingDigest: document.contentDigest,
-                workspace: makeSnapshot(record)
+                workspace: makeSnapshot(record),
+                exactRootResolution: exactRootResolution
             )
             publish(
                 kind: .workspaceCreated,
@@ -2442,7 +2493,8 @@ actor DomainWorkspaceContextAuthority {
     private func unchangedOutcome(
         _ envelope: DomainWorkspaceCommandEnvelope,
         fingerprint: String,
-        record original: WorkspaceRecord
+        record original: WorkspaceRecord,
+        exactRootResolution: DomainExactRootResolution? = nil
     ) async -> DomainCommandOutcome {
         var record = original
         let outcome = DomainCommandOutcome(
@@ -2452,7 +2504,8 @@ actor DomainWorkspaceContextAuthority {
             after: record.revisions,
             catalogRevision: catalogRevision,
             resultingDigest: record.document.contentDigest,
-            workspace: makeSnapshot(record)
+            workspace: makeSnapshot(record),
+            exactRootResolution: exactRootResolution
         )
         let operation = DomainRecordedOperation(
             fingerprint: fingerprint,
@@ -2522,7 +2575,8 @@ actor DomainWorkspaceContextAuthority {
         fingerprint: String,
         disposition: DomainCommandDisposition,
         errorCode: DomainCommandErrorCode,
-        diagnostic: String
+        diagnostic: String,
+        exactRootResolution: DomainExactRootResolution? = nil
     ) -> DomainCommandOutcome {
         let workspace = envelope.workspaceID.flatMap(canonicalWorkspaceSnapshot)
         let outcome = DomainCommandOutcome(
@@ -2534,7 +2588,8 @@ actor DomainWorkspaceContextAuthority {
             resultingDigest: workspace?.document.contentDigest,
             errorCode: errorCode,
             diagnostic: diagnostic,
-            workspace: workspace
+            workspace: workspace,
+            exactRootResolution: exactRootResolution
         )
         globalOperations.insert(DomainRecordedOperation(
             fingerprint: fingerprint,

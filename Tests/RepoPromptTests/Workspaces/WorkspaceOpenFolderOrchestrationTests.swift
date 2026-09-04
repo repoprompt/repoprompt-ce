@@ -258,8 +258,277 @@ import XCTest
             XCTAssertEqual(openingManager.activeWorkspaceID, existing.id)
         }
 
-        func testReplayedResolveOrCreateReturnsOriginalWorkspaceAfterResultDigestChanges() async throws {
+        func testResolveOrCreateExcludesVisibleRetiredWorkspaceAndReplaysCreatedProvenance() async throws {
+            let profileIdentifier = "workspace-open-folder-created-provenance-\(UUID().uuidString)"
+            let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1310)
+            let folder = try makeFolder(named: "VisibleRetiredExactRoot")
+            let retired = try WorkspaceModel(
+                id: workspaceID(20),
+                dateModified: Date(timeIntervalSinceReferenceDate: 200),
+                name: "Visible Retired",
+                repoPaths: [folder.path],
+                consolidatedIntoWorkspaceID: workspaceID(999)
+            )
+            try await createAuthorityWorkspace(retired, using: client)
+            let proposed = try WorkspaceModel(
+                id: workspaceID(21),
+                dateModified: Date(timeIntervalSinceReferenceDate: 100),
+                name: "Replacement",
+                repoPaths: [folder.path]
+            )
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath(folder),
+                operationID: UUID(),
+                windowID: -1310
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            let replay = await runtime.workspaceStore.execute(envelope)
+            let snapshot = await runtime.workspaceStore.snapshot()
+
+            XCTAssertEqual(first.disposition, .applied)
+            XCTAssertEqual(first.exactRootResolution, .created)
+            XCTAssertEqual(first.workspace?.document.workspaceID, proposed.id)
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.exactRootResolution, .created)
+            XCTAssertEqual(replay.workspace?.document.workspaceID, proposed.id)
+            XCTAssertTrue(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == retired.id
+            }))
+            XCTAssertTrue(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == proposed.id
+            }))
+
+            _ = await runtime.shutdown()
+            domainRuntimes.removeAll { $0 === runtime }
+            let restarted = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let replayAfterRestart = await restarted.workspaceStore.execute(envelope)
+
+            XCTAssertEqual(replayAfterRestart.disposition, .deduplicated)
+            XCTAssertEqual(replayAfterRestart.exactRootResolution, .created)
+            XCTAssertEqual(replayAfterRestart.workspace?.document.workspaceID, proposed.id)
+        }
+
+        func testResolveOrCreateRejectsRetiredWorkspaceIDCollision() async throws {
             let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1321)
+            let folder = try makeFolder(named: "RetiredExactRootIDCollision")
+            let retired = try WorkspaceModel(
+                id: workspaceID(22),
+                name: "Retired Collision",
+                repoPaths: [folder.path],
+                consolidatedIntoWorkspaceID: workspaceID(999)
+            )
+            try await createAuthorityWorkspace(retired, using: client)
+            let envelope = try resolveOrCreateEnvelope(
+                retired,
+                canonicalRootPath: canonicalRootPath(folder),
+                operationID: UUID(),
+                windowID: -1321
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            let replay = await runtime.workspaceStore.execute(envelope)
+            let snapshot = await runtime.workspaceStore.snapshot()
+
+            XCTAssertEqual(first.disposition, .conflict)
+            XCTAssertEqual(first.errorCode, .stateConflict)
+            XCTAssertEqual(first.diagnostic, "exact_root_workspace_id_collision")
+            XCTAssertNil(first.exactRootResolution)
+            XCTAssertEqual(first.workspace?.document.workspaceID, retired.id)
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.errorCode, .stateConflict)
+            XCTAssertEqual(replay.diagnostic, "exact_root_workspace_id_collision")
+            XCTAssertNil(replay.exactRootResolution)
+            XCTAssertEqual(snapshot.workspaces.count(where: {
+                $0.document.workspaceID == retired.id
+            }), 1)
+        }
+
+        func testResolveOrCreateBlocksIncompleteWorkingOnlyRestoreAndReplaysRecoveryProvenance() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1311)
+            let folder = try makeFolder(named: "IncompleteWorkingOnlyRestore")
+            let retired = try WorkspaceModel(
+                id: workspaceID(30),
+                dateModified: Date(timeIntervalSinceReferenceDate: 200),
+                name: "Incomplete Restore",
+                repoPaths: [folder.path],
+                isHiddenInMenus: true,
+                consolidatedIntoWorkspaceID: workspaceID(999)
+            )
+            try await createAuthorityWorkspace(retired, using: client)
+            let retiredAuthoritySnapshot = await client.workspaceSnapshot(retired.id)
+            let retiredSnapshot = try XCTUnwrap(retiredAuthoritySnapshot)
+            var restoredWorking = retired
+            restoredWorking.isHiddenInMenus = false
+            restoredWorking.consolidatedIntoWorkspaceID = nil
+            let working = try await client.replaceWorking(
+                restoredWorking,
+                fileURL: retiredSnapshot.document.fileURL,
+                expectedWorkspaceRevision: retiredSnapshot.revisions.workingRevision
+            )
+            XCTAssertEqual(working.disposition, .applied)
+            XCTAssertNotNil(working.after?.dirtyRevision)
+
+            let proposed = try WorkspaceModel(
+                id: workspaceID(31),
+                name: "Must Not Be Created",
+                repoPaths: [folder.path]
+            )
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath(folder),
+                operationID: UUID(),
+                windowID: -1311
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            let replay = await runtime.workspaceStore.execute(envelope)
+            let snapshot = await runtime.workspaceStore.snapshot()
+
+            XCTAssertEqual(first.disposition, .conflict)
+            XCTAssertEqual(first.errorCode, .stateConflict)
+            XCTAssertEqual(first.diagnostic, "exact_root_restoration_incomplete")
+            XCTAssertEqual(first.exactRootResolution, .recoveryBlocked)
+            XCTAssertNil(first.workspace)
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.errorCode, .stateConflict)
+            XCTAssertEqual(replay.diagnostic, "exact_root_restoration_incomplete")
+            XCTAssertEqual(replay.exactRootResolution, .recoveryBlocked)
+            XCTAssertNil(replay.workspace)
+            XCTAssertFalse(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == proposed.id
+            }))
+        }
+
+        func testResolveOrCreateBlocksDirtyMatchWhenSavedDocumentIsUnreadable() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1313)
+            let folder = try makeFolder(named: "UnreadableSavedExactRoot")
+            let existing = try WorkspaceModel(
+                id: workspaceID(35),
+                name: "Unreadable Saved Match",
+                repoPaths: [folder.path]
+            )
+            try await createAuthorityWorkspace(existing, using: client)
+            let authoritySnapshot = await client.workspaceSnapshot(existing.id)
+            let existingSnapshot = try XCTUnwrap(authoritySnapshot)
+            var dirtyWorking = existing
+            dirtyWorking.name = "Unreadable Saved Match Updated"
+            let dirtyOutcome = try await client.replaceWorking(
+                dirtyWorking,
+                fileURL: existingSnapshot.document.fileURL,
+                expectedWorkspaceRevision: existingSnapshot.revisions.workingRevision
+            )
+            XCTAssertEqual(dirtyOutcome.disposition, .applied)
+            XCTAssertNotNil(dirtyOutcome.after?.dirtyRevision)
+            try FileManager.default.removeItem(at: existingSnapshot.document.fileURL)
+
+            let proposed = try WorkspaceModel(
+                id: workspaceID(36),
+                name: "Must Not Be Created",
+                repoPaths: [folder.path]
+            )
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath(folder),
+                operationID: UUID(),
+                windowID: -1313
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            let replay = await runtime.workspaceStore.execute(envelope)
+            let snapshot = await runtime.workspaceStore.snapshot()
+
+            XCTAssertEqual(first.disposition, .conflict)
+            XCTAssertEqual(first.errorCode, .stateConflict)
+            XCTAssertEqual(first.diagnostic, "exact_root_restoration_incomplete")
+            XCTAssertEqual(first.exactRootResolution, .recoveryBlocked)
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.exactRootResolution, .recoveryBlocked)
+            XCTAssertFalse(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == proposed.id
+            }))
+        }
+
+        func testResolveOrCreatePrefersOrdinaryDirtyMatchOverNewerIncompleteRestore() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1312)
+            let folder = try makeFolder(named: "DirtyAlternativeToIncompleteRestore")
+            let retired = try WorkspaceModel(
+                id: workspaceID(40),
+                dateModified: Date(timeIntervalSinceReferenceDate: 300),
+                name: "Newer Incomplete Restore",
+                repoPaths: [folder.path],
+                isHiddenInMenus: true,
+                consolidatedIntoWorkspaceID: workspaceID(999)
+            )
+            try await createAuthorityWorkspace(retired, using: client)
+            let retiredAuthoritySnapshot = await client.workspaceSnapshot(retired.id)
+            let retiredSnapshot = try XCTUnwrap(retiredAuthoritySnapshot)
+            var restoredWorking = retired
+            restoredWorking.isHiddenInMenus = false
+            restoredWorking.consolidatedIntoWorkspaceID = nil
+            let restoredOutcome = try await client.replaceWorking(
+                restoredWorking,
+                fileURL: retiredSnapshot.document.fileURL,
+                expectedWorkspaceRevision: retiredSnapshot.revisions.workingRevision
+            )
+            XCTAssertEqual(restoredOutcome.disposition, .applied)
+
+            let ordinary = try WorkspaceModel(
+                id: workspaceID(41),
+                dateModified: Date(timeIntervalSinceReferenceDate: 100),
+                name: "Ordinary Dirty Match",
+                repoPaths: [folder.path]
+            )
+            try await createAuthorityWorkspace(ordinary, using: client)
+            let ordinaryAuthoritySnapshot = await client.workspaceSnapshot(ordinary.id)
+            let ordinarySnapshot = try XCTUnwrap(ordinaryAuthoritySnapshot)
+            var dirtyOrdinary = ordinary
+            dirtyOrdinary.name = "Ordinary Dirty Match Updated"
+            dirtyOrdinary.dateModified = Date(timeIntervalSinceReferenceDate: 200)
+            let dirtyOutcome = try await client.replaceWorking(
+                dirtyOrdinary,
+                fileURL: ordinarySnapshot.document.fileURL,
+                expectedWorkspaceRevision: ordinarySnapshot.revisions.workingRevision
+            )
+            XCTAssertEqual(dirtyOutcome.disposition, .applied)
+            XCTAssertNotNil(dirtyOutcome.after?.dirtyRevision)
+
+            let proposed = try WorkspaceModel(
+                id: workspaceID(42),
+                name: "Must Not Be Created",
+                repoPaths: [folder.path]
+            )
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath(folder),
+                operationID: UUID(),
+                windowID: -1312
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            let replay = await runtime.workspaceStore.execute(envelope)
+            let snapshot = await runtime.workspaceStore.snapshot()
+
+            XCTAssertEqual(first.disposition, .unchanged)
+            XCTAssertEqual(first.exactRootResolution, .reused)
+            XCTAssertEqual(first.workspace?.document.workspaceID, ordinary.id)
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.exactRootResolution, .reused)
+            XCTAssertEqual(replay.workspace?.document.workspaceID, ordinary.id)
+            XCTAssertFalse(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == proposed.id
+            }))
+        }
+
+        func testReplayedResolveOrCreateReturnsOriginalWorkspaceAfterResultDigestChanges() async throws {
+            let profileIdentifier = "workspace-open-folder-reused-provenance-\(UUID().uuidString)"
+            let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
             let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1302)
             let folder = try makeFolder(named: "ResolveOrCreateReplayMutation")
             let existing = WorkspaceModel(name: "Replay Winner", repoPaths: [folder.path])
@@ -292,11 +561,24 @@ import XCTest
             let replay = await runtime.workspaceStore.execute(envelope)
 
             XCTAssertEqual(first.disposition, .unchanged)
+            XCTAssertEqual(first.exactRootResolution, .reused)
             XCTAssertEqual(first.workspace?.document.workspaceID, existing.id)
             XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.exactRootResolution, .reused)
             XCTAssertEqual(replay.workspace?.document.workspaceID, existing.id)
             XCTAssertEqual(replay.workspace?.document.contentDigest, mutation.resultingDigest)
             XCTAssertEqual(replay.resultingDigest, originalDigest)
+
+            _ = await runtime.shutdown()
+            domainRuntimes.removeAll { $0 === runtime }
+            let restarted = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let replayAfterRestart = await restarted.workspaceStore.execute(envelope)
+
+            XCTAssertEqual(replayAfterRestart.disposition, .deduplicated)
+            XCTAssertEqual(replayAfterRestart.exactRootResolution, .reused)
+            XCTAssertEqual(replayAfterRestart.workspace?.document.workspaceID, existing.id)
+            XCTAssertEqual(replayAfterRestart.workspace?.document.contentDigest, mutation.resultingDigest)
+            XCTAssertEqual(replayAfterRestart.resultingDigest, originalDigest)
         }
 
         func testReplayedResolveOrCreateReturnsWorkspaceUnavailableAfterResultDeletion() async throws {
@@ -706,6 +988,325 @@ import XCTest
             XCTAssertEqual(targetManager.activeWorkspace?.repoPaths, [requestedFolder.path])
         }
 
+        func testManagerResolutionExposesCreatedAndReusedProvenance() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "ManagerResolutionProvenance")
+
+            let created = try await manager.resolveOrCreatePersistentWorkspaceWithProvenance(
+                fromFolderURL: folder
+            )
+            let reused = try await manager.resolveOrCreatePersistentWorkspaceWithProvenance(
+                fromFolderURL: folder
+            )
+
+            XCTAssertEqual(created.provenance, .created)
+            XCTAssertTrue(created.creationCommitted)
+            XCTAssertEqual(reused.provenance, .reused)
+            XCTAssertFalse(reused.creationCommitted)
+            XCTAssertEqual(reused.workspace.id, created.workspace.id)
+            XCTAssertNotEqual(reused.operationID, created.operationID)
+        }
+
+        func testManagerDecodesRecoveryBlockedResolution() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1320)
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "ManagerRecoveryBlocked")
+            let retired = try WorkspaceModel(
+                id: workspaceID(50),
+                name: "Manager Incomplete Restore",
+                repoPaths: [folder.path],
+                isHiddenInMenus: true,
+                consolidatedIntoWorkspaceID: workspaceID(999)
+            )
+            try await createAuthorityWorkspace(retired, using: client)
+            let authoritySnapshot = await client.workspaceSnapshot(retired.id)
+            let retiredSnapshot = try XCTUnwrap(authoritySnapshot)
+            var restoredWorking = retired
+            restoredWorking.isHiddenInMenus = false
+            restoredWorking.consolidatedIntoWorkspaceID = nil
+            let working = try await client.replaceWorking(
+                restoredWorking,
+                fileURL: retiredSnapshot.document.fileURL,
+                expectedWorkspaceRevision: retiredSnapshot.revisions.workingRevision
+            )
+            XCTAssertEqual(working.disposition, .applied)
+
+            do {
+                _ = try await manager.resolveOrCreatePersistentWorkspaceWithProvenance(
+                    fromFolderURL: folder
+                )
+                XCTFail("Expected the incomplete restore to block manager resolution")
+            } catch let error as DomainWorkspaceAuthorityOperationError {
+                XCTAssertEqual(error.outcome.disposition, .conflict)
+                XCTAssertEqual(error.outcome.errorCode, .stateConflict)
+                XCTAssertEqual(error.outcome.exactRootResolution, .recoveryBlocked)
+                XCTAssertEqual(error.outcome.diagnostic, "exact_root_restoration_incomplete")
+            }
+            XCTAssertEqual(
+                manager.domainWorkspaceAuthorityIssue?.diagnostic,
+                "exact_root_restoration_incomplete"
+            )
+        }
+
+        func testCreatedWorkspaceActivationBlockReportsCommittedCreationWithoutRollback() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "CreatedThenBlocked")
+            let activeIDBeforeOpen = manager.activeWorkspaceID
+            manager.isRefreshing = true
+            defer { manager.isRefreshing = false }
+            var createdWorkspaceID: UUID?
+
+            do {
+                try await manager.openWorkspace(
+                    fromFolderURL: folder,
+                    behavior: .createNewWorkspace
+                )
+                XCTFail("Expected activation to be blocked after creation")
+            } catch let WorkspaceOpenError.activationBlocked(workspaceID, creationCommitted, reason) {
+                createdWorkspaceID = workspaceID
+                XCTAssertTrue(creationCommitted)
+                XCTAssertEqual(reason, "Cannot switch workspaces while refresh is in progress.")
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+
+            let workspaceID = try XCTUnwrap(createdWorkspaceID)
+            let snapshot = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == workspaceID
+            }))
+            XCTAssertTrue(manager.workspaces.contains(where: { $0.id == workspaceID }))
+            XCTAssertEqual(manager.activeWorkspaceID, activeIDBeforeOpen)
+        }
+
+        func testDirectAddFolderCreationBlockReportsCommittedCreation() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "DirectAddFolderCreatedThenBlocked")
+            manager.isRefreshing = true
+            defer { manager.isRefreshing = false }
+            var createdWorkspaceID: UUID?
+
+            do {
+                try await manager.addFolder(folder)
+                XCTFail("Expected direct add-folder activation to be blocked after creation")
+            } catch let WorkspaceOpenError.activationBlocked(workspaceID, creationCommitted, reason) {
+                createdWorkspaceID = workspaceID
+                XCTAssertTrue(creationCommitted)
+                XCTAssertEqual(reason, "Cannot switch workspaces while refresh is in progress.")
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+
+            let workspaceID = try XCTUnwrap(createdWorkspaceID)
+            let snapshot = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == workspaceID
+            }))
+            XCTAssertNotEqual(manager.activeWorkspaceID, workspaceID)
+        }
+
+        func testLegacyCreatedWorkspaceActivationBlockDoesNotClaimCommittedCreation() async throws {
+            let manager = makeManager()
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "LegacyCreatedThenBlocked")
+            manager.isRefreshing = true
+            defer { manager.isRefreshing = false }
+
+            do {
+                try await manager.openWorkspace(
+                    fromFolderURL: folder,
+                    behavior: .createNewWorkspace
+                )
+                XCTFail("Expected activation to be blocked after legacy creation")
+            } catch let WorkspaceOpenError.activationBlocked(_, creationCommitted, reason) {
+                XCTAssertFalse(creationCommitted)
+                XCTAssertEqual(reason, "Cannot switch workspaces while refresh is in progress.")
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+        }
+
+        func testPersistentUnownedWorkspaceIsRejectedForActivation() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "PersistentUnownedActivation")
+            let unowned = WorkspaceModel(
+                name: "Persistent Unowned",
+                repoPaths: [folder.path]
+            )
+            manager.workspaces.append(unowned)
+            let activeIDBeforeSwitch = manager.activeWorkspaceID
+
+            let result = await manager.switchWorkspace(
+                to: unowned,
+                saveState: false,
+                reason: "persistentUnownedFixture"
+            )
+
+            guard case let .blocked(reason) = result else {
+                return XCTFail("Expected authority-absent persistent activation to be blocked")
+            }
+            XCTAssertTrue(reason.contains("could not be verified for activation"))
+            XCTAssertEqual(manager.activeWorkspaceID, activeIDBeforeSwitch)
+        }
+
+        func testRootlessPersistentCreationWaitsForPublicationBeforeActivation() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let gate = WorkspaceRootMutationTestGate()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { _, _, _ in
+                await gate.pauseUntilReleased()
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+
+            let workspace = manager.createWorkspace(
+                name: "Rootless Pending Publication",
+                repoPaths: []
+            )
+            await gate.waitUntilPaused()
+            let switchTask = Task {
+                await manager.switchWorkspace(
+                    to: workspace,
+                    saveState: false,
+                    reason: "rootlessPendingPublicationFixture"
+                )
+            }
+            await Task.yield()
+            XCTAssertNotEqual(manager.activeWorkspaceID, workspace.id)
+
+            await gate.release()
+            let result = await switchTask.value
+
+            XCTAssertEqual(result, .switched)
+            XCTAssertEqual(manager.activeWorkspaceID, workspace.id)
+            let snapshot = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == workspace.id
+            }))
+        }
+
+        func testPendingPersistentPublicationCoversEveryRootAndCleansUpAfterJoin() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let firstFolder = try makeFolder(named: "PendingPublicationFirst")
+            let secondFolder = try makeFolder(named: "PendingPublicationSecond")
+            let gate = WorkspaceRootMutationTestGate()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { _, _, _ in
+                await gate.pauseUntilReleased()
+            }
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+
+            let workspace = manager.createWorkspace(
+                name: "Pending Publication",
+                repoPaths: [firstFolder.path, secondFolder.path]
+            )
+            await gate.waitUntilPaused()
+            let firstRoot = WorkspaceRootSetKey(paths: [firstFolder.path])
+            let secondRoot = WorkspaceRootSetKey(paths: [secondFolder.path])
+            let firstToken = try XCTUnwrap(manager.pendingPersistentWorkspacePublication(
+                workspaceID: workspace.id,
+                exactRoot: firstRoot
+            ))
+            let secondToken = try XCTUnwrap(manager.pendingPersistentWorkspacePublication(
+                workspaceID: workspace.id,
+                exactRoot: secondRoot
+            ))
+
+            XCTAssertEqual(firstToken.operationID, secondToken.operationID)
+            XCTAssertEqual(firstToken.expectedRoot, firstRoot)
+            XCTAssertEqual(secondToken.expectedRoot, secondRoot)
+            XCTAssertNil(manager.pendingPersistentWorkspacePublication(
+                workspaceID: workspace.id,
+                exactRoot: WorkspaceRootSetKey(paths: ["/tmp/not-this-root"])
+            ))
+            let beforePublication = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(beforePublication.workspaces.contains(where: {
+                $0.document.workspaceID == workspace.id
+            }))
+
+            let cancelledJoin = Task {
+                try await firstToken.join()
+            }
+            await Task.yield()
+            cancelledJoin.cancel()
+            do {
+                _ = try await cancelledJoin.value
+                XCTFail("Expected the individual publication join to be cancelled")
+            } catch {
+                XCTAssertTrue(error is CancellationError)
+            }
+            XCTAssertNotNil(manager.pendingPersistentWorkspacePublication(
+                workspaceID: workspace.id,
+                exactRoot: firstRoot
+            ))
+
+            await gate.release()
+            let firstOutcome = try await firstToken.join()
+            let secondOutcome = try await secondToken.join()
+
+            XCTAssertEqual(firstOutcome.operationID, firstToken.operationID)
+            XCTAssertEqual(firstOutcome.disposition, .applied)
+            XCTAssertEqual(secondOutcome, firstOutcome)
+            try await waitUntil {
+                manager.pendingPersistentWorkspacePublication(
+                    workspaceID: workspace.id,
+                    exactRoot: firstRoot
+                ) == nil && manager.pendingPersistentWorkspacePublication(
+                    workspaceID: workspace.id,
+                    exactRoot: secondRoot
+                ) == nil
+            }
+        }
+
+        func testPendingPersistentPublicationTokenSurvivesRegistryDropOnWindowClose() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "PendingPublicationWindowClose")
+            let gate = WorkspaceRootMutationTestGate()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { _, _, _ in
+                await gate.pauseUntilReleased()
+            }
+
+            let workspace = manager.createWorkspace(
+                name: "Pending Publication Close",
+                repoPaths: [folder.path]
+            )
+            await gate.waitUntilPaused()
+            let root = WorkspaceRootSetKey(paths: [folder.path])
+            let token = try XCTUnwrap(manager.pendingPersistentWorkspacePublication(
+                workspaceID: workspace.id,
+                exactRoot: root
+            ))
+
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            manager.prepareForWindowClose()
+            XCTAssertNil(manager.pendingPersistentWorkspacePublication(
+                workspaceID: workspace.id,
+                exactRoot: root
+            ))
+
+            await gate.release()
+            let outcome = try await token.join()
+            XCTAssertEqual(outcome.operationID, token.operationID)
+            XCTAssertEqual(outcome.disposition, .applied)
+            let snapshot = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(snapshot.workspaces.contains(where: {
+                $0.document.workspaceID == workspace.id
+            }))
+        }
+
         func testActiveMatchedWorkspaceIsSilentNoOp() async throws {
             let manager = makeManager()
             await manager.awaitInitialized()
@@ -753,12 +1354,85 @@ import XCTest
             }
             let confirmation = try await waitForPendingSwitchConfirmation(in: manager)
             manager.resolveSwitchConfirmation(id: confirmation.id, allow: false)
-            try await openTask.value
+            do {
+                try await openTask.value
+                XCTFail("Expected cancelled activation to be observable")
+            } catch let WorkspaceOpenError.activationCancelled(workspaceID, creationCommitted, reason) {
+                XCTAssertFalse(creationCommitted)
+                XCTAssertEqual(workspaceID, manager.workspaces.first(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+                })?.id)
+                XCTAssertFalse(reason.isEmpty)
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
 
             XCTAssertEqual(manager.activeWorkspaceID, activeIDBeforeOpen)
             XCTAssertEqual(manager.workspaces.count, countBeforeOpen)
             XCTAssertNil(manager.pendingSwitchConfirmation)
             XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+        }
+
+        func testLastRootRemovalPublishesMissingDefaultBeforeActivation() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1322)
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let initialDefault = try XCTUnwrap(manager.workspaces.first(where: { $0.isSystemWorkspace }))
+            let folder = try makeFolder(named: "LastRootMissingDefault")
+            let workspace = WorkspaceModel(
+                name: "Last Root Workspace",
+                repoPaths: [folder.path]
+            )
+            try await createAuthorityWorkspace(workspace, using: client)
+            try await waitUntil {
+                manager.workspace(withID: workspace.id) != nil
+            }
+            let projectedWorkspace = try XCTUnwrap(manager.workspace(withID: workspace.id))
+            let initialSwitch = await manager.switchWorkspace(
+                to: projectedWorkspace,
+                saveState: false,
+                reason: "lastRootMissingDefaultFixture"
+            )
+            XCTAssertEqual(initialSwitch, .switched)
+
+            let beforeDelete = await client.snapshot()
+            let authoritativeDefault = try XCTUnwrap(beforeDelete.workspaces.first(where: {
+                $0.document.workspaceID == initialDefault.id
+            }))
+            let deleteOutcome = await client.delete(
+                workspaceID: initialDefault.id,
+                expectedCatalogRevision: beforeDelete.catalogRevision,
+                expectedWorkspaceRevision: authoritativeDefault.revisions.workingRevision
+            )
+            XCTAssertEqual(deleteOutcome.disposition, .applied)
+            try await waitUntil {
+                manager.workspace(withID: initialDefault.id) == nil
+            }
+
+            let publicationGate = WorkspaceRootMutationTestGate()
+            manager.setSystemWorkspaceCreationWillPublishHandlerForTesting { _ in
+                await publicationGate.pauseUntilReleased()
+            }
+            defer {
+                manager.setSystemWorkspaceCreationWillPublishHandlerForTesting(nil)
+            }
+            let removal = Task {
+                await manager.removeFolder(folder.path, from: projectedWorkspace)
+            }
+            await publicationGate.waitUntilPaused()
+            XCTAssertEqual(manager.activeWorkspaceID, workspace.id)
+
+            await publicationGate.release()
+            await removal.value
+
+            let activatedDefault = try XCTUnwrap(manager.activeWorkspace)
+            XCTAssertTrue(activatedDefault.isSystemWorkspace)
+            XCTAssertEqual(activatedDefault.name, "Default")
+            XCTAssertTrue(activatedDefault.repoPaths.isEmpty)
+            XCTAssertNotEqual(activatedDefault.id, initialDefault.id)
+            let authoritativeCreatedDefault = await client.canonicalWorkspaceSnapshot(activatedDefault.id)
+            XCTAssertNotNil(authoritativeCreatedDefault)
         }
 
         func testBlockedMatchedSwitchDoesNotCreateReplacement() async throws {
@@ -774,10 +1448,21 @@ import XCTest
             manager.isRefreshing = true
             defer { manager.isRefreshing = false }
 
-            try await manager.openWorkspace(
-                fromFolderURL: folder,
-                behavior: .createNewWorkspace
-            )
+            do {
+                try await manager.openWorkspace(
+                    fromFolderURL: folder,
+                    behavior: .createNewWorkspace
+                )
+                XCTFail("Expected blocked activation to be observable")
+            } catch let WorkspaceOpenError.activationBlocked(workspaceID, creationCommitted, reason) {
+                XCTAssertFalse(creationCommitted)
+                XCTAssertEqual(workspaceID, manager.workspaces.first(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
+                })?.id)
+                XCTAssertEqual(reason, "Cannot switch workspaces while refresh is in progress.")
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
 
             XCTAssertEqual(manager.activeWorkspaceID, activeIDBeforeOpen)
             XCTAssertEqual(manager.workspaces.count, countBeforeOpen)

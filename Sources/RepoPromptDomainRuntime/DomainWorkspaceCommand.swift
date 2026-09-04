@@ -152,6 +152,12 @@ package enum DomainCommandErrorCode: String, Codable, Sendable {
     case cancelled
 }
 
+package enum DomainExactRootResolution: String, Codable, Equatable, Sendable {
+    case created
+    case reused
+    case recoveryBlocked
+}
+
 package struct DomainCommandOutcome: Codable, Equatable, Sendable {
     package let operationID: UUID
     package let disposition: DomainCommandDisposition
@@ -162,6 +168,7 @@ package struct DomainCommandOutcome: Codable, Equatable, Sendable {
     package let errorCode: DomainCommandErrorCode?
     package let diagnostic: String?
     package let workspace: DomainWorkspaceSnapshot?
+    package let exactRootResolution: DomainExactRootResolution?
 
     package init(
         operationID: UUID,
@@ -172,7 +179,8 @@ package struct DomainCommandOutcome: Codable, Equatable, Sendable {
         resultingDigest: String?,
         errorCode: DomainCommandErrorCode? = nil,
         diagnostic: String? = nil,
-        workspace: DomainWorkspaceSnapshot? = nil
+        workspace: DomainWorkspaceSnapshot? = nil,
+        exactRootResolution: DomainExactRootResolution? = nil
     ) {
         self.operationID = operationID
         self.disposition = disposition
@@ -183,6 +191,7 @@ package struct DomainCommandOutcome: Codable, Equatable, Sendable {
         self.errorCode = errorCode
         self.diagnostic = diagnostic
         self.workspace = workspace
+        self.exactRootResolution = exactRootResolution
     }
 }
 
@@ -198,6 +207,7 @@ struct DomainRecordedOperation: Codable, Equatable, Sendable {
     let resultingWorkspaceID: UUID?
     let errorCode: DomainCommandErrorCode?
     let diagnostic: String?
+    let exactRootResolution: DomainExactRootResolution?
 
     init(
         fingerprint: String,
@@ -216,6 +226,7 @@ struct DomainRecordedOperation: Codable, Equatable, Sendable {
         self.resultingWorkspaceID = resultingWorkspaceID ?? outcome.workspace?.document.workspaceID
         errorCode = outcome.errorCode
         diagnostic = outcome.diagnostic
+        exactRootResolution = outcome.exactRootResolution
     }
 
     func outcome(workspace: DomainWorkspaceSnapshot?) -> DomainCommandOutcome {
@@ -228,7 +239,8 @@ struct DomainRecordedOperation: Codable, Equatable, Sendable {
             resultingDigest: resultingDigest,
             errorCode: errorCode,
             diagnostic: diagnostic,
-            workspace: workspace
+            workspace: workspace,
+            exactRootResolution: exactRootResolution
         )
     }
 }
