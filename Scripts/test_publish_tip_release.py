@@ -528,6 +528,14 @@ class PublishTipReleaseTests(unittest.TestCase):
         self.assertEqual(state["source_lookup_auth"], [False])
         self.assertEqual(state["mutations"], [])
 
+    def test_tip_workflow_does_not_set_explicit_job_timeouts(self) -> None:
+        timeout_lines = [
+            line.strip()
+            for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if line.split("#", 1)[0].partition(":")[0].strip() == "timeout-minutes"
+        ]
+        self.assertEqual(timeout_lines, [])
+
     def test_workflow_preflight_and_publisher_share_source_authority_contract(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         credential_preflight = workflow.split("\n  credential-preflight:", 1)[1].split(
