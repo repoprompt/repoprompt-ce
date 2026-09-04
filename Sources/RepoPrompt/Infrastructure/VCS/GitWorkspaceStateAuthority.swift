@@ -1798,7 +1798,7 @@ actor GitWorkspaceStateAuthority {
         else { throw GitPrefixControlEvidenceCacheError.rootIdentityChanged }
         return PrefixControlRootIdentity(
             canonicalPath: canonicalRoot.path,
-            device: UInt64(value.st_dev),
+            device: safeDeviceID(value.st_dev),
             inode: UInt64(value.st_ino)
         )
     }

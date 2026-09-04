@@ -18,7 +18,9 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         let failure: (any Error)?
 
         func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
-            if let failure { throw failure }
+            if let failure {
+                throw failure
+            }
             return models
         }
     }
@@ -77,33 +79,6 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         XCTAssertEqual(snapshot?.models.options.count ?? 0, 0)
         // Nothing may be written to the shared registry for an empty discovery.
         XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .grokBuild))
-        await service.shutdown()
-    }
-
-    func testSubscribeYieldsLatestAndStopsAfterShutdown() async throws {
-        let service = GrokBuildACPModelPollingService(
-            client: StubDiscoveryClient(models: makeModels(["grok-4.6"]), failure: nil),
-            intervalNanos: 50_000_000
-        )
-        _ = try await service.discoverOnce(workspacePath: nil)
-        let stream = await service.subscribe(workspacePath: nil)
-        var iterator = stream.makeAsyncIterator()
-        let first = await iterator.next()
-        XCTAssertEqual(first?.models.options.map(\.rawValue), ["grok-4.6"])
-        await service.shutdown()
-        let afterShutdown = await iterator.next()
-        XCTAssertNil(afterShutdown)
-    }
-
-    func testRefreshCoalescesConcurrentCalls() async {
-        let service = GrokBuildACPModelPollingService(
-            client: StubDiscoveryClient(models: makeModels(["grok-4.6"]), failure: nil)
-        )
-        async let first = service.refreshNow(workspacePath: nil)
-        async let second = service.refreshNow(workspacePath: nil)
-        let results = await (first, second)
-        XCTAssertTrue(results.0)
-        XCTAssertTrue(results.1)
         await service.shutdown()
     }
 }

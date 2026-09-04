@@ -124,6 +124,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         let expectedDebug = """
         Use RepoPrompt CE to continue this exact Agent Mode session.
 
+        Session title: "Captured"
         Window ID: 7
         Workspace ID: 11111111-1111-1111-1111-111111111111
         Context ID (compose tab): 22222222-2222-2222-2222-222222222222
@@ -140,6 +141,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         let expectedRelease = """
         Use RepoPrompt CE to continue this exact Agent Mode session.
 
+        Session title: "Captured"
         Window ID: 7
         Workspace ID: 11111111-1111-1111-1111-111111111111
         Context ID (compose tab): 22222222-2222-2222-2222-222222222222
@@ -162,6 +164,26 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli"),
             expectedRelease
         )
+    }
+
+    func testHandoffPromptEscapesSessionTitleAsOneHumanReadableLine() throws {
+        let target = try AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111")),
+            tabID: XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222")),
+            agentSessionID: XCTUnwrap(UUID(uuidString: "33333333-3333-3333-3333-333333333333")),
+            tabName: "Line 1\n\"quoted\" \\ path — 日本語 👨‍👩‍👧‍👦 \u{85}\u{2028}\u{2029}"
+        )
+
+        let prompt = AgentSessionHandoffPrompt.render(target: target, cliCommandName: "rpce-cli-debug")
+        let lines = prompt.split(separator: "\n", omittingEmptySubsequences: false)
+
+        XCTAssertEqual(
+            lines[2],
+            #"Session title: "Line 1\n\"quoted\" \\ path — 日本語 👨‍👩‍👧‍👦 \u{85}\u{2028}\u{2029}""#
+        )
+        XCTAssertEqual(prompt.components(separatedBy: "Agent session ID:").count, 2)
+        XCTAssertTrue(prompt.contains("Agent session ID: 33333333-3333-3333-3333-333333333333"))
     }
 
     func testHandoffPromptExplicitEmptyMatchesLegacyPromptByteForByte() throws {

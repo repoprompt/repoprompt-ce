@@ -13,7 +13,7 @@ struct GitWorkspaceAuthorityRepositoryKey: Hashable {
         standardizedGitDirectoryPath = layout.gitDir.standardizedFileURL.path
         var value = stat()
         if lstat(layout.commonDir.path, &value) == 0 {
-            commonDirectoryDevice = UInt64(value.st_dev)
+            commonDirectoryDevice = safeDeviceID(value.st_dev)
             commonDirectoryInode = UInt64(value.st_ino)
         } else {
             commonDirectoryDevice = nil

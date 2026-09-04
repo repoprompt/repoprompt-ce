@@ -76,7 +76,7 @@ struct WorkspaceRootNamespaceRootIdentity: Hashable {
         canonicalPathBytes = canonicalURL.withUnsafeFileSystemRepresentation { pointer in
             pointer.map { Data(bytes: $0, count: strlen($0)) } ?? Data()
         }
-        device = UInt64(status.st_dev)
+        device = safeDeviceID(status.st_dev)
         inode = UInt64(status.st_ino)
     }
 }

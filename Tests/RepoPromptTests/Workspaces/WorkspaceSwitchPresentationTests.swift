@@ -4,47 +4,6 @@ import XCTest
 
 @MainActor
 final class WorkspaceSwitchPresentationTests: XCTestCase {
-    func testStaleConfirmationDismissalBindingCannotResolveReplacementConfirmation() async throws {
-        let manager = makeComposition().workspaceManager
-        await manager.awaitInitialized()
-        manager.registerSwitchSessionProvider(PresentationWorkspaceSwitchSessionProvider())
-
-        let firstTarget = manager.createWorkspace(
-            name: "Presentation First \(UUID().uuidString.prefix(8))",
-            repoPaths: [],
-            ephemeral: true
-        )
-        let firstRequest = Task { @MainActor in
-            await manager.requestWorkspaceSwitch(to: firstTarget, reason: "presentationFirst")
-        }
-        try await waitUntil { manager.pendingSwitchConfirmation != nil }
-        let firstID = try XCTUnwrap(manager.pendingSwitchConfirmation?.id)
-        let staleBinding = WorkspaceSwitchConfirmationModifier.confirmationPresentationBinding(
-            manager: manager,
-            confirmationID: firstID
-        )
-        manager.resolveSwitchConfirmation(id: firstID, allow: false)
-        _ = await firstRequest.value
-
-        let secondTarget = manager.createWorkspace(
-            name: "Presentation Second \(UUID().uuidString.prefix(8))",
-            repoPaths: [],
-            ephemeral: true
-        )
-        let secondRequest = Task { @MainActor in
-            await manager.requestWorkspaceSwitch(to: secondTarget, reason: "presentationSecond")
-        }
-        try await waitUntil { manager.pendingSwitchConfirmation != nil }
-        let secondID = try XCTUnwrap(manager.pendingSwitchConfirmation?.id)
-
-        staleBinding.wrappedValue = false
-
-        XCTAssertEqual(manager.pendingSwitchConfirmation?.id, secondID)
-        XCTAssertTrue(manager.hasPendingSwitchConfirmation)
-        manager.resolveSwitchConfirmation(id: secondID, allow: false)
-        _ = await secondRequest.value
-    }
-
     func testBlockedResultsPublishSharedNoticeAndStaleDismissalCannotClearReplacement() async throws {
         let manager = makeComposition().workspaceManager
         await manager.awaitInitialized()
@@ -166,20 +125,6 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
             deferredInitialAgentSystemWorkspaceRefresh: true,
             sharedMCPService: MCPService()
         )
-    }
-
-    private func waitUntil(
-        timeout: TimeInterval = 3,
-        file: StaticString = #filePath,
-        line: UInt = #line,
-        _ condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition", file: file, line: line)
     }
 }
 

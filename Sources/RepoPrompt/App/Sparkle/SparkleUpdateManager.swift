@@ -9,6 +9,12 @@ import Combine
 import Sparkle
 import SwiftUI
 
+enum SparkleUpdaterStartDecision: Equatable {
+    case ignore
+    case blocked(String)
+    case start
+}
+
 #if DEBUG
     private var sparkleUpdaterManagerDebugLoggingEnabled = false
     private func sparkleUpdaterManagerDebugLog(_ message: @autoclosure () -> String) {
@@ -166,7 +172,20 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     func startUpdater() {
-        guard sparkleConfigurationValid, !updaterStarted else { return }
+        switch Self.startDecision(
+            sparkleConfigurationValid: sparkleConfigurationValid,
+            updaterStarted: updaterStarted,
+            identityMigrationBlockedMessage: IdentityMigrationRuntimeState.shared.updatesBlockedMessage()
+        ) {
+        case .ignore:
+            return
+        case let .blocked(blockedMessage):
+            updatesDisabledMessage = blockedMessage
+            canCheckForUpdates = false
+            return
+        case .start:
+            break
+        }
 
         // Install observers before activation so no Sparkle event can race registration.
         setupObservers()
@@ -182,6 +201,18 @@ final class SparkleUpdaterManager: ObservableObject {
 
         // Setup periodic passive update checking if enabled.
         setupPeriodicUpdateCheck()
+    }
+
+    static func startDecision(
+        sparkleConfigurationValid: Bool,
+        updaterStarted: Bool,
+        identityMigrationBlockedMessage: String?
+    ) -> SparkleUpdaterStartDecision {
+        guard sparkleConfigurationValid, !updaterStarted else { return .ignore }
+        if let identityMigrationBlockedMessage {
+            return .blocked(identityMigrationBlockedMessage)
+        }
+        return .start
     }
 
     private static func loadPassiveAppcastChecksPreference(defaultingTo sparkleAutomaticChecks: Bool) -> Bool {
@@ -269,11 +300,14 @@ final class SparkleUpdaterManager: ObservableObject {
 
         let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
         let currentBuildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+        let eligibilityContext = Self.currentEligibilityContext(
+            currentBuildNumber: currentBuildNumber
+        )
         let client = httpClient
         invalidateActiveAppcastCheck()
         activeAppcastCheckRequest = requestIdentity
         let task = Task.detached(priority: .utility) {
-            await Self.fetchAndParseAppcast(feedURL: url, httpClient: client)
+            await Self.fetchAndParseAppcast(feedURL: url, httpClient: client, context: eligibilityContext)
         }
         appcastCheckTask = task
         let appcastInfo = await task.value
@@ -350,10 +384,33 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     static func testFetchAndParseAppcastVersion(feedURL: URL, httpClient: HTTPClient) async -> String? {
-        await fetchAndParseAppcast(feedURL: feedURL, httpClient: httpClient)?.latestVersion
+        let currentBuildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+        return await fetchAndParseAppcast(
+            feedURL: feedURL,
+            httpClient: httpClient,
+            context: currentEligibilityContext(currentBuildNumber: currentBuildNumber)
+        )?.latestVersion
     }
 
-    private static func fetchAndParseAppcast(feedURL: URL, httpClient: HTTPClient) async -> AppcastUpdateInfo? {
+    static func currentEligibilityContext(
+        currentBuildNumber: String
+    ) -> AppcastEligibilityContext {
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        return AppcastEligibilityContext(
+            currentBuildNumber: currentBuildNumber,
+            osVersion: SparkleBuildVersion(
+                major: osVersion.majorVersion,
+                minor: osVersion.minorVersion,
+                patch: osVersion.patchVersion
+            )
+        )
+    }
+
+    private static func fetchAndParseAppcast(
+        feedURL: URL,
+        httpClient: HTTPClient,
+        context: AppcastEligibilityContext
+    ) async -> AppcastUpdateInfo? {
         let request = makePassiveAppcastRequest(feedURL: feedURL)
 
         do {
@@ -367,8 +424,8 @@ final class SparkleUpdaterManager: ObservableObject {
             let data = response.data
             return await Task.detached(priority: .utility) {
                 let parser = AppcastParser()
-                guard let latestVersion = parser.parse(data: data) else {
-                    sparkleUpdaterManagerDebugLog("Failed to parse appcast - no versions found")
+                guard let latestVersion = parser.parse(data: data, context: context) else {
+                    sparkleUpdaterManagerDebugLog("Failed to parse appcast - no eligible versions found")
                     return nil
                 }
                 return AppcastUpdateInfo(
@@ -399,7 +456,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
         let isNewer = appcastInfo.latestBuildNumber.flatMap { latestBuild in
             isBuildNumber(latestBuild, newerThan: currentBuildNumber)
-        } ?? isVersion(appcastInfo.latestVersion, newerThan: currentVersion)
+        } ?? SparkleVersionComparison.isVersion(appcastInfo.latestVersion, newerThan: currentVersion)
 
         if isNewer {
             let presentationVersion = Self.presentationVersion(
@@ -420,23 +477,6 @@ final class SparkleUpdaterManager: ObservableObject {
             clearUpdateState()
             sparkleUpdaterManagerDebugLog("No update available. Current: \(currentVersion) build \(currentBuildNumber), Latest: \(appcastInfo.latestVersion) build \(appcastInfo.latestBuildNumber ?? "<missing>")")
         }
-    }
-
-    /// Compares two version strings to determine if the first is newer than the second
-    private func isVersion(_ v1: String, newerThan v2: String) -> Bool {
-        let v1Components = v1.split(separator: ".").compactMap { Int($0) }
-        let v2Components = v2.split(separator: ".").compactMap { Int($0) }
-
-        let maxLength = max(v1Components.count, v2Components.count)
-
-        for i in 0 ..< maxLength {
-            let v1Part = i < v1Components.count ? v1Components[i] : 0
-            let v2Part = i < v2Components.count ? v2Components[i] : 0
-
-            if v1Part > v2Part { return true }
-            if v1Part < v2Part { return false }
-        }
-        return false
     }
 
     private func isBuildNumber(_ lhs: String, newerThan rhs: String) -> Bool? {
@@ -733,17 +773,7 @@ final class SparkleUpdaterManager: ObservableObject {
         }
 
         static func debugIsVersion(_ lhs: String, newerThan rhs: String) -> Bool {
-            let lhsComponents = lhs.split(separator: ".").compactMap { Int($0) }
-            let rhsComponents = rhs.split(separator: ".").compactMap { Int($0) }
-            let maxLength = max(lhsComponents.count, rhsComponents.count)
-
-            for index in 0 ..< maxLength {
-                let lhsPart = index < lhsComponents.count ? lhsComponents[index] : 0
-                let rhsPart = index < rhsComponents.count ? rhsComponents[index] : 0
-                if lhsPart > rhsPart { return true }
-                if lhsPart < rhsPart { return false }
-            }
-            return false
+            SparkleVersionComparison.isVersion(lhs, newerThan: rhs)
         }
 
         @MainActor

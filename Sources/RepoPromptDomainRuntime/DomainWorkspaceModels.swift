@@ -122,6 +122,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
     package let customStoragePath: URL?
     package let isSystemWorkspace: Bool
     package let isHiddenInMenus: Bool
+    package let consolidatedIntoWorkspaceID: UUID?
     package let isEphemeral: Bool
     package let activeContextID: UUID?
     package let contexts: [DomainContextMetadata]
@@ -135,6 +136,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
         customStoragePath: URL?,
         isSystemWorkspace: Bool,
         isHiddenInMenus: Bool,
+        consolidatedIntoWorkspaceID: UUID? = nil,
         isEphemeral: Bool,
         activeContextID: UUID?,
         contexts: [DomainContextMetadata],
@@ -147,6 +149,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
         self.customStoragePath = customStoragePath
         self.isSystemWorkspace = isSystemWorkspace
         self.isHiddenInMenus = isHiddenInMenus
+        self.consolidatedIntoWorkspaceID = consolidatedIntoWorkspaceID
         self.isEphemeral = isEphemeral
         self.activeContextID = activeContextID
         self.contexts = contexts
@@ -335,6 +338,8 @@ private enum DomainWorkspaceDocumentDecoder {
             customStoragePath: customStoragePath,
             isSystemWorkspace: object["isSystemWorkspace"] as? Bool ?? false,
             isHiddenInMenus: object["isHiddenInMenus"] as? Bool ?? false,
+            consolidatedIntoWorkspaceID: (object["consolidatedIntoWorkspaceID"] as? String)
+                .flatMap(UUID.init(uuidString:)),
             isEphemeral: object["ephemeralFlag"] as? Bool ?? false,
             activeContextID: (object["activeComposeTabID"] as? String).flatMap(UUID.init(uuidString:)),
             contexts: contexts,

@@ -215,6 +215,10 @@ enum CodexToolSettingMutation: Equatable {
     case goalSupport(enabled: Bool)
     case reasoningSummaries(enabled: Bool)
     case memories(enabled: Bool)
+    case apps(enabled: Bool)
+    case plugins(enabled: Bool)
+    case mcpElicitation(enabled: Bool)
+    case toolSuggestions(enabled: Bool)
     case mcpServer(normalizedName: String, enabled: Bool)
 }
 
@@ -239,6 +243,10 @@ struct CodexToolSettingsBinding: Equatable {
     let reasoningSummariesEnabled: Bool
     /// Controls Codex local memory generation and reuse across app-server threads.
     let memoriesEnabled: Bool
+    let appsEnabled: Bool
+    let pluginsEnabled: Bool
+    let mcpElicitationEnabled: Bool
+    let toolSuggestionsEnabled: Bool
     let mcpServerEntries: [MCPIntegrationHelper.CodexServerEntry]
     /// Keys are lowercased/trimmed toggle keys derived from each entry's normalized name,
     /// matching the current AgentInputBar lookup convention.

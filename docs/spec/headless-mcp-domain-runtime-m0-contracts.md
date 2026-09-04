@@ -71,7 +71,7 @@ The joined EditFlowPerf request timeline separately freezes `MainActorScheduled 
 
 ### Approval
 
-`WorkspaceApprovalManager` currently owns `create_workspace`, `delete_workspace`, `add_folder`, and `remove_folder`. Terminal results are approved (including always-allow), denied, and timeout. Cancellation settles as denied exactly once, guarded by `WorkspaceApprovalCancellationTests`.
+`WorkspaceApprovalManager` currently owns `create_workspace`, `delete_workspace`, `add_folder`, and `remove_folder`. Terminal results are approved (including always-allow), denied, and timeout. Cancellation settles as denied exactly once; retained MCP approval-response and hook-approval tests cover the serialized response and fail-closed paths.
 
 ## Evidence dispositions
 

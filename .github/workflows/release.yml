@@ -7,10 +7,18 @@ on:
         description: Existing release tag to publish
         required: true
         type: string
+      identity_migration_phase:
+        description: Apple identity migration mode for this release
+        required: true
+        default: disabled
+        type: choice
+        options:
+          - disabled
+          - legacy-preparer
 
 concurrency:
   group: release-draft-creation
-  cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read
@@ -63,6 +71,22 @@ jobs:
           path: release-source
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Resolve Stable release identity context
+        env:
+          REQUESTED_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}
+        run: |
+          set -euo pipefail
+          python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard \
+            --declaration release-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json
+          python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration release-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env release-source/version.env \
+            --expected-migration-phase "$REQUESTED_IDENTITY_MIGRATION_PHASE" \
+            --github-env "$GITHUB_ENV" \
+            --github-summary "$GITHUB_STEP_SUMMARY"
 
       - name: Build and stage approved source
         env:
@@ -120,6 +144,22 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Resolve Stable release identity context
+        env:
+          REQUESTED_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}
+        run: |
+          set -euo pipefail
+          python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard \
+            --declaration approved-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json
+          python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration approved-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env approved-source/version.env \
+            --expected-migration-phase "$REQUESTED_IDENTITY_MIGRATION_PHASE" \
+            --github-env "$GITHUB_ENV" \
+            --github-summary "$GITHUB_STEP_SUMMARY"
+
       - name: Verify and expand staged release source
         env:
           RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
@@ -144,7 +184,6 @@ jobs:
           CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
           CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
           CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
-          CONFIGURED_SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           umask 077
@@ -159,6 +198,7 @@ jobs:
             fi
           }
           trap cleanup_certificate_and_failed_keychain EXIT
+          : "${EXPECTED_SIGN_IDENTITY:?Apple application identity is missing from the reviewed policy}"
           printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
           security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           keychain_created=1
@@ -167,8 +207,63 @@ jobs:
           security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH"
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-          echo "SIGN_IDENTITY=${CONFIGURED_SIGN_IDENTITY:-Developer ID Application: Eric Provencher (648A27MST5)}" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" |
+            grep -F "\"$EXPECTED_SIGN_IDENTITY\"" >/dev/null || {
+              echo "Expected application identity is not present and usable in the ephemeral keychain" >&2
+              exit 1
+            }
+          printf 'KEYCHAIN_PATH=%s\n' "$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          printf 'SIGN_IDENTITY=%s\n' "$EXPECTED_SIGN_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Prepare successor identity migration anchor
+        if: inputs.identity_migration_phase == 'legacy-preparer'
+        env:
+          SUCCESSOR_CERTIFICATE_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          SUCCESSOR_CERTIFICATE_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : "${SUCCESSOR_CERTIFICATE_P12_BASE64:?Successor Developer ID Application certificate is not configured}"
+          : "${SUCCESSOR_CERTIFICATE_P12_PASSWORD:?Successor Developer ID Application password is not configured}"
+          expected_identity="$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY"
+          [[ -n "$expected_identity" ]] || {
+            echo "Migration-anchor signing identity is missing from the reviewed policy" >&2
+            exit 1
+          }
+          successor_certificate="$RUNNER_TEMP/repoprompt-release-successor.p12"
+          anchor_source="trusted-control-plane/Scripts/identity_migration_anchor.c"
+          anchor="$RUNNER_TEMP/repoprompt-successor-identity-anchor"
+          [[ -f "$anchor_source" ]] || {
+            echo "Missing trusted successor identity anchor source: $anchor_source" >&2
+            exit 1
+          }
+          xcrun clang -arch arm64 -arch x86_64 -Os -Wl,-dead_strip -o "$anchor" "$anchor_source"
+          [[ -f "$anchor" && -x "$anchor" ]] || {
+            echo "Failed to build successor identity anchor" >&2
+            exit 1
+          }
+          printf '%s' "$SUCCESSOR_CERTIFICATE_P12_BASE64" | base64 --decode > "$successor_certificate"
+          security import "$successor_certificate" -k "$KEYCHAIN_PATH" \
+            -P "$SUCCESSOR_CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" |
+            grep -F "\"$expected_identity\"" >/dev/null || {
+              echo "Expected successor application identity is not present and usable in the ephemeral keychain" >&2
+              exit 1
+            }
+          codesign --force --sign "$expected_identity" --keychain "$KEYCHAIN_PATH" \
+            --identifier "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" \
+            --timestamp --options runtime "$anchor"
+          codesign --verify --strict --verbose=2 \
+            -R="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" "$anchor"
+          signature_details="$(codesign -dv --verbose=4 "$anchor" 2>&1)"
+          grep -Fx "Identifier=$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" \
+            <<< "$signature_details" >/dev/null
+          grep -Fx "TeamIdentifier=$EXPECTED_MIGRATION_ANCHOR_TEAM_ID" \
+            <<< "$signature_details" >/dev/null
+          printf 'REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=%s\n' "$anchor" >> "$GITHUB_ENV"
 
       - name: Prepare provisioning profile and notarization key
         env:
@@ -235,6 +330,8 @@ jobs:
           CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-release.p12"
           security delete-keychain "$KEYCHAIN_PATH" || true
           rm -f "$CERTIFICATE_PATH"
+          rm -f "$RUNNER_TEMP/repoprompt-release-successor.p12"
+          rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"
           rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"
 
       - name: Upload signed release ZIP for secret-free smoke

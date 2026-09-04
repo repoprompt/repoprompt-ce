@@ -44,6 +44,7 @@ private actor AgentSessionDiskWriter {
     #endif
 
     func enqueueAndWait(data: Data, url: URL) async throws {
+        let url = url.standardizedFileURL
         try await withCheckedThrowingContinuation { continuation in
             var pending = pendingByURL[url] ?? PendingWrite(
                 pendingData: nil,
@@ -62,10 +63,42 @@ private actor AgentSessionDiskWriter {
     }
 
     func waitUntilIdle(for url: URL) async {
+        let url = url.standardizedFileURL
         guard pendingByURL[url] != nil else { return }
         await withCheckedContinuation { continuation in
             idleWaitersByURL[url, default: []].append(continuation)
         }
+    }
+
+    /// Validates and conditionally commits one prepared rehome batch without suspending the actor.
+    /// A normal write already queued or in flight for any destination makes the batch fail closed.
+    func commitPreparedWorkspaceSessionSidecarBatch(
+        _ batch: WorkspaceSessionSidecarPreparedBatch
+    ) throws {
+        let sourceFolder = batch.sourceFolder.standardizedFileURL
+        if let pendingSourceURL = pendingByURL.keys.first(where: { url in
+            let url = url.standardizedFileURL
+            return url.deletingLastPathComponent() == sourceFolder
+                && url.lastPathComponent.hasPrefix(batch.filenamePrefix)
+                && url.pathExtension.lowercased() == "json"
+        }) {
+            throw WorkspaceSessionSidecarMigrationError.sourceWriteInProgress(pendingSourceURL)
+        }
+        for copy in batch.copies {
+            let destinationURL = copy.destinationURL.standardizedFileURL
+            guard pendingByURL[destinationURL] == nil else {
+                throw WorkspaceSessionSidecarMigrationError.destinationWriteInProgress(destinationURL)
+            }
+        }
+        try WorkspaceSessionSidecarMigration.commitPreparedBatch(batch)
+    }
+
+    /// Withdraws a committed batch on the same serialized boundary that published it, so a normal
+    /// save cannot interleave between the two.
+    func rollbackPreparedWorkspaceSessionSidecarBatch(
+        _ batch: WorkspaceSessionSidecarPreparedBatch
+    ) -> [URL] {
+        WorkspaceSessionSidecarMigration.rollbackPreparedBatch(batch)
     }
 
     #if DEBUG
@@ -129,6 +162,11 @@ private actor AgentSessionDiskWriter {
 actor AgentSessionDataService {
     static let shared = AgentSessionDataService()
 
+    static func defaultWorkspaceRootURL() -> URL {
+        MCPFilesystemConstants.identity.applicationSupportRootURL()
+            .appendingPathComponent("Workspaces", isDirectory: true)
+    }
+
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let diskWriter = AgentSessionDiskWriter()
@@ -144,6 +182,7 @@ actor AgentSessionDataService {
     private var deletedSessionFileURLs: Set<URL> = []
     #if DEBUG
         private var deletionTombstoneWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
+        private var workspaceRootOverrideForTesting: URL?
     #endif
     private var metadataIndexReconciliationTasksByFolder: [URL: MetadataIndexReconciliationTaskState] = [:]
     private var metadataIndexReconciledThisProcess: Set<URL> = []
@@ -954,6 +993,115 @@ actor AgentSessionDataService {
         return index.entries.sortedForAgentSessionMetadataIndex()
     }
 
+    /// Prepares a retired workspace's session copies without changing either storage tree.
+    /// The coordinator prepares Chat sidecars too before allowing either family to write.
+    func prepareWorkspaceSessionRehome(
+        from sourceWorkspace: WorkspaceModel,
+        to destinationWorkspace: WorkspaceModel
+    ) async throws -> WorkspaceSessionSidecarPreparedBatch? {
+        let sourceWorkspaceDirectory = resolvedWorkspaceFolderURL(for: sourceWorkspace)
+        let destinationWorkspaceDirectory = resolvedWorkspaceFolderURL(for: destinationWorkspace)
+        let sourceFolder = sourceWorkspaceDirectory
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+            .standardizedFileURL
+        let destinationFolder = destinationWorkspaceDirectory
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+            .standardizedFileURL
+        try WorkspaceSessionSidecarMigration.validateDistinctSessionFolders(
+            source: sourceFolder,
+            destination: destinationFolder
+        )
+        let sourceFiles = try WorkspaceSessionSidecarMigration.sessionFileURLs(
+            in: sourceFolder,
+            prefix: "AgentSession-"
+        )
+
+        for sourceURL in sourceFiles {
+            await diskWriter.waitUntilIdle(for: sourceURL.standardizedFileURL)
+            let destinationURL = destinationFolder
+                .appendingPathComponent(sourceURL.lastPathComponent)
+                .standardizedFileURL
+            await diskWriter.waitUntilIdle(for: destinationURL)
+        }
+        try WorkspaceSessionSidecarMigration.validateDistinctSessionFolders(
+            source: sourceFolder,
+            destination: destinationFolder
+        )
+        let prepared = try WorkspaceSessionSidecarMigration.prepareCopies(
+            from: sourceFolder,
+            to: destinationFolder,
+            filenamePrefix: "AgentSession-",
+            canonicalWorkspaceID: destinationWorkspace.id
+        )
+
+        return WorkspaceSessionSidecarPreparedBatch(
+            sourceFolder: sourceFolder,
+            destinationFolder: destinationFolder,
+            filenamePrefix: "AgentSession-",
+            copies: prepared
+        )
+    }
+
+    /// Commits one already-preflighted Agent batch. Source files remain untouched, and the metadata
+    /// index is rebuilt only after every prepared destination write succeeds.
+    func commitWorkspaceSessionRehome(
+        _ batch: WorkspaceSessionSidecarPreparedBatch
+    ) async throws {
+        for copy in batch.copies {
+            let destinationURL = copy.destinationURL.standardizedFileURL
+            guard !deletedSessionFileURLs.contains(destinationURL) else {
+                let rawID = destinationURL.deletingPathExtension().lastPathComponent
+                    .replacingOccurrences(of: "AgentSession-", with: "")
+                guard let sessionID = UUID(uuidString: rawID) else {
+                    throw WorkspaceSessionSidecarMigrationError.invalidSessionFile(destinationURL)
+                }
+                throw AgentSessionDataError.sessionDeleted(sessionID)
+            }
+        }
+        try await diskWriter.commitPreparedWorkspaceSessionSidecarBatch(batch)
+        guard !batch.copies.isEmpty else { return }
+        do {
+            for copy in batch.copies {
+                let destinationURL = copy.destinationURL.standardizedFileURL
+                let rawID = destinationURL.deletingPathExtension().lastPathComponent
+                    .replacingOccurrences(of: "AgentSession-", with: "")
+                guard let sessionID = UUID(uuidString: rawID) else {
+                    throw WorkspaceSessionSidecarMigrationError.invalidSessionFile(destinationURL)
+                }
+                try await discardSaveIfSessionWasDeleted(
+                    sessionID,
+                    fileURL: destinationURL,
+                    folder: batch.destinationFolder
+                )
+            }
+            _ = try await reconcileMetadataIndex(folder: batch.destinationFolder)
+        } catch {
+            // The files are already published here, so failing without withdrawing them would leave
+            // exactly the half-merged canonical workspace that a later family's rejection would.
+            await rollbackWorkspaceSessionRehome(batch)
+            throw error
+        }
+    }
+
+    /// Withdraws an Agent batch this service already committed, after a later step of the same
+    /// consolidation failed.
+    ///
+    /// Returns the destinations that could not be returned to their pre-commit state, so the
+    /// coordinator can disclose the residue instead of reporting a clean skip.
+    @discardableResult
+    func rollbackWorkspaceSessionRehome(
+        _ batch: WorkspaceSessionSidecarPreparedBatch
+    ) async -> [URL] {
+        let unresolved = await diskWriter.rollbackPreparedWorkspaceSessionSidecarBatch(batch)
+        guard batch.copies.contains(where: \.destinationState.requiresWrite) else {
+            return unresolved
+        }
+        // The metadata index is derived from the destination folder, so it keeps advertising the
+        // withdrawn sessions until it is rebuilt.
+        _ = try? await reconcileMetadataIndex(folder: batch.destinationFolder)
+        return unresolved
+    }
+
     // MARK: - Public API
 
     /// Save an AgentSession for a given workspace, returning the file URL on success.
@@ -1360,7 +1508,9 @@ actor AgentSessionDataService {
 
     func deleteAgentSessions(forComposeTabID tabID: UUID, for workspace: WorkspaceModel) async throws {
         let failures = await deleteAgentSessions(forComposeTabIDs: [tabID], for: workspace)
-        if let failure = failures[tabID] { throw failure }
+        if let failure = failures[tabID] {
+            throw failure
+        }
     }
 
     func deleteAgentSessions(
@@ -1455,6 +1605,14 @@ actor AgentSessionDataService {
     }
 
     #if DEBUG
+        func test_setWorkspaceRootOverride(_ root: URL?) {
+            workspaceRootOverrideForTesting = root?.standardizedFileURL
+        }
+
+        func test_workspaceRootURL() -> URL {
+            workspaceRootURL()
+        }
+
         func test_setBeforeSessionWriteHook(_ hook: (@Sendable (URL) async -> Void)?) async {
             await diskWriter.test_setBeforeWriteHook(hook)
         }
@@ -1501,22 +1659,28 @@ actor AgentSessionDataService {
         return agentSessionsFolder
     }
 
-    /// Return the main folder for the workspace (with custom or default path).
+    private func workspaceRootURL() -> URL {
+        #if DEBUG
+            if let workspaceRootOverrideForTesting {
+                return workspaceRootOverrideForTesting
+            }
+        #endif
+        return Self.defaultWorkspaceRootURL()
+    }
+
+    private func resolvedWorkspaceFolderURL(for workspace: WorkspaceModel) -> URL {
+        WorkspaceSessionSidecarMigration.workspaceDirectory(
+            for: workspace,
+            root: workspaceRootURL()
+        )
+    }
+
+    /// Return the main folder for the workspace.
     private func workspaceFolderURL(for workspace: WorkspaceModel) throws -> URL {
-        if let customURL = workspace.customStoragePath {
-            return customURL
-        } else {
-            let root = MCPFilesystemConstants.identity.applicationSupportRootURL()
-                .appendingPathComponent("Workspaces", isDirectory: true)
-            if !FileManager.default.fileExists(atPath: root.path) {
-                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            }
-            let folderName = WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id)
-            let workspaceDir = root.appendingPathComponent(folderName)
-            if !FileManager.default.fileExists(atPath: workspaceDir.path) {
-                try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
-            }
-            return workspaceDir
+        let workspaceDir = resolvedWorkspaceFolderURL(for: workspace)
+        if !FileManager.default.fileExists(atPath: workspaceDir.path) {
+            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         }
+        return workspaceDir
     }
 }

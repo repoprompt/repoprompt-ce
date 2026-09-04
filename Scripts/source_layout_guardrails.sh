@@ -769,6 +769,7 @@ print_matches \
 # 8. Agent-authored reports and working notes stay local unless explicitly
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
+  "docs/architecture/apple-identity-migration.md"
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
@@ -797,8 +798,6 @@ allowed_tracked_docs=(
   "docs/spec/mcp-domain-canonical-tool-definitions.generated.json"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
-  "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
-  "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )
 existing_tracked_docs=()
 while IFS= read -r path; do

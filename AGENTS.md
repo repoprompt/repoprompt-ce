@@ -73,12 +73,11 @@ authoritative.
 ```bash
 make xcode                  # generate and open
 make xcode-generate         # generate without opening
-make xcode-generator-test   # deterministic generator contract tests (default CI)
 make xcode-validate         # explicit full validation with xcodebuild -list
 make xcode-clean            # remove generated workspace metadata
 ```
 
-Default CI runs `make xcode-generator-test`; full `make xcode-validate` is explicit and runs through local `pr-ready` for Xcode workspace boundary changes or the dedicated `Xcode Workspace Validation` workflow.
+`make xcode-validate` is the canonical generated-workspace check and runs through local `pr-ready` for Xcode workspace boundary changes or the dedicated `Xcode Workspace Validation` workflow.
 
 Xcode 26.3 exposes the native `RepoPrompt` and `repoprompt-mcp` product schemes.
 Use `RepoPrompt CE App` and `RepoPrompt CE MCP` for conductor-coordinated debug

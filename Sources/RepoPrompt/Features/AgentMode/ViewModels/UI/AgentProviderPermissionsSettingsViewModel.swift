@@ -112,6 +112,14 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
                 CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
             case let .memories(enabled):
                 CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
+            case let .apps(enabled):
+                CodexAgentModeBooleanPreference.apps.setEnabled(enabled, defaults: defaults)
+            case let .plugins(enabled):
+                CodexAgentModeBooleanPreference.plugins.setEnabled(enabled, defaults: defaults)
+            case let .mcpElicitation(enabled):
+                CodexAgentModeBooleanPreference.mcpElicitation.setEnabled(enabled, defaults: defaults)
+            case let .toolSuggestions(enabled):
+                CodexAgentModeBooleanPreference.toolSuggestions.setEnabled(enabled, defaults: defaults)
             case let .mcpServer(normalizedName, enabled):
                 CodexAgentToolPreferences.setMCPServerEnabled(
                     normalizedName: normalizedName,

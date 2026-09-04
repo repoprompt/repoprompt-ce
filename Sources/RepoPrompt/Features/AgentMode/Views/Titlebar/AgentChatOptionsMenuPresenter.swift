@@ -9,6 +9,21 @@ struct AgentChatOptionsMenuTarget: Equatable {
 }
 
 enum AgentSessionHandoffPrompt {
+    private static func quotedSingleLineTitle(_ title: String) -> String {
+        let reflected = String(reflecting: title)
+        var rendered = ""
+        rendered.reserveCapacity(reflected.utf8.count)
+        for scalar in reflected.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .control, .lineSeparator, .paragraphSeparator:
+                rendered += "\\u{\(String(scalar.value, radix: 16, uppercase: true))}"
+            default:
+                rendered.unicodeScalars.append(scalar)
+            }
+        }
+        return rendered
+    }
+
     static func render(
         target: AgentChatOptionsMenuTarget,
         cliCommandName: String,
@@ -17,6 +32,7 @@ enum AgentSessionHandoffPrompt {
         let prompt = """
         Use RepoPrompt CE to continue this exact Agent Mode session.
 
+        Session title: \(quotedSingleLineTitle(target.tabName))
         Window ID: \(target.windowID)
         Workspace ID: \(target.workspaceID.uuidString)
         Context ID (compose tab): \(target.tabID.uuidString)

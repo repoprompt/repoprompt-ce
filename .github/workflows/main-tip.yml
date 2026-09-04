@@ -6,25 +6,16 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
-    inputs:
-      commit:
-        description: Commit SHA on protected main to publish as tip
-        required: false
-        type: string
 
 concurrency:
   group: >-
     ${{
-      (github.event_name == 'workflow_dispatch' ||
-        github.event.workflow_run.conclusion == 'success') &&
-      'main-tip-channel' ||
+      (github.event_name == 'workflow_dispatch' && 'main-tip-dispatch-channel') ||
+      (github.event.workflow_run.conclusion == 'success' && 'main-tip-channel') ||
       format('main-tip-skipped-{0}', github.run_id)
     }}
-  # Tip is a rolling channel: once main advances, completing an older artifact only
-  # delays the commit users actually asked the channel to publish. A failed CI
-  # notification receives a unique group so it cannot evict a healthy pending or
-  # in-flight Tip build before setup's success guard skips the replacement run.
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+  queue: single
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -42,28 +33,67 @@ jobs:
       build-number: ${{ steps.tip.outputs.build-number }}
       tag: ${{ steps.tip.outputs.tag }}
       tooling-commit: ${{ steps.tip.outputs.tooling-commit }}
-      should-publish: ${{ steps.tip.outputs.should-publish }}
+      rollout-role: ${{ steps.tip.outputs.rollout-role }}
+      rollout-identity: ${{ steps.tip.outputs.rollout-identity }}
+      migration-phase: ${{ steps.tip.outputs.migration-phase }}
+      installation-type: ${{ steps.tip.outputs.installation-type }}
     steps:
       - name: Check out trusted tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: main
+          ref: ${{ github.workflow_sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Resolve protected main commit
         id: tip
         env:
-          REQUESTED_COMMIT: ${{ inputs.commit || github.event.workflow_run.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_COMMIT: ${{ github.sha }}
+          DISPATCH_REF: ${{ github.ref }}
+          WORKFLOW_RUN_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_DEFINITION_COMMIT: ${{ github.workflow_sha }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
-          TIP_GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              [[ "$DISPATCH_REF" == "refs/heads/main" ]] || {
+                echo "Manual Tip dispatch must run from protected main" >&2
+                exit 1
+              }
+              requested_commit="$DISPATCH_COMMIT"
+              ;;
+            workflow_run)
+              requested_commit="$WORKFLOW_RUN_COMMIT"
+              ;;
+            *)
+              echo "Unsupported Tip release event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          [[ "$requested_commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "GitHub did not provide a full lowercase source commit SHA" >&2
+            exit 1
+          }
+          [[ "$WORKFLOW_DEFINITION_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "GitHub did not provide a full workflow definition SHA" >&2
+            exit 1
+          }
           git fetch --no-tags origin main
-          commit="${REQUESTED_COMMIT:-$(git rev-parse origin/main)}"
-          commit="$(git rev-parse "$commit^{commit}")"
-          git merge-base --is-ancestor "$commit" origin/main || {
-            echo "Requested tip commit is not reachable from origin/main" >&2
+          commit="$(git rev-parse "$requested_commit^{commit}")"
+          live_main="$(git rev-parse origin/main)"
+          [[ "$commit" == "$live_main" ]] || {
+            echo "Tip candidate is not the current protected-main commit: candidate=$commit live-main=$live_main" >&2
+            exit 1
+          }
+          tooling_commit="$(git rev-parse HEAD)"
+          [[ "$tooling_commit" == "$WORKFLOW_DEFINITION_COMMIT" ]] || {
+            echo "Checked-out release tooling differs from the workflow definition commit" >&2
+            exit 1
+          }
+          [[ "$tooling_commit" == "$commit" ]] || {
+            echo "Release tooling and selected protected-main source are not the same commit" >&2
             exit 1
           }
           short_sha="$(git rev-parse --short=12 "$commit")"
@@ -73,63 +103,239 @@ jobs:
             exit 1
           }
 
-          stable_appcast="$RUNNER_TEMP/stable-appcast.xml"
-          curl --fail --location --retry 3 --silent --show-error \
-            https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml \
-            --output "$stable_appcast"
-          stable_build_number="$(python3 - "$stable_appcast" <<'PYTHON'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          root = ET.parse(sys.argv[1]).getroot()
-          versions = [
-              (element.text or "").strip()
-              for element in root.iter()
-              if element.tag.rsplit("}", 1)[-1] == "version"
-          ]
-          if len(versions) != 1 or not versions[0].isdigit():
-              raise SystemExit("Stable appcast must contain exactly one numeric sparkle:version")
-          print(versions[0])
-          PYTHON
-          )"
-          (( ${#stable_build_number} <= 4 )) || {
-            echo "Stable build number exceeds CFBundleVersion's four-digit major component" >&2
+          rollout_declaration="$RUNNER_TEMP/tip-rollout.json"
+          rollout_version_env="$RUNNER_TEMP/tip-version.env"
+          git show "$commit:tip-rollout.json" > "$rollout_declaration"
+          git show "$commit:version.env" > "$rollout_version_env"
+          eval "$(python3 Scripts/stable_rollout.py packaging-context \
+            --declaration "$rollout_declaration" \
+            --policy Scripts/apple_identity_policy.json \
+            --version-env "$rollout_version_env")"
+          [[ "$ROLLOUT_UPDATE_REPOSITORY" == "$TIP_UPDATE_REPOSITORY" ]] || {
+            echo "Configured Tip update repository does not match the reviewed identity policy" >&2
             exit 1
           }
+
+          stable_appcast="$RUNNER_TEMP/stable-appcast.xml"
+          stable_feed_url="$(python3 Scripts/stable_rollout.py feed-url \
+            --policy Scripts/apple_identity_policy.json --channel stable)"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            "$stable_feed_url" --output "$stable_appcast"
+          stable_build_number="$(python3 Scripts/stable_rollout.py max-build --appcast "$stable_appcast")"
+          [[ "$stable_build_number" =~ ^[0-9]{1,4}$ ]] || {
+            echo "Stable appcast maximum build must be one numeric component of at most four digits" >&2
+            exit 1
+          }
+          if [[ "$ROLLOUT_ROLE" == "transition" || "$ROLLOUT_ROLE" == "successor" ]]; then
+            live_tip_manifest="$RUNNER_TEMP/live-tip-identity-rollout.json"
+            live_tip_appcast="$RUNNER_TEMP/live-tip-appcast.xml"
+            curl --fail --location --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              "https://github.com/$ROLLOUT_UPDATE_REPOSITORY/releases/latest/download/identity-rollout.json" \
+              --output "$live_tip_manifest"
+            curl --fail --location --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              "https://github.com/$ROLLOUT_UPDATE_REPOSITORY/releases/latest/download/appcast.xml" \
+              --output "$live_tip_appcast"
+            python3 Scripts/stable_rollout.py validate-stable-tip-floor \
+              --policy Scripts/apple_identity_policy.json \
+              --stable-appcast "$stable_appcast" \
+              --tip-manifest "$live_tip_manifest" \
+              --tip-appcast "$live_tip_appcast"
+          fi
           build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"
           archive_basename="RepoPrompt-tip-$short_sha-$build_number"
           tag="tip-$short_sha"
 
-          lookup_classification="$(./Scripts/lookup_public_tip_release.sh \
-            "$TIP_UPDATE_REPOSITORY" \
-            "$tag" \
-            "$archive_basename")"
-          case "$lookup_classification" in
-            found)
-              should_publish=false
-              echo "Existing tip release response classification=complete; skipping rebuild."
-              ;;
-            not-found)
-              should_publish=true
-              ;;
-            *)
-              echo "GitHub public tip lookup classification=unexpected-helper-output" >&2
-              exit 1
-              ;;
-          esac
           {
             echo "commit=$commit"
             echo "short-sha=$short_sha"
             echo "build-number=$build_number"
             echo "tag=$tag"
-            echo "tooling-commit=$(git rev-parse HEAD)"
-            echo "should-publish=$should_publish"
+            echo "tooling-commit=$tooling_commit"
+            echo "rollout-role=$ROLLOUT_ROLE"
+            echo "rollout-identity=$ROLLOUT_IDENTITY"
+            echo "migration-phase=$REPOPROMPT_IDENTITY_MIGRATION_PHASE"
+            echo "installation-type=$ROLLOUT_INSTALLATION_TYPE"
           } >> "$GITHUB_OUTPUT"
+
+  credential-preflight:
+    name: Preflight Tip Rollout Credentials
+    needs: setup
+    environment: tip-release
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.setup.outputs.tooling-commit }}
+          path: trusted-control-plane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out approved tip source as data
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.setup.outputs.commit }}
+          path: approved-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify authenticated protected-main authority
+        env:
+          TIP_SOURCE_GH_TOKEN: ${{ github.token }}
+          TIP_SOURCE_REPOSITORY: ${{ github.repository }}
+          TIP_SOURCE_BRANCH: main
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+        run: ./trusted-control-plane/Scripts/verify_tip_source_commit.sh "credential preflight"
+
+      - name: Validate role-selected Tip credentials
+        env:
+          SETUP_ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
+          SETUP_ROLLOUT_IDENTITY: ${{ needs.setup.outputs.rollout-identity }}
+          SETUP_MIGRATION_PHASE: ${{ needs.setup.outputs.migration-phase }}
+          SETUP_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
+          LEGACY_CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          LEGACY_CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          SUCCESSOR_CERTIFICATE_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          SUCCESSOR_CERTIFICATE_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          SUCCESSOR_INSTALLER_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          SUCCESSOR_INSTALLER_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          LEGACY_PROVISIONING_PROFILE_BASE64: ${{ secrets.REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
+          SUCCESSOR_PROVISIONING_PROFILE_BASE64: ${{ secrets.SUCCESSOR_REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
+          LEGACY_NOTARYTOOL_PRIVATE_KEY_BASE64: ${{ secrets.NOTARYTOOL_PRIVATE_KEY_BASE64 }}
+          LEGACY_NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
+          LEGACY_NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
+          SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64: ${{ secrets.SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64 }}
+          SUCCESSOR_NOTARYTOOL_KEY_ID: ${{ secrets.SUCCESSOR_NOTARYTOOL_KEY_ID }}
+          SUCCESSOR_NOTARYTOOL_ISSUER_ID: ${{ secrets.SUCCESSOR_NOTARYTOOL_ISSUER_ID }}
+          CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          PREFLIGHT_KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-tip-preflight.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-tip-preflight.p12"
+          SUCCESSOR_CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-tip-preflight-successor.p12"
+          INSTALLER_CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-tip-preflight-installer.p12"
+          cleanup_preflight_credentials() {
+            rm -f "$CERTIFICATE_PATH" "$SUCCESSOR_CERTIFICATE_PATH" "$INSTALLER_CERTIFICATE_PATH"
+            security delete-keychain "$PREFLIGHT_KEYCHAIN_PATH" || true
+            rm -f "$PREFLIGHT_KEYCHAIN_PATH"
+          }
+          trap cleanup_preflight_credentials EXIT
+          fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+          require_value() {
+            local name="$1"
+            [[ -n "${!name:-}" ]] || fail "$name is not configured for the $ROLLOUT_ROLE rollout"
+          }
+          decode_value() {
+            local label="$1"
+            local value="$2"
+            printf '%s' "$value" | base64 --decode >/dev/null || fail "$label is not valid base64"
+          }
+
+          eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration approved-source/tip-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env approved-source/version.env)"
+          [[ "$ROLLOUT_CHANNEL" == "tip" ]] || fail "Tip credential preflight requires a Tip declaration"
+          [[ "$ROLLOUT_ROLE" == "$SETUP_ROLLOUT_ROLE" ]] || fail "Tip rollout role changed after setup"
+          [[ "$ROLLOUT_IDENTITY" == "$SETUP_ROLLOUT_IDENTITY" ]] || fail "Tip rollout identity changed after setup"
+          [[ "$REPOPROMPT_IDENTITY_MIGRATION_PHASE" == "$SETUP_MIGRATION_PHASE" ]] || fail "Tip migration phase changed after setup"
+          [[ "$ROLLOUT_INSTALLATION_TYPE" == "$SETUP_INSTALLATION_TYPE" ]] || fail "Tip installation type changed after setup"
+          require_value EXPECTED_SIGN_IDENTITY
+          require_value CI_KEYCHAIN_PASSWORD
+
+          case "$ROLLOUT_IDENTITY" in
+            legacy)
+              CERTIFICATE_P12_BASE64="$LEGACY_CERTIFICATE_P12_BASE64"
+              CERTIFICATE_P12_PASSWORD="$LEGACY_CERTIFICATE_P12_PASSWORD"
+              PROVISIONING_PROFILE_BASE64="$LEGACY_PROVISIONING_PROFILE_BASE64"
+              NOTARYTOOL_PRIVATE_KEY_BASE64="$LEGACY_NOTARYTOOL_PRIVATE_KEY_BASE64"
+              NOTARYTOOL_KEY_ID="$LEGACY_NOTARYTOOL_KEY_ID"
+              NOTARYTOOL_ISSUER_ID="$LEGACY_NOTARYTOOL_ISSUER_ID"
+              ;;
+            successor)
+              CERTIFICATE_P12_BASE64="$SUCCESSOR_CERTIFICATE_P12_BASE64"
+              CERTIFICATE_P12_PASSWORD="$SUCCESSOR_CERTIFICATE_P12_PASSWORD"
+              PROVISIONING_PROFILE_BASE64="$SUCCESSOR_PROVISIONING_PROFILE_BASE64"
+              NOTARYTOOL_PRIVATE_KEY_BASE64="$SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64"
+              NOTARYTOOL_KEY_ID="$SUCCESSOR_NOTARYTOOL_KEY_ID"
+              NOTARYTOOL_ISSUER_ID="$SUCCESSOR_NOTARYTOOL_ISSUER_ID"
+              ;;
+            *)
+              fail "Unsupported Tip rollout identity: $ROLLOUT_IDENTITY"
+              ;;
+          esac
+          require_value CERTIFICATE_P12_BASE64
+          require_value CERTIFICATE_P12_PASSWORD
+          require_value PROVISIONING_PROFILE_BASE64
+          require_value NOTARYTOOL_PRIVATE_KEY_BASE64
+          require_value NOTARYTOOL_KEY_ID
+          require_value NOTARYTOOL_ISSUER_ID
+
+          decode_value "application certificate" "$CERTIFICATE_P12_BASE64"
+          decode_value "provisioning profile" "$PROVISIONING_PROFILE_BASE64"
+          decode_value "notarytool private key" "$NOTARYTOOL_PRIVATE_KEY_BASE64"
+
+          if [[ "$ROLLOUT_ROLE" == "preparer" ]]; then
+            require_value EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY
+            require_value SUCCESSOR_CERTIFICATE_P12_BASE64
+            require_value SUCCESSOR_CERTIFICATE_P12_PASSWORD
+            decode_value "successor anchor certificate" "$SUCCESSOR_CERTIFICATE_P12_BASE64"
+          fi
+          if [[ "$ROLLOUT_ROLE" == "transition" ]]; then
+            require_value EXPECTED_INSTALLER_IDENTITY
+            require_value SUCCESSOR_INSTALLER_P12_BASE64
+            require_value SUCCESSOR_INSTALLER_P12_PASSWORD
+            decode_value "successor installer certificate" "$SUCCESSOR_INSTALLER_P12_BASE64"
+          fi
+
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH" || fail "application P12 write failed"
+          security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$PREFLIGHT_KEYCHAIN_PATH"
+          security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security \
+            >/dev/null || fail "application P12 import failed"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH" \
+            >/dev/null || fail "application key partition setup failed"
+          security find-identity -v -p codesigning "$PREFLIGHT_KEYCHAIN_PATH" |
+            grep -F "\"$EXPECTED_SIGN_IDENTITY\"" >/dev/null || fail "application identity verification failed"
+
+          if [[ "$ROLLOUT_ROLE" == "preparer" ]]; then
+            printf '%s' "$SUCCESSOR_CERTIFICATE_P12_BASE64" | base64 --decode > "$SUCCESSOR_CERTIFICATE_PATH" || fail "successor application P12 write failed"
+            security import "$SUCCESSOR_CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$SUCCESSOR_CERTIFICATE_P12_PASSWORD" \
+              -T /usr/bin/codesign -T /usr/bin/security \
+              >/dev/null || fail "successor application P12 import failed"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH" \
+              >/dev/null || fail "successor application key partition setup failed"
+            security find-identity -v -p codesigning "$PREFLIGHT_KEYCHAIN_PATH" |
+              grep -F "\"$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY\"" >/dev/null || fail "successor application identity verification failed"
+          fi
+          if [[ "$ROLLOUT_ROLE" == "transition" ]]; then
+            printf '%s' "$SUCCESSOR_INSTALLER_P12_BASE64" | base64 --decode > "$INSTALLER_CERTIFICATE_PATH" || fail "successor installer P12 write failed"
+            security import "$INSTALLER_CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$SUCCESSOR_INSTALLER_P12_PASSWORD" \
+              -T /usr/bin/productbuild -T /usr/bin/productsign -T /usr/bin/security \
+              >/dev/null || fail "successor installer P12 import failed"
+            security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild:,productsign: \
+              -s -k "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH" \
+              >/dev/null || fail "successor installer key partition setup failed"
+            security find-identity -v -p basic "$PREFLIGHT_KEYCHAIN_PATH" |
+              grep -F "\"$EXPECTED_INSTALLER_IDENTITY\"" >/dev/null || fail "successor installer identity verification failed"
+          fi
+          printf 'OK: Tip %s credential/configuration preflight passed.\n' "$ROLLOUT_ROLE"
 
   stage:
     name: Build Tip Source Without Secrets
-    needs: setup
-    if: needs.setup.outputs.should-publish == 'true'
+    needs:
+      - setup
+      - credential-preflight
     runs-on: macos-26
     permissions:
       contents: read
@@ -208,6 +414,7 @@ jobs:
         env:
           RELEASE_COMMIT: ${{ needs.setup.outputs.commit }}
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
+          REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ needs.setup.outputs.migration-phase }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -218,19 +425,54 @@ jobs:
           [[ "${checksums[0]}" == "${archives[0]}.sha256" ]] || { echo "Staged tip checksum name mismatch" >&2; exit 1; }
           (cd staged-tip && shasum -a 256 -c "$(basename "${checksums[0]}")")
           ./trusted-control-plane/Scripts/extract_staged_release.py "${archives[0]}" tip-source RepoPrompt
-          REPOPROMPT_RELEASE_SOURCE_ROOT=tip-source \
+          REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1 \
+            REPOPROMPT_RELEASE_SOURCE_ROOT=tip-source \
             REPOPROMPT_APPROVED_SOURCE_ROOT=approved-source \
             ./trusted-control-plane/Scripts/validate_staged_release.sh
 
-      - name: Import Developer ID certificate
+      - name: Import role-selected Developer ID certificates
         env:
-          CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
-          CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
+          ROLLOUT_IDENTITY: ${{ needs.setup.outputs.rollout-identity }}
+          LEGACY_CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          LEGACY_CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          SUCCESSOR_CERTIFICATE_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          SUCCESSOR_CERTIFICATE_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          SUCCESSOR_INSTALLER_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          SUCCESSOR_INSTALLER_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
           CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
-          CONFIGURED_SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           umask 077
+          fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+          verify_identity() {
+            local policy="$1"
+            local identity="$2"
+            local label="$3"
+            security find-identity -v -p "$policy" "$KEYCHAIN_PATH" |
+              grep -F "\"$identity\"" >/dev/null ||
+              fail "Expected $label identity is not present and usable in the ephemeral keychain"
+          }
+          eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration approved-source/tip-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env approved-source/version.env)"
+          : "${CI_KEYCHAIN_PASSWORD:?CI keychain password is not configured}"
+          case "$ROLLOUT_IDENTITY" in
+            successor)
+              CERTIFICATE_P12_BASE64="$SUCCESSOR_CERTIFICATE_P12_BASE64"
+              CERTIFICATE_P12_PASSWORD="$SUCCESSOR_CERTIFICATE_P12_PASSWORD"
+              ;;
+            legacy)
+              CERTIFICATE_P12_BASE64="$LEGACY_CERTIFICATE_P12_BASE64"
+              CERTIFICATE_P12_PASSWORD="$LEGACY_CERTIFICATE_P12_PASSWORD"
+              ;;
+            *)
+              fail "Unsupported Tip rollout identity: $ROLLOUT_IDENTITY"
+              ;;
+          esac
+          : "${CERTIFICATE_P12_BASE64:?Application signing certificate is not configured for this identity}"
+          : "${CERTIFICATE_P12_PASSWORD:?Application signing certificate password is not configured for this identity}"
           KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-tip.keychain-db"
           CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-tip.p12"
           printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
@@ -240,22 +482,104 @@ jobs:
           security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH"
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-          echo "SIGN_IDENTITY=${CONFIGURED_SIGN_IDENTITY:-Developer ID Application: Eric Provencher (648A27MST5)}" >> "$GITHUB_ENV"
+          verify_identity codesigning "$EXPECTED_SIGN_IDENTITY" application
+          if [[ "$ROLLOUT_ROLE" == "transition" ]]; then
+            : "${SUCCESSOR_INSTALLER_P12_BASE64:?Successor Developer ID Installer certificate is not configured}"
+            : "${SUCCESSOR_INSTALLER_P12_PASSWORD:?Successor Developer ID Installer password is not configured}"
+            installer_certificate="$RUNNER_TEMP/repoprompt-tip-installer.p12"
+            printf '%s' "$SUCCESSOR_INSTALLER_P12_BASE64" | base64 --decode > "$installer_certificate"
+            security import "$installer_certificate" -k "$KEYCHAIN_PATH" \
+              -P "$SUCCESSOR_INSTALLER_P12_PASSWORD" -T /usr/bin/productbuild -T /usr/bin/productsign -T /usr/bin/security
+            security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild:,productsign: \
+              -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            verify_identity basic "$EXPECTED_INSTALLER_IDENTITY" installer
+            rm -f "$installer_certificate"
+          fi
+          printf 'KEYCHAIN_PATH=%s\n' "$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          printf 'SIGN_IDENTITY=%s\n' "$EXPECTED_SIGN_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Prepare successor identity migration anchor
+        if: needs.setup.outputs.rollout-role == 'preparer'
+        env:
+          SUCCESSOR_CERTIFICATE_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          SUCCESSOR_CERTIFICATE_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration approved-source/tip-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env approved-source/version.env)"
+          : "${SUCCESSOR_CERTIFICATE_P12_BASE64:?Successor Developer ID Application certificate is not configured}"
+          : "${SUCCESSOR_CERTIFICATE_P12_PASSWORD:?Successor Developer ID Application password is not configured}"
+          successor_certificate="$RUNNER_TEMP/repoprompt-tip-successor.p12"
+          anchor="$RUNNER_TEMP/repoprompt-successor-identity-anchor"
+          xcrun clang -arch arm64 -arch x86_64 -Os -Wl,-dead_strip \
+            -o "$anchor" trusted-control-plane/Scripts/identity_migration_anchor.c
+          printf '%s' "$SUCCESSOR_CERTIFICATE_P12_BASE64" | base64 --decode > "$successor_certificate"
+          security import "$successor_certificate" -k "$KEYCHAIN_PATH" \
+            -P "$SUCCESSOR_CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" |
+            grep -F "\"$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY\"" >/dev/null || {
+              echo "Expected successor application identity is not present and usable in the ephemeral keychain" >&2
+              exit 1
+            }
+          codesign --force --sign "$EXPECTED_MIGRATION_ANCHOR_SIGN_IDENTITY" --keychain "$KEYCHAIN_PATH" \
+            --identifier "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" --timestamp --options runtime "$anchor"
+          codesign --verify --strict --verbose=2 \
+            -R="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" "$anchor"
+          signature_details="$(codesign -dv --verbose=4 "$anchor" 2>&1)"
+          grep -Fx "Identifier=$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" <<< "$signature_details" >/dev/null
+          grep -Fx "TeamIdentifier=$EXPECTED_MIGRATION_ANCHOR_TEAM_ID" <<< "$signature_details" >/dev/null
+          printf 'REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=%s\n' "$anchor" >> "$GITHUB_ENV"
 
       - name: Prepare provisioning profile and notarization key
         env:
-          PROVISIONING_PROFILE_BASE64: ${{ secrets.REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
-          NOTARYTOOL_PRIVATE_KEY_BASE64: ${{ secrets.NOTARYTOOL_PRIVATE_KEY_BASE64 }}
+          ROLLOUT_IDENTITY: ${{ needs.setup.outputs.rollout-identity }}
+          LEGACY_PROVISIONING_PROFILE_BASE64: ${{ secrets.REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
+          SUCCESSOR_PROVISIONING_PROFILE_BASE64: ${{ secrets.SUCCESSOR_REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
+          LEGACY_NOTARYTOOL_PRIVATE_KEY_BASE64: ${{ secrets.NOTARYTOOL_PRIVATE_KEY_BASE64 }}
+          LEGACY_NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
+          LEGACY_NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
+          SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64: ${{ secrets.SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64 }}
+          SUCCESSOR_NOTARYTOOL_KEY_ID: ${{ secrets.SUCCESSOR_NOTARYTOOL_KEY_ID }}
+          SUCCESSOR_NOTARYTOOL_ISSUER_ID: ${{ secrets.SUCCESSOR_NOTARYTOOL_ISSUER_ID }}
         run: |
           set -euo pipefail
           umask 077
           SECRETS_DIR="$RUNNER_TEMP/repoprompt-tip-secrets"
           mkdir -p "$SECRETS_DIR"
+          case "$ROLLOUT_IDENTITY" in
+            successor)
+              PROVISIONING_PROFILE_BASE64="$SUCCESSOR_PROVISIONING_PROFILE_BASE64"
+              NOTARYTOOL_PRIVATE_KEY_BASE64="$SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64"
+              NOTARYTOOL_KEY_ID="$SUCCESSOR_NOTARYTOOL_KEY_ID"
+              NOTARYTOOL_ISSUER_ID="$SUCCESSOR_NOTARYTOOL_ISSUER_ID"
+              ;;
+            legacy)
+              PROVISIONING_PROFILE_BASE64="$LEGACY_PROVISIONING_PROFILE_BASE64"
+              NOTARYTOOL_PRIVATE_KEY_BASE64="$LEGACY_NOTARYTOOL_PRIVATE_KEY_BASE64"
+              NOTARYTOOL_KEY_ID="$LEGACY_NOTARYTOOL_KEY_ID"
+              NOTARYTOOL_ISSUER_ID="$LEGACY_NOTARYTOOL_ISSUER_ID"
+              ;;
+            *)
+              echo "Unsupported Tip rollout identity: $ROLLOUT_IDENTITY" >&2
+              exit 1
+              ;;
+          esac
+          : "${PROVISIONING_PROFILE_BASE64:?Provisioning profile is not configured for this identity}"
+          : "${NOTARYTOOL_PRIVATE_KEY_BASE64:?Notarytool private key is not configured for this identity}"
+          : "${NOTARYTOOL_KEY_ID:?Notarytool key ID is not configured for this identity}"
+          : "${NOTARYTOOL_ISSUER_ID:?Notarytool issuer ID is not configured for this identity}"
           printf '%s' "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$SECRETS_DIR/repoprompt-ce.provisionprofile"
           printf '%s' "$NOTARYTOOL_PRIVATE_KEY_BASE64" | base64 --decode > "$SECRETS_DIR/notarytool-private-key.p8"
-          echo "REPOPROMPT_PROVISIONING_PROFILE=$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
-          echo "NOTARYTOOL_PRIVATE_KEY=$SECRETS_DIR/notarytool-private-key.p8" >> "$GITHUB_ENV"
+          printf 'REPOPROMPT_PROVISIONING_PROFILE=%s\n' "$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
+          printf 'NOTARYTOOL_PRIVATE_KEY=%s\n' "$SECRETS_DIR/notarytool-private-key.p8" >> "$GITHUB_ENV"
+          printf 'NOTARYTOOL_KEY_ID=%s\n' "$NOTARYTOOL_KEY_ID" >> "$GITHUB_ENV"
+          printf 'NOTARYTOOL_ISSUER_ID=%s\n' "$NOTARYTOOL_ISSUER_ID" >> "$GITHUB_ENV"
 
       - name: Install Sentry CLI for Tip symbol upload
         run: |
@@ -276,7 +600,7 @@ jobs:
           printf '%s' "$SENTRY_AUTH_TOKEN" > "$SENTRY_TOKEN_FILE"
           chmod 600 "$SENTRY_TOKEN_FILE"
 
-      - name: Sign and notarize staged tip
+      - name: Sign application
         env:
           TIP_COMMIT: ${{ needs.setup.outputs.commit }}
           TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
@@ -289,14 +613,59 @@ jobs:
           REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
           REPOPROMPT_ENABLE_SENTRY: "1"
+          REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ needs.setup.outputs.migration-phase }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
           REPOPROMPT_SENTRY_AUTH_TOKEN_FILE: ${{ runner.temp }}/repoprompt-tip-secrets/sentry-auth-token
+          SPARKLE_PRIVATE_KEY: ${{ needs.setup.outputs.installation-type == 'application' && secrets.SPARKLE_PRIVATE_KEY || '' }}
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh sign-application
+
+      - name: Build package
+        if: needs.setup.outputs.installation-type == 'package'
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh build-package
+
+      - name: Submit package notarization
+        if: needs.setup.outputs.installation-type == 'package'
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh submit-package-notarization
+
+      - name: Staple package
+        if: needs.setup.outputs.installation-type == 'package'
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh staple-package
+
+      - name: Validate package
+        if: needs.setup.outputs.installation-type == 'package'
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-          NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
-          NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
-        run: ./trusted-control-plane/Scripts/main_tip_release.sh sign
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh validate-package
 
       - name: Remove ephemeral keychain
         if: always()
@@ -304,18 +673,27 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/repoprompt-tip.keychain-db" || true
           rm -rf "$RUNNER_TEMP/repoprompt-tip-secrets"
           rm -f "$RUNNER_TEMP/repoprompt-tip.p12"
+          rm -f "$RUNNER_TEMP/repoprompt-tip-installer.p12"
+          rm -f "$RUNNER_TEMP/repoprompt-tip-successor.p12"
+          rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"
+
+      - name: Validate signed Tip asset inventory
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          TIP_PUBLISH_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh validate-assets
 
       - name: Upload signed tip assets for smoke and publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: RepoPrompt-CE-signed-tip
-          path: |
-            tip-source/dist/*.zip
-            tip-source/dist/*.dmg
-            tip-source/dist/appcast.xml
-            tip-source/dist/SHA256SUMS
-            tip-source/dist/*-artifact-manifest.json
-            tip-source/dist/*-metadata.json
+          path: tip-source/dist/
           if-no-files-found: error
           retention-days: 1
 
@@ -342,20 +720,42 @@ jobs:
           name: RepoPrompt-CE-signed-tip
           path: signed-tip
 
+      - name: Validate signed Tip asset inventory
+        env:
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
+          TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+          TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
+          TIP_PUBLISH_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/trusted-control-plane
+          DIST_DIR: ${{ github.workspace }}/signed-tip
+        run: ./trusted-control-plane/Scripts/main_tip_release.sh validate-assets
+
       - name: Verify and smoke signed tip
         env:
+          ROLLOUT_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
           REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"
           REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"
           REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/tip-smoke-diagnostics
         run: |
           set -euo pipefail
           shopt -s nullglob
-          archives=(signed-tip/*.zip)
           manifests=(signed-tip/*-artifact-manifest.json)
-          [[ "${#archives[@]}" == "1" ]] || { echo "Expected one signed tip ZIP" >&2; exit 1; }
           [[ "${#manifests[@]}" == "1" ]] || { echo "Expected one signed tip manifest" >&2; exit 1; }
           mkdir extracted
-          ditto -x -k "${archives[0]}" extracted
+          if [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" ]]; then
+            packages=(signed-tip/*.pkg)
+            [[ "${#packages[@]}" == "1" ]] || { echo "Expected one signed Tip transition PKG" >&2; exit 1; }
+            REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+              ./trusted-control-plane/Scripts/build_identity_transition_pkg.sh validate \
+              "${packages[0]}" --expanded-payload-dir extracted
+          else
+            archives=(signed-tip/*.zip)
+            [[ "${#archives[@]}" == "1" ]] || { echo "Expected one signed Tip ZIP" >&2; exit 1; }
+            ditto -x -k "${archives[0]}" extracted
+          fi
           env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             HOME="$HOME" \
@@ -381,6 +781,9 @@ jobs:
 
   publish:
     name: Publish Tip Appcast
+    concurrency:
+      group: main-tip-publish
+      queue: max
     needs:
       - setup
       - smoke-no-secrets
@@ -411,6 +814,10 @@ jobs:
           TIP_TAG: ${{ needs.setup.outputs.tag }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
           TIP_GH_TOKEN: ${{ secrets.TIP_UPDATE_REPOSITORY_TOKEN }}
+          TIP_SOURCE_GH_TOKEN: ${{ github.token }}
+          TIP_SOURCE_REPOSITORY: ${{ github.repository }}
+          TIP_SOURCE_BRANCH: main
+          TIP_PUBLISH_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/trusted-control-plane
           DIST_DIR: ${{ github.workspace }}/tip-assets

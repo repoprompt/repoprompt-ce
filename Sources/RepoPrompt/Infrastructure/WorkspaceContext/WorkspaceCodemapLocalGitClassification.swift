@@ -250,7 +250,7 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
         }
 
         return .init(
-            device: UInt64(info.st_dev),
+            device: safeDeviceID(info.st_dev),
             inode: UInt64(info.st_ino),
             mode: UInt32(info.st_mode),
             changeTimeSeconds: Int64(info.st_ctimespec.tv_sec),

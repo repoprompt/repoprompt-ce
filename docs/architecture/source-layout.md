@@ -197,8 +197,6 @@ Run the smallest focused validation that covers your change, then broaden as nee
 ```bash
 make dev-swift-build PRODUCT=RepoPrompt
 make dev-swift-build PRODUCT=repoprompt-mcp
-make dev-test FILTER=CodexIntegrationConfigurationTests
-make dev-test FILTER=WorkspaceFileContextStoreTests
 make dev-test
 make guardrails
 make doctor

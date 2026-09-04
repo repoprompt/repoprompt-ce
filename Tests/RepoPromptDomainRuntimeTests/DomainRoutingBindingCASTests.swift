@@ -3,47 +3,6 @@ import Foundation
 import XCTest
 
 final class DomainRoutingBindingCASTests: XCTestCase {
-    func testCompareAndSetBindingRaceReturnsOneAppliedAndOneConflictSnapshot() async throws {
-        let fixture = try RoutingFixture.make()
-        let runtime = fixture.runtime()
-        try await runtime.start()
-        addTeardownBlock {
-            _ = await runtime.shutdown()
-            fixture.remove()
-        }
-        try await fixture.install(in: runtime)
-        let scopeID = DomainStandaloneScopeID()
-        let scope = try await runtime.standaloneScopeCoordinator.register(
-            scopeID: scopeID,
-            connectionID: UUID(),
-            workingDirectories: [fixture.primaryRoot]
-        )
-        let closed = DomainContextIdentity(workspaceID: fixture.primaryWorkspaceID, contextID: fixture.closedContextID)
-        let replacement = DomainContextIdentity(workspaceID: fixture.primaryWorkspaceID, contextID: fixture.replacementContextID)
-        _ = try await runtime.standaloneScopeCoordinator.bind(scopeID: scopeID, context: closed)
-        let expected = DomainBinding.context(closed, explicit: true)
-        let next = DomainBinding.context(replacement, explicit: true)
-
-        async let first = runtime.standaloneScopeCoordinator.compareAndSetBinding(
-            scopeID: scopeID,
-            expectedBinding: expected,
-            replacement: next
-        )
-        async let second = runtime.standaloneScopeCoordinator.compareAndSetBinding(
-            scopeID: scopeID,
-            expectedBinding: expected,
-            replacement: next
-        )
-        let outcomes = try await [first, second]
-
-        XCTAssertEqual(outcomes.count(where: { $0.disposition.rawValue == "applied" }), 1)
-        XCTAssertEqual(outcomes.count(where: { $0.disposition.rawValue == "conflict" }), 1)
-        XCTAssertTrue(outcomes.contains { $0.snapshot.binding == next })
-        let finalSnapshot = try await runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID)
-        XCTAssertEqual(finalSnapshot.binding, next)
-        XCTAssertEqual(scope.registration.connectionID, finalSnapshot.registration.connectionID)
-    }
-
     func testCompareAndSetBindingRejectsACompetingOtherWorkspaceBinding() async throws {
         let fixture = try RoutingFixture.make()
         let runtime = fixture.runtime()

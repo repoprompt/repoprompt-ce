@@ -2,42 +2,573 @@
 import XCTest
 
 final class WorkspaceSearchServiceTests: XCTestCase {
-    func testSearchCatalogGenerationChangesOnRootLoadDeltaAndUnload() async throws {
-        let root = try makeTemporaryRoot(name: "CatalogGeneration")
-        try write("alpha", to: root.appendingPathComponent("A.swift"))
+    func testHeldRootLoadEventMakesOldReadyIndexStaleFromStoreGeneration() async throws {
+        let rootA = try makeTemporaryRoot(name: "HeldCatalogEventRootA")
+        let rootB = try makeTemporaryRoot(name: "HeldCatalogEventRootB")
+        try write("alpha", to: rootA.appendingPathComponent("Sources/SharedRaceTarget.swift"))
+        try write("beta", to: rootB.appendingPathComponent("Sources/SharedRaceTarget.swift"))
 
         let store = WorkspaceFileContextStore()
-        let initialGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        let recordA = try await store.loadRoot(path: rootA.path)
+        let snapshotA = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let service = WorkspaceSearchService()
+        let eventGate = TestAsyncGate()
+        addTeardownBlock {
+            await service.setCatalogChangeWillHandleHandler(nil)
+            await eventGate.open()
+            await service.stopKeepingFresh()
+        }
 
-        let record = try await store.loadRoot(path: root.path)
-        let loadedSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        XCTAssertNotEqual(loadedSnapshot.generation, initialGeneration)
-        XCTAssertEqual(loadedSnapshot.diagnostics.rootCount, 1)
-        XCTAssertEqual(loadedSnapshot.diagnostics.fileCount, 1)
-        XCTAssertEqual(loadedSnapshot.entries.map(\.standardizedRelativePath), ["A.swift"])
+        await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        await service.rebuildIndex(from: snapshotA)
+        await service.setCatalogChangeWillHandleHandler { event in
+            guard event.kind == .rootLoaded, event.rootPath == rootB.path else { return }
+            await eventGate.wait()
+        }
 
-        let supplementalRoot = try makeTemporaryRoot(name: "SupplementalCatalogGeneration")
-        try write("system", to: supplementalRoot.appendingPathComponent("SystemOnly.swift"))
-        let allLoadedBeforeSupplemental = await store.catalogGeneration(rootScope: .allLoaded)
-        _ = try await store.loadRoot(path: supplementalRoot.path, kind: .supplementalSystem)
-        let visibleAfterSupplemental = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        let allLoadedAfterSupplemental = await store.catalogGeneration(rootScope: .allLoaded)
-        XCTAssertEqual(visibleAfterSupplemental, loadedSnapshot.generation)
-        XCTAssertNotEqual(allLoadedAfterSupplemental, allLoadedBeforeSupplemental)
+        let recordB = try await store.loadRoot(path: rootB.path)
+        await eventGate.waitUntilEntered()
+        let currentGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
 
-        try write("beta", to: root.appendingPathComponent("Sources/B.swift"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("Sources/B.swift")])
-        let deltaSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        XCTAssertNotEqual(deltaSnapshot.generation, loadedSnapshot.generation)
-        XCTAssertEqual(Set(deltaSnapshot.entries.map(\.standardizedRelativePath)), ["A.swift", "Sources/B.swift"])
-        XCTAssertEqual(deltaSnapshot.diagnostics.fileCount, 2)
+        let result = await service.search("SharedRaceTarget", limit: 10)
+        XCTAssertTrue(result.isIndexReady)
+        XCTAssertTrue(result.isStale)
+        XCTAssertEqual(result.indexedGeneration, snapshotA.generation)
+        XCTAssertEqual(result.snapshotGeneration, snapshotA.generation)
+        XCTAssertEqual(result.observedGeneration, currentGeneration)
+        XCTAssertEqual(result.results.map(\.rootID), [recordA.id])
+        XCTAssertFalse(result.results.contains { $0.rootID == recordB.id })
+    }
 
-        await store.unloadRoot(id: record.id)
-        let unloadedSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        XCTAssertNotEqual(unloadedSnapshot.generation, deltaSnapshot.generation)
-        XCTAssertEqual(unloadedSnapshot.diagnostics.rootCount, 0)
-        XCTAssertEqual(unloadedSnapshot.diagnostics.fileCount, 0)
-        XCTAssertTrue(unloadedSnapshot.entries.isEmpty)
+    func testReleasingRootLoadEventConvergesToReadyNonStaleIndex() async throws {
+        let rootA = try makeTemporaryRoot(name: "ReleasedCatalogEventRootA")
+        let rootB = try makeTemporaryRoot(name: "ReleasedCatalogEventRootB")
+        try write("alpha", to: rootA.appendingPathComponent("Sources/SharedRaceTarget.swift"))
+        try write("beta", to: rootB.appendingPathComponent("Sources/SharedRaceTarget.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let recordA = try await store.loadRoot(path: rootA.path)
+        let snapshotA = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let service = WorkspaceSearchService()
+        let eventGate = TestAsyncGate()
+        let commitSignal = TestAsyncSignal()
+        addTeardownBlock {
+            await service.setCatalogChangeWillHandleHandler(nil)
+            await service.setAutomaticRebuildDidCommitHandler(nil)
+            await eventGate.open()
+            await service.stopKeepingFresh()
+        }
+
+        await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        await service.rebuildIndex(from: snapshotA)
+        await service.setCatalogChangeWillHandleHandler { event in
+            guard event.kind == .rootLoaded, event.rootPath == rootB.path else { return }
+            await eventGate.wait()
+        }
+
+        let recordB = try await store.loadRoot(path: rootB.path)
+        await eventGate.waitUntilEntered()
+        let currentGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        await service.setAutomaticRebuildDidCommitHandler { generation in
+            guard generation == currentGeneration else { return }
+            await commitSignal.signal()
+        }
+        await eventGate.open()
+        await commitSignal.wait()
+
+        let result = await service.search("SharedRaceTarget", limit: 10)
+        XCTAssertTrue(result.isIndexReady)
+        XCTAssertFalse(result.isStale)
+        XCTAssertEqual(result.indexedGeneration, currentGeneration)
+        XCTAssertEqual(result.snapshotGeneration, currentGeneration)
+        XCTAssertNil(result.pendingGeneration)
+        XCTAssertEqual(result.observedGeneration, currentGeneration)
+        XCTAssertEqual(Set(result.results.map(\.rootID)), [recordA.id, recordB.id])
+    }
+
+    func testManagedOnlyMaterializationConvergesFreshnessWithoutBecomingSearchable() async throws {
+        let root = try makeTemporaryRoot(name: "ManagedOnlySearchFreshness")
+        let visibleURL = root.appendingPathComponent("Sources/VisibleTarget.swift")
+        let ignoredURL = root.appendingPathComponent("HiddenIgnoredTarget.ignored")
+        let secondIgnoredURL = root.appendingPathComponent("SecondHiddenTarget.ignored")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        try write("visible", to: visibleURL)
+        try write("hidden", to: ignoredURL)
+        try write("second hidden", to: secondIgnoredURL)
+
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        var initialSnapshot: WorkspaceSearchCatalogSnapshot? = await store.searchCatalogSnapshot(
+            rootScope: .visibleWorkspace
+        )
+        let initialGeneration = try XCTUnwrap(initialSnapshot).generation
+        XCTAssertFalse(try XCTUnwrap(initialSnapshot).files.contains { $0.standardizedFullPath == ignoredURL.path })
+        let initialStoreWork = await store.storeWorkDiagnosticsSnapshot()
+        let initialRootShard = try XCTUnwrap(
+            initialStoreWork.rootCatalogShards.roots.first { $0.rootID == rootRecord.id }
+        )
+        let appliedIndexStream = await store.appliedIndexEvents()
+        var appliedIndexIterator = appliedIndexStream.makeAsyncIterator()
+
+        let service = WorkspaceSearchService()
+        let generationCommitted = expectation(description: "projection-neutral catalog generation committed")
+        let neutralEventGate = TestAsyncGate()
+        let finalRebuildCommitted = TestAsyncSignal()
+        addTeardownBlock {
+            await service.setProjectionNeutralGenerationDidCommitHandler(nil)
+            await service.setCatalogChangeWillHandleHandler(nil)
+            await service.setAutomaticRebuildDidCommitHandler(nil)
+            await neutralEventGate.open()
+            await service.stopKeepingFresh()
+        }
+
+        await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        try await service.rebuildIndex(from: XCTUnwrap(initialSnapshot))
+        initialSnapshot = nil
+        let initialSearchWork = await service.workDiagnosticsSnapshot()
+        await service.setProjectionNeutralGenerationDidCommitHandler { _ in
+            generationCommitted.fulfill()
+        }
+
+        let materialization = try await store.materializeExplicitlyRequestedFile(
+            ignoredURL.path,
+            rootScope: .visibleWorkspace
+        )
+        guard case let .materialized(file) = materialization else {
+            return XCTFail("Expected ignored file to materialize as a managed-only record")
+        }
+        XCTAssertEqual(file.standardizedFullPath, ignoredURL.path)
+        let materializedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        XCTAssertNotEqual(materializedGeneration, initialGeneration)
+
+        await fulfillment(of: [generationCommitted], timeout: 2)
+        await service.setProjectionNeutralGenerationDidCommitHandler(nil)
+
+        let visibleResult = await service.search("VisibleTarget", limit: 10)
+        XCTAssertTrue(visibleResult.isIndexReady)
+        XCTAssertFalse(visibleResult.isStale)
+        XCTAssertEqual(visibleResult.indexedGeneration, materializedGeneration)
+        XCTAssertEqual(visibleResult.snapshotGeneration, materializedGeneration)
+        XCTAssertNil(visibleResult.pendingGeneration)
+        XCTAssertEqual(visibleResult.observedGeneration, materializedGeneration)
+        XCTAssertEqual(visibleResult.results.map(\.standardizedFullPath), [visibleURL.path])
+
+        let ignoredResult = await service.search("HiddenIgnoredTarget", limit: 10)
+        XCTAssertTrue(ignoredResult.isIndexReady)
+        XCTAssertFalse(ignoredResult.isStale)
+        XCTAssertEqual(ignoredResult.indexedGeneration, materializedGeneration)
+        XCTAssertTrue(ignoredResult.results.isEmpty)
+        let searchDiagnostics = await service.diagnostics
+        XCTAssertEqual(searchDiagnostics?.generation, materializedGeneration)
+
+        let finalSearchWork = await service.workDiagnosticsSnapshot()
+        XCTAssertEqual(finalSearchWork.rebuildCount, initialSearchWork.rebuildCount)
+        let finalStoreWork = await store.storeWorkDiagnosticsSnapshot()
+        let finalRootShard = try XCTUnwrap(
+            finalStoreWork.rootCatalogShards.roots.first { $0.rootID == rootRecord.id }
+        )
+        XCTAssertEqual(finalRootShard.buildCount, initialRootShard.buildCount)
+        XCTAssertEqual(finalRootShard.authoritativeRebuildCount, initialRootShard.authoritativeRebuildCount)
+        XCTAssertEqual(finalRootShard.lastAppliedIndexGeneration, initialRootShard.lastAppliedIndexGeneration)
+        XCTAssertEqual(
+            finalRootShard.fallbackReasonCounts[.fullResync, default: 0],
+            initialRootShard.fallbackReasonCounts[.fullResync, default: 0]
+        )
+
+        await service.setCatalogChangeWillHandleHandler { event in
+            guard event.kind == .generationAdvancedWithoutProjectionChange else { return }
+            await neutralEventGate.wait()
+        }
+        let secondMaterialization = try await store.materializeExplicitlyRequestedFile(
+            secondIgnoredURL.path,
+            rootScope: .visibleWorkspace
+        )
+        guard case .materialized = secondMaterialization else {
+            return XCTFail("Expected second ignored file to materialize as a managed-only record")
+        }
+        await neutralEventGate.waitUntilEntered()
+
+        let sentinelRelativePath = "AppliedIndexSentinel.swift"
+        try write("sentinel", to: root.appendingPathComponent(sentinelRelativePath))
+        await store.replayObservedFileSystemDeltas(
+            rootID: rootRecord.id,
+            deltas: [.fileAdded(sentinelRelativePath)]
+        )
+        let finalGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        await service.setAutomaticRebuildDidCommitHandler { generation in
+            guard generation == finalGeneration else { return }
+            await finalRebuildCommitted.signal()
+        }
+
+        let firstAppliedIndexValue = await appliedIndexIterator.next()
+        let firstAppliedIndexEvent = try XCTUnwrap(firstAppliedIndexValue)
+        XCTAssertFalse(firstAppliedIndexEvent.requiresFullResync)
+        XCTAssertEqual(
+            firstAppliedIndexEvent.upsertedFiles.map(\.standardizedRelativePath),
+            [sentinelRelativePath]
+        )
+
+        await neutralEventGate.open()
+        await finalRebuildCommitted.wait()
+
+        let sentinelResult = await service.search("AppliedIndexSentinel", limit: 10)
+        XCTAssertTrue(sentinelResult.isIndexReady)
+        XCTAssertFalse(sentinelResult.isStale)
+        XCTAssertEqual(sentinelResult.indexedGeneration, finalGeneration)
+        XCTAssertEqual(sentinelResult.results.map(\.standardizedRelativePath), [sentinelRelativePath])
+        let secondIgnoredResult = await service.search("SecondHiddenTarget", limit: 10)
+        XCTAssertTrue(secondIgnoredResult.results.isEmpty)
+
+        let postAppliedStoreWork = await store.storeWorkDiagnosticsSnapshot()
+        let postAppliedRootShard = try XCTUnwrap(
+            postAppliedStoreWork.rootCatalogShards.roots.first { $0.rootID == rootRecord.id }
+        )
+        XCTAssertEqual(postAppliedRootShard.buildCount, finalRootShard.buildCount + 1)
+        XCTAssertEqual(postAppliedRootShard.patchCount, finalRootShard.patchCount + 1)
+        XCTAssertEqual(postAppliedRootShard.authoritativeRebuildCount, finalRootShard.authoritativeRebuildCount)
+        XCTAssertEqual(postAppliedRootShard.fallbackCount, finalRootShard.fallbackCount)
+        XCTAssertEqual(postAppliedRootShard.fallbackReasonCounts, finalRootShard.fallbackReasonCounts)
+        XCTAssertEqual(postAppliedRootShard.lastAppliedIndexGeneration, firstAppliedIndexEvent.generation)
+        XCTAssertFalse(postAppliedRootShard.deltaStateDirty)
+    }
+
+    func testRemovedRootCannotBeResurrectedByDelayedLoadRefresh() async throws {
+        let rootA = try makeTemporaryRoot(name: "DelayedLoadRemovalRootA")
+        let rootB = try makeTemporaryRoot(name: "DelayedLoadRemovalRootB")
+        try write("alpha", to: rootA.appendingPathComponent("Sources/SharedRaceTarget.swift"))
+        try write("beta", to: rootB.appendingPathComponent("Sources/SharedRaceTarget.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let recordA = try await store.loadRoot(path: rootA.path)
+        let snapshotA = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let service = WorkspaceSearchService()
+        let eventGate = TestAsyncGate()
+        let commitSignal = TestAsyncSignal()
+        addTeardownBlock {
+            await service.setCatalogChangeWillHandleHandler(nil)
+            await service.setAutomaticRebuildDidCommitHandler(nil)
+            await eventGate.open()
+            await service.stopKeepingFresh()
+        }
+
+        await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        await service.rebuildIndex(from: snapshotA)
+        await service.setCatalogChangeWillHandleHandler { event in
+            guard event.kind == .rootLoaded, event.rootPath == rootB.path else { return }
+            await eventGate.wait()
+        }
+
+        let recordB = try await store.loadRoot(path: rootB.path)
+        await eventGate.waitUntilEntered()
+        await store.unloadRoot(id: recordB.id)
+        let finalGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        await service.setAutomaticRebuildDidCommitHandler { generation in
+            guard generation == finalGeneration else { return }
+            await commitSignal.signal()
+        }
+        await eventGate.open()
+        await commitSignal.wait()
+
+        let result = await service.search("SharedRaceTarget", limit: 10)
+        XCTAssertTrue(result.isIndexReady)
+        XCTAssertFalse(result.isStale)
+        XCTAssertEqual(result.indexedGeneration, finalGeneration)
+        XCTAssertEqual(result.snapshotGeneration, finalGeneration)
+        XCTAssertEqual(result.observedGeneration, finalGeneration)
+        XCTAssertEqual(result.results.map(\.rootID), [recordA.id])
+        XCTAssertFalse(result.results.contains { $0.rootID == recordB.id })
+        let indexedPathCount = await service.indexedPathCount
+        XCTAssertEqual(indexedPathCount, 1)
+    }
+
+    func testExpiredRootLifetimeCannotCommitAfterSamePathReload() async throws {
+        let root = try makeTemporaryRoot(name: "ExpiredLifetimeReloadRoot")
+        let oldOnlyFile = root.appendingPathComponent("Sources/OldOnly.swift")
+        let refreshTriggerFile = root.appendingPathComponent("Sources/RefreshTrigger.swift")
+        try write("old", to: oldOnlyFile)
+
+        let store = WorkspaceFileContextStore()
+        let oldRoot = try await store.loadRoot(path: root.path)
+        let oldSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let oldFileIDs = Set(oldSnapshot.entries.map(\.id))
+        let service = WorkspaceSearchService()
+        let triggerEventGate = TestAsyncGate()
+        let staleRebuildGate = TestAsyncGate()
+        let unloadEventGate = TestAsyncGate()
+        let reloadEventGate = TestAsyncGate()
+        let commitSignal = TestAsyncSignal()
+        addTeardownBlock {
+            await service.setCatalogChangeWillHandleHandler(nil)
+            await service.setAutomaticRebuildDidStartHandler(nil)
+            await service.setAutomaticRebuildDidCommitHandler(nil)
+            await triggerEventGate.open()
+            await staleRebuildGate.open()
+            await unloadEventGate.open()
+            await reloadEventGate.open()
+            await service.stopKeepingFresh()
+        }
+
+        await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        await service.rebuildIndex(from: oldSnapshot)
+        await service.setCatalogChangeWillHandleHandler { event in
+            guard event.kind == .appliedIndex, event.rootID == oldRoot.id else { return }
+            await triggerEventGate.wait()
+        }
+
+        try write("trigger", to: refreshTriggerFile)
+        await store.replayObservedFileSystemDeltas(
+            rootID: oldRoot.id,
+            deltas: [.fileAdded("Sources/RefreshTrigger.swift")]
+        )
+        await triggerEventGate.waitUntilEntered()
+        let staleGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        await service.setAutomaticRebuildDidStartHandler { generation in
+            guard generation == staleGeneration else { return }
+            await staleRebuildGate.wait()
+        }
+        await triggerEventGate.open()
+        await staleRebuildGate.waitUntilEntered()
+
+        await service.setCatalogChangeWillHandleHandler { event in
+            if event.kind == .rootUnloaded, event.rootID == oldRoot.id {
+                await unloadEventGate.wait()
+            } else if event.kind == .rootLoaded, event.rootPath == root.path {
+                await reloadEventGate.wait()
+            }
+        }
+        await store.unloadRoot(id: oldRoot.id)
+        await unloadEventGate.waitUntilEntered()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Sources"))
+        try write("new", to: root.appendingPathComponent("Sources/NewOnly.swift"))
+        let newRoot = try await store.loadRoot(path: root.path)
+        let newGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        await service.setAutomaticRebuildDidCommitHandler { generation in
+            guard generation == newGeneration else { return }
+            await commitSignal.signal()
+        }
+
+        await staleRebuildGate.open()
+        await commitSignal.wait()
+        await unloadEventGate.open()
+        await reloadEventGate.waitUntilEntered()
+
+        let result = await service.search("Only", limit: 10)
+        XCTAssertTrue(result.isIndexReady)
+        XCTAssertFalse(result.isStale)
+        XCTAssertEqual(result.indexedGeneration, newGeneration)
+        XCTAssertEqual(result.snapshotGeneration, newGeneration)
+        XCTAssertEqual(result.observedGeneration, newGeneration)
+        XCTAssertNotEqual(newRoot.id, oldRoot.id)
+        XCTAssertEqual(result.results.map(\.rootID), [newRoot.id])
+        XCTAssertEqual(result.results.map(\.standardizedRelativePath), ["Sources/NewOnly.swift"])
+        XCTAssertTrue(Set(result.results.map(\.id)).isDisjoint(with: oldFileIDs))
+        XCTAssertFalse(result.results.contains { $0.standardizedRelativePath == "Sources/OldOnly.swift" })
+    }
+
+    func testVisibleWorkspaceFreshnessIgnoresOutOfScopeRootTopology() async throws {
+        let visibleRoot = try makeTemporaryRoot(name: "VisibleScopePrimaryRoot")
+        let gitDataRoot = try makeTemporaryRoot(name: "VisibleScopeGitDataRoot")
+        let sessionRoot = try makeTemporaryRoot(name: "VisibleScopeSessionRoot")
+        let supplementalRoot = try makeTemporaryRoot(name: "VisibleScopeSupplementalRoot")
+        let barrierRoot = try makeTemporaryRoot(name: "VisibleScopeBarrierRoot")
+        try write("visible", to: visibleRoot.appendingPathComponent("Sources/VisibleScopeTarget.swift"))
+        try write("git", to: gitDataRoot.appendingPathComponent("GitScopeTarget.swift"))
+        try write("session", to: sessionRoot.appendingPathComponent("SessionScopeTarget.swift"))
+        try write("supplemental", to: supplementalRoot.appendingPathComponent("SupplementalScopeTarget.swift"))
+        try write("barrier", to: barrierRoot.appendingPathComponent("BarrierScopeTarget.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let visibleRecord = try await store.loadRoot(path: visibleRoot.path)
+        let visibleSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let service = WorkspaceSearchService()
+        let barrierGate = TestAsyncGate()
+        addTeardownBlock {
+            await service.setCatalogChangeWillHandleHandler(nil)
+            await barrierGate.open()
+            await service.stopKeepingFresh()
+        }
+
+        await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        await service.rebuildIndex(from: visibleSnapshot)
+        await service.setCatalogChangeWillHandleHandler { event in
+            guard event.kind == .rootLoaded, event.rootPath == barrierRoot.path else { return }
+            await barrierGate.wait()
+        }
+
+        let gitDataRecord = try await store.loadRoot(path: gitDataRoot.path, kind: .workspaceGitData)
+        let sessionRecord = try await store.loadRoot(path: sessionRoot.path, kind: .sessionWorktree)
+        let supplementalRecord = try await store.loadRoot(path: supplementalRoot.path, kind: .supplementalSystem)
+        let barrierRecord = try await store.loadRoot(path: barrierRoot.path, kind: .supplementalSystem)
+        await barrierGate.waitUntilEntered()
+
+        let visibleGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        let result = await service.search("ScopeTarget", limit: 10)
+        XCTAssertTrue(result.isIndexReady)
+        XCTAssertFalse(result.isStale)
+        XCTAssertEqual(visibleGeneration, visibleSnapshot.generation)
+        XCTAssertEqual(result.indexedGeneration, visibleSnapshot.generation)
+        XCTAssertEqual(result.snapshotGeneration, visibleSnapshot.generation)
+        XCTAssertNil(result.pendingGeneration)
+        XCTAssertEqual(result.observedGeneration, visibleSnapshot.generation)
+        XCTAssertEqual(result.results.map(\.rootID), [visibleRecord.id])
+        let excludedRootIDs = Set([
+            gitDataRecord.id,
+            sessionRecord.id,
+            supplementalRecord.id,
+            barrierRecord.id
+        ])
+        XCTAssertTrue(Set(result.results.map(\.rootID)).isDisjoint(with: excludedRootIDs))
+    }
+
+    func testSearchCatalogChangeEventsFollowCatalogAuthorityChanges() async throws {
+        let rootA = try makeTemporaryRoot(name: "CatalogChangeRootA")
+        let rootB = try makeTemporaryRoot(name: "CatalogChangeRootB")
+        try write("alpha", to: rootA.appendingPathComponent("Sources/Alpha.swift"))
+        try write("beta", to: rootB.appendingPathComponent("Sources/Beta.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let stream = await store.searchCatalogChangeEvents()
+        var iterator = stream.makeAsyncIterator()
+
+        let recordA = try await store.loadRoot(path: rootA.path)
+        let loadedAValue = await iterator.next()
+        let loadedA = try XCTUnwrap(loadedAValue)
+        XCTAssertEqual(loadedA.kind, .rootLoaded)
+        XCTAssertEqual(loadedA.rootID, recordA.id)
+        XCTAssertEqual(loadedA.rootPath, recordA.standardizedFullPath)
+        XCTAssertNotNil(loadedA.rootLifetimeID)
+        XCTAssertEqual(loadedA.rootAppliedIndexGeneration, 0)
+
+        try write("delta", to: rootA.appendingPathComponent("Sources/Delta.swift"))
+        await store.replayObservedFileSystemDeltas(
+            rootID: recordA.id,
+            deltas: [.fileAdded("Sources/Delta.swift")]
+        )
+        let appliedValue = await iterator.next()
+        let applied = try XCTUnwrap(appliedValue)
+        XCTAssertEqual(applied.kind, .appliedIndex)
+        XCTAssertEqual(applied.rootID, recordA.id)
+        XCTAssertEqual(applied.rootLifetimeID, loadedA.rootLifetimeID)
+        XCTAssertEqual(applied.rootAppliedIndexGeneration, 1)
+
+        await store.unloadRoot(id: recordA.id)
+        let unloadedAValue = await iterator.next()
+        let unloadedA = try XCTUnwrap(unloadedAValue)
+        XCTAssertEqual(unloadedA.kind, .rootUnloaded)
+        XCTAssertEqual(unloadedA.rootID, recordA.id)
+        XCTAssertEqual(unloadedA.rootLifetimeID, loadedA.rootLifetimeID)
+
+        let recordB = try await store.loadRoot(path: rootB.path)
+        let loadedBValue = await iterator.next()
+        let loadedB = try XCTUnwrap(loadedBValue)
+        XCTAssertEqual(loadedB.kind, .rootLoaded)
+        XCTAssertEqual(loadedB.rootID, recordB.id)
+    }
+
+    func testCanceledRootLoadPublishesNoRootLoadedEvent() async throws {
+        let canceledRoot = try makeTemporaryRoot(name: "CanceledCatalogChangeRoot")
+        let sentinelRoot = try makeTemporaryRoot(name: "CatalogChangeSentinelRoot")
+        try write("canceled", to: canceledRoot.appendingPathComponent("Sources/Canceled.swift"))
+        try write("sentinel", to: sentinelRoot.appendingPathComponent("Sources/Sentinel.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let stream = await store.searchCatalogChangeEvents()
+        var iterator = stream.makeAsyncIterator()
+        let loadGate = TestAsyncGate()
+        let loadEntered = expectation(description: "root load entered")
+        await store.setRootLoadWillStartHandler { _ in
+            loadEntered.fulfill()
+            await loadGate.wait()
+        }
+
+        let loadTask = Task {
+            try await store.loadRoot(
+                path: canceledRoot.path,
+                cancelUnderlyingLoadOnCallerCancellation: true
+            )
+        }
+        await fulfillment(of: [loadEntered], timeout: 2)
+        loadTask.cancel()
+        await store.cancelRootLoad(path: canceledRoot.path)
+        await loadGate.open()
+        do {
+            _ = try await loadTask.value
+            XCTFail("Expected the root load to be canceled")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        await store.setRootLoadWillStartHandler(nil)
+
+        let sentinel = try await store.loadRoot(path: sentinelRoot.path)
+        let firstEventValue = await iterator.next()
+        let firstEvent = try XCTUnwrap(firstEventValue)
+        XCTAssertEqual(firstEvent.kind, .rootLoaded)
+        XCTAssertEqual(firstEvent.rootID, sentinel.id)
+    }
+
+    func testStoppedFreshnessBindingMarksOldReadyIndexStaleAtQueryTime() async throws {
+        let rootA = try makeTemporaryRoot(name: "StoppedFreshnessRootA")
+        let rootB = try makeTemporaryRoot(name: "StoppedFreshnessRootB")
+        try write("alpha", to: rootA.appendingPathComponent("Sources/AlphaTarget.swift"))
+        try write("beta", to: rootB.appendingPathComponent("Sources/BetaTarget.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let recordA = try await store.loadRoot(path: rootA.path)
+        let snapshotA = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let service = WorkspaceSearchService()
+        await service.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        await service.rebuildIndex(from: snapshotA)
+        await service.stopKeepingFresh()
+
+        let recordB = try await store.loadRoot(path: rootB.path)
+        let currentGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        XCTAssertNotEqual(currentGeneration, snapshotA.generation)
+
+        let result = await service.search("Target", limit: 10)
+        XCTAssertTrue(result.isIndexReady)
+        XCTAssertTrue(result.isStale)
+        XCTAssertEqual(result.indexedGeneration, snapshotA.generation)
+        XCTAssertEqual(result.snapshotGeneration, snapshotA.generation)
+        XCTAssertNil(result.pendingGeneration)
+        XCTAssertEqual(result.observedGeneration, currentGeneration)
+        XCTAssertEqual(result.results.map(\.rootID), [recordA.id])
+        XCTAssertFalse(result.results.contains { $0.rootID == recordB.id })
+
+        let zeroLimitResult = await service.search("Target", limit: 0)
+        XCTAssertTrue(zeroLimitResult.isIndexReady)
+        XCTAssertTrue(zeroLimitResult.isStale)
+        XCTAssertEqual(zeroLimitResult.observedGeneration, currentGeneration)
+        XCTAssertTrue(zeroLimitResult.results.isEmpty)
+    }
+
+    func testManualRebuildReconcilesNewerBoundCatalogDemand() async throws {
+        let rootA = try makeTemporaryRoot(name: "ManualRebuildRootA")
+        let rootB = try makeTemporaryRoot(name: "ManualRebuildRootB")
+        try write("alpha", to: rootA.appendingPathComponent("Sources/Alpha.swift"))
+        try write("beta", to: rootB.appendingPathComponent("Sources/Beta.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: rootA.path)
+        let snapshotA = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let service = WorkspaceSearchService()
+        await service.startKeepingFresh(
+            with: store,
+            rootScope: .visibleWorkspace,
+            debounceNanoseconds: 10_000_000_000
+        )
+        await service.rebuildIndex(from: snapshotA)
+
+        _ = try await store.loadRoot(path: rootB.path)
+        let currentGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+        await service.rebuildIndex(from: snapshotA)
+
+        let indexedGeneration = await service.indexedGeneration
+        let pendingGeneration = await service.pendingGeneration
+        XCTAssertTrue(
+            indexedGeneration == currentGeneration || pendingGeneration == currentGeneration,
+            "The stale manual snapshot must not erase demand for the authoritative generation"
+        )
+        await service.stopKeepingFresh()
     }
 
     func testWorkspaceSearchServiceSearchesSingleRootCatalog() async throws {
@@ -97,272 +628,6 @@ final class WorkspaceSearchServiceTests: XCTestCase {
         XCTAssertEqual(rootQualifiedResult.results.map(\.standardizedRelativePath), ["Sources/BetaTarget.swift"])
     }
 
-    func testWorkspaceSearchServiceRefreshesAfterFileAdd() async throws {
-        let root = try makeTemporaryRoot(name: "LiveAddSearch")
-        try write("alpha", to: root.appendingPathComponent("A.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        let service = WorkspaceSearchService()
-        let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        await service.rebuildIndex(from: snapshot)
-        await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
-
-        try write("beta", to: root.appendingPathComponent("Sources/BetaAdded.swift"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("Sources/BetaAdded.swift")])
-        let expectedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        try await waitForIndexedGeneration(expectedGeneration, service: service)
-
-        let result = await service.search("BetaAdded", limit: 10)
-        XCTAssertFalse(result.isStale)
-        XCTAssertEqual(result.indexedGeneration, expectedGeneration)
-        XCTAssertEqual(result.results.map(\.standardizedRelativePath), ["Sources/BetaAdded.swift"])
-    }
-
-    func testWorkspaceSearchServiceRefreshesAfterFileRemove() async throws {
-        let root = try makeTemporaryRoot(name: "LiveRemoveSearch")
-        try write("alpha", to: root.appendingPathComponent("Keep.swift"))
-        try write("remove", to: root.appendingPathComponent("RemoveMe.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        let service = WorkspaceSearchService()
-        let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        await service.rebuildIndex(from: snapshot)
-        await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
-
-        try FileManager.default.removeItem(at: root.appendingPathComponent("RemoveMe.swift"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileRemoved("RemoveMe.swift")])
-        let expectedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        try await waitForIndexedGeneration(expectedGeneration, service: service)
-
-        let removedResult = await service.search("RemoveMe", limit: 10)
-        XCTAssertTrue(removedResult.results.isEmpty)
-        let keepResult = await service.search("Keep", limit: 10)
-        XCTAssertEqual(keepResult.results.map(\.standardizedRelativePath), ["Keep.swift"])
-    }
-
-    func testWorkspaceSearchServiceRefreshesAfterFolderRemove() async throws {
-        let root = try makeTemporaryRoot(name: "LiveFolderRemoveSearch")
-        try write("keep", to: root.appendingPathComponent("Keep.swift"))
-        try write("gone", to: root.appendingPathComponent("Gone/NestedTarget.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        let service = WorkspaceSearchService()
-        let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        await service.rebuildIndex(from: snapshot)
-        await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
-
-        try FileManager.default.removeItem(at: root.appendingPathComponent("Gone"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.folderRemoved("Gone")])
-        let expectedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        try await waitForIndexedGeneration(expectedGeneration, service: service)
-
-        let removedResult = await service.search("NestedTarget", limit: 10)
-        XCTAssertTrue(removedResult.results.isEmpty)
-        let keepResult = await service.search("Keep", limit: 10)
-        XCTAssertEqual(keepResult.results.map(\.standardizedRelativePath), ["Keep.swift"])
-    }
-
-    func testWorkspaceSearchServiceInvalidatesAfterRootUnload() async throws {
-        let rootA = try makeTemporaryRoot(name: "LiveRootUnloadA")
-        let rootB = try makeTemporaryRoot(name: "LiveRootUnloadB")
-        try write("unload", to: rootA.appendingPathComponent("UnloadedTarget.swift"))
-        try write("keep", to: rootB.appendingPathComponent("KeptTarget.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let recordA = try await store.loadRoot(path: rootA.path)
-        let recordB = try await store.loadRoot(path: rootB.path)
-        let service = WorkspaceSearchService()
-        let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        await service.rebuildIndex(from: snapshot)
-        await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
-
-        await store.unloadRoot(id: recordA.id)
-        let expectedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        try await waitForIndexedGeneration(expectedGeneration, service: service)
-
-        let unloadedResult = await service.search("UnloadedTarget", limit: 10)
-        XCTAssertTrue(unloadedResult.results.isEmpty)
-        let keptResult = await service.search("KeptTarget", limit: 10)
-        XCTAssertEqual(keptResult.results.map(\.rootID), [recordB.id])
-        XCTAssertEqual(keptResult.results.map(\.standardizedRelativePath), ["KeptTarget.swift"])
-    }
-
-    func testWorkspaceSearchServiceDeduplicatesDuplicateDeltas() async throws {
-        let root = try makeTemporaryRoot(name: "LiveDuplicateDeltasSearch")
-        try write("seed", to: root.appendingPathComponent("Seed.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        let service = WorkspaceSearchService()
-        let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        await service.rebuildIndex(from: snapshot)
-        await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
-
-        try write("duplicate", to: root.appendingPathComponent("DuplicateTarget.swift"))
-        await store.replayObservedFileSystemDeltas(
-            rootID: record.id,
-            deltas: [.fileAdded("DuplicateTarget.swift"), .fileAdded("DuplicateTarget.swift")]
-        )
-        let expectedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        try await waitForIndexedGeneration(expectedGeneration, service: service)
-
-        let result = await service.search("DuplicateTarget", limit: 10)
-        XCTAssertEqual(result.results.map(\.standardizedRelativePath), ["DuplicateTarget.swift"])
-        XCTAssertEqual(Set(result.results.map(\.id)).count, 1)
-    }
-
-    func testWorkspaceSearchServiceCatchesUpWhenEventPrecedesSubscription() async throws {
-        let root = try makeTemporaryRoot(name: "LiveCatchUpBeforeSubscription")
-        try write("alpha", to: root.appendingPathComponent("Alpha.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        let staleSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-
-        try write("missed", to: root.appendingPathComponent("MissedBeforeSubscribe.swift"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("MissedBeforeSubscribe.swift")])
-        let expectedGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-
-        let service = WorkspaceSearchService()
-        await service.rebuildIndex(from: staleSnapshot)
-        await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
-        try await waitForIndexedGeneration(expectedGeneration, service: service)
-
-        let result = await service.search("MissedBeforeSubscribe", limit: 10)
-        XCTAssertFalse(result.isStale)
-        XCTAssertEqual(result.results.map(\.standardizedRelativePath), ["MissedBeforeSubscribe.swift"])
-    }
-
-    func testWorkspaceSearchServiceDoesNotCancelActiveRebuildForSameGenerationEvent() async throws {
-        let root = try makeTemporaryRoot(name: "LiveSameGenerationEvent")
-        try write("alpha", to: root.appendingPathComponent("Alpha.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        let service = WorkspaceSearchService(automaticIndexBuildDelayNanoseconds: 200_000_000)
-        let initialSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        await service.rebuildIndex(from: initialSnapshot)
-        await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
-
-        try write("beta", to: root.appendingPathComponent("BetaAdded.swift"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("BetaAdded.swift")])
-        let targetGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        try await waitForPendingGeneration(targetGeneration, service: service)
-
-        try write("alpha modified", to: root.appendingPathComponent("Alpha.swift"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileModified("Alpha.swift", Date())])
-        let generationAfterModify = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        XCTAssertEqual(generationAfterModify, targetGeneration)
-
-        try await waitForIndexedGeneration(targetGeneration, service: service, timeout: 3.0)
-        let result = await service.search("BetaAdded", limit: 10)
-        XCTAssertFalse(result.isStale)
-        XCTAssertEqual(result.results.map(\.standardizedRelativePath), ["BetaAdded.swift"])
-    }
-
-    func testWorkspaceSearchServiceDiscardsStaleRebuildCompletion() async throws {
-        let root = try makeTemporaryRoot(name: "LiveStaleRebuildSearch")
-        try write("alpha", to: root.appendingPathComponent("Alpha.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        let service = WorkspaceSearchService(automaticIndexBuildDelayNanoseconds: 200_000_000)
-        let initialSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-        await service.rebuildIndex(from: initialSnapshot)
-        await service.startKeepingFresh(with: store, debounceNanoseconds: 0)
-
-        try write("beta", to: root.appendingPathComponent("BetaFirst.swift"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("BetaFirst.swift")])
-        let firstGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        try await waitForPendingGeneration(firstGeneration, service: service)
-
-        let staleResult = await service.search("Alpha", limit: 10)
-        XCTAssertTrue(staleResult.isStale)
-        XCTAssertEqual(staleResult.indexedGeneration, initialSnapshot.generation)
-        XCTAssertEqual(staleResult.pendingGeneration, firstGeneration)
-        XCTAssertEqual(staleResult.results.map(\.standardizedRelativePath), ["Alpha.swift"])
-
-        try write("gamma", to: root.appendingPathComponent("GammaSecond.swift"))
-        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("GammaSecond.swift")])
-        let finalGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        try await waitForIndexedGeneration(finalGeneration, service: service, timeout: 3.0)
-
-        let discardedCount = await service.discardedStaleRebuildCount
-        XCTAssertGreaterThanOrEqual(discardedCount, 1)
-        let finalResult = await service.search("Second", limit: 10)
-        XCTAssertFalse(finalResult.isStale)
-        XCTAssertEqual(finalResult.indexedGeneration, finalGeneration)
-        XCTAssertEqual(finalResult.results.map(\.standardizedRelativePath), ["GammaSecond.swift"])
-    }
-
-    func testPathMatchWarmupPreservesLookupBehavior() async throws {
-        let root = try makeTemporaryRoot(name: "PathMatchWarmup")
-        try write("alpha", to: root.appendingPathComponent("Sources/Nested/A.swift"))
-        try write("beta", to: root.appendingPathComponent("Sources/B.swift"))
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-
-        let before = await store.lookupPath(
-            WorkspacePathLookupRequest(userPath: "Sources/Nested/A.swift", profile: .mcpRead, rootScope: .visibleWorkspace)
-        )
-        XCTAssertEqual(before?.file?.rootID, record.id)
-        XCTAssertEqual(before?.file?.standardizedRelativePath, "Sources/Nested/A.swift")
-
-        let warmedGeneration = await store.warmPathLookupIndexes(rootScope: .visibleWorkspace)
-        let catalogGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        XCTAssertEqual(warmedGeneration, catalogGeneration)
-
-        let after = await store.lookupPath(
-            WorkspacePathLookupRequest(userPath: "Sources/Nested/A.swift", profile: .mcpRead, rootScope: .visibleWorkspace)
-        )
-        XCTAssertEqual(after?.file, before?.file)
-        XCTAssertEqual(after?.location, before?.location)
-
-        let directChildren = await store.directFolderChildren(rootID: record.id, relativePath: "Sources")
-        XCTAssertEqual(directChildren?.childFolders.map(\.standardizedRelativePath), ["Sources/Nested"])
-        XCTAssertEqual(directChildren?.childFiles.map(\.standardizedRelativePath), ["Sources/B.swift"])
-    }
-
-    private func waitForIndexedGeneration(
-        _ expectedGeneration: UInt64,
-        service: WorkspaceSearchService,
-        timeout: TimeInterval = 2.0,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await service.indexedGeneration == expectedGeneration {
-                return
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        let actual = await service.indexedGeneration
-        XCTFail("Timed out waiting for indexed generation \(expectedGeneration); actual=\(String(describing: actual))", file: file, line: line)
-    }
-
-    private func waitForPendingGeneration(
-        _ expectedGeneration: UInt64,
-        service: WorkspaceSearchService,
-        timeout: TimeInterval = 2.0,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await service.pendingGeneration == expectedGeneration {
-                return
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        let actual = await service.pendingGeneration
-        XCTFail("Timed out waiting for pending generation \(expectedGeneration); actual=\(String(describing: actual))", file: file, line: line)
-    }
-
     private func makeTemporaryRoot(name: String) throws -> URL {
         try makeTestDirectory(name: name)
     }
@@ -370,5 +635,69 @@ final class WorkspaceSearchServiceTests: XCTestCase {
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+private actor TestAsyncSignal {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isSignaled = false
+
+    func wait() async {
+        guard !isSignaled else { return }
+        await withCheckedContinuation { continuation in
+            if isSignaled {
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func signal() {
+        guard !isSignaled else { return }
+        isSignaled = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor TestAsyncGate {
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var openContinuation: CheckedContinuation<Void, Never>?
+    private var hasEntered = false
+    private var isOpen = false
+
+    func wait() async {
+        if !hasEntered {
+            hasEntered = true
+            enteredContinuation?.resume()
+            enteredContinuation = nil
+        }
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            if isOpen {
+                continuation.resume()
+            } else {
+                openContinuation = continuation
+            }
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !hasEntered else { return }
+        await withCheckedContinuation { continuation in
+            if hasEntered {
+                continuation.resume()
+            } else {
+                enteredContinuation = continuation
+            }
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        openContinuation?.resume()
+        openContinuation = nil
     }
 }

@@ -667,6 +667,7 @@ final class CodexNativeSessionController {
         /// Nil preserves Codex process defaults; non-nil values are explicit process overrides.
         /// Agent Mode omits this so thread start/resume config is authoritative.
         var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
+        var capabilitiesProvider: @MainActor () -> CodexCapabilitySettings = { .disabled }
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
@@ -698,6 +699,7 @@ final class CodexNativeSessionController {
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
             shellToolEnabled: Bool? = nil,
             suppressThirdPartyMCPServers: Bool = false,
+            capabilitiesProvider: @escaping @MainActor () -> CodexCapabilitySettings = { .disabled },
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
@@ -708,6 +710,7 @@ final class CodexNativeSessionController {
                 configOverridesProvider: {
                     let featurePolicy = await MainActor.run {
                         (
+                            capabilities: capabilitiesProvider(),
                             goalSupportEnabled: goalSupportEnabledProvider(),
                             reasoningSummariesEnabled: reasoningSummariesEnabledProvider(),
                             memoriesEnabled: memoriesEnabledProvider(),
@@ -717,6 +720,7 @@ final class CodexNativeSessionController {
                     return CodexNativeSessionController.defaultAppServerConfigOverrides(
                         shellToolEnabled: shellToolEnabled,
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
+                        capabilities: featurePolicy.capabilities,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
                         memoriesEnabled: featurePolicy.memoriesEnabled,
@@ -728,6 +732,7 @@ final class CodexNativeSessionController {
                 approvalReviewerProvider: approvalReviewerProvider,
                 authTokensRefreshHandler: nil,
                 processModelReasoningSummary: nil,
+                capabilitiesProvider: capabilitiesProvider,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
@@ -2779,7 +2784,8 @@ final class CodexNativeSessionController {
             .resolved(
                 goalsEnabled: options.goalSupportEnabledProvider(),
                 memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
-                computerUseEnabled: options.computerUseEnabledProvider()
+                computerUseEnabled: options.computerUseEnabledProvider(),
+                capabilities: options.capabilitiesProvider()
             )
         }
     }
@@ -9110,6 +9116,7 @@ final class CodexNativeSessionController {
     static func defaultAppServerConfigOverrides(
         shellToolEnabled: Bool? = nil,
         suppressThirdPartyMCPServers: Bool = false,
+        capabilities: CodexCapabilitySettings = .disabled,
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
         memoriesEnabled: Bool = false,
@@ -9130,7 +9137,8 @@ final class CodexNativeSessionController {
             featurePolicy: .resolved(
                 goalsEnabled: goalSupportEnabled,
                 memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled
+                computerUseEnabled: computerUseEnabled,
+                capabilities: capabilities
             )
         )
         let mcpOverrides = appServerMCPServerOverrides(

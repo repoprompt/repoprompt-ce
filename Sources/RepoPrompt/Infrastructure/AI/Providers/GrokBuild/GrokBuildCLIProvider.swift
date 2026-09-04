@@ -1,7 +1,7 @@
 import Foundation
 
-/// Grok Build CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
-/// Runs a fresh prompt-only ACP session per request without injecting RepoPrompt MCP/tools.
+/// Grok Build CLI provider for non-agent use (chat, Oracle, AI queries).
+/// Runs a fresh prompt-only one-shot process per request without injecting RepoPrompt MCP/tools.
 final class GrokBuildCLIProvider: AIProvider {
     private let activeProviders = ActiveGrokBuildCLIProviderStore()
 
@@ -31,9 +31,8 @@ final class GrokBuildCLIProvider: AIProvider {
         model: AIModel,
         maxTokens _: Int? = nil
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let provider = GrokBuildACPHeadlessAgentProvider(
-            config: Self.makeHeadlessConfig(modelName: grokBuildModelName(for: model)),
-            workspacePath: nil
+        let provider = GrokBuildOneShotHeadlessAgentProvider(
+            config: Self.makeHeadlessConfig(modelName: grokBuildModelName(for: model))
         )
         activeProviders.insert(provider)
 
@@ -116,7 +115,7 @@ final class GrokBuildCLIProvider: AIProvider {
                 if let value = result.cost { cost = value }
             case "error":
                 throw AIProviderError.invalidConfiguration(
-                    detail: result.text ?? "Grok Build ACP reported an error"
+                    detail: result.text ?? "Grok Build reported an error"
                 )
             default:
                 continue
@@ -264,21 +263,21 @@ private extension AIStreamResult {
 
 private final class ActiveGrokBuildCLIProviderStore: @unchecked Sendable {
     private let lock = NSLock()
-    private var providers: [ObjectIdentifier: GrokBuildACPHeadlessAgentProvider] = [:]
+    private var providers: [ObjectIdentifier: GrokBuildOneShotHeadlessAgentProvider] = [:]
 
-    func insert(_ provider: GrokBuildACPHeadlessAgentProvider) {
+    func insert(_ provider: GrokBuildOneShotHeadlessAgentProvider) {
         lock.lock()
         providers[ObjectIdentifier(provider)] = provider
         lock.unlock()
     }
 
-    func remove(_ provider: GrokBuildACPHeadlessAgentProvider) {
+    func remove(_ provider: GrokBuildOneShotHeadlessAgentProvider) {
         lock.lock()
         providers.removeValue(forKey: ObjectIdentifier(provider))
         lock.unlock()
     }
 
-    func removeAll() -> [GrokBuildACPHeadlessAgentProvider] {
+    func removeAll() -> [GrokBuildOneShotHeadlessAgentProvider] {
         lock.lock()
         let current = Array(providers.values)
         providers.removeAll()

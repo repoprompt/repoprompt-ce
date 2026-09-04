@@ -33,8 +33,9 @@ struct AgentSessionRow: View {
     var hiddenThreadDescendantAttentionCount: Int = 0
     var onToggleThreadCollapse: (() -> Void)?
     var isSelected = false
-    var isSelectionMode = false
-    var isSelectionEnabled = true
+    var showsSelectionPresentation = false
+    var isInteractionEnabled = true
+    var commandProgressKind: AgentSidebarBulkActionKind?
     let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
     let onSelect: () -> Void
     let onTogglePin: () -> Void
@@ -54,6 +55,29 @@ struct AgentSessionRow: View {
     @State private var showRenameAlert = false
     @State private var showDeleteConfirmation = false
     @State private var renameText = ""
+
+    // MARK: - Context Menu Snapshot
+
+    /// Snapshot of the conditions that control context menu item visibility,
+    /// captured on hover. Using a snapshot prevents AppKit from observing a
+    /// mid-layout item-count change (which triggers an NSRangeException when
+    /// NSContextMenuImpl measures row heights for items that were just removed).
+    private struct ContextMenuSnapshot {
+        var isInteractionEnabled: Bool
+        var showsSelectionPresentation: Bool
+        var hasAttentionRunState: Bool
+        var hasOnStash: Bool
+        var hasOnDismissAttention: Bool
+    }
+
+    @State private var menuSnapshot = ContextMenuSnapshot(
+        isInteractionEnabled: true,
+        showsSelectionPresentation: false,
+        hasAttentionRunState: false,
+        hasOnStash: false,
+        hasOnDismissAttention: false
+    )
+
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -142,12 +166,18 @@ struct AgentSessionRow: View {
         "Delete chat"
     }
 
+    private var allowsDirectMutations: Bool {
+        isInteractionEnabled && !showsSelectionPresentation
+    }
+
     private func beginRename() {
+        guard allowsDirectMutations else { return }
         renameText = title
         showRenameAlert = true
     }
 
     private func requestDeleteConfirmation() {
+        guard allowsDirectMutations else { return }
         showDeleteConfirmation = true
     }
 
@@ -160,25 +190,26 @@ struct AgentSessionRow: View {
     }
 
     private func handleRowTap() {
+        guard isInteractionEnabled else { return }
         if onSelectionGesture(currentSelectionGesture) == .activate {
             onSelect()
         }
     }
 
     private func toggleSelection() {
-        guard isSelectionEnabled else { return }
+        guard isInteractionEnabled else { return }
         _ = onSelectionGesture(.toggle)
     }
 
     var body: some View {
         HStack(spacing: rowSpacing) {
-            if isSelectionMode {
+            if showsSelectionPresentation {
                 Button(action: toggleSelection) {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                 }
                 .buttonStyle(.plain)
-                .disabled(!isSelectionEnabled)
+                .disabled(!isInteractionEnabled)
                 .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(title)")
                 .accessibilityValue(isSelected ? "Selected" : "Not selected")
             }
@@ -230,9 +261,11 @@ struct AgentSessionRow: View {
 
             Spacer()
 
-            // Trailing indicator (checkmark or delete button)
-            if isHovered, !isSelectionMode {
-                if attentionRunState != nil, let onDismissAttention {
+            // Trailing command progress or hover actions.
+            if let commandProgressKind {
+                commandProgressIndicator(for: commandProgressKind)
+            } else if isHovered {
+                if !showsSelectionPresentation, attentionRunState != nil, let onDismissAttention {
                     Button(action: onDismissAttention) {
                         Image(systemName: "bell.slash")
                             .font(.system(size: 11))
@@ -244,43 +277,45 @@ struct AgentSessionRow: View {
                     .accessibilityLabel(dismissAttentionActionLabel)
                 }
 
-                Button(action: onTogglePin) {
-                    Image(systemName: isPinned ? "pin.slash" : "pin")
-                        .font(.system(size: 11))
-                        .foregroundColor(isPinHovered ? .accentColor : .secondary)
-                }
-                .buttonStyle(.plain)
-                .onHover { isPinHovered = $0 }
-                .hoverTooltip(pinActionLabel)
-
-                Button(action: beginRename) {
-                    Image(systemName: "pencil")
-                        .font(.system(size: 11))
-                        .foregroundColor(isRenameHovered ? .accentColor : .secondary)
-                }
-                .buttonStyle(.plain)
-                .onHover { isRenameHovered = $0 }
-                .hoverTooltip(renameActionLabel)
-
-                if let onStash {
-                    Button(action: onStash) {
-                        Image(systemName: "tray.and.arrow.down")
+                if allowsDirectMutations {
+                    Button(action: onTogglePin) {
+                        Image(systemName: isPinned ? "pin.slash" : "pin")
                             .font(.system(size: 11))
-                            .foregroundColor(isStashHovered ? .accentColor : .secondary)
+                            .foregroundColor(isPinHovered ? .accentColor : .secondary)
                     }
                     .buttonStyle(.plain)
-                    .onHover { isStashHovered = $0 }
-                    .hoverTooltip(stashActionLabel)
-                }
+                    .onHover { isPinHovered = $0 }
+                    .hoverTooltip(pinActionLabel)
 
-                Button(action: requestDeleteConfirmation) {
-                    Image(systemName: "trash")
-                        .font(.system(size: 11))
-                        .foregroundColor(isDeleteHovered ? .red : .secondary)
+                    Button(action: beginRename) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 11))
+                            .foregroundColor(isRenameHovered ? .accentColor : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isRenameHovered = $0 }
+                    .hoverTooltip(renameActionLabel)
+
+                    if let onStash {
+                        Button(action: onStash) {
+                            Image(systemName: "tray.and.arrow.down")
+                                .font(.system(size: 11))
+                                .foregroundColor(isStashHovered ? .accentColor : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { isStashHovered = $0 }
+                        .hoverTooltip(stashActionLabel)
+                    }
+
+                    Button(action: requestDeleteConfirmation) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11))
+                            .foregroundColor(isDeleteHovered ? .red : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isDeleteHovered = $0 }
+                    .hoverTooltip(deleteActionLabel)
                 }
-                .buttonStyle(.plain)
-                .onHover { isDeleteHovered = $0 }
-                .hoverTooltip(deleteActionLabel)
             }
             // Selected state is already signaled by the accent-tinted background +
             // semibold title weight; a trailing checkmark was redundant.
@@ -304,34 +339,49 @@ struct AgentSessionRow: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
-            if !isSelectionMode {
-                Button("Select chat", action: toggleSelection)
+            if !menuSnapshot.showsSelectionPresentation {
+                if menuSnapshot.isInteractionEnabled {
+                    Button("Select chat", action: toggleSelection)
 
-                Divider()
+                    Divider()
 
-                Button(pinActionLabel, action: onTogglePin)
+                    Button(pinActionLabel, action: onTogglePin)
 
-                Button(renameActionLabel, action: beginRename)
+                    Button(renameActionLabel, action: beginRename)
+                }
 
                 Button(AgentSidebarSessionIDCopyAction.menuTitle) {
                     sessionIDCopyAction.perform()
                 }
                 .disabled(!sessionIDCopyAction.isEnabled)
 
-                if let onStash {
-                    Button(stashActionLabel, action: onStash)
+                if menuSnapshot.isInteractionEnabled, menuSnapshot.hasOnStash {
+                    Button(stashActionLabel, action: { onStash?() })
                 }
 
-                if attentionRunState != nil, let onDismissAttention {
-                    Button(dismissAttentionActionLabel, action: onDismissAttention)
+                if menuSnapshot.hasAttentionRunState, menuSnapshot.hasOnDismissAttention {
+                    Button(dismissAttentionActionLabel, action: { onDismissAttention?() })
                 }
 
-                Divider()
+                if menuSnapshot.isInteractionEnabled {
+                    Divider()
 
-                Button(deleteActionLabel, role: .destructive, action: requestDeleteConfirmation)
+                    Button(deleteActionLabel, role: .destructive, action: requestDeleteConfirmation)
+                }
             }
         }
-        .onHover { isHovered = $0 }
+        .onHover { hovered in
+            isHovered = hovered
+            if hovered {
+                menuSnapshot = ContextMenuSnapshot(
+                    isInteractionEnabled: isInteractionEnabled,
+                    showsSelectionPresentation: showsSelectionPresentation,
+                    hasAttentionRunState: attentionRunState != nil,
+                    hasOnStash: onStash != nil,
+                    hasOnDismissAttention: onDismissAttention != nil
+                )
+            }
+        }
         .onTapGesture(perform: handleRowTap)
         .focusable()
         .onKeyPress(.space) {
@@ -354,10 +404,12 @@ struct AgentSessionRow: View {
                         showDeleteConfirmation = false
                     }
                     Button("Delete") {
+                        guard allowsDirectMutations else { return }
                         showDeleteConfirmation = false
                         onDelete()
                     }
                     .keyboardShortcut(.defaultAction)
+                    .disabled(!allowsDirectMutations)
                 }
             }
             .padding()
@@ -367,6 +419,7 @@ struct AgentSessionRow: View {
             AgentSessionRenameSheet(
                 renameText: $renameText,
                 onConfirm: { newName in
+                    guard allowsDirectMutations else { return }
                     showRenameAlert = false
                     onRename(newName)
                 },
@@ -374,6 +427,11 @@ struct AgentSessionRow: View {
                     showRenameAlert = false
                 }
             )
+        }
+        .onChange(of: isInteractionEnabled) { _, isEnabled in
+            guard !isEnabled else { return }
+            showDeleteConfirmation = false
+            showRenameAlert = false
         }
     }
 
@@ -734,6 +792,16 @@ struct AgentSessionRow: View {
         return isMCPControlledRoot ? "MCP controlled" : ""
     }
 
+    private func commandProgressIndicator(
+        for kind: AgentSidebarBulkActionKind
+    ) -> some View {
+        ProgressView()
+            .controlSize(.small)
+            .frame(width: 16, height: 16)
+            .allowsHitTesting(false)
+            .accessibilityLabel(kind.rowProgressAccessibilityLabel)
+    }
+
     private func waitingTooltip(
         for state: AgentSessionRunState,
         unseen: Bool
@@ -753,8 +821,9 @@ struct AgentSessionRow: View {
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
     var isSelected = false
-    var isSelectionMode = false
-    var isSelectionEnabled = true
+    var showsSelectionPresentation = false
+    var isInteractionEnabled = true
+    var commandProgressKind: AgentSidebarBulkActionKind?
     let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
     let onRestore: () -> Void
     let onDelete: () -> Void
@@ -763,6 +832,21 @@ struct AgentStashedSessionRow: View {
     @State private var isHovered = false
     @State private var isRestoreHovered = false
     @State private var isDeleteHovered = false
+
+    // MARK: - Context Menu Snapshot
+
+    /// Snapshot of conditions controlling context menu item visibility, captured
+    /// on hover to prevent NSRangeException from AppKit measuring stale item counts.
+    private struct ContextMenuSnapshot {
+        var isInteractionEnabled: Bool
+        var showsSelectionPresentation: Bool
+    }
+
+    @State private var menuSnapshot = ContextMenuSnapshot(
+        isInteractionEnabled: true,
+        showsSelectionPresentation: false
+    )
+
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -804,6 +888,10 @@ struct AgentStashedSessionRow: View {
         fontPreset.scaledClamped(10, max: 13)
     }
 
+    private var allowsDirectMutations: Bool {
+        isInteractionEnabled && !showsSelectionPresentation
+    }
+
     private var restoreActionLabel: String {
         "Restore tab"
     }
@@ -821,25 +909,26 @@ struct AgentStashedSessionRow: View {
     }
 
     private func handleRowTap() {
+        guard isInteractionEnabled else { return }
         if onSelectionGesture(currentSelectionGesture) == .activate {
             onRestore()
         }
     }
 
     private func toggleSelection() {
-        guard isSelectionEnabled else { return }
+        guard isInteractionEnabled else { return }
         _ = onSelectionGesture(.toggle)
     }
 
     var body: some View {
         HStack(spacing: rowSpacing) {
-            if isSelectionMode {
+            if showsSelectionPresentation {
                 Button(action: toggleSelection) {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                 }
                 .buttonStyle(.plain)
-                .disabled(!isSelectionEnabled)
+                .disabled(!isInteractionEnabled)
                 .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(stashed.tab.name)")
                 .accessibilityValue(isSelected ? "Selected" : "Not selected")
             }
@@ -864,7 +953,13 @@ struct AgentStashedSessionRow: View {
 
             Spacer()
 
-            if isHovered, !isSelectionMode {
+            if let commandProgressKind {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 16, height: 16)
+                    .allowsHitTesting(false)
+                    .accessibilityLabel(commandProgressKind.rowProgressAccessibilityLabel)
+            } else if isHovered, allowsDirectMutations {
                 Button(action: onRestore) {
                     Image(systemName: "tray.and.arrow.up")
                         .font(.system(size: 11))
@@ -900,19 +995,31 @@ struct AgentStashedSessionRow: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
-            if !isSelectionMode {
-                Button("Select chat", action: toggleSelection)
-                Divider()
-                Button(restoreActionLabel, action: onRestore)
+            if !menuSnapshot.showsSelectionPresentation {
+                if menuSnapshot.isInteractionEnabled {
+                    Button("Select chat", action: toggleSelection)
+                    Divider()
+                    Button(restoreActionLabel, action: onRestore)
+                }
                 Button(AgentSidebarSessionIDCopyAction.menuTitle) {
                     sessionIDCopyAction.perform()
                 }
                 .disabled(!sessionIDCopyAction.isEnabled)
-                Divider()
-                Button(deleteActionLabel, role: .destructive, action: onDelete)
+                if menuSnapshot.isInteractionEnabled {
+                    Divider()
+                    Button(deleteActionLabel, role: .destructive, action: onDelete)
+                }
             }
         }
-        .onHover { isHovered = $0 }
+        .onHover { hovered in
+            isHovered = hovered
+            if hovered {
+                menuSnapshot = ContextMenuSnapshot(
+                    isInteractionEnabled: isInteractionEnabled,
+                    showsSelectionPresentation: showsSelectionPresentation
+                )
+            }
+        }
         .onTapGesture(perform: handleRowTap)
         .focusable()
         .onKeyPress(.space) {

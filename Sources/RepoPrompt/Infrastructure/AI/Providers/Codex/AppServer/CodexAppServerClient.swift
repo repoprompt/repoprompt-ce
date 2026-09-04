@@ -443,6 +443,7 @@ actor CodexAppServerClient {
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
     private let processSpawnPreparation: @Sendable () async throws -> Void
     private let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
+    private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
     private let provisionsRepoPromptMCPOnStart: Bool
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
@@ -466,6 +467,9 @@ actor CodexAppServerClient {
         processEnvironmentBuilder: @escaping @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult = {
             await ProcessEnvironmentBuilder.build($0)
         },
+        runtimeStatePreparer: @escaping @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void = {
+            try $0.prepareState()
+        },
         provisionsRepoPromptMCPOnStart: Bool = true,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver(pid: $0)
@@ -477,6 +481,7 @@ actor CodexAppServerClient {
         self.livenessProbe = livenessProbe
         self.processSpawnPreparation = processSpawnPreparation
         self.processEnvironmentBuilder = processEnvironmentBuilder
+        self.runtimeStatePreparer = runtimeStatePreparer
         self.provisionsRepoPromptMCPOnStart = provisionsRepoPromptMCPOnStart
         self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
@@ -499,6 +504,7 @@ actor CodexAppServerClient {
     /// the same captured launch context instead of consulting a second environment snapshot.
     func prepareRuntimeForLaunch() async throws -> CodexRuntimeAuthority.Runtime {
         if let runtime = preparedRuntimeLaunchContext?.resolution.runtime {
+            try prepareState(for: runtime)
             return runtime
         }
 
@@ -521,19 +527,23 @@ actor CodexAppServerClient {
         guard let runtime = resolution.runtime else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: runtime resolution completed without runtime metadata.")
         }
-        do {
-            try runtime.prepareState()
-        } catch {
-            throw ClientError.executableUnavailable(
-                "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
-            )
-        }
+        try prepareState(for: runtime)
         environment.merge(resolution.environmentOverrides) { _, ownedValue in ownedValue }
         preparedRuntimeLaunchContext = PreparedRuntimeLaunchContext(
             environment: environment,
             resolution: resolution
         )
         return runtime
+    }
+
+    private func prepareState(for runtime: CodexRuntimeAuthority.Runtime) throws {
+        do {
+            try runtimeStatePreparer(runtime)
+        } catch {
+            throw ClientError.executableUnavailable(
+                "RepoPrompt could not start Codex: unable to prepare its isolated Codex state (\(error.localizedDescription))."
+            )
+        }
     }
 
     private static func processEnvironmentForCurrentLaunch(

@@ -81,8 +81,38 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         publishSelection(next, eventName: "sessionSidebar.selection.reconcile")
     }
 
-    func beginBulkAction(kind: AgentSidebarBulkActionKind, targetCount: Int, workspaceID: UUID) -> UUID? {
-        guard selectionState.inFlightAction == nil, targetCount > 0 else { return nil }
+    func beginBulkAction(
+        kind: AgentSidebarBulkActionKind,
+        origin: AgentSidebarBulkActionOrigin,
+        presentationTargets: Set<AgentSidebarSelectionIdentity>,
+        commandProgressPlacement: AgentSidebarCommandProgressPlacement?,
+        workspaceID: UUID
+    ) -> UUID? {
+        guard selectionState.inFlightAction == nil, !presentationTargets.isEmpty else { return nil }
+        switch origin {
+        case .selection:
+            guard commandProgressPlacement == nil,
+                  selectionState.workspaceID == workspaceID,
+                  !selectionState.selectedIdentities.isEmpty,
+                  presentationTargets.isSubset(of: selectionState.selectedIdentities)
+            else { return nil }
+        case .command:
+            guard selectionState.selectedIdentities.isEmpty,
+                  let commandProgressPlacement
+            else { return nil }
+            switch commandProgressPlacement {
+            case .row:
+                guard presentationTargets.count == 1 else { return nil }
+            case .archivedHeader:
+                guard kind == .delete,
+                      presentationTargets.allSatisfy({ identity in
+                          if case .archived = identity { return true }
+                          return false
+                      })
+                else { return nil }
+            }
+        }
+
         let token = UUID()
         var next = selectionState
         next.workspaceID = workspaceID
@@ -91,7 +121,9 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             token: token,
             workspaceID: workspaceID,
             kind: kind,
-            targetCount: targetCount
+            origin: origin,
+            presentationTargets: presentationTargets,
+            commandProgressPlacement: commandProgressPlacement
         )
         next.revision &+= 1
         publishSelection(next, eventName: "sessionSidebar.selection.bulkBegin")
@@ -101,6 +133,28 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     func isCurrentBulkAction(token: UUID, workspaceID: UUID) -> Bool {
         selectionState.inFlightAction?.token == token
             && selectionState.inFlightAction?.workspaceID == workspaceID
+    }
+
+    func retireCommandRowProgress(
+        token: UUID,
+        forRemovedTabIDs tabIDs: Set<UUID>,
+        workspaceID: UUID
+    ) {
+        guard !tabIDs.isEmpty,
+              var operation = selectionState.inFlightAction,
+              operation.token == token,
+              operation.origin == .command,
+              operation.commandProgressPlacement == .row,
+              operation.workspaceID == workspaceID,
+              !operation.commandRowProgressRetired,
+              operation.presentationTargets.contains(where: { tabIDs.contains($0.tabID) })
+        else { return }
+
+        operation.commandRowProgressRetired = true
+        var next = selectionState
+        next.inFlightAction = operation
+        next.revision &+= 1
+        publishSelection(next, eventName: "sessionSidebar.selection.commandRowProgressRetired")
     }
 
     func finishBulkAction(token: UUID, workspaceID: UUID, notice: AgentSidebarBulkActionNotice?) {
@@ -253,7 +307,21 @@ final class AgentSessionSidebarUIStore: ObservableObject {
                     "revision": String(next.revision),
                     "selectedCount": String(next.selectedIdentities.count),
                     "hasAnchor": String(next.anchor != nil),
-                    "inFlightKind": next.inFlightAction?.kind.rawValue ?? "none"
+                    "inFlightKind": next.inFlightAction?.kind.rawValue ?? "none",
+                    "inFlightTargetCount": String(next.inFlightAction?.targetCount ?? 0),
+                    "inFlightRowProgressRetired": String(next.inFlightAction?.commandRowProgressRetired ?? false),
+                    "inFlightPlacement": next.inFlightAction?.commandProgressPlacement.map {
+                        switch $0 {
+                        case .row: "row"
+                        case .archivedHeader: "archivedHeader"
+                        }
+                    } ?? "none",
+                    "inFlightOrigin": next.inFlightAction.map {
+                        switch $0.origin {
+                        case .selection: "selection"
+                        case .command: "command"
+                        }
+                    } ?? "none"
                 ]
             )
         #endif

@@ -1136,13 +1136,8 @@ extension MCPServerViewModel {
             throw TabBindError.tabNotFound(tabID)
         }
 
-        // Tear down any previous binding for this connection
-        if tabContextByConnectionID[connectionID] != nil {
-            releaseBinding(connectionID: connectionID)
-        }
-
-        // Explicit tab-context bindings preserve the tab's stored state unless a caller opts into
-        // active selection flushing through the snapshot helper.
+        // Build the replacement before releasing a usable binding. A stale or otherwise invalid
+        // target must not turn a failed rebind into an unbound connection.
         var context = try makeTabContextSnapshot(
             tabID: tab.id,
             workspaceID: ws.id,
@@ -1152,6 +1147,10 @@ extension MCPServerViewModel {
             captureActiveUIState: false,
             flushActiveSelection: false
         )
+
+        if tabContextByConnectionID[connectionID] != nil {
+            releaseBinding(connectionID: connectionID)
+        }
 
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
@@ -2024,7 +2023,26 @@ extension MCPServerViewModel {
         tabID: UUID,
         workspaceID: UUID?
     ) async throws -> WorkspaceLookupContext {
-        let snapshot = try makeTabContextSnapshot(
+        try await resolveProspectiveFileToolLookupContext(
+            tabID: tabID,
+            workspaceID: workspaceID
+        ).lookupContext
+    }
+
+    struct ProspectiveFileToolLookupResolution {
+        let lookupContext: WorkspaceLookupContext
+        let sourceIdentity: AgentWorkspaceLookupContextIdentity
+        fileprivate let visibleRootFingerprint: String
+        fileprivate let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot?
+    }
+
+    @MainActor
+    func resolveProspectiveFileToolLookupContext(
+        tabID: UUID,
+        workspaceID: UUID?
+    ) async throws -> ProspectiveFileToolLookupResolution {
+        let visibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        var snapshot = try makeTabContextSnapshot(
             tabID: tabID,
             workspaceID: workspaceID,
             windowID: windowID,
@@ -2033,7 +2051,152 @@ extension MCPServerViewModel {
             captureActiveUIState: false,
             flushActiveSelection: false
         )
-        return await lookupContext(for: snapshot)
+        guard await hydrateFileToolLookupSnapshotIfNeeded(&snapshot, connectionID: nil) else {
+            let source = AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: snapshot.activeAgentSessionID,
+                worktreeBindingState: snapshot.worktreeBindingState
+            )
+            return ProspectiveFileToolLookupResolution(
+                lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
+                sourceIdentity: source.identity,
+                visibleRootFingerprint: visibleRootFingerprint,
+                sessionRootLifetimeSnapshot: nil
+            )
+        }
+
+        let source = AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: snapshot.activeAgentSessionID,
+            worktreeBindingState: snapshot.worktreeBindingState
+        )
+        let lookupContext = await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
+            source: source,
+            store: promptVM.workspaceFileContextStore
+        )
+        let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot? = if let bindingProjection = lookupContext.bindingProjection {
+            await promptVM.workspaceFileContextStore.sessionBoundRootScopeValidationSnapshot(
+                lookupContext.rootScope,
+                expectedPhysicalRoots: bindingProjection.physicalRootRefs
+            )
+        } else {
+            nil
+        }
+        let currentVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard currentVisibleRootFingerprint == visibleRootFingerprint,
+              lookupContext.bindingProjection == nil || sessionRootLifetimeSnapshot != nil,
+              fileToolLookupSnapshotIsCurrent(snapshot, connectionID: nil),
+              fileToolBindingSourceIsCurrent(source, for: snapshot)
+        else {
+            #if DEBUG
+                fileToolLookupContextStaleCompletionCount += 1
+            #endif
+            return ProspectiveFileToolLookupResolution(
+                lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
+                sourceIdentity: source.identity,
+                visibleRootFingerprint: visibleRootFingerprint,
+                sessionRootLifetimeSnapshot: nil
+            )
+        }
+        if let sessionRootLifetimeSnapshot {
+            guard await sessionRootLifetimeSnapshot.isCurrent() else {
+                #if DEBUG
+                    fileToolLookupContextStaleCompletionCount += 1
+                #endif
+                return ProspectiveFileToolLookupResolution(
+                    lookupContext: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
+                    sourceIdentity: source.identity,
+                    visibleRootFingerprint: visibleRootFingerprint,
+                    sessionRootLifetimeSnapshot: nil
+                )
+            }
+        }
+        return ProspectiveFileToolLookupResolution(
+            lookupContext: lookupContext,
+            sourceIdentity: source.identity,
+            visibleRootFingerprint: visibleRootFingerprint,
+            sessionRootLifetimeSnapshot: sessionRootLifetimeSnapshot
+        )
+    }
+
+    @MainActor
+    func prospectiveFileToolLookupSourceIsCurrent(
+        tabID: UUID,
+        workspaceID: UUID,
+        expectedSourceIdentity: AgentWorkspaceLookupContextIdentity
+    ) -> Bool {
+        guard var snapshot = try? makeTabContextSnapshot(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: windowID,
+            runID: nil,
+            explicitlyBound: false,
+            captureActiveUIState: false,
+            flushActiveSelection: false
+        ) else { return false }
+
+        if let sessionID = snapshot.activeAgentSessionID {
+            snapshot.worktreeBindingState = agentWorktreeBindingStateProvider?(sessionID, snapshot.tabID) ?? .unhydrated
+        } else {
+            snapshot.worktreeBindingState = .notApplicable
+        }
+        let source = AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: snapshot.activeAgentSessionID,
+            worktreeBindingState: snapshot.worktreeBindingState
+        )
+        return fileToolLookupSnapshotIsCurrent(snapshot, connectionID: nil)
+            && source.identity == expectedSourceIdentity
+    }
+
+    @MainActor
+    func performIfProspectiveFileToolLookupResolutionIsCurrent(
+        _ resolution: ProspectiveFileToolLookupResolution,
+        tabID: UUID,
+        workspaceID: UUID,
+        operation: @MainActor () throws -> Void
+    ) async throws -> Bool {
+        guard prospectiveFileToolLookupSourceIsCurrent(
+            tabID: tabID,
+            workspaceID: workspaceID,
+            expectedSourceIdentity: resolution.sourceIdentity
+        ) else { return false }
+
+        let currentVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard currentVisibleRootFingerprint == resolution.visibleRootFingerprint else { return false }
+        if let sessionRootLifetimeSnapshot = resolution.sessionRootLifetimeSnapshot {
+            guard await sessionRootLifetimeSnapshot.isCurrent() else { return false }
+        }
+
+        #if DEBUG
+            if let debugAfterFileToolLookupContextRootValidationForTesting {
+                await debugAfterFileToolLookupContextRootValidationForTesting()
+            }
+        #endif
+
+        let finalVisibleRootFingerprint = await fileToolVisibleRootFingerprint()
+        guard finalVisibleRootFingerprint == resolution.visibleRootFingerprint,
+              prospectiveFileToolLookupSourceIsCurrent(
+                  tabID: tabID,
+                  workspaceID: workspaceID,
+                  expectedSourceIdentity: resolution.sourceIdentity
+              )
+        else { return false }
+
+        if let sessionRootLifetimeSnapshot = resolution.sessionRootLifetimeSnapshot {
+            var operationError: Error?
+            let didPerform = sessionRootLifetimeSnapshot.performIfGenerationCurrent {
+                do {
+                    try operation()
+                } catch {
+                    operationError = error
+                }
+            }
+            if let operationError {
+                throw operationError
+            }
+            return didPerform
+        }
+
+        try operation()
+        return true
     }
 
     @MainActor
@@ -2069,34 +2232,11 @@ extension MCPServerViewModel {
                 }
             }
 
-            if let sessionID = snapshot.activeAgentSessionID {
-                if snapshot.runID == nil,
-                   let agentWorktreeBindingStateProvider
-                {
-                    snapshot.worktreeBindingState = agentWorktreeBindingStateProvider(sessionID, snapshot.tabID)
-                }
-                if snapshot.worktreeBindingState == .unhydrated,
-                   let agentWorktreeBindingStateResolver
-                {
-                    let bindingGeneration = snapshot.readFileAutoSelectionGeneration
-                    let hydratedState = await agentWorktreeBindingStateResolver(sessionID, snapshot.tabID)
-                    guard fileToolLookupSnapshotIsCurrent(
-                        snapshot,
-                        connectionID: metadata.connectionID,
-                        expectedBindingGeneration: bindingGeneration
-                    ),
-                        agentWorktreeBindingStateProvider?(sessionID, snapshot.tabID) == hydratedState
-                        || agentWorktreeBindingStateProvider == nil
-                    else {
-                        #if DEBUG
-                            fileToolLookupContextStaleCompletionCount += 1
-                        #endif
-                        return AgentWorkspaceLookupContextResolver.failClosedLookupContext
-                    }
-                    snapshot.worktreeBindingState = hydratedState
-                }
-            } else {
-                snapshot.worktreeBindingState = .notApplicable
+            guard await hydrateFileToolLookupSnapshotIfNeeded(
+                &snapshot,
+                connectionID: metadata.connectionID
+            ) else {
+                return AgentWorkspaceLookupContextResolver.failClosedLookupContext
             }
 
             resolved?.snapshot = snapshot
@@ -2348,6 +2488,43 @@ extension MCPServerViewModel {
             pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)
         }
         return adjustedLookupContext
+    }
+
+    @MainActor
+    private func hydrateFileToolLookupSnapshotIfNeeded(
+        _ snapshot: inout TabContextSnapshot,
+        connectionID: UUID?
+    ) async -> Bool {
+        guard let sessionID = snapshot.activeAgentSessionID else {
+            snapshot.worktreeBindingState = .notApplicable
+            return true
+        }
+        if snapshot.runID == nil,
+           let agentWorktreeBindingStateProvider
+        {
+            snapshot.worktreeBindingState = agentWorktreeBindingStateProvider(sessionID, snapshot.tabID)
+        }
+        guard snapshot.worktreeBindingState == .unhydrated,
+              let agentWorktreeBindingStateResolver
+        else { return true }
+
+        let bindingGeneration = snapshot.readFileAutoSelectionGeneration
+        let hydratedState = await agentWorktreeBindingStateResolver(sessionID, snapshot.tabID)
+        guard fileToolLookupSnapshotIsCurrent(
+            snapshot,
+            connectionID: connectionID,
+            expectedBindingGeneration: bindingGeneration
+        ),
+            agentWorktreeBindingStateProvider?(sessionID, snapshot.tabID) == hydratedState
+            || agentWorktreeBindingStateProvider == nil
+        else {
+            #if DEBUG
+                fileToolLookupContextStaleCompletionCount += 1
+            #endif
+            return false
+        }
+        snapshot.worktreeBindingState = hydratedState
+        return true
     }
 
     /// Resolves mutation routing and lookup authority together so an inactive,
@@ -2912,7 +3089,23 @@ extension MCPServerViewModel {
                 bound: bound
             ) {
                 if let explicitHint, !Self.hint(explicitHint, matches: bound) {
-                    throw MCPError.invalidParams("Explicit tab context hint for \(toolName) targets tab \(explicitHint.tabID), but this connection is already bound to tab \(bound.tabID). Clear or intentionally rebind the connection before targeting a different tab context.")
+                    var conflicts: [String] = []
+                    if explicitHint.tabID != bound.tabID {
+                        conflicts.append("context_id hint=\(explicitHint.tabID), bound=\(bound.tabID)")
+                    }
+                    if let workspaceID = explicitHint.workspaceID, workspaceID != bound.workspaceID {
+                        conflicts.append(
+                            "workspace_id hint=\(workspaceID), bound=\(bound.workspaceID?.uuidString ?? "none")"
+                        )
+                    }
+                    if let windowID = explicitHint.windowID, windowID != bound.windowID {
+                        conflicts.append("window_id hint=\(windowID), bound=\(bound.windowID)")
+                    }
+                    throw MCPError.invalidParams(
+                        "Explicit tab context hint for \(toolName) conflicts with this connection's authoritative " +
+                            "tab-context binding: \(conflicts.joined(separator: "; ")); clear or intentionally rebind " +
+                            "the connection before targeting a different tab context."
+                    )
                 }
                 if let hinted = resolvedWindowID {
                     if let existing = presentationWindowByConnection[connectionID], existing != hinted {

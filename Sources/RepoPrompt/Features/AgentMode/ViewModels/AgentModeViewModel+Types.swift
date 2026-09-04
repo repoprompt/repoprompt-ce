@@ -209,6 +209,7 @@ extension AgentModeViewModel {
         let archivedDateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
         let archivedSessionIDByStashedTabID: [UUID: UUID]
         let defaultCollapseSeedKeys: [AgentSidebarThreadKey]
+        let existingSelectionIdentities: Set<AgentSidebarSelectionIdentity>
         let renderedSelectionOrder: [AgentSidebarSelectionIdentity]
 
         var hasMoreSessions: Bool {
@@ -235,6 +236,24 @@ extension AgentModeViewModel {
         let stashTabIDs: Set<UUID>
         let pinTabIDs: Set<UUID>
         let unpinTabIDs: Set<UUID>
+
+        func presentationTargets(
+            for action: AgentSidebarBulkActionKind
+        ) -> Set<AgentSidebarSelectionIdentity> {
+            switch action {
+            case .delete:
+                Set(activeDeleteTabIDs.map(AgentSidebarSelectionIdentity.active(tabID:)))
+                    .union(archivedDeleteTargets.map {
+                        .archived(stashedTabID: $0.stashedTabID, tabID: $0.tabID)
+                    })
+            case .stash:
+                Set(stashTabIDs.map(AgentSidebarSelectionIdentity.active(tabID:)))
+            case .pin:
+                Set(pinTabIDs.map(AgentSidebarSelectionIdentity.active(tabID:)))
+            case .unpin:
+                Set(unpinTabIDs.map(AgentSidebarSelectionIdentity.active(tabID:)))
+            }
+        }
     }
 
     /// Signature of a compose tab's sidebar-rendered metadata. Captured separately

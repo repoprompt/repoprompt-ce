@@ -667,7 +667,7 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
         guard lstat(url.path, &value) == 0,
               value.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
         else { return nil }
-        return StableWatchRootIdentity(device: UInt64(value.st_dev), inode: UInt64(value.st_ino))
+        return StableWatchRootIdentity(device: safeDeviceID(value.st_dev), inode: UInt64(value.st_ino))
     }
 
     private static func canonicalURL(_ url: URL) -> URL {

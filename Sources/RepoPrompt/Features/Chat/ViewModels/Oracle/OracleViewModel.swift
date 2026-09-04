@@ -644,6 +644,7 @@ class OracleViewModel: ObservableObject {
     // NEW: keep references to background calculations so we can cancel them
     private var latestTokenCountsTask: Task<Void, Never>?
     private var upcomingTokenEstimateTask: Task<Void, Never>?
+    private var autosaveTasksByWorkspaceID: [UUID: [UUID: Task<Void, Never>]] = [:]
 
     /// Store Combine cancellables
     private var cancellables = Set<AnyCancellable>()
@@ -1212,6 +1213,9 @@ class OracleViewModel: ObservableObject {
         }
         for (_, task) in streamInactivityWatchdogs {
             task.cancel()
+        }
+        for tasks in autosaveTasksByWorkspaceID.values {
+            tasks.values.forEach { $0.cancel() }
         }
 
         // Cancel background token calculation tasks
@@ -1858,9 +1862,10 @@ class OracleViewModel: ObservableObject {
         if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
             sessions[idx].composeTabID = updatedTab.id
             refreshSessionLists()
-            Task { [weak self] in
+            let sessionToSave = sessions[idx]
+            scheduleTrackedAutosave(for: sessionToSave) { [weak self] in
                 guard let self else { return }
-                _ = try? await autosaveSession(sessions[idx])
+                _ = try? await autosaveSession(sessionToSave)
             }
         }
 
@@ -1875,9 +1880,10 @@ class OracleViewModel: ObservableObject {
         if setActiveForTab {
             workspaceManager.setActiveChatSessionID(sessionID, forTabID: tabID)
         }
-        Task { [weak self] in
+        let sessionToSave = sessions[idx]
+        scheduleTrackedAutosave(for: sessionToSave) { [weak self] in
             guard let self else { return }
-            _ = try? await autosaveSession(sessions[idx])
+            _ = try? await autosaveSession(sessionToSave)
         }
     }
 
@@ -2707,6 +2713,34 @@ class OracleViewModel: ObservableObject {
 
     // MARK: - Autosave
 
+    func scheduleTrackedAutosave(
+        for session: ChatSession,
+        operation: @escaping @MainActor () async -> Void
+    ) {
+        guard let workspaceID = session.workspaceID else { return }
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self] in
+            await operation()
+            self?.finishTrackedAutosave(workspaceID: workspaceID, taskID: taskID)
+        }
+        autosaveTasksByWorkspaceID[workspaceID, default: [:]][taskID] = task
+    }
+
+    func drainTrackedAutosaves(for workspaceID: UUID) async {
+        while let tasks = autosaveTasksByWorkspaceID[workspaceID], !tasks.isEmpty {
+            for task in tasks.values {
+                await task.value
+            }
+        }
+    }
+
+    private func finishTrackedAutosave(workspaceID: UUID, taskID: UUID) {
+        autosaveTasksByWorkspaceID[workspaceID]?.removeValue(forKey: taskID)
+        if autosaveTasksByWorkspaceID[workspaceID]?.isEmpty == true {
+            autosaveTasksByWorkspaceID.removeValue(forKey: workspaceID)
+        }
+    }
+
     /// Update the current session’s data from in-memory `messages` & tasks, then save to disk.
     @MainActor
     func autosaveChatHistory(force: Bool = false) {
@@ -2837,27 +2871,26 @@ class OracleViewModel: ObservableObject {
         // ------------------------------------------------------------------
         // 7️⃣  Persist to disk
         // ------------------------------------------------------------------
-        Task {
+        scheduleTrackedAutosave(for: sessionCopy) { [weak self] in
+            guard let self else { return }
             do {
                 let fileURL = try await autosaveSession(sessionCopy)
-                await MainActor.run {
-                    if let idx = sessions.firstIndex(where: { $0.id == sessionCopy.id }) {
-                        var updated = sessionCopy
+                if let idx = sessions.firstIndex(where: { $0.id == sessionCopy.id }) {
+                    var updated = sessionCopy
+                    updated.fileURL = fileURL
+                    updated.savedAt = sessionCopy.savedAt
+
+                    // Keep only the active session loaded; list entries should be lightweight.
+                    // Skip stubbing if a caller has pinned the session.
+                    if sessionCopy.id != currentSessionID, !isSessionPinned(sessionCopy.id) {
+                        updated = updated.listStub()
                         updated.fileURL = fileURL
                         updated.savedAt = sessionCopy.savedAt
-
-                        // Keep only the active session loaded; list entries should be lightweight.
-                        // Skip stubbing if a caller has pinned the session.
-                        if sessionCopy.id != currentSessionID, !isSessionPinned(sessionCopy.id) {
-                            updated = updated.listStub()
-                            updated.fileURL = fileURL
-                            updated.savedAt = sessionCopy.savedAt
-                        }
-                        sessions[idx] = updated
                     }
-                    unloadNonCurrentSessions()
-                    workspaceManager.pollAndSaveState()
+                    sessions[idx] = updated
                 }
+                unloadNonCurrentSessions()
+                workspaceManager.pollAndSaveState()
             } catch {
                 print("Autosave failed: \(error)")
             }
@@ -3829,7 +3862,8 @@ class OracleViewModel: ObservableObject {
         } else {
             // Non-current session: explicitly save it (stub-safe via autosaveSession)
             let sessionToSave = sessions[index]
-            Task {
+            scheduleTrackedAutosave(for: sessionToSave) { [weak self] in
+                guard let self else { return }
                 do {
                     let savedURL = try await autosaveSession(sessionToSave)
                     // Update the sessions array with the saved fileURL

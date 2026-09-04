@@ -324,6 +324,9 @@ class WindowState: ObservableObject {
     }
 
     private var pendingRestoreEntry: WindowSessionEntry?
+    /// The session entry this window failed to restore, kept so a Default fallback is never
+    /// written back over a still-valid snapshot entry. Cleared as soon as a restore resolves.
+    private(set) var unresolvedRestoreEntry: WindowSessionEntry?
     private var pendingRestoreCompletion: (() -> Void)?
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
@@ -461,6 +464,22 @@ class WindowState: ObservableObject {
                 await self.processCommands()
             }
         }
+
+        // Once this window lands on any real workspace, a failed restore no longer describes it,
+        // so stop carrying the unresolved entry forward. This covers a successful restore, a
+        // user switch, and a restore whose switch was refused after resolution succeeded --
+        // and it lets a later deliberate switch back to Default persist normally.
+        workspaceManager.$activeWorkspaceID
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newWorkspaceID in
+                guard let self,
+                      let newWorkspaceID,
+                      let workspace = workspaceManager.workspaces.first(where: { $0.id == newWorkspaceID }),
+                      !workspace.isSystemWorkspace
+                else { return }
+                unresolvedRestoreEntry = nil
+            }
+            .store(in: &cancellables)
 
         // Keep the window title in sync when this window's active compose tab changes,
         // so the Agent session portion of the title does not go stale.
@@ -1187,12 +1206,23 @@ class WindowState: ObservableObject {
         #if DEBUG
             let restoreStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
+        // Armed up front, cleared only once a real workspace actually becomes active. Resolving
+        // a target does not prove the switch took, so clearing on resolution alone would let a
+        // refused switch persist the Default fallback over the snapshot.
+        unresolvedRestoreEntry = entry
         if let target = resolveWorkspace(for: entry) {
             #if DEBUG
                 WorkspaceRestorePerfLog.log(
                     "restore.window workspaceResolved windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(target.id)) workspaceName=\(target.name) entryWorkspaceID=\(WorkspaceRestorePerfLog.shortID(entry.workspaceID))"
                 )
             #endif
+            if target.isSystemWorkspace {
+                // The entry intended the system workspace, so the fallback state and the intended
+                // state coincide and there is nothing to protect. Clearing here keeps such a window
+                // capturing live state instead of re-emitting its restore-time entry for good --
+                // the observer below only fires for non-system workspaces.
+                unresolvedRestoreEntry = nil
+            }
             _ = await workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
             #if DEBUG
                 if let restoreStartMS {
@@ -1211,7 +1241,9 @@ class WindowState: ObservableObject {
                 )
             }
         #endif
-        // No existing workspace matches; leave the window in its default state.
+        // No existing workspace matches; leave the window in its default state. The entry armed
+        // above stays set, so `captureCurrentSession` re-emits it instead of persisting the
+        // Default fallback, which would discard the user's real window layout.
     }
 
     private func resolveWorkspace(for entry: WindowSessionEntry) -> WorkspaceModel? {

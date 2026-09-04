@@ -6,7 +6,7 @@ import Foundation
 /// only user-configurable external fallback is an absolute path supplied through
 /// `REPOPROMPT_CODEX_EXECUTABLE`; ordinary PATH lookup is intentionally not consulted.
 enum CodexRuntimeAuthority {
-    static let bundledVersion = Version(major: 0, minor: 147, patch: 0)
+    static let bundledVersion = Version(major: 0, minor: 149, patch: 0)
     static let minimumExternalVersion = bundledVersion
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
 
@@ -33,9 +33,19 @@ enum CodexRuntimeAuthority {
         let source: Source
         let statePaths: StatePaths
 
-        func prepareState(fileManager: FileManager = .default) throws {
+        func prepareState(
+            fileManager: FileManager = .default,
+            ordinaryCodexHomeURL: URL? = nil
+        ) throws {
             try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
+            let ordinaryCodexHome = ordinaryCodexHomeURL
+                ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+            try CodexGlobalInstructionsProjection.prepare(
+                ordinaryCodexHome: ordinaryCodexHome,
+                managedCodexHome: statePaths.codexHome,
+                fileManager: fileManager
+            )
         }
 
         var redactedDiagnosticSummary: String {

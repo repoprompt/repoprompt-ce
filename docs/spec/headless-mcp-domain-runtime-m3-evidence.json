@@ -65,23 +65,14 @@
     "golden_changed": false,
     "test": "RepoPromptTests.ToolCatalogSnapshotTests/testWindowToolCatalogSignatureMatchesGolden"
   },
-  "latency_contention_evidence": {
-    "measurement_kind": "bounded_in_process_same_backend_comparison",
-    "test": "RepoPromptDomainRuntimeTests.MCPDomainReadToolProviderTests/testDirectBackendVersusM3ProviderWrapperLatencyIsBounded",
-    "iterations": 1000,
-    "direct_backend_total_nanoseconds": 110625,
-    "provider_wrapper_total_nanoseconds": 709083,
-    "provider_wrapper_overhead_per_call_nanoseconds": 598,
-    "asserted_maximum_overhead_per_call_nanoseconds": 100000,
-    "comparable_scope": "provider orchestration only; same no-I/O injected backend; not an M0 EditFlowPerf sample",
-    "not_comparable_to_m0_editflowperf_json": true,
-    "live_relaunch_performed": false,
-    "contention_tests": [
+  "historical_contention_evidence": {
+    "tests_removed_from_current_suite": [
       "RepoPromptDomainRuntimeTests.DomainReadSideEffectCoordinatorTests/testSameContextSerializesSelectionButDoesNotBlockGitArtifacts",
       "RepoPromptDomainRuntimeTests.MCPDomainReadToolProviderTests/testIndependentReadBackendsDoNotContendOnSideEffectCoordinator"
     ]
   },
-  "validation": {
+  "historical_validation": {
+    "status": "recorded milestone evidence; named suites may have been removed during test cleanup",
     "owner_tests": {
       "MCPDomainReadToolProviderTests": {"executed": 9, "failures": 0},
       "DomainReadSideEffectCoordinatorTests": {"executed": 7, "failures": 0},
@@ -97,7 +88,7 @@
       "families": ["read", "search", "history", "git_artifacts", "oracle_worktree", "watchdog", "persistent_connections"]
     }
   },
-  "cancellation_evidence": [
+  "historical_cancellation_evidence": [
     "RepoPromptDomainRuntimeTests.MCPDomainReadToolProviderTests/testCancellationPropagatesWithoutSuccessNormalization",
     "RepoPromptDomainRuntimeTests.DomainReadSideEffectCoordinatorTests/testShutdownRejectsNewEffectsAndCancelsPendingWork",
     "RepoPromptDomainRuntimeTests.DomainReadSideEffectCoordinatorTests/testCancellingDrainDoesNotWaitForOrCancelSharedEffect"

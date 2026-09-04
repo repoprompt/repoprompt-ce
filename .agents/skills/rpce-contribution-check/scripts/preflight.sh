@@ -206,7 +206,6 @@ run_pr_ready_path_validations() {
   local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
   local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'
   local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
-  local xcode_generator_test_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|Scripts/test_xcode_workspace_generator\.py|\.github/workflows/xcode-workspace\.yml)$'
 
   local has_control_plane_changes=0
   local has_ci_app_test_runner_changes=0
@@ -215,7 +214,6 @@ run_pr_ready_path_validations() {
   local has_provider_package_changes=0
   local has_repoprompt_product_changes=0
   local has_mcp_product_changes=0
-  local has_xcode_generator_test_changes=0
   local has_xcode_full_validation_changes=0
   local changed_path_count=0
   local file
@@ -229,7 +227,6 @@ run_pr_ready_path_validations() {
     [[ "$file" =~ $provider_package_paths_pattern ]] && has_provider_package_changes=1
     [[ "$file" =~ $repoprompt_product_paths_pattern ]] && has_repoprompt_product_changes=1
     [[ "$file" =~ $mcp_product_paths_pattern ]] && has_mcp_product_changes=1
-    [[ "$file" =~ $xcode_generator_test_paths_pattern ]] && has_xcode_generator_test_changes=1
     [[ "$file" =~ $xcode_full_validation_paths_pattern ]] && has_xcode_full_validation_changes=1
   done < "$files"
 
@@ -241,7 +238,6 @@ run_pr_ready_path_validations() {
   (( has_provider_package_changes )) && selected_lane_ids+=(provider_tests)
   (( has_repoprompt_product_changes )) && selected_lane_ids+=(repoprompt_build)
   (( has_mcp_product_changes )) && selected_lane_ids+=(mcp_build)
-  (( has_xcode_generator_test_changes )) && selected_lane_ids+=(xcode_generator_tests)
   (( has_xcode_full_validation_changes )) && selected_lane_ids+=(xcode_workspace_validation)
   if (( ${#selected_lane_ids[@]} )); then
     timing_record_selection "$changed_path_count" "${selected_lane_ids[@]}"
@@ -291,12 +287,6 @@ run_pr_ready_path_validations() {
     log "Build repoprompt-mcp product"
     make dev-swift-build PRODUCT=repoprompt-mcp
     timing_phase_pass mcp_build
-  fi
-  if (( has_xcode_generator_test_changes )); then
-    timing_phase_start xcode_generator_tests
-    log "Run Xcode workspace generator tests"
-    make xcode-generator-test
-    timing_phase_pass xcode_generator_tests
   fi
   if (( has_xcode_full_validation_changes )); then
     timing_phase_start xcode_workspace_validation

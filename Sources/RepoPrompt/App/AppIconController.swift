@@ -14,12 +14,12 @@ enum AppIconMode: String, CaseIterable, Identifiable {
         return appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .dark : .light
     }
 
-    fileprivate var resource: (name: String, extension: String) {
+    var customResource: (name: String, extension: String)? {
         switch self {
         case .light:
             ("AppIconLight", "png")
         case .dark, .system:
-            ("AppIcon", "icns")
+            nil
         }
     }
 }
@@ -50,7 +50,12 @@ final class AppIconController {
         let resolvedMode = mode.resolved(for: application.effectiveAppearance)
         guard resolvedMode != lastAppliedMode else { return }
 
-        let resource = resolvedMode.resource
+        guard let resource = resolvedMode.customResource else {
+            application.applicationIconImage = nil
+            lastAppliedMode = resolvedMode
+            return
+        }
+
         guard let resourceURL = Bundle.main.url(forResource: resource.name, withExtension: resource.extension),
               let image = NSImage(contentsOf: resourceURL)
         else {

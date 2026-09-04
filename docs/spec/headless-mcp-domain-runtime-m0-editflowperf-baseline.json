@@ -2,7 +2,7 @@
   "schema_version": 1,
   "recorded_at": "2026-07-26",
   "classification": "deterministic_contract_evidence_index_not_live_latency_baseline",
-  "citation_provenance": "declared_source_file",
+  "citation_provenance": "historical_declared_source_file",
   "checkout_baseline": {
     "base_commit": "664252ebc85e",
     "workspace": "repoprompt-ce-release",
@@ -33,9 +33,9 @@
   "guarded_stage_contracts": [
     {
       "stage": "queue",
-      "evidence_kind": "source_file_executable_contract_reference",
-      "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testLimiterDiagnosticsReportPromptQueuedCancellationAndIdleState",
-      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
+      "evidence_kind": "historical_source_contract_reference_removed_from_current_suite",
+      "evidence": "historical M0 queue diagnostics contract (removed during timing cleanup)",
+      "source_file": null,
       "observations": {
         "ordinary_connection_capacity": 1,
         "file_search_connection_capacity": 4,
@@ -46,9 +46,9 @@
     },
     {
       "stage": "main_actor",
-      "evidence_kind": "source_file_executable_contract_reference",
-      "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
-      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
+      "evidence_kind": "historical_source_contract_reference_removed_from_current_suite",
+      "evidence": "historical M0 joined lifecycle diagnostics contract (removed during timing cleanup)",
+      "source_file": null,
       "observations": {
         "ordered_events": ["MCP.ToolCall.MainActorScheduled", "MCP.ToolCall.MainActorEntered", "MCP.ToolCall.MainActorExited"],
         "shared_request_identity_required": true
@@ -56,9 +56,9 @@
     },
     {
       "stage": "execution",
-      "evidence_kind": "source_file_executable_contract_reference",
-      "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
-      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
+      "evidence_kind": "historical_source_contract_reference_removed_from_current_suite",
+      "evidence": "historical M0 joined lifecycle diagnostics contract (removed during timing cleanup)",
+      "source_file": null,
       "observations": {
         "joined_tool_lifecycle_event_count": 14,
         "workload_matrix_count": 5,
@@ -78,9 +78,9 @@
     },
     {
       "stage": "response",
-      "evidence_kind": "source_file_executable_contract_reference",
-      "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
-      "source_file": "Tests/RepoPromptTests/MCP/MCPReadSearchLatencyDiagnosticsGuardTests.swift",
+      "evidence_kind": "historical_source_contract_reference_removed_from_current_suite",
+      "evidence": "historical M0 joined lifecycle diagnostics contract (removed during timing cleanup)",
+      "source_file": null,
       "observations": {
         "ordered_event_count": 7,
         "ordered_events": ["frame_accepted", "sdk_decode_completed", "handler_result_ready", "sdk_encode_completed", "transport_write_completed", "frame_committed", "stdout_write_completed"],
@@ -106,5 +106,5 @@
       "cache_hit": false
     }
   },
-  "interpretation": "This is an M0 deterministic contract-evidence index, not a live latency baseline. The checkout counts describe only this checkout. Evidence floors make the referenced queue, MainActor, execution, durability, response, and historical work-count observations substantive; ledger and source-file provenance keep every executable citation resolvable. The artifact does not prove those separate tests passed in the current run, and live latency remains unobserved until measured before M2 no-regression decisions."
+  "interpretation": "This is an M0 deterministic contract-evidence index, not a live latency baseline. The checkout counts describe only this checkout. Evidence floors make the recorded queue, MainActor, execution, durability, response, and historical work-count observations substantive; the queue/MainActor/execution/response citations are historical and were removed from the current timing-sensitive suite. The artifact does not prove those separate tests passed in the current run, and live latency remains unobserved until measured before M2 no-regression decisions."
 }
