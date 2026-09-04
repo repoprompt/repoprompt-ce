@@ -6104,7 +6104,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
             return
         }
-        guard workspaceIndex(for: wsID) != nil else {
+        guard let idx2 = workspaceIndex(for: wsID) else {
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
                     "workspaceSwitch.restoreState.abort",

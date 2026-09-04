@@ -233,7 +233,7 @@ actor IgnoreRulesManager {
     private func fileMetaKey(for url: URL) -> FileMetaKey {
         var st = stat()
         if stat(url.path, &st) == 0 {
-            let dev = UInt64(st.st_dev)
+            let dev = safeDeviceID(st.st_dev)
             let ino = UInt64(st.st_ino)
             #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
                 let mtime = UInt64(st.st_mtimespec.tv_sec)

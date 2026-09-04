@@ -244,7 +244,6 @@ struct OptimizedModelPicker: View {
         } label: {
             HStack {
                 Text(title ?? model.displayName)
-                    .font(font)
                 Spacer()
                 if destination.currentRawValue == model.rawValue {
                     Image(systemName: "checkmark")

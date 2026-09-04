@@ -94,6 +94,46 @@ struct AgentSessionRow: View {
     @State private var showRenameAlert = false
     @State private var showDeleteConfirmation = false
     @State private var renameText = ""
+
+    // MARK: - Context Menu Snapshot
+
+    /// Snapshot of the conditions that control context menu item visibility,
+    /// captured on hover. Using a snapshot prevents AppKit from observing a
+    /// mid-layout item-count change (which triggers an NSRangeException when
+    /// NSContextMenuImpl measures row heights for items that were just removed).
+    private struct ContextMenuSnapshot {
+        var isInteractionEnabled: Bool
+        var showsSelectionPresentation: Bool
+        var hasAttentionRunState: Bool
+        var hasOnStash: Bool
+        var hasOnDismissAttention: Bool
+        /// Frozen for the same reason as the flags above: the oversight section's item count
+        /// depends on this list, so resolving it live while the menu is open reintroduces the
+        /// removed-item measurement crash.
+        var sidebarOversightMenu: AgentSidebarOversightMenuProps?
+    }
+
+    @State private var menuSnapshot = ContextMenuSnapshot(
+        isInteractionEnabled: true,
+        showsSelectionPresentation: false,
+        hasAttentionRunState: false,
+        hasOnStash: false,
+        hasOnDismissAttention: false,
+        sidebarOversightMenu: nil
+    )
+
+    /// The oversight menu as it should appear, or nil when the section must not be offered.
+    /// Evaluated at hover so the context menu's item count cannot change while it is open.
+    private var presentableSidebarOversightMenu: AgentSidebarOversightMenuProps? {
+        guard allowsDirectMutations,
+              let menu = resolveSidebarOversightMenu?(),
+              !menu.isEmpty,
+              onAddSidebarOversight != nil,
+              onStopSidebarOversight != nil
+        else { return nil }
+        return menu
+    }
+
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -204,9 +244,12 @@ struct AgentSessionRow: View {
             + "\(available) eligible Agent session\(available == 1 ? "" : "s")"
     }
 
-    @ViewBuilder
-    private var sidebarOversightMenuContent: some View {
-        if let menu = resolveSidebarOversightMenu?() {
+    /// Builds the oversight items from the supplied value rather than resolving them live, so the
+    /// context menu can pass a snapshot frozen at hover and keep its item count stable while open.
+    private func sidebarOversightMenuContent(
+        _ menu: AgentSidebarOversightMenuProps
+    ) -> some View {
+        Group {
             if menu.isEmpty {
                 Button("No eligible agents") {}
                     .disabled(true)
@@ -278,9 +321,6 @@ struct AgentSessionRow: View {
                     }
                 }
             }
-        } else {
-            Button("No eligible agents") {}
-                .disabled(true)
         }
     }
 
@@ -516,7 +556,7 @@ struct AgentSessionRow: View {
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
         Menu {
-            sidebarOversightMenuContent
+            sidebarOversightMenuContent(menu)
         } label: {
             Image(systemName: "eye")
                 .font(.system(size: 11))
@@ -540,7 +580,7 @@ struct AgentSessionRow: View {
         _ menu: AgentSidebarOversightMenuProps
     ) -> some View {
         Menu {
-            sidebarOversightMenuContent
+            sidebarOversightMenuContent(menu)
         } label: {
             Label(Self.sidebarOversightManagementHelp, systemImage: "eye")
         }
@@ -738,18 +778,13 @@ struct AgentSessionRow: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
-            if allowsDirectMutations,
-               let sidebarOversightMenu,
-               !sidebarOversightMenu.isEmpty,
-               onAddSidebarOversight != nil,
-               onStopSidebarOversight != nil
-            {
+            if let sidebarOversightMenu = menuSnapshot.sidebarOversightMenu {
                 sidebarOversightContextMenu(sidebarOversightMenu)
                 Divider()
             }
 
-            if !showsSelectionPresentation {
-                if isInteractionEnabled {
+            if !menuSnapshot.showsSelectionPresentation {
+                if menuSnapshot.isInteractionEnabled {
                     Button("Select chat", action: toggleSelection)
 
                     Divider()
@@ -768,22 +803,38 @@ struct AgentSessionRow: View {
                     .disabled(!sessionIDCopyAction.isEnabled)
                 }
 
-                if isInteractionEnabled, let onStash {
-                    Button(stashActionLabel, action: onStash)
+                if menuSnapshot.isInteractionEnabled, menuSnapshot.hasOnStash {
+                    Button(stashActionLabel, action: { onStash?() })
                 }
 
-                if attentionRunState != nil, let onDismissAttention {
-                    Button(dismissAttentionActionLabel, action: onDismissAttention)
+                if menuSnapshot.hasAttentionRunState, menuSnapshot.hasOnDismissAttention {
+                    Button(dismissAttentionActionLabel, action: { onDismissAttention?() })
                 }
 
-                if isInteractionEnabled {
+                if menuSnapshot.isInteractionEnabled {
                     Divider()
 
                     Button(deleteActionLabel, role: .destructive, action: requestDeleteConfirmation)
                 }
             }
         }
-        .onHover { isHovered = $0 }
+        .onHover { hovered in
+            isHovered = hovered
+            if hovered {
+                menuSnapshot = ContextMenuSnapshot(
+                    isInteractionEnabled: isInteractionEnabled,
+                    showsSelectionPresentation: showsSelectionPresentation,
+                    hasAttentionRunState: attentionRunState != nil,
+                    hasOnStash: onStash != nil,
+                    hasOnDismissAttention: onDismissAttention != nil,
+                    sidebarOversightMenu: presentableSidebarOversightMenu
+                )
+            }
+        }
+        // Deliberately does not refresh `menuSnapshot`: an endpoint rebind while the menu is open
+        // would change its item count, which is the crash the snapshot exists to prevent. Stale
+        // presentation is safe because Add re-resolves current eligibility, while Stop is
+        // exact-endpoint and generation-reference qualified.
         .onChange(of: sidebarOversightTargetEndpoint) { previous, current in
             guard previous != current else { return }
             resetSidebarOversightPresentation()
@@ -1248,6 +1299,21 @@ struct AgentStashedSessionRow: View {
     @State private var isHovered = false
     @State private var isRestoreHovered = false
     @State private var isDeleteHovered = false
+
+    // MARK: - Context Menu Snapshot
+
+    /// Snapshot of conditions controlling context menu item visibility, captured
+    /// on hover to prevent NSRangeException from AppKit measuring stale item counts.
+    private struct ContextMenuSnapshot {
+        var isInteractionEnabled: Bool
+        var showsSelectionPresentation: Bool
+    }
+
+    @State private var menuSnapshot = ContextMenuSnapshot(
+        isInteractionEnabled: true,
+        showsSelectionPresentation: false
+    )
+
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -1396,8 +1462,8 @@ struct AgentStashedSessionRow: View {
         )
         .contentShape(Rectangle())
         .contextMenu {
-            if !showsSelectionPresentation {
-                if isInteractionEnabled {
+            if !menuSnapshot.showsSelectionPresentation {
+                if menuSnapshot.isInteractionEnabled {
                     Button("Select chat", action: toggleSelection)
                     Divider()
                     Button(restoreActionLabel, action: onRestore)
@@ -1406,13 +1472,21 @@ struct AgentStashedSessionRow: View {
                     sessionIDCopyAction.perform()
                 }
                 .disabled(!sessionIDCopyAction.isEnabled)
-                if isInteractionEnabled {
+                if menuSnapshot.isInteractionEnabled {
                     Divider()
                     Button(deleteActionLabel, role: .destructive, action: onDelete)
                 }
             }
         }
-        .onHover { isHovered = $0 }
+        .onHover { hovered in
+            isHovered = hovered
+            if hovered {
+                menuSnapshot = ContextMenuSnapshot(
+                    isInteractionEnabled: isInteractionEnabled,
+                    showsSelectionPresentation: showsSelectionPresentation
+                )
+            }
+        }
         .onTapGesture(perform: handleRowTap)
         .focusable()
         .onKeyPress(.space) {

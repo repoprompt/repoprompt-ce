@@ -218,7 +218,7 @@ final class GitRawOutputSpool: @unchecked Sendable {
             throw GitRawOutputSpoolError.corrupt("negative spool size")
         }
         return GitRawOutputSpoolDescriptorIdentity(
-            device: UInt64(value.st_dev),
+            device: safeDeviceID(value.st_dev),
             inode: UInt64(value.st_ino),
             byteCount: UInt64(value.st_size),
             modificationSeconds: Int64(value.st_mtimespec.tv_sec),
@@ -349,7 +349,7 @@ final class GitRawOutputSpoolLease: @unchecked Sendable {
         }
         var pathValue = stat()
         guard lstat(fileURL.path, &pathValue) == 0,
-              UInt64(pathValue.st_dev) == identity.device,
+              safeDeviceID(pathValue.st_dev) == identity.device,
               UInt64(pathValue.st_ino) == identity.inode,
               pathValue.st_size >= 0,
               UInt64(pathValue.st_size) == identity.byteCount

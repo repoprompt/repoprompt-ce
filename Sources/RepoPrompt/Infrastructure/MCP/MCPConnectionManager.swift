@@ -2537,14 +2537,28 @@ actor ServerNetworkManager {
         waiter.continuation.resume(returning: outcome)
     }
 
+    /// - Parameter expectedRouteToken: the route token the caller has already determined to be
+    ///   authoritative, or nil when it has none.
+    ///
+    ///   When a token is supplied, the fast path below must not hand back an observation carrying a
+    ///   *different* one: the caller would reject it immediately, and because the shortcut returns
+    ///   before a waiter is registered, the relist that would refresh the observation never runs.
+    ///   The caller then fails closed with `.unavailable` in the same millisecond, which no amount
+    ///   of retrying can clear. Falling through instead lets the relist resolve the disagreement.
+    ///
+    ///   When the caller has no authoritative token, a ready observation is still returned so it can
+    ///   apply its own rejection: waiting cannot help, because the token is recomputed from live
+    ///   route state rather than produced by the catalog.
     func awaitRunCatalogReadiness(
         runID: UUID,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedRouteToken: AgentSessionLinkRunCatalogRouteToken?,
         timeout: TimeInterval
     ) async -> AgentSessionLinkRunCatalogWaitOutcome {
         if let projection = runCatalogObservationByRunID[runID]?.projection,
            projection.isReady,
-           projection.routeToken?.observerEndpoint == observerEndpoint
+           projection.routeToken?.observerEndpoint == observerEndpoint,
+           expectedRouteToken == nil || projection.routeToken == expectedRouteToken
         {
             return .ready(projection)
         }
@@ -2570,11 +2584,35 @@ actor ServerNetworkManager {
                     continuation: continuation,
                     timeoutTask: timeoutTask
                 )
+                // Registered first, so the re-list this triggers cannot settle ahead of the waiter.
+                Task { [weak self] in
+                    await self?.requestRunCatalogRelist(runID: runID)
+                }
             }
         } onCancel: {
             Task { [weak self] in
                 await self?.finishRunCatalogWaiter(runID: runID, waiterID: waiterID, outcome: .cancelled)
             }
+        }
+    }
+
+    /// Asks this run's live connections to re-read their tool catalog.
+    ///
+    /// Catalog observations are keyed per run, but a provider that keeps one long-lived MCP
+    /// connection across runs (the Claude native runtime) reuses a connection whose last
+    /// `tools/list` predates the run being qualified. `notifyToolListChangedForAgentSession` only
+    /// fires when a link changes while a run is already active, so a link added to an idle session
+    /// leaves the next run with no observation and nothing that would ever produce one. Waiting
+    /// alone could then only time out, which surfaced as a refused send for an overseer that was
+    /// correctly linked.
+    ///
+    /// A redundant `tools/list` is idempotent and advertisement is never authority, so nudging a
+    /// connection that is already current costs one extra round trip and nothing else.
+    private func requestRunCatalogRelist(runID: UUID) async {
+        for (connectionID, mappedRunID) in runIDByConnectionID
+            where mappedRunID == runID && !connectionsBeingRemoved.contains(connectionID)
+        {
+            await notifyToolListChanged(connectionID: connectionID)
         }
     }
 
@@ -7050,10 +7088,40 @@ actor ServerNetworkManager {
 
     private var bindingResolver: MCPBindingResolver {
         MCPBindingResolver(
-            collectMatchesForContextID: { contextID in
+            collectMatchesForContextID: { connectionID, contextID in
                 await MainActor.run {
-                    WindowStatesManager.shared.allWindows.compactMap { windowState in
-                        guard let candidate = windowState.workspaceManager.storedBindingCandidate(forContextID: contextID) else {
+                    let windows = WindowStatesManager.shared.allWindows
+                    let bindingSnapshots = windows.map { windowState in
+                        (
+                            windowState: windowState,
+                            binding: windowState.mcpServer.connectionBindingSnapshot(forConnection: connectionID)
+                        )
+                    }
+                    let authoritativeBinding = bindingSnapshots.first {
+                        $0.binding.explicitlyBound && $0.binding.runID == nil
+                    } ?? bindingSnapshots.first {
+                        $0.binding.runID != nil
+                    }
+
+                    // Preserve an exact authoritative connection binding before active-workspace discovery
+                    if let authoritativeBinding,
+                       authoritativeBinding.binding.tabID == contextID,
+                       let tabID = authoritativeBinding.binding.tabID,
+                       let workspaceID = authoritativeBinding.binding.workspaceID,
+                       let workspaceName = authoritativeBinding.binding.workspaceName
+                    {
+                        return [MCPContextBindingMatch(
+                            windowID: authoritativeBinding.windowState.windowID,
+                            tabID: tabID,
+                            workspaceID: workspaceID,
+                            workspaceName: workspaceName,
+                            repoPaths: authoritativeBinding.binding.repoPaths
+                        )]
+                    }
+
+                    // Unbound one-shot context IDs share bind_context's active-workspace authority
+                    return windows.compactMap { windowState in
+                        guard let candidate = windowState.workspaceManager.bindingCandidate(forContextID: contextID) else {
                             return nil
                         }
                         return MCPContextBindingMatch(

@@ -995,8 +995,12 @@ final class ClaudeAgentModeCoordinator {
         // controller is a transport retry of the *same* user turn, so every attempt must carry a
         // byte-equivalent oversight supplement rather than re-deciding per attempt.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
-        let routeVerificationFailureMessage =
-            "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run."
+        /// The same refusal is reachable from three predicates that fail for different reasons and
+        /// are indistinguishable in the UI, which cost a full diagnostic cycle. The bracketed code
+        /// names the branch; it carries no identifiers or user content.
+        func routeVerificationFailure(_ code: String) -> String {
+            "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run. [route:\(code)]"
+        }
 
         for attempt in 0 ..< 3 {
             switch await ensureClaudeNativeSession(session: session, intent: intent) {
@@ -1126,7 +1130,7 @@ final class ClaudeAgentModeCoordinator {
                 }
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return recordSendFailure(
-                    routeVerificationFailureMessage,
+                    routeVerificationFailure(catalogReadiness == .timedOut ? "timeout" : "unavailable"),
                     session: session,
                     intent: intent
                 )
@@ -1164,7 +1168,7 @@ final class ClaudeAgentModeCoordinator {
                 }
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                 return recordSendFailure(
-                    routeVerificationFailureMessage,
+                    routeVerificationFailure("fence"),
                     session: session,
                     intent: intent
                 )

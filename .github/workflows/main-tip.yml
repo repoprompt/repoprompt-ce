@@ -186,6 +186,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Verify authenticated protected-main authority
+        env:
+          TIP_SOURCE_GH_TOKEN: ${{ github.token }}
+          TIP_SOURCE_REPOSITORY: ${{ github.repository }}
+          TIP_SOURCE_BRANCH: main
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+        run: ./trusted-control-plane/Scripts/verify_tip_source_commit.sh "credential preflight"
+
       - name: Validate role-selected Tip credentials
         env:
           SETUP_ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
@@ -812,6 +820,7 @@ jobs:
           TIP_TAG: ${{ needs.setup.outputs.tag }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
           TIP_GH_TOKEN: ${{ secrets.TIP_UPDATE_REPOSITORY_TOKEN }}
+          TIP_SOURCE_GH_TOKEN: ${{ github.token }}
           TIP_SOURCE_REPOSITORY: ${{ github.repository }}
           TIP_SOURCE_BRANCH: main
           TIP_PUBLISH_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}

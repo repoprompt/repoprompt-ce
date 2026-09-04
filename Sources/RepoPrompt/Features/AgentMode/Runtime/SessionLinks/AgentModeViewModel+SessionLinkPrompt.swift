@@ -132,6 +132,7 @@ extension AgentModeViewModel {
         let outcome = await ServerNetworkManager.shared.awaitRunCatalogReadiness(
             runID: runID,
             observerEndpoint: endpoint,
+            expectedRouteToken: authoritativeRouteToken,
             timeout: timeout
         )
         switch outcome {
