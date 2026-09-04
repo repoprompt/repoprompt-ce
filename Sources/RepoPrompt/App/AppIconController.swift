@@ -29,11 +29,13 @@ final class AppIconController {
     static let shared = AppIconController()
 
     private let application: NSApplication
+    private let defaultApplicationIcon: NSImage?
     private var appearanceObservation: NSKeyValueObservation?
     private var lastAppliedMode: AppIconMode?
 
     private init(application: NSApplication = .shared) {
         self.application = application
+        defaultApplicationIcon = application.applicationIconImage.copy() as? NSImage
         appearanceObservation = application.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in
                 self?.applyFromGlobalSettings()
@@ -51,7 +53,7 @@ final class AppIconController {
         guard resolvedMode != lastAppliedMode else { return }
 
         guard let resource = resolvedMode.customResource else {
-            application.applicationIconImage = nil
+            application.applicationIconImage = defaultApplicationIcon
             lastAppliedMode = resolvedMode
             return
         }
