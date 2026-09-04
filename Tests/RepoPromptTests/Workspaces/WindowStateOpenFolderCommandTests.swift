@@ -518,7 +518,7 @@ import XCTest
                 name: "Former Winner",
                 repoPaths: [requestedFolder.path]
             )
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(formerWinner)
+            try await saveAuthoritativeWorkspace(formerWinner, in: authorityWindow, runtime: runtime)
             try await waitUntil {
                 targetWindow.workspaceManager.workspace(withID: formerWinnerID)?.repoPaths == [requestedFolder.path]
             }
@@ -551,14 +551,14 @@ import XCTest
             var movedFormerWinner = formerWinner
             movedFormerWinner.repoPaths = [replacementFolder.path]
             movedFormerWinner.dateModified = Date(timeIntervalSince1970: 20)
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(movedFormerWinner)
+            try await saveAuthoritativeWorkspace(movedFormerWinner, in: authorityWindow, runtime: runtime)
             let currentWinner = WorkspaceModel(
                 id: currentWinnerID,
                 dateModified: Date(timeIntervalSince1970: 30),
                 name: "Current Winner",
                 repoPaths: [requestedFolder.path]
             )
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(currentWinner)
+            try await saveAuthoritativeWorkspace(currentWinner, in: authorityWindow, runtime: runtime)
             let finalWinner = WorkspaceModel(
                 id: finalWinnerID,
                 dateModified: Date(timeIntervalSince1970: 40),
@@ -575,10 +575,8 @@ import XCTest
                 var movedCurrentWinner = currentWinner
                 movedCurrentWinner.repoPaths = [replacementFolder.path]
                 movedCurrentWinner.dateModified = Date(timeIntervalSince1970: 35)
-                _ = try? await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(
-                    movedCurrentWinner
-                )
-                _ = try? await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(finalWinner)
+                try? await self.saveAuthoritativeWorkspace(movedCurrentWinner, in: authorityWindow, runtime: runtime)
+                try? await self.saveAuthoritativeWorkspace(finalWinner, in: authorityWindow, runtime: runtime)
             }
 
             await targetWindow.processCommands()
@@ -634,8 +632,8 @@ import XCTest
                 name: "Final Admission Active Alternate",
                 repoPaths: [alternateFolder.path]
             )
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(target)
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(alternate)
+            try await saveAuthoritativeWorkspace(target, in: authorityWindow, runtime: runtime)
+            try await saveAuthoritativeWorkspace(alternate, in: authorityWindow, runtime: runtime)
             try await waitUntil {
                 window.workspaceManager.workspace(withID: target.id) != nil
                     && window.workspaceManager.workspace(withID: alternate.id) != nil
@@ -717,7 +715,7 @@ import XCTest
                 name: "Final Admission Hidden Target",
                 repoPaths: [targetFolder.path]
             )
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(target)
+            try await saveAuthoritativeWorkspace(target, in: authorityWindow, runtime: runtime)
             try await waitUntil {
                 window.workspaceManager.workspace(withID: target.id) != nil
             }
@@ -781,6 +779,37 @@ import XCTest
             XCTAssertFalse(window.promptManager.storedPrompts.contains {
                 $0.title == storedPromptTitle
             })
+        }
+
+        func testAuthorityBackedActivationAllowsWorkspaceAbsentFromCanonicalCatalog() async throws {
+            let runtime = try await makeDomainRuntime()
+            let window = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "UnownedLiveSupplementActivation")
+            let workspace = WorkspaceModel(
+                name: "Unowned Live Supplement",
+                repoPaths: [folder.path]
+            )
+            let fileURL = window.workspaceManager.workspaceFileURL(for: workspace)
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try JSONEncoder().encode(workspace).write(to: fileURL, options: .atomic)
+            window.workspaceManager.workspaces.append(workspace)
+
+            let routingSnapshot = await window.workspaceManager.workspaceRoutingCatalogSnapshot()
+            let routingCatalog = try XCTUnwrap(routingSnapshot)
+            XCTAssertFalse(routingCatalog.contains { $0.id == workspace.id })
+
+            let switchResult = await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "unownedLiveSupplementActivationRegression"
+            )
+
+            XCTAssertEqual(switchResult, .switched)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.repoPaths, [folder.path])
         }
 
         func testQueuedHiddenLiveSupplementRevalidatesBeforePayloadAdmission() async throws {
@@ -898,7 +927,7 @@ import XCTest
                 name: "Authority Workspace",
                 repoPaths: [requestedFolder.path]
             )
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(expectedWorkspace)
+            try await saveAuthoritativeWorkspace(expectedWorkspace, in: authorityWindow, runtime: runtime)
             try await waitUntil {
                 targetWindow.workspaceManager.workspace(withID: workspaceID)?.repoPaths == [requestedFolder.path]
             }
@@ -931,7 +960,7 @@ import XCTest
             var replacementWorkspace = expectedWorkspace
             replacementWorkspace.repoPaths = [replacementFolder.path]
             replacementWorkspace.dateModified = Date()
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(replacementWorkspace)
+            try await saveAuthoritativeWorkspace(replacementWorkspace, in: authorityWindow, runtime: runtime)
             let routingCatalog = await targetWindow.workspaceManager.workspaceRoutingCatalogSnapshot()
             let authoritativeCatalog = try XCTUnwrap(routingCatalog)
             XCTAssertEqual(
@@ -975,7 +1004,7 @@ import XCTest
                 repoPaths: [folder.path]
             )
             targetWindow.stopDomainWorkspaceProjectionForTesting()
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(workspace)
+            try await saveAuthoritativeWorkspace(workspace, in: authorityWindow, runtime: runtime)
             XCTAssertNil(targetWindow.workspaceManager.workspace(withID: workspaceID))
             let countBeforeRoute = targetWindow.workspaceManager.workspaces.count
             targetWindow.setAutomaticCommandProcessingForTesting(false)
@@ -1018,7 +1047,7 @@ import XCTest
                 name: "Authority Active Projection",
                 repoPaths: [oldFolder.path]
             )
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(oldWorkspace)
+            try await saveAuthoritativeWorkspace(oldWorkspace, in: authorityWindow, runtime: runtime)
             try await waitUntil {
                 targetWindow.workspaceManager.workspace(withID: workspaceID)?.repoPaths == [oldFolder.path]
             }
@@ -1034,7 +1063,7 @@ import XCTest
             var replacementWorkspace = oldWorkspace
             replacementWorkspace.repoPaths = [requestedFolder.path]
             replacementWorkspace.dateModified = Date()
-            _ = try await authorityWindow.workspaceManager.saveWorkspaceToFileAsync(replacementWorkspace)
+            try await saveAuthoritativeWorkspace(replacementWorkspace, in: authorityWindow, runtime: runtime)
             XCTAssertEqual(targetWindow.workspaceManager.activeWorkspace?.repoPaths, [oldFolder.path])
             targetWindow.setAutomaticCommandProcessingForTesting(false)
             let url = try XCTUnwrap(URL(
@@ -1674,6 +1703,40 @@ import XCTest
             windows.append(window)
             await window.workspaceManager.awaitInitialized()
             return window
+        }
+
+        private func saveAuthoritativeWorkspace(
+            _ workspace: WorkspaceModel,
+            in window: WindowState,
+            runtime: MCPDomainRuntime
+        ) async throws {
+            let client = DomainWorkspaceAuthorityClient(
+                store: runtime.workspaceStore,
+                windowID: window.windowID
+            )
+            let snapshot = await client.snapshot()
+            let existing = snapshot.workspaces.first {
+                $0.document.workspaceID == workspace.id
+            }
+            let outcome: DomainCommandOutcome = if let existing {
+                try await client.save(
+                    workspace,
+                    fileURL: existing.document.fileURL,
+                    expectedWorkspaceRevision: existing.revisions.workingRevision,
+                    expectedContentDigest: existing.document.contentDigest
+                )
+            } else {
+                try await client.create(
+                    workspace,
+                    fileURL: window.workspaceManager.workspaceFileURL(for: workspace)
+                )
+            }
+            guard outcome.disposition == .applied
+                || outcome.disposition == .unchanged
+                || outcome.disposition == .deduplicated
+            else {
+                throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
+            }
         }
 
         private func makeDomainRuntime() async throws -> MCPDomainRuntime {

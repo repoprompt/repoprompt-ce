@@ -3116,7 +3116,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             let classificationBlocksSwitch = switch classification {
             case .clear:
                 false
-            case .retired, .incomplete(_), .unavailable, .stale:
+            case .unowned, .retired, .incomplete(_), .unavailable, .stale:
                 true
             }
             if newWorkspace.consolidatedIntoWorkspaceID != nil
@@ -4659,6 +4659,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private enum AuthorityConsolidatedRestoreClassification {
         case clear
+        case unowned
         case retired
         case incomplete(AuthorityIncompleteRestoreState)
         case unavailable
@@ -4800,15 +4801,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     ) async -> AuthorityConsolidatedRestoreClassification {
         guard let domainWorkspaceAuthorityClient else { return .clear }
         let snapshot = await domainWorkspaceAuthorityClient.snapshot()
-        guard snapshot.isBootstrapped,
-              let authoritative = snapshot.workspaces.first(where: {
-                  $0.document.workspaceID == workspaceID
-              }),
-              let working = try? Self.decodeDomainWorkspaceProjection(
-                  documentBytes: authoritative.document.documentBytes,
-                  fileURL: authoritative.document.fileURL
-              )
-        else { return .unavailable }
+        guard snapshot.isBootstrapped else { return .unavailable }
+        guard let authoritative = snapshot.workspaces.first(where: {
+            $0.document.workspaceID == workspaceID
+        }) else { return .unowned }
+        guard let working = try? Self.decodeDomainWorkspaceProjection(
+            documentBytes: authoritative.document.documentBytes,
+            fileURL: authoritative.document.fileURL
+        ) else { return .unavailable }
 
         if working.consolidatedIntoWorkspaceID != nil {
             guard snapshot.publicationSequence >= lastDomainProjectionSequence,
@@ -4870,7 +4870,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard let target = workspace(withID: workspaceID) else { return false }
         if domainWorkspaceAuthorityClient != nil, !target.isEphemeral {
             switch await refreshAuthorityConsolidatedRestoreClassification(workspaceID: workspaceID) {
-            case .clear:
+            case .clear, .unowned:
                 break
             case .retired, .incomplete(_), .unavailable, .stale:
                 return false
@@ -8222,7 +8222,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                         NSLocalizedDescriptionKey: "Workspace retirement changed while restoration was being prepared. Retry after the workspace list refreshes."
                     ]
                 )
-            case .unavailable, .stale:
+            case .unowned, .unavailable, .stale:
                 throw NSError(
                     domain: "WorkspaceDuplicateCleanup",
                     code: 12,
@@ -8347,7 +8347,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 ) {
                 case .clear:
                     break
-                case .retired, .incomplete, .unavailable, .stale:
+                case .unowned, .retired, .incomplete, .unavailable, .stale:
                     authorityIncompleteConsolidatedRestoreIDs.insert(updated.id)
                     publishPendingConsolidatedRestoreIDs()
                 }

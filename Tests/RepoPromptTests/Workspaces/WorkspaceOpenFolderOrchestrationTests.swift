@@ -613,6 +613,7 @@ import XCTest
 
         func testReopeningExistingWorkspacePreservesStateThroughDomainAuthority() async throws {
             let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1306)
             let manager = makeManager(domainRuntime: runtime)
             await manager.awaitInitialized()
             let folder = try makeFolder(named: "DomainExistingProject")
@@ -639,7 +640,7 @@ import XCTest
                 activeComposeTabID: preservedTab.id
             )
 
-            _ = try await manager.saveWorkspaceToFileAsync(existing)
+            try await saveAuthoritativeWorkspace(existing, using: client)
             try await waitUntil {
                 manager.workspace(withID: existing.id)?.composeTabs == [preservedTab, secondaryTab]
             }
@@ -666,6 +667,7 @@ import XCTest
 
         func testInteractiveReuseReloadsStaleActiveAuthorityProjection() async throws {
             let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1307)
             let authorityManager = makeManager(domainRuntime: runtime)
             let targetManager = makeManager(domainRuntime: runtime)
             let targetBridge = try XCTUnwrap(domainBridges.last)
@@ -677,7 +679,7 @@ import XCTest
                 name: "Interactive Stale",
                 repoPaths: [originalFolder.path]
             )
-            _ = try await authorityManager.saveWorkspaceToFileAsync(workspace)
+            try await saveAuthoritativeWorkspace(workspace, using: client)
             try await waitUntil {
                 targetManager.workspace(withID: workspace.id)?.repoPaths == [originalFolder.path]
             }
@@ -692,7 +694,7 @@ import XCTest
             var replacement = workspace
             replacement.repoPaths = [requestedFolder.path]
             replacement.dateModified = Date()
-            _ = try await authorityManager.saveWorkspaceToFileAsync(replacement)
+            try await saveAuthoritativeWorkspace(replacement, using: client)
             XCTAssertEqual(targetManager.activeWorkspace?.repoPaths, [originalFolder.path])
 
             try await targetManager.openWorkspace(
@@ -896,6 +898,35 @@ import XCTest
             )
             XCTAssertEqual(outcome.disposition, .applied)
             XCTAssertEqual(outcome.workspace?.document.workspaceID, workspace.id)
+        }
+
+        private func saveAuthoritativeWorkspace(
+            _ workspace: WorkspaceModel,
+            using client: DomainWorkspaceAuthorityClient
+        ) async throws {
+            let snapshot = await client.snapshot()
+            let existing = snapshot.workspaces.first {
+                $0.document.workspaceID == workspace.id
+            }
+            let outcome: DomainCommandOutcome = if let existing {
+                try await client.save(
+                    workspace,
+                    fileURL: existing.document.fileURL,
+                    expectedWorkspaceRevision: existing.revisions.workingRevision,
+                    expectedContentDigest: existing.document.contentDigest
+                )
+            } else {
+                try await client.create(
+                    workspace,
+                    fileURL: authorityWorkspaceFileURL(workspace.id)
+                )
+            }
+            guard outcome.disposition == .applied
+                || outcome.disposition == .unchanged
+                || outcome.disposition == .deduplicated
+            else {
+                throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
+            }
         }
 
         private func workingJournalURL(workspaceID: UUID) throws -> URL {
