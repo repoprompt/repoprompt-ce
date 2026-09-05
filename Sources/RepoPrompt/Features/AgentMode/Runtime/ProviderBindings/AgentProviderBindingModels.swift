@@ -19,6 +19,7 @@ enum AgentProviderPermissionLevelID: Hashable {
     case openCode(OpenCodeAgentToolPreferences.PermissionLevel)
     case cursor(CursorAgentToolPreferences.PermissionLevel)
     case grokBuild(GrokBuildAgentToolPreferences.PermissionLevel)
+    case omp(OMPAgentToolPreferences.PermissionLevel)
 
     var providerID: AgentProviderBindingID {
         switch self {
@@ -32,6 +33,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .cursor
         case .grokBuild:
             .grokBuild
+        case .omp:
+            .omp
         }
     }
 
@@ -47,6 +50,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .cursor(.managedDefault)
         case .grokBuild:
             .grokBuild(.managedDefault)
+        case .omp:
+            .omp(.providerManaged)
         }
     }
 
@@ -62,6 +67,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             CursorAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.cursor)
         case .grokBuild:
             GrokBuildAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grokBuild)
+        case .omp:
+            OMPAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.omp)
         }
     }
 
@@ -83,6 +90,9 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .grokBuild:
             guard let level = GrokBuildAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .grokBuild(level)
+        case .omp:
+            guard let level = OMPAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            self = .omp(level)
         }
     }
 
@@ -97,6 +107,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .cursor(level):
             level.rawValue
         case let .grokBuild(level):
+            level.rawValue
+        case let .omp(level):
             level.rawValue
         }
     }
@@ -113,6 +125,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.displayName
         case let .grokBuild(level):
             level.displayName
+        case let .omp(level):
+            level.displayName
         }
     }
 
@@ -127,6 +141,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .cursor(level):
             level.iconName
         case let .grokBuild(level):
+            level.iconName
+        case let .omp(level):
             level.iconName
         }
     }
@@ -143,6 +159,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .grokBuild(level):
             level.detailText
+        case let .omp(level):
+            level.detailText
         }
     }
 
@@ -158,6 +176,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.isWarning
         case let .grokBuild(level):
             level.isWarning
+        case .omp:
+            false
         }
     }
 }
