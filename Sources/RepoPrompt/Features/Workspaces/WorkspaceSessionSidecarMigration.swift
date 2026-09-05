@@ -46,6 +46,7 @@ struct WorkspaceSessionSidecarPreparedBatch {
 
 enum WorkspaceSessionSidecarMigrationError: LocalizedError {
     case invalidSessionFile(URL)
+    case oracleGroupOwnerChange(URL)
     case sessionIdentityMismatch(URL)
     case divergentCollision(URL)
     case aliasedSessionFolders(source: URL, destination: URL)
@@ -58,6 +59,8 @@ enum WorkspaceSessionSidecarMigrationError: LocalizedError {
         switch self {
         case let .invalidSessionFile(url):
             "Invalid session sidecar: \(url.lastPathComponent)"
+        case let .oracleGroupOwnerChange(url):
+            "Grouped Oracle history cannot be moved between workspaces: \(url.lastPathComponent)"
         case let .sessionIdentityMismatch(url):
             "Session identity does not match its filename: \(url.lastPathComponent)"
         case let .divergentCollision(url):
