@@ -18,6 +18,29 @@ struct FSEventCallbackPayload {
     }
 }
 
+struct FileSystemExplicitlyManagedRegularFileRegistrationToken: Hashable {
+    fileprivate let ownerID: UUID
+    fileprivate let serviceID: UUID
+    fileprivate let relativePath: String
+    fileprivate let preservesIgnoredProvenance: Bool
+}
+
+struct FileSystemExplicitlyManagedRegularFileRegistration {
+    let eligibility: CatalogRegularFileEligibility
+    let token: FileSystemExplicitlyManagedRegularFileRegistrationToken?
+}
+
+#if DEBUG
+    struct FileSystemExplicitlyManagedIgnoredRegistrationSnapshot: Equatable {
+        let pendingOwnerCount: Int
+        let hasCommittedOwner: Bool
+        let visitedItem: Bool?
+        let isVisited: Bool
+        let isRegistered: Bool
+        let watcherExemptsPath: Bool
+    }
+#endif
+
 extension FileSystemService {
     // MARK: - Public watchers API
 
@@ -191,22 +214,167 @@ extension FileSystemService {
         )
     }
 
-    func registerExplicitlyManagedRegularFile(relativePath rawRelativePath: String) async -> CatalogRegularFileEligibility {
+    func beginExplicitlyManagedRegularFileRegistration(
+        relativePath rawRelativePath: String
+    ) async -> FileSystemExplicitlyManagedRegularFileRegistration {
         let eligibility = await catalogRegularFileEligibility(relativePath: rawRelativePath)
+        let relativePath = (rawRelativePath as NSString).standardizingPath
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         switch eligibility {
-        case .eligible, .ineligible(.ignored):
-            let relativePath = (rawRelativePath as NSString).standardizingPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        case .eligible:
+            let token: FileSystemExplicitlyManagedRegularFileRegistrationToken?
+            if var registrationState = explicitlyManagedIgnoredRegistrationStates[relativePath] {
+                let eligibleToken = FileSystemExplicitlyManagedRegularFileRegistrationToken(
+                    ownerID: UUID(),
+                    serviceID: diagnosticRootToken,
+                    relativePath: relativePath,
+                    preservesIgnoredProvenance: false
+                )
+                registrationState.pendingOwnerIDs.insert(eligibleToken.ownerID)
+                explicitlyManagedIgnoredRegistrationStates[relativePath] = registrationState
+                token = eligibleToken
+            } else {
+                token = nil
+            }
             visitedPaths.insert(relativePath)
             visitedItems[relativePath] = false
-            if case .ineligible(.ignored) = eligibility {
-                explicitlyManagedIgnoredFilePaths.insert(relativePath)
-                watcherEarlyFilter.addExplicitlyManagedIgnoredFile(relativePath)
-            }
+            return FileSystemExplicitlyManagedRegularFileRegistration(
+                eligibility: eligibility,
+                token: token
+            )
+        case .ineligible(.ignored):
+            let token = FileSystemExplicitlyManagedRegularFileRegistrationToken(
+                ownerID: UUID(),
+                serviceID: diagnosticRootToken,
+                relativePath: relativePath,
+                preservesIgnoredProvenance: true
+            )
+            var registrationState = explicitlyManagedIgnoredRegistrationStates[relativePath] ??
+                FileSystemExplicitlyManagedIgnoredRegistrationState(
+                    priorVisitedPathMembership: visitedPaths.contains(relativePath),
+                    priorVisitedItem: visitedItems[relativePath],
+                    priorCatalogOwnership: explicitlyManagedIgnoredFilePaths.contains(relativePath),
+                    priorWatcherOwnership: watcherEarlyFilter.containsExplicitlyManagedIgnoredFile(relativePath),
+                    pendingOwnerIDs: [],
+                    hasCommittedIgnoredOwner: explicitlyManagedIgnoredFilePaths.contains(relativePath),
+                    hasCommittedEligibleOwner: false
+                )
+            registrationState.pendingOwnerIDs.insert(token.ownerID)
+            explicitlyManagedIgnoredRegistrationStates[relativePath] = registrationState
+            visitedPaths.insert(relativePath)
+            visitedItems[relativePath] = false
+            explicitlyManagedIgnoredFilePaths.insert(relativePath)
+            watcherEarlyFilter.addExplicitlyManagedIgnoredFile(relativePath)
+            return FileSystemExplicitlyManagedRegularFileRegistration(
+                eligibility: eligibility,
+                token: token
+            )
         case .ineligible:
-            break
+            return FileSystemExplicitlyManagedRegularFileRegistration(
+                eligibility: eligibility,
+                token: nil
+            )
         }
-        return eligibility
     }
+
+    @discardableResult
+    func commitExplicitlyManagedRegularFileRegistration(
+        _ token: FileSystemExplicitlyManagedRegularFileRegistrationToken
+    ) -> Bool {
+        guard token.serviceID == diagnosticRootToken,
+              var registrationState = explicitlyManagedIgnoredRegistrationStates[token.relativePath],
+              registrationState.pendingOwnerIDs.remove(token.ownerID) != nil
+        else { return false }
+
+        if token.preservesIgnoredProvenance {
+            registrationState.hasCommittedIgnoredOwner = true
+        } else {
+            registrationState.hasCommittedEligibleOwner = true
+        }
+        settleExplicitlyManagedRegularFileRegistrationIfPossible(
+            relativePath: token.relativePath,
+            state: registrationState
+        )
+        return true
+    }
+
+    @discardableResult
+    func rollbackExplicitlyManagedRegularFileRegistration(
+        _ token: FileSystemExplicitlyManagedRegularFileRegistrationToken
+    ) -> Bool {
+        guard token.serviceID == diagnosticRootToken,
+              var registrationState = explicitlyManagedIgnoredRegistrationStates[token.relativePath],
+              registrationState.pendingOwnerIDs.remove(token.ownerID) != nil
+        else { return false }
+
+        settleExplicitlyManagedRegularFileRegistrationIfPossible(
+            relativePath: token.relativePath,
+            state: registrationState
+        )
+        return true
+    }
+
+    private func settleExplicitlyManagedRegularFileRegistrationIfPossible(
+        relativePath: String,
+        state: FileSystemExplicitlyManagedIgnoredRegistrationState
+    ) {
+        guard state.pendingOwnerIDs.isEmpty else {
+            explicitlyManagedIgnoredRegistrationStates[relativePath] = state
+            return
+        }
+        explicitlyManagedIgnoredRegistrationStates.removeValue(forKey: relativePath)
+        guard !state.hasCommittedIgnoredOwner else { return }
+
+        if !state.hasCommittedEligibleOwner, visitedItems[relativePath] == false {
+            visitedItems[relativePath] = state.priorVisitedItem
+            if state.priorVisitedPathMembership {
+                visitedPaths.insert(relativePath)
+            } else {
+                visitedPaths.remove(relativePath)
+            }
+        }
+        if explicitlyManagedIgnoredFilePaths.contains(relativePath),
+           !state.priorCatalogOwnership
+        {
+            explicitlyManagedIgnoredFilePaths.remove(relativePath)
+        }
+        if watcherEarlyFilter.containsExplicitlyManagedIgnoredFile(relativePath),
+           !state.priorWatcherOwnership
+        {
+            watcherEarlyFilter.removeExplicitlyManagedIgnoredFile(relativePath)
+        }
+    }
+
+    #if DEBUG
+        func explicitlyManagedIgnoredRegistrationSnapshotForTesting(
+            relativePath rawRelativePath: String
+        ) -> FileSystemExplicitlyManagedIgnoredRegistrationSnapshot {
+            let relativePath = (rawRelativePath as NSString).standardizingPath
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let registrationState = explicitlyManagedIgnoredRegistrationStates[relativePath]
+            return FileSystemExplicitlyManagedIgnoredRegistrationSnapshot(
+                pendingOwnerCount: registrationState?.pendingOwnerIDs.count ?? 0,
+                hasCommittedOwner: registrationState?.hasCommittedIgnoredOwner ?? explicitlyManagedIgnoredFilePaths.contains(relativePath),
+                visitedItem: visitedItems[relativePath],
+                isVisited: visitedPaths.contains(relativePath),
+                isRegistered: explicitlyManagedIgnoredFilePaths.contains(relativePath),
+                watcherExemptsPath: watcherEarlyFilter.containsExplicitlyManagedIgnoredFile(relativePath)
+            )
+        }
+
+        func watcherFiltersIgnoredRegularFileEventForTesting(relativePath: String) -> Bool {
+            let result = watcherEarlyFilter.filter(
+                FSEventCallbackPayload(entries: [
+                    FSEventCallbackEntry(
+                        path: fullPath(forRelativePath: relativePath),
+                        flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsFile),
+                        id: 1
+                    )
+                ])
+            )
+            return result.payload == nil && result.filteredEntryCount == 1
+        }
+    #endif
 
     func pathContainsSymlinkComponent(relativePath: String) -> Bool {
         var current = rootURL

@@ -35,6 +35,16 @@ struct FileSystemMutationDrainWaiter {
     let continuation: CheckedContinuation<Void, Never>
 }
 
+struct FileSystemExplicitlyManagedIgnoredRegistrationState {
+    let priorVisitedPathMembership: Bool
+    let priorVisitedItem: Bool?
+    let priorCatalogOwnership: Bool
+    let priorWatcherOwnership: Bool
+    var pendingOwnerIDs: Set<UUID>
+    var hasCommittedIgnoredOwner: Bool
+    var hasCommittedEligibleOwner: Bool
+}
+
 enum FileSystemMutationCompletion {
     case success
     case failure(any Error)
@@ -237,6 +247,7 @@ actor FileSystemService {
     /// Ignored regular files retained only because an explicit app/MCP request manages them.
     /// Ordinary catalog files that later become ignored must not acquire this provenance.
     var explicitlyManagedIgnoredFilePaths = Set<String>()
+    var explicitlyManagedIgnoredRegistrationStates: [String: FileSystemExplicitlyManagedIgnoredRegistrationState] = [:]
 
     /// True => directory, False => file
     lazy var visitedItems = visitedInventory.items
