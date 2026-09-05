@@ -6,8 +6,44 @@ package struct DomainProtectedMutationOperation: Hashable, Sendable {
     package let action: String
 }
 
+package enum DomainProtectedMutationState: String, Equatable, Sendable {
+    case unknown
+    case applied
+    case notApplied = "not_applied"
+    case indeterminateAfterCommit = "indeterminate_after_commit"
+}
+
+package struct DomainProtectedMutationSettlement: Equatable, Sendable {
+    package let state: DomainProtectedMutationState
+    package let operationID: String
+
+    package init(state: DomainProtectedMutationState, operationID: String) {
+        self.state = state
+        self.operationID = operationID
+    }
+}
+
+package enum MCPDomainProtectedMutationSettlementContext {
+    @TaskLocal
+    package static var observer: (@Sendable (DomainProtectedMutationSettlement) -> Void)?
+
+    package static func report(_ state: DomainProtectedMutationState, operationID: String) {
+        observer?(DomainProtectedMutationSettlement(state: state, operationID: operationID))
+    }
+}
+
 package enum DomainProtectedMutationError: Error, Equatable, LocalizedError, Sendable {
     case partialSuccessAfterCommit(operationID: String)
+
+    package var settlement: DomainProtectedMutationSettlement {
+        switch self {
+        case let .partialSuccessAfterCommit(operationID):
+            DomainProtectedMutationSettlement(
+                state: .indeterminateAfterCommit,
+                operationID: operationID
+            )
+        }
+    }
 
     package var errorDescription: String? {
         switch self {
@@ -96,20 +132,17 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                 ? .init(toolName: toolName, action: action)
                 : nil
         case "prompt":
-            let action = arguments["op"]?.stringValue ?? "get"
-            if ["set", "append", "clear", "select_preset"].contains(action) {
-                return .init(toolName: toolName, action: action)
-            }
-            if action == "export" {
-                return .init(toolName: toolName, action: action)
-            }
-            return nil
+            return promptContextMutationOperation(
+                toolName: toolName,
+                arguments: arguments,
+                allowedOperations: [.set, .append, .clear, .export, .selectPreset]
+            )
         case "workspace_context":
-            let action = arguments["op"]?.stringValue ?? "snapshot"
-            if action == "select_preset" || action == "export" {
-                return .init(toolName: toolName, action: action)
-            }
-            return nil
+            return promptContextMutationOperation(
+                toolName: toolName,
+                arguments: arguments,
+                allowedOperations: [.export, .selectPreset]
+            )
         case "bind_context":
             let action = arguments["op"]?.stringValue ?? "list"
             return action == "bind" ? .init(toolName: toolName, action: action) : nil
@@ -142,6 +175,16 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         }
     }
 
+    private static func promptContextMutationOperation(
+        toolName: String,
+        arguments: [String: Value],
+        allowedOperations: [MCPPromptContextOperation]
+    ) -> DomainProtectedMutationOperation? {
+        let operation = MCPPromptContextOperation.parse(toolName: toolName, arguments: arguments)
+        guard allowedOperations.contains(operation) else { return nil }
+        return .init(toolName: toolName, action: operation.rawValue)
+    }
+
     private static func executeDurableMutation(
         operation: DomainProtectedMutationOperation,
         arguments: [String: Value],
@@ -157,29 +200,37 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         // the server-created request identity so continue/abort/retry remain recoverable.
         let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 }
             ?? securityContext.invocationID.uuidString
+        MCPDomainProtectedMutationSettlementContext.report(.unknown, operationID: operationID)
 
         // Authenticate the operation before invoking the physical backend. Exact root scope is
         // authorized again when that backend has translated and resolved the real target.
-        let initialAuthorization = try await policyStore.authorize(
-            context: securityContext,
-            toolName: operation.toolName,
-            action: operation.action,
-            workspaceID: securityContext.workspaceID,
-            canonicalRoots: Self.canonicalRoots(
+        let initialAuthorization: DomainMutationAuthorizationSnapshot
+        let fingerprint: String
+        do {
+            try Task.checkCancellation()
+            initialAuthorization = try await policyStore.authorize(
+                context: securityContext,
+                toolName: operation.toolName,
+                action: operation.action,
+                workspaceID: securityContext.workspaceID,
+                canonicalRoots: Self.canonicalRoots(
+                    operation: operation,
+                    arguments: effectiveArguments,
+                    securityContext: securityContext,
+                    includeAuthoritativeRoots: false
+                )
+            )
+            try Task.checkCancellation()
+            fingerprint = try mutationFingerprint(
                 operation: operation,
                 arguments: effectiveArguments,
-                securityContext: securityContext,
-                includeAuthoritativeRoots: false
+                workspaceID: securityContext.workspaceID,
+                pathFence: nil
             )
-        )
-        try Task.checkCancellation()
-
-        let fingerprint = try mutationFingerprint(
-            operation: operation,
-            arguments: effectiveArguments,
-            workspaceID: securityContext.workspaceID,
-            pathFence: nil
-        )
+        } catch {
+            MCPDomainProtectedMutationSettlementContext.report(.notApplied, operationID: operationID)
+            throw error
+        }
         let key = "\(operation.toolName).\(operation.action):request:\(securityContext.mutationRequestKey)"
         let begin = try await journal.begin(
             key: key,
@@ -194,6 +245,7 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         )
         switch begin {
         case let .replay(result):
+            MCPDomainProtectedMutationSettlementContext.report(.applied, operationID: operationID)
             return result
         case let .execute(ticket):
             let commitState = DomainMutationCommitState()
@@ -226,24 +278,37 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                 }
                 let didBeginCommit = await commitState.hasBegunCommit()
                 if Task.isCancelled, didBeginCommit {
-                    try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
-                    throw DomainProtectedMutationError.partialSuccessAfterCommit(operationID: operationID)
+                    try await finishIndeterminateAfterCommitAndThrow(
+                        journal: journal,
+                        ticket: ticket,
+                        operationID: operationID
+                    )
                 }
                 try await detachedFinishApplied(journal: journal, ticket: ticket, result: result)
+                MCPDomainProtectedMutationSettlementContext.report(.applied, operationID: operationID)
                 return result
             } catch let error as DomainProtectedMutationError {
                 throw error
             } catch {
                 let didBeginCommit = await commitState.hasBegunCommit()
                 if didBeginCommit {
-                    try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
-                    throw DomainProtectedMutationError.partialSuccessAfterCommit(operationID: operationID)
+                    try await finishIndeterminateAfterCommitAndThrow(
+                        journal: journal,
+                        ticket: ticket,
+                        operationID: operationID
+                    )
                 }
-                try? await detachedFinishBeforeCommit(
-                    journal: journal,
-                    ticket: ticket,
-                    cancelled: error is CancellationError
-                )
+                do {
+                    try await detachedFinishBeforeCommit(
+                        journal: journal,
+                        ticket: ticket,
+                        cancelled: MCPToolExecutionCancelledError.matches(error)
+                    )
+                    MCPDomainProtectedMutationSettlementContext.report(.notApplied, operationID: operationID)
+                } catch {
+                    // Preserve the provider failure while leaving settlement unknown if the authority
+                    // could not durably confirm its before-commit terminal state.
+                }
                 throw error
             }
         }
@@ -348,6 +413,19 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         try await Task.detached(priority: .utility) {
             try await journal.finishIndeterminateAfterCommit(ticket)
         }.value
+    }
+
+    private static func finishIndeterminateAfterCommitAndThrow(
+        journal: DomainMutationJournal,
+        ticket: DomainMutationJournalTicket,
+        operationID: String
+    ) async throws -> Never {
+        try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
+        MCPDomainProtectedMutationSettlementContext.report(
+            .indeterminateAfterCommit,
+            operationID: operationID
+        )
+        throw DomainProtectedMutationError.partialSuccessAfterCommit(operationID: operationID)
     }
 }
 

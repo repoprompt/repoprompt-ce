@@ -64,6 +64,12 @@ package enum MCPToolExecutionDispatchError: Error, Equatable, Sendable {
 }
 
 package enum MCPToolExecutionContractCatalog {
+    private static let promptExportContract = MCPToolExecutionContract.bounded(
+        deadline: MCPTimeoutPolicy.promptExportExecutionDeadline,
+        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+        cleanupDisposition: .forceDisconnect
+    )
+
     private static let workspaceSwitchContract = MCPToolExecutionContract.bounded(
         deadline: MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline,
         cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
@@ -139,6 +145,11 @@ package enum MCPToolExecutionContractCatalog {
         arguments: [String: Value]
     ) -> MCPToolExecutionContract? {
         guard let baseContract = contract(for: toolName) else { return nil }
+        if [MCPWindowToolName.prompt, MCPWindowToolName.workspaceContext].contains(toolName),
+           MCPPromptContextOperation.parse(toolName: toolName, arguments: arguments) == .export
+        {
+            return promptExportContract
+        }
         if toolName == MCPWindowToolName.fileActions,
            arguments["action"]?.stringValue?
            .trimmingCharacters(in: .whitespacesAndNewlines)

@@ -66,6 +66,10 @@ package struct MCPDomainHostInvocation: Sendable {
     package let arguments: [String: Value]
     package let securityContext: DomainToolInvocationSecurityContext
     package let admittedContext: MCPDomainAdmittedContext?
+    package let admissionDeadline: MCPDomainAdmissionDeadline?
+    /// Synchronous so the caller can establish execution timing without opening a
+    /// reentrancy gap between final host admission and provider invocation.
+    package let onProviderEntry: @Sendable () throws -> Void
     package let submittedAt: ContinuousClock.Instant
 
     package init(
@@ -75,6 +79,8 @@ package struct MCPDomainHostInvocation: Sendable {
         arguments: [String: Value],
         securityContext: DomainToolInvocationSecurityContext,
         admittedContext: MCPDomainAdmittedContext? = nil,
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil,
+        onProviderEntry: @escaping @Sendable () throws -> Void = {},
         submittedAt: ContinuousClock.Instant = ContinuousClock().now
     ) {
         precondition(admittedContext == nil || admittedContext?.connectionID == connectionID)
@@ -84,6 +90,8 @@ package struct MCPDomainHostInvocation: Sendable {
         self.arguments = arguments
         self.securityContext = securityContext
         self.admittedContext = admittedContext
+        self.admissionDeadline = admissionDeadline
+        self.onProviderEntry = onProviderEntry
         self.submittedAt = submittedAt
     }
 }
@@ -141,6 +149,9 @@ package actor MCPDomainHost {
     private var requestProgressByStateID: [UUID: RequestProgressRecord] = [:]
     private var terminalConnectionGenerationByID: [UUID: UInt64] = [:]
     private var releasedConnectionGenerationByID: [UUID: UInt64] = [:]
+    #if DEBUG
+        private var debugBeforeProviderActivationForTesting: (@Sendable (UUID, String, UUID) async -> Void)?
+    #endif
 
     package init(
         identity: DomainRuntimeIdentity,
@@ -184,6 +195,7 @@ package actor MCPDomainHost {
     }
 
     package func invoke(_ invocation: MCPDomainHostInvocation) async throws -> Value {
+        try invocation.admissionDeadline?.check()
         let clock = ContinuousClock()
         let hostEntry = clock.now
         recordTimingMetric(
@@ -200,18 +212,23 @@ package actor MCPDomainHost {
         }
         try validateSecurityContext(invocation)
 
-        guard let resolved = await registry.resolve(
+        let resolvedCandidate = await registry.resolve(
             toolName: invocation.resolution.toolName,
             scope: invocation.resolution.scope
-        ) else {
+        )
+        try invocation.admissionDeadline?.check()
+        guard let resolved = resolvedCandidate else {
             throw MCPDomainHostError.scopeUnavailable(
                 toolName: invocation.resolution.toolName,
                 scope: invocation.resolution.scope
             )
         }
-        guard resolved.handle == invocation.resolution.registrationHandle,
-              await registry.isActive(resolved.handle)
-        else {
+        guard resolved.handle == invocation.resolution.registrationHandle else {
+            throw MCPDomainHostError.staleRegistration(toolName: invocation.resolution.toolName)
+        }
+        let resolvedIsActive = await registry.isActive(resolved.handle)
+        try invocation.admissionDeadline?.check()
+        guard resolvedIsActive else {
             throw MCPDomainHostError.staleRegistration(toolName: invocation.resolution.toolName)
         }
 
@@ -221,8 +238,10 @@ package actor MCPDomainHost {
                 connectionID: invocation.connectionID
             )
         } catch {
+            try invocation.admissionDeadline?.check()
             throw MCPDomainHostError.connectionRegistrationInvalid
         }
+        try invocation.admissionDeadline?.check()
         guard currentRegistration.runtimeID == identity.runtimeID,
               currentRegistration.generation == invocation.securityContext.connectionGeneration
         else {
@@ -230,6 +249,7 @@ package actor MCPDomainHost {
         }
 
         await beforeFinalAdmission()
+        try invocation.admissionDeadline?.check()
 
         // Actor reentrancy permits drain to begin across any validation suspension above.
         // This final check and active-map insertion form the authoritative admission fence:
@@ -247,21 +267,46 @@ package actor MCPDomainHost {
             throw MCPDomainHostError.connectionRegistrationInvalid
         }
         let metrics = metrics
+        let registry = registry
         let toolName = invocation.resolution.toolName
-        let task = Task {
+        let connectionID = invocation.connectionID
+        let invocationID = invocation.invocationID
+        let arguments = invocation.arguments
+        let securityContext = invocation.securityContext
+        let admittedContext = invocation.admittedContext
+        let admissionDeadline = invocation.admissionDeadline
+        let onProviderEntry = invocation.onProviderEntry
+        #if DEBUG
+            let beforeProviderActivation = debugBeforeProviderActivationForTesting
+        #endif
+        try admissionDeadline?.check()
+        let task: Task<Value, Error> = Task {
+            try Task.checkCancellation()
             let executionStartedAt = clock.now
             do {
-                try Task.checkCancellation()
-                guard await self.registry.isActive(resolved.handle) else {
+                try admissionDeadline?.check()
+                let resolvedIsActive = await registry.isActive(resolved.handle)
+                try admissionDeadline?.check()
+                guard resolvedIsActive else {
                     throw MCPDomainHostError.staleRegistration(toolName: toolName)
                 }
                 let value = try await MCPDomainInvocationSecurityContext.$current.withValue(
-                    invocation.securityContext
+                    securityContext
                 ) {
-                    try await MCPDomainAdmittedContextValues.$current.withValue(
-                        invocation.admittedContext
+                    try admissionDeadline?.check()
+                    return try await MCPDomainAdmittedContextValues.$current.withValue(
+                        admittedContext
                     ) {
-                        try await resolved.binding(invocation.arguments)
+                        try admissionDeadline?.check()
+                        #if DEBUG
+                            if let beforeProviderActivation {
+                                try admissionDeadline?.check()
+                                await beforeProviderActivation(connectionID, toolName, invocationID)
+                            }
+                        #endif
+                        try admissionDeadline?.check()
+                        try onProviderEntry()
+                        return try await resolved.binding(arguments)
                     }
                 }
                 Self.recordTimingMetric(
@@ -303,6 +348,14 @@ package actor MCPDomainHost {
             task.cancel()
         }
     }
+
+    #if DEBUG
+        package func debugSetBeforeProviderActivationForTesting(
+            _ handler: (@Sendable (UUID, String, UUID) async -> Void)?
+        ) {
+            debugBeforeProviderActivationForTesting = handler
+        }
+    #endif
 
     package func beginRequestProgress(
         connectionID: UUID,
@@ -348,24 +401,36 @@ package actor MCPDomainHost {
     }
 
     package func acquireMutationResourceAdmission(
-        _ resource: MCPDomainToolResourceAdmissionController.Resource
+        _ resource: MCPDomainToolResourceAdmissionController.Resource,
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil
     ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
         guard lifecycle == .accepting else { throw MCPDomainHostError.draining }
-        return try await mutationAdmissionController.acquire(resource)
+        return try await mutationAdmissionController.acquire(
+            resource,
+            admissionDeadline: admissionDeadline
+        )
     }
 
     package func acquireSmallReadResourceAdmission(
-        windowID: Int
+        windowID: Int,
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil
     ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
         guard lifecycle == .accepting else { throw MCPDomainHostError.draining }
-        return try await smallReadAdmissionController.acquire(.window(windowID))
+        return try await smallReadAdmissionController.acquire(
+            .window(windowID),
+            admissionDeadline: admissionDeadline
+        )
     }
 
     package func acquireFileReadResourceAdmission(
-        windowID: Int
+        windowID: Int,
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil
     ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
         guard lifecycle == .accepting else { throw MCPDomainHostError.draining }
-        return try await fileReadAdmissionController.acquire(.window(windowID))
+        return try await fileReadAdmissionController.acquire(
+            .window(windowID),
+            admissionDeadline: admissionDeadline
+        )
     }
 
     package func cancelInvocations(
@@ -536,7 +601,7 @@ package actor MCPDomainHost {
             dimensions: [
                 "tool_name": toolName,
                 "duration_microseconds": String(microseconds),
-                "outcome": outcome,
+                "outcome": outcome
             ]
         ))
     }

@@ -9,13 +9,46 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         XCTAssertEqual(operation("manage_selection", ["op": .string("set")])?.action, "set")
         XCTAssertNil(operation("prompt", ["op": .string("get")]))
         XCTAssertEqual(operation("prompt", ["op": .string("append")])?.action, "append")
+        XCTAssertEqual(operation("prompt", ["op": .string("  ExPoRt  ")])?.action, "export")
         XCTAssertNil(operation("workspace_context", ["op": .string("snapshot")]))
         XCTAssertEqual(operation("workspace_context", ["op": .string("select_preset")])?.action, "select_preset")
+        XCTAssertEqual(operation("workspace_context", ["op": .string("  ExPoRt  ")])?.action, "export")
         XCTAssertEqual(operation("bind_context", ["op": .string("bind")])?.action, "bind")
         XCTAssertEqual(operation("manage_workspaces", ["action": .string("create")])?.action, "create")
         XCTAssertEqual(operation("file_actions", ["action": .string("create")])?.action, "create")
         XCTAssertEqual(operation("apply_edits", ["path": .string("file.swift")])?.action, "replace")
         XCTAssertEqual(operation("manage_worktree", ["op": .string("create")])?.action, "create")
+    }
+
+    func testPromptContextClassifierPreservesToolDefaultsMalformedAndUnknownOperations() {
+        let cases: [(label: String, toolName: String, arguments: [String: Value], expected: MCPPromptContextOperation)] = [
+            ("prompt missing", "prompt", [:], .get),
+            ("prompt malformed", "prompt", ["op": .bool(true)], .get),
+            ("prompt normalized", "prompt", ["op": .string("  SeT  ")], .set),
+            ("prompt unknown", "prompt", ["op": .string("  Future_Op  ")], .unknown(rawValue: "future_op")),
+            ("workspace missing", "workspace_context", [:], .snapshot),
+            ("workspace malformed", "workspace_context", ["op": .bool(true)], .snapshot),
+            ("workspace normalized", "workspace_context", ["op": .string("  LIST_PRESETS  ")], .listPresets),
+            ("workspace unknown", "workspace_context", ["op": .string("  Future_Op  ")], .unknown(rawValue: "future_op"))
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                MCPPromptContextOperation.parse(
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                ),
+                testCase.expected,
+                testCase.label
+            )
+        }
+
+        XCTAssertNil(operation("prompt", [:]))
+        XCTAssertNil(operation("prompt", ["op": .bool(true)]))
+        XCTAssertNil(operation("prompt", ["op": .string("future_op")]))
+        XCTAssertNil(operation("workspace_context", [:]))
+        XCTAssertNil(operation("workspace_context", ["op": .bool(true)]))
+        XCTAssertNil(operation("workspace_context", ["op": .string("future_op")]))
     }
 
     func testProtectedBindingDefaultsToDenyAndNeverCallsBackendWithoutPrincipal() async throws {
