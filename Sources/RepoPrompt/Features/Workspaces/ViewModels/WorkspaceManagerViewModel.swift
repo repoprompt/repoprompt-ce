@@ -11264,15 +11264,21 @@ class WorkspaceManagerViewModel: ObservableObject {
             throw error
         }
 
-        if outcome.exactRootResolution == .recoveryBlocked {
-            applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
-            reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
-        }
         guard Self.isSuccessfulDomainOutcome(outcome),
               let outcomeWorkspace = outcome.workspace
         else {
             applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
+            reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
+            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
+        }
+
+        let provenance: PersistentFolderOpenProvenance
+        switch outcome.exactRootResolution {
+        case .created:
+            provenance = .created
+        case .reused:
+            provenance = .reused
+        case .recoveryBlocked, nil:
             reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
             throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
         }
@@ -11296,19 +11302,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         recordRepoPathBaseline(for: canonical)
 
-        let provenance: PersistentFolderOpenProvenance
-        switch outcome.exactRootResolution {
-        case .created:
-            provenance = .created
-        case .reused:
-            provenance = .reused
-        case .recoveryBlocked:
-            reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
-        case nil:
-            // Compatibility with operation records written before exact-root provenance existed.
-            provenance = canonical.id == workspace.id ? .created : .reused
-        }
         if provenance == .created {
             NotificationCenter.default.post(
                 name: .workspaceDidCreate,

@@ -718,31 +718,94 @@ import XCTest
             }))
         }
 
-        func testLegacyResolveOrCreateReplayUsesDigestFallbackWhenResultIdentityIsMissing() async throws {
-            let profileIdentifier = "workspace-open-folder-legacy-\(UUID().uuidString)"
-            let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
-            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1304)
-            let folder = try makeFolder(named: "ResolveOrCreateLegacyReplay")
-            let existing = WorkspaceModel(name: "Legacy Replay Winner", repoPaths: [folder.path])
-            try await createAuthorityWorkspace(existing, using: client)
-            let proposed = WorkspaceModel(name: "Legacy Replay Proposed", repoPaths: [folder.path])
-            let canonicalRootPath = try canonicalRootPath(folder)
-            let operationID = UUID()
-            let envelope = try resolveOrCreateEnvelope(
-                proposed,
-                canonicalRootPath: canonicalRootPath,
-                operationID: operationID,
-                windowID: -1304
-            )
+        func testExactRootReplayRejectsSuccessfulRecordsWithMissingOrInvalidResultFields() async throws {
+            let malformedResults: [(missingFields: [String], provenance: String?)] = [
+                (["resultingWorkspaceID"], nil),
+                (["exactRootResolution"], nil),
+                (["resultingWorkspaceID", "exactRootResolution"], nil),
+                ([], "recoveryBlocked")
+            ]
+            for reuseExisting in [false, true] {
+                for fixture in malformedResults {
+                    let profileIdentifier = "workspace-open-folder-malformed-\(UUID().uuidString)"
+                    let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+                    let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1304)
+                    let folder = try makeFolder(named: "MalformedReplay-\(UUID().uuidString)")
+                    let existing = WorkspaceModel(name: "Replay Winner", repoPaths: [folder.path])
+                    if reuseExisting {
+                        try await createAuthorityWorkspace(existing, using: client)
+                    }
+                    let proposed = WorkspaceModel(name: "Replay Proposed", repoPaths: [folder.path])
+                    let expectedWorkspaceID = reuseExisting ? existing.id : proposed.id
+                    let envelope = try resolveOrCreateEnvelope(
+                        proposed,
+                        canonicalRootPath: canonicalRootPath(folder),
+                        operationID: UUID(),
+                        windowID: -1304
+                    )
 
+                    let first = await runtime.workspaceStore.execute(envelope)
+                    XCTAssertEqual(first.disposition, reuseExisting ? .unchanged : .applied)
+                    XCTAssertEqual(first.exactRootResolution, reuseExisting ? .reused : .created)
+                    XCTAssertEqual(first.workspace?.document.workspaceID, expectedWorkspaceID)
+                    let journalURL = try workingJournalURL(workspaceID: expectedWorkspaceID)
+                    _ = await runtime.shutdown()
+                    domainRuntimes.removeAll { $0 === runtime }
+                    try rewriteOperationResultFields(
+                        removing: fixture.missingFields,
+                        replacingProvenance: fixture.provenance,
+                        operationID: envelope.operationID,
+                        expectedWorkspaceID: expectedWorkspaceID,
+                        from: journalURL
+                    )
+                    let malformedBytes = try Data(contentsOf: journalURL)
+
+                    let restarted = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+                    let replay = await restarted.workspaceStore.execute(envelope)
+                    let replayAgain = await restarted.workspaceStore.execute(envelope)
+                    let catalog = await restarted.workspaceStore.snapshot()
+
+                    XCTAssertEqual(replay.disposition, .failed, "Malformed result: \(fixture)")
+                    XCTAssertEqual(replay.errorCode, .invalidDocument)
+                    XCTAssertEqual(replay.diagnostic, "exact_root_record_missing_result_identity_or_provenance")
+                    XCTAssertNil(replay.workspace)
+                    XCTAssertEqual(replay.resultingDigest, first.resultingDigest)
+                    XCTAssertEqual(replayAgain, replay)
+                    XCTAssertTrue(catalog.workspaces.contains { $0.document.workspaceID == expectedWorkspaceID })
+                    if reuseExisting {
+                        XCTAssertFalse(catalog.workspaces.contains { $0.document.workspaceID == proposed.id })
+                    }
+                    XCTAssertEqual(try Data(contentsOf: journalURL), malformedBytes, "Replay must not repair or overwrite the record")
+                    _ = await restarted.shutdown()
+                    domainRuntimes.removeAll { $0 === restarted }
+                }
+            }
+        }
+
+        func testLegacyGenericCreateReplaysWithoutResultIdentityOrProvenance() async throws {
+            let profileIdentifier = "workspace-open-folder-generic-legacy-\(UUID().uuidString)"
+            let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let folder = try makeFolder(named: "GenericLegacyReplay")
+            let workspace = WorkspaceModel(name: "Generic Legacy", repoPaths: [folder.path])
+            let document = try DomainWorkspaceDocument.decode(
+                documentBytes: JSONEncoder().encode(workspace),
+                fileURL: authorityWorkspaceFileURL(workspace.id)
+            )
+            let envelope = DomainWorkspaceCommandEnvelope(
+                operationID: UUID(),
+                origin: .appPresentation(windowID: -1304),
+                command: .createWorkspace(document)
+            )
             let first = await runtime.workspaceStore.execute(envelope)
-            XCTAssertEqual(first.workspace?.document.workspaceID, existing.id)
-            let journalURL = try workingJournalURL(workspaceID: existing.id)
+            XCTAssertEqual(first.disposition, .applied)
+            XCTAssertNil(first.exactRootResolution)
+            let journalURL = try workingJournalURL(workspaceID: workspace.id)
             _ = await runtime.shutdown()
             domainRuntimes.removeAll { $0 === runtime }
-            try removeResultingWorkspaceID(
-                operationID: operationID,
-                expectedWorkspaceID: existing.id,
+            try rewriteOperationResultFields(
+                removing: ["resultingWorkspaceID", "exactRootResolution"],
+                operationID: envelope.operationID,
+                expectedWorkspaceID: workspace.id,
                 from: journalURL
             )
 
@@ -750,8 +813,34 @@ import XCTest
             let replay = await restarted.workspaceStore.execute(envelope)
 
             XCTAssertEqual(replay.disposition, .deduplicated)
-            XCTAssertEqual(replay.workspace?.document.workspaceID, existing.id)
+            XCTAssertNil(replay.errorCode)
+            XCTAssertNil(replay.exactRootResolution)
+            XCTAssertEqual(replay.workspace?.document.workspaceID, workspace.id)
             XCTAssertEqual(replay.resultingDigest, first.resultingDigest)
+        }
+
+        func testExactRootFailureReplaysWithoutSuccessIdentityOrProvenance() async throws {
+            let runtime = try await makeDomainRuntime()
+            let folder = try makeFolder(named: "InvalidExactRootReplay")
+            let proposed = WorkspaceModel(name: "Must Not Be Created", repoPaths: [folder.path])
+            let envelope = try resolveOrCreateEnvelope(
+                proposed,
+                canonicalRootPath: canonicalRootPath(folder) + "/different-root",
+                operationID: UUID(),
+                windowID: -1304
+            )
+
+            let first = await runtime.workspaceStore.execute(envelope)
+            let replay = await runtime.workspaceStore.execute(envelope)
+
+            XCTAssertEqual(first.disposition, .invalid)
+            XCTAssertNil(first.workspace)
+            XCTAssertNil(first.exactRootResolution)
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.errorCode, .invalidDocument)
+            XCTAssertEqual(replay.diagnostic, "folder_open_root_mismatch")
+            XCTAssertNil(replay.workspace)
+            XCTAssertNil(replay.exactRootResolution)
         }
 
         func testAuthorityClientDeterministicWorkspaceEncodingDeduplicatesEqualModelsAndRejectsChangedModel() async throws {
@@ -1771,7 +1860,9 @@ import XCTest
             throw WorkspaceOpenFolderOrchestrationTestError.journalNotFound
         }
 
-        private func removeResultingWorkspaceID(
+        private func rewriteOperationResultFields(
+            removing fields: [String],
+            replacingProvenance: String? = nil,
             operationID: UUID,
             expectedWorkspaceID: UUID,
             from journalURL: URL
@@ -1789,10 +1880,15 @@ import XCTest
                 expectedWorkspaceID.uuidString,
                 "New operation records must persist the stable result identity"
             )
-            operations[operationIndex].removeValue(forKey: "resultingWorkspaceID")
+            for field in fields {
+                operations[operationIndex].removeValue(forKey: field)
+            }
+            if let replacingProvenance {
+                operations[operationIndex]["exactRootResolution"] = replacingProvenance
+            }
             journal["operations"] = operations
-            let legacyData = try JSONSerialization.data(withJSONObject: journal, options: [.sortedKeys])
-            try legacyData.write(to: journalURL, options: .atomic)
+            let updatedData = try JSONSerialization.data(withJSONObject: journal, options: [.sortedKeys])
+            try updatedData.write(to: journalURL, options: .atomic)
         }
 
         private func makeDomainRuntime(

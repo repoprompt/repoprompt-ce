@@ -617,36 +617,32 @@ actor DomainWorkspaceContextAuthority {
             return prior.outcome(workspace: fallbackWorkspace)
         }
 
-        if let resultingWorkspaceID = prior.resultingWorkspaceID {
-            if let record = records[resultingWorkspaceID] {
-                return prior.outcome(workspace: makeSnapshot(record))
-            }
-            return unavailableReplayOutcome(
+        // Records retain only a command fingerprint, so validate where the command is known.
+        // Exact-root success has always required identity and provenance; generic records have not.
+        guard let resultingWorkspaceID = prior.resultingWorkspaceID,
+              prior.exactRootResolution == .created || prior.exactRootResolution == .reused
+        else {
+            return failedReplayOutcome(
                 prior,
-                diagnostic: deletedWorkspaceIDs.contains(resultingWorkspaceID)
-                    ? "recorded_result_workspace_deleted"
-                    : "recorded_result_workspace_unavailable"
+                errorCode: .invalidDocument,
+                diagnostic: "exact_root_record_missing_result_identity_or_provenance"
             )
         }
-
-        // Pre-result-identity journals can only recover by digest. UUID ordering keeps the
-        // compatibility fallback deterministic if legacy data contains ambiguous matches.
-        let legacyWorkspace = records.values
-            .filter { $0.document.contentDigest == prior.resultingDigest }
-            .sorted { $0.document.workspaceID.uuidString < $1.document.workspaceID.uuidString }
-            .first
-            .map(makeSnapshot)
-        if let legacyWorkspace {
-            return prior.outcome(workspace: legacyWorkspace)
+        if let record = records[resultingWorkspaceID] {
+            return prior.outcome(workspace: makeSnapshot(record))
         }
-        return unavailableReplayOutcome(
+        return failedReplayOutcome(
             prior,
-            diagnostic: "legacy_recorded_result_workspace_unavailable"
+            errorCode: .workspaceUnavailable,
+            diagnostic: deletedWorkspaceIDs.contains(resultingWorkspaceID)
+                ? "recorded_result_workspace_deleted"
+                : "recorded_result_workspace_unavailable"
         )
     }
 
-    private func unavailableReplayOutcome(
+    private func failedReplayOutcome(
         _ prior: DomainRecordedOperation,
+        errorCode: DomainCommandErrorCode,
         diagnostic: String
     ) -> DomainCommandOutcome {
         DomainCommandOutcome(
@@ -656,7 +652,7 @@ actor DomainWorkspaceContextAuthority {
             after: prior.after,
             catalogRevision: catalogRevision,
             resultingDigest: prior.resultingDigest,
-            errorCode: .workspaceUnavailable,
+            errorCode: errorCode,
             diagnostic: diagnostic,
             workspace: nil,
             exactRootResolution: prior.exactRootResolution
