@@ -8,21 +8,26 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         let reaper = RecordingChildStatusObserver()
         let lifecycle = ProcessLifecycleProbe()
         let started = expectation(description: "streaming process started")
-        let ready = expectation(description: "streaming process produced readiness output")
+        let consumerStarted = expectation(description: "stream consumer entered")
         let terminated = expectation(description: "streaming process terminated")
         let secondStarted = expectation(description: "second process started after gate release")
         let secondTerminated = expectation(description: "second process terminated")
 
+        let taskBag = TestTaskCancellationBag()
         let runner = makeRunner(statusObserver: { pid, beforeReap, completion in
             reaper.observe(pid: pid, beforeReap: beforeReap, completion: completion)
         })
         addTeardownBlock {
+            taskBag.cancelAll()
             await runner.cancelAll()
-            await self.fulfillment(of: [terminated, secondTerminated], timeout: 5)
+            let processesTerminated = await lifecycle.waitForAllProcessesToTerminate()
+            if !processesTerminated {
+                XCTFail("owned streaming processes did not terminate during bounded teardown")
+            }
         }
 
         let stream = try await runner.runStreaming(
-            args: ["-c", "printf 'ready\\n'; exec /bin/sleep 60"],
+            args: ["-c", "exec /bin/sleep 60"],
             stdin: nil,
             outputMode: .none,
             timeout: 10,
@@ -41,13 +46,9 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         let consumer = Task {
             defer { consumerFinished.fulfill() }
             do {
-                for try await event in stream {
-                    if case let .stdout(data) = event,
-                       data.range(of: Data("ready\n".utf8)) != nil
-                    {
-                        ready.fulfill()
-                    }
-                }
+                var iterator = stream.makeAsyncIterator()
+                consumerStarted.fulfill()
+                while let _ = try await iterator.next() {}
                 await consumerOutcome.recordSuccess()
             } catch {
                 if error is CancellationError {
@@ -62,8 +63,9 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
                 }
             }
         }
+        taskBag.add(consumer)
 
-        await fulfillment(of: [started, ready], timeout: 2)
+        await fulfillment(of: [started, consumerStarted], timeout: 2)
         consumer.cancel()
         await fulfillment(of: [consumerFinished], timeout: 5)
         guard let consumerResult = await consumerOutcome.value else {
@@ -108,6 +110,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
                 }
             )
         }
+        taskBag.add(secondTask)
         await fulfillment(of: [secondStarted], timeout: 2)
         guard await lifecycle.startedCount == 2 else {
             secondTask.cancel()
@@ -139,6 +142,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
                 }
             }
         }
+        taskBag.add(secondConsumer)
         await fulfillment(of: [secondConsumerFinished, secondTerminated], timeout: 5)
         guard let secondResult = await secondOutcome.value else {
             secondConsumer.cancel()
@@ -163,13 +167,15 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
     func testStreamingNormalCompletionDrainsOutputBeforeTerminalEvent() async throws {
         let reaper = RecordingChildStatusObserver()
         let lifecycle = ProcessLifecycleProbe()
-        let processTerminated = expectation(description: "normal stream process terminated")
         let runner = makeRunner(statusObserver: { pid, beforeReap, completion in
             reaper.observe(pid: pid, beforeReap: beforeReap, completion: completion)
         })
         addTeardownBlock {
             await runner.cancelAll()
-            await self.fulfillment(of: [processTerminated], timeout: 5)
+            let processTerminated = await lifecycle.waitForAllProcessesToTerminate()
+            if !processTerminated {
+                XCTFail("owned streaming process did not terminate during bounded teardown")
+            }
         }
 
         let stream = try await runner.runStreaming(
@@ -180,9 +186,11 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
             stdin: nil,
             outputMode: .none,
             timeout: 2,
+            onProcessStarted: { pid in
+                await lifecycle.recordStarted(pid)
+            },
             onProcessTerminated: { pid in
                 await lifecycle.recordTerminated(pid)
-                processTerminated.fulfill()
             }
         )
 
@@ -225,13 +233,18 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         let secondStarted = expectation(description: "gate-reuse control started")
         let secondTerminated = expectation(description: "gate reuse process terminated")
 
+        let taskBag = TestTaskCancellationBag()
         let runner = makeRunner(statusObserver: { pid, beforeReap, completion in
             delayedObserver.observe(pid: pid, beforeReap: beforeReap, completion: completion)
         })
         addTeardownBlock {
+            taskBag.cancelAll()
             delayedObserver.releaseObservation()
             await runner.cancelAll()
-            await self.fulfillment(of: [terminated, secondTerminated], timeout: 5)
+            let processesTerminated = await lifecycle.waitForAllProcessesToTerminate()
+            if !processesTerminated {
+                XCTFail("owned streaming processes did not terminate during bounded teardown")
+            }
         }
 
         let stream = try await runner.runStreaming(
@@ -270,6 +283,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
                 }
             }
         }
+        taskBag.add(consumer)
         await fulfillment(of: [consumerFinished], timeout: 5)
         guard let consumerResult = await consumerOutcome.value else {
             consumer.cancel()
@@ -317,6 +331,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
                 }
             )
         }
+        taskBag.add(secondTask)
         delayedObserver.releaseObservation()
         await fulfillment(of: [terminated, secondStarted], timeout: 5)
         let firstPIDValue = await lifecycle.firstStartedPID()
@@ -355,6 +370,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
                 }
             }
         }
+        taskBag.add(secondConsumer)
         await fulfillment(of: [secondConsumerFinished, secondTerminated], timeout: 5)
         guard let secondResult = await secondOutcome.value else {
             secondConsumer.cancel()
@@ -624,6 +640,32 @@ private actor ConsumerOutcomeProbe {
     }
 }
 
+private final class TestTaskCancellationBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelActions: [@Sendable () -> Void] = []
+    private var cancellationRequested = false
+
+    func add(_ task: Task<some Any, some Error>) {
+        lock.lock()
+        guard !cancellationRequested else {
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        cancelActions.append { task.cancel() }
+        lock.unlock()
+    }
+
+    func cancelAll() {
+        lock.lock()
+        cancellationRequested = true
+        let actions = cancelActions
+        cancelActions.removeAll()
+        lock.unlock()
+        actions.forEach { $0() }
+    }
+}
+
 private actor ProcessLifecycleProbe {
     private var startedPIDs: [pid_t] = []
     private var terminatedPIDs: [pid_t] = []
@@ -650,6 +692,15 @@ private actor ProcessLifecycleProbe {
 
     func terminationCount(for pid: pid_t) -> Int {
         terminatedPIDs.count(where: { $0 == pid })
+    }
+
+    func waitForAllProcessesToTerminate() async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while terminatedPIDs.count < startedPIDs.count {
+            guard ContinuousClock.now < deadline else { return false }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return true
     }
 }
 
