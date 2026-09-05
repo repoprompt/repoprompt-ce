@@ -95,6 +95,8 @@ A turn is prepared before provider work starts. A terminal turn contains one str
 
 If terminal persistence fails, `OracleGroupTerminalPublisher` retries the same canonical outcome. It does not invent a replacement result. Cancellation drains lane callbacks and persists cancelled lane outcomes before the claim is released.
 
+Duplicate-workspace cleanup must not rehome grouped Chat projections independently of their canonical group owner, which includes the workspace ID. Until both can migrate together, Chat sidecar preflight rejects owner-changing grouped history. Cleanup reports `sidecar_preflight_failed`, retains the duplicate workspace, and writes neither Agent nor Chat destination sidecars. Drive this boundary through `WorkspaceDuplicateCleanupTests.testGroupedOracleHistoryPreventsRetirementWithoutMovingEitherSidecarFamily`; unchanged source bytes and a loadable canonical group prove preservation.
+
 ## Settings and schema authority
 
 The app and direct headless runtime use separate settings stores with the same semantic descriptors.

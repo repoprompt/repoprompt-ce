@@ -159,6 +159,30 @@ final class OracleGroupProjectionRecoveryTests: XCTestCase {
         }
     }
 
+    func testAutosaveWithoutWorkspaceReportsFailureExactlyOnce() async {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -2886,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        defer { composition.workspaceManager.prepareForWindowClose() }
+        let session = ChatSession(workspaceID: nil, name: "Missing workspace")
+        composition.oracleViewModel.sessions = [session]
+        composition.oracleViewModel.currentSessionID = session.id
+        composition.oracleViewModel.messages = []
+        var completions: [Bool] = []
+
+        composition.oracleViewModel.autosaveChatHistory(for: session.id, force: true) {
+            completions.append($0)
+        }
+
+        XCTAssertEqual(completions, [false])
+    }
+
     private enum TestStop: Error {
         case unexpectedPreparedCallback
     }

@@ -217,6 +217,17 @@ actor ChatDataService {
                         filenamePrefix: "ChatSession-",
                         canonicalWorkspaceID: canonicalWorkspaceID
                     )
+                    // Group ownership includes the workspace ID. Moving only its
+                    // projections would orphan canonical history; retain the duplicate
+                    // until consolidation can migrate both authorities together.
+                    for copy in prepared {
+                        let header = try JSONSerialization.jsonObject(with: copy.expectedSourceData) as? [String: Any]
+                        if let groupID = header?["oracleGroupID"], !(groupID is NSNull),
+                           (header?["workspaceID"] as? String).flatMap(UUID.init(uuidString:)) != canonicalWorkspaceID
+                        {
+                            throw WorkspaceSessionSidecarMigrationError.oracleGroupOwnerChange(copy.sourceURL)
+                        }
+                    }
                     continuation.resume(returning: WorkspaceSessionSidecarPreparedBatch(
                         sourceFolder: sourceFolder,
                         destinationFolder: destinationFolder,

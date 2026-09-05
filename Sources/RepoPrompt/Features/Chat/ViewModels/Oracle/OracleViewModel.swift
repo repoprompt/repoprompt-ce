@@ -2784,7 +2784,7 @@ class OracleViewModel: ObservableObject {
         // ------------------------------------------------------------------
         // 0️⃣  Preconditions
         // ------------------------------------------------------------------
-        guard let session = sessions.first(where: { $0.id == sessionID }) else {
+        guard let session = sessions.first(where: { $0.id == sessionID }), session.workspaceID != nil else {
             completion?(false)
             return
         }
