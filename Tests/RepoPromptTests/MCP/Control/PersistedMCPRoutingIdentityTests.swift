@@ -87,8 +87,8 @@
             XCTAssertNil(liveB.mcpServer.connectionBindingSnapshot(forConnection: connection.connectionID).windowID)
 
             let rejected = try await connection.client.callTool(
-                name: "workspace_context",
-                arguments: ["_rawJSON": .bool(true)]
+                name: "get_file_tree",
+                arguments: ["type": .string("roots"), "_rawJSON": .bool(true)]
             )
             XCTAssertEqual(rejected.isError, true, toolText(rejected))
             XCTAssertTrue(toolText(rejected).contains("workspace routing affinity"), toolText(rejected))
@@ -123,7 +123,8 @@
             XCTAssertTrue(restoredAToolsEnabled)
 
             // A is restored under a different numeric ID; the same real tools/call now
-            // reaches the stable target rather than falling back to B.
+            // reaches the stable target rather than falling back to B. Roots lookup is
+            // window-scoped and needs no explicit context hint that could override affinity.
             WindowStatesManager.shared.allWindows = [restoredA]
             await manager.debugSetRoutingWindowSnapshotForTesting([
                 MCPRoutingWindowSnapshot(
@@ -133,8 +134,8 @@
                 )
             ])
             let restored = try await connection.client.callTool(
-                name: "workspace_context",
-                arguments: ["_rawJSON": .bool(true)]
+                name: "get_file_tree",
+                arguments: ["type": .string("roots"), "_rawJSON": .bool(true)]
             )
             XCTAssertNotEqual(restored.isError, true, toolText(restored))
             let selectedAfterRestore = await manager.selectedWindow(for: connection.connectionID)
