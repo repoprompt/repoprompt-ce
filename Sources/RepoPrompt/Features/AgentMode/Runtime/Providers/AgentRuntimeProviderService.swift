@@ -291,7 +291,6 @@ final class AgentRuntimeProviderService {
             return OpenCodeACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         case .cursor:
             let config = CursorAgentConfig(
-                commandName: agent.commandName,
                 enableDebugLogging: Self.enableDebugLogging,
                 modelString: modelString,
                 includeRepoPromptMCPServer: true,

@@ -252,6 +252,20 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
 }
 
 enum ProcessTermination {
+    struct TimeoutCleanupPolicy: Equatable {
+        let sigtermGrace: TimeInterval
+        let sigkillGrace: TimeInterval
+
+        init(sigtermGrace: TimeInterval, sigkillGrace: TimeInterval) {
+            self.sigtermGrace = max(sigtermGrace, 0)
+            self.sigkillGrace = max(sigkillGrace, 0)
+        }
+
+        var maximumDuration: TimeInterval {
+            sigtermGrace + sigkillGrace
+        }
+    }
+
     private struct TerminationTiming {
         let cooperativeWaitTimeout: TimeInterval
         let sigtermGrace: TimeInterval
@@ -283,6 +297,14 @@ enum ProcessTermination {
 
     static func cooperativeCancellationWaitTimeout() -> TimeInterval {
         currentTiming().cooperativeWaitTimeout
+    }
+
+    static func currentTimeoutCleanupPolicy() -> TimeoutCleanupPolicy {
+        let timing = currentTiming()
+        return TimeoutCleanupPolicy(
+            sigtermGrace: timing.sigtermGrace,
+            sigkillGrace: timing.sigkillGrace
+        )
     }
 
     private static func currentTiming() -> TerminationTiming {
@@ -687,12 +709,14 @@ enum ProcessTermination {
         pid: pid_t,
         processGroupID: pid_t?,
         timeout: TimeInterval?,
+        timeoutCleanupPolicy: TimeoutCleanupPolicy? = nil,
         logger: (String) -> Void = { _ in }
     ) async throws -> (exitCode: Int32, timedOut: Bool) {
         let outcome = try await waitForTerminationStatus(
             pid: pid,
             processGroupID: processGroupID,
             timeout: timeout,
+            timeoutCleanupPolicy: timeoutCleanupPolicy,
             logger: logger
         )
         return (outcome.status.normalizedExitCode, outcome.timedOut)
@@ -705,6 +729,7 @@ enum ProcessTermination {
         pid: pid_t,
         processGroupID: pid_t?,
         timeout: TimeInterval?,
+        timeoutCleanupPolicy: TimeoutCleanupPolicy? = nil,
         logger: (String) -> Void = { _ in }
     ) async throws -> (status: ProcessExitStatus, timedOut: Bool) {
         var status: Int32 = 0
@@ -739,14 +764,14 @@ enum ProcessTermination {
                 if r == pid { return (decodeWaitStatus(status), false) }
                 if r == 0 {
                     if ProcessInfo.processInfo.systemUptime >= deadline {
-                        let timing = currentTiming()
+                        let cleanupPolicy = timeoutCleanupPolicy ?? currentTimeoutCleanupPolicy()
                         logger("Process timed out after \(timeout) seconds; sending SIGTERM")
                         let exitStatus = await terminateAndReapStatus(
                             pid: pid,
                             processGroupID: processGroupID,
                             status: &status,
-                            sigtermGrace: timing.sigtermGrace,
-                            sigkillGrace: timing.sigkillGrace,
+                            sigtermGrace: cleanupPolicy.sigtermGrace,
+                            sigkillGrace: cleanupPolicy.sigkillGrace,
                             logger: logger
                         )
                         return (exitStatus, true)

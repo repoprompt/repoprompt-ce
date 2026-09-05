@@ -140,7 +140,7 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         if let runnerError = error as? CLIProcessRunnerError,
            case .commandNotFound = runnerError
         {
-            return AIProviderError.invalidConfiguration(detail: "Cursor Agent CLI ACP server not found. Install Cursor Agent CLI and ensure `cursor-agent acp` is available.")
+            return AIProviderError.invalidConfiguration(detail: "Cursor Agent CLI ACP server not found. Install Cursor Agent CLI and ensure `cursor-agent acp` or the verified `agent acp` entrypoint is available.")
         }
         if error is CursorACPLaunchResolutionError || error is ExecutableFileIdentityError {
             return AIProviderError.invalidConfiguration(detail: error.localizedDescription)

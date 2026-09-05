@@ -3658,16 +3658,16 @@ public class APISettingsViewModel: ObservableObject {
         let message = error.localizedDescription
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
-            return "Cursor Agent CLI ACP server was not found. Install Cursor Agent CLI and ensure `cursor-agent acp` is available."
+            return "Cursor Agent CLI ACP server was not found. Install Cursor Agent CLI and ensure `cursor-agent acp` or the verified `agent acp` entrypoint is available."
         }
         if lowered.contains("permission denied") {
-            return "Permission denied. Ensure the `cursor-agent` executable is accessible."
+            return "Permission denied. Ensure the Cursor `cursor-agent` or `agent` executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
             return "Cursor Agent CLI is not authenticated. Set `CURSOR_API_KEY`/`CURSOR_AUTH_TOKEN` or complete Cursor login."
         }
         if lowered.contains("does not advertise acp") || lowered.contains("acp support") {
-            return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` works."
+            return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` or `agent acp --help` identifies Cursor ACP."
         }
         return message
     }
