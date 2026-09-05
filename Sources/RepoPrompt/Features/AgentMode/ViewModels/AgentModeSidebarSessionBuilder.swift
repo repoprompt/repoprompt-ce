@@ -225,6 +225,7 @@ struct AgentModeSidebarSessionBuilder {
             agentKindRaw: entry.agentKindRaw,
             agentModelRaw: entry.agentModelRaw,
             agentReasoningEffortRaw: entry.agentReasoningEffortRaw,
+            acpModelParameterSelections: entry.acpModelParameterSelections,
             autoEditEnabled: entry.autoEditEnabled,
             parentSessionID: entry.parentSessionID,
             hasUnknownConversationContent: entry.hasUnknownConversationContent,

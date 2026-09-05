@@ -25,6 +25,51 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         .cursor
     }
 
+    var supportsParameterizedModelPicker: Bool {
+        true
+    }
+
+    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        let category = Self.semanticToken(input.category)
+        let configID = Self.semanticToken(input.configID)
+        let displayName = Self.semanticToken(input.displayName)
+        let identity = Set([configID, displayName])
+        let choiceValues = Set(input.choices.map { Self.semanticToken($0.rawValue) })
+        let isBooleanSelector = choiceValues == Set(["false", "true"])
+
+        guard category != "model", category != "mode",
+              configID != "model", configID != "mode"
+        else { return nil }
+
+        let isGenericCategory = category == "model_config" || category == "model_parameter"
+        let isMissingCategory = category.isEmpty
+        let isThinkingCategory = ["thought_level", "thinking_level", "reasoning_effort"].contains(category)
+        guard isGenericCategory || isMissingCategory || isThinkingCategory else { return nil }
+        let thinkingIdentities = Set([
+            "thought_level",
+            "thinking_level",
+            "reasoning_effort",
+            "effort",
+            "reasoning",
+            "thinking",
+            "cursor.thought_level"
+        ])
+        if isThinkingCategory || !identity.isDisjoint(with: thinkingIdentities), !isBooleanSelector {
+            return .thinking
+        }
+
+        let speedIdentities = Set(["speed", "fast", "fast_mode", "cursor.fast_mode"])
+        if !identity.isDisjoint(with: speedIdentities) {
+            return .speed
+        }
+        guard isGenericCategory else { return nil }
+        let choiceNames = Set(input.choices.map { Self.semanticToken($0.displayName) })
+        if choiceNames.contains("standard"), choiceNames.contains("fast") {
+            return .speed
+        }
+        return nil
+    }
+
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }
@@ -140,7 +185,7 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         if let runnerError = error as? CLIProcessRunnerError,
            case .commandNotFound = runnerError
         {
-            return AIProviderError.invalidConfiguration(detail: "Cursor Agent CLI ACP server not found. Install Cursor Agent CLI and ensure `cursor-agent acp` is available.")
+            return AIProviderError.invalidConfiguration(detail: "Cursor Agent CLI ACP server not found. Install Cursor Agent CLI and ensure `cursor-agent acp` or the verified `agent acp` entrypoint is available.")
         }
         if error is CursorACPLaunchResolutionError || error is ExecutableFileIdentityError {
             return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
@@ -167,5 +212,13 @@ struct CursorACPAgentProvider: ACPAgentProvider {
             .appendingPathComponent("RepoPromptCursorACPPreflight", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: nil)
         return url.standardizedFileURL.path
+    }
+
+    private static func semanticToken(_ value: String?) -> String {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_") ?? ""
     }
 }

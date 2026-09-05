@@ -663,7 +663,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ tabIDs: Set<UUID>,
         _ workspace: WorkspaceModel
     ) async -> [UUID: Error]
-
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
     private var saveCompletionWaitersBySessionID: [UUID: [CheckedContinuation<Void, Never>]] = [:]
@@ -729,6 +728,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
     #if DEBUG
+        var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
         var test_updateBindingsCallCount: Int = 0
         var test_syncComposerCallCount: Int = 0
         var test_syncRuntimeMetricsCallCount: Int = 0
@@ -1177,6 +1177,35 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedModelRaw = rawModel
     }
 
+    func selectCursorModelParameter(configID: String, valueRaw: String) {
+        guard selectedAgent == .cursor,
+              let session = activeSession,
+              !session.runState.isActive,
+              !isMCPControlled(tabID: session.tabID),
+              let parameterSet = ACPModelParameterResolver.cursorParameterSet(selectedModelRaw: selectedModelRaw)
+        else { return }
+        guard let definition = parameterSet.definition(configID: configID),
+              let choice = definition.choice(matching: valueRaw)
+        else { return }
+
+        let selection = ACPModelParameterSelection(
+            providerID: .cursor,
+            baseModelRaw: parameterSet.baseModelRaw,
+            kind: definition.kind,
+            configID: definition.configID,
+            valueRaw: choice.rawValue
+        )
+        let updatedSelections = ACPModelParameterSelection.normalized(
+            session.acpModelParameterSelections + [selection]
+        )
+        guard updatedSelections != session.acpModelParameterSelections else { return }
+        session.acpModelParameterSelections = updatedSelections
+        session.isDirty = true
+        scheduleSave(for: session.tabID)
+        syncComposerUIState()
+        syncRunInteractionUIState()
+    }
+
     /// Persist the last-used model for a given agent to UserDefaults.
     private static func persistModelForAgent(agentRaw: String, modelRaw: String) {
         var dict = UserDefaults.standard.dictionary(forKey: lastUsedModelsByAgentKey) as? [String: String] ?? [:]
@@ -1525,9 +1554,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func syncSelectedACPModelFromRegistryIfNeeded(for agent: AgentProviderKind) {
-        // Grok's "default" selection must stick: a discovered session's current model is
-        // never auto-adopted as an explicit selection (default sends no model mutation).
-        guard agent != .grokBuild else { return }
+        guard Self.shouldAdoptDiscoveredPreferredModel(for: agent) else { return }
         guard selectedAgent == agent,
               let providerID = agent.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
@@ -1554,6 +1581,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isRestoringState = false
         persistLastUsedModelIfNeeded(agent: agent, modelRaw: preferredModelRaw)
     }
+
+    private nonisolated static func shouldAdoptDiscoveredPreferredModel(
+        for agent: AgentProviderKind
+    ) -> Bool {
+        // Grok's default sends no model mutation. Cursor's release catalog is the
+        // selection authority, while discovery only reconciles runtime capabilities.
+        agent != .grokBuild && agent != .cursor
+    }
+
+    #if DEBUG
+        @_spi(TestSupport)
+        public nonisolated static func test_shouldAdoptDiscoveredPreferredModel(
+            for agent: AgentProviderKind
+        ) -> Bool {
+            shouldAdoptDiscoveredPreferredModel(for: agent)
+        }
+    #endif
 
     private nonisolated static func defaultHeadlessProviderFactory(
         agent: AgentProviderKind,
@@ -3926,6 +3970,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selectedAgent = normalizedSelection.agent
         session.selectedModelRaw = normalizedSelection.modelRaw
         session.selectedReasoningEffortRaw = indexEntry.agentReasoningEffortRaw
+        session.acpModelParameterSelections = indexEntry.acpModelParameterSelections
         session.autoEditEnabled = indexEntry.autoEditEnabled
     }
 
@@ -4793,6 +4838,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessionIndexStore.removeSortDate(forTabID: session.tabID)
         }
         session.selectedAgent = payload.normalizedSelection.agent
+        session.acpModelParameterSelections = agentSession.acpModelParameterSelections
         if session.transcriptAnalyticsSnapshot.selectedAgent != session.selectedAgent {
             session.transcriptAnalyticsSnapshot.selectedAgent = session.selectedAgent
         }
@@ -5896,6 +5942,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentDisplayName: session.selectedAgent.displayName,
             modelRaw: session.selectedModelRaw,
             reasoningEffortRaw: session.selectedReasoningEffortRaw,
+            modelParameterSelections: AgentMCPModelParameterSupport.effectiveSelections(
+                session.acpModelParameterSelections,
+                agentRaw: session.selectedAgent.rawValue,
+                modelRaw: session.selectedModelRaw
+            ).map {
+                AgentRunMCPSnapshot.ModelParameterSelection(
+                    providerID: $0.providerID.rawValue,
+                    baseModelRaw: $0.baseModelRaw,
+                    kind: $0.kind.rawValue,
+                    configID: $0.configID,
+                    valueRaw: $0.valueRaw
+                )
+            },
             status: status,
             statusText: resolvedStatusText,
             latestAssistantPreview: mcpResolvedAssistantPreview(session: session, status: status),
@@ -7145,6 +7204,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 agentKindRaw: existingEntry.agentKindRaw,
                 agentModelRaw: existingEntry.agentModelRaw,
                 agentReasoningEffortRaw: existingEntry.agentReasoningEffortRaw,
+                acpModelParameterSelections: existingEntry.acpModelParameterSelections,
                 autoEditEnabled: existingEntry.autoEditEnabled,
                 parentSessionID: parentSessionID,
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
@@ -7538,9 +7598,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         agentRaw: String?,
         modelRaw: String?,
-        reasoningEffortRaw: String?
+        reasoningEffortRaw: String?,
+        modelParameterSelections: [ACPModelParameterSelection] = [],
+        requireInactiveRunState: Bool = false,
+        expectedTarget: PersistentBindingTransitionToken? = nil
     ) async throws {
+        if let expectedTarget, !persistentBindingTransitionIsCurrent(expectedTarget) {
+            throw MCPError.invalidParams("The agent session binding changed before model configuration.")
+        }
         let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        let expectedSessionID = session.activeAgentSessionID
+        func requireConfigurationAdmission() throws {
+            guard requireInactiveRunState || !modelParameterSelections.isEmpty else { return }
+            guard sessions[tabID] === session,
+                  session.activeAgentSessionID == expectedSessionID,
+                  !session.bindingTransitionInProgress,
+                  expectedTarget.map(persistentBindingTransitionIsCurrent) ?? true
+            else {
+                throw MCPError.invalidParams("The agent session binding changed before model configuration.")
+            }
+            guard !session.runState.isActive else {
+                throw MCPError.invalidParams("Cannot change model settings while this session is actively running.")
+            }
+        }
+        try requireConfigurationAdmission()
         let normalized = normalizedSelection(
             agentRaw: agentRaw ?? session.selectedAgent.rawValue,
             modelRaw: modelRaw ?? session.selectedModelRaw,
@@ -7555,6 +7636,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        try mcpValidateModelParameterSelections(
+            selectedAgent: normalized.agent,
+            selectedModelRaw: normalized.modelRaw,
+            selections: modelParameterSelections
+        )
         let previousAgent = session.selectedAgent
         if previousAgent != normalized.agent {
             codexCoordinator.handleProviderSwitch(from: previousAgent, to: normalized.agent, session: session)
@@ -7565,11 +7651,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        // Recheck after awaited hydration/provider setup, then apply the complete
+        // configuration without suspension before another run can be admitted.
+        try requireConfigurationAdmission()
         session.selectedAgent = normalized.agent
         session.selectedModelRaw = normalized.modelRaw
         if let reasoningEffortRaw {
             session.selectedReasoningEffortRaw = reasoningEffortRaw
         }
+        try mcpApplyModelParameterSelections(tabID: tabID, selections: modelParameterSelections)
         // Recompute the MCP permission profile after a provider change so a `.custom`
         // tri-state policy's per-provider override never goes stale on an already-active
         // MCP-controlled session (sub-agent or top-level).
@@ -7815,6 +7905,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return identities(source) == identities(target)
     }
 
+    @discardableResult
     func mcpActivateControlContext(
         forTabID tabID: UUID,
         sessionID: UUID,
@@ -7823,7 +7914,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         startPending: Bool = false,
         markSessionAsMCPOriginated: Bool = true,
         requireInactiveRunState: Bool = false
-    ) async throws {
+    ) async throws -> AgentMCPControlContext {
         let session = await ensureSessionReady(tabID: tabID)
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
@@ -7869,6 +7960,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 "The Agent session runtime is shutting down and cannot activate a control session."
             )
         }
+        #if DEBUG
+            await test_afterMCPControlRegistration?(activationID)
+        #endif
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
               !session.bindingTransitionInProgress,
@@ -7886,7 +7980,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
             : session.autoEditEnabled
-        session.mcpControlContext = AgentMCPControlContext(
+        let activatedContext = AgentMCPControlContext(
             sessionID: sessionID,
             activationID: activationID,
             registration: registration,
@@ -7903,6 +7997,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEditEnabledBeforeOverride: priorAutoEditEnabled,
             taskLabelKind: taskLabelKind
         )
+        session.mcpControlContext = activatedContext
         let cancellationInstalled = await AgentRunSessionStore.installCancellationHandler(
             registration: registration
         ) { [weak self] in
@@ -7912,6 +8007,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 activationID: activationID,
                 registration: registration
             )
+        }
+        guard sessions[tabID] === session,
+              session.mcpControlActivationGeneration == activationGeneration,
+              session.mcpControlContext?.activationID == activationID,
+              session.mcpControlContext?.registration == registration
+        else {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw MCPError.invalidParams("The MCP control activation was superseded during setup.")
         }
         guard cancellationInstalled else {
             session.mcpControlContext = nil
@@ -7952,10 +8055,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 updateGlobalDefault: false
             )
         }
+        guard sessions[tabID] === session,
+              session.mcpControlActivationGeneration == activationGeneration,
+              session.mcpControlContext?.activationID == activationID,
+              session.mcpControlContext?.registration == registration
+        else {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw MCPError.invalidParams("The MCP control activation was superseded during setup.")
+        }
         if tabID == currentTabID {
             updateBindingsFromSession(session)
         }
         handleObservedMCPStateChange(for: session)
+        return activatedContext
     }
 
     /// Discard a session target created by `mcpResolveOrCreateSessionTarget` when a later step
@@ -8036,6 +8148,54 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             updateBindingsFromSession(session)
             refreshAutoEditPermissionGuidanceForActiveSession()
         }
+    }
+
+    /// Failed resume attempts may release only the activation they created.
+    /// Detach local ownership before suspension; later cleanup names the exact
+    /// registration, so it cannot clear a successor installed while awaiting.
+    func mcpDeactivateOwnedControlContext(
+        sessionID: UUID,
+        expectedContext: AgentMCPControlContext
+    ) async -> Bool {
+        guard let session = mcpControlledSession(sessionID: sessionID),
+              let context = session.mcpControlContext,
+              context.activationID == expectedContext.activationID,
+              context.registration == expectedContext.registration,
+              !session.runState.isActive
+        else { return false }
+        mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
+        codexCoordinator.handleMCPControlReset(
+            for: session,
+            reason: "Codex queued follow-up was cancelled because its MCP resume failed."
+        )
+        session.mcpControlActivationGeneration &+= 1
+        let deactivationGeneration = session.mcpControlActivationGeneration
+        session.mcpControlCleanupTask?.cancel()
+        session.mcpControlCleanupTask = nil
+        session.mcpFollowUpRunPending = false
+        if context.forceAutoEditEnabled {
+            session.autoEditEnabled = context.autoEditEnabledBeforeOverride
+        }
+        session.mcpControlContext = nil
+        mcpControlledTabIDs.remove(session.tabID)
+        session.permissionProfile = .userConfigured
+        if session.tabID == currentTabID {
+            updateBindingsFromSession(session)
+            refreshAutoEditPermissionGuidanceForActiveSession()
+        }
+        if context.forceAutoEditEnabled {
+            await applyEditsApprovalStore.setAutoEditEnabled(
+                context.autoEditEnabledBeforeOverride,
+                for: applyEditsScope(for: session.tabID),
+                updateGlobalDefault: false
+            )
+        }
+        await AgentRunSessionStore.removeCancellationHandler(registration: context.registration)
+        await AgentRunSessionStore.cleanup(registration: context.registration)
+        return sessions[session.tabID] === session
+            && session.mcpControlActivationGeneration == deactivationGeneration
+            && session.mcpControlContext == nil
+            && !session.runState.isActive
     }
 
     private func mcpCancelControlRunIfCurrent(
@@ -11389,6 +11549,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         agentKindRaw: String?,
         agentModelRaw: String?,
         agentReasoningEffortRaw: String?,
+        acpModelParameterSelections: [ACPModelParameterSelection] = [],
         autoEditEnabled: Bool,
         parentSessionID: UUID? = nil,
         hasUnknownConversationContent: Bool = false,
@@ -11407,6 +11568,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentKindRaw: agentKindRaw,
             agentModelRaw: agentModelRaw,
             agentReasoningEffortRaw: agentReasoningEffortRaw,
+            acpModelParameterSelections: acpModelParameterSelections,
             autoEditEnabled: autoEditEnabled,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
@@ -12965,6 +13127,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentKind: session.selectedAgent.rawValue,
             agentModel: session.selectedModelRaw,
             agentReasoningEffort: session.selectedReasoningEffortRaw,
+            acpModelParameterSelections: session.acpModelParameterSelections,
             lastRunState: session.runState.rawValue,
             providerSessionID: session.providerSessionID,
             providerCleanupHandle: providerCleanupHandle(
@@ -13018,6 +13181,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 agentKindRaw: agentSession.agentKind,
                 agentModelRaw: agentSession.agentModel,
                 agentReasoningEffortRaw: agentSession.agentReasoningEffort,
+                acpModelParameterSelections: agentSession.acpModelParameterSelections,
                 autoEditEnabled: agentSession.autoEditEnabled,
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
@@ -13487,6 +13651,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let selectedAgent: AgentProviderKind
         let selectedModelRaw: String
         let selectedReasoningEffortRaw: String?
+        let acpModelParameterSelections: [ACPModelParameterSelection]
         let autoEditEnabled: Bool
         let selectedWorkflow: AgentWorkflowDefinition?
         let imageAttachments: [AgentImageAttachment]
@@ -13504,6 +13669,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             selectedAgent = session?.selectedAgent ?? fallbackSelectedAgent
             selectedModelRaw = session?.selectedModelRaw ?? fallbackSelectedModelRaw
             selectedReasoningEffortRaw = session?.selectedReasoningEffortRaw ?? fallbackSelectedReasoningEffortRaw
+            acpModelParameterSelections = session?.acpModelParameterSelections ?? []
             autoEditEnabled = session?.autoEditEnabled ?? fallbackAutoEditEnabled
             selectedWorkflow = session?.selectedWorkflow
             imageAttachments = session?.pendingImageAttachments ?? []
@@ -13517,6 +13683,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return selectedAgent == session.selectedAgent
                 && selectedModelRaw == session.selectedModelRaw
                 && selectedReasoningEffortRaw == session.selectedReasoningEffortRaw
+                && acpModelParameterSelections == session.acpModelParameterSelections
                 && autoEditEnabled == session.autoEditEnabled
                 && selectedWorkflow == session.selectedWorkflow
                 && imageAttachments == session.pendingImageAttachments
@@ -13528,6 +13695,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session.selectedAgent = selectedAgent
             session.selectedModelRaw = selectedModelRaw
             session.selectedReasoningEffortRaw = selectedReasoningEffortRaw
+            session.acpModelParameterSelections = acpModelParameterSelections
             session.autoEditEnabled = autoEditEnabled
         }
     }
@@ -18452,6 +18620,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         destSession.selectedAgent = destinationAgent
         destSession.selectedModelRaw = destinationModelRaw
         destSession.selectedReasoningEffortRaw = destinationReasoningEffortRaw
+        if destinationAgent == sourceSession.selectedAgent,
+           ACPAIModelCatalog.normalizedCursorModelAlias(destinationModelRaw)
+           == ACPAIModelCatalog.normalizedCursorModelAlias(sourceSession.selectedModelRaw)
+        {
+            destSession.acpModelParameterSelections = sourceSession.acpModelParameterSelections
+        }
         destSession.autoEditEnabled = sourceSession.autoEditEnabled
         destSession.replaceItems(migratedItems)
         destSession.hasSentFirstMessage = migratedItems.contains { $0.kind == .user }

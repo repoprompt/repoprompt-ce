@@ -38,7 +38,7 @@ final class AgentSessionWorktreeBindingPersistenceTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
 
         XCTAssertEqual(decoded.serializationVersion, AgentSession.currentSerializationVersion)
-        XCTAssertEqual(decoded.serializationVersion, 7)
+        XCTAssertEqual(decoded.serializationVersion, 8)
         XCTAssertEqual(decoded.worktreeBindings, [binding])
     }
 

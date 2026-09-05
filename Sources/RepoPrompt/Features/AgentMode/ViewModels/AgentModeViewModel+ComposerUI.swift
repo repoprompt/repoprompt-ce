@@ -19,6 +19,8 @@ extension AgentModeViewModel {
             return makeRunCancelTarget(tabID: tabID, session: session)
         }()
         let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
+        let cursorRunLocksModelControls = selectedAgent == .cursor
+            && session?.runState.isActive == true
         return AgentComposerProps(
             currentTabID: tabID,
             submitTarget: submitTarget,
@@ -33,7 +35,7 @@ extension AgentModeViewModel {
             isWaitingForInstruction: isWaitingForInstruction,
             canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
             isCurrentTabMCPControlled: isMCPControlled,
-            areModelControlsDisabled: isMCPControlled,
+            areModelControlsDisabled: isMCPControlled || cursorRunLocksModelControls,
             providerControls: activeProviderControlsBinding,
             isCodexRunActive: isCodexRunActive,
             hasAvailableAgentProviders: hasAvailableAgentProviders,
@@ -44,6 +46,7 @@ extension AgentModeViewModel {
             selectedModelDisplayName: selectedModelDisplayName,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
+            cursorModelParameterControls: cursorModelParameterControls(session: session),
             availableAgents: availableAgents,
             isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
             lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
@@ -52,6 +55,25 @@ extension AgentModeViewModel {
             draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
             fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session)
         )
+    }
+
+    private func cursorModelParameterControls(session: TabSession?) -> [AgentComposerModelParameterControlProps] {
+        let resolved = ACPModelParameterResolver.resolve(
+            providerID: selectedAgent.acpProviderID ?? .openCode,
+            selectedModelRaw: selectedModelRaw,
+            persistedSelections: session?.acpModelParameterSelections ?? []
+        )
+        return resolved.map { parameter in
+            .init(
+                kind: parameter.definition.kind,
+                baseModelRaw: parameter.baseModelRaw,
+                configID: parameter.definition.configID,
+                displayName: parameter.definition.displayName,
+                selectedValueRaw: parameter.selectedChoice.rawValue,
+                selectedDisplayName: parameter.selectedChoice.displayName,
+                choices: parameter.definition.choices
+            )
+        }
     }
 
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {

@@ -32,7 +32,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 formatVersion: 1,
                 authority: "generated-review-projection-only",
                 generatedFrom: "Sources/RepoPromptDomainRuntime/MCPDomainCanonicalToolDefinitions.swift",
-                regeneration: "mkdir -p .build && touch .build/update-mcp-domain-schema-review-snapshot && make dev-test FILTER=ToolCatalogSnapshotTests/testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot"
+                regeneration: "mkdir -p .build && touch .build/update-mcp-domain-schema-review-snapshot && make dev-test FILTER=DirectHeadlessCompositionTests/testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot"
             ),
             tools: definitions
         )
@@ -1041,7 +1041,45 @@ package enum MCPDomainCanonicalToolDefinitions {
         else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
-        return definitions.map(canonicalizeGlobalSemantics)
+        return definitions.map(canonicalizeGlobalSemantics).map(advertiseModelParameters)
+    }
+
+    private static func advertiseModelParameters(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard [MCPWindowToolName.agentRun, MCPWindowToolName.agentManage].contains(definition.name),
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else { return definition }
+
+        let operations = definition.name == MCPWindowToolName.agentRun ? "start" : "create_session, resume_session"
+        properties["model_parameters"] = .object([
+            "type": .string("array"),
+            "description": .string("[\(operations)] Exact provider parameters for app-backed Cursor sessions, advertised by agent_manage.list_agents for the selected model. Unknown config IDs or values are rejected before the session starts. Standalone headless sessions do not support parameter overrides."),
+            "items": .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "config_id": .object([
+                        "type": .string("string"),
+                        "description": .string("Exact provider config identifier from model_parameters[].config_id.")
+                    ]),
+                    "value": .object([
+                        "type": .string("string"),
+                        "description": .string("Exact advertised choice value from model_parameters[].choices[].value.")
+                    ])
+                ]),
+                "required": .array([.string("config_id"), .string("value")])
+            ])
+        ])
+        schema["properties"] = .object(properties)
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: definition.description
+                + "\n\n**Cursor parameters**: `\(operations)` accept `model_parameters` as exact `config_id` and `value` pairs for app-backed Cursor sessions. Discover choices in `agent_manage.list_agents`; catalog `current_value` is the catalog default, not a live session value. Selections are applied before prompting and returned in session snapshots. Standalone headless sessions reject parameter overrides.",
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
     }
 
     private static func canonicalizeGlobalSemantics(

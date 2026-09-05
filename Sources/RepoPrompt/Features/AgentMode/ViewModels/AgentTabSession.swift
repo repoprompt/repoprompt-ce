@@ -495,6 +495,7 @@ final class AgentTabSession: ObservableObject {
     var selectedAgent: AgentProviderKind = .claudeCode
     var selectedModelRaw: String = AgentModel.defaultModel.rawValue
     var selectedReasoningEffortRaw: String?
+    var acpModelParameterSelections: [ACPModelParameterSelection] = []
     var autoEditEnabled: Bool = true
     var selectedModel: AgentModel {
         get { AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel }
