@@ -481,6 +481,17 @@ extension OracleViewModel {
                 }
                 continue
             }
+            // The app sends from ChatSession history, not the canonical result log.
+            if group.turns.contains(where: { turn in
+                turn.results.contains {
+                    $0.laneIndex == member.laneID.index
+                        && ($0.response != nil || $0.error?.partialResponse != nil)
+                }
+            }) {
+                throw ChatToolError.invalidParams(
+                    "Oracle conversation history is unavailable. Restore the chat history or set new_chat=true."
+                )
+            }
             let created = await startNewChatSession(
                 id: member.memberID.rawValue,
                 name: expectedName,
