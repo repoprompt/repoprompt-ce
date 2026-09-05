@@ -138,6 +138,8 @@ final class AgentProviderPreferenceSnapshotStore {
         case .omp:
             let level = effectiveOMPPermissionLevel(profile: profile)
             return AgentProviderRuntimePermissionBinding(acpSessionModeID: level.sessionModeID)
+        case .devin:
+            return AgentProviderRuntimePermissionBinding()
         case .grokBuild:
             let level = effectiveGrokBuildPermissionLevel(profile: profile)
             // For Grok this flag becomes a launch-time `--always-approve` argument in the
@@ -164,6 +166,8 @@ final class AgentProviderPreferenceSnapshotStore {
             GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .omp(level):
             OMPAgentToolPreferences.setPermissionLevel(level, defaults: defaults)
+        case .devin:
+            break
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -409,6 +413,26 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .devin:
+            let level = AgentProviderPermissionLevelID.devin
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: level.displayName,
+                iconName: level.iconName,
+                isWarning: level.isWarning,
+                externallyManagedReason: level.detailText,
+                options: [
+                    AgentPermissionOptionBinding(
+                        id: level,
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: true,
+                        isEnabled: false
+                    )
+                ]
+            )
         case .grokBuild:
             let effective = effectiveGrokBuildPermissionLevel(profile: profile)
             return AgentPermissionChromeBinding(
@@ -653,6 +677,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .cursor: .cursor
         case .grokBuild: .grokBuild
         case .omp: .omp
+        case .devin: .devin
         }
     }
 

@@ -311,6 +311,10 @@ public class APISettingsViewModel: ObservableObject {
     @Published var isOMPConnected: Bool = UserDefaults.standard.bool(forKey: "OMPCLIConnected")
     @Published var ompError: String? = nil
     private var ompLogCollector: CLIProcessLogCollector?
+    // Devin CLI / ACP
+    @Published var isDevinConnected: Bool = UserDefaults.standard.bool(forKey: "DevinCLIConnected")
+    @Published var devinError: String? = nil
+    private var devinLogCollector: CLIProcessLogCollector?
 
     /// CLI connection flags are persisted configuration hints, not proof that the provider is
     /// usable in the current process. Context Builder restoration waits for this validation pass
@@ -394,6 +398,7 @@ public class APISettingsViewModel: ObservableObject {
             cursorAvailable: isCursorConnected,
             grokBuildAvailable: isGrokBuildConnected,
             ompAvailable: isOMPConnected,
+            devinAvailable: isDevinConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -426,6 +431,7 @@ public class APISettingsViewModel: ObservableObject {
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
             $isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
             $isOMPConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isDevinConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
@@ -448,6 +454,7 @@ public class APISettingsViewModel: ObservableObject {
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
             grokBuildAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokBuildConnected,
             ompAvailable: isVerifiedContextBuilderProvider(.omp) && isOMPConnected,
+            devinAvailable: false,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -505,6 +512,8 @@ public class APISettingsViewModel: ObservableObject {
             isGrokBuildConnected
         case .omp:
             isOMPConnected
+        case .devin:
+            isDevinConnected
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -554,7 +563,8 @@ public class APISettingsViewModel: ObservableObject {
             NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
             NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
             NotificationCenter.default.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild },
-            NotificationCenter.default.publisher(for: .ompConnectionChanged).map { _ in AgentProviderKind.omp }
+            NotificationCenter.default.publisher(for: .ompConnectionChanged).map { _ in AgentProviderKind.omp },
+            NotificationCenter.default.publisher(for: .devinConnectionChanged).map { _ in AgentProviderKind.devin }
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] provider in
@@ -609,6 +619,7 @@ public class APISettingsViewModel: ObservableObject {
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
         isGrokBuildConnected = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
         isOMPConnected = UserDefaults.standard.bool(forKey: "OMPCLIConnected")
+        isDevinConnected = UserDefaults.standard.bool(forKey: "DevinCLIConnected")
         if wasGrokBuildConnected != isGrokBuildConnected {
             if isGrokBuildConnected {
                 startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
@@ -3820,6 +3831,97 @@ public class APISettingsViewModel: ObservableObject {
         let url = try collector.writeMarkdownToDownloads(
             baseFilename: "RepoPrompt-OMPTrace",
             title: "Oh My Pi CLI Connection Trace",
+            timestamp: exportDate
+        )
+        collector.append("Trace exported to \(url.lastPathComponent)")
+        return url
+    }
+
+    // MARK: - Devin CLI / ACP
+
+    func testDevinConnection() async throws -> Bool {
+        let collector = CLIProcessLogCollector()
+        collector.append("Devin CLI connection test started")
+        devinLogCollector = collector
+
+        collector.append("Refreshing login-shell environment cache")
+        await CLIEnvironmentCache.shared.invalidate()
+
+        do {
+            guard let models = try await DevinACPModelDiscoveryService.discoverModels(),
+                  !models.options.isEmpty
+            else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Devin CLI ACP did not advertise any selectable models."
+                )
+            }
+            isDevinConnected = true
+            devinError = nil
+            UserDefaults.standard.set(true, forKey: "DevinCLIConnected")
+            collector.append("Devin CLI marked as connected with \(models.options.count) model(s)")
+            devinLogCollector = nil
+            NotificationCenter.default.post(
+                name: .devinConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            return true
+        } catch {
+            collector.append("Connection test threw error: \(error.localizedDescription)")
+            isDevinConnected = false
+            devinError = friendlyDevinMessage(for: error)
+            UserDefaults.standard.set(false, forKey: "DevinCLIConnected")
+            collector.append("User guidance: \(devinError ?? error.localizedDescription)")
+            NotificationCenter.default.post(
+                name: .devinConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            throw error
+        }
+    }
+
+    func disconnectDevin() {
+        isDevinConnected = false
+        devinError = nil
+        UserDefaults.standard.set(false, forKey: "DevinCLIConnected")
+        NotificationCenter.default.post(
+            name: .devinConnectionChanged,
+            object: nil,
+            userInfo: ["windowID": 0]
+        )
+    }
+
+    private func friendlyDevinMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError,
+           case let .invalidConfiguration(detail) = providerError
+        {
+            return detail
+        }
+        let message = error.localizedDescription
+        let lowered = message.lowercased()
+        if lowered.contains("not installed") || lowered.contains("not found") || lowered.contains("no such file") {
+            return "Devin CLI was not found. Install it and ensure `devin acp` is available."
+        }
+        if lowered.contains("permission denied") {
+            return "Permission denied. Ensure the `devin` executable is accessible."
+        }
+        return message
+    }
+
+    func hasDevinTrace() -> Bool {
+        devinLogCollector?.isEmpty == false
+    }
+
+    func dumpDevinTrace() throws -> URL {
+        guard let collector = devinLogCollector else {
+            throw CLIProcessLogCollectorError.noEntries
+        }
+        collector.append("Exporting trace to Downloads folder")
+        let exportDate = Date()
+        let url = try collector.writeMarkdownToDownloads(
+            baseFilename: "RepoPrompt-DevinTrace",
+            title: "Devin CLI Connection Trace",
             timestamp: exportDate
         )
         collector.append("Trace exported to \(url.lastPathComponent)")

@@ -629,7 +629,7 @@ enum ACPPermissionOptionPolicy {
     /// bare kind match would otherwise select it and broaden approval beyond the request.
     static func denylistedAutoSelectOptionIDs(for providerID: ACPProviderID) -> Set<String> {
         switch providerID {
-        case .openCode, .cursor, .omp:
+        case .openCode, .cursor, .omp, .devin:
             []
         case .grokBuild:
             ["enable-always-approve"]

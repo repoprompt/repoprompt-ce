@@ -172,7 +172,7 @@ extension AgentProviderPermissionProfile {
             openCodeSessionModeID
         case .omp:
             ompPermissionLevel().sessionModeID
-        case .cursor, .grokBuild:
+        case .cursor, .grokBuild, .devin:
             nil
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil

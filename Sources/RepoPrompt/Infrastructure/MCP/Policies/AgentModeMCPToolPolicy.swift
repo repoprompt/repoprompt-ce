@@ -48,7 +48,7 @@ enum AgentModeMCPToolPolicy {
             cursorGrantedTools
         case .grokBuild:
             grokBuildGrantedTools
-        case .omp:
+        case .omp, .devin:
             grantedTools
         }
     }
