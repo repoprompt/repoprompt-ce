@@ -1272,6 +1272,15 @@ actor ServerNetworkManager {
     #if DEBUG
         private var debugRoutingWindowSnapshotOverride: [MCPRoutingWindowSnapshot]?
         private var debugSuppressRoutingStatePersistenceForTesting = false
+
+        private struct DebugPersistedRoutingFixtureBackup {
+            let routingState: MCPRoutingState
+            let lastWindowByClientSession: [String: [String: Int]]
+            let suppressRoutingStatePersistence: Bool
+            let routingWindowSnapshotOverride: [MCPRoutingWindowSnapshot]?
+        }
+
+        private var debugPersistedRoutingFixtureBackup: DebugPersistedRoutingFixtureBackup?
     #endif
     /// In-memory last window selection per (clientID, sessionKey) for quick access
     /// Outer key is clientID, inner key is sessionKey -> windowID
@@ -13590,6 +13599,15 @@ actor ServerNetworkManager {
             records: [MCPRoutingState.ClientRecord],
             cachedWindowIDs: [String: Int] = [:]
         ) {
+            if debugPersistedRoutingFixtureBackup == nil {
+                debugPersistedRoutingFixtureBackup = DebugPersistedRoutingFixtureBackup(
+                    routingState: routingState,
+                    lastWindowByClientSession: lastWindowByClientSession,
+                    suppressRoutingStatePersistence: debugSuppressRoutingStatePersistenceForTesting,
+                    routingWindowSnapshotOverride: debugRoutingWindowSnapshotOverride
+                )
+            }
+
             var recordsByClient: [String: [MCPRoutingState.ClientRecord]] = [:]
             for record in records {
                 recordsByClient[record.clientID, default: []].append(record)
@@ -13605,6 +13623,15 @@ actor ServerNetworkManager {
                 lastWindowByClientSession[record.clientID, default: [:]][sessionKey] = cachedWindowID
             }
             debugSuppressRoutingStatePersistenceForTesting = true
+        }
+
+        func debugRestorePersistedRoutingFixtureForTesting() {
+            guard let backup = debugPersistedRoutingFixtureBackup else { return }
+            routingState = backup.routingState
+            lastWindowByClientSession = backup.lastWindowByClientSession
+            debugSuppressRoutingStatePersistenceForTesting = backup.suppressRoutingStatePersistence
+            debugRoutingWindowSnapshotOverride = backup.routingWindowSnapshotOverride
+            debugPersistedRoutingFixtureBackup = nil
         }
 
         func debugSetRoutingWindowSnapshotForTesting(_ snapshot: [MCPRoutingWindowSnapshot]?) {

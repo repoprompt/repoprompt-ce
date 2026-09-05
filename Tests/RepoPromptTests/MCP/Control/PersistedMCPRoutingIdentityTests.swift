@@ -12,37 +12,63 @@
             let sessionKey = "issue-862-boundary-\(UUID().uuidString)"
             let workspaceA = workspace(name: "Restored A", root: "/tmp/issue-862-a")
             let workspaceB = workspace(name: "Unrelated B", root: "/tmp/issue-862-b")
-            let liveB = try await makeWindow(activeWorkspace: workspaceB)
-            let restoredA = try await makeWindow(activeWorkspace: workspaceA)
+            let manager = ServerNetworkManager.shared
             let previousWindows = WindowStatesManager.shared.allWindows
-            WindowStatesManager.shared.allWindows = [liveB]
+            // Register first so XCTest runs this final restoration after the connection
+            // and each owned window have finished teardown while routing persistence is suppressed.
             addTeardownBlock { @MainActor in
+                await manager.debugRestorePersistedRoutingFixtureForTesting()
                 WindowStatesManager.shared.allWindows = previousWindows
-                _ = await liveB.mcpServer.setWindowToolsEnabled(false)
-                _ = await restoredA.mcpServer.setWindowToolsEnabled(false)
             }
+            // Snapshot and suppress shared routing persistence before any window setup can mutate it.
+            await manager.debugInstallPersistedRoutingFixtureForTesting(records: [])
+            WindowStatesManager.shared.allWindows = []
+            let liveB = try await makeWindow(activeWorkspace: workspaceB)
+            addTeardownBlock { @MainActor in
+                _ = await liveB.mcpServer.setWindowToolsEnabled(false)
+                WindowStatesManager.shared.allWindows.removeAll { $0 === liveB }
+                WindowStatesManager.shared.clearInstanceAssignment(forWindowID: liveB.windowID)
+                if !liveB.isClosing {
+                    await liveB.tearDown()
+                }
+            }
+            let restoredA = try await makeWindow(activeWorkspace: workspaceA)
+            addTeardownBlock { @MainActor in
+                _ = await restoredA.mcpServer.setWindowToolsEnabled(false)
+                WindowStatesManager.shared.allWindows.removeAll { $0 === restoredA }
+                WindowStatesManager.shared.clearInstanceAssignment(forWindowID: restoredA.windowID)
+                if !restoredA.isClosing {
+                    await restoredA.tearDown()
+                }
+            }
+            WindowStatesManager.shared.allWindows = [liveB]
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let liveBToolsEnabled = await liveB.mcpServer.setWindowToolsEnabled(true)
-            let restoredAToolsEnabled = await restoredA.mcpServer.setWindowToolsEnabled(true)
             XCTAssertTrue(liveBToolsEnabled)
-            XCTAssertTrue(restoredAToolsEnabled)
 
-            let manager = ServerNetworkManager()
+            let persistedWorkspaceInstanceNumber = 1
             let record = routingRecord(
                 clientName: clientName,
                 sessionKey: sessionKey,
                 windowID: liveB.windowID,
                 workspaceID: workspaceA.id,
-                instanceNumber: 1
+                instanceNumber: persistedWorkspaceInstanceNumber
             )
             await manager.debugInstallPersistedRoutingFixtureForTesting(
                 records: [record],
                 cachedWindowIDs: [sessionKey: liveB.windowID]
             )
+            let liveBInstanceNumber = try XCTUnwrap(
+                WindowStatesManager.shared.recordWorkspaceSwitch(
+                    forWindowID: liveB.windowID,
+                    to: workspaceB
+                )
+            )
+            liveB.workspaceInstanceNumber = liveBInstanceNumber
             await manager.debugSetRoutingWindowSnapshotForTesting([
                 MCPRoutingWindowSnapshot(
                     workspaceID: workspaceB.id,
-                    instanceNumber: 1,
+                    instanceNumber: liveBInstanceNumber,
                     windowID: liveB.windowID
                 )
             ])
@@ -65,14 +91,36 @@
                 arguments: ["_rawJSON": .bool(true)]
             )
             XCTAssertEqual(rejected.isError, true, toolText(rejected))
-            XCTAssertTrue(toolText(rejected).contains("persisted workspace/window affinity"), toolText(rejected))
+            XCTAssertTrue(toolText(rejected).contains("workspace routing affinity"), toolText(rejected))
             let selectedAfterRejectedCall = await manager.selectedWindow(for: connection.connectionID)
             XCTAssertNil(selectedAfterRejectedCall)
             let recordsBeforeRestore = await manager.debugRoutingRecordsForTesting(clientName: clientName)
             let retainedBeforeRestore = try XCTUnwrap(recordsBeforeRestore.first)
             XCTAssertEqual(retainedBeforeRestore.lastWorkspaceID, workspaceA.id)
-            XCTAssertEqual(retainedBeforeRestore.lastWorkspaceInstanceNumber, 1)
+            XCTAssertEqual(
+                retainedBeforeRestore.lastWorkspaceInstanceNumber,
+                persistedWorkspaceInstanceNumber
+            )
             XCTAssertNil(retainedBeforeRestore.lastWindowID)
+
+            // Restore A through the same instance-number authority that production uses.
+            // The allWindows list and enabled catalog provide the real live dispatch target
+            // without registering a persistent window-session fixture.
+            _ = await liveB.mcpServer.setWindowToolsEnabled(false)
+            WindowStatesManager.shared.allWindows = []
+            WindowStatesManager.shared.clearInstanceAssignment(forWindowID: liveB.windowID)
+            liveB.beginClose()
+            await liveB.tearDown()
+            let restoredAInstanceNumber = try XCTUnwrap(
+                WindowStatesManager.shared.recordWorkspaceSwitch(
+                    forWindowID: restoredA.windowID,
+                    to: workspaceA
+                )
+            )
+            restoredA.workspaceInstanceNumber = restoredAInstanceNumber
+            XCTAssertEqual(restoredAInstanceNumber, persistedWorkspaceInstanceNumber)
+            let restoredAToolsEnabled = await restoredA.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(restoredAToolsEnabled)
 
             // A is restored under a different numeric ID; the same real tools/call now
             // reaches the stable target rather than falling back to B.
@@ -80,7 +128,7 @@
             await manager.debugSetRoutingWindowSnapshotForTesting([
                 MCPRoutingWindowSnapshot(
                     workspaceID: workspaceA.id,
-                    instanceNumber: 1,
+                    instanceNumber: restoredAInstanceNumber,
                     windowID: restoredA.windowID
                 )
             ])
@@ -94,7 +142,10 @@
             let recordsAfterRestore = await manager.debugRoutingRecordsForTesting(clientName: clientName)
             let retainedAfterRestore = try XCTUnwrap(recordsAfterRestore.first)
             XCTAssertEqual(retainedAfterRestore.lastWorkspaceID, workspaceA.id)
-            XCTAssertEqual(retainedAfterRestore.lastWorkspaceInstanceNumber, 1)
+            XCTAssertEqual(
+                retainedAfterRestore.lastWorkspaceInstanceNumber,
+                restoredAInstanceNumber
+            )
         }
 
         func testReusedNumericWindowIDDoesNotRouteWorkspaceAToLiveWorkspaceB() async {
