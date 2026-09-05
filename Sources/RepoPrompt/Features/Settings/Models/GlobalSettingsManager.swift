@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 // MARK: - Canonical Settings Keys
 
@@ -488,6 +489,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     func globalAgentModelsProfile() -> AgentModelsSettingsProfile {
         AgentModelsSettingsProfile(
             planningModelRaw: scalarPreferences.modelSelection?.planningModel,
+            additionalOracleModelRaws: scalarPreferences.modelSelection?.additionalOracleModels ?? [],
             preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
             syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
             contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
@@ -505,6 +507,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         let normalized = normalizedAgentModelsProfile(profile)
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
         modelSelection.planningModel = normalized.planningModelRaw
+        modelSelection.additionalOracleModels = normalized.additionalOracleModelRaws.isEmpty
+            ? nil
+            : normalized.additionalOracleModelRaws
         modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
         modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
         scalarPreferences.modelSelection = modelSelection
@@ -630,9 +635,14 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         var globalChanged = false
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
         let planning = normalized(modelSelection.planningModel)
+        let additional = modelSelection.additionalOracleModels?.compactMap(normalized)
         let compose = normalized(modelSelection.preferredComposeModel)
-        if planning != modelSelection.planningModel || compose != modelSelection.preferredComposeModel {
+        if planning != modelSelection.planningModel
+            || additional != modelSelection.additionalOracleModels
+            || compose != modelSelection.preferredComposeModel
+        {
             modelSelection.planningModel = planning
+            modelSelection.additionalOracleModels = additional?.isEmpty == false ? additional : nil
             modelSelection.preferredComposeModel = compose
             scalarPreferences.modelSelection = modelSelection
             globalChanged = true
@@ -655,6 +665,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             guard var settings = agentModelsSettingsByWorkspaceID[workspaceID], var profile = settings.profile else { continue }
             let old = profile
             profile.planningModelRaw = normalized(profile.planningModelRaw)
+            profile.additionalOracleModelRaws = profile.additionalOracleModelRaws.compactMap(normalized)
             profile.preferredComposeModelRaw = normalized(profile.preferredComposeModelRaw)
             if let models = profile.contextBuilderModelsByAgent {
                 profile.contextBuilderModelsByAgent = models.mapValues { AIModel.rawValueWithoutOpenAIServiceTier($0) }
@@ -1117,6 +1128,19 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         if globalAgentModelsProfile() != oldAgentModelsProfile {
             postAgentModelsSettingsDidChange(scope: .global)
         }
+    }
+
+    func additionalOracleModelRaws() -> [String] {
+        scalarPreferences.modelSelection?.additionalOracleModels ?? []
+    }
+
+    func setAdditionalOracleModelRaws(_ raws: [String], commit: Bool = true) throws {
+        let normalized = try OracleRosterContract.normalizedAdditionalModelIDs(raws)
+        guard normalized != additionalOracleModelRaws() else { return }
+        updateModelSelectionScalar(commit: commit) { settings in
+            settings.additionalOracleModels = normalized.isEmpty ? nil : normalized
+        }
+        postAgentModelsSettingsDidChange(scope: .global)
     }
 
     func syncChatModelWithOracle() -> Bool {
@@ -2237,6 +2261,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     private func normalizedAgentModelsProfile(_ profile: AgentModelsSettingsProfile) -> AgentModelsSettingsProfile {
         var normalized = AgentModelsSettingsProfile(
             planningModelRaw: profile.planningModelRaw,
+            additionalOracleModelRaws: profile.additionalOracleModelRaws,
             preferredComposeModelRaw: profile.preferredComposeModelRaw,
             syncChatModelWithOracle: profile.syncChatModelWithOracle,
             contextBuilderAgentRaw: profile.contextBuilderAgentRaw,
@@ -2298,6 +2323,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         let contextBuilderModelRaw = profile.contextBuilderAgentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
         return [
             "planning=\(profile.planningModelRaw ?? "nil")",
+            "additionalOracles=\(profile.additionalOracleModelRaws.joined(separator: ","))",
             "compose=\(profile.preferredComposeModelRaw ?? "nil")",
             "sync=\(profile.syncChatModelWithOracle)",
             "contextBuilder=\(profile.contextBuilderAgentRaw ?? "nil"):\(contextBuilderModelRaw ?? "nil")",

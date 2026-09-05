@@ -322,6 +322,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 properties: [
                     "instructions": .string(description: "Your request, ideally structured with XML tags: <task> for the main goal, <context> for background/constraints/file references, <discovery_agent-guidelines> for optional starting hints. Describe what you need — the agent finds the right files."),
                     "response_type": .string(description: "Optional: 'plan' to generate implementation plan, 'question' to ask a question, or 'review' to generate a code review. Omit or 'clarify' to just return context.", enum: ["plan", "question", "review", "clarify"]),
+                    "context_pack_ref": .string(description: "Direct-headless only: canonical oracle-pack:sha256 reference to an already persisted frozen Context Builder package. Mutually exclusive with instructions."),
                     "export_response": .boolean(description: "When true, export the generated response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Requires a response_type that generates a response. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt.")
                 ],
                 required: []
@@ -342,6 +343,11 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         connectionID: UUID?,
         dependencies: Dependencies
     ) async throws -> ContextBuilderToolResult {
+        guard args["context_pack_ref"] == nil else {
+            throw MCPError.invalidParams(
+                "context_pack_ref is accepted only by the direct-headless Context Builder adapter."
+            )
+        }
         let instructions = args["instructions"]?.stringValue ?? ""
         let metadata = await dependencies.context.captureRequestMetadata()
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
@@ -821,7 +827,11 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                     } else {
                         planReply = reply
                     }
-                    followUpHint = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(reply.shortId)\", new_chat: false)"
+                    followUpHint = Self.generatedResponseFollowUpHint(
+                        modeLabel: modeLabel,
+                        chatID: reply.shortId,
+                        oracleCount: reply.oracleGroup?.result.oracleCount
+                    )
                 }
 
                 await dependencies.execution.sendStageProgress(
@@ -910,6 +920,18 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             }
             return try await runContextBuilderAndPlan()
         }
+    }
+
+    nonisolated static func generatedResponseFollowUpHint(
+        modeLabel: String,
+        chatID: String,
+        oracleCount: Int?
+    ) -> String {
+        let continuation = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(chatID)\", new_chat: false)"
+        guard let oracleCount, oracleCount > 1 else { return continuation }
+
+        let groupGuidance = "The Oracle group returned ordered, independent lane results. Check each result against the task and report unresolved disagreements."
+        return groupGuidance + "\n\nOptional later follow-up: " + continuation
     }
 
     nonisolated static func responseDisposition(

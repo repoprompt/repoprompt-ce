@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
@@ -61,13 +62,93 @@ final class DirectHeadlessCompositionTests: XCTestCase {
     }
 
     func testHeadlessCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
-        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil)
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .agent)
 
         XCTAssertFalse(arguments.contains("--full-auto"))
         XCTAssertEqual(
             Array(arguments.suffix(5)),
             ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
         )
+    }
+
+    func testDirectHeadlessOracleCodexExecUsesWorkspaceWriteSandbox() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .directOracle)
+
+        XCTAssertEqual(
+            Array(arguments.suffix(5)),
+            ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        )
+    }
+
+    func testGroupedHeadlessOracleCodexExecUsesReadOnlySandbox() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .oracleGroup)
+
+        XCTAssertEqual(
+            Array(arguments.suffix(5)),
+            ["--skip-git-repo-check", "--sandbox", "read-only", "--json", "-"]
+        )
+    }
+
+    func testGroupedOracleChildPolicyIsStrictlyReadOnly() {
+        let groupID = OracleGroupID()
+        let restricted = DirectHeadlessMCPService.childRestrictedToolNames(
+            base: [],
+            oracleGroupID: groupID
+        )
+        let visible = Set(MCPDomainToolCatalog.orderedToolNames).subtracting(restricted)
+
+        XCTAssertEqual(visible, DirectHeadlessMCPService.oracleGroupChildAllowedToolNames)
+        let allowedCapabilities = Set(visible.compactMap { MCPDomainToolCatalog.entry(named: $0)?.capability })
+        XCTAssertEqual(
+            allowedCapabilities,
+            [.structuralExplore, .fileRead, .fileSearch, .gitRead]
+        )
+        XCTAssertEqual(MCPDomainToolCatalog.entry(named: MCPWindowToolName.git)?.capability, .gitRead)
+        XCTAssertTrue(restricted.contains(MCPGlobalToolName.appSettings))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.agentExplore))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.agentRun))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.contextBuilder))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.applyEdits))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.fileActions))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.manageWorktree))
+
+        let inherited = Set([MCPWindowToolName.readFile])
+        XCTAssertTrue(DirectHeadlessMCPService.childRestrictedToolNames(
+            base: inherited,
+            oracleGroupID: groupID
+        ).contains(MCPWindowToolName.readFile))
+        XCTAssertEqual(
+            DirectHeadlessMCPService.childRestrictedToolNames(
+                base: inherited,
+                oracleGroupID: nil
+            ),
+            inherited
+        )
+    }
+
+    func testChildBridgeWriteTimeoutIsBoundedWhenDestinationStalls() throws {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.pipe(&descriptors), 0)
+        defer {
+            if descriptors[0] >= 0 { Darwin.close(descriptors[0]) }
+            if descriptors[1] >= 0 { Darwin.close(descriptors[1]) }
+        }
+
+        let payload = Data(repeating: 0x41, count: 1_000_000)
+        let clock = ContinuousClock()
+        let started = clock.now
+        XCTAssertThrowsError(
+            try DirectHeadlessChildBridge.writeAll(
+                payload,
+                to: descriptors[1],
+                stallTimeout: 0.05
+            )
+        ) { error in
+            guard case DirectHeadlessChildBridge.BridgeError.writeTimeout = error else {
+                return XCTFail("Expected writeTimeout, got \(error)")
+            }
+        }
+        XCTAssertTrue(started.duration(to: clock.now) < .seconds(2))
     }
 
     func testManageWorktreeFencesAbsoluteSelectorsToBoundWorkspaceRoots() throws {

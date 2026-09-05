@@ -1,11 +1,29 @@
 import Foundation
+import RepoPromptDomainRuntime
+
+private func sanitizedAdditionalOracleModelRaws(_ raws: [String]) -> [String] {
+    OracleRosterContract.sanitizedAdditionalModelIDs(raws)
+}
+
+private func strictAdditionalOracleModelRaws(_ raws: [String], codingPath: [CodingKey]) throws -> [String] {
+    do {
+        return try OracleRosterContract.normalizedAdditionalModelIDs(raws)
+    } catch {
+        throw DecodingError.dataCorrupted(
+            DecodingError.Context(
+                codingPath: codingPath,
+                debugDescription: "Invalid additional Oracle models: \(error.localizedDescription)"
+            )
+        )
+    }
+}
 
 /// Versioned JSON document stored at
 /// `~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json`.
 ///
 /// Schema v1 contains copy settings, chat settings, and cross-workspace global
 /// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
-/// workspace-scoped Agent Models profiles. Scalar fields stay optional so missing
+/// workspace-scoped Agent Models profiles. Schema v7 adds the Oracle roster. Scalar fields stay optional so missing
 /// JSON fields fall back through the typed GlobalSettingsStore accessors without
 /// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
@@ -14,7 +32,9 @@ struct GlobalSettingsDocument: Codable {
     /// version from `currentSchemaVersion`.
     static let baselineSchemaVersion = 2
     static let workspaceAgentModelsSchemaVersion = 4
-    static let currentSchemaVersion = 4
+    static let oracleRosterSchemaVersion = 7
+    static let rejectedExperimentalSchemaVersions = 5 ... 6
+    static let currentSchemaVersion = 7
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -77,6 +97,13 @@ struct GlobalSettingsDocument: Codable {
         var requiredVersion = Self.baselineSchemaVersion
         if let agentModelsSettingsByWorkspaceID, !agentModelsSettingsByWorkspaceID.isEmpty {
             requiredVersion = max(requiredVersion, Self.workspaceAgentModelsSchemaVersion)
+        }
+        let hasGlobalOracleRoster = scalarPreferences?.modelSelection?.additionalOracleModels?.isEmpty == false
+        let hasWorkspaceOracleRoster = agentModelsSettings.values.contains { settings in
+            settings.profile?.additionalOracleModelRaws.isEmpty == false
+        }
+        if hasGlobalOracleRoster || hasWorkspaceOracleRoster {
+            requiredVersion = max(requiredVersion, Self.oracleRosterSchemaVersion)
         }
         return requiredVersion
     }
@@ -175,6 +202,7 @@ enum ContextBuilderSettingsWriteIntent {
 
 struct AgentModelsSettingsProfile: Codable, Equatable {
     var planningModelRaw: String?
+    var additionalOracleModelRaws: [String]
     var preferredComposeModelRaw: String?
     var syncChatModelWithOracle: Bool
     var contextBuilderAgentRaw: String?
@@ -184,6 +212,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
 
     init(
         planningModelRaw: String? = nil,
+        additionalOracleModelRaws: [String] = [],
         preferredComposeModelRaw: String? = nil,
         syncChatModelWithOracle: Bool = false,
         contextBuilderAgentRaw: String? = nil,
@@ -192,6 +221,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         restrictMCPAgentDiscoveryToRoleLabels: Bool = false
     ) {
         self.planningModelRaw = Self.normalizedChatModelRaw(planningModelRaw)
+        self.additionalOracleModelRaws = sanitizedAdditionalOracleModelRaws(additionalOracleModelRaws)
         self.preferredComposeModelRaw = Self.normalizedChatModelRaw(preferredComposeModelRaw)
         self.syncChatModelWithOracle = syncChatModelWithOracle
         self.contextBuilderAgentRaw = Self.normalizedAgentRaw(contextBuilderAgentRaw)
@@ -202,6 +232,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case planningModelRaw
+        case additionalOracleModelRaws
         case preferredComposeModelRaw
         case syncChatModelWithOracle
         case contextBuilderAgentRaw
@@ -212,15 +243,31 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(
-            planningModelRaw: container.decodeIfPresent(String.self, forKey: .planningModelRaw),
-            preferredComposeModelRaw: container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw),
-            syncChatModelWithOracle: container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle) ?? false,
-            contextBuilderAgentRaw: container.decodeIfPresent(String.self, forKey: .contextBuilderAgentRaw),
-            contextBuilderModelsByAgent: container.decodeIfPresent([String: String].self, forKey: .contextBuilderModelsByAgent),
-            mcpAgentRoleOverrides: container.decodeIfPresent([String: String].self, forKey: .mcpAgentRoleOverrides),
-            restrictMCPAgentDiscoveryToRoleLabels: container.decodeIfPresent(Bool.self, forKey: .restrictMCPAgentDiscoveryToRoleLabels) ?? false
+        let additional = try strictAdditionalOracleModelRaws(
+            container.decodeIfPresent([String].self, forKey: .additionalOracleModelRaws) ?? [],
+            codingPath: container.codingPath + [CodingKeys.additionalOracleModelRaws]
         )
+        planningModelRaw = try Self.normalizedChatModelRaw(
+            container.decodeIfPresent(String.self, forKey: .planningModelRaw)
+        )
+        additionalOracleModelRaws = additional
+        preferredComposeModelRaw = try Self.normalizedChatModelRaw(
+            container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw)
+        )
+        syncChatModelWithOracle = try container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle) ?? false
+        contextBuilderAgentRaw = try Self.normalizedAgentRaw(
+            container.decodeIfPresent(String.self, forKey: .contextBuilderAgentRaw)
+        )
+        contextBuilderModelsByAgent = try Self.normalizedContextBuilderModelsByAgent(
+            container.decodeIfPresent([String: String].self, forKey: .contextBuilderModelsByAgent)
+        )
+        mcpAgentRoleOverrides = try Self.normalizedStringMap(
+            container.decodeIfPresent([String: String].self, forKey: .mcpAgentRoleOverrides)
+        )
+        restrictMCPAgentDiscoveryToRoleLabels = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .restrictMCPAgentDiscoveryToRoleLabels
+        ) ?? false
     }
 
     func replacingContextBuilderModel(_ modelRaw: String?, for agentRaw: String?) -> AgentModelsSettingsProfile {
@@ -461,16 +508,41 @@ struct GlobalScalarPreferences: Codable, Equatable {
     struct ModelSelectionSettings: Codable, Equatable {
         var preferredComposeModel: String?
         var planningModel: String?
+        var additionalOracleModels: [String]?
         var syncChatModelWithOracle: Bool?
 
         init(
             preferredComposeModel: String? = nil,
             planningModel: String? = nil,
+            additionalOracleModels: [String]? = nil,
             syncChatModelWithOracle: Bool? = nil
         ) {
             self.preferredComposeModel = preferredComposeModel
             self.planningModel = planningModel
+            self.additionalOracleModels = additionalOracleModels
             self.syncChatModelWithOracle = syncChatModelWithOracle
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case preferredComposeModel
+            case planningModel
+            case additionalOracleModels
+            case syncChatModelWithOracle
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            preferredComposeModel = try container.decodeIfPresent(String.self, forKey: .preferredComposeModel)
+            planningModel = try container.decodeIfPresent(String.self, forKey: .planningModel)
+            if let values = try container.decodeIfPresent([String].self, forKey: .additionalOracleModels) {
+                additionalOracleModels = try strictAdditionalOracleModelRaws(
+                    values,
+                    codingPath: container.codingPath + [CodingKeys.additionalOracleModels]
+                )
+            } else {
+                additionalOracleModels = nil
+            }
+            syncChatModelWithOracle = try container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle)
         }
     }
 

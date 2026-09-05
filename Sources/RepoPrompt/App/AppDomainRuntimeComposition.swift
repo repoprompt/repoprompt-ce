@@ -35,6 +35,8 @@ final class AppDomainRuntimeComposition: Sendable {
     ]
 
     let runtime: MCPDomainRuntime
+    let oracleConversationStore: DomainOracleConversationStore
+    let oracleGroupRuntime: OracleGroupRuntime
 
     static func collectLegacyRuntimeDefaults(from defaults: UserDefaults) -> [String: Data] {
         var collected: [String: Data] = [:]
@@ -71,7 +73,7 @@ final class AppDomainRuntimeComposition: Sendable {
         let workspaceStorageDirectory = customStoragePath.map {
             URL(fileURLWithPath: $0, isDirectory: true)
         } ?? root.appendingPathComponent("Workspaces", isDirectory: true)
-        runtime = MCPDomainRuntime(
+        let runtime = MCPDomainRuntime(
             configuration: DomainRuntimeConfiguration(
                 mode: .app,
                 profileIdentifier: "default",
@@ -83,6 +85,19 @@ final class AppDomainRuntimeComposition: Sendable {
                 legacyRuntimeDefaults: legacyRuntimeDefaults,
                 metrics: AppDomainRuntimeMetrics.editFlowSink
             )
+        )
+        self.runtime = runtime
+        oracleConversationStore = DomainOracleConversationStore(
+            persistence: runtime.persistenceCoordinator,
+            identity: runtime.identity
+        )
+        let oracleGroupClaimManager = OracleGroupClaimManager(
+            persistence: runtime.persistenceCoordinator,
+            identity: runtime.identity
+        )
+        oracleGroupRuntime = OracleGroupRuntime(
+            store: oracleConversationStore,
+            claimManager: oracleGroupClaimManager
         )
     }
 }

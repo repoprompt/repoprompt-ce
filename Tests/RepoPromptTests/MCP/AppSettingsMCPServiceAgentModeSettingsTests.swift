@@ -5,6 +5,64 @@ import XCTest
 
 @MainActor
 final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
+    func testOracleRosterSettingIsOrderedValidatedAndPersistedAsSchemaV7() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceOracleRosterTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceOracleRosterTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        let service = AppSettingsMCPService(store: store)
+        let key = "models.additional_oracle_models"
+
+        let listed = try await service.handleForTesting([
+            "op": .string("list"),
+            "group": .string("models"),
+            "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let catalog = try XCTUnwrap(settings.first { $0.objectValue?["key"]?.stringValue == key })
+        XCTAssertEqual(catalog.objectValue?["type"]?.stringValue, "string[]")
+        XCTAssertEqual(catalog.objectValue?["value"]?.arrayValue, [])
+
+        let set = try await service.handleForTesting([
+            "op": .string("set"),
+            "key": .string(key),
+            "value": .array([.string(" model-a "), .string("model-a"), .string("model-b")])
+        ])
+        XCTAssertEqual(
+            set.objectValue?["new_value"]?.arrayValue?.compactMap(\.stringValue),
+            ["model-a", "model-a", "model-b"]
+        )
+        XCTAssertEqual(store.additionalOracleModelRaws(), ["model-a", "model-a", "model-b"])
+
+        let persisted = try JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        XCTAssertEqual(persisted?["schemaVersion"] as? Int, 7)
+        let scalar = persisted?["scalarPreferences"] as? [String: Any]
+        let models = scalar?["modelSelection"] as? [String: Any]
+        XCTAssertEqual(models?["additionalOracleModels"] as? [String], ["model-a", "model-a", "model-b"])
+        XCTAssertNil(models?["secondaryPlanningModels"])
+
+        do {
+            _ = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string(key),
+                "value": .array(["a", "b", "c", "d", "e"].map(Value.string))
+            ])
+            XCTFail("Expected an oversized roster to be rejected")
+        } catch {
+            // Expected: validation is atomic and leaves the previous value intact.
+        }
+        XCTAssertEqual(store.additionalOracleModelRaws(), ["model-a", "model-a", "model-b"])
+    }
+
     func testCodexReasoningSummariesSettingListsReadsAndWrites() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)

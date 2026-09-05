@@ -2,7 +2,9 @@ import Foundation
 import MCP
 
 package enum DomainChildLaunchContext {
+    /// Exact N=1 compatibility carrier. Group execution uses `bundle` and leaves this nil.
     @TaskLocal package static var current: DomainChildLaunchCarrier?
+    @TaskLocal package static var bundle: DomainChildLaunchCarrierBundle?
 }
 
 package enum DomainInteractionPresentationContext {
@@ -32,6 +34,24 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         _ securityContext: DomainToolInvocationSecurityContext
     ) async throws -> DomainChildLaunchCarrier?
 
+    package typealias ResolveChildLaunchPlan = @Sendable (
+        _ toolName: String,
+        _ arguments: [String: Value],
+        _ securityContext: DomainToolInvocationSecurityContext
+    ) async throws -> DomainChildLaunchPlan?
+
+    package typealias PrepareChildLaunches = @Sendable (
+        _ plan: DomainChildLaunchPlan,
+        _ toolName: String,
+        _ arguments: [String: Value],
+        _ securityContext: DomainToolInvocationSecurityContext
+    ) async throws -> DomainChildLaunchCarrierBundle
+
+    package typealias RevokeChildLaunches = @Sendable (
+        _ plan: DomainChildLaunchPlan,
+        _ bundle: DomainChildLaunchCarrierBundle?
+    ) async -> Void
+
     package static let toolNames: Set<String> = [
         "oracle_utils",
         "ask_oracle",
@@ -51,6 +71,9 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
     private let interactionBroker: DomainInteractionBroker
     private let activityCenter: DomainActivityCenter
     private let prepareChildLaunch: PrepareChildLaunch
+    private let resolveChildLaunchPlan: ResolveChildLaunchPlan?
+    private let prepareChildLaunches: PrepareChildLaunches?
+    private let revokeChildLaunches: RevokeChildLaunches?
 
     package init(
         identity: DomainRuntimeIdentity,
@@ -64,6 +87,28 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         self.interactionBroker = interactionBroker
         self.activityCenter = activityCenter
         self.prepareChildLaunch = prepareChildLaunch
+        resolveChildLaunchPlan = nil
+        prepareChildLaunches = nil
+        revokeChildLaunches = nil
+    }
+
+    package init(
+        identity: DomainRuntimeIdentity,
+        policyStore: DomainMutationPolicyStore,
+        interactionBroker: DomainInteractionBroker,
+        activityCenter: DomainActivityCenter,
+        resolveChildLaunchPlan: @escaping ResolveChildLaunchPlan,
+        prepareChildLaunches: @escaping PrepareChildLaunches,
+        revokeChildLaunches: @escaping RevokeChildLaunches
+    ) {
+        self.identity = identity
+        self.policyStore = policyStore
+        self.interactionBroker = interactionBroker
+        self.activityCenter = activityCenter
+        prepareChildLaunch = { _, _, _ in nil }
+        self.resolveChildLaunchPlan = resolveChildLaunchPlan
+        self.prepareChildLaunches = prepareChildLaunches
+        self.revokeChildLaunches = revokeChildLaunches
     }
 
     package func wrapping(
@@ -108,30 +153,86 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                     interactionAdapter: interactionAdapter
                 )
             } else {
-                let authorizations = try await authorizeIfNeeded(
-                    toolName: toolName,
-                    arguments: arguments,
-                    context: securityContext
-                )
-                try Task.checkCancellation()
-                let carrier: DomainChildLaunchCarrier?
-                if requiresChildLaunch(toolName: toolName, arguments: arguments) {
+                let requiresLaunch = requiresChildLaunch(toolName: toolName, arguments: arguments)
+                let launchPlan: DomainChildLaunchPlan?
+                if requiresLaunch, let resolveChildLaunchPlan {
                     guard let securityContext else {
                         throw MCPError.invalidParams(
                             "approval_required_noninteractive: missing verified invocation identity"
                         )
                     }
-                    carrier = try await prepareChildLaunch(toolName, arguments, securityContext)
+                    guard let resolved = try await resolveChildLaunchPlan(
+                        toolName,
+                        arguments,
+                        securityContext
+                    ) else {
+                        throw MCPError.internalError(
+                            "child_launch_plan_missing: launch-requiring planned execution must resolve an exact plan"
+                        )
+                    }
+                    launchPlan = resolved
+                } else {
+                    launchPlan = nil
+                }
+                let authorizations: [DomainMutationAuthorizationSnapshot]
+                do {
+                    authorizations = try await authorizeIfNeeded(
+                        toolName: toolName,
+                        arguments: arguments,
+                        context: securityContext
+                    )
+                } catch {
+                    if let launchPlan { await revokeChildLaunches?(launchPlan, nil) }
+                    throw error
+                }
+                do {
+                    try Task.checkCancellation()
+                } catch {
+                    if let launchPlan { await revokeChildLaunches?(launchPlan, nil) }
+                    throw error
+                }
+                let carrier: DomainChildLaunchCarrier?
+                var bundle: DomainChildLaunchCarrierBundle?
+                if requiresLaunch {
+                    guard let securityContext else {
+                        throw MCPError.invalidParams(
+                            "approval_required_noninteractive: missing verified invocation identity"
+                        )
+                    }
+                    if let launchPlan, let prepareChildLaunches {
+                        do {
+                            bundle = try await prepareChildLaunches(
+                                launchPlan,
+                                toolName,
+                                arguments,
+                                securityContext
+                            )
+                        } catch {
+                            await revokeChildLaunches?(launchPlan, nil)
+                            throw error
+                        }
+                        carrier = bundle?.singleCarrier
+                    } else {
+                        carrier = try await prepareChildLaunch(toolName, arguments, securityContext)
+                    }
                 } else {
                     carrier = nil
                 }
-                for authorization in authorizations {
-                    try await policyStore.revalidate(authorization)
+                do {
+                    for authorization in authorizations {
+                        try await policyStore.revalidate(authorization)
+                    }
+                    try Task.checkCancellation()
+                    value = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
+                        try await DomainChildLaunchContext.$current.withValue(carrier) {
+                            try await binding(arguments)
+                        }
+                    }
+                } catch {
+                    if let launchPlan { await revokeChildLaunches?(launchPlan, bundle) }
+                    throw error
                 }
-                try Task.checkCancellation()
-                value = try await DomainChildLaunchContext.$current.withValue(carrier) {
-                    try await binding(arguments)
-                }
+                if let launchPlan { await revokeChildLaunches?(launchPlan, bundle) }
             }
             _ = await activityCenter.finish(
                 activity,
