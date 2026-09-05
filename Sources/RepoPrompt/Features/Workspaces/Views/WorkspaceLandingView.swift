@@ -67,8 +67,8 @@ struct WorkspaceLandingView: View {
 
     private var expandedContent: some View {
         VStack(alignment: .leading, spacing: 32) {
-            // Top: New workspace section
-            newWorkspaceSection
+            // Top: Open Folder section
+            openFolderSection
 
             // Bottom: Recent workspaces in two columns
             if !userWorkspaces.isEmpty {
@@ -82,7 +82,7 @@ struct WorkspaceLandingView: View {
         .frame(maxWidth: maxWidth, alignment: .center)
     }
 
-    private var newWorkspaceSection: some View {
+    private var openFolderSection: some View {
         ZStack(alignment: .topTrailing) {
             // Main content: left side + right links
             HStack(alignment: .top, spacing: 32) {
@@ -92,13 +92,13 @@ struct WorkspaceLandingView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(.primary)
 
-                    Text("Open a folder to create a new workspace")
+                    Text("Open a folder or reopen an existing workspace")
                         .font(.system(size: 13))
                         .foregroundColor(.secondary)
 
                     Button(action: onSelectFolder) {
                         HStack(spacing: 10) {
-                            Image(systemName: "folder.badge.plus")
+                            Image(systemName: "folder")
                                 .font(.system(size: 16))
                             Text("Open Folder")
                                 .font(.system(size: 14, weight: .medium))
@@ -234,7 +234,7 @@ struct WorkspaceLandingView: View {
             }
             Text("Workspaces")
                 .font(fontPreset.headlineFont)
-            Text("Open or drag a folder to create a new workspace.")
+            Text("Open a folder to open a workspace.")
                 .font(fontPreset.font)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(centered ? .center : .leading)
@@ -244,7 +244,7 @@ struct WorkspaceLandingView: View {
     private var openFolderButton: some View {
         Button(action: onSelectFolder) {
             HStack {
-                Image(systemName: "folder.badge.plus")
+                Image(systemName: "folder")
                 Text("Open Folder")
                     .font(fontPreset.font)
             }
@@ -252,7 +252,7 @@ struct WorkspaceLandingView: View {
             .padding(.horizontal, 4)
         }
         .buttonStyle(CustomButtonStyle())
-        .hoverTooltip("Open a folder and create a new workspace", .top)
+        .hoverTooltip("Open a folder or reopen a matching workspace", .top)
     }
 
     @ViewBuilder

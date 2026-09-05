@@ -117,6 +117,7 @@ package struct DomainContextMetadata: Codable, Equatable {
 package struct DomainWorkspaceMetadata: Codable, Equatable {
     package let workspaceID: UUID
     package let schemaVersion: Int
+    package let dateModified: Date
     package let name: String
     package let repoPaths: [String]
     package let customStoragePath: URL?
@@ -131,6 +132,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
     package init(
         workspaceID: UUID,
         schemaVersion: Int,
+        dateModified: Date,
         name: String,
         repoPaths: [String],
         customStoragePath: URL?,
@@ -144,6 +146,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
     ) {
         self.workspaceID = workspaceID
         self.schemaVersion = schemaVersion
+        self.dateModified = dateModified
         self.name = name
         self.repoPaths = repoPaths
         self.customStoragePath = customStoragePath
@@ -194,6 +197,14 @@ package struct DomainWorkspaceSnapshot: Codable, Equatable {
     package let revisions: DomainRevisionState
     package let health: DomainAuthorityHealth
     package let contexts: [DomainContextSnapshot]
+}
+
+/// Recovery-aware canonical selection shared by folder resolution and command admission.
+package enum DomainExactRootSelection: Equatable {
+    case matched(DomainWorkspaceSnapshot)
+    case noMatch
+    case recoveryBlocked
+    case changed
 }
 
 package struct DomainWorkspaceCatalogSnapshot: Equatable {
@@ -333,6 +344,9 @@ private enum DomainWorkspaceDocumentDecoder {
         return DomainWorkspaceMetadata(
             workspaceID: workspaceID,
             schemaVersion: schemaVersion,
+            dateModified: (object["dateModified"] as? NSNumber)
+                .map { Date(timeIntervalSinceReferenceDate: $0.doubleValue) }
+                ?? .distantPast,
             name: object["name"] as? String ?? "Untitled Workspace",
             repoPaths: object["repoPaths"] as? [String] ?? [],
             customStoragePath: customStoragePath,
