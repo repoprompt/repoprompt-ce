@@ -229,11 +229,31 @@ enum PersistentFolderOpenProvenance: Equatable {
     case created
 }
 
+/// Captured before resolution can publish metadata without hydrating the active file tree.
+struct FolderOpenActivationState {
+    let workspaceID: UUID?
+    let declaredRoots: WorkspaceRootSetKey
+    let loadedRoots: WorkspaceRootSetKey
+
+    func contains(_ expectedRoot: WorkspaceRootSetKey) -> Bool {
+        guard !expectedRoot.isEmpty else { return false }
+        return declaredRoots.normalizedPaths.contains { WorkspaceRootSetKey(paths: [$0]) == expectedRoot }
+            && loadedRoots.normalizedPaths.contains { WorkspaceRootSetKey(paths: [$0]) == expectedRoot }
+    }
+}
+
+enum FolderOpenActivationPolicy {
+    case interactiveReuse
+    case interactiveCreate
+    case appCommand
+}
+
 struct PersistentFolderOpenResolutionDetails {
     let workspace: WorkspaceModel
     let provenance: PersistentFolderOpenProvenance
     let operationID: UUID
     let creationCommitted: Bool
+    let activationState: FolderOpenActivationState
 }
 
 /// Compatibility shape retained until WindowState adopts `PersistentFolderOpenResolutionDetails`.
@@ -1040,6 +1060,46 @@ class WorkspaceManagerViewModel: ObservableObject {
             await workspaceRoutingAuthorityDidSnapshotHandlerForTesting?()
         #endif
         return decodeDomainWorkspaceRoutingSnapshot(snapshot)
+    }
+
+    enum PersistentFolderOpenSelection {
+        case matched(WorkspaceModel)
+        case noMatch
+        case recoveryBlocked
+        case changed
+    }
+
+    /// Read-only persistent command admission uses the same saved recovery checks as resolution.
+    func persistentFolderOpenSelection(forFolderPath path: String) async throws -> PersistentFolderOpenSelection {
+        guard let canonicalRootPath = WorkspaceRootSetKey(paths: [path]).normalizedPaths.first?.lowercased() else {
+            throw PersistentFolderOpenError.invalidFolder
+        }
+        guard let domainWorkspaceAuthorityClient else {
+            return WorkspaceFolderOpenResolver.bestEligibleMatch(forFolderPath: path, in: workspaces)
+                .map(PersistentFolderOpenSelection.matched) ?? .noMatch
+        }
+        let selection = try await domainWorkspaceAuthorityClient.exactRootSelection(canonicalRootPath: canonicalRootPath)
+        #if DEBUG
+            await workspaceRoutingAuthorityDidSnapshotHandlerForTesting?()
+        #endif
+        switch selection {
+        case let .matched(snapshot):
+            do {
+                return try .matched(Self.decodeDomainWorkspaceProjection(
+                    documentBytes: snapshot.document.documentBytes,
+                    fileURL: snapshot.document.fileURL
+                ))
+            } catch {
+                reportDomainProjectionFailure(error)
+                throw error
+            }
+        case .noMatch:
+            return .noMatch
+        case .recoveryBlocked:
+            return .recoveryBlocked
+        case .changed:
+            return .changed
+        }
     }
 
     private func decodeDomainWorkspaceRoutingSnapshot(
@@ -3597,6 +3657,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceActivationLeaseDidAcquireHandlerForTesting = handler
         }
 
+        /// Runs after authoritative routing reads, including recovery-aware exact-root admission.
         func setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting(
             _ handler: (@MainActor () async -> Void)?
         ) {
@@ -11130,6 +11191,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     func resolveOrCreatePersistentWorkspaceWithProvenance(
         fromFolderURL url: URL
     ) async throws -> PersistentFolderOpenResolutionDetails {
+        let activationState = captureFolderOpenActivationState()
         let folderURL = url.standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDirectory),
@@ -11148,7 +11210,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     workspace: existing,
                     provenance: .reused,
                     operationID: operationID,
-                    creationCommitted: false
+                    creationCommitted: false,
+                    activationState: activationState
                 )
             }
             let workspace = createWorkspace(
@@ -11159,7 +11222,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspace: workspace,
                 provenance: .created,
                 operationID: operationID,
-                creationCommitted: false
+                creationCommitted: false,
+                activationState: activationState
             )
         }
 
@@ -11256,7 +11320,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspace: canonical,
             provenance: provenance,
             operationID: operationID,
-            creationCommitted: provenance == .created
+            creationCommitted: provenance == .created,
+            activationState: activationState
         )
     }
 
@@ -11315,47 +11380,60 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    func captureFolderOpenActivationState() -> FolderOpenActivationState {
+        FolderOpenActivationState(
+            workspaceID: activeWorkspaceID,
+            declaredRoots: WorkspaceRootSetKey(paths: activeWorkspace?.repoPaths ?? []),
+            loadedRoots: WorkspaceRootSetKey(paths: fileManager.rootFolders.map(\.standardizedFullPath))
+        )
+    }
+
+    func activateFolderOpenWorkspace(
+        _ workspace: WorkspaceModel,
+        expectedRoot: WorkspaceRootSetKey,
+        activationState: FolderOpenActivationState,
+        policy: FolderOpenActivationPolicy
+    ) async -> WorkspaceSwitchResult {
+        guard !Task.isCancelled else {
+            return .cancelled("Folder workspace activation was cancelled.")
+        }
+        let currentState = captureFolderOpenActivationState()
+        if currentState.workspaceID == workspace.id {
+            // Canonical publication must not erase evidence of stale active roots.
+            let wasStale = activationState.workspaceID == workspace.id && !activationState.contains(expectedRoot)
+            if !wasStale, currentState.contains(expectedRoot) {
+                return .switched
+            }
+            return await reactivateWorkspaceAfterReplacement(
+                workspace,
+                reason: policy == .appCommand
+                    ? "appCommandFolderOpenAuthorityProjection"
+                    : "openFolderReuseAuthorityProjection"
+            )
+        }
+        switch policy {
+        case .interactiveCreate:
+            return await switchWorkspace(to: workspace, saveState: false, reason: "openFolderCreate")
+        case .interactiveReuse, .appCommand:
+            return await requestWorkspaceSwitch(
+                to: workspace,
+                saveState: true,
+                reason: policy == .appCommand ? "appCommandFolderOpen" : "openFolderReuse"
+            )
+        }
+    }
+
     private func activatePersistentFolderOpenResolution(
         _ resolution: PersistentFolderOpenResolutionDetails,
         folderPath: String
     ) async throws {
         let workspace = resolution.workspace
-        let expectedRoot = WorkspaceRootSetKey(paths: [folderPath])
-        if resolution.provenance == .reused,
-           activeWorkspaceID == workspace.id,
-           self.workspace(withID: workspace.id).map({ current in
-               WorkspaceFolderOpenResolver.bestEligibleMatch(
-                   forFolderPath: folderPath,
-                   in: [current]
-               )?.id == workspace.id
-           }) == true
-        {
-            return
-        }
-
-        let switchResult: WorkspaceSwitchResult = if resolution.provenance == .reused,
-                                                     activeWorkspaceID == workspace.id,
-                                                     self.workspace(withID: workspace.id).map({
-                                                         !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
-                                                     }) ?? true
-        {
-            await reactivateWorkspaceAfterReplacement(
-                workspace,
-                reason: "openFolderReuseAuthorityProjection"
-            )
-        } else if resolution.provenance == .reused {
-            await requestWorkspaceSwitch(
-                to: workspace,
-                saveState: true,
-                reason: "openFolderReuse"
-            )
-        } else {
-            await switchWorkspace(
-                to: workspace,
-                saveState: false,
-                reason: "openFolderCreate"
-            )
-        }
+        let switchResult = await activateFolderOpenWorkspace(
+            workspace,
+            expectedRoot: WorkspaceRootSetKey(paths: [folderPath]),
+            activationState: resolution.activationState,
+            policy: resolution.provenance == .created ? .interactiveCreate : .interactiveReuse
+        )
 
         switch switchResult {
         case .switched:

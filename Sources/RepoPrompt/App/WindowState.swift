@@ -380,7 +380,7 @@ class WindowState: ObservableObject {
     private struct ResolvedFolderTarget {
         let workspace: WorkspaceModel
         let source: FolderTargetSource
-        let requiresActivationReload: Bool
+        let activationState: FolderOpenActivationState
         let persistentResolution: PersistentFolderOpenProvenance?
         let durableCreationCommit: DurablePersistentWorkspaceCreationCommit?
     }
@@ -1947,10 +1947,11 @@ class WindowState: ObservableObject {
             return forwardingOutcome
         }
 
-        let switchResult = await activateFolderTarget(
+        let switchResult = await workspaceManager.activateFolderOpenWorkspace(
             target.workspace,
             expectedRoot: expectedRoot,
-            requiresReload: target.requiresActivationReload
+            activationState: target.activationState,
+            policy: .appCommand
         )
         if let interruption = commandInterruptionResult() {
             return .terminal(interruption)
@@ -1988,25 +1989,27 @@ class WindowState: ObservableObject {
         }
 
         if !admitsLocalEphemeralTarget {
-            guard let routingCatalog = await workspaceManager.workspaceRoutingCatalogSnapshot() else {
-                return .terminal(.failed(.authorityFailure))
+            let selection: WorkspaceManagerViewModel.PersistentFolderOpenSelection
+            do {
+                selection = try await workspaceManager.persistentFolderOpenSelection(forFolderPath: folderURL.path)
+            } catch is CancellationError {
+                return .terminal(.cancelled)
+            } catch {
+                return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
             }
             if let interruption = commandInterruptionResult() {
                 return .terminal(interruption)
             }
-            let currentAuthorityWinner = WorkspaceFolderOpenResolver.bestEligibleMatch(
-                forFolderPath: folderURL.path,
-                in: routingCatalog
-            )
-            guard let authoritativeTarget = routingCatalog.first(where: {
-                $0.id == target.workspace.id
-            }),
-                WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeTarget),
-                WorkspaceFolderOpenResolver.bestEligibleMatch(
-                    forFolderPath: folderURL.path,
-                    in: [authoritativeTarget]
-                )?.id == target.workspace.id,
-                currentAuthorityWinner?.id == target.workspace.id
+            if case .recoveryBlocked = selection {
+                return .terminal(.failed(.authorityFailure))
+            }
+            guard case let .matched(authoritativeTarget) = selection,
+                  authoritativeTarget.id == target.workspace.id,
+                  WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeTarget),
+                  WorkspaceFolderOpenResolver.bestEligibleMatch(
+                      forFolderPath: folderURL.path,
+                      in: [authoritativeTarget]
+                  )?.id == target.workspace.id
             else {
                 return retryOrTerminal(
                     queuedCommand,
@@ -2089,6 +2092,7 @@ class WindowState: ObservableObject {
         folderURL: URL,
         expectedRoot: WorkspaceRootSetKey
     ) async -> FolderTargetResolution {
+        let activationState = workspaceManager.captureFolderOpenActivationState()
         guard publication.expectedRoot == expectedRoot else {
             return retryFolderResolution(
                 queuedCommand,
@@ -2122,28 +2126,27 @@ class WindowState: ObservableObject {
             return .terminal(interruption)
         }
 
-        guard let routingCatalog = await workspaceManager.workspaceRoutingCatalogSnapshot() else {
-            return retryFolderResolution(
-                queuedCommand,
-                expectedRoot: expectedRoot,
-                failure: .authorityFailure
-            )
+        let selection: WorkspaceManagerViewModel.PersistentFolderOpenSelection
+        do {
+            selection = try await workspaceManager.persistentFolderOpenSelection(forFolderPath: folderURL.path)
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
         }
         if let interruption = commandInterruptionResult() {
             return .terminal(interruption)
         }
-        guard let authoritativeWorkspace = routingCatalog.first(where: {
-            $0.id == publication.workspaceID
-        }),
-            WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeWorkspace),
-            WorkspaceFolderOpenResolver.bestEligibleMatch(
-                forFolderPath: folderURL.path,
-                in: [authoritativeWorkspace]
-            )?.id == publication.workspaceID,
-            WorkspaceFolderOpenResolver.bestEligibleMatch(
-                forFolderPath: folderURL.path,
-                in: routingCatalog
-            )?.id == publication.workspaceID
+        if case .recoveryBlocked = selection {
+            return .terminal(.failed(.authorityFailure))
+        }
+        guard case let .matched(authoritativeWorkspace) = selection,
+              authoritativeWorkspace.id == publication.workspaceID,
+              WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeWorkspace),
+              WorkspaceFolderOpenResolver.bestEligibleMatch(
+                  forFolderPath: folderURL.path,
+                  in: [authoritativeWorkspace]
+              )?.id == publication.workspaceID
         else {
             return retryFolderResolution(
                 queuedCommand,
@@ -2155,10 +2158,7 @@ class WindowState: ObservableObject {
         return .resolved(ResolvedFolderTarget(
             workspace: authoritativeWorkspace,
             source: .pendingPersistentPublication(publication),
-            requiresActivationReload: workspaceManager.activeWorkspace.map {
-                $0.id == authoritativeWorkspace.id
-                    && !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
-            } ?? false,
+            activationState: activationState,
             persistentResolution: .reused,
             durableCreationCommit: nil
         ))
@@ -2169,7 +2169,6 @@ class WindowState: ObservableObject {
         folderURL: URL,
         expectedRoot: WorkspaceRootSetKey
     ) async -> FolderTargetResolution {
-        let activeWorkspaceBeforeResolution = workspaceManager.activeWorkspace
         do {
             let resolution = try await workspaceManager.resolveOrCreatePersistentWorkspaceWithProvenance(
                 fromFolderURL: folderURL
@@ -2200,15 +2199,20 @@ class WindowState: ObservableObject {
             return .resolved(ResolvedFolderTarget(
                 workspace: workspace,
                 source: .authority,
-                requiresActivationReload: activeWorkspaceBeforeResolution.map {
-                    $0.id == workspace.id
-                        && !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
-                } ?? false,
+                activationState: resolution.activationState,
                 persistentResolution: resolution.provenance,
                 durableCreationCommit: durableCreationCommit
             ))
         } catch is CancellationError {
             return .terminal(.cancelled)
+        } catch let error as DomainWorkspaceAuthorityOperationError
+            where error.outcome.diagnostic == "exact_root_selection_changed"
+        {
+            return retryFolderResolution(
+                queuedCommand,
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
         } catch let error as DomainWorkspaceAuthorityOperationError
             where error.outcome.errorCode == .workspaceUnavailable
         {
@@ -2218,7 +2222,7 @@ class WindowState: ObservableObject {
                 failure: .workspaceUnavailable
             )
         } catch {
-            return .terminal(.failed(.authorityFailure))
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
         }
     }
 
@@ -2226,6 +2230,7 @@ class WindowState: ObservableObject {
         folderURL: URL,
         expectedRoot: WorkspaceRootSetKey
     ) async -> FolderTargetResolution {
+        let activationState = workspaceManager.captureFolderOpenActivationState()
         guard let routingCatalog = await workspaceManager.workspaceRoutingCatalogSnapshot() else {
             return .terminal(.failed(.authorityFailure))
         }
@@ -2270,10 +2275,7 @@ class WindowState: ObservableObject {
             return .resolved(ResolvedFolderTarget(
                 workspace: winner,
                 source: representation.source,
-                requiresActivationReload: workspaceManager.activeWorkspace.map {
-                    $0.id == winner.id
-                        && !WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: $0)
-                } ?? false,
+                activationState: activationState,
                 persistentResolution: nil,
                 durableCreationCommit: nil
             ))
@@ -2287,7 +2289,7 @@ class WindowState: ObservableObject {
         return .resolved(ResolvedFolderTarget(
             workspace: workspace,
             source: .ephemeralLiveWindow(self),
-            requiresActivationReload: false,
+            activationState: activationState,
             persistentResolution: nil,
             durableCreationCommit: nil
         ))
@@ -2366,30 +2368,6 @@ class WindowState: ObservableObject {
                 workspaceID: target.workspace.id,
                 expectedRoot: expectedRoot
             )
-        )
-    }
-
-    private func activateFolderTarget(
-        _ workspace: WorkspaceModel,
-        expectedRoot: WorkspaceRootSetKey,
-        requiresReload: Bool
-    ) async -> WorkspaceSwitchResult {
-        if workspaceManager.activeWorkspaceID == workspace.id {
-            if !requiresReload,
-               let projectedWorkspace = workspaceManager.activeWorkspace,
-               WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: projectedWorkspace)
-            {
-                return .switched
-            }
-            return await workspaceManager.reactivateWorkspaceAfterReplacement(
-                workspace,
-                reason: "appCommandFolderOpenAuthorityProjection"
-            )
-        }
-        return await workspaceManager.requestWorkspaceSwitch(
-            to: workspace,
-            saveState: true,
-            reason: "appCommandFolderOpen"
         )
     }
 

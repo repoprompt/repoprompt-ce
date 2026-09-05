@@ -42,6 +42,10 @@ struct DomainWorkspaceAuthorityClient {
         await store.snapshot()
     }
 
+    func exactRootSelection(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        try await store.exactRootSelection(canonicalRootPath: canonicalRootPath)
+    }
+
     func workspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
         await store.workspaceSnapshot(workspaceID)
     }

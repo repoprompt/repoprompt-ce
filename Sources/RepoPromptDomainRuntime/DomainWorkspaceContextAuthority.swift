@@ -17,6 +17,10 @@ package struct DomainWorkspaceStore {
         await authority.readySnapshot()
     }
 
+    package func exactRootSelection(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        try await authority.exactRootSelection(canonicalRootPath: canonicalRootPath)
+    }
+
     package func subscribe() async -> DomainWorkspaceSnapshotSubscription {
         await authority.readySubscription()
     }
@@ -31,6 +35,12 @@ package struct DomainWorkspaceStore {
     }
 
     #if DEBUG
+        package func testSetAfterExactRootSavedMarkerRead(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await authority.testSetAfterExactRootSavedMarkerRead(hook)
+        }
+
         package func testSetBeforeExternalReconciliation(
             _ hook: (@Sendable (UUID) async -> Void)?
         ) async {
@@ -133,8 +143,14 @@ actor DomainWorkspaceContextAuthority {
     private static let maximumCASRecoveryAttempts = 2
 
     #if DEBUG
+        private var testAfterExactRootSavedMarkerRead: (@Sendable (UUID) async -> Void)?
+
+        func testSetAfterExactRootSavedMarkerRead(_ hook: (@Sendable (UUID) async -> Void)?) {
+            testAfterExactRootSavedMarkerRead = hook
+        }
+
         private var testBeforeExternalReconciliation: (@Sendable (UUID) async -> Void)?
-    private var testAfterWorkspaceMutationGateAcquired: (@Sendable (UUID) async -> Void)?
+        private var testAfterWorkspaceMutationGateAcquired: (@Sendable (UUID) async -> Void)?
     #endif
 
     private enum DirtyExternalRebaseResult {
@@ -316,6 +332,13 @@ actor DomainWorkspaceContextAuthority {
     func readySnapshot() async -> DomainWorkspaceCatalogSnapshot {
         await bootstrap()
         return snapshot()
+    }
+
+    func exactRootSelection(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        await bootstrap()
+        await acquireCatalogMutation()
+        defer { releaseCatalogMutation() }
+        return try await selectExactRoot(canonicalRootPath: canonicalRootPath)
     }
 
     func readySubscription() async -> DomainWorkspaceSnapshotSubscription {
@@ -1337,34 +1360,94 @@ actor DomainWorkspaceContextAuthority {
             )
         }
 
-        let matchingRecords = records.values.filter { record in
-            let metadata = record.document.metadata
-            return !metadata.isSystemWorkspace
-                && !metadata.isHiddenInMenus
-                && !metadata.isEphemeral
-                && metadata.repoPaths.contains(where: {
-                    Self.canonicalFolderOpenRootPath($0) == canonicalRootPath
-                })
+        let selection: DomainExactRootSelection
+        do {
+            selection = try await selectExactRoot(canonicalRootPath: canonicalRootPath)
+        } catch {
+            return persistenceFailureOutcome(envelope, record: nil, error: error)
         }
+        if case let .matched(snapshot) = selection,
+           let existing = records[snapshot.document.workspaceID]
+        {
+            return await unchangedOutcome(
+                envelope,
+                fingerprint: fingerprint,
+                record: existing,
+                exactRootResolution: .reused
+            )
+        }
+        switch selection {
+        case .recoveryBlocked:
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .conflict,
+                errorCode: .stateConflict,
+                diagnostic: "exact_root_restoration_incomplete",
+                exactRootResolution: .recoveryBlocked
+            )
+        case .matched, .changed:
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .conflict,
+                errorCode: .stateConflict,
+                diagnostic: "exact_root_selection_changed"
+            )
+        case .noMatch:
+            break
+        }
+        guard records[document.workspaceID] == nil else {
+            return recordTransientOutcome(
+                envelope: envelope,
+                fingerprint: fingerprint,
+                disposition: .conflict,
+                errorCode: .stateConflict,
+                diagnostic: "exact_root_workspace_id_collision"
+            )
+        }
+
+        return await createWorkspace(
+            document,
+            envelope: envelope,
+            fingerprint: fingerprint,
+            acquireMutationGate: false,
+            exactRootResolution: .created
+        )
+    }
+
+    /// Both callers hold the catalog gate. Saves and external reloads can still reenter during
+    /// saved-file I/O, so validate all exact-root candidates before returning a selection.
+    private func selectExactRoot(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        try Task.checkCancellation()
+        let matchingRecords = exactRootRecords(canonicalRootPath: canonicalRootPath)
+        let before = matchingRecords.mapValues(makeSnapshot)
         var eligibleMatches: [WorkspaceRecord] = []
         var hasRecoveryBlockedMatch = false
-        for record in matchingRecords {
+        for record in matchingRecords.values {
             let metadata = record.document.metadata
-            guard metadata.consolidatedIntoWorkspaceID == nil else { continue }
+            guard !metadata.isSystemWorkspace,
+                  !metadata.isHiddenInMenus,
+                  !metadata.isEphemeral,
+                  metadata.consolidatedIntoWorkspaceID == nil
+            else { continue }
             guard record.revisions.dirtyRevision != nil else {
                 eligibleMatches.append(record)
                 continue
             }
-            do {
-                switch try await persistence.savedConsolidationMarkerStatus(for: record.document) {
-                case .unmarked:
-                    eligibleMatches.append(record)
-                case .marked, .unreadable:
-                    hasRecoveryBlockedMatch = true
-                }
-            } catch {
-                return persistenceFailureOutcome(envelope, record: nil, error: error)
+            switch try await persistence.savedConsolidationMarkerStatus(for: record.document) {
+            case .unmarked:
+                eligibleMatches.append(record)
+            case .marked, .unreadable:
+                hasRecoveryBlockedMatch = true
             }
+            #if DEBUG
+                await testAfterExactRootSavedMarkerRead?(record.document.workspaceID)
+            #endif
+        }
+        try Task.checkCancellation()
+        guard before == exactRootRecords(canonicalRootPath: canonicalRootPath).mapValues(makeSnapshot) else {
+            return .changed
         }
 
         eligibleMatches.sort { lhs, rhs in
@@ -1384,40 +1467,17 @@ actor DomainWorkspaceContextAuthority {
             return lhsMetadata.workspaceID.uuidString < rhsMetadata.workspaceID.uuidString
         }
         if let existing = eligibleMatches.first {
-            return await unchangedOutcome(
-                envelope,
-                fingerprint: fingerprint,
-                record: existing,
-                exactRootResolution: .reused
-            )
+            return .matched(makeSnapshot(existing))
         }
-        if hasRecoveryBlockedMatch {
-            return recordTransientOutcome(
-                envelope: envelope,
-                fingerprint: fingerprint,
-                disposition: .conflict,
-                errorCode: .stateConflict,
-                diagnostic: "exact_root_restoration_incomplete",
-                exactRootResolution: .recoveryBlocked
-            )
-        }
-        guard records[document.workspaceID] == nil else {
-            return recordTransientOutcome(
-                envelope: envelope,
-                fingerprint: fingerprint,
-                disposition: .conflict,
-                errorCode: .stateConflict,
-                diagnostic: "exact_root_workspace_id_collision"
-            )
-        }
+        return hasRecoveryBlockedMatch ? .recoveryBlocked : .noMatch
+    }
 
-        return await createWorkspace(
-            document,
-            envelope: envelope,
-            fingerprint: fingerprint,
-            acquireMutationGate: false,
-            exactRootResolution: .created
-        )
+    private func exactRootRecords(canonicalRootPath: String) -> [UUID: WorkspaceRecord] {
+        records.filter { _, record in
+            record.document.metadata.repoPaths.contains {
+                Self.canonicalFolderOpenRootPath($0) == canonicalRootPath
+            }
+        }
     }
 
     private static func canonicalFolderOpenRootPath(_ path: String) -> String? {

@@ -199,6 +199,14 @@ package struct DomainWorkspaceSnapshot: Codable, Equatable {
     package let contexts: [DomainContextSnapshot]
 }
 
+/// Recovery-aware canonical selection shared by folder resolution and command admission.
+package enum DomainExactRootSelection: Equatable {
+    case matched(DomainWorkspaceSnapshot)
+    case noMatch
+    case recoveryBlocked
+    case changed
+}
+
 package struct DomainWorkspaceCatalogSnapshot: Equatable {
     package let runtimeIdentity: DomainRuntimeIdentity
     package let isBootstrapped: Bool

@@ -32,6 +32,7 @@ import XCTest
             }
             windows.removeAll()
             for runtime in domainRuntimes {
+                await runtime.workspaceStore.testSetAfterExactRootSavedMarkerRead(nil)
                 _ = await runtime.shutdown()
             }
             domainRuntimes.removeAll()
@@ -180,6 +181,8 @@ import XCTest
             )
             XCTAssertEqual(initialSwitch, .switched)
             window.promptManager.promptText = "before"
+            window.workspaceManager.isRefreshing = true
+            defer { window.workspaceManager.isRefreshing = false }
 
             window.enqueueCommand(folderCommand(
                 folderPath: folder.path,
@@ -866,6 +869,217 @@ import XCTest
             XCTAssertEqual(staleWindow.promptManager.promptText, "stale-before")
         }
 
+        func testQueuedOpenAdmitsOlderEligibleActiveWorkspaceOverNewerIncompleteRestoreOnce() async throws {
+            let runtime = try await makeDomainRuntime()
+            let window = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "EligibleActiveWithIncompleteAlternative")
+            let payloadFile = folder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let eligible = WorkspaceModel(name: "Eligible A", repoPaths: [folder.path])
+            try await saveAuthoritativeWorkspace(eligible, in: window, runtime: runtime)
+            try await waitUntil { window.workspaceManager.workspace(withID: eligible.id) != nil }
+            let projected = try XCTUnwrap(window.workspaceManager.workspace(withID: eligible.id))
+            let activation = await window.workspaceManager.switchWorkspace(
+                to: projected, saveState: false, reason: "eligibleActiveRecoveryFixture"
+            )
+            XCTAssertEqual(activation, .switched)
+            let loadedPayload = await window.workspaceFilesViewModel.findFile(atPath: payloadFile.path)
+            XCTAssertNotNil(loadedPayload)
+            window.stopDomainWorkspaceProjectionForTesting()
+            window.setAutomaticCommandProcessingForTesting(false)
+            window.promptManager.promptText = "before"
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: window.windowID)
+            let activeSnapshot = await client.canonicalWorkspaceSnapshot(eligible.id)
+            let beforeDirty = try XCTUnwrap(activeSnapshot)
+            var dirtyEligible = projected
+            dirtyEligible.name = "Ordinary dirty A"
+            dirtyEligible.dateModified = Date(timeIntervalSinceReferenceDate: 100)
+            let dirty = try await client.replaceWorking(
+                dirtyEligible,
+                fileURL: beforeDirty.document.fileURL,
+                expectedWorkspaceRevision: beforeDirty.revisions.workingRevision
+            )
+            XCTAssertEqual(dirty.disposition, .applied)
+            XCTAssertNotNil(dirty.after?.dirtyRevision)
+            let incomplete = try await makeIncompleteFolderMatch(folder: folder, window: window, runtime: runtime)
+            window.workspaceManager.workspaces.append(incomplete)
+            // A recovery-blind catalog would choose B, which is the original admission failure.
+            XCTAssertEqual(WorkspaceFolderOpenResolver.bestEligibleMatch(
+                forFolderPath: folder.path, in: [dirtyEligible, incomplete]
+            )?.id, incomplete.id)
+            let localCount = window.workspaceManager.workspaces.count
+            let canonicalBefore = await client.snapshot()
+            var resolutionPasses = 0
+            var admissionPasses = 0
+            window.workspaceManager.setPersistentFolderOpenDidSnapshotHandlerForTesting { resolutionPasses += 1 }
+            window.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting { admissionPasses += 1 }
+            let title = "Recovery eligible stored prompt \(UUID().uuidString)"
+            var completions: [AppCommandExecutionResult] = []
+            window.enqueueCommand(folderCommand(
+                folderPath: folder.path,
+                fileList: [payloadFile.path],
+                promptText: "after",
+                newPrompt: (title, "stored once")
+            )) { completions.append($0) }
+
+            await window.processCommands()
+
+            XCTAssertEqual(completions, [.completed(workspaceID: eligible.id)])
+            XCTAssertEqual(resolutionPasses, 1)
+            XCTAssertEqual(admissionPasses, 1)
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, eligible.id)
+            XCTAssertEqual(window.workspaceManager.workspaces.count, localCount)
+            let canonicalAfter = await client.snapshot()
+            XCTAssertEqual(
+                Set(canonicalAfter.workspaces.map(\.document.workspaceID)),
+                Set(canonicalBefore.workspaces.map(\.document.workspaceID))
+            )
+            XCTAssertEqual(window.promptManager.promptText, "after")
+            XCTAssertEqual(window.workspaceFilesViewModel.selectedFiles.count(where: { $0.fullPath == payloadFile.path }), 1)
+            let stored = try XCTUnwrap(window.promptManager.storedPrompts.first { $0.title == title })
+            XCTAssertEqual(stored.content, "stored once")
+            XCTAssertTrue(window.promptManager.selectedPromptIDs.contains(stored.id))
+            XCTAssertEqual(window.promptManager.storedPrompts.count { $0.title == title }, 1)
+
+            // A drained queue must not reapply either payload or add another stored prompt.
+            window.promptManager.promptText = "after drain"
+            await window.workspaceFilesViewModel.selectFiles(withPaths: [], allowEmpty: true)
+            await window.processCommands()
+            XCTAssertEqual(completions, [.completed(workspaceID: eligible.id)])
+            XCTAssertEqual(resolutionPasses, 1)
+            XCTAssertEqual(admissionPasses, 1)
+            XCTAssertEqual(window.promptManager.promptText, "after drain")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains { $0.fullPath == payloadFile.path })
+            XCTAssertEqual(window.promptManager.storedPrompts.count { $0.title == title }, 1)
+        }
+
+        func testQueuedOpenRejectsIncompleteOnlyWithoutPayloadOrCreation() async throws {
+            try await assertQueuedOpenRejectsRecoveryBlockedMatch(unreadable: false)
+        }
+
+        func testQueuedOpenRejectsUnreadableSavedMatchWithoutPayloadOrCreation() async throws {
+            try await assertQueuedOpenRejectsRecoveryBlockedMatch(unreadable: true)
+        }
+
+        func testQueuedOpenCancellationDuringSavedEligibilityReadDrainsWithoutPayloadOrCreation() async throws {
+            try await assertQueuedOpenRejectsRecoveryBlockedMatch(unreadable: false, cancelDuringResolution: true)
+        }
+
+        private func assertQueuedOpenRejectsRecoveryBlockedMatch(
+            unreadable: Bool,
+            cancelDuringResolution: Bool = false
+        ) async throws {
+            let runtime = try await makeDomainRuntime()
+            let window = await makeWindow(domainRuntime: runtime)
+            let activeFolder = try makeFolder(named: "RecoveryBlockedActive")
+            let folder = try makeFolder(named: "RecoveryBlockedRequested")
+            let payloadFile = folder.appendingPathComponent("Payload.swift")
+            let selectedFile = activeFolder.appendingPathComponent("Keep.swift")
+            try Data("let keep = true\n".utf8).write(to: selectedFile)
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let active = WorkspaceModel(name: "Keep active", repoPaths: [activeFolder.path])
+            try await saveAuthoritativeWorkspace(active, in: window, runtime: runtime)
+            try await waitUntil { window.workspaceManager.workspace(withID: active.id) != nil }
+            let projected = try XCTUnwrap(window.workspaceManager.workspace(withID: active.id))
+            let activation = await window.workspaceManager.switchWorkspace(
+                to: projected, saveState: false, reason: "recoveryBlockedCommandFixture"
+            )
+            XCTAssertEqual(activation, .switched)
+            await window.workspaceFilesViewModel.selectFiles(withPaths: [selectedFile.path])
+            window.promptManager.promptText = "keep prompt"
+            window.stopDomainWorkspaceProjectionForTesting()
+            window.setAutomaticCommandProcessingForTesting(false)
+            let blocked = try await makeIncompleteFolderMatch(
+                folder: folder, window: window, runtime: runtime, unreadable: unreadable
+            )
+            window.workspaceManager.workspaces.append(blocked)
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: window.windowID)
+            let before = await client.snapshot()
+            let localCount = window.workspaceManager.workspaces.count
+            let selectedBefore = Set(window.workspaceFilesViewModel.selectedFiles.map(\.fullPath))
+            let storedBefore = window.promptManager.storedPrompts.map(\.id)
+            let selectedPromptsBefore = window.promptManager.selectedPromptIDs
+            var resolutionPasses = 0
+            var admissionPasses = 0
+            window.workspaceManager.setPersistentFolderOpenDidSnapshotHandlerForTesting { resolutionPasses += 1 }
+            window.workspaceManager.setWorkspaceRoutingAuthorityDidSnapshotHandlerForTesting { admissionPasses += 1 }
+            var completions: [AppCommandExecutionResult] = []
+            window.enqueueCommand(folderCommand(
+                folderPath: folder.path,
+                fileList: [payloadFile.path],
+                promptText: "must not apply",
+                newPrompt: ("Must not store \(UUID().uuidString)", "blocked")
+            )) { completions.append($0) }
+
+            let expectedResult: AppCommandExecutionResult
+            if cancelDuringResolution {
+                let gate = WindowFolderOpenCreationGate()
+                await runtime.workspaceStore.testSetAfterExactRootSavedMarkerRead { workspaceID in
+                    guard workspaceID == blocked.id else { return }
+                    await gate.pauseUntilReleased()
+                }
+                let processing = Task { await window.processCommands() }
+                await gate.waitUntilPaused()
+                processing.cancel()
+                await gate.release()
+                await processing.value
+                await runtime.workspaceStore.testSetAfterExactRootSavedMarkerRead(nil)
+                expectedResult = .cancelled
+            } else {
+                await window.processCommands()
+                expectedResult = .failed(.authorityFailure)
+            }
+            await window.processCommands()
+
+            XCTAssertEqual(completions, [expectedResult])
+            XCTAssertEqual(resolutionPasses, 1)
+            XCTAssertEqual(admissionPasses, 0)
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, active.id)
+            XCTAssertEqual(window.workspaceManager.workspaces.count, localCount)
+            XCTAssertEqual(window.promptManager.promptText, "keep prompt")
+            XCTAssertEqual(Set(window.workspaceFilesViewModel.selectedFiles.map(\.fullPath)), selectedBefore)
+            XCTAssertEqual(window.promptManager.storedPrompts.map(\.id), storedBefore)
+            XCTAssertEqual(window.promptManager.selectedPromptIDs, selectedPromptsBefore)
+            let after = await client.snapshot()
+            XCTAssertEqual(
+                Set(after.workspaces.map(\.document.workspaceID)),
+                Set(before.workspaces.map(\.document.workspaceID))
+            )
+        }
+
+        private func makeIncompleteFolderMatch(
+            folder: URL,
+            window: WindowState,
+            runtime: MCPDomainRuntime,
+            unreadable: Bool = false
+        ) async throws -> WorkspaceModel {
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: window.windowID)
+            let saved = WorkspaceModel(
+                dateModified: Date(timeIntervalSinceReferenceDate: 300),
+                name: "Newer incomplete B",
+                repoPaths: [folder.path],
+                isHiddenInMenus: !unreadable,
+                consolidatedIntoWorkspaceID: unreadable ? nil : UUID()
+            )
+            let fileURL = window.workspaceManager.workspaceFileURL(for: saved)
+            let created = try await client.create(saved, fileURL: fileURL)
+            XCTAssertEqual(created.disposition, .applied)
+            let snapshot = try XCTUnwrap(created.workspace)
+            var working = saved
+            working.isHiddenInMenus = false
+            working.consolidatedIntoWorkspaceID = nil
+            working.name = "Newer incomplete working B"
+            let dirty = try await client.replaceWorking(
+                working, fileURL: fileURL, expectedWorkspaceRevision: snapshot.revisions.workingRevision
+            )
+            XCTAssertEqual(dirty.disposition, .applied)
+            XCTAssertNotNil(dirty.after?.dirtyRevision)
+            if unreadable { try FileManager.default.removeItem(at: fileURL) }
+            return working
+        }
+
         func testQueuedOpenReResolvesCurrentAuthorityWinnerAndPreservesPayload() async throws {
             let runtime = try await makeDomainRuntime()
             let authorityWindow = await makeWindow(domainRuntime: runtime)
@@ -1410,11 +1624,25 @@ import XCTest
         }
 
         func testResolvedFolderRouteReloadsActiveWorkspaceWhenAuthorityProjectionIsNewer() async throws {
+            try await assertCommandStaleActivation(metadataPublished: false, refreshBlocked: false)
+        }
+
+        func testFolderCommandReloadsStaleLoadedRootsWithCurrentMetadata() async throws {
+            try await assertCommandStaleActivation(metadataPublished: true, refreshBlocked: false)
+        }
+
+        func testFolderCommandStaleSameIDRefreshBlockAppliesNoPayloadOrDuplicate() async throws {
+            try await assertCommandStaleActivation(metadataPublished: false, refreshBlocked: true)
+        }
+
+        private func assertCommandStaleActivation(metadataPublished: Bool, refreshBlocked: Bool) async throws {
             let runtime = try await makeDomainRuntime()
             let authorityWindow = await makeWindow(domainRuntime: runtime)
             let targetWindow = await makeWindow(domainRuntime: runtime)
             let oldFolder = try makeFolder(named: "AuthorityOldActiveRoot")
             let requestedFolder = try makeFolder(named: "AuthorityNewActiveRoot")
+            let oldFile = oldFolder.appendingPathComponent("Original.swift")
+            try Data("let original = true\n".utf8).write(to: oldFile)
             let payloadFile = requestedFolder.appendingPathComponent("Payload.swift")
             try Data("let payload = true\n".utf8).write(to: payloadFile)
             let workspaceID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000029"))
@@ -1434,27 +1662,66 @@ import XCTest
                 reason: "folderCommandAuthorityProjectionLagFixture"
             )
             XCTAssertEqual(initialSwitch, .switched)
+            let loadedOriginal = await targetWindow.workspaceFilesViewModel.findFile(atPath: oldFile.path)
+            XCTAssertNotNil(loadedOriginal)
+            await targetWindow.workspaceFilesViewModel.selectFiles(withPaths: [oldFile.path])
+            XCTAssertEqual(targetWindow.workspaceFilesViewModel.selectedFiles.map(\.fullPath), [oldFile.path])
+            targetWindow.promptManager.promptText = "before"
             let countBeforeRoute = targetWindow.workspaceManager.workspaces.count
+            let catalogBeforeRoute = await runtime.workspaceStore.snapshot()
             targetWindow.stopDomainWorkspaceProjectionForTesting()
             var replacementWorkspace = oldWorkspace
             replacementWorkspace.repoPaths = [requestedFolder.path]
             replacementWorkspace.dateModified = Date()
             try await saveAuthoritativeWorkspace(replacementWorkspace, in: authorityWindow, runtime: runtime)
             XCTAssertEqual(targetWindow.workspaceManager.activeWorkspace?.repoPaths, [oldFolder.path])
+            if metadataPublished {
+                let index = try XCTUnwrap(targetWindow.workspaceManager.workspaces.firstIndex { $0.id == workspaceID })
+                targetWindow.workspaceManager.workspaces[index] = replacementWorkspace
+            }
+            XCTAssertTrue(targetWindow.workspaceFilesViewModel.rootFolders.contains { $0.fullPath == oldFolder.path })
+            targetWindow.workspaceManager.isRefreshing = refreshBlocked
+            defer { targetWindow.workspaceManager.isRefreshing = false }
             targetWindow.setAutomaticCommandProcessingForTesting(false)
-            let url = try XCTUnwrap(URL(
-                string: "repoprompt-ce://open/\(requestedFolder.path)?files=\(payloadFile.path)&prompt=after"
-            ))
-
-            await AppDeepLinkRouter(windowStatesManager: .shared).route(
-                url: url,
-                preferredLegacyWindow: targetWindow
-            )
+            let storedPromptTitle = "Same-ID Folder Payload \(UUID().uuidString)"
+            var completions: [AppCommandExecutionResult] = []
+            targetWindow.enqueueCommand(
+                folderCommand(
+                    folderPath: requestedFolder.path,
+                    fileList: [payloadFile.path],
+                    promptText: "after",
+                    newPrompt: (storedPromptTitle, "same-ID stored prompt")
+                ),
+                folderRoute: .authorityExactRoot(expectedRoot: WorkspaceRootSetKey(paths: [requestedFolder.path]))
+            ) { completions.append($0) }
+            await targetWindow.processCommands()
             await targetWindow.processCommands()
 
+            XCTAssertEqual(completions, refreshBlocked ? [.failed(.workspaceSwitchBlocked)] : [.completed(workspaceID: workspaceID)])
+            XCTAssertEqual(targetWindow.queuedCommandCountForTesting, 0)
+            let catalogAfterRoute = await runtime.workspaceStore.snapshot()
+            XCTAssertEqual(catalogAfterRoute.workspaces.count, catalogBeforeRoute.workspaces.count)
+            XCTAssertEqual(catalogAfterRoute.workspaces.count(where: { $0.document.workspaceID == workspaceID }), 1)
             XCTAssertEqual(targetWindow.workspaceManager.activeWorkspaceID, workspaceID)
             XCTAssertEqual(targetWindow.workspaceManager.activeWorkspace?.repoPaths, [requestedFolder.path])
             XCTAssertEqual(targetWindow.workspaceManager.workspaces.count, countBeforeRoute)
+            XCTAssertEqual(targetWindow.workspaceManager.workspaces.count { $0.id == workspaceID }, 1)
+            if refreshBlocked {
+                XCTAssertEqual(targetWindow.promptManager.promptText, "before")
+                XCTAssertEqual(targetWindow.workspaceFilesViewModel.selectedFiles.map(\.fullPath), [oldFile.path])
+                XCTAssertFalse(targetWindow.promptManager.storedPrompts.contains { $0.title == storedPromptTitle })
+                XCTAssertTrue(targetWindow.workspaceFilesViewModel.rootFolders.contains { $0.fullPath == oldFolder.path })
+                XCTAssertFalse(targetWindow.workspaceFilesViewModel.rootFolders.contains { $0.fullPath == requestedFolder.path })
+                XCTAssertNotNil(targetWindow.workspaceFilesViewModel.findFileByFullPath(oldFile.path))
+                XCTAssertNil(targetWindow.workspaceFilesViewModel.findFileByFullPath(payloadFile.path))
+                return
+            }
+            XCTAssertTrue(targetWindow.workspaceFilesViewModel.rootFolders.contains { $0.fullPath == requestedFolder.path })
+            XCTAssertFalse(targetWindow.workspaceFilesViewModel.rootFolders.contains { $0.fullPath == oldFolder.path })
+            XCTAssertNotNil(targetWindow.workspaceFilesViewModel.findFileByFullPath(payloadFile.path))
+            XCTAssertNil(targetWindow.workspaceFilesViewModel.findFileByFullPath(oldFile.path))
+            XCTAssertEqual(targetWindow.promptManager.storedPrompts.count(where: { $0.title == storedPromptTitle }), 1)
+            XCTAssertEqual(targetWindow.workspaceFilesViewModel.selectedFiles.map(\.fullPath), [payloadFile.path])
             XCTAssertEqual(targetWindow.promptManager.promptText, "after")
             XCTAssertTrue(targetWindow.workspaceFilesViewModel.selectedFiles.contains {
                 $0.fullPath == payloadFile.path

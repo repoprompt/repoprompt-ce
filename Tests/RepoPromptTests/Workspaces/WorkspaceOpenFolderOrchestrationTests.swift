@@ -30,6 +30,7 @@ import XCTest
             managers.forEach { $0.prepareForWindowClose() }
             managers.removeAll()
             for runtime in domainRuntimes {
+                await runtime.workspaceStore.testSetAfterExactRootSavedMarkerRead(nil)
                 _ = await runtime.shutdown()
             }
             domainRuntimes.removeAll()
@@ -384,6 +385,8 @@ import XCTest
                 operationID: UUID(),
                 windowID: -1311
             )
+            let selection = try await client.exactRootSelection(canonicalRootPath: canonicalRootPath(folder))
+            XCTAssertEqual(selection, .recoveryBlocked)
 
             let first = await runtime.workspaceStore.execute(envelope)
             let replay = await runtime.workspaceStore.execute(envelope)
@@ -438,6 +441,8 @@ import XCTest
                 operationID: UUID(),
                 windowID: -1313
             )
+            let selection = try await client.exactRootSelection(canonicalRootPath: canonicalRootPath(folder))
+            XCTAssertEqual(selection, .recoveryBlocked)
 
             let first = await runtime.workspaceStore.execute(envelope)
             let replay = await runtime.workspaceStore.execute(envelope)
@@ -510,6 +515,11 @@ import XCTest
                 operationID: UUID(),
                 windowID: -1312
             )
+            let selection = try await client.exactRootSelection(canonicalRootPath: canonicalRootPath(folder))
+            guard case let .matched(selected) = selection else {
+                return XCTFail("Expected the ordinary dirty workspace to remain eligible")
+            }
+            XCTAssertEqual(selected.document.workspaceID, ordinary.id)
 
             let first = await runtime.workspaceStore.execute(envelope)
             let replay = await runtime.workspaceStore.execute(envelope)
@@ -524,6 +534,80 @@ import XCTest
             XCTAssertFalse(snapshot.workspaces.contains(where: {
                 $0.document.workspaceID == proposed.id
             }))
+        }
+
+        func testExactRootSelectionNoMatchDoesNotCreateWorkspace() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "ReadOnlyNoMatch")
+            let before = await runtime.workspaceStore.snapshot()
+            let localCount = manager.workspaces.count
+
+            let selection = try await manager.persistentFolderOpenSelection(forFolderPath: folder.path)
+
+            guard case .noMatch = selection else { return XCTFail("Expected no match") }
+            let after = await runtime.workspaceStore.snapshot()
+            XCTAssertEqual(after, before)
+            XCTAssertEqual(manager.workspaces.count, localCount)
+        }
+
+        func testExactRootReadAndResolutionDetectSaveDuringEligibilityInspection() async throws {
+            let runtime = try await makeDomainRuntime()
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1314)
+            let folder = try makeFolder(named: "EligibilitySaveInterleaving")
+            let existing = WorkspaceModel(name: "Save interleaving", repoPaths: [folder.path])
+            try await createAuthorityWorkspace(existing, using: client)
+            let proposed = WorkspaceModel(name: "Must not create", repoPaths: [folder.path])
+            let initial = await client.snapshot()
+            for resolveCommand in [false, true] {
+                let currentSnapshot = await client.canonicalWorkspaceSnapshot(existing.id)
+                let current = try XCTUnwrap(currentSnapshot)
+                var working = existing
+                working.name = "Dirty \(resolveCommand)"
+                let dirty = try await client.replaceWorking(
+                    working,
+                    fileURL: current.document.fileURL,
+                    expectedWorkspaceRevision: current.revisions.workingRevision
+                )
+                XCTAssertEqual(dirty.disposition, .applied)
+                let dirtySnapshot = try XCTUnwrap(dirty.workspace)
+                // Save does not take the catalog gate. This is a real reentrant mutation, not
+                // a synthetic revision bump: the saved eligibility baseline changes under the read.
+                await runtime.workspaceStore.testSetAfterExactRootSavedMarkerRead { workspaceID in
+                    guard workspaceID == existing.id else { return }
+                    await runtime.workspaceStore.testSetAfterExactRootSavedMarkerRead(nil)
+                    let saved = await runtime.workspaceStore.execute(.init(
+                        operationID: UUID(),
+                        expectedWorkspaceRevision: dirtySnapshot.revisions.workingRevision,
+                        origin: .appPresentation(windowID: -1314),
+                        command: .saveWorkspaceDocument(workspaceID: existing.id)
+                    ))
+                    XCTAssertEqual(saved.disposition, .applied)
+                }
+                if resolveCommand {
+                    let outcome = try await client.resolveOrCreatePersistentWorkspace(
+                        proposed,
+                        fileURL: storageRoot.appendingPathComponent("MustNotCreate.json"),
+                        canonicalRootPath: canonicalRootPath(folder)
+                    )
+                    XCTAssertEqual(outcome.disposition, .conflict)
+                    XCTAssertEqual(outcome.diagnostic, "exact_root_selection_changed")
+                    XCTAssertNil(outcome.workspace)
+                } else {
+                    let selection = try await client.exactRootSelection(canonicalRootPath: canonicalRootPath(folder))
+                    XCTAssertEqual(selection, .changed)
+                }
+                await runtime.workspaceStore.testSetAfterExactRootSavedMarkerRead(nil)
+                let stable = try await client.exactRootSelection(canonicalRootPath: canonicalRootPath(folder))
+                guard case let .matched(selected) = stable else { return XCTFail("Expected stable saved match") }
+                XCTAssertEqual(selected.document.workspaceID, existing.id)
+            }
+            let final = await client.snapshot()
+            XCTAssertEqual(
+                Set(final.workspaces.map(\.document.workspaceID)),
+                Set(initial.workspaces.map(\.document.workspaceID))
+            )
         }
 
         func testReplayedResolveOrCreateReturnsOriginalWorkspaceAfterResultDigestChanges() async throws {
@@ -948,6 +1032,18 @@ import XCTest
         }
 
         func testInteractiveReuseReloadsStaleActiveAuthorityProjection() async throws {
+            try await assertInteractiveStaleActivation(metadataPublished: false, refreshBlocked: false)
+        }
+
+        func testInteractiveReuseReloadsStaleLoadedRootsWithCurrentMetadata() async throws {
+            try await assertInteractiveStaleActivation(metadataPublished: true, refreshBlocked: false)
+        }
+
+        func testInteractiveStaleSameIDActivationReportsRefreshBlockWithoutDuplicate() async throws {
+            try await assertInteractiveStaleActivation(metadataPublished: false, refreshBlocked: true)
+        }
+
+        private func assertInteractiveStaleActivation(metadataPublished: Bool, refreshBlocked: Bool) async throws {
             let runtime = try await makeDomainRuntime()
             let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1307)
             let authorityManager = makeManager(domainRuntime: runtime)
@@ -957,6 +1053,10 @@ import XCTest
             await targetManager.awaitInitialized()
             let originalFolder = try makeFolder(named: "InteractiveStaleOriginal")
             let requestedFolder = try makeFolder(named: "InteractiveStaleRequested")
+            let originalFile = originalFolder.appendingPathComponent("Original.swift")
+            let requestedFile = requestedFolder.appendingPathComponent("Requested.swift")
+            try Data("let original = true\n".utf8).write(to: originalFile)
+            try Data("let requested = true\n".utf8).write(to: requestedFile)
             let workspace = WorkspaceModel(
                 name: "Interactive Stale",
                 repoPaths: [originalFolder.path]
@@ -972,6 +1072,11 @@ import XCTest
                 reason: "interactiveStaleFixture"
             )
             XCTAssertEqual(initialSwitch, .switched)
+            // File view models are lazy; query the loaded workspace index before checking the UI projection.
+            let loadedOriginal = await targetManager.fileManager.findFile(atPath: originalFile.path)
+            XCTAssertNotNil(loadedOriginal)
+            let countBeforeOpen = targetManager.workspaces.count
+            let catalogBeforeOpen = await client.snapshot()
             targetBridge.stop()
             var replacement = workspace
             replacement.repoPaths = [requestedFolder.path]
@@ -979,13 +1084,46 @@ import XCTest
             try await saveAuthoritativeWorkspace(replacement, using: client)
             XCTAssertEqual(targetManager.activeWorkspace?.repoPaths, [originalFolder.path])
 
-            try await targetManager.openWorkspace(
-                fromFolderURL: requestedFolder,
-                behavior: .createNewWorkspace
-            )
+            if metadataPublished {
+                let index = try XCTUnwrap(targetManager.workspaces.firstIndex { $0.id == workspace.id })
+                targetManager.workspaces[index] = replacement
+            }
+            XCTAssertTrue(targetManager.fileManager.rootFolders.contains { $0.fullPath == originalFolder.path })
+            targetManager.isRefreshing = refreshBlocked
+            defer { targetManager.isRefreshing = false }
+            do {
+                try await targetManager.openWorkspace(
+                    fromFolderURL: requestedFolder,
+                    behavior: .createNewWorkspace
+                )
+                XCTAssertFalse(refreshBlocked, "Stale same-ID activation must report the refresh block")
+            } catch let WorkspaceOpenError.activationBlocked(workspaceID, creationCommitted, reason) {
+                XCTAssertTrue(refreshBlocked)
+                XCTAssertEqual(workspaceID, workspace.id)
+                XCTAssertFalse(creationCommitted)
+                XCTAssertEqual(reason, "Cannot reload the active workspace while refresh is in progress.")
+            }
 
             XCTAssertEqual(targetManager.activeWorkspaceID, workspace.id)
             XCTAssertEqual(targetManager.activeWorkspace?.repoPaths, [requestedFolder.path])
+            XCTAssertEqual(targetManager.workspaces.count, countBeforeOpen)
+            let catalogAfterOpen = await client.snapshot()
+            XCTAssertEqual(catalogAfterOpen.workspaces.count, catalogBeforeOpen.workspaces.count)
+            XCTAssertEqual(catalogAfterOpen.workspaces.count(where: { $0.document.workspaceID == workspace.id }), 1)
+            if refreshBlocked {
+                XCTAssertTrue(targetManager.fileManager.rootFolders.contains { $0.fullPath == originalFolder.path })
+                XCTAssertFalse(targetManager.fileManager.rootFolders.contains { $0.fullPath == requestedFolder.path })
+                XCTAssertNotNil(targetManager.fileManager.findFileByFullPath(originalFile.path))
+                XCTAssertNil(targetManager.fileManager.findFileByFullPath(requestedFile.path))
+                return
+            }
+            XCTAssertTrue(targetManager.fileManager.rootFolders.contains { $0.fullPath == requestedFolder.path })
+            XCTAssertFalse(targetManager.fileManager.rootFolders.contains { $0.fullPath == originalFolder.path })
+            let loadedRequested = await targetManager.fileManager.findFile(atPath: requestedFile.path)
+            XCTAssertNotNil(loadedRequested)
+            XCTAssertNil(targetManager.fileManager.findFileByFullPath(originalFile.path))
+            await targetManager.fileManager.selectFiles(withPaths: [requestedFile.path])
+            XCTAssertEqual(targetManager.fileManager.selectedFiles.map(\.fullPath), [requestedFile.path])
         }
 
         func testManagerResolutionExposesCreatedAndReusedProvenance() async throws {
@@ -1322,6 +1460,8 @@ import XCTest
             )
             XCTAssertEqual(initialSwitch, .switched)
             let countBeforeOpen = manager.workspaces.count
+            manager.isRefreshing = true
+            defer { manager.isRefreshing = false }
 
             try await manager.openWorkspace(
                 fromFolderURL: folder,
