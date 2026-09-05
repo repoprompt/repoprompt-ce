@@ -2,8 +2,8 @@ import Foundation
 
 /// The single source of truth for RepoPrompt-managed Codex runtime selection and state.
 ///
-/// Production defaults to the verified bundled package for the running architecture. The
-/// only user-configurable external fallback is an absolute path supplied through
+/// Production defaults to the verified bundled package for the running architecture. Advanced
+/// users may explicitly select an absolute executable in Settings or supply one through
 /// `REPOPROMPT_CODEX_EXECUTABLE`; ordinary PATH lookup is intentionally not consulted.
 enum CodexRuntimeAuthority {
     static let bundledVersion = Version(major: 0, minor: 149, patch: 0)
@@ -87,15 +87,15 @@ enum CodexRuntimeAuthority {
             case let .bundledLayoutIncomplete(target, component):
                 "RepoPrompt could not start Codex: the bundled \(target) package is incomplete at `\(component)`. Reinstall RepoPrompt CE."
             case .externalOverrideMustBeAbsolute:
-                "RepoPrompt could not start Codex: \(externalExecutableOverrideEnvironmentKey) must be an absolute executable path. PATH lookup is not used."
+                "RepoPrompt could not start Codex: the local executable configured in Settings or \(externalExecutableOverrideEnvironmentKey) must use an absolute path. PATH lookup is not used."
             case let .externalOverrideMissing(path):
-                "RepoPrompt could not start Codex: the configured external override does not exist at `\(path)`. Fix or remove \(externalExecutableOverrideEnvironmentKey)."
+                "RepoPrompt could not start Codex: the configured local executable does not exist at `\(path)`. Choose another in Settings, or fix/remove \(externalExecutableOverrideEnvironmentKey)."
             case let .externalOverrideNotExecutable(path):
-                "RepoPrompt could not start Codex: the configured external override is not an executable file at `\(path)`. Fix or remove \(externalExecutableOverrideEnvironmentKey)."
+                "RepoPrompt could not start Codex: the configured local executable is not executable at `\(path)`. Choose another in Settings, or fix/remove \(externalExecutableOverrideEnvironmentKey)."
             case let .externalOverrideVersionUnreadable(path):
-                "RepoPrompt could not start Codex: the external override at `\(path)` did not report a compatible Codex version. Version \(minimumExternalVersion) or newer is required by RepoPrompt's app-server contract."
+                "RepoPrompt could not start Codex: the local executable at `\(path)` did not report a compatible Codex version. Version \(minimumExternalVersion) or newer is required by RepoPrompt's app-server contract."
             case let .externalOverrideTooOld(actual, minimum):
-                "RepoPrompt could not start Codex: external override version \(actual) is too old. Version \(minimum) or newer is required by RepoPrompt's app-server contract; update the explicit override or remove \(externalExecutableOverrideEnvironmentKey) to use bundled Codex \(bundledVersion)."
+                "RepoPrompt could not start Codex: local version \(actual) is too old. Version \(minimum) or newer is required by RepoPrompt's app-server contract; update the configured executable or remove it to use bundled Codex \(bundledVersion)."
             }
         }
     }
@@ -193,6 +193,7 @@ enum CodexRuntimeAuthority {
 
     private struct ExternalVersionCacheKey: Hashable {
         let path: String
+        let environment: [String: String]
         let modificationDate: Date?
         let fileSize: UInt64?
     }
@@ -249,6 +250,7 @@ enum CodexRuntimeAuthority {
             return resolveExternalOverride(
                 configuredOverride,
                 statePaths: state,
+                environment: environment,
                 versionReader: externalVersionReader
             )
         }
@@ -324,9 +326,56 @@ enum CodexRuntimeAuthority {
         )
     }
 
+    /// Resolves the production configuration without making persistence part of the pure
+    /// validation path. A call-site override wins, followed by the Settings choice, environment,
+    /// and finally the bundled runtime. An explicitly bundled selection suppresses the legacy
+    /// environment override so the visible choice remains authoritative.
+    static func resolveConfigured(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        resourcesURL: URL? = Bundle.main.resourceURL,
+        architectureTarget: String? = currentArchitectureTarget,
+        applicationSupportURL: URL? = nil,
+        explicitExecutableOverride: String? = nil,
+        selection: CodexRuntimePreferences.Selection = CodexRuntimePreferences.activeSelection,
+        externalVersionReader: ((URL) -> String?)? = nil
+    ) -> Result<Runtime, Failure> {
+        if let explicitExecutableOverride {
+            return resolve(
+                environment: environment,
+                resourcesURL: resourcesURL,
+                architectureTarget: architectureTarget,
+                applicationSupportURL: applicationSupportURL,
+                explicitExecutableOverride: explicitExecutableOverride,
+                externalVersionReader: externalVersionReader
+            )
+        }
+
+        var configuredEnvironment = environment
+        let configuredOverride: String?
+        switch selection {
+        case .inherited:
+            configuredOverride = nil
+        case .bundled:
+            configuredEnvironment.removeValue(forKey: externalExecutableOverrideEnvironmentKey)
+            configuredOverride = nil
+        case let .external(path):
+            configuredOverride = path
+        }
+
+        return resolve(
+            environment: configuredEnvironment,
+            resourcesURL: resourcesURL,
+            architectureTarget: architectureTarget,
+            applicationSupportURL: applicationSupportURL,
+            explicitExecutableOverride: configuredOverride,
+            externalVersionReader: externalVersionReader
+        )
+    }
+
     private static func resolveExternalOverride(
         _ rawPath: String,
         statePaths: StatePaths,
+        environment: [String: String],
         versionReader: ((URL) -> String?)?
     ) -> Result<Runtime, Failure> {
         let expandedPath = (rawPath as NSString).expandingTildeInPath
@@ -344,7 +393,7 @@ enum CodexRuntimeAuthority {
         let version: Version? = if let versionReader {
             versionReader(url).flatMap(Version.parse)
         } else {
-            cachedExternalVersion(executableURL: url)
+            cachedExternalVersion(executableURL: url, environment: environment)
         }
         guard let version else {
             return .failure(.externalOverrideVersionUnreadable(url.path))
@@ -362,10 +411,11 @@ enum CodexRuntimeAuthority {
         )
     }
 
-    private static func cachedExternalVersion(executableURL: URL) -> Version? {
+    private static func cachedExternalVersion(executableURL: URL, environment: [String: String]) -> Version? {
         let attributes = try? FileManager.default.attributesOfItem(atPath: executableURL.path)
         let key = ExternalVersionCacheKey(
             path: executableURL.path,
+            environment: environment,
             modificationDate: attributes?[.modificationDate] as? Date,
             fileSize: (attributes?[.size] as? NSNumber)?.uint64Value
         )
@@ -388,7 +438,7 @@ enum CodexRuntimeAuthority {
         // Version probing may launch an invalid or hanging executable. Never hold the global
         // cache lock while waiting for that child; cache identity-bound failures briefly so
         // repeated callers do not serialize behind the same bad override.
-        let version = readExternalVersion(executableURL: executableURL).flatMap(Version.parse)
+        let version = readExternalVersion(executableURL: executableURL, environment: environment).flatMap(Version.parse)
 
         externalVersionCacheLock.lock()
         if let version {
@@ -403,11 +453,12 @@ enum CodexRuntimeAuthority {
         return version
     }
 
-    private static func readExternalVersion(executableURL: URL) -> String? {
+    private static func readExternalVersion(executableURL: URL, environment: [String: String]) -> String? {
         let process = Process()
         let output = Pipe()
         process.executableURL = executableURL
         process.arguments = ["--version"]
+        process.environment = environment
         process.standardOutput = output
         process.standardError = output
         let completed = DispatchSemaphore(value: 0)

@@ -177,7 +177,7 @@ enum CodexIntegrationConfiguration {
     @discardableResult
     static func installPersistentMCPConfig() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
         let runtime: CodexRuntimeAuthority.Runtime
-        switch CodexRuntimeAuthority.resolve() {
+        switch CodexRuntimeAuthority.resolveConfigured() {
         case let .success(resolved):
             runtime = resolved
         case let .failure(failure):
@@ -224,7 +224,7 @@ enum CodexIntegrationConfiguration {
     /// `-c` overrides.
     @discardableResult
     static func ensureServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
-        switch CodexRuntimeAuthority.resolve() {
+        switch CodexRuntimeAuthority.resolveConfigured() {
         case let .success(resolved):
             ensureServerForDiscovery(runtime: resolved)
         case let .failure(failure):

@@ -119,7 +119,7 @@ actor CodexAppServerClient {
             else {
                 return message
             }
-            return "\(message) The active Codex runtime rejected RepoPrompt's required \(method) request shape. Reinstall or update RepoPrompt CE; if REPOPROMPT_CODEX_EXECUTABLE is set, update or remove that explicit override."
+            return "\(message) The active Codex runtime rejected RepoPrompt's required \(method) request shape. Reinstall or update RepoPrompt CE; if a local Codex executable is configured, update it or switch back to the bundled runtime."
         }
     }
 
