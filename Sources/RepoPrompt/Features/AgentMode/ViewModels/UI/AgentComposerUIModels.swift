@@ -234,6 +234,7 @@ struct AgentComposerProps: Equatable {
     let selectedModelDisplayName: String
     let selectedReasoningEffortRaw: String?
     let selectedReasoningEffortDisplayName: String
+    let codexReasoningEffortOptions: [CodexReasoningEffort]
     let availableAgents: [AgentProviderKind]
     let isProviderPickerLockedForCurrentTab: Bool
     let lockedAgentSelectionMessage: String?
@@ -266,6 +267,7 @@ struct AgentComposerProps: Equatable {
         selectedModelDisplayName: AgentModel.defaultModel.displayName,
         selectedReasoningEffortRaw: nil,
         selectedReasoningEffortDisplayName: "",
+        codexReasoningEffortOptions: [],
         availableAgents: [],
         isProviderPickerLockedForCurrentTab: false,
         lockedAgentSelectionMessage: nil,
