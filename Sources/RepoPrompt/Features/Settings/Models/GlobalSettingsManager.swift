@@ -1833,12 +1833,19 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     ) {
         var repositories = globalDefaults.worktreeVisualIdentitiesByRepositoryID ?? [:]
         var bucket = repositories[repositoryID] ?? WorktreeVisualIdentityRepositoryBucket()
+        let previousLabel = normalizedWorktreeVisualLabel(bucket.identitiesByWorktreeID[worktreeID]?.label)
         bucket.identitiesByWorktreeID[worktreeID] = identity
         repositories[repositoryID] = bucket
         globalDefaults.worktreeVisualIdentitiesByRepositoryID = repositories
         objectWillChange.send()
         if commit {
             save()
+        }
+        // Label only. Color, icon, marker style, and `updatedAt` cannot change any oversight row's
+        // location text, so they must not schedule a repaint. Fired from the live assignment rather
+        // than from `save()`: presentation follows memory, and a revert emits its own refresh.
+        if previousLabel != normalizedWorktreeVisualLabel(identity.label) {
+            AgentSessionLinkLocationInvalidationSink.locationLabelsChanged(inWorkspace: nil)
         }
     }
 

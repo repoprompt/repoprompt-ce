@@ -57,6 +57,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
                 rename: { invocations.append(("rename", $0)) },
                 stash: { invocations.append(("stash", $0)) },
                 copyHandoffPrompt: { invocations.append(("copy", $0)) },
+                copySessionID: { _ in },
                 delete: { invocations.append(("delete", $0)) }
             )
         )
@@ -77,6 +78,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
                 rename: { _ in },
                 stash: { _ in },
                 copyHandoffPrompt: { _ in },
+                copySessionID: { _ in },
                 delete: { _ in }
             )
         )
@@ -101,6 +103,126 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
 
         XCTAssertEqual(invocations.map(\.0), ["pin", "rename", "stash", "copy", "delete"])
         XCTAssertEqual(invocations.map(\.1), Array(repeating: target, count: 5))
+    }
+
+    func testCopySessionIDItemAppearsOnlyWithAGenerationBearingCaptureAndPassesItThrough() throws {
+        let target = AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            agentSessionID: UUID(),
+            tabName: "Captured"
+        )
+
+        // No eligible endpoint: the action is not offered at all, rather than offered and then denied.
+        let withoutCapture = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: AgentChatOptionsMenuSnapshot(target: target, isPinned: false),
+            actions: Self.noopActions()
+        )
+        XCTAssertFalse(withoutCapture.items.map(\.title).contains("Copy Session ID"))
+
+        let capture = AgentSessionCopyIDTarget(
+            windowID: target.windowID,
+            workspaceID: target.workspaceID,
+            tabID: target.tabID,
+            sessionID: target.agentSessionID,
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 4
+        )
+        var copied: [AgentSessionCopyIDTarget] = []
+        let menu = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: AgentChatOptionsMenuSnapshot(
+                target: target,
+                isPinned: false,
+                copySessionIDTarget: capture
+            ),
+            actions: Self.noopActions(copySessionID: { copied.append($0) })
+        )
+        XCTAssertEqual(menu.items.map(\.title), [
+            "Pin",
+            "Rename",
+            "Stash",
+            "Handoff",
+            "Copy Session ID",
+            "",
+            "Delete"
+        ])
+
+        let item = menu.items[4]
+        XCTAssertTrue(try NSApplication.shared.sendAction(
+            XCTUnwrap(item.action),
+            to: item.target,
+            from: item
+        ))
+        // The menu carries the exact incarnation, not just the session ID, so a same-ID rebind
+        // between menu open and click is still detectable at the clipboard write.
+        XCTAssertEqual(copied, [capture])
+    }
+
+    func testTitleClusterCopiedNoticeIsRevisionGuardedAndSurvivesUnrelatedTitleUpdates() async throws {
+        let model = AgentChatTitleClusterModel(title: "Alpha")
+        XCTAssertNil(model.state.copiedNotice)
+
+        model.showCopiedNotice("Session ID copied", duration: .milliseconds(60))
+        XCTAssertEqual(model.state.copiedNotice, "Session ID copied")
+
+        // A title/chat-options refresh must not clear an in-flight confirmation.
+        model.update(title: "Alpha renamed", showsChatOptions: true)
+        XCTAssertEqual(model.state.title, "Alpha renamed")
+        XCTAssertEqual(model.state.copiedNotice, "Session ID copied")
+
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertNil(model.state.copiedNotice)
+    }
+
+    func testLaterCopiedNoticeSupersedesAnInFlightReset() async throws {
+        let model = AgentChatTitleClusterModel(title: "Alpha")
+        model.showCopiedNotice("first", duration: .milliseconds(40))
+        // The second notice takes a newer generation, so the first one's pending reset must not clear
+        // it when it fires.
+        model.showCopiedNotice("second", duration: .milliseconds(400))
+
+        try await Task.sleep(for: .milliseconds(180))
+        XCTAssertEqual(model.state.copiedNotice, "second")
+
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertNil(model.state.copiedNotice)
+    }
+
+    func testTitlebarCopyWritesNothingAndShowsNoFeedbackForAForeignWindow() {
+        // A capture from another window can never be satisfied here: zero clipboard writes and no
+        // false success confirmation.
+        let model = AgentChatTitleClusterModel(title: "Alpha")
+        let capture = AgentSessionCopyIDTarget(
+            windowID: 1234,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
+        )
+        var writes: [String] = []
+        let outcome = AgentSessionCopyIDPolicy.outcome(for: capture, liveCandidates: [])
+        if case let .copied(value) = outcome {
+            writes.append(value)
+            model.showCopiedNotice("Session ID copied")
+        }
+        XCTAssertEqual(outcome, .staleTarget)
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertNil(model.state.copiedNotice)
+    }
+
+    private static func noopActions(
+        copySessionID: @escaping (AgentSessionCopyIDTarget) -> Void = { _ in }
+    ) -> AgentChatOptionsMenuActions {
+        AgentChatOptionsMenuActions(
+            togglePin: { _ in },
+            rename: { _ in },
+            stash: { _ in },
+            copyHandoffPrompt: { _ in },
+            copySessionID: copySessionID,
+            delete: { _ in }
+        )
     }
 
     func testHandoffPromptRendersExactBuildAwareMCPAndCLIRouting() throws {

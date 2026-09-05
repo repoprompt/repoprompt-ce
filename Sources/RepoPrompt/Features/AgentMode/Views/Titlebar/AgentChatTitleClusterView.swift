@@ -6,18 +6,41 @@ final class AgentChatTitleClusterModel: ObservableObject {
     struct State: Equatable {
         var title: String
         var showsChatOptions: Bool
+        /// Transient confirmation shown on the persistent title cluster.
+        ///
+        /// The native chat-options menu dismisses the moment an item is chosen, so success feedback
+        /// for Copy Session ID cannot live on the menu itself.
+        var copiedNotice: String?
     }
 
     @Published private(set) var state: State
+    private var copiedNoticeGeneration: UInt64 = 0
 
     init(title: String) {
-        state = State(title: title, showsChatOptions: false)
+        state = State(title: title, showsChatOptions: false, copiedNotice: nil)
     }
 
     func update(title: String, showsChatOptions: Bool) {
-        let nextState = State(title: title, showsChatOptions: showsChatOptions)
+        let nextState = State(
+            title: title,
+            showsChatOptions: showsChatOptions,
+            copiedNotice: state.copiedNotice
+        )
         guard state != nextState else { return }
         state = nextState
+    }
+
+    /// Revision-guarded: a later confirmation always supersedes an in-flight reset, and a reset never
+    /// clears a newer notice.
+    func showCopiedNotice(_ message: String, duration: Duration = .milliseconds(1500)) {
+        copiedNoticeGeneration &+= 1
+        let generation = copiedNoticeGeneration
+        state.copiedNotice = message
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: duration)
+            guard let self, copiedNoticeGeneration == generation else { return }
+            state.copiedNotice = nil
+        }
     }
 }
 
@@ -40,6 +63,16 @@ struct AgentChatTitleClusterView: View {
                     menuSnapshot: menuSnapshot,
                     menuActions: menuActions
                 )
+            }
+
+            if let copiedNotice = model.state.copiedNotice {
+                Text(copiedNotice)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .transition(.opacity)
+                    .accessibilityIdentifier("AgentChatTitleCopiedNotice")
+                    .accessibilityLabel(copiedNotice)
             }
         }
         .fixedSize(horizontal: false, vertical: true)

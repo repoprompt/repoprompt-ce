@@ -73,6 +73,75 @@ final class ClaudeAgentModeCoordinator {
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Void
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
+        let ensureAgentSessionLinkProviderInputCatalogReady: @MainActor (
+            _ session: AgentTabSession
+        ) async -> AgentModeViewModel.ProviderInputCatalogReadiness
+        let hasCurrentAgentSessionLinkProviderInputCatalogRoute: @MainActor (
+            _ session: AgentTabSession
+        ) -> Bool
+        let decorateAgentSessionLinkPrompt: @MainActor (
+            _ text: String,
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> AgentSessionLinkDecoratedProviderText
+        let acquireAgentSessionLinkPhysicalDispatch: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Bool
+        let recordAgentSessionLinkPhysicalDispatchNotAttempted: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Void
+        let recordAgentSessionLinkPhysicalDispatchFailure: @MainActor (
+            _ session: AgentTabSession,
+            _ dispatchID: AgentSessionLinkPromptDispatchID
+        ) -> Void
+        let acceptAgentSessionLinkPromptClaim: @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
+
+        init(
+            isSessionCurrent: @escaping @MainActor (_ session: AgentTabSession) -> Bool,
+            requestUIRefresh: @escaping @MainActor (_ session: AgentTabSession, _ urgent: Bool) -> Void,
+            scheduleSave: @escaping @MainActor (_ session: AgentTabSession) -> Void,
+            stageClaudeResumeRecoveryHandoff: @escaping @MainActor (_ session: AgentTabSession) async -> Void,
+            prependPendingHandoff: @escaping @MainActor (_ text: String, _ session: AgentTabSession) -> String,
+            ensureAgentSessionLinkProviderInputCatalogReady: @escaping @MainActor (
+                _ session: AgentTabSession
+            ) async -> AgentModeViewModel.ProviderInputCatalogReadiness = { _ in .notRequired },
+            hasCurrentAgentSessionLinkProviderInputCatalogRoute: @escaping @MainActor (
+                _ session: AgentTabSession
+            ) -> Bool = { _ in true },
+            decorateAgentSessionLinkPrompt: @escaping @MainActor (
+                _ text: String,
+                _ session: AgentTabSession,
+                _ dispatchID: AgentSessionLinkPromptDispatchID
+            ) -> AgentSessionLinkDecoratedProviderText,
+            acquireAgentSessionLinkPhysicalDispatch: @escaping @MainActor (
+                _ session: AgentTabSession,
+                _ dispatchID: AgentSessionLinkPromptDispatchID
+            ) -> Bool,
+            recordAgentSessionLinkPhysicalDispatchNotAttempted: @escaping @MainActor (
+                _ session: AgentTabSession,
+                _ dispatchID: AgentSessionLinkPromptDispatchID
+            ) -> Void,
+            recordAgentSessionLinkPhysicalDispatchFailure: @escaping @MainActor (
+                _ session: AgentTabSession,
+                _ dispatchID: AgentSessionLinkPromptDispatchID
+            ) -> Void,
+            acceptAgentSessionLinkPromptClaim: @escaping @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
+        ) {
+            self.isSessionCurrent = isSessionCurrent
+            self.requestUIRefresh = requestUIRefresh
+            self.scheduleSave = scheduleSave
+            self.stageClaudeResumeRecoveryHandoff = stageClaudeResumeRecoveryHandoff
+            self.prependPendingHandoff = prependPendingHandoff
+            self.ensureAgentSessionLinkProviderInputCatalogReady = ensureAgentSessionLinkProviderInputCatalogReady
+            self.hasCurrentAgentSessionLinkProviderInputCatalogRoute = hasCurrentAgentSessionLinkProviderInputCatalogRoute
+            self.decorateAgentSessionLinkPrompt = decorateAgentSessionLinkPrompt
+            self.acquireAgentSessionLinkPhysicalDispatch = acquireAgentSessionLinkPhysicalDispatch
+            self.recordAgentSessionLinkPhysicalDispatchNotAttempted = recordAgentSessionLinkPhysicalDispatchNotAttempted
+            self.recordAgentSessionLinkPhysicalDispatchFailure = recordAgentSessionLinkPhysicalDispatchFailure
+            self.acceptAgentSessionLinkPromptClaim = acceptAgentSessionLinkPromptClaim
+        }
 
         static var noOp: Self {
             Self(
@@ -80,7 +149,16 @@ final class ClaudeAgentModeCoordinator {
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
-                prependPendingHandoff: { text, _ in text }
+                prependPendingHandoff: { text, _ in text },
+                ensureAgentSessionLinkProviderInputCatalogReady: { _ in .notRequired },
+                hasCurrentAgentSessionLinkProviderInputCatalogRoute: { _ in true },
+                decorateAgentSessionLinkPrompt: { text, _, _ in
+                    .init(text: text, claim: nil, mustAbortDispatch: false)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
+                acceptAgentSessionLinkPromptClaim: { _ in }
             )
         }
     }
@@ -906,13 +984,25 @@ final class ClaudeAgentModeCoordinator {
         session: AgentTabSession,
         text: String,
         attachments _: [AgentImageAttachment],
-        intent: NativeSessionIntent
+        intent: NativeSessionIntent,
+        allowsCatalogRouteControllerRecovery: Bool
     ) async -> NativeSendOutcome {
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         var handler = toolHandler(for: session)
         handler.resetTurnState(for: session)
 
-        for _ in 0 ..< 3 {
+        // One logical dispatch spans the whole bounded controller-retry loop below: a recycled
+        // controller is a transport retry of the *same* user turn, so every attempt must carry a
+        // byte-equivalent oversight supplement rather than re-deciding per attempt.
+        let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+        /// The same refusal is reachable from three predicates that fail for different reasons and
+        /// are indistinguishable in the UI, which cost a full diagnostic cycle. The bracketed code
+        /// names the branch; it carries no identifiers or user content.
+        func routeVerificationFailure(_ code: String) -> String {
+            "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run. [route:\(code)]"
+        }
+
+        for attempt in 0 ..< 3 {
             switch await ensureClaudeNativeSession(session: session, intent: intent) {
             case .ready:
                 break
@@ -1009,6 +1099,43 @@ final class ClaudeAgentModeCoordinator {
                 return .superseded
             }
 
+            let catalogReadiness = await hostCapabilities.ensureAgentSessionLinkProviderInputCatalogReady(session)
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return .superseded
+            }
+            let requiresFinalRouteFence: Bool
+            switch catalogReadiness {
+            case .notRequired:
+                requiresFinalRouteFence = false
+            case .ready:
+                requiresFinalRouteFence = true
+            case .cancelled, .superseded:
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return .superseded
+            case .unavailable, .timedOut:
+                if allowsCatalogRouteControllerRecovery,
+                   attempt < 2,
+                   await recycleClaudeControllerForCatalogRouteRecovery(
+                       session: session,
+                       existingController: controller
+                   )
+                {
+                    guard intentIsCurrent(intent, for: session) else { return .superseded }
+                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+                    handler = toolHandler(for: session)
+                    continue
+                }
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return recordSendFailure(
+                    routeVerificationFailure(catalogReadiness == .timedOut ? "timeout" : "unavailable"),
+                    session: session,
+                    intent: intent
+                )
+            }
+
             // This is the final launch-settings validation before dispatch. There is
             // intentionally no suspension between this check and sendUserMessage, so a
             // Safe Managed tightening cannot enqueue a turn on the stale controller.
@@ -1024,11 +1151,62 @@ final class ClaudeAgentModeCoordinator {
                 continue
             }
 
+            if requiresFinalRouteFence,
+               !hostCapabilities.hasCurrentAgentSessionLinkProviderInputCatalogRoute(session)
+            {
+                if allowsCatalogRouteControllerRecovery,
+                   attempt < 2,
+                   await recycleClaudeControllerForCatalogRouteRecovery(
+                       session: session,
+                       existingController: controller
+                   )
+                {
+                    guard intentIsCurrent(intent, for: session) else { return .superseded }
+                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+                    handler = toolHandler(for: session)
+                    continue
+                }
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return recordSendFailure(
+                    routeVerificationFailure("fence"),
+                    session: session,
+                    intent: intent
+                )
+            }
+
             do {
                 let outboundText = hostCapabilities.prependPendingHandoff(text, session)
+                // Applied after handoff composition and before delivery-mode packaging, so the
+                // oversight supplement remains the final RepoPrompt envelope in the user-message
+                // channel regardless of native-system or XML instruction delivery.
+                let monitoring = hostCapabilities.decorateAgentSessionLinkPrompt(
+                    outboundText,
+                    session,
+                    promptDispatchID
+                )
+                // A lane-update dispatch has no base user instruction. If its required batch was
+                // revoked, acknowledged, revision-fenced, or omitted by the shared budget, stop before
+                // `sendUserMessage`; `.superseded` is the quiet no-provider-call outcome.
+                guard !monitoring.mustAbortDispatch else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
+                }
+                guard hostCapabilities.acquireAgentSessionLinkPhysicalDispatch(
+                    session,
+                    promptDispatchID
+                ) else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
+                }
                 let instructions = agentModeInstructionInjection(for: session)
-                let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
+                let providerBoundText = providerBoundUserMessage(
+                    monitoring.text,
+                    instructions: instructions
+                )
                 let turnID = try await controller.sendUserMessage(providerBoundText)
+                // The returned provider turn ID is the acceptance signal. Acknowledge before the
+                // currency guard: even a locally superseded turn delivered this supplement.
+                hostCapabilities.acceptAgentSessionLinkPromptClaim(monitoring.claim)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {
@@ -1040,6 +1218,7 @@ final class ClaudeAgentModeCoordinator {
                 session.claudeExpectedTurnIDs.insert(turnID)
                 return .sent
             } catch {
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchFailure(session, promptDispatchID)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {
@@ -1061,6 +1240,30 @@ final class ClaudeAgentModeCoordinator {
             session: session,
             intent: intent
         )
+    }
+
+    /// Replaces a retained Claude process whose MCP connection disappeared between turns.
+    ///
+    /// The provider message has not been attempted when this runs. Retiring the controller keeps the
+    /// process run and captured provider session ID, so the next iteration resumes the same Claude
+    /// conversation while establishing a fresh RepoPrompt MCP connection and exact catalog route.
+    private func recycleClaudeControllerForCatalogRouteRecovery(
+        session: AgentTabSession,
+        existingController: any NativeAgentRuntimeControlling
+    ) async -> Bool {
+        guard let detached = detachClaudeController(
+            existingController,
+            from: session,
+            removeToolTracking: true
+        ) else {
+            return false
+        }
+        _ = await retireClaudeController(
+            detached,
+            for: session,
+            captureProviderSessionID: true
+        )
+        return true
     }
 
     private func recordSendFailure(

@@ -120,6 +120,7 @@ package actor MCPDomainRuntime {
     package nonisolated let mutationJournal: DomainMutationJournal
     package nonisolated let protectedMutationProvider: MCPDomainProtectedMutationToolProvider
     package nonisolated let agentSessionStore: DomainAgentRunSessionStore
+    package nonisolated let agentSessionLinkAuthority: DomainAgentSessionLinkAuthority
     package nonisolated let agentWorktreeBindingStore: DomainAgentWorktreeBindingStore
     package nonisolated let interactionBroker: DomainInteractionBroker
     package nonisolated let activityCenter: DomainActivityCenter
@@ -208,6 +209,8 @@ package actor MCPDomainRuntime {
             persistence: persistence,
             profileIdentifier: configuration.profileIdentifier
         )
+        // Never persisted: oversight links are live-only and must not survive a restart.
+        agentSessionLinkAuthority = DomainAgentSessionLinkAuthority(identity: runtimeIdentity)
         agentWorktreeBindingStore = DomainAgentWorktreeBindingStore(
             persistence: persistence,
             profileIdentifier: configuration.profileIdentifier
@@ -271,7 +274,13 @@ package actor MCPDomainRuntime {
         publishSnapshot()
         externalReloadTask?.cancel()
         externalReloadTask = nil
+        // Phase one must precede the host drain so parked oversight waits resume while their MCP
+        // invocations can still settle. Waking them only after the host cancelled those invocations
+        // would strand every continuation.
+        await agentSessionLinkAuthority.beginDrain()
         _ = await domainHost.drain(timeout: configuration.hostDrainTimeout)
+        // Phase two clears links/cursors/ledger/subscribers and advances the runtime generation.
+        await agentSessionLinkAuthority.finishShutdown()
         await mutationApprovalBroker.shutdown()
         await interactionBroker.shutdown()
         _ = await agentSessionStore.shutdown()

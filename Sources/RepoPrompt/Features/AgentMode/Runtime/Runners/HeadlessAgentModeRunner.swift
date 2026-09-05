@@ -109,6 +109,9 @@ final class HeadlessAgentModeRunner {
                     return
                 }
 
+                // Undecorated: the oversight supplement is attached inside `executeHeadlessRun`,
+                // after the lease's provider-initialization hop, because that hop is a suspension
+                // during which link membership can change.
                 let agentMessage = self.hooks.providerInput.buildHeadlessAgentMessage(
                     session,
                     initialMessageForRun,
@@ -172,7 +175,38 @@ final class HeadlessAgentModeRunner {
             failureText: { "Agent failed: \($0.localizedDescription)" }
         ) {
             await lease.providerInitializationStarted(provider: session.selectedAgent.rawValue)
-            let stream = try await provider.streamAgentMessage(initialMessage, runID: runID)
+            // Composed here, after the lease hop and immediately before stream creation: that hop is
+            // a suspension, so reading membership any earlier could dispatch inventory the user has
+            // already changed. This is the last point before the provider sees the turn.
+            let monitoring = hooks.providerInput.decoratedAgentMessage(
+                initialMessage,
+                session: session,
+                dispatchID: .headlessRun(runID: runID)
+            )
+            // A dispatch that exists only to carry a lane batch has nothing to say without it, so it
+            // is retracted here rather than sent empty. Cancellation is the quiet terminal: no
+            // provider call, no error row, and the batch stays owed to a later dispatch.
+            guard !monitoring.mustAbortDispatch else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                    session,
+                    .headlessRun(runID: runID)
+                )
+                throw CancellationError()
+            }
+            guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+                session,
+                .headlessRun(runID: runID)
+            ) else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                    session,
+                    .headlessRun(runID: runID)
+                )
+                throw CancellationError()
+            }
+            let stream = try await provider.streamAgentMessage(monitoring.message, runID: runID)
+            // Successful stream creation is the acceptance signal for every headless provider,
+            // including Claude headless. A throwing creation leaves the claim pending for the retry.
+            if let claim = monitoring.claim { hooks.providerInput.acceptAgentSessionLinkPrompt(claim) }
             providerInitializationCompleted = true
             await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "ready")
             hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
@@ -201,6 +235,12 @@ final class HeadlessAgentModeRunner {
         }
 
         guard case let .terminal(outcome) = report.result else { return }
+        if !providerInitializationCompleted {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                session,
+                .headlessRun(runID: runID)
+            )
+        }
         let terminalState: AgentSessionRunState
         let source: String
         let notifyTurnComplete: Bool

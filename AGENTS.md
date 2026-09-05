@@ -214,7 +214,7 @@ These do not claim daemon lanes or lifecycle supersession, so when multiple agen
 
 ## Source placement rules
 
-See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). In short:
+See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). Before changing Agent Mode cross-session oversight, read [`docs/architecture/agent-session-oversight-auto-wake.md`](docs/architecture/agent-session-oversight-auto-wake.md): it records the four disjoint owners, why a snooze suppresses admission but never delivery, and why the `.cancelledBeforeDispatch` tombstone is a transport fence whose dependency lives in a different file. In short:
 
 - The shipped `RepoPrompt` executable target lives under `Sources/RepoPromptExecutable` and must remain a one-file entry shell over the internal `RepoPromptApp` target; do not add implementation code there.
 - Product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
