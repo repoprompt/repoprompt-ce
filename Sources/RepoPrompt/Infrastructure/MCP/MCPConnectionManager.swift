@@ -13565,7 +13565,7 @@ actor ServerNetworkManager {
             // A numeric cache entry is usable only while its persisted record still
             // carries a validated numeric hint. Stable affinity with no live target
             // remains in routingState.records and is intentionally not pruned.
-            let validSessionKeys = Set(filtered.compactMap { record in
+            let validSessionKeys = Set<String>(filtered.compactMap { record in
                 guard record.lastWindowID != nil else { return nil }
                 return record.sessionKey
             })
