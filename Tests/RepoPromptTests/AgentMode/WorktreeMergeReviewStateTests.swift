@@ -303,10 +303,22 @@ final class WorktreeMergeReviewStateTests: XCTestCase {
         )
         let endpoint = try GitWorktreeMergeEndpoint(descriptor: mainDescriptor(head: endpointHead))
         let resolvedMain = mainDescriptor(head: resolvedHead)
+        let resolvedMainDescriptor = GitRepoDescriptor(
+            rootURL: URL(fileURLWithPath: mainPath),
+            rootPath: mainPath,
+            repoKey: resolvedMain.repository.repoKey,
+            displayName: resolvedMain.repository.displayName,
+            worktreeIdentity: GitWorktreeIdentitySnapshot(
+                repository: resolvedMain.repository,
+                worktreeID: resolvedMain.worktreeID,
+                worktreeRootPath: mainPath,
+                isMain: resolvedMain.isMain
+            )
+        )
         let resolver = GitRepoTargetResolver(dependencies: .init(
             resolveRepo: { url in
                 url.standardizedFileURL.path == mainPath
-                    ? GitRepoDescriptor(rootURL: URL(fileURLWithPath: mainPath))
+                    ? resolvedMainDescriptor
                     : nil
             },
             listWorktrees: { _ in [resolvedMain, linked] }
