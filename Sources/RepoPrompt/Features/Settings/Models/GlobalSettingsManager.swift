@@ -2379,15 +2379,23 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
 
     /// User-initiated recovery when `persistenceBlockReason` is non-nil. The file store backs
     /// up the offending on-disk file, writes the current in-memory settings as a fresh
-    /// current-schema document, and clears the block; this method then re-reads state so the
-    /// store and observers refresh.
+    /// current-schema document, and clears the block on success. A failed replacement keeps
+    /// the current in-memory document and the file store's blocked state intact.
     /// Returns true only when recovery completed successfully.
     @discardableResult
     func recoverBlockedPersistenceAfterBackup() -> Bool {
-        let backedUp = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
+        let recovered = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
         objectWillChange.send()
-        load(notifyAgentModelsChanges: true)
-        return backedUp
+        if recovered {
+            load(notifyAgentModelsChanges: true)
+        } else {
+            // Recovery may have moved the original file before its replacement write failed.
+            // Do not reload a missing primary file: that would install and persist defaults.
+            // Keep the live document intact and surface the store's actionable blocked state so
+            // the user can retry the intended settings after fixing the underlying failure.
+            persistenceBlockReason = fileStore.blockReason
+        }
+        return recovered
     }
 
     /// User-initiated compatible import from a blocked newer/different-schema settings file.
