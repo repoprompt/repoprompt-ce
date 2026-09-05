@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 
 // MARK: - Agent Session Data Error
 
@@ -518,6 +523,46 @@ actor AgentSessionDataService {
         let start = filename.index(filename.startIndex, offsetBy: prefixLength)
         let end = filename.index(filename.endIndex, offsetBy: -suffixLength)
         return UUID(uuidString: String(filename[start ..< end]))
+    }
+
+    /// Returns only a canonical, real session file directly under `folder`.
+    /// The metadata index is not an authority for this path: callers must discover the URL from the
+    /// folder scan, then validate the filename, filesystem object, canonical parent, and decoded ID.
+    private func canonicalAgentSessionFile(
+        _ fileURL: URL,
+        in folder: URL
+    ) -> (fileURL: URL, sessionID: UUID)? {
+        let standardizedFolder = folder.standardizedFileURL
+        let standardizedFile = fileURL.standardizedFileURL
+        guard standardizedFile.deletingLastPathComponent().path == standardizedFolder.path,
+              let sessionID = agentSessionID(fromFilename: standardizedFile.lastPathComponent),
+              standardizedFile.lastPathComponent == agentSessionFilename(for: sessionID),
+              isRealDirectory(at: standardizedFolder),
+              isRegularFileWithoutSymlinks(at: standardizedFile)
+        else {
+            return nil
+        }
+
+        let canonicalFolder = standardizedFolder.resolvingSymlinksInPath().standardizedFileURL
+        let canonicalFile = standardizedFile.resolvingSymlinksInPath().standardizedFileURL
+        guard canonicalFile.deletingLastPathComponent().path == canonicalFolder.path,
+              canonicalFile.lastPathComponent == standardizedFile.lastPathComponent
+        else {
+            return nil
+        }
+        return (standardizedFile, sessionID)
+    }
+
+    private func isRealDirectory(at url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return false }
+        return info.st_mode & S_IFMT == S_IFDIR
+    }
+
+    private func isRegularFileWithoutSymlinks(at url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return false }
+        return info.st_mode & S_IFMT == S_IFREG
     }
 
     private func metadataResourceValues(for fileURL: URL) -> (size: Int64?, modified: Date?) {
@@ -1526,14 +1571,6 @@ actor AgentSessionDataService {
         }
 
         var candidateByPath: [String: (fileURL: URL, tabID: UUID)] = [:]
-        if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
-            for record in index.entries {
-                guard let tabID = record.composeTabID, tabIDs.contains(tabID) else { continue }
-                let fileURL = agentSessionsFolder.appendingPathComponent(record.filename)
-                candidateByPath[fileURL.path] = (fileURL, tabID)
-            }
-        }
-
         let files: [URL]
         do {
             files = try await listAgentSessions(for: workspace)
@@ -1542,15 +1579,17 @@ actor AgentSessionDataService {
         }
         for fileURL in files {
             guard
+                let canonicalFile = canonicalAgentSessionFile(fileURL, in: agentSessionsFolder),
                 let stub = try? await loadAgentSessionStub(
-                    from: fileURL,
+                    from: canonicalFile.fileURL,
                     recoverMissingMetadata: false,
                     persistRecoveredMetadata: false
                 ),
+                stub.id == canonicalFile.sessionID,
                 let tabID = stub.composeTabID,
                 tabIDs.contains(tabID)
             else { continue }
-            candidateByPath[fileURL.path] = (fileURL, tabID)
+            candidateByPath[canonicalFile.fileURL.path] = (canonicalFile.fileURL, tabID)
         }
 
         var failures: [UUID: Error] = [:]
