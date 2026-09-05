@@ -195,51 +195,20 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionIngressWait, transition: .completed)
         }
         try Task.checkCancellation()
-        await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionConstruction)
-        resolvedContext.snapshot.selection = await dependencies.selection.stabilizedVirtualSelection(resolvedContext.snapshot)
-        try Task.checkCancellation()
-        resolvedContext.snapshot.selection = lookupContext.physicalizeSelection(resolvedContext.snapshot.selection)
-        let frozenReviewContext: FrozenPromptGitReviewContext?
-        let artifactResolution: MCPManageSelectionArtifactResolution
-        if ["add", "remove", "set", "preview"].contains(op) {
-            let frozen = await dependencies.selection.freezePromptGitReviewContext(resolvedContext.snapshot)
-            frozenReviewContext = frozen
-            let identity = resolvedContext.snapshot.workspaceID.map {
-                WorkspaceSelectionIdentity(
-                    workspaceID: $0,
-                    tabID: resolvedContext.snapshot.tabID
-                )
-            }
-            artifactResolution = await dependencies.selection.resolveManageSelectionArtifactInputs(
-                MCPManageSelectionArtifactResolutionRequest(
-                    paths: parsedInputs.paths,
-                    sliceInputs: parsedInputs.sliceInputs,
-                    use: op == "remove" ? .remove : .insert,
-                    mode: mode,
-                    physicalSelection: resolvedContext.snapshot.selection,
-                    identity: identity,
-                    capability: frozen.artifactCapability
-                )
-            )
-        } else {
-            frozenReviewContext = nil
-            let artifactInputs = parsedInputs.paths.filter {
-                let path = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-                return path == "_git_data" || path.hasPrefix("_git_data/")
-            }
-            if !artifactInputs.isEmpty, op == "promote" || op == "demote" {
-                throw MCPError.invalidParams(
-                    "Git artifact aliases support add, remove, set, and preview in mode 'full' only."
-                )
-            }
-            artifactResolution = MCPManageSelectionArtifactResolution(
-                ordinaryPaths: parsedInputs.paths,
-                ordinarySliceInputs: parsedInputs.sliceInputs,
-                artifacts: [],
-                invalidDiagnostics: [],
-                fence: nil
-            )
-        }
+        let construction = try await MCPSelectionConstruction.run(
+            snapshot: resolvedContext.snapshot,
+            op: op,
+            mode: mode,
+            parsedInputs: parsedInputs,
+            physicalize: lookupContext.physicalizeSelection,
+            stabilizedVirtualSelection: dependencies.selection.stabilizedVirtualSelection,
+            freezePromptGitReviewContext: dependencies.selection.freezePromptGitReviewContext,
+            resolveManageSelectionArtifactInputs: dependencies.selection
+                .resolveManageSelectionArtifactInputs
+        )
+        resolvedContext.snapshot = construction.snapshot
+        let frozenReviewContext = construction.frozenReviewContext
+        let artifactResolution = construction.artifactResolution
         let physicalParsedInputs = MCPServerViewModel.ManageSelectionInputs(
             paths: lookupContext.translateInputPaths(artifactResolution.ordinaryPaths),
             sliceInputs: lookupContext.translateSliceInputs(artifactResolution.ordinarySliceInputs),
