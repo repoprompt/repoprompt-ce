@@ -88,8 +88,8 @@ private final class ProcessDescriptorCleanup: @unchecked Sendable {
     private func markClosed(_ keyPath: ReferenceWritableKeyPath<ProcessDescriptorCleanup, Bool>) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard !self[keyPath] else { return false }
-        self[keyPath] = true
+        guard !self[keyPath: keyPath] else { return false }
+        self[keyPath: keyPath] = true
         return true
     }
 }
