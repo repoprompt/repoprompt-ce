@@ -18,12 +18,15 @@ struct CodexModelSpecifier: Equatable {
         self.serviceTier = self.baseModel == nil ? nil : serviceTier
     }
 
-    init(raw: String?) {
-        let parts = Self.splitLegacyModelID(raw)
+    init(raw: String?, discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()) {
+        let parts = Self.splitLegacyModelID(raw, discoveredRecords: discoveredRecords())
         self.init(baseModel: parts.baseModel, reasoningEffort: parts.reasoningEffort, serviceTier: parts.serviceTier)
     }
 
-    static func splitLegacyModelID(_ raw: String?) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {
+    static func splitLegacyModelID(
+        _ raw: String?,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+    ) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {
         guard
             let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
             !raw.isEmpty,
@@ -34,8 +37,8 @@ struct CodexModelSpecifier: Equatable {
 
         // First strip any reasoning effort suffix. Legacy efforts remain broadly decoded for
         // stored selections such as `gpt-5.5-xhigh` and `gpt-5.1-codex-max-low`.
-        // Extended efforts are gated to known GPT-5.6 families so the legitimate base ID
-        // `gpt-5.1-codex-max` is not misread as `gpt-5.1-codex` + max effort.
+        // Extended efforts require discovery metadata or a known legacy family, so a
+        // legitimate base ID such as `gpt-5.1-codex-max` is not split by its name alone.
         let suffixes: [(suffix: String, effort: ReasoningEffort, requiresKnownFamilySupport: Bool)] = [
             ("-xhigh", .xhigh, false),
             ("-maximum", .max, true),
@@ -54,7 +57,12 @@ struct CodexModelSpecifier: Equatable {
             let candidate = String(raw.dropLast(suffix.count))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !candidate.isEmpty else { break }
-            if !requiresKnownFamilySupport || Self.supportsExtendedEffort(candidateEffort, forBaseCandidate: candidate) {
+            if !requiresKnownFamilySupport || Self.supportsExtendedEffort(
+                candidateEffort,
+                forBaseCandidate: candidate,
+                rawModel: raw,
+                records: discoveredRecords()
+            ) {
                 base = candidate
                 effort = candidateEffort
             }
@@ -81,8 +89,27 @@ struct CodexModelSpecifier: Equatable {
         return (base, effort, tier)
     }
 
-    private static func supportsExtendedEffort(_ effort: ReasoningEffort, forBaseCandidate candidate: String) -> Bool {
+    private static func supportsExtendedEffort(
+        _ effort: ReasoningEffort,
+        forBaseCandidate candidate: String,
+        rawModel: String,
+        records: [CodexDynamicModelRecord]
+    ) -> Bool {
+        // Exact advertised identities take precedence over synthetic effort suffixes.
+        if records.contains(where: { $0.id.caseInsensitiveCompare(rawModel) == .orderedSame }) {
+            return false
+        }
         let supportBase = serviceTierStrippedBase(candidate).lowercased()
+        if let record = records.first(where: { $0.id.lowercased() == supportBase }) {
+            let advertisedEfforts = record.supportedReasoningEfforts.map(\.reasoningEffort)
+                + [record.defaultReasoningEffort].compactMap(\.self)
+            if advertisedEfforts.compactMap(ReasoningEffort.parse).contains(effort) {
+                return true
+            }
+        }
+
+        // Keep decoding saved and backfilled legacy selections when discovery is
+        // unavailable or omits capabilities previously supported by those families.
         let supported: Set<ReasoningEffort>
         switch supportBase {
         case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":

@@ -90,6 +90,7 @@ enum CodexDynamicModelMapper {
     static func options(from records: [CodexDynamicModelRecord]) -> [CodexDynamicModelOption] {
         var options: [CodexDynamicModelOption] = []
         var seen = Set<String>()
+        let advertisedIDs = Set(records.map { normalizeID($0.id).lowercased() })
 
         for record in records {
             let baseID = normalizeID(record.id)
@@ -101,7 +102,12 @@ enum CodexDynamicModelMapper {
                 fallbackID: baseID
             )
             let baseDescription = record.description.trimmingCharacters(in: .whitespacesAndNewlines)
-            let effortEntries = normalizedEfforts(for: record, fallbackDescription: baseDescription)
+            // Extended effort parsing preserves exact model identities. Do not offer a
+            // synthetic option that would resolve to another advertised model instead.
+            let effortEntries = normalizedEfforts(for: record, fallbackDescription: baseDescription).filter { entry in
+                ![CodexReasoningEffort.max, .ultra].contains(entry.effort)
+                    || !advertisedIDs.contains("\(baseID)-\(entry.effort.rawValue)".lowercased())
+            }
 
             if effortEntries.isEmpty {
                 appendOption(
@@ -312,6 +318,9 @@ enum CodexDynamicModelMapper {
 
 enum CodexDynamicModelStore {
     private static let storageKey = "CodexDynamicModelRecords"
+    private static let cacheLock = NSLock()
+    private static var cachedData: Data?
+    private static var cachedRecords: [CodexDynamicModelRecord] = []
 
     static func canonicalRecords(from models: [CodexAppServerClient.RemoteModel]) -> [CodexDynamicModelRecord] {
         models
@@ -326,8 +335,16 @@ enum CodexDynamicModelStore {
     }
 
     static func load(defaults: UserDefaults = .standard) -> [CodexDynamicModelRecord] {
-        guard let data = defaults.data(forKey: storageKey) else { return [] }
-        return (try? JSONDecoder().decode([CodexDynamicModelRecord].self, from: data)) ?? []
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        // Parsing and picker ordering share this store. Decode only when the persisted
+        // payload changes, including writes from other windows or defaults suites.
+        let data = defaults.data(forKey: storageKey)
+        if data != cachedData {
+            cachedData = data
+            cachedRecords = data.flatMap { try? JSONDecoder().decode([CodexDynamicModelRecord].self, from: $0) } ?? []
+        }
+        return cachedRecords
     }
 
     static func modelOptions(defaults: UserDefaults = .standard) -> [CodexDynamicModelOption] {

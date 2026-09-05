@@ -67,12 +67,20 @@ enum CodexServiceTierVariantCatalog {
 
     static func fastVariantID(
         baseModelID: String,
-        reasoningEffort: CodexReasoningEffort?
+        reasoningEffort: CodexReasoningEffort?,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
     ) -> String? {
         let baseModelID = baseModelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !baseModelID.isEmpty, isFastEligible(baseModelID: baseModelID) else { return nil }
         if let reasoningEffort {
-            return "\(baseModelID)-\(fastServiceTier)-\(reasoningEffort.rawValue)"
+            let variantID = "\(baseModelID)-\(fastServiceTier)-\(reasoningEffort.rawValue)"
+            // Exact discovered model IDs take precedence during extended-effort parsing.
+            if [CodexReasoningEffort.max, .ultra].contains(reasoningEffort),
+               discoveredRecords().contains(where: { $0.id.caseInsensitiveCompare(variantID) == .orderedSame })
+            {
+                return nil
+            }
+            return variantID
         }
         return "\(baseModelID)-\(fastServiceTier)"
     }
