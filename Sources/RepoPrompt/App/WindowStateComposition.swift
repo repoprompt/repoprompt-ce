@@ -36,6 +36,7 @@ enum WindowStateCompositionFactory {
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared
@@ -74,7 +75,8 @@ enum WindowStateCompositionFactory {
             aiQueriesService: aiQueriesService,
             apiSettingsViewModel: apiSettingsViewModel,
             windowID: windowID,
-            settingsManager: settingsManager
+            settingsManager: settingsManager,
+            storedPromptPersistence: storedPromptPersistence
         )
 
         // 7) Create the workspace manager with construction-time runtime persistence ownership.
