@@ -338,6 +338,76 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
         XCTAssertNil(session.followUpOracleGroupTask)
         XCTAssertNil(session.followUpOracleGroupState.groupID)
         XCTAssertTrue(session.followUpOracleGroupState.members.isEmpty)
+
+        // A newer run takes ownership while the replacement awaits the old task's drain.
+        let newerRoute = ContextBuilderGeneratedAnswerRoute(
+            workspaceID: workspace.id,
+            tabID: tab.id,
+            chatID: "newer-oracle"
+        )
+        var newerGeneration: UInt64?
+        let drainingTask = Task<OracleGroupRuntime.Completion, Error> { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(5))
+                XCTFail("Expected the previous Oracle task to be cancelled")
+            } catch is CancellationError {
+                newerGeneration = session.followUpOracleGroupState.beginRun()
+                session.generatedAnswerRoute = newerRoute
+                session.isBackgroundPlanGenerating = true
+                session.backgroundPlanResponseText = "newer answer"
+                session.backgroundPlanError = nil
+                throw CancellationError()
+            }
+            throw ProbeError.packagingFailed
+        }
+        session.followUpOracleGroupTask = drainingTask
+        defer { drainingTask.cancel() }
+
+        do {
+            _ = try await viewModel.runMCPPlanOrQuestion(
+                for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
+                oracleViewModel: composition.oracleViewModel,
+                mode: .plan,
+                prompt: "Superseded replacement",
+                selection: tab.selection,
+                reviewGitContext: .automaticOnly()
+            )
+            XCTFail("Expected superseded startup to be cancelled")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Superseded startup reached packaging: \(error)")
+        }
+        let expectedGeneration = try XCTUnwrap(newerGeneration)
+        XCTAssertEqual(session.followUpOracleGroupState.generation, expectedGeneration)
+        XCTAssertEqual(session.generatedAnswerRoute, newerRoute)
+        XCTAssertEqual(session.backgroundPlanResponseText, "newer answer")
+        XCTAssertTrue(session.isBackgroundPlanGenerating)
+        XCTAssertNil(session.backgroundPlanError)
+
+        // A queued request cancelled before startup must not invalidate that newer run either.
+        let cancelledRequest = Task { @MainActor in
+            try await viewModel.runMCPPlanOrQuestion(
+                for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
+                oracleViewModel: composition.oracleViewModel,
+                mode: .plan,
+                prompt: "Already cancelled replacement",
+                selection: tab.selection,
+                reviewGitContext: .automaticOnly()
+            )
+        }
+        cancelledRequest.cancel()
+        do {
+            _ = try await cancelledRequest.value
+            XCTFail("Expected cancelled startup to stop before draining")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Cancelled startup reached packaging: \(error)")
+        }
+        XCTAssertEqual(session.followUpOracleGroupState.generation, expectedGeneration)
+        XCTAssertEqual(session.generatedAnswerRoute, newerRoute)
+        XCTAssertEqual(session.backgroundPlanResponseText, "newer answer")
+        XCTAssertTrue(session.isBackgroundPlanGenerating)
+        XCTAssertNil(session.backgroundPlanError)
     }
 
     private typealias Fixture = (

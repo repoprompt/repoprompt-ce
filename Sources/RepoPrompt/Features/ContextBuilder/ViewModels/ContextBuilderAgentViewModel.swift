@@ -3146,7 +3146,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func agentConnectionIDs(for runID: UUID, agent: AgentProviderKind) async -> [UUID] {
         guard let agentClientName = agent.mcpClientNameHint else { return [] }
 
-        // Get all connection candidates for this run
+        // Get all connection candidates for a run
         let candidateIDs = mcpServer.connectionIDs(forRunID: runID)
         guard !candidateIDs.isEmpty else { return [] }
 
@@ -4510,7 +4510,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         activityReporter: ContextBuilderMCPActivityReporter?
     ) async throws -> ChatSendReply {
         let session = session(for: tabID)
-        _ = await cancelAndDrainOracleGroup(in: session, using: oracleViewModel)
+        try Task.checkCancellation()
+        guard await cancelAndDrainOracleGroup(in: session, using: oracleViewModel) else {
+            throw CancellationError()
+        }
         let generation = session.followUpOracleGroupState.beginRun()
         let groupPrompt = ContextBuilderFrozenOraclePack.prompt(for: mode, prompt: prompt)
         let oracleStore = AppDomainRuntimeComposition.shared.oracleConversationStore
@@ -5219,7 +5222,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     ///   - tabID: The tab containing the discovery results
     ///   - oracleViewModel: The OracleViewModel to use for follow-up generation
     ///   - chatName: Optional name for the resulting chat session
-    ///   - mode: The headless mode (plan/review/chat) - determines which generation path to use
+    ///   - mode: The headless mode (plan/review/chat) - determines which system prompt and generation path to use
     ///   - onProgress: Optional callback invoked with accumulated text and reasoning during streaming
     /// - Returns: The chat reply with chat_id for follow-up
     @MainActor
