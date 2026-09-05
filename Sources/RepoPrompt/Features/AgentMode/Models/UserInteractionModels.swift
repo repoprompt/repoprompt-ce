@@ -538,14 +538,32 @@ struct AgentAskUserPendingState: Identifiable, Hashable {
 
 /// Response from user instruction input in Agent mode
 public struct UserInstructionResponse: Sendable {
+    /// Who supplied the text a waiting run is being resumed with.
+    ///
+    /// A typed origin rather than an inference from the text: an auto-wake continuation resumes with
+    /// a RepoPrompt-authored envelope that is indistinguishable, byte-wise, from a user instruction
+    /// that happened to contain one. Defaulting to `.user` keeps every existing construction
+    /// source-compatible and keeps the unusual case the one that has to name itself.
+    public enum Origin: Sendable, Equatable {
+        case user
+        case laneUpdateAutoWake(wakeID: UUID)
+    }
+
     public let text: String?
     public let timedOut: Bool
     public let elapsedSeconds: Int
+    public let origin: Origin
 
-    public init(text: String?, timedOut: Bool, elapsedSeconds: Int) {
+    public init(
+        text: String?,
+        timedOut: Bool,
+        elapsedSeconds: Int,
+        origin: Origin = .user
+    ) {
         self.text = text
         self.timedOut = timedOut
         self.elapsedSeconds = elapsedSeconds
+        self.origin = origin
     }
 }
 

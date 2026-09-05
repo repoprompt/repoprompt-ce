@@ -105,7 +105,10 @@ package enum MCPToolExecutionContractCatalog {
 
         for toolName in [
             MCPWindowToolName.agentExplore,
-            MCPWindowToolName.agentRun
+            MCPWindowToolName.agentRun,
+            // `agent_session_link.wait` parks on an event, not a timer, for up to the shared agent
+            // wait maximum. A bounded dispatch deadline would sever it mid-wait.
+            MCPWindowToolName.agentSessionLink
         ] {
             result[toolName] = .lifecycleManagedCancellable
         }

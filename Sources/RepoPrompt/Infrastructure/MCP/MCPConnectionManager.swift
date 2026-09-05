@@ -149,7 +149,9 @@ private actor MCPConnectionStopRace {
     }
 
     func wait() async -> MCPConnectionStopRaceOutcome {
-        if let outcome { return outcome }
+        if let outcome {
+            return outcome
+        }
         return await withCheckedContinuation { continuation in
             waiters.append(continuation)
         }
@@ -1082,6 +1084,8 @@ actor ServerNetworkManager {
     private var toolObserverUnregistrationsByRunID: [UUID: ToolObserverUnregistrationState] = [:]
     #if DEBUG
         private var debugBeforeToolEventObserverDeliveryForTesting: (@Sendable () async -> Void)?
+        private var debugAnyActiveSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
+        private var debugOutboundSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
     #endif
 
     // Per-connection restriction + routing state
@@ -1198,6 +1202,9 @@ actor ServerNetworkManager {
         private var debugShouldSuspendNextConfirmOrFenceBeforeRevocation = false
         private var debugConfirmOrFenceBeforeRevocationIsSuspended = false
         private var debugConfirmOrFenceBeforeRevocationResumeWaiters: [CheckedContinuation<Void, Never>] = []
+        private var debugShouldSuspendNextRunCatalogPublicationBeforeMainActor = false
+        private var debugRunCatalogPublicationBeforeMainActorIsSuspended = false
+        private var debugRunCatalogPublicationBeforeMainActorResumeWaiters: [CheckedContinuation<Void, Never>] = []
         private var debugPendingPolicyReplacementSchedules: [(existing: UUID, replacement: UUID, runID: UUID)] = []
     #endif
     private var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
@@ -1209,6 +1216,53 @@ actor ServerNetworkManager {
     private var pendingPolicyApplicationIDByRunID: [UUID: UUID] = [:]
     private var runRoutingAuthorityGenerationByRunID: [UUID: UInt64] = [:]
     private var revocationFenceGenerationByRunID: [UUID: UInt64] = [:]
+
+    private struct RunCatalogObservation: Equatable {
+        let runID: UUID
+        let observerEndpoint: DomainAgentSessionLinkEndpointIdentity?
+        let connectionID: UUID?
+        let routingAuthorityGeneration: UInt64?
+        let connectionLifecycleGeneration: UInt64?
+        let hasAgentSessionLink: Bool?
+        let hasActiveOutboundLink: Bool?
+        let projectionRevision: UInt64
+
+        var routeToken: AgentSessionLinkRunCatalogRouteToken? {
+            guard let observerEndpoint,
+                  let connectionID,
+                  let routingAuthorityGeneration,
+                  let connectionLifecycleGeneration
+            else { return nil }
+            return AgentSessionLinkRunCatalogRouteToken(
+                runID: runID,
+                observerEndpoint: observerEndpoint,
+                connectionID: connectionID,
+                routingAuthorityGeneration: routingAuthorityGeneration,
+                connectionLifecycleGeneration: connectionLifecycleGeneration
+            )
+        }
+
+        var projection: AgentSessionLinkRunCatalogProjection {
+            AgentSessionLinkRunCatalogProjection(
+                runID: runID,
+                routeToken: routeToken,
+                projectionRevision: projectionRevision,
+                hasAgentSessionLink: hasAgentSessionLink,
+                hasActiveOutboundLink: hasActiveOutboundLink
+            )
+        }
+    }
+
+    private struct RunCatalogWaiter {
+        let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+        let minimumRevision: UInt64
+        let continuation: CheckedContinuation<AgentSessionLinkRunCatalogWaitOutcome, Never>
+        var timeoutTask: Task<Void, Never>?
+    }
+
+    private var runCatalogObservationByRunID: [UUID: RunCatalogObservation] = [:]
+    private var runCatalogProjectionRevision: UInt64 = 0
+    private var runCatalogWaitersByRunID: [UUID: [UUID: RunCatalogWaiter]] = [:]
 
     // 🆕 Per-connection → windowID routing map
     private var presentationWindowByConnection: [UUID: Int] = [:]
@@ -2197,11 +2251,436 @@ actor ServerNetworkManager {
         return (restricted, additional, preassigned, purpose, taskLabelKind, allowsAgentExternalControlTools)
     }
 
+    /// Live additional grants that are **not** part of any installed run policy.
+    ///
+    /// `agent_session_link` is advertised and callable while the exact caller Agent session currently
+    /// holds at least one active link in either direction. This catalog grant is distinct from outbound
+    /// observer authority: list/read/send and observer readiness remain outbound-only, while an
+    /// inbound-only endpoint can reach self-scoped and inverse operations. Both facts are recomputed
+    /// from the domain link authority on every `tools/list` and `tools/call` rather than cached in
+    /// connection policy: link membership changes at user speed and in another window, so a cached
+    /// grant would either linger after revocation or lag after an add.
+    ///
+    /// The caller endpoint is derived from server-owned run routing only (`connection → runID →
+    /// installed run policy window/tab → that tab's live binding`), never from tool arguments,
+    /// explicit bindings, or hints.
+    ///
+    /// The routed `(window, tab)` is resolved to the full endpoint incarnation rather than to its
+    /// session UUID. The same UUID can be live in two windows at once, so a UUID-scoped grant check
+    /// would advertise — and, on the `tools/call` path, admit — `agent_session_link` for an
+    /// incarnation the user never granted anything to.
+    private struct LiveSessionLinkGrantSnapshot: Equatable {
+        let routeToken: AgentSessionLinkRunCatalogRouteToken
+        /// Catalog reachability only. This confers no outbound observer authority.
+        let hasAnyActiveLink: Bool
+        /// Kept separate for observer prompt/catalog readiness and outbound operations.
+        let hasActiveOutboundLink: Bool
+
+        var additionalGrants: Set<String> {
+            hasAnyActiveLink ? [MCPWindowToolName.agentSessionLink] : []
+        }
+    }
+
+    private func liveSessionLinkGrantSnapshot(connectionID: UUID) async -> LiveSessionLinkGrantSnapshot? {
+        guard let runID = runIDByConnectionID[connectionID],
+              let runState = runPolicyStateByRunID[runID],
+              runState.purpose == .agentModeRun,
+              let tabID = runState.tabID,
+              let routeToken = await authoritativeRunCatalogRouteToken(
+                  runID: runID,
+                  windowID: runState.windowID,
+                  tabID: tabID
+              ),
+              routeToken.connectionID == connectionID
+        else {
+            return nil
+        }
+        let hasAnyActiveLink: Bool
+        let hasActiveOutboundLink: Bool
+        #if DEBUG
+            if let debugAnyActiveSessionLinkEndpointsForTesting {
+                hasAnyActiveLink = debugAnyActiveSessionLinkEndpointsForTesting.contains(routeToken.observerEndpoint)
+            } else {
+                hasAnyActiveLink = await AgentSessionLinkRuntimeBridge.shared.hasActiveLink(
+                    endpoint: routeToken.observerEndpoint
+                )
+            }
+            if let debugOutboundSessionLinkEndpointsForTesting {
+                hasActiveOutboundLink = debugOutboundSessionLinkEndpointsForTesting.contains(routeToken.observerEndpoint)
+            } else {
+                hasActiveOutboundLink = await AgentSessionLinkRuntimeBridge.shared.hasActiveOutboundLink(
+                    observerEndpoint: routeToken.observerEndpoint
+                )
+            }
+        #else
+            hasAnyActiveLink = await AgentSessionLinkRuntimeBridge.shared.hasActiveLink(
+                endpoint: routeToken.observerEndpoint
+            )
+            hasActiveOutboundLink = await AgentSessionLinkRuntimeBridge.shared.hasActiveOutboundLink(
+                observerEndpoint: routeToken.observerEndpoint
+            )
+        #endif
+        guard let revalidatedRouteToken = await authoritativeRunCatalogRouteToken(
+            runID: routeToken.runID,
+            windowID: runState.windowID,
+            tabID: tabID
+        ), revalidatedRouteToken == routeToken else {
+            return nil
+        }
+        return LiveSessionLinkGrantSnapshot(
+            routeToken: routeToken,
+            hasAnyActiveLink: hasAnyActiveLink,
+            hasActiveOutboundLink: hasActiveOutboundLink
+        )
+    }
+
+    private func completeRunCatalogObservation(
+        connectionID: UUID,
+        initialRouteToken: AgentSessionLinkRunCatalogRouteToken?,
+        returnedSessionLinkPresence: Bool
+    ) async {
+        let runID = initialRouteToken?.runID ?? runIDByConnectionID[connectionID]
+        guard let runID else { return }
+
+        let finalSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+        let routeTokensAgree = finalSnapshot?.routeToken == initialRouteToken
+        let routeIsCurrent = routeTokensAgree && finalSnapshot != nil
+        let liveCatalogPresence = finalSnapshot?.hasAnyActiveLink ?? false
+        let liveOutboundPresence = finalSnapshot?.hasActiveOutboundLink ?? false
+        let membershipAgrees = liveCatalogPresence == returnedSessionLinkPresence
+        let currentRouteToken = runCatalogObservationByRunID[runID]?.routeToken
+        // The currently authoritative successor may replace a preserved unready predecessor.
+        // A late predecessor completion still fails `routeIsCurrent` and cannot overwrite a
+        // successor observation it does not own.
+        let ownsObservation = routeIsCurrent || currentRouteToken == initialRouteToken
+        if ownsObservation {
+            _ = await publishRunCatalogObservation(
+                runID: runID,
+                routeToken: routeIsCurrent ? finalSnapshot?.routeToken : nil,
+                hasAgentSessionLink: routeIsCurrent ? returnedSessionLinkPresence : nil,
+                hasActiveOutboundLink: routeIsCurrent ? liveOutboundPresence : nil,
+                supersedesWaiters: false
+            )
+        }
+
+        guard !routeTokensAgree || !membershipAgrees else { return }
+        if routeTokensAgree, let authoritativeConnectionID = finalSnapshot?.routeToken.connectionID {
+            await notifyToolListChanged(connectionID: authoritativeConnectionID)
+        } else if let authoritativeRouteToken = await authoritativeRunCatalogRouteToken(for: runID) {
+            await notifyToolListChanged(connectionID: authoritativeRouteToken.connectionID)
+        }
+    }
+
+    private func authoritativeRunCatalogRouteToken(
+        for runID: UUID
+    ) async -> AgentSessionLinkRunCatalogRouteToken? {
+        guard let runState = runPolicyStateByRunID[runID],
+              let tabID = runState.tabID
+        else { return nil }
+        return await authoritativeRunCatalogRouteToken(
+            runID: runID,
+            windowID: runState.windowID,
+            tabID: tabID
+        )
+    }
+
+    @discardableResult
+    private func publishRunCatalogObservation(
+        runID: UUID,
+        routeToken: AgentSessionLinkRunCatalogRouteToken?,
+        hasAgentSessionLink: Bool?,
+        hasActiveOutboundLink: Bool?,
+        supersedesWaiters: Bool
+    ) async -> AgentSessionLinkRunCatalogProjection {
+        runCatalogProjectionRevision &+= 1
+        let observation = RunCatalogObservation(
+            runID: runID,
+            observerEndpoint: routeToken?.observerEndpoint,
+            connectionID: routeToken?.connectionID,
+            routingAuthorityGeneration: routeToken?.routingAuthorityGeneration,
+            connectionLifecycleGeneration: routeToken?.connectionLifecycleGeneration,
+            hasAgentSessionLink: hasAgentSessionLink,
+            hasActiveOutboundLink: hasActiveOutboundLink,
+            projectionRevision: runCatalogProjectionRevision
+        )
+        runCatalogObservationByRunID[runID] = observation
+        AgentSessionLinkCatalogDiagnostics.catalogPublished(
+            runID: runID,
+            routeToken: routeToken,
+            revision: runCatalogProjectionRevision,
+            catalog: hasAgentSessionLink,
+            outbound: hasActiveOutboundLink
+        )
+        let projection = observation.projection
+        #if DEBUG
+            await debugSuspendRunCatalogPublicationBeforeMainActorIfRequested()
+        #endif
+        await MainActor.run {
+            WindowStatesManager.shared.agentSessionLinkPublishRunCatalogProjection(projection)
+        }
+        guard runCatalogObservationByRunID[runID]?.projectionRevision == projection.projectionRevision else {
+            return projection
+        }
+        settleRunCatalogWaiters(for: runID, projection: projection, superseded: supersedesWaiters)
+        return projection
+    }
+
+    @discardableResult
+    private func invalidateRunCatalogObservation(
+        runID: UUID,
+        preserving routeToken: AgentSessionLinkRunCatalogRouteToken? = nil,
+        supersedesWaiters: Bool
+    ) async -> AgentSessionLinkRunCatalogProjection {
+        await publishRunCatalogObservation(
+            runID: runID,
+            routeToken: routeToken ?? runCatalogObservationByRunID[runID]?.routeToken,
+            hasAgentSessionLink: nil,
+            hasActiveOutboundLink: nil,
+            supersedesWaiters: supersedesWaiters
+        )
+    }
+
+    private func terminateRunCatalogObservation(runID: UUID) async {
+        guard let ownedObservation = runCatalogObservationByRunID[runID] else {
+            guard runCatalogWaitersByRunID[runID] != nil else { return }
+            let projection = await publishRunCatalogObservation(
+                runID: runID,
+                routeToken: nil,
+                hasAgentSessionLink: nil,
+                hasActiveOutboundLink: nil,
+                supersedesWaiters: true
+            )
+            if runCatalogObservationByRunID[runID]?.projectionRevision == projection.projectionRevision {
+                runCatalogObservationByRunID.removeValue(forKey: runID)
+            }
+            return
+        }
+        let projection = await publishRunCatalogObservation(
+            runID: runID,
+            routeToken: ownedObservation.routeToken,
+            hasAgentSessionLink: nil,
+            hasActiveOutboundLink: nil,
+            supersedesWaiters: true
+        )
+        guard runCatalogObservationByRunID[runID]?.projectionRevision == projection.projectionRevision else { return }
+        runCatalogObservationByRunID.removeValue(forKey: runID)
+    }
+
+    private func terminateRunCatalogObservation(
+        runID: UUID,
+        ownedByConnectionID connectionID: UUID,
+        lifecycleGeneration: UInt64
+    ) async {
+        guard let routeToken = runCatalogObservationByRunID[runID]?.routeToken,
+              routeToken.connectionID == connectionID,
+              routeToken.connectionLifecycleGeneration == lifecycleGeneration
+        else { return }
+        await terminateRunCatalogObservation(runID: runID)
+    }
+
+    private func retractRunCatalogObservationBeforeHandover(
+        runID: UUID,
+        successorConnectionID: UUID
+    ) async {
+        guard let routeToken = runCatalogObservationByRunID[runID]?.routeToken,
+              routeToken.connectionID != successorConnectionID
+        else { return }
+        _ = await publishRunCatalogObservation(
+            runID: runID,
+            // Keep the predecessor address long enough to deliver the unready projection to
+            // its owning view model. A nil token cannot be routed by WindowStatesManager and
+            // would leave the old ready projection cached until the successor lists tools.
+            routeToken: routeToken,
+            hasAgentSessionLink: nil,
+            hasActiveOutboundLink: nil,
+            supersedesWaiters: true
+        )
+    }
+
+    private func settleRunCatalogWaiters(
+        for runID: UUID,
+        projection: AgentSessionLinkRunCatalogProjection,
+        superseded: Bool
+    ) {
+        guard let waiters = runCatalogWaitersByRunID[runID] else { return }
+        for (waiterID, waiter) in waiters {
+            let outcome: AgentSessionLinkRunCatalogWaitOutcome? = if projection.projectionRevision >= waiter.minimumRevision,
+                                                                     projection.isReady,
+                                                                     projection.routeToken?.observerEndpoint == waiter.observerEndpoint
+            {
+                .ready(projection)
+            } else if superseded, projection.projectionRevision > waiter.minimumRevision {
+                .superseded
+            } else {
+                nil
+            }
+            guard let outcome else { continue }
+            runCatalogWaitersByRunID[runID]?.removeValue(forKey: waiterID)
+            waiter.timeoutTask?.cancel()
+            waiter.continuation.resume(returning: outcome)
+        }
+        if runCatalogWaitersByRunID[runID]?.isEmpty == true {
+            runCatalogWaitersByRunID.removeValue(forKey: runID)
+        }
+    }
+
+    private func finishRunCatalogWaiter(
+        runID: UUID,
+        waiterID: UUID,
+        outcome: AgentSessionLinkRunCatalogWaitOutcome
+    ) {
+        guard let waiter = runCatalogWaitersByRunID[runID]?.removeValue(forKey: waiterID) else { return }
+        waiter.timeoutTask?.cancel()
+        if runCatalogWaitersByRunID[runID]?.isEmpty == true {
+            runCatalogWaitersByRunID.removeValue(forKey: runID)
+        }
+        waiter.continuation.resume(returning: outcome)
+    }
+
+    /// - Parameter expectedRouteToken: the route token the caller has already determined to be
+    ///   authoritative, or nil when it has none.
+    ///
+    ///   When a token is supplied, the fast path below must not hand back an observation carrying a
+    ///   *different* one: the caller would reject it immediately, and because the shortcut returns
+    ///   before a waiter is registered, the relist that would refresh the observation never runs.
+    ///   The caller then fails closed with `.unavailable` in the same millisecond, which no amount
+    ///   of retrying can clear. Falling through instead lets the relist resolve the disagreement.
+    ///
+    ///   When the caller has no authoritative token, a ready observation is still returned so it can
+    ///   apply its own rejection: waiting cannot help, because the token is recomputed from live
+    ///   route state rather than produced by the catalog.
+    func awaitRunCatalogReadiness(
+        runID: UUID,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedRouteToken: AgentSessionLinkRunCatalogRouteToken?,
+        timeout: TimeInterval
+    ) async -> AgentSessionLinkRunCatalogWaitOutcome {
+        if let projection = runCatalogObservationByRunID[runID]?.projection,
+           projection.isReady,
+           projection.routeToken?.observerEndpoint == observerEndpoint,
+           expectedRouteToken == nil || projection.routeToken == expectedRouteToken
+        {
+            return .ready(projection)
+        }
+        if Task.isCancelled {
+            return .cancelled
+        }
+        let minimumRevision = runCatalogProjectionRevision
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let timeoutTask = Task { [weak self] in
+                    let nanoseconds = UInt64(max(0, timeout) * 1_000_000_000)
+                    do {
+                        try await Task.sleep(nanoseconds: nanoseconds)
+                    } catch {
+                        return
+                    }
+                    await self?.finishRunCatalogWaiter(runID: runID, waiterID: waiterID, outcome: .timedOut)
+                }
+                runCatalogWaitersByRunID[runID, default: [:]][waiterID] = RunCatalogWaiter(
+                    observerEndpoint: observerEndpoint,
+                    minimumRevision: minimumRevision,
+                    continuation: continuation,
+                    timeoutTask: timeoutTask
+                )
+                // Registered first, so the re-list this triggers cannot settle ahead of the waiter.
+                Task { [weak self] in
+                    await self?.requestRunCatalogRelist(runID: runID)
+                }
+            }
+        } onCancel: {
+            Task { [weak self] in
+                await self?.finishRunCatalogWaiter(runID: runID, waiterID: waiterID, outcome: .cancelled)
+            }
+        }
+    }
+
+    /// Asks this run's live connections to re-read their tool catalog.
+    ///
+    /// Catalog observations are keyed per run, but a provider that keeps one long-lived MCP
+    /// connection across runs (the Claude native runtime) reuses a connection whose last
+    /// `tools/list` predates the run being qualified. `notifyToolListChangedForAgentSession` only
+    /// fires when a link changes while a run is already active, so a link added to an idle session
+    /// leaves the next run with no observation and nothing that would ever produce one. Waiting
+    /// alone could then only time out, which surfaced as a refused send for an overseer that was
+    /// correctly linked.
+    ///
+    /// A redundant `tools/list` is idempotent and advertisement is never authority, so nudging a
+    /// connection that is already current costs one extra round trip and nothing else.
+    private func requestRunCatalogRelist(runID: UUID) async {
+        for (connectionID, mappedRunID) in runIDByConnectionID
+            where mappedRunID == runID && !connectionsBeingRemoved.contains(connectionID)
+        {
+            await notifyToolListChanged(connectionID: connectionID)
+        }
+    }
+
+    /// Re-advertises the catalog for every live connection owned by one Agent session.
+    ///
+    /// Used when that session's exact inbound or outbound link membership changes. Selection begins
+    /// at session UUID scope because one UUID can own several live runs, but every candidate connection
+    /// recomputes against its full routed endpoint before a notification is emitted. A duplicate
+    /// incarnation therefore receives no catalog grant from the incarnation the user linked.
+    func notifyToolListChangedForAgentSession(_ sessionID: UUID) async {
+        let candidateRunIDs = runPolicyStateByRunID.compactMap { runID, state -> (UUID, Int, UUID)? in
+            guard state.purpose == .agentModeRun, let tabID = state.tabID else { return nil }
+            return (runID, state.windowID, tabID)
+        }
+        guard !candidateRunIDs.isEmpty else { return }
+        let matchingRunIDs: Set<UUID> = await MainActor.run {
+            var result: Set<UUID> = []
+            for (runID, windowID, tabID) in candidateRunIDs {
+                guard let window = WindowStatesManager.shared.window(withID: windowID),
+                      window.agentModeViewModel.sessions[tabID]?.activeAgentSessionID == sessionID
+                else { continue }
+                result.insert(runID)
+            }
+            return result
+        }
+        guard !matchingRunIDs.isEmpty else { return }
+        for (connectionID, runID) in runIDByConnectionID
+            where matchingRunIDs.contains(runID) && !connectionsBeingRemoved.contains(connectionID)
+        {
+            let snapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+            let observation = runCatalogObservationByRunID[runID]
+            let routeToken = snapshot?.routeToken
+            let hasAnyActiveLink = snapshot?.hasAnyActiveLink
+            let hasActiveOutboundLink = snapshot?.hasActiveOutboundLink
+            if observation?.routeToken == routeToken,
+               observation?.hasAgentSessionLink == hasAnyActiveLink,
+               observation?.hasActiveOutboundLink == hasActiveOutboundLink
+            {
+                continue
+            }
+
+            if routeToken == nil,
+               let observedRouteToken = observation?.routeToken,
+               observedRouteToken.connectionID != connectionID
+               || observedRouteToken.connectionLifecycleGeneration != connectionLifecycleGenerationByID[connectionID]
+            {
+                continue
+            }
+            let returnedPresence = observation?.routeToken == routeToken
+                ? observation?.hasAgentSessionLink
+                : nil
+            _ = await publishRunCatalogObservation(
+                runID: runID,
+                routeToken: routeToken,
+                hasAgentSessionLink: returnedPresence,
+                hasActiveOutboundLink: hasActiveOutboundLink,
+                supersedesWaiters: false
+            )
+            await notifyToolListChanged(connectionID: connectionID)
+        }
+    }
+
     private static func domainPolicySnapshot(
         restricted: Set<String>,
         additional: Set<String>,
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
-        allowsAgentExternalControlTools: Bool
+        allowsAgentExternalControlTools: Bool,
+        hasExactAgentSessionLinkGrant: Bool = false
     ) -> MCPDomainClientPolicySnapshot {
         let role: MCPClientTaskRole = switch taskLabelKind {
         case .explore:
@@ -2215,8 +2694,16 @@ actor ServerNetworkManager {
             restrictedToolNames: restricted,
             additionalToolNames: additional,
             role: role,
-            allowsAgentExternalControlTools: allowsAgentExternalControlTools
+            allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+            hasExactAgentSessionLinkGrant: hasExactAgentSessionLinkGrant
         )
+    }
+
+    private func agentSessionLinkCatalogDiagnosticContext(
+        for connectionID: UUID
+    ) -> (runID: UUID?, tabID: UUID?) {
+        let runID = runIDByConnectionID[connectionID]
+        return (runID, runID.flatMap { runPolicyStateByRunID[$0]?.tabID })
     }
 
     #if DEBUG
@@ -2596,6 +3083,66 @@ actor ServerNetworkManager {
         return true
     }
 
+    /// Returns the exact route/policy/connection token used to qualify a server-observed catalog.
+    func authoritativeRunCatalogRouteToken(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID
+    ) async -> AgentSessionLinkRunCatalogRouteToken? {
+        let candidate = await MainActor.run { () -> (UUID, DomainAgentSessionLinkEndpointIdentity)? in
+            guard let window = WindowStatesManager.shared.window(withID: windowID),
+                  let connectionID = window.mcpServer.connectionIDByRunID[runID],
+                  window.mcpServer.hasCurrentRunRouteMapping(
+                      runID: runID,
+                      connectionID: connectionID,
+                      expectedTabID: tabID
+                  ),
+                  let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tabID)
+            else { return nil }
+            return (connectionID, endpoint)
+        }
+        guard let (connectionID, endpoint) = candidate,
+              let actorSnapshot = authoritativeRunRouteActorSnapshot(
+                  runID: runID,
+                  connectionID: connectionID,
+                  windowID: windowID,
+                  tabID: tabID
+              ),
+              let routingAuthorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
+              let connectionLifecycleGeneration = actorSnapshot.connectionLifecycleGeneration
+        else { return nil }
+
+        let mappingIsStillCurrent = await MainActor.run {
+            guard let window = WindowStatesManager.shared.window(withID: windowID),
+                  window.mcpServer.hasCurrentRunRouteMapping(
+                      runID: runID,
+                      connectionID: connectionID,
+                      expectedTabID: tabID
+                  )
+            else { return false }
+            return window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tabID) == endpoint
+        }
+        guard mappingIsStillCurrent,
+              let revalidatedActorSnapshot = authoritativeRunRouteActorSnapshot(
+                  runID: runID,
+                  connectionID: connectionID,
+                  windowID: windowID,
+                  tabID: tabID
+              ),
+              revalidatedActorSnapshot == actorSnapshot,
+              runRoutingAuthorityGenerationByRunID[runID] == routingAuthorityGeneration,
+              revalidatedActorSnapshot.connectionLifecycleGeneration == connectionLifecycleGeneration
+        else { return nil }
+
+        return AgentSessionLinkRunCatalogRouteToken(
+            runID: runID,
+            observerEndpoint: endpoint,
+            connectionID: connectionID,
+            routingAuthorityGeneration: routingAuthorityGeneration,
+            connectionLifecycleGeneration: connectionLifecycleGeneration
+        )
+    }
+
     /// Rechecks committed route authority and, if it is absent, fences this run against
     /// any in-flight policy application before returning. The final actor-side route
     /// sample and fence installation share one actor turn; MainActor mapping checks are
@@ -2928,6 +3475,11 @@ actor ServerNetworkManager {
             log.warning("mapConnectionToRunID: registerRunIDMapping refused connection \(connectionID) run \(runID) window \(windowID)")
             return false
         }
+
+        await retractRunCatalogObservationBeforeHandover(
+            runID: runID,
+            successorConnectionID: connectionID
+        )
 
         if persistWindowBinding, presentationWindowByConnection[connectionID] != windowID {
             setConnectionWindowMapping(connectionID, windowID: windowID)
@@ -3372,6 +3924,7 @@ actor ServerNetworkManager {
     /// Use this at true end-of-scope boundaries (session deletion, tab/window close),
     /// not for normal observer lifecycle teardown.
     func cleanupRunRoutingState(for runID: UUID, windowID: Int? = nil) async {
+        await terminateRunCatalogObservation(runID: runID)
         runPolicyStateByRunID.removeValue(forKey: runID)
         admittedPolicyRunIDs.remove(runID)
         presentationWindowByRun.removeValue(forKey: runID)
@@ -5486,7 +6039,7 @@ actor ServerNetworkManager {
         sessionTokenBindingGeneration.removeAll()
         transportTerminalConnections.removeAll()
         signalRoutingOwnershipLossBeforeReset()
-        resetInMemoryRoutingCachesForRestart()
+        await resetInMemoryRoutingCachesForRestart()
         for (connectionID, _) in connectionsToStop {
             terminalRecordClaimsByConnectionID.removeValue(forKey: connectionID)
             transportTerminalConnections.remove(connectionID)
@@ -5555,7 +6108,7 @@ actor ServerNetworkManager {
         }
     }
 
-    private func resetInMemoryRoutingCachesForRestart() {
+    private func resetInMemoryRoutingCachesForRestart() async {
         presentationWindowByConnection.removeAll()
         runIDByConnectionID.removeAll()
         resolvedPresentationWindowByConnection.removeAll()
@@ -5582,6 +6135,27 @@ actor ServerNetworkManager {
         liveRunAffinityByClientSession.removeAll()
         activeToolScopesByWindow.removeAll()
         connectionStats.removeAll()
+
+        let catalogRunIDs = Set(runCatalogObservationByRunID.keys).union(runCatalogWaitersByRunID.keys)
+        let invalidatedProjections = catalogRunIDs.map { runID -> AgentSessionLinkRunCatalogProjection in
+            runCatalogProjectionRevision &+= 1
+            let projection = AgentSessionLinkRunCatalogProjection(
+                runID: runID,
+                routeToken: runCatalogObservationByRunID[runID]?.routeToken,
+                projectionRevision: runCatalogProjectionRevision,
+                hasAgentSessionLink: nil,
+                hasActiveOutboundLink: nil
+            )
+            settleRunCatalogWaiters(for: runID, projection: projection, superseded: true)
+            return projection
+        }
+        runCatalogObservationByRunID.removeAll()
+        runCatalogWaitersByRunID.removeAll()
+        for projection in invalidatedProjections {
+            await MainActor.run {
+                WindowStatesManager.shared.agentSessionLinkPublishRunCatalogProjection(projection)
+            }
+        }
     }
 
     // MARK: - Termination & Kill Semantics
@@ -5847,7 +6421,9 @@ actor ServerNetworkManager {
         }
         // Fallback scan in case mapping got out of sync.
         for (id, mgr) in connections {
-            if mgr.isFilesystemBacked || connectionsBeingRemoved.contains(id) { continue }
+            if mgr.isFilesystemBacked || connectionsBeingRemoved.contains(id) {
+                continue
+            }
             let stored = capabilityTokenByConnection[id] ?? mgr.capabilityToken
             if stored == token {
                 bindSessionToken(token, to: id)
@@ -6311,6 +6887,13 @@ actor ServerNetworkManager {
         // by the commit path's isStillCurrent checks.
         let cleanupRunPurpose = runPurposeByConnection[id] ?? .unknown
         let cleanupRunID = runIDByConnectionID[id]
+        if let cleanupRunID, let removedConnectionGeneration {
+            await terminateRunCatalogObservation(
+                runID: cleanupRunID,
+                ownedByConnectionID: id,
+                lifecycleGeneration: removedConnectionGeneration
+            )
+        }
         let detachContextBuilderRunID: UUID? = cleanupRunPurpose == .discoverRun ? cleanupRunID : nil
         let responseDeliverySnapshot = await connections[id]?.responseDeliverySnapshot()
 
@@ -6423,8 +7006,11 @@ actor ServerNetworkManager {
         if let clientID = clientIDByConnection[id] {
             var set = activeConnectionsByClient[clientID] ?? []
             set.remove(id)
-            if set.isEmpty { activeConnectionsByClient.removeValue(forKey: clientID) }
-            else { activeConnectionsByClient[clientID] = set }
+            if set.isEmpty {
+                activeConnectionsByClient.removeValue(forKey: clientID)
+            } else {
+                activeConnectionsByClient[clientID] = set
+            }
             clientIDByConnection.removeValue(forKey: id)
         }
         // Clean up routing metadata before any bounded drain wait so the disconnected
@@ -6660,7 +7246,9 @@ actor ServerNetworkManager {
             if !shouldAdvertiseCanonicalBindingParams {
                 required.removeAll { value in
                     guard let stringValue = value.stringValue else { return false }
-                    if stringValue == "context_id" { return !shouldKeepContextID }
+                    if stringValue == "context_id" {
+                        return !shouldKeepContextID
+                    }
                     return stringValue == "working_dirs"
                 }
             }
@@ -6714,7 +7302,9 @@ actor ServerNetworkManager {
         args: [String: Value]
     ) -> [String: Value] {
         // Priority 1: explicit window_id in args -> keep unchanged
-        if args["window_id"] != nil { return args }
+        if args["window_id"] != nil {
+            return args
+        }
 
         // Priority 2: _windowID routing + schema has window_id -> inject
         guard let windowID = routingWindowID,
@@ -7198,7 +7788,9 @@ actor ServerNetworkManager {
             guard var queue = pendingPoliciesByClient[key] else { continue }
             for index in queue.indices {
                 guard queue[index].runID == runID else { continue }
-                if let windowID, queue[index].windowID != windowID { continue }
+                if let windowID, queue[index].windowID != windowID {
+                    continue
+                }
                 matchedCount += 1
                 if !queue[index].requiresExpectedAgentPID {
                     queue[index].requiresExpectedAgentPID = true
@@ -7318,6 +7910,22 @@ actor ServerNetworkManager {
             waiters.forEach { $0.resume() }
         }
 
+        func debugSuspendNextRunCatalogPublicationBeforeMainActor() {
+            debugShouldSuspendNextRunCatalogPublicationBeforeMainActor = true
+        }
+
+        func debugIsRunCatalogPublicationBeforeMainActorSuspended() -> Bool {
+            debugRunCatalogPublicationBeforeMainActorIsSuspended
+        }
+
+        func debugResumeRunCatalogPublicationBeforeMainActor() {
+            debugShouldSuspendNextRunCatalogPublicationBeforeMainActor = false
+            debugRunCatalogPublicationBeforeMainActorIsSuspended = false
+            let waiters = debugRunCatalogPublicationBeforeMainActorResumeWaiters
+            debugRunCatalogPublicationBeforeMainActorResumeWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+
         private func debugSuspendPendingPolicyObservationIfNeeded() async {
             guard debugShouldSuspendNextPendingPolicyObservation else { return }
             debugShouldSuspendNextPendingPolicyObservation = false
@@ -7366,6 +7974,16 @@ actor ServerNetworkManager {
                 debugConfirmOrFenceBeforeRevocationResumeWaiters.append(continuation)
             }
             debugConfirmOrFenceBeforeRevocationIsSuspended = false
+        }
+
+        private func debugSuspendRunCatalogPublicationBeforeMainActorIfRequested() async {
+            guard debugShouldSuspendNextRunCatalogPublicationBeforeMainActor else { return }
+            debugShouldSuspendNextRunCatalogPublicationBeforeMainActor = false
+            debugRunCatalogPublicationBeforeMainActorIsSuspended = true
+            await withCheckedContinuation { continuation in
+                debugRunCatalogPublicationBeforeMainActorResumeWaiters.append(continuation)
+            }
+            debugRunCatalogPublicationBeforeMainActorIsSuspended = false
         }
 
         func debugPendingPolicyReplacementScheduleCount(
@@ -8155,10 +8773,14 @@ actor ServerNetworkManager {
                         guard !excludeConnectionIDs.contains(entry.id) else { return false }
                         guard MCPClientIdentity.matches(entry.clientName, clientName) else { return false }
                         guard debugSessionFingerprint(forToken: entry.sessionKey) == fingerprint else { return false }
-                        if requireReady, entry.state != .ready { return false }
+                        if requireReady, entry.state != .ready {
+                            return false
+                        }
                         return true
                     }
-                    if found != nil { break }
+                    if found != nil {
+                        break
+                    }
                     try? await Task.sleep(for: .milliseconds(pollMS))
                 } while Date() < deadline
 
@@ -9376,7 +9998,9 @@ actor ServerNetworkManager {
                 }
             }
             .sorted { lhs, rhs in
-                if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+                if lhs.sequence != rhs.sequence {
+                    return lhs.sequence < rhs.sequence
+                }
                 return lhs.scopeID.uuidString < rhs.scopeID.uuidString
             }
         }
@@ -9443,30 +10067,85 @@ actor ServerNetworkManager {
             let disabled = await MainActor.run {
                 ToolAvailabilityStore.shared.effectiveDisabledTools
             }
-            let catalog = await domainHost.catalogSnapshot()
             let policy = effectivePolicyState(for: connectionID)
-            let restricted = policy.restricted
-            let additionalTools = policy.additional
+            let sessionLinkGrantSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+            let domainPolicy = Self.domainPolicySnapshot(
+                restricted: policy.restricted,
+                additional: policy.additional.union(
+                    sessionLinkGrantSnapshot?.additionalGrants ?? []
+                ),
+                taskLabelKind: policy.taskLabelKind,
+                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+                hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true
+            )
+            let advertisement = await domainHost.advertisedCatalog(
+                MCPDomainCatalogAdvertisementRequest(
+                    isGloballyEnabled: isEnabledState,
+                    disabledToolNames: disabled,
+                    policy: domainPolicy
+                )
+            )
+            let names = advertisement.definitions.map(\.name).sorted()
+            await completeRunCatalogObservation(
+                connectionID: connectionID,
+                initialRouteToken: sessionLinkGrantSnapshot?.routeToken,
+                returnedSessionLinkPresence: names.contains(MCPWindowToolName.agentSessionLink)
+            )
+            return names
+        }
 
-            guard isEnabledState else { return [] }
-            return catalog.definitions.compactMap { definition in
-                guard !disabled.contains(definition.name),
-                      !restricted.contains(definition.name)
-                else { return nil }
+        /// Compatibility helper for tests whose linked endpoints are all outbound observers.
+        func debugSetActiveSessionLinkEndpointsForTesting(
+            _ endpoints: Set<DomainAgentSessionLinkEndpointIdentity>?
+        ) {
+            debugAnyActiveSessionLinkEndpointsForTesting = endpoints
+            debugOutboundSessionLinkEndpointsForTesting = endpoints
+        }
 
-                if MCPPolicyGatedTools.names.contains(definition.name),
-                   !additionalTools.contains(definition.name)
-                {
-                    return nil
-                }
+        /// Models catalog reachability independently from outbound observer authority.
+        func debugSetSessionLinkCatalogEndpointsForTesting(
+            anyActive: Set<DomainAgentSessionLinkEndpointIdentity>?,
+            outbound: Set<DomainAgentSessionLinkEndpointIdentity>?
+        ) {
+            debugAnyActiveSessionLinkEndpointsForTesting = anyActive
+            debugOutboundSessionLinkEndpointsForTesting = outbound
+        }
 
-                guard AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                    toolName: definition.name,
-                    taskLabelKind: policy.taskLabelKind,
-                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                ) else { return nil }
-                return definition.name
-            }.sorted()
+        func debugRunCatalogProjection(for runID: UUID) -> AgentSessionLinkRunCatalogProjection? {
+            runCatalogObservationByRunID[runID]?.projection
+        }
+
+        func debugHasRunCatalogState(for runID: UUID) -> Bool {
+            runCatalogObservationByRunID[runID] != nil || runCatalogWaitersByRunID[runID] != nil
+        }
+
+        func debugRunCatalogWaiterCount(for runID: UUID) -> Int {
+            runCatalogWaitersByRunID[runID]?.count ?? 0
+        }
+
+        func debugPublishRunCatalogObservation(
+            routeToken: AgentSessionLinkRunCatalogRouteToken,
+            hasAgentSessionLink: Bool?
+        ) async -> AgentSessionLinkRunCatalogProjection {
+            await publishRunCatalogObservation(
+                runID: routeToken.runID,
+                routeToken: routeToken,
+                hasAgentSessionLink: hasAgentSessionLink,
+                hasActiveOutboundLink: hasAgentSessionLink,
+                supersedesWaiters: false
+            )
+        }
+
+        func debugCompleteRunCatalogObservation(
+            connectionID: UUID,
+            initialRouteToken: AgentSessionLinkRunCatalogRouteToken?,
+            returnedSessionLinkPresence: Bool
+        ) async {
+            await completeRunCatalogObservation(
+                connectionID: connectionID,
+                initialRouteToken: initialRouteToken,
+                returnedSessionLinkPresence: returnedSessionLinkPresence
+            )
         }
 
         func debugSetBeforeToolEventObserverDeliveryForTesting(
@@ -10354,6 +11033,13 @@ actor ServerNetworkManager {
             return .rejected(runID: policy.runID, reason: "policy_removed")
         }
 
+        if let runID = policy.runID {
+            await retractRunCatalogObservationBeforeHandover(
+                runID: runID,
+                successorConnectionID: connectionID
+            )
+        }
+
         finishPendingPolicyApplication(
             pendingPolicyApplicationID,
             connectionID: connectionID,
@@ -10833,11 +11519,15 @@ actor ServerNetworkManager {
                 ToolAvailabilityStore.shared.effectiveDisabledTools
             }
             let policy = await effectivePolicyState(for: connectionID)
-            let domainPolicy = Self.domainPolicySnapshot(
+            let sessionLinkGrantSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+            let domainPolicy = await Self.domainPolicySnapshot(
                 restricted: policy.restricted,
-                additional: policy.additional,
+                additional: policy.additional.union(
+                    sessionLinkGrantSnapshot?.additionalGrants ?? []
+                ),
                 taskLabelKind: policy.taskLabelKind,
-                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+                hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true
             )
             // The domain host owns canonical filtering; this app shell retains only
             // purpose-specific schema/description and client annotation projection.
@@ -10892,6 +11582,12 @@ actor ServerNetworkManager {
                     "hiddenSamples": hiddenToolSamples.joined(separator: ",")
                 ])
             #endif
+            let returnedSessionLinkPresence = tools.contains { $0.name == MCPWindowToolName.agentSessionLink }
+            await completeRunCatalogObservation(
+                connectionID: connectionID,
+                initialRouteToken: sessionLinkGrantSnapshot?.routeToken,
+                returnedSessionLinkPresence: returnedSessionLinkPresence
+            )
             connectionLog("Returning \(tools.count) available tools for \(connectionID)")
             return ListTools.Result(tools: tools)
         }
@@ -10910,6 +11606,14 @@ actor ServerNetworkManager {
             let originalName = params.name
             let toolName = Self.canonicalToolName(for: originalName)
             connectionLog("tools/call received original=\(originalName) canonical=\(toolName) connection=\(connectionID)")
+            if toolName == MCPWindowToolName.agentSessionLink {
+                let context = await agentSessionLinkCatalogDiagnosticContext(for: connectionID)
+                AgentSessionLinkCatalogDiagnostics.toolCallReceived(
+                    runID: context.runID,
+                    tabID: context.tabID,
+                    connectionID: connectionID
+                )
+            }
             #if DEBUG
                 await debugPolicyDiagnostic("toolsCallReceived", connectionID: connectionID, extra: [
                     "toolName": toolName,
@@ -11136,17 +11840,40 @@ actor ServerNetworkManager {
                 // Avoid repeating that work while a tool call is in-flight.
 
                 let effectivePolicy = await effectivePolicyState(for: connectionID)
+                // Recomputed live rather than read from the installed policy: a `list_changed`
+                // notification can lag a grant change in either direction, so stale advertisement
+                // must never decide execution. Scoped to the only tool whose grant is live link
+                // state, so no other tool call pays for the lookup or its actor hop.
+                let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
+                    ? await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+                    : nil
+                let liveAdditional = effectivePolicy.additional.union(
+                    liveSessionLinkGrant?.additionalGrants ?? []
+                )
                 let domainPolicy = Self.domainPolicySnapshot(
                     restricted: effectivePolicy.restricted,
-                    additional: effectivePolicy.additional,
+                    additional: liveAdditional,
                     taskLabelKind: effectivePolicy.taskLabelKind,
-                    allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools
+                    allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools,
+                    hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true
                 )
                 do {
                     try await domainHost.evaluateEarlyCallPolicy(
                         toolName: toolName,
                         policy: domainPolicy
                     )
+                } catch MCPDomainCallPolicyDenial.missingAdditionalGrant
+                    where toolName == MCPWindowToolName.agentSessionLink
+                {
+                    #if DEBUG
+                        await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
+                            "toolName": toolName,
+                            "reason": "missing_session_link_grant"
+                        ])
+                    #endif
+                    // Identical to the ungranted-caller denial, so calling the hidden tool by name
+                    // reveals nothing beyond "you have no oversight authority".
+                    return CallTool.Result.err("Tool '\(toolName)' is not available for this session.")
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
@@ -11209,11 +11936,20 @@ actor ServerNetworkManager {
                     EditFlowPerf.Dimensions(toolName: toolName)
                 )
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.policyGating, policyState) }
+                // Rebuild with a fresh exact link fact. The early grant check and this role/profile
+                // gate are separated by routing work, so carrying the earlier answer would let a
+                // revocation stale-authorize this exception.
+                let liveSessionLinkGrant = toolName == MCPWindowToolName.agentSessionLink
+                    ? await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+                    : nil
                 let domainPolicy = Self.domainPolicySnapshot(
                     restricted: policy.restricted,
-                    additional: policy.additional,
+                    additional: policy.additional.union(
+                        liveSessionLinkGrant?.additionalGrants ?? []
+                    ),
                     taskLabelKind: policy.taskLabelKind,
-                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+                    hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true
                 )
                 preAdmissionDecision = try await domainHost.evaluatePreAdmissionCallPolicy(
                     toolName: toolName,
@@ -12879,8 +13615,12 @@ actor ServerNetworkManager {
                     )
                 }
             }.sorted { lhs, rhs in
-                if lhs.sequence != rhs.sequence { return lhs.sequence > rhs.sequence }
-                if lhs.windowID != rhs.windowID { return lhs.windowID < rhs.windowID }
+                if lhs.sequence != rhs.sequence {
+                    return lhs.sequence > rhs.sequence
+                }
+                if lhs.windowID != rhs.windowID {
+                    return lhs.windowID < rhs.windowID
+                }
                 return lhs.toolName < rhs.toolName
             }
 
@@ -13268,7 +14008,9 @@ actor ServerNetworkManager {
                 }
                 pruneDeadSlots(for: clientID)
                 effectiveSet = effectiveActiveConnectionIDs(for: clientID)
-                if effectiveSet.count < maxConnectionsPerClient { break }
+                if effectiveSet.count < maxConnectionsPerClient {
+                    break
+                }
 
                 let evictionResult = await evictLeastValuable(
                     for: clientID,
@@ -13278,7 +14020,9 @@ actor ServerNetworkManager {
                     return false
                 }
                 effectiveSet = effectiveActiveConnectionIDs(for: clientID)
-                if effectiveSet.count < maxConnectionsPerClient { break }
+                if effectiveSet.count < maxConnectionsPerClient {
+                    break
+                }
 
                 switch evictionResult {
                 case .evicted, .capacityChanged:
@@ -13328,8 +14072,11 @@ actor ServerNetworkManager {
         if let clientID = clientIDByConnection[connectionID] {
             var set = activeConnectionsByClient[clientID] ?? []
             set.remove(connectionID)
-            if set.isEmpty { activeConnectionsByClient.removeValue(forKey: clientID) }
-            else { activeConnectionsByClient[clientID] = set }
+            if set.isEmpty {
+                activeConnectionsByClient.removeValue(forKey: clientID)
+            } else {
+                activeConnectionsByClient[clientID] = set
+            }
             clientIDByConnection.removeValue(forKey: connectionID)
         }
     }
@@ -13545,7 +14292,9 @@ actor ServerNetworkManager {
     func recordToolCall(for connectionID: UUID, toolName: String) {
         // Hidden coordination calls should not appear in dashboards/histories.
         let canonicalToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
-        if canonicalToolName == "set_status" || canonicalToolName == "bind_context" { return }
+        if canonicalToolName == "set_status" || canonicalToolName == "bind_context" {
+            return
+        }
 
         // If this connection dropped out of the active sets (e.g., after transport toggles),
         // re-associate it now that we have a live tool call.
@@ -13934,15 +14683,24 @@ actor ServerNetworkManager {
         guard var set = activeConnectionsByClient[clientID] else { return }
         let live = Set(connections.keys)
         set = set.filter { live.contains($0) }
-        if set.isEmpty { activeConnectionsByClient.removeValue(forKey: clientID) }
-        else { activeConnectionsByClient[clientID] = set }
+        if set.isEmpty {
+            activeConnectionsByClient.removeValue(forKey: clientID)
+        } else {
+            activeConnectionsByClient[clientID] = set
+        }
     }
 
     /// Connection is evictable if it has no in-flight calls and does not own an active tool.
     private func isEvictable(_ id: UUID) async -> Bool {
-        if connectionsBeingRemoved.contains(id) { return false }
-        if let limiters = callLimiters[id], await limiters.hasInFlightCalls() { return false }
-        if hasActiveToolScopes(ownedBy: id) { return false }
+        if connectionsBeingRemoved.contains(id) {
+            return false
+        }
+        if let limiters = callLimiters[id], await limiters.hasInFlightCalls() {
+            return false
+        }
+        if hasActiveToolScopes(ownedBy: id) {
+            return false
+        }
         return true
     }
 
@@ -14113,9 +14871,15 @@ actor ServerNetworkManager {
 
     /// Sort ascending by value (least valuable first)
     private func isLessValuable(_ a: EvictionCandidate, than b: EvictionCandidate) -> Bool {
-        if a.everCalled != b.everCalled { return a.everCalled == false }
-        if a.idleSeconds != b.idleSeconds { return a.idleSeconds > b.idleSeconds }
-        if a.totalCalls != b.totalCalls { return a.totalCalls < b.totalCalls }
+        if a.everCalled != b.everCalled {
+            return a.everCalled == false
+        }
+        if a.idleSeconds != b.idleSeconds {
+            return a.idleSeconds > b.idleSeconds
+        }
+        if a.totalCalls != b.totalCalls {
+            return a.totalCalls < b.totalCalls
+        }
         return a.createdAt < b.createdAt
     }
 

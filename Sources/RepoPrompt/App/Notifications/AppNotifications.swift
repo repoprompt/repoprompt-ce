@@ -71,6 +71,7 @@ extension Notification.Name {
     /// Posted when Agent Mode should open the Workflow pill popover.
     /// userInfo: ["windowID": Int]
     static let showAgentWorkflowPopover = Notification.Name("showAgentWorkflowPopover")
+
     /// Posted by WorkspaceManagerViewModel when workspace switch overlay visibility changes.
     /// object: WorkspaceManagerViewModel instance (window-scoped)
     /// userInfo: ["isVisible": Bool]

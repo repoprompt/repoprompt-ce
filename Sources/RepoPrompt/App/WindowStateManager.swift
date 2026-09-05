@@ -396,6 +396,57 @@ class WindowStatesManager: ObservableObject {
     private var hasLoadedRestoreSession = false
     private var restorePersistenceGate = WindowSessionRestorePersistenceGate()
 
+    /// Why the restore gate became idle, published for automatic oversight restoration.
+    ///
+    /// The gate itself is unchanged; this only *explains* its idle edge. "All entries consumed" means
+    /// the expected window topology was actually observed, so a saved session that is nowhere to be
+    /// found is genuinely gone. "Leftovers abandoned" means windows never came back, and absence
+    /// proves nothing — an oversight intent in that state must survive rather than be deleted.
+    private(set) var agentSessionOversightRestoreTopologyState: AgentSessionOversightRestoreTopologyState = .pending
+    /// How many restore entries the grace valve gave up on. Non-zero makes absence uncertain.
+    private var abandonedRestoreEntryCount = 0
+    private var didBootstrapAgentSessionOversightIntentStore = false
+
+    /// Installs the durable oversight store for this launch.
+    ///
+    /// Deliberately independent of `loadWindowRestoreSessionIfNeeded()` and its
+    /// `autoRestoreWorkspacesEnabled` early return: turning window restoration off must leave saved
+    /// oversight dormant, not unread and therefore at risk of being overwritten by the next explicit
+    /// Add. Suppressed launches construct the store too — it refuses every filesystem call itself,
+    /// which is a stronger guarantee than each call site remembering to check a flag.
+    func bootstrapAgentSessionOversightIntentStoreIfNeeded() {
+        guard !didBootstrapAgentSessionOversightIntentStore else { return }
+        didBootstrapAgentSessionOversightIntentStore = true
+        let mode = AppLaunchConfiguration.current.agentSessionOversightPersistenceMode(
+            autoRestoreWorkspacesEnabled: autoRestoreWorkspacesEnabled
+        )
+        let store = AgentSessionOversightIntentStore.production(mode: mode)
+        Task { @MainActor in
+            await AgentSessionLinkRuntimeBridge.shared.bootstrapIntentStore(store)
+        }
+    }
+
+    /// Recomputes and republishes the reason-aware topology state.
+    private func updateAgentSessionOversightTopologyState() {
+        let state = computeAgentSessionOversightTopologyState()
+        guard state != agentSessionOversightRestoreTopologyState else {
+            notifyAgentSessionLinkTopologyChanged()
+            return
+        }
+        agentSessionOversightRestoreTopologyState = state
+        notifyAgentSessionLinkTopologyChanged()
+    }
+
+    private func computeAgentSessionOversightTopologyState() -> AgentSessionOversightRestoreTopologyState {
+        if AppLaunchConfiguration.current.suppressesAgentSessionOversightPersistence { return .suppressed }
+        guard autoRestoreWorkspacesEnabled else { return .dormantAutoRestoreDisabled }
+        guard hasLoadedRestoreSession, !restorePersistenceGate.isRestoreInProgress else { return .pending }
+        guard abandonedRestoreEntryCount == 0 else {
+            return .incompleteLeftoversAbandoned(count: abandonedRestoreEntryCount)
+        }
+        return .completeAllEntriesConsumed
+    }
+
     func claimInitialRefreshDeferralForNewWindow() -> WindowInitialRefreshDeferral? {
         guard !pendingInitialRefreshDeferrals.isEmpty else { return nil }
         return pendingInitialRefreshDeferrals.removeFirst()
@@ -443,6 +494,7 @@ class WindowStatesManager: ObservableObject {
             #if DEBUG
                 WorkspaceRestorePerfLog.log("restore.session skipped reason=autoRestoreDisabled registeredWindows=\(allWindows.count)")
             #endif
+            updateAgentSessionOversightTopologyState()
             return
         }
 
@@ -477,6 +529,7 @@ class WindowStatesManager: ObservableObject {
                 }
                 self.flushDeferredWindowSessionPersistIfRestoreIdle()
                 self.scheduleLeftoverRestoreEntryGraceReleaseIfNeeded()
+                self.updateAgentSessionOversightTopologyState()
                 #if DEBUG
                     if let applyStartMS {
                         WorkspaceRestorePerfLog.log(
@@ -705,6 +758,7 @@ class WindowStatesManager: ObservableObject {
             guard let self else { return }
             restorePersistenceGate.finishRestoringWindow(windowID)
             flushDeferredWindowSessionPersistIfRestoreIdle()
+            updateAgentSessionOversightTopologyState()
         }
     }
 
@@ -776,6 +830,12 @@ class WindowStatesManager: ObservableObject {
         }
 
         updateKeyboardShortcutsState()
+        // Idempotent: the process-wide oversight-link bridge resolves endpoints through this manager.
+        attachAgentSessionLinkBridge()
+        // Bootstrapped after the bridge has a host, so the launch load's presentation and worklist
+        // land on a manager that can already broadcast and enumerate.
+        bootstrapAgentSessionOversightIntentStoreIfNeeded()
+        updateAgentSessionOversightTopologyState()
         persistWindowSession(reason: "registerWindow")
         #if DEBUG
             if let registerStartMS {
@@ -791,12 +851,16 @@ class WindowStatesManager: ObservableObject {
         if let idx = allWindows.firstIndex(where: { $0 === state }) {
             allWindows.remove(at: idx)
         }
+        // Eager revocation for both endpoints of every link this window held. Operation-time identity
+        // revalidation still catches a missed hook, but the surviving endpoint should learn now.
+        invalidateAgentSessionLinks(forClosedWindowID: state.windowID)
         explicitlyClosingWindowIDs.remove(state.windowID)
         // A window that closes mid-restore must not leave the persistence gate held.
         restorePersistenceGate.finishRestoringWindow(state.windowID)
 
         // Skip notifications and updates during termination to prevent observation crashes
         guard !isTerminating else { return }
+        updateAgentSessionOversightTopologyState()
 
         // Notify that window count changed
         NotificationCenter.default.post(name: .windowCountDidChange, object: nil)
@@ -884,8 +948,10 @@ class WindowStatesManager: ObservableObject {
                 "restore.persist leftoverEntriesReleased pendingEntries=\(restorePersistenceGate.pendingRestoreEntryCount) remainingQueue=\(restoreQueue.count)"
             )
         #endif
+        abandonedRestoreEntryCount = max(abandonedRestoreEntryCount, restorePersistenceGate.pendingRestoreEntryCount)
         restorePersistenceGate.abandonPendingRestoreEntries()
         flushDeferredWindowSessionPersistIfRestoreIdle()
+        updateAgentSessionOversightTopologyState()
     }
 
     private func captureCurrentSession() -> WindowSessionSnapshot {
@@ -1073,6 +1139,11 @@ class WindowStatesManager: ObservableObject {
             perWS[prev.workspaceID] = prev.number
             windowWorkspaceNumberHistory[windowID] = perWS
             assignedInstanceByWindowID.removeValue(forKey: windowID)
+            // Switching away ends this window's live bindings for the previous workspace. Scope the
+            // revocation to this window so another window still on that workspace keeps its links.
+            if prev.workspaceID != workspace?.id {
+                invalidateAgentSessionLinks(forWindowID: windowID, leavingWorkspaceID: prev.workspaceID)
+            }
         }
 
         guard let ws = workspace else {

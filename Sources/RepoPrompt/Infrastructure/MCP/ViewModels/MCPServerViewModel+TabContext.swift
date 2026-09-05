@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 #if DEBUG
     private func tabContextLog(_ message: @autoclosure () -> String) {
@@ -925,6 +926,24 @@ extension MCPServerViewModel {
         guard let expectedTabID else { return true }
         return tabContextByConnectionID[connectionID]?.runID == runID
             && tabContextByConnectionID[connectionID]?.tabID == expectedTabID
+    }
+
+    /// Final synchronous fence for a catalog-qualified provider dispatch.
+    ///
+    /// The server actor already qualified the token's policy and connection lifecycle. This
+    /// MainActor check closes the remaining handover interval by requiring that the exact
+    /// connection observed by `tools/list` still owns the bidirectional route at composition time.
+    @MainActor
+    func hasCurrentRunCatalogRouteToken(
+        _ token: AgentSessionLinkRunCatalogRouteToken,
+        expectedTabID: UUID
+    ) -> Bool {
+        token.observerEndpoint.tabID == expectedTabID
+            && hasCurrentRunRouteMapping(
+                runID: token.runID,
+                connectionID: token.connectionID,
+                expectedTabID: expectedTabID
+            )
     }
 
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.
@@ -2673,7 +2692,25 @@ extension MCPServerViewModel {
         return resolvedContext.snapshot.tabID
     }
 
-    private static func isExactRunScopedTabContext(
+    /// Whether this request presents exact run-scoped tab context, independent of connection purpose.
+    ///
+    /// This is the marker that separates an Agent Mode run's *own* connection from an external client
+    /// that merely started a run: a supervisor connection also carries a connection→run mapping, but
+    /// only a run-installed, handed-over, or pending-run-scoped context is server-installed routing
+    /// for the run itself. It is therefore usable as fail-closed Agent-origin evidence when every
+    /// captured/live/cached run purpose has been lost.
+    @MainActor
+    func hasExactRunScopedTabContext(metadata: RequestMetadata) -> Bool {
+        guard let resolvedContext = try? resolveTabContextSnapshot(
+            from: metadata,
+            toolName: "agent_session_run_scope"
+        ) else {
+            return false
+        }
+        return Self.isExactRunScopedTabContext(resolvedContext)
+    }
+
+    static func isExactRunScopedTabContext(
         _ resolvedContext: ResolvedTabContextSnapshot
     ) -> Bool {
         guard resolvedContext.snapshot.runID != nil
@@ -2984,6 +3021,33 @@ extension MCPServerViewModel {
             return nil
         }
         return targetWindow.agentModeViewModel.mcpSpawnParentSessionID(sourceTabID: sourceTabID)
+    }
+
+    /// The caller's exact oversight endpoint incarnation, derived from the same server-owned routing as
+    /// `resolveSpawnParentSessionID` and then resolved to a live `(window, tab)` binding.
+    ///
+    /// Oversight authority is incarnation-scoped, so a session UUID is not a sufficient caller
+    /// identity: the same UUID can be live in two windows at once. The routed source tab is what the
+    /// server actually knows, so the endpoint is built from it and cross-checked against the session
+    /// the spawn-parent resolver reports, and any disagreement fails closed.
+    @MainActor
+    func resolveAgentSessionLinkObserverEndpoint(
+        metadata: RequestMetadata,
+        targetWindow: WindowState
+    ) async -> DomainAgentSessionLinkEndpointIdentity? {
+        guard let sourceTabID = await resolveSpawnParentSourceTabIDForAgentSessionCreation(
+            metadata: metadata
+        ) else {
+            return nil
+        }
+        let agentModeVM = targetWindow.agentModeViewModel
+        guard let sessionID = agentModeVM.mcpSpawnParentSessionID(sourceTabID: sourceTabID),
+              let endpoint = agentModeVM.agentSessionLinkObserverEndpoint(tabID: sourceTabID),
+              endpoint.sessionID == sessionID
+        else {
+            return nil
+        }
+        return endpoint
     }
 
     nonisolated static func tabContextRoutingErrorMessage(

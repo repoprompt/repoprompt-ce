@@ -815,6 +815,16 @@ actor DirectHeadlessAgentBackend: DomainAgentCapabilityBackend {
         }
     }
 
+    /// Oversight links are grants between two live top-level Agent sessions in open RepoPrompt
+    /// windows. A headless composition has neither, so every operation fails closed rather than
+    /// inventing an endpoint.
+    func monitorSessionLink(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        throw MCPError.invalidRequest(
+            "agent_session_link requires two live RepoPrompt window sessions and a user-granted "
+                + "oversight link; it is unavailable in headless mode."
+        )
+    }
+
     func shareThoughts(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
         let sessionID = try Self.sessionID(args, request: request)
