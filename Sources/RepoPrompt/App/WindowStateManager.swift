@@ -304,6 +304,14 @@ final class WorkspaceActivityCoordinator {
 /// find the "latest" one or broadcast to all windows if needed.
 @MainActor
 class WindowStatesManager: ObservableObject {
+    private final class WeakWindowState {
+        weak var value: WindowState?
+
+        init(_ value: WindowState) {
+            self.value = value
+        }
+    }
+
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
 
@@ -392,6 +400,13 @@ class WindowStatesManager: ObservableObject {
         fileURL: WindowSessionStore.sessionFileURL()
     )
     private var explicitlyClosingWindowIDs: Set<Int> = []
+    /// A closing window may leave `allWindows` before app termination starts. Weak retention
+    /// lets termination join any still-live teardown without extending the window's lifetime.
+    private var closingWindowReferences: [WeakWindowState] = []
+    // AppKit can unregister and release windows before the asynchronous termination task starts.
+    // Capture participants at the synchronous termination fence so their process owners survive
+    // until Context Builder and Agent Mode teardown have both joined.
+    private var terminationWindowSnapshot: [WindowState] = []
     private var restoreQueue: [WindowSessionEntry] = []
     private var hasLoadedRestoreSession = false
     private var restorePersistenceGate = WindowSessionRestorePersistenceGate()
@@ -717,6 +732,11 @@ class WindowStatesManager: ObservableObject {
     }
 
     func registerWindowState(_ state: WindowState) {
+        guard !isTerminating else {
+            state.beginClose()
+            return
+        }
+        closingWindowReferences.removeAll { $0.value == nil || $0.value === state }
         // Prevent duplicate registration
         guard !allWindows.contains(where: { $0 === state }) else { return }
 
@@ -790,6 +810,8 @@ class WindowStatesManager: ObservableObject {
         state.beginClose()
         if let idx = allWindows.firstIndex(where: { $0 === state }) {
             allWindows.remove(at: idx)
+            closingWindowReferences.removeAll { $0.value == nil || $0.value === state }
+            closingWindowReferences.append(WeakWindowState(state))
         }
         explicitlyClosingWindowIDs.remove(state.windowID)
         // A window that closes mid-restore must not leave the persistence gate held.
@@ -993,11 +1015,26 @@ class WindowStatesManager: ObservableObject {
         // Use MainActor.assumeIsolated since this is called from applicationWillTerminate
         // which runs on the main thread, but Swift doesn't know that statically.
         MainActor.assumeIsolated {
+            self.closingWindowReferences.removeAll { $0.value == nil }
+            self.terminationWindowSnapshot = self.deduplicatedWindows(
+                self.terminationWindowSnapshot +
+                    self.allWindows +
+                    self.closingWindowReferences.compactMap(\.value)
+            )
             self.isTerminating = true
             // Cancel any pending focus/workspace change notifications that might trigger updates
             self.cancellablesDuringTermination()
         }
     }
+
+    #if DEBUG
+        func setTerminatingForTesting(_ isTerminating: Bool) {
+            self.isTerminating = isTerminating
+            if !isTerminating {
+                terminationWindowSnapshot.removeAll()
+            }
+        }
+    #endif
 
     /// Cancels Combine subscriptions and clears state that could trigger updates during shutdown.
     private func cancellablesDuringTermination() {
@@ -1039,23 +1076,41 @@ class WindowStatesManager: ObservableObject {
 
     /// Shuts down all agent processes (Claude CLI, Codex app-server) across every window.
     /// Called during app termination to prevent orphaned child processes.
-    /// Safe to call after `signalTermination()` — only performs cancellation and process teardown,
-    /// no UI-observed state mutations.
+    /// Safe to call after `signalTermination()` — fences new work and joins provider/process
+    /// teardown before MCP servers stop.
     func shutdownAllAgentSessions() async {
-        let windowIDs = allWindows.map(\.windowID)
+        closingWindowReferences.removeAll { $0.value == nil }
+        let windows = deduplicatedWindows(
+            terminationWindowSnapshot + allWindows + closingWindowReferences.compactMap(\.value)
+        )
+        defer { terminationWindowSnapshot.removeAll() }
+        let participatingWindowIdentities = Set(windows.map(ObjectIdentifier.init))
+
+        // The strong snapshot owns every participant until both shutdown paths have joined.
         await withTaskGroup(of: Void.self) { group in
-            for windowID in windowIDs {
-                group.addTask { @MainActor [weak self] in
-                    guard let self, let ws = window(withID: windowID) else { return }
-                    await ws.agentModeViewModel.prepareForWindowClose()
+            for window in windows {
+                group.addTask { @MainActor [window] in
+                    await window.contextBuilderAgentViewModel.shutdownForAppTermination()
+                    await window.agentModeViewModel.prepareForWindowClose()
                 }
             }
+        }
+        closingWindowReferences.removeAll { reference in
+            guard let window = reference.value else { return true }
+            return participatingWindowIdentities.contains(ObjectIdentifier(window))
         }
         // Stop dedicated CLI model polling so background refreshes cannot race shutdown.
         await CodexModelPollingService.shared.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
         await GrokBuildACPModelPollingService.shared.shutdown()
+    }
+
+    private func deduplicatedWindows(_ windows: [WindowState]) -> [WindowState] {
+        var seenWindowIdentities: Set<ObjectIdentifier> = []
+        return windows.filter { window in
+            seenWindowIdentities.insert(ObjectIdentifier(window)).inserted
+        }
     }
 
     // MARK: - Instance Number Management

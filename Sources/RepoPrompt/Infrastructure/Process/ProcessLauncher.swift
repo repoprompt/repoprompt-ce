@@ -210,11 +210,12 @@ enum ProcessLauncher {
         }
         defer { posix_spawnattr_destroy(&attributes) }
 
-        // Parent-side write paths use no-SIGPIPE hardening; restore the default SIGPIPE
-        // disposition in spawned children so CLI/tool processes keep normal pipe semantics.
+        // App lifecycle routing ignores SIGTERM process-wide, and parent write paths harden
+        // SIGPIPE. Spawned tools need default dispositions for normal termination semantics.
         var defaultSignals = sigset_t()
         sigemptyset(&defaultSignals)
         sigaddset(&defaultSignals, SIGPIPE)
+        sigaddset(&defaultSignals, SIGTERM)
 
         var spawnFlags: Int16 = 0
         let getFlagsResult = posix_spawnattr_getflags(&attributes, &spawnFlags)

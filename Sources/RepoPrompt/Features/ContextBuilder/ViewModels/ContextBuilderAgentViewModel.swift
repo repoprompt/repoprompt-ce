@@ -514,6 +514,67 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 source: "contextBuilder.testing.staleRetirement"
             )
         }
+
+        @discardableResult
+        func registerRunRecordForTesting(
+            _ record: ContextBuilderRunRecord,
+            makeCurrent: Bool,
+            releaseActiveSlot: Bool = false
+        ) -> Bool {
+            if makeCurrent {
+                sessions[record.tabID] = record.session
+            }
+            guard runRegistry.register(record) else { return false }
+            if releaseActiveSlot {
+                runRegistry.releaseActiveSlot(for: record)
+            }
+            return true
+        }
+
+        func cancelRunForTesting(
+            _ record: ContextBuilderRunRecord,
+            waiterResolution: ContextBuilderRunWaiterResolution = .snapshot
+        ) {
+            cancelRun(record, waiterResolution: waiterResolution, saveHistory: false)
+        }
+
+        @discardableResult
+        func finalizeRunForTesting(
+            _ record: ContextBuilderRunRecord,
+            outcome: ContextBuilderRunTerminalOutcome,
+            cancelExecution: Bool = false
+        ) -> Bool {
+            finalizeContextBuilderRun(
+                record,
+                outcome: outcome,
+                waiterResolution: .snapshot,
+                cancelExecution: cancelExecution,
+                saveHistory: false,
+                source: "contextBuilder.testing.finalize"
+            )
+        }
+
+        @discardableResult
+        func finishDeferredCancellationAtSafeBoundaryForTesting(
+            _ record: ContextBuilderRunRecord
+        ) -> Bool {
+            guard let policy = record.consumeDeferredCancellationAtSafeBoundary() else { return false }
+            return finalizeContextBuilderRun(
+                record,
+                outcome: .cancelled,
+                waiterResolution: policy.waiterResolution,
+                cancelExecution: false,
+                saveHistory: policy.saveHistory,
+                source: "contextBuilder.testing.safeBoundary"
+            )
+        }
+
+        func scheduleRunTeardownForTesting(
+            _ record: ContextBuilderRunRecord,
+            cancelExecution: Bool = true
+        ) {
+            scheduleRunTeardown(record, cancelExecution: cancelExecution)
+        }
     #endif
 
     // MARK: - Published session-scoped proxies
@@ -1015,6 +1076,28 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             self.tabCloseListenerToken = nil
         }
         cancellables.removeAll()
+    }
+
+    func shutdownForAppTermination() async {
+        prepareForWindowClose()
+        let records = runRegistry.retainedRecordsSnapshot()
+        for record in records where !record.isTerminal {
+            cancelRun(
+                record,
+                waiterResolution: record.origin.isMCP ? .cancellationError : .snapshot,
+                deferredWaiterResolution: .snapshot,
+                saveHistory: true
+            )
+        }
+        // Sweeps records that were already terminal with no teardown scheduled; such a record would
+        // otherwise never settle and would hang the join below. Records settled by the cancellation
+        // pass above are revisited harmlessly because starting teardown is idempotent.
+        for record in records where record.isTerminal {
+            scheduleRunTeardown(record, cancelExecution: true)
+        }
+        for record in records {
+            await record.awaitTeardownSettlement()
+        }
     }
 
     private var agentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
@@ -1744,6 +1827,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
         activityReporter: ContextBuilderMCPActivityReporter? = nil
     ) async throws -> MCPContextBuilderRunCompletion {
+        guard !hasPreparedForWindowClose else { throw CancellationError() }
         let configuration = authority.configuration
         let identity = configuration.identity
         let tabID = identity.tabID
@@ -1795,7 +1879,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         let restoreConfiguration: () -> Void = { [weak self, weak session] in
-            guard let self, let session, sessions[tabID] === session else { return }
+            guard let self, !hasPreparedForWindowClose,
+                  let session, sessions[tabID] === session else { return }
             session.contextBuilderInstructions = savedSessionInstructions
             updateRuntimeBindings(from: session)
         }
@@ -1805,7 +1890,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let runID = UUID()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                guard runRegistry.activeRecord(tabID: tabID) == nil,
+                guard !hasPreparedForWindowClose,
+                      runRegistry.activeRecord(tabID: tabID) == nil,
                       !session.agentRunState.isRunning,
                       !session.isAgentBusy
                 else {
@@ -2214,19 +2300,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.started", tabID: record.tabID)
         #endif
 
-        let disposalTask = Task { @MainActor [weak record] in
+        let disposalTask = Task { @MainActor [record] in
+            defer { record.markProviderDisposalFinished() }
             await payload.provider?.dispose()
-            record?.markProviderDisposalFinished()
         }
-        let executionJoinTask = Task { @MainActor [weak record] in
+        let executionJoinTask = Task { @MainActor [record] in
+            defer { record.markExecutionTaskFinished() }
             await payload.executionTask?.value
-            record?.markExecutionTaskFinished()
         }
 
-        Task { @MainActor [weak self, weak record] in
+        Task { @MainActor [weak self, record] in
             await disposalTask.value
             await executionJoinTask.value
-            guard let self, let record else { return }
+            guard let self else { return }
             if runRegistry.removeAfterTeardown(record) {
                 #if DEBUG
                     AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.completed", tabID: record.tabID)
@@ -2295,7 +2381,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     func runContextBuilderAgent() {
-        guard let tabID = currentTabID else { return }
+        guard !hasPreparedForWindowClose,
+              let tabID = currentTabID else { return }
         let session = session(for: tabID)
 
         guard session.mcpControlToken == nil,
@@ -3006,21 +3093,21 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         deferredWaiterResolution: ContextBuilderRunWaiterResolution? = nil,
         saveHistory: Bool
     ) {
-        guard acceptsEvents(from: record) else {
-            retireContextBuilderRunRecordWithoutPublishing(
-                record,
-                waiterResolution: waiterResolution,
-                cancelExecution: true,
-                source: "contextBuilder.cancel.staleRetirement"
-            )
-            return
-        }
         let deferredSettlementPolicy = ContextBuilderRunCancellationSettlementPolicy(
             waiterResolution: deferredWaiterResolution ?? waiterResolution,
             saveHistory: saveHistory
         )
         switch record.requestCancellation(deferredSettlementPolicy: deferredSettlementPolicy) {
         case .settleImmediately:
+            guard acceptsEvents(from: record) else {
+                retireContextBuilderRunRecordWithoutPublishing(
+                    record,
+                    waiterResolution: waiterResolution,
+                    cancelExecution: true,
+                    source: "contextBuilder.cancel.staleRetirement"
+                )
+                return
+            }
             _ = beginCancellation(forTabID: record.tabID)
             debugLog("Cancel requested for run \(record.runID) tab \(record.tabID)")
             finalizeContextBuilderRun(
