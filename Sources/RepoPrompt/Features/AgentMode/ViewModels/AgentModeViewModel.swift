@@ -621,6 +621,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
+    private var antigravityModelsSubscriptionTask: Task<Void, Never>?
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     let sessionIndexStore = AgentWorkspaceSessionIndexStore()
@@ -1422,6 +1423,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
         updateGrokBuildModelPolling(startPolling: startCursorPolling)
+        updateAntigravityModelPolling(startPolling: startCursorPolling)
     }
 
     private func updateOpenCodeModelPolling() {
@@ -1522,6 +1524,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func stopGrokBuildModelsSubscription() {
         grokBuildModelsSubscriptionTask?.cancel()
         grokBuildModelsSubscriptionTask = nil
+    }
+
+    private func updateAntigravityModelPolling(startPolling: Bool = true) {
+        guard selectedAgent == .antigravity else { antigravityModelsSubscriptionTask?.cancel()
+            antigravityModelsSubscriptionTask = nil
+            return
+        }
+        guard startPolling, AgentModelCatalog.isAgentAvailable(.antigravity, availability: agentAvailabilityContext) else { return }
+        guard antigravityModelsSubscriptionTask == nil else { return }
+        let workspacePath = workspacePathProvider()
+        antigravityModelsSubscriptionTask = Task { [weak self, workspacePath] in
+            let stream = await AntigravityACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await _ in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    acpDynamicModelRevision &+= 1
+                    syncSelectedACPModelFromRegistryIfNeeded(for: .antigravity)
+                    syncComposerUIState()
+                }
+            }
+        }
     }
 
     private func syncSelectedACPModelFromRegistryIfNeeded(for agent: AgentProviderKind) {
@@ -4837,7 +4861,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor, .grokBuild:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -14907,7 +14931,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> String {
         guard !attachments.isEmpty else { return text }
         switch agent {
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor, .antigravity:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec, .grokBuild:
             return text
@@ -16202,6 +16226,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // System messages - skip lifecycle messages that don't need UI display.
                 // Preserve Claude reasoning previews until the next reasoning or assistant message.
                 if let text = result.text, !text.isEmpty {
+                    if session.selectedAgent == .antigravity,
+                       text.trimmingCharacters(in: .whitespacesAndNewlines)
+                       .range(of: #"^I\d{4}\s+\d+\s"#, options: .regularExpression) != nil
+                    {
+                        break
+                    }
                     nonCodexContextUsageEstimator(for: session.selectedAgent)?.ingestSystemSignal(text, session: session)
                     flushPendingAssistantDelta(session)
                     endActiveAssistantSegment(session)

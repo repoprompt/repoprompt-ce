@@ -42,7 +42,7 @@ enum AgentModeMCPToolPolicy {
             codexNativeGrantedTools
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             claudeNativeGrantedTools
-        case .openCode:
+        case .openCode, .antigravity:
             openCodeGrantedTools
         case .cursor:
             cursorGrantedTools

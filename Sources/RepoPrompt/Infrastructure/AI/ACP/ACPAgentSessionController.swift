@@ -675,7 +675,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor, .grokBuild:
+        case .openCode, .cursor, .grokBuild, .antigravity:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -2980,7 +2980,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .antigravity:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
@@ -3031,7 +3031,7 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode, .grokBuild:
+        case .openCode, .grokBuild, .antigravity:
             // Grok full access is provider-native (`grok agent --always-approve stdio`); the
             // controller never auto-selects permission options for it.
             return nil
@@ -3076,7 +3076,7 @@ actor ACPAgentSessionController {
         }
 
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .antigravity:
             [
                 .optionID("always"),
                 .optionID("allow_always"),
@@ -3085,7 +3085,7 @@ actor ACPAgentSessionController {
                 .optionID("allow_once"),
                 .kind("allow_once")
             ]
-        case .grokBuild:
+        case .grokBuild, .antigravity:
             // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
             // session-scoped `allow-edits-session` here.
             [
@@ -3288,6 +3288,8 @@ actor ACPAgentSessionController {
                 "RP_OPENCODE_ACP_RAW_CAPTURE_PATH"
             case .grokBuild:
                 "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
+            case .antigravity:
+                "RP_ANTIGRAVITY_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
