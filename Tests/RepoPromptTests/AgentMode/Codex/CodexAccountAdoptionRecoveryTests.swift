@@ -2,6 +2,32 @@
 import XCTest
 
 final class CodexAccountAdoptionRecoveryTests: XCTestCase {
+    func testRepairTransportRetirementProofIsManagedOnlyAndDoesNotLaunch() async {
+        let managed = CodexAppServerClient(managedHTTPAccountAdoption: true)
+        let ordinary = CodexAppServerClient()
+        let managedEnded = await managed.managedTransportHasFullyEnded()
+        let ordinaryEnded = await ordinary.managedTransportHasFullyEnded()
+        XCTAssertTrue(managedEnded)
+        XCTAssertFalse(ordinaryEnded)
+    }
+
+    func testUnknownNativeItemsCannotMasqueradeAsIdleHistory() {
+        for type in ["", "unrecognizedTool"] {
+            let response: [String: Any] = ["thread": [
+                "id": "retained-thread", "modelProvider": CodexManagedHTTPPolicy.providerID,
+                "status": ["type": "idle"], "turns": [[
+                    "id": "turn",
+                    "status": "completed",
+                    "items": [["id": "item", "type": type, "status": "inProgress"]]
+                ]]
+            ]]
+            XCTAssertThrowsError(try CodexManagedHTTPPolicy.threadProof(
+                response: response, loaded: ["data": ["retained-thread"]], expectedThreadID: "retained-thread",
+                pendingMutation: false, persistedTools: []
+            ))
+        }
+    }
+
     func testActualRuntimeInitialAndCompletedHistoryPayloads() throws {
         for (index, fixture) in try CodexManagedHTTPThreadFixture.responses().enumerated() {
             let response = try XCTUnwrap(fixture["read"] as? [String: Any])
@@ -41,6 +67,7 @@ final class CodexAccountAdoptionRecoveryTests: XCTestCase {
         XCTAssertThrowsError(try fresh.authorize(method: "turn/start"))
         XCTAssertTrue(fresh.permitsUnmaterializedThreadProof)
         let lease = try fresh.reserve()
+        try fresh.bindAuthorization(CodexAccountAdoptionAuthorization())
         fresh.finish(lease, allowTurns: true)
         try fresh.authorize(method: "turn/start")
         XCTAssertFalse(fresh.permitsUnmaterializedThreadProof)

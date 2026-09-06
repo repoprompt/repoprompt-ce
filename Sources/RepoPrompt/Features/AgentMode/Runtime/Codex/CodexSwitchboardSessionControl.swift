@@ -15,6 +15,15 @@ extension SwitchboardBridgeClient: CodexSwitchboardBridge {}
 /// are serialized into Agent Mode persistence or exposed to generic MCP tools.
 @MainActor
 final class CodexSwitchboardSessionControl: ObservableObject {
+    struct Launch {
+        let resumeThreadID: String?
+        let resolveControl: @MainActor (ObjectIdentifier) -> CodexSwitchboardSessionControl?
+    }
+
+    @MainActor final class ControllerReference {
+        weak var value: (any CodexSessionControlling)?
+    }
+
     struct Runtime {
         let admission: @MainActor () -> CodexAccountAdoptionAdmission?
         let inspect: @MainActor () async throws -> CodexAccountAdoptionRuntimeProof
@@ -43,10 +52,28 @@ final class CodexSwitchboardSessionControl: ObservableObject {
         isPreparing || isTransactionInFlight || core?.blocksDispatch != false
     }
 
+    var keepsRuntimeAlive: Bool {
+        isPreparing || isTransactionInFlight || !blocksPermanently
+    }
+
+    var accountSummary: String? {
+        let applied = core?.appliedAccountLabel
+        let pending = selectedGrant.flatMap { grant in
+            core?.appliedRevision == grant.revision ? nil : (grant.email ?? grant.accountID)
+        }
+        switch state {
+        case .appliedUnverified: return applied.map { "Applied: \($0)" }
+        case .waitingIdle, .applying:
+            return [applied.map { "Applied: \($0)" }, pending.map { "Pending: \($0)" }].compactMap(\.self).joined(separator: " · ")
+        case .failedUnknown, .revoked: return nil
+        }
+    }
+
     var statusText: String {
         if isPreparing { return "Preparing private account pairing…" }
         switch state {
-        case .waitingIdle: return "Account selection saved; waiting for an idle session."
+        case .waitingIdle:
+            return selectedGrant == nil ? "Paired; choose an account in Switchboard." : "Account selection saved; waiting for an idle session."
         case .applying: return "Applying account to this conversation…"
         case .appliedUnverified: return "Account applied; next request unverified."
         case .failedUnknown: return "Account state unknown. Re-pair this conversation to continue."
@@ -97,6 +124,7 @@ final class CodexSwitchboardSessionControl: ObservableObject {
                 try await bridge.register(threadID: scope.threadID)
                 try checkIdentity(expectedEpoch)
                 await runtime.finish(lease, false)
+                try checkIdentity(expectedEpoch)
             } catch {
                 await runtime.finish(lease, false)
                 throw error
@@ -128,36 +156,40 @@ final class CodexSwitchboardSessionControl: ObservableObject {
     private func pollLocked() async {
         guard !isPreparing, !blocksPermanently, let bridge, let runtime, let core else { return }
         let expectedEpoch = epoch
-        isTransactionInFlight = true
-        defer { isTransactionInFlight = false }
         do {
-            let lease = try await runtime.reserve()
-            do {
-                try checkIdentity(expectedEpoch)
-                let grant = try await bridge.poll(lastSeenRevision: lastSeenRevision)
-                try checkIdentity(expectedEpoch)
-                if let grant {
-                    lastSeenRevision = grant.revision
-                    selectedGrant = grant
-                    await core.submit(grant)
-                } else {
-                    await core.retryAtIdleBoundary()
-                }
-                try checkIdentity(expectedEpoch)
-                if case let .waitingIdle(reason) = core.state, let selectedGrant {
-                    try await bridge.status(
-                        adoptionID: selectedGrant.adoptionID,
-                        expectedRevision: selectedGrant.revision,
-                        state: "waiting_idle",
-                        reason: reason.rawValue
-                    )
+            try checkIdentity(expectedEpoch)
+            // Read-only polling never reserves the native backend or blocks Stop,
+            // steering, or accepted user work. Only a ready adoption may reserve.
+            let grant = try await bridge.poll(lastSeenRevision: lastSeenRevision)
+            try checkIdentity(expectedEpoch)
+            if let grant {
+                lastSeenRevision = grant.revision
+                selectedGrant = grant
+                core.queue(grant)
+            }
+            if core.isReadyForApplication() {
+                isTransactionInFlight = true
+                defer { isTransactionInFlight = false }
+                let lease = try await runtime.reserve()
+                do {
                     try checkIdentity(expectedEpoch)
+                    await core.retryAtIdleBoundary()
+                    try checkIdentity(expectedEpoch)
+                    await runtime.finish(lease, !core.blocksDispatch)
+                } catch {
+                    core.suspend(.bridgeUnavailable)
+                    await runtime.finish(lease, false)
+                    throw error
                 }
-                await runtime.finish(lease, !core.blocksDispatch)
-            } catch {
-                core.suspend(.bridgeUnavailable)
-                await runtime.finish(lease, false)
-                throw error
+            }
+            if case let .waitingIdle(reason) = core.state, let selectedGrant {
+                try await bridge.status(
+                    adoptionID: selectedGrant.adoptionID,
+                    expectedRevision: selectedGrant.revision,
+                    state: "waiting_idle",
+                    reason: reason.rawValue
+                )
+                try checkIdentity(expectedEpoch)
             }
         } catch {
             core.suspend(.bridgeUnavailable)
@@ -176,11 +208,18 @@ final class CodexSwitchboardSessionControl: ObservableObject {
         let expectedEpoch = epoch
         isTransactionInFlight = true
         defer { isTransactionInFlight = false }
-        let lease = try await runtime.reserve()
+        let lease: UUID
+        do { lease = try await runtime.reserve() } catch {
+            core.suspend(.runtimeUnavailable)
+            throw CodexAccountAdoptionReason.runtimeUnavailable
+        }
         do {
             try checkIdentity(expectedEpoch)
             let grant = try await core.refresh(previousAccountID: previousAccountID)
             try checkIdentity(expectedEpoch)
+            // Reconcile a waiting destination before releasing the native lease:
+            // accepted work must still drain under the freshly renewed account.
+            _ = core.isReadyForApplication()
             await runtime.finish(lease, !core.blocksDispatch)
             try checkIdentity(expectedEpoch)
             return grant
@@ -192,7 +231,8 @@ final class CodexSwitchboardSessionControl: ObservableObject {
     }
 
     private func checkIdentity(_ expectedEpoch: UUID) throws {
-        guard epoch == expectedEpoch, let scope, runtime?.admission()?.scope == scope,
+        guard epoch == expectedEpoch, let scope, let admission = runtime?.admission(), admission.scope == scope,
+              admission.isExplicitRootCodexSession, admission.isManagedHTTPBackend,
               state != .revoked else { throw CodexAccountAdoptionReason.identityChanged }
         try Task.checkCancellation()
     }
@@ -210,23 +250,31 @@ final class CodexSwitchboardSessionControl: ObservableObject {
         core?.suspend(.runtimeUnavailable)
         state = .failedUnknown(.runtimeUnavailable)
         isPreparing = false
-        pollingTask?.cancel()
+        selectedGrant = nil
+        scheduleCleanup()
     }
 
     func revoke() {
-        guard cleanupTask == nil else { return }
         authorization.invalidate()
         epoch = UUID()
-        pollingTask?.cancel()
         core?.revoke()
         selectedGrant = nil
         state = .revoked
         isPreparing = false
+        scheduleCleanup()
+    }
+
+    private func scheduleCleanup() {
+        guard cleanupTask == nil else { return }
         let bridge = bridge
         self.bridge = nil
         let runtime = runtime
+        let pollingTask = pollingTask
         cleanupTask = Task { [mutex] in
+            // Preserve captured remote authority until revocation starts. A
+            // canceled poll must not erase it before cleanup can use it.
             await bridge?.revoke()
+            pollingTask?.cancel()
             try? await mutex.withLock {
                 if let runtime, let lease = try? await runtime.reserve() { await runtime.finish(lease, false) }
             }
@@ -240,7 +288,13 @@ final class CodexSwitchboardSessionControl: ObservableObject {
 
     deinit {
         authorization.invalidate()
-        pollingTask?.cancel()
-        if let bridge { Task { await bridge.revoke() } }
+        let pollingTask = pollingTask
+        if let bridge {
+            Task { await bridge.revoke()
+                pollingTask?.cancel()
+            }
+        } else if cleanupTask == nil {
+            pollingTask?.cancel()
+        }
     }
 }

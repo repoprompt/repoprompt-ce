@@ -6,7 +6,7 @@ import MCP
 
 @MainActor
 final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
-    typealias CodexControllerFactory = (
+    typealias CodexControllerFactory = @MainActor (
         _ runID: UUID,
         _ tabID: UUID,
         _ windowID: Int,
@@ -14,7 +14,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ permissionProfile: AgentModeViewModel.AgentPermissionProfile,
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         _ computerUseEnabled: Bool,
-        _ capabilities: CodexCapabilitySettings
+        _ capabilities: CodexCapabilitySettings,
+        _ switchboardLaunch: CodexSwitchboardSessionControl.Launch?
     ) -> any CodexSessionControlling
 
     typealias ConnectionPolicyInstaller = (
@@ -571,6 +572,37 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             || session.pendingUserInputRequest != nil
             || !session.queuedUserInputRequests.isEmpty
             || session.runState == .waitingForApproval
+    }
+
+    func switchboardSetupRejection(for session: AgentTabSession) -> CodexAccountAdoptionReason? {
+        guard session.selectedAgent == .codexExec, session.parentSessionID == nil else { return .identityChanged }
+        if session.runState.isActive || session.activeRunOwnership != nil || session.bindingTransitionInProgress { return .busy }
+        if hasPendingCodexInteraction(for: session) { return .pendingInteraction }
+        if !hardLocalToolLivenessReasons(for: session).isEmpty || hasSoftLocalToolLiveness(for: session) { return .activeTools }
+        if !session.pendingInstructions.isEmpty || !session.codexFallbackQueue.isEmpty || session.codexFallbackDispatchInFlight != nil { return .queuedDispatch }
+        if session.codexAuthoritativeActiveTurn != nil || session.codexAnonymousActiveTurn != nil || session.codexPendingTurnKind != nil { return .busy }
+        if codexRecoveryAttemptKeys.contains(where: { $0.runID == session.runID })
+            || codexActiveReattachAttemptKeys.contains(where: { $0.runID == session.runID }) { return .runtimeUnavailable }
+        return nil
+    }
+
+    func switchboardAdmission(for session: AgentTabSession, scope: CodexAccountAdoptionScope, hasActiveChildren: Bool) -> CodexAccountAdoptionAdmission {
+        .init(
+            scope: scope,
+            isExplicitRootCodexSession: session.selectedAgent == .codexExec && session.parentSessionID == nil
+                && session.requiresSwitchboardPairing && session.activeAgentSessionID == scope.sessionID
+                && session.switchboardAccountControl?.scope == scope,
+            isManagedHTTPBackend: session.codexController?.usesManagedHTTPAccountAdoption == true,
+            isIdle: !session.runState.isActive && session.activeRunOwnership == nil && !session.bindingTransitionInProgress
+                && session.codexAuthoritativeActiveTurn == nil && session.codexAnonymousActiveTurn == nil && session.codexPendingTurnKind == nil,
+            hasPendingInteraction: hasPendingCodexInteraction(for: session),
+            hasActiveTools: !hardLocalToolLivenessReasons(for: session).isEmpty || hasSoftLocalToolLiveness(for: session),
+            hasActiveChildren: hasActiveChildren,
+            hasQueuedDispatch: !session.pendingInstructions.isEmpty || !session.codexFallbackQueue.isEmpty || session.codexFallbackDispatchInFlight != nil,
+            hasRecoveryOrReconnect: session.codexNeedsReconnect
+                || codexRecoveryAttemptKeys.contains(where: { $0.runID == session.runID })
+                || codexActiveReattachAttemptKeys.contains(where: { $0.runID == session.runID })
+        )
     }
 
     @discardableResult
@@ -2220,6 +2252,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         session.codexConversationID = agentSession.codexConversationID
         session.codexRolloutPath = agentSession.codexRolloutPath
+        session.requiresSwitchboardPairing = agentSession.requiresSwitchboardPairing == true
         session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
         session.codexModel = agentSession.codexModel
         session.codexReasoningEffort = agentSession.codexReasoningEffort
@@ -2241,6 +2274,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         agentSession.codexConversationID = session.codexConversationID
         agentSession.codexRolloutPath = session.codexRolloutPath
+        agentSession.requiresSwitchboardPairing = session.requiresSwitchboardPairing ? true : nil
         agentSession.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
             provider: session.selectedAgent.rawValue,
             explicit: session.providerCleanupHandle,
@@ -5205,7 +5239,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         message: String,
         sourceController: (any CodexSessionControlling)?
     ) async -> Bool {
-        guard session.selectedAgent == .codexExec, session.runState.isActive else { return false }
+        guard session.selectedAgent == .codexExec, session.runState.isActive,
+              !session.requiresSwitchboardPairing, sourceController?.usesManagedHTTPAccountAdoption != true else { return false }
         guard session.pendingApproval == nil, session.runState != .waitingForApproval else { return false }
         if let issue {
             guard CodexManagedAuthRecoveryClassifier.isRecoverable(issue: issue) else { return false }
@@ -5340,6 +5375,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) -> Bool {
         let wasReconnectNeeded = session.codexNeedsReconnect
         session.codexNeedsReconnect = true
+        if session.switchboardAccountControl?.scope != nil { session.switchboardAccountControl?.runtimeLost() }
         if !wasReconnectNeeded {
             session.isDirty = true
             if scheduleSave {
@@ -5729,6 +5765,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         semanticRunState: AgentSessionRunState? = nil
     ) async {
         let managedSessionFence = CodexManagedSessionFence.shared
+        // Managed histories are never implicitly restarted or returned to shared
+        // login. Only explicit, root-scoped preparation may create a backend.
+        guard !session.requiresSwitchboardPairing || session.codexController != nil || session.allowsSwitchboardBootstrap else { return }
+        let allowMissingRolloutFallback = allowMissingRolloutFallback && !session.requiresSwitchboardPairing
+        let allowResumeTimeoutFallback = allowResumeTimeoutFallback && !session.requiresSwitchboardPairing
         let sessionInstallationToken = managedSessionFence.capturePublicationToken()
         guard session.selectedAgent == .codexExec,
               managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
@@ -5781,7 +5822,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return
         }
-        let wantsGoalSupport = CodexGoalSupport.isEnabled
+        let wantsGoalSupport = !session.requiresSwitchboardPairing && CodexGoalSupport.isEnabled
         let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
         let wantsMemories = CodexMemories.isEnabled
         let wantsCapabilities = codexCapabilitiesForLaunch(session.isMCPRelated)
@@ -5882,7 +5923,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 && refreshedComputerUseFeatureEnabled
             let refreshedFeatureState = AgentTabSession.CodexControllerFeatureState(
                 computerUseEnabled: refreshedWantsComputerUse,
-                goalSupportEnabled: CodexGoalSupport.isEnabled,
+                goalSupportEnabled: !session.requiresSwitchboardPairing && CodexGoalSupport.isEnabled,
                 reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
                 memoriesEnabled: CodexMemories.isEnabled,
                 capabilities: codexCapabilitiesForLaunch(session.isMCPRelated)
@@ -5912,6 +5953,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             desiredFeatureState = refreshedFeatureState
 
             if session.codexController == nil {
+                guard !session.requiresSwitchboardPairing || session.allowsSwitchboardBootstrap else { return nil }
+                let switchboardLaunch: CodexSwitchboardSessionControl.Launch? = session.requiresSwitchboardPairing ? .init(
+                    resumeThreadID: session.codexConversationID,
+                    resolveControl: { [weak session] identity in
+                        guard let session, session.requiresSwitchboardPairing,
+                              let controller = session.codexController, ObjectIdentifier(controller) == identity,
+                              let control = session.switchboardAccountControl,
+                              control.scope?.controllerGeneration == session.codexControllerGeneration,
+                              control.scope?.threadID == session.codexConversationID else { return nil }
+                        return control
+                    }
+                ) : nil
                 let controller = codexControllerFactory(
                     runID,
                     session.tabID,
@@ -5920,7 +5973,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     controllerPermissionProfile,
                     currentTaskLabelKind,
                     wantsComputerUse,
-                    desiredFeatureState.capabilities
+                    desiredFeatureState.capabilities,
+                    switchboardLaunch
                 )
                 guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else {
                     logCodex("[AgentModeVM][CodexLogout] retiring controller created after managed sign-out invalidated its session token tab=\(session.tabID)")
@@ -6190,7 +6244,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
         } catch {
             var effectiveError: Error = error
-            if session.runState.isActive,
+            if !session.requiresSwitchboardPairing, session.codexController?.usesManagedHTTPAccountAdoption != true,
+               session.runState.isActive,
                let runID = session.runID,
                CodexManagedAuthRecoveryClassifier.isRecoverable(message: error.localizedDescription),
                codexAuthRecoveryAttemptedRunIDs.insert(runID).inserted
@@ -6375,6 +6430,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         policyAlreadyInstalled: Bool = false,
         terminalizeRejectedSend: Bool = true
     ) async -> NativeSendOutcome {
+        if let message = session.switchboardDispatchBlockReason {
+            viewModel?.finalizeAttachmentsForTurn(for: session, reservationID: attachmentReservationID, disposition: .restoreToPending)
+            return .preDispatchRejected(message: message)
+        }
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
         let wasRunAlreadyActive = session.runState.isActive
         let activeSendRunID = wasRunAlreadyActive ? session.runID : nil
@@ -9470,6 +9529,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         let runState = effectiveRunState ?? session.runState
         guard session.selectedAgent == .codexExec,
+              session.switchboardAccountControl?.keepsRuntimeAlive != true,
               session.codexController != nil,
               session.pendingApproval == nil,
               !runState.isActive
@@ -9490,6 +9550,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 guard !Task.isCancelled else { return }
                 guard let session else { return }
                 guard session.selectedAgent == .codexExec,
+                      session.switchboardAccountControl?.keepsRuntimeAlive != true,
                       session.codexController != nil,
                       session.pendingApproval == nil,
                       !session.runState.isActive

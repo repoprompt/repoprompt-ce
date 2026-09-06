@@ -1650,21 +1650,43 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return FileManager.default.temporaryDirectory
         }
         let providerBindingService = AgentModeProviderBindingService()
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities in
-            let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false)
-            let options = CodexNativeSessionController.Options.agentModeDefault(
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities, switchboardLaunch in
+            let client = CodexAppServerClient(
+                provisionsRepoPromptMCPOnStart: false,
+                managedHTTPAccountAdoption: switchboardLaunch != nil,
+                managedResumeThreadID: switchboardLaunch?.resumeThreadID
+            )
+            let reference = CodexSwitchboardSessionControl.ControllerReference()
+            var options = CodexNativeSessionController.Options.agentModeDefault(
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
                 shellToolEnabled: permissionProfile.codexBashToolEnabled(),
                 suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
                 capabilitiesProvider: { capabilities },
-                goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
+                goalSupportEnabledProvider: { switchboardLaunch == nil && CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
                 memoriesEnabledProvider: { CodexMemories.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )
-            return CodexNativeSessionController(
+            if let switchboardLaunch {
+                options.authTokensRefreshHandler = { request in
+                    let control = await MainActor.run {
+                        reference.value.flatMap { switchboardLaunch.resolveControl(ObjectIdentifier($0)) }
+                    }
+                    guard let control, let previousID = request.previousAccountID else { throw CodexAccountAdoptionReason.identityChanged }
+                    let grant = try await control.refresh(previousAccountID: previousID)
+                    return await MainActor.run {
+                        .init(
+                            accessToken: grant.accessToken,
+                            chatgptAccountID: grant.accountID,
+                            chatgptPlanType: grant.plan,
+                            managedAuthorization: control.authorization
+                        )
+                    }
+                }
+            }
+            let controller = CodexNativeSessionController(
                 client: client,
                 runID: runID,
                 tabID: tabID,
@@ -1674,6 +1696,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 clientShutdownBehavior: .stopOnShutdown,
                 expectedMCPClientName: AgentProviderKind.codexExec.mcpClientNameHint
             )
+            reference.value = controller
+            return controller
         }
         headlessProviderFactory = Self.defaultHeadlessProviderFactory
         acpProviderFactory = { agent, modelString in
@@ -1893,7 +1917,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
             workspacePathProvider = codexWorkspacePathProvider
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
-                ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _ in
+                ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
                 }
             self.headlessProviderFactory = headlessProviderFactory
@@ -3137,6 +3161,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         return nodes
+    }
+
+    func switchboardHasActiveOrUnknownDescendants(of session: TabSession) -> Bool {
+        guard let rootID = session.activeAgentSessionID else { return false }
+        let descendants = descendantSessionTreeIDs(startingWith: [rootID], nodes: sessionTreeNodes()).subtracting([rootID])
+        for id in descendants {
+            let live = sessions.values.filter { $0.activeAgentSessionID == id }
+            guard live.count == 1, let child = live.first, child.hasLoadedPersistedState else { return true }
+            if child.runState.isActive || child.activeRunOwnership != nil || child.bindingTransitionInProgress { return true }
+        }
+        return false
     }
 
     private func descendantSessionTreeIDs(
@@ -14000,6 +14035,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) -> UserTurnSubmissionResult {
+        if let message = session.switchboardDispatchBlockReason { return .blocked(message: message) }
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
         // Composer claims preserve the exact raw snapshot separately from provider-normalized text.
         let restorationDraftText = rawDraftText ?? trimmedText

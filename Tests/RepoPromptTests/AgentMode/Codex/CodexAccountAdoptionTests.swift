@@ -152,6 +152,12 @@ final class CodexAccountAdoptionTests: XCTestCase {
         XCTAssertFalse(String(describing: grant).contains(grant.accessToken))
         XCTAssertFalse(String(reflecting: grant).contains(grant.accessToken))
         XCTAssertTrue(Mirror(reflecting: grant).children.isEmpty)
+        let response = CodexNativeSessionController.ChatgptAuthTokensRefreshResponse(
+            accessToken: grant.accessToken, chatgptAccountID: grant.accountID, chatgptPlanType: nil
+        )
+        XCTAssertFalse(String(describing: response).contains(grant.accessToken))
+        XCTAssertFalse(String(reflecting: response).contains(grant.accessToken))
+        XCTAssertTrue(Mirror(reflecting: response).children.isEmpty)
     }
 
     func testNewSelectionDuringRefreshReportsWaitingAndLetsExistingQueueDrain() async throws {

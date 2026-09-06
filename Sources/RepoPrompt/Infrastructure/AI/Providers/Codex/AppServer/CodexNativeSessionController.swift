@@ -440,11 +440,23 @@ final class CodexNativeSessionController {
         let previousAccountID: String?
     }
 
-    struct ChatgptAuthTokensRefreshResponse: Equatable {
+    struct ChatgptAuthTokensRefreshResponse: Equatable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
         let accessToken: String
         let chatgptAccountID: String
         let chatgptPlanType: String?
         var managedAuthorization: CodexAccountAdoptionAuthorization?
+
+        var description: String {
+            "ChatgptAuthTokensRefreshResponse(redacted)"
+        }
+
+        var debugDescription: String {
+            description
+        }
+
+        var customMirror: Mirror {
+            Mirror(self, children: [:])
+        }
 
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.accessToken == rhs.accessToken && lhs.chatgptAccountID == rhs.chatgptAccountID
@@ -2081,6 +2093,10 @@ final class CodexNativeSessionController {
 
     func reserveAccountAdoption() async throws -> UUID {
         try await client.reserveManagedAccountAdoption()
+    }
+
+    func managedAccountTransportHasFullyEnded() async -> Bool {
+        await client.managedTransportHasFullyEnded()
     }
 
     func finishAccountAdoption(_ lease: UUID, allowTurns: Bool) async {

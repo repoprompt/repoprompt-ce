@@ -174,6 +174,11 @@ Additional loaded native threads refuse adoption even if they appear idle. This
 pilot does not claim arbitrary subagent-heavy backends are switchable. Active or
 unknown app-owned descendants, tools, queued work, interactions and recovery also
 prevent admission.
+Native transcript admission validates the reviewed 0.149 ThreadItem tags and
+required-field shapes, including exact tool-status enums. Unknown tags and
+non-full turn item views refuse proof. Native image-generation status is an
+unconstrained string in that schema, and subagent activity markers do not prove
+completion; those ambiguous history variants are currently ineligible.
 
 Codex 0.149 cannot return includeTurns history for an unmaterialized new thread.
 Metadata-only idle proof is allowed only when the app-server actor proves it
@@ -195,6 +200,35 @@ actor execution. Pairing and grant data remain memory-only.
 Privileged native writes use nonblocking pipe mode while holding this authority
 lock. A partial write or unavailable pipe capacity fails closed and retires the
 owned transport; revocation must not wait for a stalled child's pipe to drain.
+Routine bridge polling does not reserve the native runtime or block existing
+work. Only an admissible pending adoption takes the native lease, and Stop
+remains available during adoption/refresh. Turn admission separately checks the
+live revocable consent so a stale asynchronous lease release cannot reopen it.
+
+## Session UI and onboarding
+
+Use the Codex session's **Pair Switchboard…** control, paste a fresh private
+pairing envelope from Switchboard, and explicitly allow idle account changes.
+The envelope input is a native masked secure field and clears on submission,
+cancellation or dismissal; pairing material is never a transcript input.
+This is a separate authority from the ordinary Codex login in Settings: a paired
+managed session does not require Settings to report Connected. The UI does not
+alter or fabricate that global status.
+
+Pairing is default-off and root-only. An existing ordinary backend or ordinary
+native history cannot be converted; begin with a new empty Codex session.
+Already-managed history uses **Re-pair Switchboard…**, retaining the exact native
+thread. Cancel or Revoke invalidates local consent immediately and performs
+best-effort remote cleanup, including registration that settles after cancellation.
+If a managed controller has fully ended, explicit idle repair may retire only
+that proven-ended instance and resume the retained exact thread in a new managed
+backend. Live or unknown controller/process state is not silently stopped.
+
+The account bar distinguishes **Applied** from **Pending** labels and displays
+the separate application/verification status. A queued destination is never
+presented as the account currently applied to the backend. Account labels are
+metadata, not runtime identity proof. No token or pairing capability is shown in
+the status bar or persisted with the conversation.
 
 ## Validation status
 

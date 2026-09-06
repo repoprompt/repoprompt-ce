@@ -87,40 +87,43 @@ struct AgentModeView: View {
                     max: sidebarMaxWidth
                 )
             } detail: {
-                #if DEBUG
-                    AgentModeDetailWithSidebarView(
-                        agentModeVM: agentModeVM,
-                        runtimeVM: agentModeVM.ui.runtimeMetrics.runtimeVM,
-                        statusPillsUI: agentModeVM.ui.statusPills,
-                        contextBuilderAgentVM: windowState.contextBuilderAgentViewModel,
-                        oracleViewModel: windowState.oracleViewModel,
-                        promptManager: promptManager,
-                        workspaceSearchService: windowState.workspaceSearchService,
-                        selectionCoordinator: windowState.selectionCoordinator,
-                        stressHarness: windowState.agentChatStressHarness,
-                        windowID: windowState.windowID,
-                        currentTabID: currentTabID,
-                        codexManagedLoginAction: codexManagedLoginAction
-                    )
-                    .environment(\.agentWindowIsFocused, windowState.isCurrentlyFocused)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                #else
-                    AgentModeDetailWithSidebarView(
-                        agentModeVM: agentModeVM,
-                        runtimeVM: agentModeVM.ui.runtimeMetrics.runtimeVM,
-                        statusPillsUI: agentModeVM.ui.statusPills,
-                        contextBuilderAgentVM: windowState.contextBuilderAgentViewModel,
-                        oracleViewModel: windowState.oracleViewModel,
-                        promptManager: promptManager,
-                        workspaceSearchService: windowState.workspaceSearchService,
-                        selectionCoordinator: windowState.selectionCoordinator,
-                        windowID: windowState.windowID,
-                        currentTabID: currentTabID,
-                        codexManagedLoginAction: codexManagedLoginAction
-                    )
-                    .environment(\.agentWindowIsFocused, windowState.isCurrentlyFocused)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                #endif
+                VStack(spacing: 0) {
+                    SwitchboardSessionAccountBar(viewModel: agentModeVM, statusPillsUI: agentModeVM.ui.statusPills, tabID: currentTabID)
+                    #if DEBUG
+                        AgentModeDetailWithSidebarView(
+                            agentModeVM: agentModeVM,
+                            runtimeVM: agentModeVM.ui.runtimeMetrics.runtimeVM,
+                            statusPillsUI: agentModeVM.ui.statusPills,
+                            contextBuilderAgentVM: windowState.contextBuilderAgentViewModel,
+                            oracleViewModel: windowState.oracleViewModel,
+                            promptManager: promptManager,
+                            workspaceSearchService: windowState.workspaceSearchService,
+                            selectionCoordinator: windowState.selectionCoordinator,
+                            stressHarness: windowState.agentChatStressHarness,
+                            windowID: windowState.windowID,
+                            currentTabID: currentTabID,
+                            codexManagedLoginAction: codexManagedLoginAction
+                        )
+                        .environment(\.agentWindowIsFocused, windowState.isCurrentlyFocused)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    #else
+                        AgentModeDetailWithSidebarView(
+                            agentModeVM: agentModeVM,
+                            runtimeVM: agentModeVM.ui.runtimeMetrics.runtimeVM,
+                            statusPillsUI: agentModeVM.ui.statusPills,
+                            contextBuilderAgentVM: windowState.contextBuilderAgentViewModel,
+                            oracleViewModel: windowState.oracleViewModel,
+                            promptManager: promptManager,
+                            workspaceSearchService: windowState.workspaceSearchService,
+                            selectionCoordinator: windowState.selectionCoordinator,
+                            windowID: windowState.windowID,
+                            currentTabID: currentTabID,
+                            codexManagedLoginAction: codexManagedLoginAction
+                        )
+                        .environment(\.agentWindowIsFocused, windowState.isCurrentlyFocused)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    #endif
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }

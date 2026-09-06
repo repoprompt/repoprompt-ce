@@ -133,33 +133,49 @@ final class CodexAccountAdoption: ObservableObject {
     private var isTerminal = false
     private var refreshInFlight = false
 
+    var appliedAccountLabel: String? {
+        applied.map { $0.email ?? $0.accountID }
+    }
+
+    var appliedRevision: Int64? {
+        applied?.revision
+    }
+
     init(scope: CodexAccountAdoptionScope, dependencies: Dependencies) {
         self.scope = scope
         self.dependencies = dependencies
     }
 
     func submit(_ grant: CodexAccountAdoptionGrant) async {
+        queue(grant)
+        await retryAtIdleBoundary()
+    }
+
+    func queue(_ grant: CodexAccountAdoptionGrant) {
         guard !isRevoked, !isTerminal, grant.revision > highestRevision else { return }
         highestRevision = grant.revision
         pending = grant
         blocksDispatch = true
-        await retryAtIdleBoundary()
     }
 
-    func retryAtIdleBoundary() async {
+    func isReadyForApplication() -> Bool {
         guard !isRevoked, !isTerminal, !reservesController, !refreshInFlight,
-              let grant = pending else { return }
+              let grant = pending else { return false }
         do {
             try validateGrant(grant)
             try validateAdmission()
+            return true
         } catch let reason as CodexAccountAdoptionReason {
             handlePreMutationFailure(reason)
-            return
+            return false
         } catch {
             fail(.runtimeUnavailable)
-            return
+            return false
         }
+    }
 
+    func retryAtIdleBoundary() async {
+        guard isReadyForApplication(), let grant = pending else { return }
         reservesController = true
         blocksDispatch = true
         state = .applying

@@ -39,6 +39,7 @@ enum CodexManagedHTTPPolicy {
         private var hasStarted = false
         private var lease: UUID?
         private var permitsTurns = false
+        private var authorization: CodexAccountAdoptionAuthorization?
         private let expectedResumeThreadID: String?
         private var hasRequestedThread = false
         private var hasDispatchedProviderWork = false
@@ -75,7 +76,14 @@ enum CodexManagedHTTPPolicy {
             permitsTurns = allowTurns
         }
 
+        mutating func bindAuthorization(_ authorization: CodexAccountAdoptionAuthorization) throws {
+            guard lease != nil else { throw Failure.unsupportedConfiguration }
+            try authorization.withAuthorization {}
+            self.authorization = authorization
+        }
+
         mutating func authorize(method: String, permitsAccountLogin: Bool = false, requestedThreadID: String? = nil) throws {
+            if method == "turn/interrupt" { return }
             if method == "account/login/start" {
                 guard permitsAccountLogin, lease != nil else { throw Failure.unsupportedConfiguration }
                 return
@@ -94,7 +102,8 @@ enum CodexManagedHTTPPolicy {
                 return
             }
             if ["turn/start", "turn/steer", "review/start", "thread/compact/start", "thread/shellCommand"].contains(method) {
-                guard permitsTurns, lease == nil else { throw Failure.unsupportedConfiguration }
+                guard permitsTurns, lease == nil, let authorization else { throw Failure.unsupportedConfiguration }
+                try authorization.withAuthorization {}
                 hasDispatchedProviderWork = true
             }
             if lease != nil, method.hasPrefix("config/"), method != "config/read" {
@@ -125,16 +134,12 @@ enum CodexManagedHTTPPolicy {
             guard let id = turn["id"] as? String, !id.isEmpty,
                   let turnStatus = turn["status"] as? String,
                   ["completed", "interrupted", "failed", "inProgress"].contains(turnStatus),
+                  turn["itemsView"] == nil || turn["itemsView"] as? String == "full",
                   let items = turn["items"] as? [[String: Any]] else { throw Failure.unsupportedConfiguration }
             hasActiveTurn = hasActiveTurn || turnStatus == "inProgress"
             for item in items {
-                guard let type = item["type"] as? String else { throw Failure.unsupportedConfiguration }
-                if ["commandExecution", "mcpToolCall", "dynamicToolCall", "fileChange", "collabAgentToolCall"].contains(type) {
-                    guard let itemStatus = item["status"] as? String,
-                          ["completed", "failed", "declined", "interrupted", "inProgress"].contains(itemStatus)
-                    else { throw Failure.unsupportedConfiguration }
-                    hasTools = hasTools || itemStatus == "inProgress"
-                }
+                let active = try CodexManagedThreadItemProof.hasActiveWork(item)
+                hasTools = hasTools || active
             }
         }
         return .init(

@@ -693,6 +693,10 @@ actor CodexAppServerClient {
         managedHTTPPolicyIsVerified() && managedRequestGate.permitsUnmaterializedThreadProof
     }
 
+    func managedTransportHasFullyEnded() -> Bool {
+        usesManagedHTTPAccountAdoption && activeTransport == nil && startupTask == nil && transportTerminationTask == nil
+    }
+
     func bindManagedAccountThread(_ threadID: String) throws {
         guard managedHTTPPolicyIsVerified() else { throw CodexManagedHTTPPolicy.Failure.unsupportedConfiguration }
         try managedRequestGate.bindThread(threadID)
@@ -1387,6 +1391,9 @@ actor CodexAppServerClient {
             guardedParams = try CodexManagedHTTPPolicy.requestParameters(
                 method: method, params: params, permitsAccountLogin: permitsManagedAccountLogin
             )
+            if permitsManagedAccountLogin, let managedAuthorization {
+                try managedRequestGate.bindAuthorization(managedAuthorization)
+            }
         }
         let requestID = makeRequestID()
         let generation = activeTransport.generation

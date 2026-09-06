@@ -491,8 +491,13 @@ final class AgentTabSession: ObservableObject {
     var provider: HeadlessAgentProvider?
     var agentTask: Task<Void, Never>?
 
-    // Settings (per-tab)
-    var selectedAgent: AgentProviderKind = .claudeCode
+    /// Settings (per-tab)
+    var selectedAgent: AgentProviderKind = .claudeCode {
+        didSet {
+            if oldValue != selectedAgent, switchboardAccountControl?.scope != nil { switchboardAccountControl?.runtimeLost() }
+        }
+    }
+
     var selectedModelRaw: String = AgentModel.defaultModel.rawValue
     var selectedReasoningEffortRaw: String?
     var autoEditEnabled: Bool = true
@@ -531,6 +536,21 @@ final class AgentTabSession: ObservableObject {
     // Codex native session identifiers and metadata
     var codexConversationID: String?
     var codexRolloutPath: String?
+    @Published var requiresSwitchboardPairing = false
+    @Published var switchboardAccountControl: CodexSwitchboardSessionControl?
+
+    var switchboardDispatchBlockReason: String? {
+        guard selectedAgent == .codexExec, requiresSwitchboardPairing || switchboardAccountControl != nil else { return nil }
+        guard parentSessionID == nil else { return "Switchboard pairing is available only for root Codex sessions." }
+        guard let control = switchboardAccountControl else { return "Re-pair this retained conversation with Switchboard before continuing." }
+        return control.blocksDispatch ? control.statusText : nil
+    }
+
+    var allowsSwitchboardBootstrap: Bool {
+        selectedAgent == .codexExec && parentSessionID == nil && requiresSwitchboardPairing
+            && switchboardAccountControl?.isPreparing == true && switchboardAccountControl?.scope == nil
+    }
+
     var codexModel: String?
     var codexReasoningEffort: String?
     @Published var codexContextUsage: AgentContextUsage? = nil
@@ -545,6 +565,7 @@ final class AgentTabSession: ObservableObject {
             let oldIdentity = oldValue.map { ObjectIdentifier($0) }
             let newIdentity = codexController.map { ObjectIdentifier($0) }
             guard oldIdentity != newIdentity else { return }
+            if switchboardAccountControl?.scope != nil { switchboardAccountControl?.runtimeLost() }
             resetCodexHookGateBinding()
             codexControllerGeneration = UUID()
             codexAuthoritativeActiveTurn = nil
@@ -639,11 +660,21 @@ final class AgentTabSession: ObservableObject {
         persistentSessionBindingIdentity?.sessionID
     }
 
-    private(set) var bindingTransitionGeneration: UInt64 = 0
+    private(set) var bindingTransitionGeneration: UInt64 = 0 {
+        didSet {
+            if oldValue != bindingTransitionGeneration, switchboardAccountControl?.scope != nil { switchboardAccountControl?.runtimeLost() }
+        }
+    }
+
     private(set) var bindingTransitionInProgress: Bool = false
     private(set) var persistenceMutationGeneration: UInt64 = 0
     var saveRequestGeneration: UInt64 = 0
-    var parentSessionID: UUID?
+    var parentSessionID: UUID? {
+        didSet {
+            if oldValue != parentSessionID, switchboardAccountControl?.scope != nil { switchboardAccountControl?.runtimeLost() }
+        }
+    }
+
     var hasLoadedPersistedState: Bool = false
     private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
     private(set) var authoritativeHydratedBindingTransitionGeneration: UInt64?
@@ -702,6 +733,7 @@ final class AgentTabSession: ObservableObject {
     /// instruction, applyEditsReview, MCP control, run cancellation) remain
     /// on the VM and are called separately by each teardown path.
     func cancelEphemeralRuntimeState() {
+        switchboardAccountControl?.revoke()
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
         pendingDerivedTranscriptRefreshReason = nil

@@ -22,6 +22,7 @@ final class CodexManagedHTTPPolicyTests: XCTestCase {
         XCTAssertThrowsError(try gate.authorize(method: "thread/rollback"))
         XCTAssertThrowsError(try gate.authorize(method: "command/exec"))
         try gate.authorize(method: "thread/read")
+        try gate.authorize(method: "turn/interrupt")
     }
 
     func testFutureBundledRuntimeDoesNotInheritReviewedTransportProof() throws {
@@ -158,6 +159,7 @@ final class CodexManagedHTTPPolicyTests: XCTestCase {
         let initial = try gate.reserve()
         XCTAssertThrowsError(try gate.reserve())
         try gate.authorize(method: "account/login/start", permitsAccountLogin: true)
+        try gate.bindAuthorization(CodexAccountAdoptionAuthorization())
         gate.finish(initial, allowTurns: true)
         try gate.authorize(method: "turn/start")
         let switching = try gate.reserve()

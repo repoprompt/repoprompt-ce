@@ -3,6 +3,49 @@ import XCTest
 
 @MainActor
 final class CodexSwitchboardSessionControlTests: XCTestCase {
+    func testRefreshKeepsAppliedAccountUsableWhileNewSelectionWaits() async throws {
+        let fixture = Fixture()
+        let bridge = Bridge()
+        let control = CodexSwitchboardSessionControl()
+        fixture.control = control
+        try await control.connect(scope: fixture.scope, bridge: bridge, runtime: fixture.runtime)
+        await control.pollOnce()
+        fixture.isIdle = false
+        await bridge.queueSecondSelection()
+        await control.pollOnce()
+        let renewed = try await control.refresh(previousAccountID: "synthetic-account")
+        XCTAssertEqual(renewed.accountID, "synthetic-account")
+        XCTAssertEqual(control.state, .waitingIdle(.busy))
+        XCTAssertFalse(control.blocksDispatch)
+        XCTAssertEqual(fixture.finishes.last, true)
+        XCTAssertEqual(control.accountSummary, "Applied: synthetic-account · Pending: synthetic-b")
+        fixture.isIdle = true
+        await control.pollOnce()
+        XCTAssertEqual(control.state, .appliedUnverified(revision: 2))
+        XCTAssertEqual(control.accountSummary, "Applied: synthetic-b")
+        await control.revokeAndWait()
+    }
+
+    func testSuspendedRoutinePollDoesNotReserveRuntimeOrBlockDispatch() async throws {
+        let fixture = Fixture()
+        let bridge = Bridge()
+        let control = CodexSwitchboardSessionControl()
+        fixture.control = control
+        try await control.connect(scope: fixture.scope, bridge: bridge, runtime: fixture.runtime)
+        await control.pollOnce()
+        let reservationsBefore = fixture.reservations
+        await bridge.suspendNextPoll()
+        let polling = Task { await control.pollOnce() }
+        while await !bridge.isPollSuspended() {
+            await Task.yield()
+        }
+        XCTAssertFalse(control.blocksDispatch)
+        XCTAssertEqual(fixture.reservations, reservationsBefore)
+        await bridge.resumePoll()
+        await polling.value
+        await control.revokeAndWait()
+    }
+
     func testRevocationWhileNativeInstallIsSuspendedNeverReopensDispatch() async throws {
         let fixture = Fixture()
         fixture.suspendInstall = true
@@ -66,6 +109,8 @@ final class CodexSwitchboardSessionControlTests: XCTestCase {
         weak var control: CodexSwitchboardSessionControl?
         var installed: [String] = []
         var finishes: [Bool] = []
+        var reservations = 0
+        var isIdle = true
         var suspendInstall = false
         var installContinuation: CheckedContinuation<Void, Never>?
         var runtime: CodexSwitchboardSessionControl.Runtime {
@@ -74,7 +119,7 @@ final class CodexSwitchboardSessionControlTests: XCTestCase {
                     scope: scope,
                     isExplicitRootCodexSession: true,
                     isManagedHTTPBackend: true,
-                    isIdle: true,
+                    isIdle: isIdle,
                     hasPendingInteraction: false,
                     hasActiveTools: false,
                     hasActiveChildren: false,
@@ -93,6 +138,7 @@ final class CodexSwitchboardSessionControlTests: XCTestCase {
                 )
             }, reserve: { [self] in
                 XCTAssertTrue(control?.blocksDispatch == true)
+                reservations += 1
                 return UUID()
             }, finish: { [self] _, allow in finishes.append(allow) }, install: { [self] grant in
                 XCTAssertTrue(control?.blocksDispatch == true)
@@ -106,6 +152,9 @@ final class CodexSwitchboardSessionControlTests: XCTestCase {
     private actor Bridge: CodexSwitchboardBridge {
         var events: [String] = []
         var failing = false
+        var shouldSuspendPoll = false
+        var pollContinuation: CheckedContinuation<Void, Never>?
+        var secondGrant: CodexAccountAdoptionGrant?
         let grant = CodexAccountAdoptionGrant(
             adoptionID: UUID(),
             selectionID: UUID(),
@@ -120,14 +169,20 @@ final class CodexSwitchboardSessionControlTests: XCTestCase {
             events.append("register:\(threadID ?? "null")")
         }
 
-        func poll(lastSeenRevision: Int64) throws -> CodexAccountAdoptionGrant? {
+        func poll(lastSeenRevision: Int64) async throws -> CodexAccountAdoptionGrant? {
             events.append("poll:\(lastSeenRevision)")
+            if shouldSuspendPoll { await withCheckedContinuation { pollContinuation = $0 } }
             if failing { throw CodexAccountAdoptionReason.bridgeUnavailable }
-            return lastSeenRevision == 0 ? grant : nil
+            return lastSeenRevision == 0 ? grant : (lastSeenRevision == 1 ? secondGrant : nil)
         }
 
         func refresh(previousGrant: CodexAccountAdoptionGrant) throws -> CodexAccountAdoptionGrant {
-            throw CodexAccountAdoptionReason.bridgeUnavailable
+            CodexAccountAdoptionGrant(
+                adoptionID: previousGrant.adoptionID, selectionID: previousGrant.selectionID,
+                revision: previousGrant.revision, expiresAt: Date().addingTimeInterval(600),
+                accountID: previousGrant.accountID, email: previousGrant.email, plan: previousGrant.plan,
+                accessToken: "renewed-synthetic-only"
+            )
         }
 
         func status(adoptionID: UUID, expectedRevision: Int64, state: String, reason: String) {
@@ -144,6 +199,27 @@ final class CodexSwitchboardSessionControlTests: XCTestCase {
 
         func failPoll() {
             failing = true
+        }
+
+        func queueSecondSelection() {
+            secondGrant = CodexAccountAdoptionGrant(
+                adoptionID: UUID(), selectionID: UUID(), revision: 2, expiresAt: Date().addingTimeInterval(600),
+                accountID: "synthetic-b", email: nil, plan: nil, accessToken: "synthetic-b-only"
+            )
+        }
+
+        func suspendNextPoll() {
+            shouldSuspendPoll = true
+        }
+
+        func isPollSuspended() -> Bool {
+            pollContinuation != nil
+        }
+
+        func resumePoll() {
+            shouldSuspendPoll = false
+            pollContinuation?.resume()
+            pollContinuation = nil
         }
     }
 }
