@@ -14,6 +14,8 @@ struct GlobalSettingsPersistenceBlockBanner: View {
     @ObservedObject private var store = GlobalSettingsStore.shared
     @State private var isPresentingImportConfirmation = false
     @State private var isPresentingResetConfirmation = false
+    @State private var isPresentingReloadConfirmation = false
+    @State private var isPresentingRecreateConfirmation = false
     @State private var recoveryActionError: String?
 
     init(allowsSessionDismissal: Bool) {
@@ -63,6 +65,17 @@ struct GlobalSettingsPersistenceBlockBanner: View {
                         }
                         Button("Reset global settings…") { isPresentingResetConfirmation = true }
                             .buttonStyle(.borderless)
+                    case .writerBusy:
+                        Button("Try again") {
+                            recoveryActionError = store.retryBlockedPersistenceSave()
+                                ? nil
+                                : "Settings could not be saved. Check the warning and try again."
+                        }
+                    case .missingOnDisk:
+                        Button("Save current settings…") { isPresentingRecreateConfirmation = true }
+                        Button("Reload settings…") { isPresentingReloadConfirmation = true }
+                    case .changedOnDisk, .loadFailed:
+                        Button("Reload settings…") { isPresentingReloadConfirmation = true }
                     case .unsupportedFutureSchema:
                         Button("Reset global settings…") { isPresentingResetConfirmation = true }
                             .buttonStyle(.borderless)
@@ -99,6 +112,34 @@ struct GlobalSettingsPersistenceBlockBanner: View {
             .padding(.top, 6)
             .accessibilityElement(children: .contain)
             .confirmationDialog(
+                "Save current settings to a new file?",
+                isPresented: $isPresentingRecreateConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Save current settings") {
+                    recoveryActionError = store.recoverBlockedPersistenceAfterBackup()
+                        ? nil
+                        : "Settings could not be saved. If another process restored the file, reload it first."
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The settings file is missing. RepoPrompt will save your current in-memory settings to a new file only if the path is still empty. Existing backups will be kept.")
+            }
+            .confirmationDialog(
+                "Reload settings from disk?",
+                isPresented: $isPresentingReloadConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Reload settings") {
+                    recoveryActionError = store.reloadFromDisk()
+                        ? nil
+                        : "Settings could not be loaded. Your in-memory settings are unchanged. Check file access, then try again."
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Reloading replaces unsaved in-memory changes with the settings currently on disk. Existing settings will not be reset. If loading fails, your in-memory settings remain unchanged.")
+            }
+            .confirmationDialog(
                 "Import compatible settings?",
                 isPresented: $isPresentingImportConfirmation,
                 titleVisibility: .visible
@@ -111,7 +152,7 @@ struct GlobalSettingsPersistenceBlockBanner: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text(
-                    "RepoPrompt will move the current globalSettings.json to the Backups folder, then import the settings this build understands into a fresh current-schema file. Settings from the other schema that this build does not understand remain in the backup."
+                    "RepoPrompt will copy the current globalSettings.json to the Backups folder, then import the settings this build understands into a fresh current-schema file. Settings from the other schema that this build does not understand remain in the backup."
                 )
             }
             .confirmationDialog(
@@ -143,6 +184,8 @@ struct GlobalSettingsPersistenceBlockBanner: View {
             } else {
                 "If retrying after fixing permissions or disk space does not work, RepoPrompt can move the current globalSettings.json to the Backups folder and write your current in-memory settings to a fresh current-schema file. This cannot be undone."
             }
+        case .writerBusy, .changedOnDisk, .missingOnDisk, .loadFailed:
+            "Reload settings from disk before making further changes."
         case .unsupportedFutureSchema, .incompatibleSchema, .corruptUnrecoverable,
              .automaticSchemaNormalizationFailed:
             "The current globalSettings.json will be moved to the Backups folder and your current in-memory settings will be written to a fresh current-schema file. Your settings will then save normally. This cannot be undone."
@@ -163,6 +206,14 @@ struct GlobalSettingsPersistenceBlockBanner: View {
             } else {
                 "Global settings can't be saved: RepoPrompt couldn't write globalSettings.json. Check file permissions or available disk space, then try again."
             }
+        case .writerBusy:
+            "Another RepoPrompt CE process is updating global settings. Your changes are still in memory. Try saving again after that update finishes."
+        case .changedOnDisk:
+            "Global settings changed in another process. Reload the current settings before making further changes. Reloading replaces unsaved in-memory changes."
+        case .missingOnDisk:
+            "The global settings file is missing. Your current settings remain in memory. Save them to a new file, or restore the file and reload it."
+        case .loadFailed:
+            "Global settings could not be loaded safely. Changes are only in memory and cannot be saved. Check file access and reload settings; reloading replaces unsaved in-memory changes."
         case .automaticSchemaNormalizationFailed:
             "Global settings can't be saved: RepoPrompt identified a same-lineage schema v4 file that may only require schema v2, but couldn't safely verify, back up, and atomically normalize it. The original file is preserved. You can show the file or explicitly reset after a backup."
         }
