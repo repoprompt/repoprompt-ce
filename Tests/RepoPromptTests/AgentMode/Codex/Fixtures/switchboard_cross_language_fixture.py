@@ -15,7 +15,7 @@ import threading
 import time
 import types
 
-PINNED_SHA256 = "15dc53bd2ceee9156c41029d27b23948e67e104cceabbba30123eec7bff57dc8"
+PINNED_SHA256 = "4c3c266aa359d8be224943dbdc935b8b6f58e754e6c77f19f6fa574f89b31774"
 TOKENS = ("SYNTHETIC-CROSS-A-ONE", "SYNTHETIC-CROSS-A-TWO", "SYNTHETIC-CROSS-B-ONE")
 wire = sys.stdout
 captured = io.StringIO()
@@ -46,7 +46,7 @@ def emit(value):
 
 def run():
     source, expected_parent, directory, fault = sys.argv[1:]
-    if int(expected_parent) != os.getppid() or fault not in {"none", "refresh_identity", "hold_register", "hold_native_bind"}:
+    if int(expected_parent) != os.getppid() or fault not in {"none", "refresh_identity", "hold_register", "hold_native_bind", "hold_poll"}:
         raise RuntimeError("fixture_invalid")
     sys.addaudithook(audit)
     source_bytes = Path(source).read_bytes()
@@ -81,13 +81,14 @@ def run():
     runtime = bridge.Bridge(provider)
     registration_bound = threading.Event()
     release_registration = threading.Event()
-    if fault in {"hold_register", "hold_native_bind"}:
+    if fault in {"hold_register", "hold_native_bind", "hold_poll"}:
         original_handle = runtime.handle
 
         def gated_handle(request, peer, **kwargs):
             response = original_handle(request, peer, **kwargs)
-            if (request.get("op") == "register" and response.get("result") == {"registered": True}
-                    and (fault == "hold_register" or request.get("thread_id") is not None)):
+            if ((request.get("op") == "register" and response.get("result") == {"registered": True}
+                    and (fault == "hold_register" or (fault == "hold_native_bind" and request.get("thread_id") is not None)))
+                    or (fault == "hold_poll" and request.get("op") == "poll")):
                 registration_bound.set()
                 release_registration.wait(timeout=2.5)
             return response
@@ -96,6 +97,7 @@ def run():
         runtime.handle = gated_handle
     with bridge.Server(runtime, directory / "session.sock") as server:
         envelope = runtime.pair(bridge.process_peer(int(expected_parent)), str(server.path), server.peer)
+        capabilities = [envelope["capability"]]
         emit({"envelope": envelope, "source_pinned": True})
         for raw in sys.stdin.buffer:
             if len(raw) > 128:
@@ -104,7 +106,11 @@ def run():
             if set(command) != {"op"}:
                 raise RuntimeError("fixture_invalid")
             op = command["op"]
-            if op in {"queue_a", "queue_b"}:
+            if op == "pair_replacement":
+                replacement = runtime.pair(bridge.process_peer(int(expected_parent)), str(server.path), server.peer)
+                capabilities.append(replacement["capability"])
+                emit({"envelope": replacement})
+            elif op in {"queue_a", "queue_b"}:
                 emit(runtime.queue_account("a@example.invalid" if op == "queue_a" else "b@example.invalid"))
             elif op == "renew_a":
                 with lock:
@@ -124,7 +130,7 @@ def run():
                            "denied_operations": dict(denied), "logs_empty": captured.getvalue() == ""}
                 serialized = json.dumps(receipt)
                 receipt["redacted"] = all(secret not in serialized + captured.getvalue()
-                                          for secret in (*TOKENS, envelope["capability"], str(server.path)))
+                                          for secret in (*TOKENS, *capabilities, str(server.path)))
                 emit(receipt)
             elif op == "wait_registration":
                 emit({"bound": registration_bound.wait(timeout=2)})

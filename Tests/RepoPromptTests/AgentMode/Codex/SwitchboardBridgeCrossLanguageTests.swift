@@ -5,6 +5,57 @@ import XCTest
 /// Opt-in companion-repository acceptance. Production Swift client and Python
 /// server communicate over a real private socket; only the grant source is fake.
 final class SwitchboardBridgeCrossLanguageTests: XCTestCase {
+    func testActualServerRevokesCancelledPollWithoutCallerCleanup() async throws {
+        let fixture = try PythonFixture(fault: "hold_poll")
+        defer { fixture.finish() }
+        let client = try SwitchboardBridgeClient(pairing: fixture.pairing(), scope: SwitchboardBridgeTestData.scope())
+        try await client.register(threadID: "original-thread")
+        let polling = Task { try await client.poll(lastSeenRevision: 0) }
+        XCTAssertEqual(try fixture.command("wait_registration")["bound"] as? Bool, true)
+        polling.cancel()
+        XCTAssertEqual(try fixture.command("release_registration")["released"] as? Bool, true)
+        await assertError(.unavailable) { _ = try await polling.value }
+        let receipt = try fixture.command("status")
+        XCTAssertEqual(try fixture.status(receipt)["state"] as? String, "revoked")
+        XCTAssertEqual(try fixture.status(receipt)["switchable"] as? Bool, false)
+        XCTAssertEqual(try fixture.command("queue_a")["queued"] as? Int, 0)
+        XCTAssertEqual(receipt["redacted"] as? Bool, true)
+        XCTAssertEqual(receipt["logs_empty"] as? Bool, true)
+        await assertError(.revoked) { _ = try await client.poll(lastSeenRevision: 0) }
+    }
+
+    func testActualServerAllowsReplacementIssuedBeforeOldConsentRevocation() async throws {
+        let fixture = try PythonFixture()
+        defer { fixture.finish() }
+        let scope = SwitchboardBridgeTestData.scope()
+        let oldPairing = try fixture.pairing()
+        let old = SwitchboardBridgeClient(pairing: oldPairing, scope: scope)
+        try await old.register(threadID: scope.threadID)
+        let response = try fixture.command("pair_replacement")
+        let envelope = try XCTUnwrap(response["envelope"] as? [String: Any])
+        let replacementPairing = try SwitchboardPairingEnvelope.parse(JSONSerialization.data(withJSONObject: envelope))
+        let replacementScope = SwitchboardBridgeScope(
+            consentID: UUID(),
+            sessionID: scope.sessionID,
+            controllerGeneration: UUID(),
+            threadID: scope.threadID
+        )
+        await old.revoke()
+        let replacement = SwitchboardBridgeClient(pairing: replacementPairing, scope: replacementScope)
+        try await replacement.register(threadID: replacementScope.threadID)
+        XCTAssertEqual(try fixture.command("queue_a")["queued"] as? Int, 1)
+        let selected = try await replacement.poll(lastSeenRevision: 0)
+        XCTAssertEqual(selected?.accountID, "synthetic-cross-account-a")
+        let replayOld = SwitchboardBridgeClient(pairing: oldPairing, scope: scope)
+        await assertError(.revoked) { try await replayOld.register(threadID: scope.threadID) }
+        let receipt = try fixture.command("status")
+        let rows = try XCTUnwrap(receipt["status"] as? [[String: Any]])
+        XCTAssertEqual(rows.count(where: { $0["switchable"] as? Bool == true }), 1)
+        XCTAssertEqual(receipt["redacted"] as? Bool, true)
+        XCTAssertEqual(receipt["logs_empty"] as? Bool, true)
+        await replacement.revoke()
+    }
+
     func testActualServerRevokesCancelledRegistrationAndNativeBind() async throws {
         for variant in 0 ..< 3 {
             let fixture = try PythonFixture(fault: variant == 2 ? "hold_native_bind" : "hold_register")

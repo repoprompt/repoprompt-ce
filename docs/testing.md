@@ -59,11 +59,11 @@ canonical credential provider, coordinator, app UI, or a Codex backend.
 ### Frozen companion source
 
 The reviewed acceptance source is Switchboard commit
-`c3696726706b18642fdcee9763fc9aeb93b935d6`, file
+`2faf097b98cf60f21bfce041880b06ea0de7599d`, file
 `core/switchboard/repoprompt_bridge.py`, SHA-256:
 
 ```text
-15dc53bd2ceee9156c41029d27b23948e67e104cceabbba30123eec7bff57dc8
+4c3c266aa359d8be224943dbdc935b8b6f58e754e6c77f19f6fa574f89b31774
 ```
 
 The fixture hashes source bytes before compiling those exact bytes in memory.
@@ -121,6 +121,12 @@ account identity.
   registration is tested with both null and nonnull native IDs: the fixture
   pauses the real handler after binding and before acknowledgment, then checks
   that the settled registration is remotely revoked.
+- Canceled polling and canceled or late-expired registration replies revoke
+  the real server consent without a follow-up caller revoke. Initial null,
+  initial nonnull, and null-to-native registration cancellation are covered.
+- A replacement capability issued while the old consent is active can bind
+  the same session after old-consent revocation; only the replacement can
+  receive a queued grant, and replaying the old capability stays revoked.
 - Both directions use actual kernel peer identity checks and private Unix
   sockets. Pairing travels only over an anonymous parent/child pipe.
 - Public receipts and captured logs contain no capability, token, or socket
@@ -128,7 +134,7 @@ account identity.
   subprocess creation, and protected credential-file access; all counts must
   remain zero. It imports only the pinned bridge module and standard library.
 
-The registration pause calls the original production handler and preserves the
+The registration/poll pause calls the original production handler and preserves the
 server's normal handler/`response_current` check. It does not replace the wire
 parser, peer verification, authorization, or mutation rules.
 

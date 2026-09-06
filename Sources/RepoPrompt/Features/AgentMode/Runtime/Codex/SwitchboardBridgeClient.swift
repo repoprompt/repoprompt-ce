@@ -52,7 +52,7 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
         guard scope.threadID == nil || scope.threadID == threadID else { throw SwitchboardBridgeError.identityMismatch }
         if let threadID { try validateText(threadID) }
         guard let attemptedPairing = pairing else { throw SwitchboardBridgeError.revoked }
-        let result = try await request(op: "register", threadID: threadID)
+        let result = try await request(op: "register", threadID: threadID) { $0 }
         do {
             guard pairing != nil else { throw SwitchboardBridgeError.revoked }
             try result.requireKeys(["registered"])
@@ -74,11 +74,14 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
     func poll(lastSeenRevision: Int64) async throws -> CodexAccountAdoptionGrant? {
         try validateRevision(lastSeenRevision, allowZero: true)
         let lastSeen = max(lastSeenRevision, highestDeliveredRevision)
-        let result = try await request(op: "poll", additional: ["last_seen_revision": lastSeen])
-        try result.requireKeys(["selection"])
-        if result["selection"] == .null { return nil }
-        let grant = try SwitchboardBridgeWire.selection(result["selection"], now: now())
-        guard grant.revision > lastSeen else { throw SwitchboardBridgeError.staleRevision }
+        let selected = try await request(op: "poll", additional: ["last_seen_revision": lastSeen]) { result -> CodexAccountAdoptionGrant? in
+            try result.requireKeys(["selection"])
+            if result["selection"] == .null { return nil }
+            let grant = try SwitchboardBridgeWire.selection(result["selection"], now: now())
+            guard grant.revision > lastSeen else { throw SwitchboardBridgeError.staleRevision }
+            return grant
+        }
+        guard let grant = selected else { return nil }
         highestDeliveredRevision = grant.revision
         return grant
     }
@@ -86,21 +89,22 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
     func refresh(previousGrant: CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionGrant {
         try validateRevision(previousGrant.revision)
         try validateText(previousGrant.accountID)
-        let result = try await request(op: "refresh", additional: [
+        return try await request(op: "refresh", additional: [
             "adoption_id": previousGrant.adoptionID.uuidString.lowercased(),
             "expected_revision": previousGrant.revision,
             "previous_account_id": previousGrant.accountID
-        ])
-        try result.requireKeys(["selection"])
-        let grant = try SwitchboardBridgeWire.selection(result["selection"], now: now())
-        guard grant.selectionID == previousGrant.selectionID,
-              grant.adoptionID == previousGrant.adoptionID,
-              grant.revision == previousGrant.revision,
-              grant.accountID == previousGrant.accountID,
-              grant.email == previousGrant.email,
-              grant.accessToken != previousGrant.accessToken
-        else { throw SwitchboardBridgeError.identityMismatch }
-        return grant
+        ]) { result in
+            try result.requireKeys(["selection"])
+            let grant = try SwitchboardBridgeWire.selection(result["selection"], now: now())
+            guard grant.selectionID == previousGrant.selectionID,
+                  grant.adoptionID == previousGrant.adoptionID,
+                  grant.revision == previousGrant.revision,
+                  grant.accountID == previousGrant.accountID,
+                  grant.email == previousGrant.email,
+                  grant.accessToken != previousGrant.accessToken
+            else { throw SwitchboardBridgeError.identityMismatch }
+            return grant
+        }
     }
 
     func status(adoptionID: UUID, expectedRevision: Int64, state: String, reason: String) async throws {
@@ -112,12 +116,13 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
             "grant_expired", "bridge_unavailable", "mutation_unconfirmed", "revoked"
         ]
         guard states.contains(state), reasons.contains(reason) else { throw SwitchboardBridgeError.invalidRequest }
-        let result = try await request(op: "status", additional: [
+        try await request(op: "status", additional: [
             "adoption_id": adoptionID.uuidString.lowercased(), "expected_revision": expectedRevision,
             "state": state, "reason": reason
-        ])
-        try result.requireKeys(["accepted"])
-        guard result["accepted"] == .bool(true) else { throw SwitchboardBridgeError.invalidRequest }
+        ]) { result in
+            try result.requireKeys(["accepted"])
+            guard result["accepted"] == .bool(true) else { throw SwitchboardBridgeError.invalidRequest }
+        }
     }
 
     /// Local revocation takes effect before any suspension, including while a
@@ -142,7 +147,12 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
         }
     }
 
-    private func request(op: String, threadID: String? = nil, additional: [String: Any] = [:]) async throws -> [String: SwitchboardJSONValue] {
+    private func request<Result>(
+        op: String,
+        threadID: String? = nil,
+        additional: [String: Any] = [:],
+        decode: ([String: SwitchboardJSONValue]) throws -> Result
+    ) async throws -> Result {
         guard let pairing else { throw SwitchboardBridgeError.revoked }
         guard !inFlight else { throw SwitchboardBridgeError.unavailable }
         if !registered {
@@ -164,14 +174,16 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
             let response = try await exchange(pairing, data)
             guard self.pairing != nil, scope == pinnedScope else { throw SwitchboardBridgeError.revoked }
             try Task.checkCancellation()
-            return try SwitchboardBridgeWire.response(response, requestID: requestID)
+            return try decode(SwitchboardBridgeWire.response(response, requestID: requestID))
         } catch {
             let stable = self.pairing == nil ? .revoked : (error as? SwitchboardBridgeError ?? .unavailable)
             if op == "register" || [.unauthorized, .revoked, .unavailable, .invalidRequest].contains(stable) {
+                let needsCleanup = op == "register" || (registered && self.pairing != nil)
                 self.pairing = nil
-                // Cancellation, lost replies, and explicit revocation can all
-                // abandon a registration that completed on the server.
-                if op == "register" { await sendRevocation(pairing, threadID: nativeID) }
+                // Retain only this attempted scope for one raw best-effort
+                // cleanup exchange. Explicit revoke already owns cleanup,
+                // except registration may have completed a later native bind.
+                if needsCleanup { await sendRevocation(pairing, threadID: nativeID) }
             }
             throw stable
         }

@@ -2,6 +2,75 @@
 import XCTest
 
 final class SwitchboardBridgeClientTests: XCTestCase {
+    func testCancelledPollRevokesExactBindingOnlyOnce() async throws {
+        for explicitRevoke in [false, true] {
+            let server = StubBridge()
+            let scope = SwitchboardBridgeTestData.scope()
+            let client = try makeClient(server: server, scope: scope)
+            try await client.register(threadID: scope.threadID)
+            let gate = ExchangeGate()
+            await server.setGate(gate, operation: "poll")
+            let polling = Task { try await client.poll(lastSeenRevision: 0) }
+            await gate.waitUntilEntered()
+            if explicitRevoke { await client.revoke() }
+            polling.cancel()
+            await gate.release()
+            await assertError(explicitRevoke ? .revoked : .unavailable) { _ = try await polling.value }
+            let requests = await server.requests
+            let revocations = requests.filter { $0["op"] == .string("revoke") }
+            XCTAssertEqual(revocations.count, 1)
+            XCTAssertEqual(revocations.first?["thread_id"], scope.threadID.map(SwitchboardJSONValue.string))
+            XCTAssertEqual(revocations.first?["consent_id"], .string(scope.consentID.uuidString.lowercased()))
+            XCTAssertEqual(revocations.first?["session_id"], .string(scope.sessionID.uuidString.lowercased()))
+            XCTAssertEqual(revocations.first?["controller_generation"], .string(scope.controllerGeneration.uuidString.lowercased()))
+            await client.revoke()
+            await assertError(.revoked) { _ = try await client.poll(lastSeenRevision: 0) }
+        }
+    }
+
+    func testTerminalOperationFailuresRevokeButRecoverableErrorsKeepConsent() async throws {
+        for operation in ["poll", "refresh", "status"] {
+            for failure in ["transport", "malformed", "stale", "unavailable_grant"] {
+                let server = StubBridge()
+                let client = try makeClient(server: server)
+                try await client.register(threadID: "original-thread")
+                let previous = try SwitchboardBridgeWire.selection(.object(
+                    SwitchboardBridgeWire.decodeFrame(SwitchboardBridgeWire.encodeFrame(SwitchboardBridgeTestData.selection()))
+                ), now: SwitchboardBridgeTestData.now)
+                let expected: SwitchboardBridgeError
+                switch failure {
+                case "transport": expected = .unavailable
+                    await server.setError(SyntheticError.secret("synthetic-secret"))
+                case "malformed": expected = .invalidRequest
+                    await server.setMalformedOperation(operation)
+                case "stale": expected = .staleRevision
+                    await server.setError(expected)
+                default: expected = .grantUnavailable
+                    await server.setError(expected)
+                }
+                await assertError(expected) {
+                    switch operation {
+                    case "poll": _ = try await client.poll(lastSeenRevision: 0)
+                    case "refresh": _ = try await client.refresh(previousGrant: previous)
+                    default: try await client.status(adoptionID: previous.adoptionID, expectedRevision: 1, state: "applying", reason: "none")
+                    }
+                }
+                let requests = await server.requests
+                let terminal = failure == "transport" || failure == "malformed"
+                XCTAssertEqual(requests.count(where: { $0["op"] == .string("revoke") }), terminal ? 1 : 0)
+                await server.setError(nil)
+                await server.setMalformedOperation("")
+                await server.setSelection(nil)
+                if terminal {
+                    await assertError(.revoked) { _ = try await client.poll(lastSeenRevision: 0) }
+                } else {
+                    let selection = try await client.poll(lastSeenRevision: 0)
+                    XCTAssertNil(selection)
+                }
+            }
+        }
+    }
+
     func testCancelledRegistrationRevokesExactAttemptedBinding() async throws {
         for variant in 0 ..< 3 {
             let server = StubBridge()
@@ -191,11 +260,18 @@ final class SwitchboardBridgeClientTests: XCTestCase {
             ["account_id": " account-b"], ["selection_id": "INVALID"],
             ["unexpected": "value"]
         ] {
-            await server.setSelection(SwitchboardBridgeTestData.selection(revision: 2).merging(fields) { _, value in value })
+            // Every malformed case reaches decoding even if an earlier one
+            // terminally invalidated its own consent.
+            let malformedServer = StubBridge()
+            let malformedClient = try makeClient(server: malformedServer)
+            try await malformedClient.register(threadID: "original-thread")
+            await malformedServer.setSelection(SwitchboardBridgeTestData.selection(revision: 2).merging(fields) { _, value in value })
             do {
-                _ = try await client.poll(lastSeenRevision: 1)
+                _ = try await malformedClient.poll(lastSeenRevision: 1)
                 XCTFail("Malformed selection was released")
-            } catch {}
+            } catch {
+                XCTAssertNotEqual(error as? SwitchboardBridgeError, .revoked)
+            }
         }
     }
 
@@ -320,6 +396,11 @@ final class SwitchboardBridgeClientTests: XCTestCase {
         private var error: Error?
         private var gate: ExchangeGate?
         private var gatedOperation = ""
+        private var malformedOperation = ""
+
+        func setMalformedOperation(_ value: String) {
+            malformedOperation = value
+        }
 
         func setSelection(_ value: [String: Any]?) {
             selection = value
@@ -344,6 +425,9 @@ final class SwitchboardBridgeClientTests: XCTestCase {
             let op = try request.text("op")
             if op == gatedOperation { await gate?.suspend() }
             if let error { throw error }
+            if op == malformedOperation {
+                return try SwitchboardBridgeWire.encodeFrame(["v": 1, "id": request.text("id"), "result": ["unexpected": true]])
+            }
             let result: [String: Any]
             switch op {
             case "register": result = registrationResult
