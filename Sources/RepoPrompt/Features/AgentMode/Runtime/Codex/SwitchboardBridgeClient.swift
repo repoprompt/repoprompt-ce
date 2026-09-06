@@ -119,7 +119,10 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
         guard let previous = pairing else { return }
         pairing = nil
         guard registered else { return }
-        let threadID = scope.threadID
+        await sendRevocation(previous, threadID: scope.threadID)
+    }
+
+    private func sendRevocation(_ previous: SwitchboardPairingEnvelope, threadID: String?) async {
         let requestID = UUID()
         do {
             let data = try makeRequest(op: "revoke", requestID: requestID, pairing: previous, threadID: threadID, additional: [:])
@@ -155,12 +158,17 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
             guard self.pairing != nil, scope == pinnedScope else { throw SwitchboardBridgeError.revoked }
             try Task.checkCancellation()
             return try SwitchboardBridgeWire.response(response, requestID: requestID)
-        } catch let error as SwitchboardBridgeError {
-            if [.unauthorized, .revoked, .unavailable, .invalidRequest].contains(error) { self.pairing = nil }
-            throw error
         } catch {
-            self.pairing = nil
-            throw SwitchboardBridgeError.unavailable
+            if self.pairing == nil {
+                // A first registration (or native bind) can complete remotely
+                // after local revocation. Retire that exact late binding before
+                // releasing this operation; never restore local consent.
+                if op == "register" { await sendRevocation(pairing, threadID: nativeID) }
+                throw SwitchboardBridgeError.revoked
+            }
+            let stable = error as? SwitchboardBridgeError ?? .unavailable
+            if [.unauthorized, .revoked, .unavailable, .invalidRequest].contains(stable) { self.pairing = nil }
+            throw stable
         }
     }
 

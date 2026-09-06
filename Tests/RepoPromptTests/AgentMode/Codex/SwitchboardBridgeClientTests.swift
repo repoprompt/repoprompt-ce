@@ -2,6 +2,29 @@
 import XCTest
 
 final class SwitchboardBridgeClientTests: XCTestCase {
+    func testRevocationDuringRegistrationCleansUpExactLateBinding() async throws {
+        for variant in 0 ..< 3 {
+            let server = StubBridge()
+            let scope = SwitchboardBridgeTestData.scope(threadID: nil)
+            let client = try makeClient(server: server, scope: scope)
+            if variant == 2 { try await client.register(threadID: nil) }
+            let gate = ExchangeGate()
+            await server.setGate(gate, operation: "register")
+            let nativeID: String? = variant == 0 ? nil : "late-bound-thread"
+            let registration = Task { try await client.register(threadID: nativeID) }
+            await gate.waitUntilEntered()
+            await client.revoke()
+            await assertError(.revoked) { _ = try await client.poll(lastSeenRevision: 0) }
+            await gate.release()
+            await assertError(.revoked) { try await registration.value }
+            let requests = await server.requests
+            XCTAssertEqual(requests.count, variant == 2 ? 4 : 2)
+            XCTAssertEqual(requests.last?["op"], .string("revoke"))
+            XCTAssertEqual(requests.last?["thread_id"], nativeID.map(SwitchboardJSONValue.string) ?? .null)
+            XCTAssertEqual(requests.last?["controller_generation"], .string(scope.controllerGeneration.uuidString.lowercased()))
+        }
+    }
+
     func testRevokingRegisteredNullThreadNotifiesBridgeWithoutBindingThread() async throws {
         let server = StubBridge()
         let scope = SwitchboardBridgeTestData.scope(threadID: nil)
