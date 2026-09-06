@@ -49,6 +49,102 @@ make dev-provider-test
 
 A focused green run is evidence for the named contract, not a substitute for full-suite or CI coverage when the changed boundary is broad. The hosted root-test workflow discovers one current root XCTest population through `swift test list`, counts methods per suite, assigns every discovered suite to one of four deterministic method-count-weighted LPT shards, and executes each suite in its own XCTest process. Root CI has no contract/integration tier split or contributor-maintained registry; provider-package tests remain a separate lane.
 
+## Synthetic Swift/Python bridge acceptance
+
+This lane runs the production `SwitchboardBridgeClient` and Unix transport
+against the production Python `Bridge` and `Server`. Only the canonical grant
+source is injected with synthetic values. It does not instantiate the Vault,
+canonical credential provider, coordinator, app UI, or a Codex backend.
+
+### Frozen companion source
+
+The reviewed acceptance source is Switchboard commit
+`c3696726706b18642fdcee9763fc9aeb93b935d6`, file
+`core/switchboard/repoprompt_bridge.py`, SHA-256:
+
+```text
+15dc53bd2ceee9156c41029d27b23948e67e104cceabbba30123eec7bff57dc8
+```
+
+The fixture hashes source bytes before compiling those exact bytes in memory.
+It does not use neighboring Python bytecode caches. A different source fails
+closed; update the pin only with a reviewed companion revision.
+
+### Run through Conductor
+
+Create the ignored file
+`.build/validation-artifacts/switchboard-cross-language/config.json` in the
+checkout being tested:
+
+```json
+{"source":"/absolute/path/to/pinned/repoprompt_bridge.py","fault":"none"}
+```
+
+Use an immutable snapshot when another agent is editing the companion checkout.
+The file contains a source path and fixture mode only; never put pairing
+envelopes, capabilities, or grants in it. This explicit file avoids modifying
+Conductor's environment allowlist. Without it, these acceptance tests report
+`XCTSkip`; a skipped lane is not acceptance evidence.
+
+```bash
+./conductor test --filter SwitchboardBridgeCrossLanguageTests
+```
+
+Use the task's documented Xcode/public-dependency wrapper environment when
+required by its build setup. Conductor retains the normal shared heavy slot;
+there is no standalone Swift compile or app launch.
+
+For the negative control, change only `fault` to `refresh_identity`, then run:
+
+```bash
+./conductor test --filter SwitchboardBridgeCrossLanguageTests.testActualPythonServerPreservesAppliedRefreshWhileNewerAccountWaits
+```
+
+That run must fail with the stable identity-mismatch refusal at refresh. Restore
+`fault` to `none` for acceptance. The success assertions are identical in both
+runs; the negative control changes only the synthetic provider's returned
+account identity.
+
+### What is exercised
+
+- Null registration does not advertise a switchable session or read a grant.
+  A second registration binds the exact native thread.
+- Explicit account A selection is polled and acknowledged through
+  `applying` and `applied_unverified`; it is not redelivered.
+- Account B receives revision 2 and remains waiting while refresh returns the
+  exact applied A identity, adoption/selection IDs, and revision 1.
+- Stale A status cannot overwrite B's waiting state. A cached, unrenewed token
+  cannot be returned as a fresh grant.
+- Reusing a capability for a different scope is refused. Revocation is enforced
+  by the real server and then by the local client.
+- A registered null thread can be revoked. Revocation racing the first
+  registration is tested with both null and nonnull native IDs: the fixture
+  pauses the real handler after binding and before acknowledgment, then checks
+  that the settled registration is remotely revoked.
+- Both directions use actual kernel peer identity checks and private Unix
+  sockets. Pairing travels only over an anonymous parent/child pipe.
+- Public receipts and captured logs contain no capability, token, or socket
+  path. The isolated Python process denies and counts non-Unix sockets,
+  subprocess creation, and protected credential-file access; all counts must
+  remain zero. It imports only the pinned bridge module and standard library.
+
+The registration pause calls the original production handler and preserves the
+server's normal handler/`response_current` check. It does not replace the wire
+parser, peer verification, authorization, or mutation rules.
+
+Every Python process and temporary socket belongs to this test. The fixture
+captures unexpected output, uses bounded pipe reads, and shuts down its owned
+child at teardown. No secret fixture artifact is written to disk.
+
+### Evidence limits
+
+The test sends bridge status acknowledgments directly. It proves wire agreement
+and consent/revision behavior, not that RepoPrompt's native runtime installed a
+credential or made a provider request. It cannot certify the installed apps,
+runtime transport identity, OAuth renewal, real account switching, or preserved
+conversation context in an actual backend. Those require separate integration
+evidence.
+
 ## Codemap-sensitive changes
 
 Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.
