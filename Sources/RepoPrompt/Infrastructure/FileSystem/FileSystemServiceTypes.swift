@@ -246,6 +246,7 @@ enum FileSystemError: Error {
     case fileAlreadyExists
     case fileNotFound
     case failedToCreateFile(Error)
+    case incompleteFileCreation(path: String, underlying: Error)
     case failedToEditFile(Error)
     case failedToDeleteFile(Error)
     case failedToReadFile
@@ -261,6 +262,14 @@ enum FileSystemError: Error {
 extension FileSystemError: LocalizedError {
     var errorDescription: String? {
         switch self {
+        case .fileAlreadyExists:
+            "The destination file already exists."
+        case let .failedToCreateFile(error):
+            "File creation failed: \(error.localizedDescription)"
+        case let .incompleteFileCreation(path, underlying):
+            "File creation failed after exclusively claiming '\(path)'; incomplete output may remain at that path. Inspect it before retrying and do not blindly retry. Underlying error: \(underlying.localizedDescription)"
+        case .isDirectory:
+            "The destination path is a directory."
         case .invalidRelativePath:
             "Unsafe workspace mutation path: target escapes the loaded root, contains traversal, or uses a symbolic-link component."
         case .mutationInProgress:
