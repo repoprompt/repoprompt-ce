@@ -429,15 +429,16 @@ import XCTest
                 "Expected a bounded deletion failure, got \(deletion)"
             )
 
-            let retryClaim = coordinator.claimDeletion(workspaceIDs: [created.id])
-            XCTAssertTrue(retryClaim.lease.workspaceIDs.contains(created.id))
-            coordinator.releaseDeletion(retryClaim.lease)
-
             await manager.finishWorkspaceCreation(workspaceIDs: [created.id])
             let authoritativeAfterCreation = await runtime.workspaceStore.snapshot()
             XCTAssertTrue(authoritativeAfterCreation.workspaces.contains {
                 $0.document.workspaceID == created.id
             })
+            let retry = await manager.deleteWorkspacesAsync(
+                workspaceIDs: [created.id],
+                closeOpenWorkspaces: true
+            )
+            XCTAssertEqual(retry.deletedWorkspaceIDs, [created.id], "The timed-out claim must permit a confirmed retry")
         }
 
         func testConfirmedDeleteTimeoutCannotCloseAWorkspaceAfterLateSessionCancellation() async throws {
@@ -527,7 +528,7 @@ import XCTest
             let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
             let activation = await manager.switchWorkspace(to: targetInManager, saveState: false)
             XCTAssertTrue(activation.didSwitch, "Expected the deletion target to be active")
-            let fallback = try XCTUnwrap(manager.workspaces.first(where: { $0.isSystemWorkspace }))
+            let fallback = manager.getOrCreateSystemWorkspace()
 
             var publishedWorkspaceIDs: [UUID] = []
             let listenerToken = manager.addWorkspaceDidSwitchListener(label: "late-fallback-test") { workspace in

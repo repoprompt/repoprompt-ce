@@ -40,6 +40,18 @@ package struct DomainWorkspaceStore {
         ) async {
             await authority.testSetBeforeExternalReconciliation(hook)
         }
+
+        package func testSetBeforeWorkingPersistence(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await authority.testSetBeforeWorkingPersistence(hook)
+        }
+
+        package func testSetBeforeSavedPersistence(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) async {
+            await authority.testSetBeforeSavedPersistence(hook)
+        }
     #endif
 
     /// Registers the app's current in-memory document as an awaited read authority.
@@ -132,6 +144,8 @@ actor DomainWorkspaceContextAuthority {
 
     #if DEBUG
         private var testBeforeExternalReconciliation: (@Sendable (UUID) async -> Void)?
+        private var testBeforeWorkingPersistence: (@Sendable (UUID) async -> Void)?
+        private var testBeforeSavedPersistence: (@Sendable (UUID) async -> Void)?
     #endif
 
     private enum DirtyExternalRebaseResult {
@@ -526,7 +540,7 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: makeSnapshot(record))
             }
-            if (prior.disposition == .applied || prior.disposition == .unchanged),
+            if prior.disposition == .applied || prior.disposition == .unchanged,
                case let .createWorkspace(document) = envelope.command
             {
                 do {
@@ -558,7 +572,7 @@ actor DomainWorkspaceContextAuthority {
             guard prior.fingerprint == fingerprint else {
                 return collisionOutcome(envelope.operationID, workspace: nil)
             }
-            if (prior.disposition == .applied || prior.disposition == .unchanged),
+            if prior.disposition == .applied || prior.disposition == .unchanged,
                case let .createWorkspace(document) = envelope.command
             {
                 do {
@@ -865,6 +879,18 @@ actor DomainWorkspaceContextAuthority {
             _ hook: (@Sendable (UUID) async -> Void)?
         ) {
             testBeforeExternalReconciliation = hook
+        }
+
+        func testSetBeforeWorkingPersistence(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) {
+            testBeforeWorkingPersistence = hook
+        }
+
+        func testSetBeforeSavedPersistence(
+            _ hook: (@Sendable (UUID) async -> Void)?
+        ) {
+            testBeforeSavedPersistence = hook
         }
     #endif
 
@@ -1572,6 +1598,9 @@ actor DomainWorkspaceContextAuthority {
                 && envelope.conflictRecoveryPolicy != .failClosed
             let persisted: DomainPersistenceWorkingCommit
             do {
+                #if DEBUG
+                    await testBeforeWorkingPersistence?(document.workspaceID)
+                #endif
                 persisted = try await persistence.persistWorking(
                     document: document,
                     expectedRevision: before.workingRevision,
@@ -1721,6 +1750,9 @@ actor DomainWorkspaceContextAuthority {
         let recorded = DomainRecordedOperation(fingerprint: fingerprint, recordedAt: Date(), outcome: provisional)
         let operations = record.operations + [recorded]
         do {
+            #if DEBUG
+                await testBeforeSavedPersistence?(workspaceID)
+            #endif
             let saved = try await persistence.persistSaved(
                 document: record.document,
                 expectedWorkingRevision: before.workingRevision,
@@ -2451,7 +2483,7 @@ private extension DomainWorkspaceCommandEnvelope {
         case let .replaceWorkingDocument(document): document.workspaceID
         case let .saveWorkspaceDocument(workspaceID): workspaceID
         case let .deleteWorkspace(workspaceID): workspaceID
-            case let .resolveExternalConflict(workspaceID, _, _): workspaceID
+        case let .resolveExternalConflict(workspaceID, _, _): workspaceID
         }
     }
 }

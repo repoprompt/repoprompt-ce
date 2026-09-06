@@ -663,6 +663,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ tabIDs: Set<UUID>,
         _ workspace: WorkspaceModel
     ) async -> [UUID: Error]
+    typealias AgentSessionDeleter = @MainActor (
+        _ sessionID: UUID,
+        _ workspace: WorkspaceModel
+    ) async throws -> Void
 
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
@@ -680,6 +684,58 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var agentSessionsBatchDeleter: AgentSessionsBatchDeleter = { tabIDs, workspace in
         await AgentSessionDataService.shared.deleteAgentSessions(forComposeTabIDs: tabIDs, for: workspace)
     }
+
+    private var agentSessionDeleter: AgentSessionDeleter = { sessionID, workspace in
+        try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: workspace)
+    }
+
+    private enum NormalizedMCPSessionSelector {
+        case exact(tabID: UUID, sessionID: UUID)
+        case session(UUID)
+        case tab(tabID: UUID, sessionID: UUID?, createsBinding: Bool)
+        case fresh(UUID)
+
+        var intendedSessionID: UUID? {
+            switch self {
+            case let .exact(_, sessionID), let .session(sessionID), let .fresh(sessionID):
+                sessionID
+            case let .tab(_, sessionID, _):
+                sessionID
+            }
+        }
+    }
+
+    private struct PendingMCPSessionTargetDiscard {
+        let target: MCPSessionTarget
+        let provisionalIndexEntry: AgentSessionIndexEntry?
+        var worktreeOwnershipToken: WorkspaceSessionWorktreeOwnershipToken?
+        var attempt: (id: UUID, task: Task<MCPSessionTargetDiscardResult, Never>)?
+        var automaticRetryStarted = false
+    }
+
+    private struct ProvisionalRuntimeTargetIdentity {
+        let sessionObjectIdentifier: ObjectIdentifier
+        let lifecycleIdentity: AgentSessionLifecycleAuthority.Identity
+    }
+
+    private struct MCPSessionTargetDiscardAuthority {
+        let authorityID: UUID
+        let workspaceID: UUID?
+    }
+
+    /// The registry, rather than an MCP request stack, owns recovery after durable admission.
+    /// One outcome-driven retry handles transient settlement without polling; later explicit
+    /// discard attempts can resume a responsibility that remains nonterminal.
+    private var pendingMCPSessionTargetDiscards: [UUID: PendingMCPSessionTargetDiscard] = [:]
+    /// A claim-bearing target owns its recovery boundary from resolution until acceptance or
+    /// terminal discard, including the interval before cleanup is registered.
+    private var outstandingProvisionalMCPSessionTargets: [UUID: MCPSessionTarget] = [:]
+    /// A newer same-session target cannot become provider-visible until cleanup holding an older
+    /// authority has crossed every suspension point where it could still mutate session state.
+    private var mcpSessionTargetDiscardAuthorityBySessionID: [UUID: MCPSessionTargetDiscardAuthority] = [:]
+    private var retiringMCPSessionTargetDiscardSessionIDByRecoveryID: [UUID: UUID] = [:]
+    private var bindingOnlyMCPSessionTargetRecoveryIDs: Set<UUID> = []
+    private var provisionalRuntimeTargetIdentityByRecoveryID: [UUID: ProvisionalRuntimeTargetIdentity] = [:]
 
     let sidebarAutoArchivePolicy = AgentModeSidebarAutoArchivePolicy()
     private var initialSystemWorkspaceSessionListRefreshDeferralReason: String?
@@ -710,7 +766,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_sidebarListProjectionBuildCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
+        private var test_afterExplicitTabSessionReady: (@MainActor () async -> Void)?
+        private var test_afterProvisionalExistingTabBindingInstalled: (@MainActor () async -> Void)?
+        private var test_afterDurableExplicitTabSessionBinding: (@MainActor () async -> Void)?
+        var test_afterMCPControlActivation: (@MainActor (TabSession) async -> Void)?
+        var test_beforeMCPSelectionCommit: (@MainActor () async -> Void)?
         private var test_composeTabRemovalTeardownObserver: (@MainActor (UUID) async -> Void)?
+        private var test_beforeAutomaticMCPSessionTargetDiscardRetry: (@MainActor () async -> Void)?
+        private var test_beforeMCPSessionTargetDiscardAuthorityEstablishment: (@MainActor (UUID) async -> Void)?
+        private var test_afterMCPSessionTargetDiscardRetired: (@MainActor (UUID) async -> Void)?
+        private var test_afterMCPPersistedSessionResolution: (@MainActor (UUID) async -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?,
@@ -760,8 +825,70 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
+        func test_setAgentSessionDeleter(_ deleter: @escaping AgentSessionDeleter) {
+            agentSessionDeleter = deleter
+        }
+
         func test_setComposeTabRemovalTeardownObserver(_ observer: @escaping @MainActor (UUID) async -> Void) {
             test_composeTabRemovalTeardownObserver = observer
+        }
+
+        func test_setBeforeAutomaticMCPSessionTargetDiscardRetry(
+            _ observer: (@MainActor () async -> Void)?
+        ) {
+            test_beforeAutomaticMCPSessionTargetDiscardRetry = observer
+        }
+
+        func test_setBeforeMCPSessionTargetDiscardAuthorityEstablishment(
+            _ observer: (@MainActor (UUID) async -> Void)?
+        ) {
+            test_beforeMCPSessionTargetDiscardAuthorityEstablishment = observer
+        }
+
+        func test_setAfterMCPSessionTargetDiscardRetired(
+            _ observer: (@MainActor (UUID) async -> Void)?
+        ) {
+            test_afterMCPSessionTargetDiscardRetired = observer
+        }
+
+        func test_setAfterMCPPersistedSessionResolution(
+            _ observer: (@MainActor (UUID) async -> Void)?
+        ) {
+            test_afterMCPPersistedSessionResolution = observer
+        }
+
+        func test_installMCPSessionTargetDiscardAuthority(
+            _ discardAuthorityID: UUID,
+            sessionID: UUID
+        ) {
+            mcpSessionTargetDiscardAuthorityBySessionID[sessionID] = MCPSessionTargetDiscardAuthority(
+                authorityID: discardAuthorityID,
+                workspaceID: nil
+            )
+        }
+
+        var test_pendingMCPSessionTargetDiscardCount: Int {
+            pendingMCPSessionTargetDiscards.count
+        }
+
+        var test_outstandingProvisionalMCPSessionTargetCount: Int {
+            outstandingProvisionalMCPSessionTargets.count
+        }
+
+        var test_provisionalRuntimeTargetIdentityCount: Int {
+            provisionalRuntimeTargetIdentityByRecoveryID.count
+        }
+
+        func test_outstandingProvisionalMCPSessionTarget(
+            sessionID: UUID
+        ) -> MCPSessionTarget? {
+            outstandingProvisionalMCPSessionTargets.values.first {
+                $0.sessionID == sessionID
+            }
+        }
+
+        func test_registerOutstandingProvisionalMCPSessionTarget(_ target: MCPSessionTarget) {
+            registerOutstandingProvisionalMCPSessionTarget(target)
         }
 
         var test_codexCoordinator: CodexAgentModeCoordinator {
@@ -823,6 +950,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             test_afterDurableChildTabCreation = hook
         }
 
+        func test_setAfterExplicitTabSessionReady(_ hook: (@MainActor () async -> Void)?) {
+            test_afterExplicitTabSessionReady = hook
+        }
+
+        func test_setAfterProvisionalExistingTabBindingInstalled(_ hook: (@MainActor () async -> Void)?) {
+            test_afterProvisionalExistingTabBindingInstalled = hook
+        }
+
+        func test_setAfterDurableExplicitTabSessionBinding(_ hook: (@MainActor () async -> Void)?) {
+            test_afterDurableExplicitTabSessionBinding = hook
+        }
+
         func test_setTerminalPublicationOverride(
             _ hook: ((
                 AgentRunTerminalCommitRevision,
@@ -867,15 +1006,48 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_installPersistentSessionBinding(
             sessionID: UUID?,
-            on session: TabSession,
-            updateWorkspaceMetadata: Bool = false
+            on session: TabSession
         ) -> AgentPersistentSessionBindingIdentity? {
             installPersistentSessionBinding(
                 sessionID: sessionID,
                 on: session,
-                updateWorkspaceMetadata: updateWorkspaceMetadata,
+                mutationTarget: .runtimeOnly,
                 invalidateAsyncWork: true
             )
+        }
+
+        func test_installPersistentSessionBinding(
+            sessionID: UUID?,
+            on session: TabSession,
+            compareAndSetInWorkspaceID workspaceID: UUID
+        ) -> AgentPersistentSessionBindingIdentity? {
+            installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session,
+                mutationTarget: .compareAndSet(workspaceID: workspaceID),
+                invalidateAsyncWork: true
+            )
+        }
+
+        func test_installPersistentSessionBinding(
+            sessionID: UUID?,
+            on session: TabSession,
+            updateWorkspaceMetadata: Bool
+        ) -> AgentPersistentSessionBindingIdentity? {
+            if updateWorkspaceMetadata {
+                installPersistentSessionBindingUpdatingInferredWorkspace(
+                    sessionID: sessionID,
+                    on: session,
+                    invalidateAsyncWork: true
+                )
+            } else {
+                installPersistentSessionBinding(
+                    sessionID: sessionID,
+                    on: session,
+                    mutationTarget: .runtimeOnly,
+                    invalidateAsyncWork: true
+                )
+            }
         }
 
         func test_ensureSessionBoundToTab(_ session: TabSession) -> UUID? {
@@ -2921,6 +3093,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             .init(tabID: target.tabID, identity: identity),
             intent: .providerStart
         )
+        if let recoveryClaim = target.recoveryClaim {
+            guard outstandingProvisionalMCPSessionTargetMatches(target),
+                  recoveryClaim.state == .provisional,
+                  mcpSessionTargetDiscardAuthorityIsCurrent(target),
+                  pendingMCPSessionTargetDiscards[recoveryClaim.identity.recoveryID] == nil,
+                  retiringMCPSessionTargetDiscardSessionIDByRecoveryID[
+                      recoveryClaim.identity.recoveryID
+                  ] == nil
+            else {
+                throw MCPError.invalidParams(
+                    "The Agent session recovery claim changed before provider dispatch."
+                )
+            }
+        } else {
+            try requireSettledClaimlessMCPSessionTarget(target, discardAuthorityID: nil)
+        }
     }
 
     private func installPromptManagerCascadeResolvers(_ promptManager: PromptViewModel) {
@@ -3862,7 +4050,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             _ = installPersistentSessionBinding(
                 sessionID: explicitSessionID,
                 on: session,
-                updateWorkspaceMetadata: false,
+                mutationTarget: .runtimeOnly,
                 invalidateAsyncWork: false
             )
         }
@@ -3890,7 +4078,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             _ = installPersistentSessionBinding(
                 sessionID: explicitSessionID,
                 on: newSession,
-                updateWorkspaceMetadata: false,
+                mutationTarget: .runtimeOnly,
                 invalidateAsyncWork: false
             )
         }
@@ -4100,6 +4288,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshSessionListCache(for: workspace, owner: token.owner)
     }
 
+    private enum PersistentSessionBindingMutationTarget {
+        case runtimeOnly
+        case compareAndSet(workspaceID: UUID)
+    }
+
     /// Single mutation path for the runtime binding between a compose tab and a
     /// persistent Agent session. Workspace metadata mirrors this identity but is
     /// never used as a generation source.
@@ -4107,7 +4300,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func installPersistentSessionBinding(
         sessionID: UUID?,
         on session: TabSession,
-        updateWorkspaceMetadata: Bool,
+        mutationTarget: PersistentSessionBindingMutationTarget,
         invalidateAsyncWork: Bool
     ) -> AgentPersistentSessionBindingIdentity? {
         if session.activeAgentSessionID == sessionID {
@@ -4115,10 +4308,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         let previousSessionID = session.activeAgentSessionID
-        if updateWorkspaceMetadata, let workspaceManager {
-            let workspaceID = workspaceManager.activeWorkspaceID
-                ?? sessionIndexOwner?.workspaceID
-                ?? lastKnownWorkspaceSnapshot?.id
+        switch mutationTarget {
+        case .runtimeOnly:
+            break
+        case let .compareAndSet(workspaceID):
+            guard let workspaceManager else { return nil }
             let currentWorkspaceSessionID = workspaceManager.activeAgentSessionID(
                 forTabID: session.tabID,
                 inWorkspaceID: workspaceID
@@ -4170,6 +4364,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             publishLoadingTranscriptPresentation(tabID: session.tabID)
         }
         #if DEBUG
+            let workspaceMetadataUpdated = switch mutationTarget {
+            case .runtimeOnly: false
+            case .compareAndSet: true
+            }
             AgentModePerfDiagnostics.event(
                 "agentSessionBinding.mutated",
                 tabID: session.tabID,
@@ -4177,11 +4375,42 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "sessionID": sessionID?.uuidString ?? "nil",
                     "bindingGeneration": binding?.generation.uuidString ?? "nil",
                     "transitionGeneration": String(session.bindingTransitionGeneration),
-                    "workspaceMetadataUpdated": String(updateWorkspaceMetadata)
+                    "workspaceMetadataUpdated": String(workspaceMetadataUpdated)
                 ]
             )
         #endif
         return binding
+    }
+
+    @discardableResult
+    private func installPersistentSessionBindingUpdatingInferredWorkspace(
+        sessionID: UUID?,
+        on session: TabSession,
+        invalidateAsyncWork: Bool
+    ) -> AgentPersistentSessionBindingIdentity? {
+        guard let workspaceManager else {
+            return installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session,
+                mutationTarget: .runtimeOnly,
+                invalidateAsyncWork: invalidateAsyncWork
+            )
+        }
+
+        let workspaceID = workspaceManager.activeWorkspaceID
+            ?? sessionIndexOwner?.workspaceID
+            ?? lastKnownWorkspaceSnapshot?.id
+            ?? workspaceManager.workspaces.first(where: { workspace in
+                workspace.composeTabs.contains(where: { $0.id == session.tabID })
+                    || workspace.stashedTabs.contains(where: { $0.tab.id == session.tabID })
+            })?.id
+        guard let workspaceID else { return nil }
+        return installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            mutationTarget: .compareAndSet(workspaceID: workspaceID),
+            invalidateAsyncWork: invalidateAsyncWork
+        )
     }
 
     private func postAgentSessionBindingDidChange(
@@ -4208,10 +4437,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return existing
         }
         let created = UUID()
-        return installPersistentSessionBinding(
+        return installPersistentSessionBindingUpdatingInferredWorkspace(
             sessionID: created,
             on: session,
-            updateWorkspaceMetadata: true,
             invalidateAsyncWork: true
         )?.sessionID
     }
@@ -4279,7 +4507,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func persistentBindingResolution(
         for sessionID: UUID,
-        using snapshot: PersistentBindingResolutionSnapshot
+        using snapshot: PersistentBindingResolutionSnapshot,
+        includeIndexFallback: Bool = true
     ) -> PersistentBindingResolution {
         let authoritativeCandidates = snapshot.claimedTabIDsBySessionID[sessionID] ?? []
         let conflictingTabIDs = snapshot.conflictingTabIDsBySessionID[sessionID] ?? []
@@ -4301,7 +4530,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let tabID = authoritativeCandidates.first {
             return .unique(tabID: tabID)
         }
-        if let indexedTabID = snapshot.indexedTabIDBySessionID[sessionID],
+        if includeIndexFallback,
+           let indexedTabID = snapshot.indexedTabIDBySessionID[sessionID],
            snapshot.composeTabIDs.contains(indexedTabID),
            snapshot.liveClaimsByTabID[indexedTabID] == nil,
            snapshot.workspaceClaimsByTabID[indexedTabID]?.isEmpty != false
@@ -4311,10 +4541,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return .notFound
     }
 
-    private func persistentBindingResolution(for sessionID: UUID) -> PersistentBindingResolution {
+    private func persistentBindingResolution(
+        for sessionID: UUID,
+        includeIndexFallback: Bool = true
+    ) -> PersistentBindingResolution {
         persistentBindingResolution(
             for: sessionID,
-            using: makePersistentBindingResolutionSnapshot()
+            using: makePersistentBindingResolutionSnapshot(),
+            includeIndexFallback: includeIndexFallback
         )
     }
 
@@ -4461,10 +4695,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         if let sourceSession, sourceSession !== targetSession {
-            _ = installPersistentSessionBinding(
+            _ = installPersistentSessionBindingUpdatingInferredWorkspace(
                 sessionID: nil,
                 on: sourceSession,
-                updateWorkspaceMetadata: true,
                 invalidateAsyncWork: true
             )
             guard sourceSession.activeAgentSessionID == nil else {
@@ -4478,17 +4711,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if requiresHydration {
             targetSession.hasLoadedPersistedState = false
         }
-        guard let binding = installPersistentSessionBinding(
+        guard let binding = installPersistentSessionBindingUpdatingInferredWorkspace(
             sessionID: requestedSessionID,
             on: targetSession,
-            updateWorkspaceMetadata: true,
             invalidateAsyncWork: true
         ), binding.sessionID == requestedSessionID else {
             if let sourceSession, sourceSession !== targetSession {
-                _ = installPersistentSessionBinding(
+                _ = installPersistentSessionBindingUpdatingInferredWorkspace(
                     sessionID: requestedSessionID,
                     on: sourceSession,
-                    updateWorkspaceMetadata: true,
                     invalidateAsyncWork: true
                 )
             }
@@ -6322,19 +6553,76 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let parsedUUID = UUID(uuidString: trimmed) else { return nil }
 
         // Check live sessions
-        if sessions.values.contains(where: { $0.activeAgentSessionID == parsedUUID }) {
-            return parsedUUID
+        if let liveSession = sessions.values.first(where: { $0.activeAgentSessionID == parsedUUID }) {
+            if liveSession.mcpControlContext?.sessionID == parsedUUID
+                || workspace.composeTabs.contains(where: {
+                    $0.id == liveSession.tabID && $0.activeAgentSessionID == parsedUUID
+                })
+            {
+                return parsedUUID
+            }
         }
         // Check workspace compose tabs
         if workspace.composeTabs.contains(where: { $0.activeAgentSessionID == parsedUUID }) {
             return parsedUUID
         }
         // Check session index
-        if ownerValidatedSessionIndex[parsedUUID] != nil {
+        if ownerValidatedSessionIndex[parsedUUID] != nil,
+           sessionIndexStore.sessionIndexOwner?.workspaceID == workspace.id
+        {
             return parsedUUID
         }
         // Fall back to persisted
-        return try await AgentSessionDataService.shared.resolveAgentSessionID(reference: trimmed, for: workspace)
+        let resolved = try await AgentSessionDataService.shared.resolveAgentSessionID(
+            reference: trimmed,
+            for: workspace
+        )
+        #if DEBUG
+            await test_afterMCPPersistedSessionResolution?(workspace.id)
+        #endif
+        guard workspaceManager?.activeWorkspaceID == workspace.id else {
+            throw MCPError.invalidParams(
+                "The active workspace changed while the Agent session reference was resolved."
+            )
+        }
+        return resolved
+    }
+
+    func requireCurrentMCPWorkspaceTarget(
+        _ target: MCPSessionTarget,
+        expectedWorkspaceID: UUID,
+        allowMatchingControlledSession: Bool = false
+    ) throws {
+        guard workspaceManager?.activeWorkspaceID == expectedWorkspaceID,
+              let sessionID = target.sessionID,
+              let session = sessions[target.tabID],
+              session.activeAgentSessionID == sessionID
+        else {
+            throw MCPError.invalidParams(
+                "The active workspace or Agent session target changed before the operation completed."
+            )
+        }
+        if allowMatchingControlledSession,
+           session.mcpControlContext?.sessionID == sessionID
+        {
+            return
+        }
+        guard workspaceManager?.workspaces.first(where: {
+            $0.id == expectedWorkspaceID
+        })?.composeTabs.contains(where: {
+            $0.id == target.tabID && $0.activeAgentSessionID == sessionID
+        }) == true else {
+            throw MCPError.invalidParams(
+                "The Agent session target is no longer owned by the expected workspace."
+            )
+        }
+        try requireCurrentAgentSessionLifecycleAdmission(target)
+    }
+
+    struct MCPWorkspaceTargetAuthority {
+        let target: MCPSessionTarget
+        let expectedWorkspaceID: UUID
+        let allowMatchingControlledSession: Bool
     }
 
     func mcpValidateAgentRunSpawnAllowed(
@@ -7193,12 +7481,255 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         createIfNeeded: Bool,
         sessionName: String?,
         parentSessionID: UUID? = nil,
-        inheritWorktreeBindings: Bool = false
+        inheritWorktreeBindings: Bool = false,
+        expectedWorkspaceID: UUID? = nil
     ) async throws -> MCPSessionTarget {
+        let selector = try normalizeMCPSessionSelector(
+            tabID: tabID,
+            sessionID: sessionID,
+            createIfNeeded: createIfNeeded,
+            expectedWorkspaceID: expectedWorkspaceID
+        )
+        let discardAuthorityID = UUID()
+        var reservedSessionID: UUID?
+        do {
+            if let intendedSessionID = selector.intendedSessionID {
+                guard let reservationWorkspaceID = expectedWorkspaceID ?? workspaceManager?.activeWorkspaceID else {
+                    throw MCPError.internalError("Workspace unavailable during Agent session reservation.")
+                }
+                try await establishMCPSessionTargetDiscardAuthority(
+                    discardAuthorityID,
+                    sessionID: intendedSessionID,
+                    workspaceID: reservationWorkspaceID
+                )
+                reservedSessionID = intendedSessionID
+            }
+            triggerPendingMCPSessionTargetDiscardRetries()
+            try revalidateNormalizedMCPSessionSelector(
+                selector,
+                expectedWorkspaceID: expectedWorkspaceID
+            )
+            let target = try await mcpResolveOrCreateSessionTargetWithoutDiscardFence(
+                selector: selector,
+                discardAuthorityID: discardAuthorityID,
+                createIfNeeded: createIfNeeded,
+                sessionName: sessionName,
+                parentSessionID: parentSessionID,
+                inheritWorktreeBindings: inheritWorktreeBindings,
+                expectedWorkspaceID: expectedWorkspaceID
+            )
+            guard let resolvedSessionID = target.sessionID else { return target }
+            guard target.recoveryClaim != nil else {
+                if reservedSessionID != nil {
+                    try requireSettledClaimlessMCPSessionTarget(
+                        target,
+                        discardAuthorityID: discardAuthorityID
+                    )
+                    releaseMCPSessionTargetDiscardAuthority(
+                        discardAuthorityID,
+                        sessionID: resolvedSessionID
+                    )
+                    reservedSessionID = nil
+                }
+                return target
+            }
+            guard mcpSessionTargetDiscardAuthorityBySessionID[resolvedSessionID]?.authorityID == discardAuthorityID else {
+                throw MCPError.invalidParams(
+                    "The Agent session target was superseded before provider dispatch."
+                )
+            }
+            let provisionalTarget = target.withDiscardAuthorityID(discardAuthorityID)
+            registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
+            guard outstandingProvisionalMCPSessionTargetMatches(provisionalTarget) else {
+                throw MCPError.invalidParams(
+                    "The Agent session recovery claim changed before provider dispatch."
+                )
+            }
+            return provisionalTarget
+        } catch {
+            if let reservedSessionID {
+                let recoveryRetainsAuthority = outstandingProvisionalMCPSessionTargets.values.contains { target in
+                    target.sessionID == reservedSessionID
+                        && target.discardAuthorityID == discardAuthorityID
+                        && target.recoveryClaim?.state != .accepted
+                        && target.recoveryClaim?.state != .complete
+                }
+                if !recoveryRetainsAuthority {
+                    releaseMCPSessionTargetDiscardAuthority(
+                        discardAuthorityID,
+                        sessionID: reservedSessionID
+                    )
+                }
+            }
+            throw error
+        }
+    }
+
+    private func normalizeMCPSessionSelector(
+        tabID: UUID?,
+        sessionID: UUID?,
+        createIfNeeded: Bool,
+        expectedWorkspaceID: UUID?
+    ) throws -> NormalizedMCPSessionSelector {
+        if let expectedWorkspaceID,
+           workspaceManager?.activeWorkspaceID != expectedWorkspaceID
+        {
+            throw MCPError.invalidParams(
+                "The active workspace changed before the Agent session target was resolved."
+            )
+        }
+        if let tabID {
+            guard let workspaceManager,
+                  let workspaceID = expectedWorkspaceID ?? workspaceManager.activeWorkspaceID,
+                  let tab = workspaceManager.workspaces.first(where: { $0.id == workspaceID })?
+                  .composeTabs.first(where: { $0.id == tabID })
+            else {
+                throw MCPError.invalidParams("Tab '\(tabID.uuidString)' was not found in the expected workspace.")
+            }
+            let liveSessionID = sessions[tabID]?.activeAgentSessionID
+            if let liveSessionID,
+               let durableSessionID = tab.activeAgentSessionID,
+               liveSessionID != durableSessionID
+            {
+                throw ambiguousAgentSessionError()
+            }
+            let boundSessionID = tab.activeAgentSessionID ?? liveSessionID
+            if let sessionID {
+                guard boundSessionID == sessionID else {
+                    throw MCPError.invalidParams(
+                        "The supplied tab and Agent session do not identify the same durable target."
+                    )
+                }
+                return .exact(tabID: tabID, sessionID: sessionID)
+            }
+            if let boundSessionID {
+                return .tab(tabID: tabID, sessionID: boundSessionID, createsBinding: false)
+            }
+            return .tab(
+                tabID: tabID,
+                sessionID: createIfNeeded ? UUID() : nil,
+                createsBinding: createIfNeeded
+            )
+        }
         if let sessionID {
+            return .session(sessionID)
+        }
+        guard createIfNeeded else {
+            throw MCPError.invalidParams("No target agent session was specified.")
+        }
+        return .fresh(UUID())
+    }
+
+    private func revalidateNormalizedMCPSessionSelector(
+        _ selector: NormalizedMCPSessionSelector,
+        expectedWorkspaceID: UUID?
+    ) throws {
+        if let expectedWorkspaceID,
+           workspaceManager?.activeWorkspaceID != expectedWorkspaceID
+        {
+            throw MCPError.invalidParams(
+                "The active workspace changed after the Agent session selector was frozen."
+            )
+        }
+        switch selector {
+        case let .exact(tabID, sessionID), let .tab(tabID, sessionID?, false):
+            try requireFrozenMCPSessionBinding(
+                tabID: tabID,
+                sessionID: sessionID,
+                expectedWorkspaceID: expectedWorkspaceID,
+                requiresHydratedRuntime: false
+            )
+        case let .tab(tabID, _, true):
+            guard let workspaceManager,
+                  let workspaceID = expectedWorkspaceID ?? workspaceManager.activeWorkspaceID,
+                  workspaceManager.workspaces.first(where: { $0.id == workspaceID })?
+                  .composeTabs.first(where: { $0.id == tabID })?.activeAgentSessionID == nil,
+                  sessions[tabID]?.activeAgentSessionID == nil
+            else {
+                throw MCPError.invalidParams(
+                    "The target tab changed after the Agent session selector was frozen."
+                )
+            }
+        case .session, .fresh, .tab:
+            break
+        }
+    }
+
+    private func requireFrozenMCPSessionBinding(
+        tabID: UUID,
+        sessionID: UUID,
+        expectedWorkspaceID: UUID?,
+        requiresHydratedRuntime: Bool
+    ) throws {
+        guard let workspaceManager,
+              let workspace = workspaceManager.workspaces.first(where: { workspace in
+                  workspace.composeTabs.contains(where: {
+                      $0.id == tabID && $0.activeAgentSessionID == sessionID
+                  })
+              }),
+              expectedWorkspaceID.map({ $0 == workspace.id }) ?? true
+        else {
+            throw MCPError.invalidParams(
+                "The requested tab and Agent session binding changed after its selector was frozen."
+            )
+        }
+        switch persistentBindingResolution(for: sessionID, includeIndexFallback: false) {
+        case let .unique(authoritativeTabID) where authoritativeTabID == tabID:
+            break
+        case .ambiguous:
+            throw ambiguousAgentSessionError()
+        case .unique, .notFound:
+            throw MCPError.invalidParams(
+                "The requested tab and Agent session binding changed after its selector was frozen."
+            )
+        }
+        if let liveSession = sessions[tabID] {
+            guard liveSession.activeAgentSessionID == sessionID else {
+                throw MCPError.invalidParams(
+                    "The requested tab and Agent session runtime changed after its selector was frozen."
+                )
+            }
+        } else if requiresHydratedRuntime {
+            throw MCPError.invalidParams(
+                "The requested Agent session runtime disappeared while its target was prepared."
+            )
+        }
+    }
+
+    private func mcpResolveOrCreateSessionTargetWithoutDiscardFence(
+        selector: NormalizedMCPSessionSelector,
+        discardAuthorityID: UUID,
+        createIfNeeded: Bool,
+        sessionName: String?,
+        parentSessionID: UUID?,
+        inheritWorktreeBindings: Bool,
+        expectedWorkspaceID: UUID?
+    ) async throws -> MCPSessionTarget {
+        if let expectedWorkspaceID,
+           workspaceManager?.activeWorkspaceID != expectedWorkspaceID
+        {
+            throw MCPError.invalidParams(
+                "The active workspace changed before the Agent session target was resolved."
+            )
+        }
+        switch selector {
+        case let .exact(tabID, sessionID):
+            return try await mcpExistingSessionTarget(
+                tabID: tabID,
+                sessionID: sessionID,
+                parentSessionID: parentSessionID,
+                inheritWorktreeBindings: inheritWorktreeBindings,
+                expectedWorkspaceID: expectedWorkspaceID,
+                discardAuthorityID: discardAuthorityID
+            )
+
+        case let .session(sessionID):
             let discardRestoreIndexEntry = ownerValidatedSessionIndex[sessionID]
             let indexedParentSessionID = ownerValidatedSessionIndex[sessionID]?.parentSessionID
-            let existingTabID: UUID? = switch persistentBindingResolution(for: sessionID) {
+            let existingTabID: UUID? = switch persistentBindingResolution(
+                for: sessionID,
+                includeIndexFallback: false
+            ) {
             case let .unique(tabID): tabID
             case .notFound: nil
             case .ambiguous: throw ambiguousAgentSessionError()
@@ -7208,7 +7739,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     tabID: existingTabID,
                     sessionID: sessionID,
                     parentSessionID: indexedParentSessionID ?? parentSessionID,
-                    inheritWorktreeBindings: inheritWorktreeBindings
+                    inheritWorktreeBindings: inheritWorktreeBindings,
+                    expectedWorkspaceID: expectedWorkspaceID,
+                    discardAuthorityID: discardAuthorityID
                 )
             }
             guard createIfNeeded else {
@@ -7218,158 +7751,258 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let parentWasLocallyRepresentedAtAdmissionStart = effectiveParentSessionID.map {
                 sessionTreeNodes()[$0] != nil
             } ?? false
-            let createdTabID = try await mcpCreateBackgroundSessionTab(
+            let creation = try await mcpCreateBackgroundSessionTab(
                 name: sessionName,
                 sessionID: sessionID,
-                parentSessionID: effectiveParentSessionID
-            )
-            defer { provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID) }
-            #if DEBUG
-                await test_afterDurableChildTabCreation?()
-            #endif
-            try requireSpawnAdmissionStillCurrent(
-                childTabID: createdTabID,
                 parentSessionID: effectiveParentSessionID,
-                parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
+                expectedWorkspaceID: expectedWorkspaceID
             )
-            let hydrated = await ensureSessionReady(tabID: createdTabID)
-            await loadSessionFromDisk(for: hydrated)
-            applySpawnParentSessionID(
-                effectiveParentSessionID,
-                to: hydrated,
-                inheritWorktreeBindings: inheritWorktreeBindings
-            )
-            return .init(
-                tabID: hydrated.tabID,
+            let createdTabID = creation.tabID
+            defer { provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID) }
+            // Durable publication transfers cleanup ownership to the claim before any later work can suspend or fail.
+            var provisionalTarget = MCPSessionTarget(
+                tabID: createdTabID,
                 sessionID: sessionID,
                 origin: .createdForSessionResume,
-                lifecycleIdentity: agentSessionLifecycleIdentity(
-                    tabID: hydrated.tabID,
-                    expectedSessionID: sessionID
-                ),
+                recoveryClaim: creation.recoveryClaim,
+                discardAuthorityID: discardAuthorityID,
                 discardRestoreIndexEntry: discardRestoreIndexEntry
             )
-        }
+            registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
+            do {
+                #if DEBUG
+                    await test_afterDurableChildTabCreation?()
+                #endif
+                let hydrated = await ensureSessionReady(tabID: createdTabID)
+                await loadSessionFromDisk(for: hydrated)
+                provisionalTarget = MCPSessionTarget(
+                    tabID: hydrated.tabID,
+                    sessionID: sessionID,
+                    origin: .createdForSessionResume,
+                    lifecycleIdentity: agentSessionLifecycleIdentity(
+                        tabID: hydrated.tabID,
+                        expectedSessionID: sessionID
+                    ),
+                    recoveryClaim: creation.recoveryClaim,
+                    discardAuthorityID: discardAuthorityID,
+                    discardRestoreIndexEntry: discardRestoreIndexEntry
+                )
+                registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
+                try Task.checkCancellation()
+                try requireSpawnAdmissionStillCurrent(
+                    childTabID: createdTabID,
+                    parentSessionID: effectiveParentSessionID,
+                    parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
+                )
+                try requireCurrentAgentSessionLifecycleAdmission(provisionalTarget)
+                applySpawnParentSessionID(
+                    effectiveParentSessionID,
+                    to: hydrated,
+                    inheritWorktreeBindings: inheritWorktreeBindings
+                )
+                return provisionalTarget
+            } catch {
+                _ = await mcpDiscardSessionTarget(provisionalTarget)
+                throw error
+            }
 
-        if let tabID {
-            guard workspaceManager?.composeTab(with: tabID) != nil else {
-                throw MCPError.invalidParams("Tab '\(tabID.uuidString)' was not found.")
+        case let .tab(tabID, resolvedSessionID, createsBinding):
+            guard let workspaceManager,
+                  let expectedWorkspaceID = expectedWorkspaceID ?? workspaceManager.activeWorkspaceID,
+                  workspaceManager.workspaces.first(where: {
+                      $0.id == expectedWorkspaceID
+                  })?.composeTabs.contains(where: { $0.id == tabID }) == true
+            else {
+                throw MCPError.invalidParams("Tab '\(tabID.uuidString)' was not found in the expected workspace.")
             }
-            let hydrated = await ensureSessionReady(tabID: tabID)
-            let resolvedSessionID: UUID? = if createIfNeeded {
-                try await durablyEnsureSessionBoundToTab(hydrated)
-            } else {
-                hydrated.activeAgentSessionID
+            if let resolvedSessionID, !createsBinding {
+                return try await mcpExistingSessionTarget(
+                    tabID: tabID,
+                    sessionID: resolvedSessionID,
+                    parentSessionID: parentSessionID,
+                    inheritWorktreeBindings: inheritWorktreeBindings,
+                    expectedWorkspaceID: expectedWorkspaceID,
+                    discardAuthorityID: discardAuthorityID
+                )
             }
-            if parentSessionID != nil {
+            guard createsBinding, createIfNeeded, let intendedSessionID = resolvedSessionID else {
+                let hydrated = await ensureSessionReady(tabID: tabID)
+                #if DEBUG
+                    await test_afterExplicitTabSessionReady?()
+                #endif
+                guard workspaceManager.activeAgentSessionID(
+                    forTabID: tabID,
+                    inWorkspaceID: expectedWorkspaceID
+                ) == nil,
+                    hydrated.activeAgentSessionID == nil
+                else {
+                    throw MCPError.invalidParams(
+                        "The target tab acquired an Agent session while its selector was being resolved."
+                    )
+                }
+                return .init(tabID: tabID, sessionID: nil, origin: .existingTab)
+            }
+            let identity = AgentProvisionalAdmissionIdentity(
+                recoveryID: UUID(),
+                workspaceID: expectedWorkspaceID,
+                tabID: tabID,
+                sessionID: intendedSessionID,
+                replacementTabID: UUID()
+            )
+            let claim = AgentProvisionalAdmissionClaim(identity: identity)
+            var provisionalTarget = MCPSessionTarget(
+                tabID: tabID,
+                sessionID: intendedSessionID,
+                origin: .existingTab,
+                recoveryClaim: claim,
+                discardAuthorityID: discardAuthorityID
+            )
+            bindingOnlyMCPSessionTargetRecoveryIDs.insert(identity.recoveryID)
+            registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
+            do {
+                let hydrated = await ensureSessionReady(tabID: tabID)
+                #if DEBUG
+                    await test_afterExplicitTabSessionReady?()
+                #endif
+                try Task.checkCancellation()
+                let boundSessionID = try await durablyEnsureSessionBoundToTab(
+                    hydrated,
+                    intendedSessionID: intendedSessionID,
+                    expectedWorkspaceID: expectedWorkspaceID
+                )
+                guard boundSessionID == intendedSessionID else {
+                    throw MCPError.invalidParams("The target tab could not be bound to the intended Agent session.")
+                }
+                provisionalTarget = MCPSessionTarget(
+                    tabID: tabID,
+                    sessionID: intendedSessionID,
+                    origin: .existingTab,
+                    lifecycleIdentity: agentSessionLifecycleIdentity(
+                        tabID: tabID,
+                        expectedSessionID: intendedSessionID
+                    ),
+                    recoveryClaim: claim,
+                    discardAuthorityID: discardAuthorityID
+                )
+                registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
+                #if DEBUG
+                    await test_afterDurableExplicitTabSessionBinding?()
+                #endif
+                try Task.checkCancellation()
+                try requireCurrentAgentSessionLifecycleAdmission(provisionalTarget)
+                if parentSessionID != nil {
+                    applySpawnParentSessionID(
+                        parentSessionID,
+                        to: hydrated,
+                        inheritWorktreeBindings: inheritWorktreeBindings
+                    )
+                }
+                return provisionalTarget
+            } catch {
+                _ = await mcpDiscardSessionTarget(provisionalTarget)
+                throw error
+            }
+
+        case let .fresh(intendedSessionID):
+            guard createIfNeeded else {
+                throw MCPError.invalidParams("No target agent session was specified.")
+            }
+            let parentWasLocallyRepresentedAtAdmissionStart = parentSessionID.map {
+                sessionTreeNodes()[$0] != nil
+            } ?? false
+            let creation = try await mcpCreateBackgroundSessionTab(
+                name: sessionName,
+                sessionID: intendedSessionID,
+                parentSessionID: parentSessionID,
+                expectedWorkspaceID: expectedWorkspaceID
+            )
+            let createdTabID = creation.tabID
+            defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
+            // The registry retains the durable recovery claim even if cancellation arrives while the
+            // newly published tab is being hydrated into this view model.
+            var provisionalTarget = MCPSessionTarget(
+                tabID: createdTabID,
+                sessionID: intendedSessionID,
+                origin: .createdNewTab,
+                recoveryClaim: creation.recoveryClaim,
+                discardAuthorityID: discardAuthorityID
+            )
+            registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
+            do {
+                #if DEBUG
+                    await test_afterDurableChildTabCreation?()
+                #endif
+                let hydrated = await ensureSessionReady(tabID: createdTabID)
+                provisionalTarget = MCPSessionTarget(
+                    tabID: hydrated.tabID,
+                    sessionID: intendedSessionID,
+                    origin: .createdNewTab,
+                    lifecycleIdentity: agentSessionLifecycleIdentity(
+                        tabID: hydrated.tabID,
+                        expectedSessionID: intendedSessionID
+                    ),
+                    recoveryClaim: creation.recoveryClaim,
+                    discardAuthorityID: discardAuthorityID
+                )
+                registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
+                try Task.checkCancellation()
+                try requireSpawnAdmissionStillCurrent(
+                    childTabID: createdTabID,
+                    parentSessionID: parentSessionID,
+                    parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
+                )
+                guard hydrated.activeAgentSessionID == intendedSessionID else {
+                    throw MCPError.invalidParams("The new tab could not be bound to an agent session.")
+                }
+                try requireCurrentAgentSessionLifecycleAdmission(provisionalTarget)
                 applySpawnParentSessionID(
                     parentSessionID,
                     to: hydrated,
                     inheritWorktreeBindings: inheritWorktreeBindings
                 )
+                return provisionalTarget
+            } catch {
+                _ = await mcpDiscardSessionTarget(provisionalTarget)
+                throw error
             }
-            return .init(
-                tabID: hydrated.tabID,
-                sessionID: resolvedSessionID,
-                origin: .existingTab,
-                lifecycleIdentity: resolvedSessionID.flatMap {
-                    agentSessionLifecycleIdentity(tabID: hydrated.tabID, expectedSessionID: $0)
-                }
-            )
         }
-
-        guard createIfNeeded else {
-            throw MCPError.invalidParams("No target agent session was specified.")
-        }
-        let intendedSessionID = UUID()
-        let parentWasLocallyRepresentedAtAdmissionStart = parentSessionID.map {
-            sessionTreeNodes()[$0] != nil
-        } ?? false
-        let createdTabID = try await mcpCreateBackgroundSessionTab(
-            name: sessionName,
-            sessionID: intendedSessionID,
-            parentSessionID: parentSessionID
-        )
-        defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
-        #if DEBUG
-            await test_afterDurableChildTabCreation?()
-        #endif
-        try requireSpawnAdmissionStillCurrent(
-            childTabID: createdTabID,
-            parentSessionID: parentSessionID,
-            parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
-        )
-        let hydrated = await ensureSessionReady(tabID: createdTabID)
-        guard hydrated.activeAgentSessionID == intendedSessionID else {
-            throw MCPError.invalidParams("The new tab could not be bound to an agent session.")
-        }
-        applySpawnParentSessionID(
-            parentSessionID,
-            to: hydrated,
-            inheritWorktreeBindings: inheritWorktreeBindings
-        )
-        return .init(
-            tabID: hydrated.tabID,
-            sessionID: intendedSessionID,
-            origin: .createdNewTab,
-            lifecycleIdentity: agentSessionLifecycleIdentity(
-                tabID: hydrated.tabID,
-                expectedSessionID: intendedSessionID
-            )
-        )
     }
 
     private func mcpExistingSessionTarget(
         tabID: UUID,
         sessionID: UUID,
         parentSessionID: UUID?,
-        inheritWorktreeBindings: Bool
+        inheritWorktreeBindings: Bool,
+        expectedWorkspaceID: UUID?,
+        discardAuthorityID: UUID
     ) async throws -> MCPSessionTarget {
+        try requireFrozenMCPSessionBinding(
+            tabID: tabID,
+            sessionID: sessionID,
+            expectedWorkspaceID: expectedWorkspaceID,
+            requiresHydratedRuntime: false
+        )
         let hydrated = await ensureSessionReady(tabID: tabID)
-        if let currentSessionID = hydrated.activeAgentSessionID,
-           currentSessionID != sessionID
-        {
-            sessionLifecycleAuthority.record(.init(
-                caller: .agentRunStart,
-                intent: .createOrContinue,
-                phase: .beforeBinding,
-                decision: .rejected,
-                identity: agentSessionLifecycleIdentity(
-                    tabID: tabID,
-                    expectedSessionID: currentSessionID
-                ),
-                previousSessionID: currentSessionID,
-                currentSessionID: sessionID,
-                isPinned: workspaceManager?.composeTab(with: tabID)?.isPinned ?? false,
-                isLive: true,
-                isActive: workspaceManager?.activeWorkspace?.activeComposeTabID == tabID,
-                isProtected: true,
-                workspaceSaveResult: "not_attempted",
-                reason: AgentSessionLifecycleAuthority.RejectionReason.sessionIdentityChanged.rawValue
-            ))
+        #if DEBUG
+            await test_afterExplicitTabSessionReady?()
+        #endif
+        try Task.checkCancellation()
+        try requireFrozenMCPSessionBinding(
+            tabID: tabID,
+            sessionID: sessionID,
+            expectedWorkspaceID: expectedWorkspaceID,
+            requiresHydratedRuntime: true
+        )
+        guard sessions[tabID] === hydrated,
+              hydrated.activeAgentSessionID == sessionID
+        else {
             throw MCPError.invalidParams(
-                "The requested session conflicts with a live tab binding; the live session was preserved."
+                "The requested Agent session runtime changed while its target was prepared."
             )
-        }
-        if hydrated.activeAgentSessionID == nil {
-            _ = try await rebindPersistentSession(
-                sessionID,
-                to: hydrated,
-                requiresHydration: true
-            )
-            await loadSessionFromDisk(for: hydrated)
-        }
-        guard hydrated.activeAgentSessionID == sessionID else {
-            throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
         let resolvedSessionID = sessionID
         let indexedParentSessionID = ownerValidatedSessionIndex[resolvedSessionID]?.parentSessionID
-        applySpawnParentSessionID(
-            hydrated.parentSessionID ?? indexedParentSessionID ?? parentSessionID,
-            to: hydrated,
-            inheritWorktreeBindings: inheritWorktreeBindings
-        )
-        return .init(
+        let target = MCPSessionTarget(
             tabID: hydrated.tabID,
             sessionID: resolvedSessionID,
             origin: .existingSession,
@@ -7378,6 +8011,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 expectedSessionID: resolvedSessionID
             )
         )
+        guard mcpSessionTargetDiscardAuthorityBySessionID[sessionID]?.authorityID == discardAuthorityID else {
+            throw MCPError.invalidParams("The Agent session target authority changed during resolution.")
+        }
+        guard let lifecycleIdentity = target.lifecycleIdentity else {
+            throw MCPError.invalidParams(
+                "The Agent session did not retain a durable lifecycle identity."
+            )
+        }
+        _ = try requireCurrentAgentSessionLifecycleTarget(
+            .init(tabID: target.tabID, identity: lifecycleIdentity),
+            intent: .providerStart
+        )
+        applySpawnParentSessionID(
+            hydrated.parentSessionID ?? indexedParentSessionID ?? parentSessionID,
+            to: hydrated,
+            inheritWorktreeBindings: inheritWorktreeBindings
+        )
+        return target
     }
 
     private func requireSpawnAdmissionStillCurrent(
@@ -7396,12 +8047,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    private struct BackgroundSessionTabCreation {
+        let tabID: UUID
+        let recoveryClaim: AgentProvisionalAdmissionClaim
+    }
+
     private func mcpCreateBackgroundSessionTab(
         name: String?,
         sessionID: UUID,
-        parentSessionID: UUID?
-    ) async throws -> UUID {
-        guard let promptManager else {
+        parentSessionID: UUID?,
+        expectedWorkspaceID: UUID?
+    ) async throws -> BackgroundSessionTabCreation {
+        guard promptManager != nil else {
             throw MCPError.internalError("Prompt manager unavailable.")
         }
         if let parentSessionID, parentSessionID != sessionID {
@@ -7410,7 +8067,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         do {
             return try await createBackgroundSessionTab(
                 name: name,
-                sessionID: sessionID
+                sessionID: sessionID,
+                expectedWorkspaceID: expectedWorkspaceID
             )
         } catch {
             provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID)
@@ -7420,10 +8078,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func createBackgroundSessionTab(
         name: String?,
-        sessionID: UUID
-    ) async throws -> UUID {
+        sessionID: UUID,
+        expectedWorkspaceID: UUID?
+    ) async throws -> BackgroundSessionTabCreation {
         guard let promptManager else {
             throw MCPError.internalError("Prompt manager unavailable.")
+        }
+        guard let expectedWorkspaceID = expectedWorkspaceID ?? workspaceManager?.activeWorkspaceID else {
+            throw MCPError.internalError("Workspace unavailable during Agent session admission.")
         }
         let tentativeIdentity: AgentSessionLifecycleAuthority.Identity? = nil
         sessionLifecycleAuthority.record(.init(
@@ -7442,13 +8104,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             reason: "admission_requested"
         ))
 
-        switch await promptManager.createDurableBackgroundAgentSessionTab(
+        switch try await promptManager.createDurableBackgroundAgentSessionTab(
             name: name,
             sessionID: sessionID,
+            expectedWorkspaceID: expectedWorkspaceID,
             lifecycleAuthority: sessionLifecycleAuthority
         ) {
-        case let .created(createdTab, persistence):
-            let identity = persistence.workspaceID.map {
+        case let .created(createdTab, receipt, recoveryClaim):
+            let identity = receipt.outcome.workspaceID.map {
                 AgentSessionLifecycleAuthority.Identity(
                     workspaceID: $0,
                     tabID: createdTab.id,
@@ -7469,11 +8132,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 isLive: false,
                 isActive: false,
                 isProtected: true,
-                workspaceSaveResult: persistence.diagnosticCategory,
+                workspaceSaveResult: receipt.outcome.diagnosticCategory,
                 reason: "binding_persisted_before_provider"
             ))
-            return createdTab.id
-        case let .rejected(persistence):
+            return BackgroundSessionTabCreation(
+                tabID: createdTab.id,
+                recoveryClaim: recoveryClaim
+            )
+        case let .rejected(receipt, reason):
             sessionLifecycleAuthority.record(.init(
                 caller: .agentRunStart,
                 intent: .createOrContinue,
@@ -7486,8 +8152,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 isLive: false,
                 isActive: false,
                 isProtected: false,
-                workspaceSaveResult: persistence.diagnosticCategory,
-                reason: AgentSessionLifecycleAuthority.RejectionReason.workspacePersistenceRejected.rawValue
+                workspaceSaveResult: receipt.outcome.diagnosticCategory,
+                reason: reason.rawValue
             ))
             throw MCPError.internalError(
                 "The Agent session could not be started because its workspace binding was not durably accepted. No provider was started; resolve workspace persistence and retry."
@@ -7495,66 +8161,162 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func durablyEnsureSessionBoundToTab(_ session: TabSession) async throws -> UUID {
+    private func durablyEnsureSessionBoundToTab(
+        _ session: TabSession,
+        intendedSessionID: UUID,
+        expectedWorkspaceID: UUID
+    ) async throws -> UUID {
         if let existingSessionID = session.activeAgentSessionID {
             return existingSessionID
         }
         guard let workspaceManager,
-              let workspaceID = workspaceManager.workspaces.first(where: {
+              let owningWorkspaceID = workspaceManager.workspaces.first(where: {
                   $0.composeTabs.contains(where: { $0.id == session.tabID })
-              })?.id
+              })?.id,
+              owningWorkspaceID == expectedWorkspaceID
         else {
-            throw MCPError.internalError("Workspace unavailable during Agent session admission.")
+            throw MCPError.invalidParams(
+                "The target tab is not owned by the expected workspace."
+            )
         }
-        guard let installedSessionID = ensureSessionBoundToTab(session) else {
-            throw MCPError.invalidParams("The target tab could not be bound to an agent session.")
-        }
-        let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
-            workspaceID: workspaceID,
-            source: WorkspaceSaveSource("agentSessionLifecycleExistingTabAdmission")
-        )
-        let bindingStillCurrent = session.activeAgentSessionID == installedSessionID
-            && workspaceManager.composeTab(with: session.tabID)?.activeAgentSessionID == installedSessionID
-        guard sessionLifecycleAuthority.decideAdmission(
-            persistence: persistence,
-            targetWorkspaceID: workspaceID,
-            bindingStillCurrent: bindingStillCurrent
-        ) == .commit else {
-            _ = installPersistentSessionBinding(
-                sessionID: nil,
+
+        return try await workspaceManager.withAgentSessionAdmission(
+            workspaceID: owningWorkspaceID,
+            admissionID: UUID(),
+            refreshCanonicalState: true
+        ) {
+            guard workspaceManager.activeWorkspaceID == expectedWorkspaceID,
+                  workspaceManager.workspaces.first(where: {
+                      $0.id == expectedWorkspaceID
+                  })?.composeTabs.contains(where: {
+                      $0.id == session.tabID && $0.activeAgentSessionID == nil
+                  }) == true,
+                  sessions[session.tabID] === session,
+                  session.activeAgentSessionID == nil
+            else {
+                throw MCPError.invalidParams(
+                    "The target tab changed before Agent session admission completed."
+                )
+            }
+            guard let installedBinding = installPersistentSessionBinding(
+                sessionID: intendedSessionID,
                 on: session,
-                updateWorkspaceMetadata: true,
+                mutationTarget: .compareAndSet(workspaceID: expectedWorkspaceID),
                 invalidateAsyncWork: true
+            ) else {
+                throw MCPError.invalidParams(
+                    "The target tab could not be bound to an agent session."
+                )
+            }
+
+            let installedTransitionGeneration = session.bindingTransitionGeneration
+            var shouldRollback = true
+            defer {
+                if shouldRollback {
+                    rollbackProvisionalSessionBinding(
+                        installedBinding,
+                        transitionGeneration: installedTransitionGeneration,
+                        session: session,
+                        workspaceID: expectedWorkspaceID,
+                        workspaceManager: workspaceManager
+                    )
+                }
+            }
+
+            try Task.checkCancellation()
+            let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: expectedWorkspaceID,
+                source: WorkspaceSaveSource("agentSessionLifecycleExistingTabAdmission"),
+                allowRetainedAgentAdmissionRecoveryRetry: false
             )
-            sessionLifecycleAuthority.record(.init(
-                caller: .agentRunStart,
-                intent: .createOrContinue,
-                phase: .beforeProviderStart,
-                decision: .rejected,
-                identity: nil,
-                previousSessionID: nil,
-                currentSessionID: installedSessionID,
-                isPinned: workspaceManager.composeTab(with: session.tabID)?.isPinned ?? false,
-                isLive: true,
-                isActive: workspaceManager.activeWorkspace?.activeComposeTabID == session.tabID,
-                isProtected: false,
-                workspaceSaveResult: persistence.diagnosticCategory,
-                reason: AgentSessionLifecycleAuthority.RejectionReason.workspacePersistenceRejected.rawValue
-            ))
-            throw MCPError.internalError(
-                "The Agent session binding was rejected by workspace persistence. No provider was started."
+            #if DEBUG
+                await test_afterProvisionalExistingTabBindingInstalled?()
+            #endif
+            try Task.checkCancellation()
+            let bindingStillCurrent = session.persistentSessionBindingIdentity == installedBinding
+                && session.bindingTransitionGeneration == installedTransitionGeneration
+                && workspaceManager.workspaces.first(where: {
+                    $0.id == expectedWorkspaceID
+                })?.composeTabs.contains(where: {
+                    $0.id == session.tabID && $0.activeAgentSessionID == installedBinding.sessionID
+                }) == true
+            let admissionDecision = sessionLifecycleAuthority.decideAdmission(
+                persistence: persistence,
+                targetWorkspaceID: expectedWorkspaceID,
+                bindingStillCurrent: bindingStillCurrent
             )
+            switch admissionDecision {
+            case .commit:
+                shouldRollback = false
+                return installedBinding.sessionID
+            case let .rollback(reason):
+                sessionLifecycleAuthority.record(.init(
+                    caller: .agentRunStart,
+                    intent: .createOrContinue,
+                    phase: .beforeProviderStart,
+                    decision: .rejected,
+                    identity: nil,
+                    previousSessionID: nil,
+                    currentSessionID: installedBinding.sessionID,
+                    isPinned: workspaceManager.composeTab(with: session.tabID)?.isPinned ?? false,
+                    isLive: true,
+                    isActive: workspaceManager.activeWorkspace?.activeComposeTabID == session.tabID,
+                    isProtected: false,
+                    workspaceSaveResult: persistence.diagnosticCategory,
+                    reason: reason.rawValue
+                ))
+                throw MCPError.internalError(
+                    "The Agent session binding was rejected by workspace persistence. No provider was started."
+                )
+            }
         }
-        return installedSessionID
+    }
+
+    private func rollbackProvisionalSessionBinding(
+        _ installedBinding: AgentPersistentSessionBindingIdentity,
+        transitionGeneration: UInt64,
+        session: TabSession,
+        workspaceID: UUID,
+        workspaceManager: WorkspaceManagerViewModel
+    ) {
+        guard sessions[session.tabID] === session,
+              session.persistentSessionBindingIdentity == installedBinding,
+              session.bindingTransitionGeneration == transitionGeneration,
+              workspaceManager.activeAgentSessionID(
+                  forTabID: session.tabID,
+                  inWorkspaceID: workspaceID
+              ) == installedBinding.sessionID,
+              workspaceManager.compareAndSetActiveAgentSessionID(
+                  expected: installedBinding.sessionID,
+                  replacement: nil,
+                  forTabID: session.tabID,
+                  inWorkspaceID: workspaceID
+              )
+        else { return }
+
+        _ = installPersistentSessionBinding(
+            sessionID: nil,
+            on: session,
+            mutationTarget: .runtimeOnly,
+            invalidateAsyncWork: true
+        )
     }
 
     func mcpConfigureSession(
         tabID: UUID,
         agentRaw: String?,
         modelRaw: String?,
-        reasoningEffortRaw: String?
+        reasoningEffortRaw: String?,
+        workspaceAuthority: MCPWorkspaceTargetAuthority? = nil
     ) async throws {
         let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        if let workspaceAuthority {
+            try requireCurrentMCPWorkspaceTarget(
+                workspaceAuthority.target,
+                expectedWorkspaceID: workspaceAuthority.expectedWorkspaceID,
+                allowMatchingControlledSession: workspaceAuthority.allowMatchingControlledSession
+            )
+        }
         let normalized = normalizedSelection(
             agentRaw: agentRaw ?? session.selectedAgent.rawValue,
             modelRaw: modelRaw ?? session.selectedModelRaw,
@@ -7576,6 +8338,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 session: session,
                 from: previousAgent,
                 to: normalized.agent
+            )
+        }
+
+        #if DEBUG
+            await test_beforeMCPSelectionCommit?()
+        #endif
+        if let workspaceAuthority {
+            try requireCurrentMCPWorkspaceTarget(
+                workspaceAuthority.target,
+                expectedWorkspaceID: workspaceAuthority.expectedWorkspaceID,
+                allowMatchingControlledSession: workspaceAuthority.allowMatchingControlledSession
             )
         }
 
@@ -7972,28 +8745,638 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             updateBindingsFromSession(session)
         }
         handleObservedMCPStateChange(for: session)
+        #if DEBUG
+            await test_afterMCPControlActivation?(session)
+        #endif
+    }
+
+    /// Closes the provisional recovery claim once a target becomes externally real.
+    func mcpAcceptSessionTarget(_ target: MCPSessionTarget) {
+        target.recoveryClaim?.markAccepted()
+        if let recoveryID = target.recoveryClaim?.identity.recoveryID {
+            bindingOnlyMCPSessionTargetRecoveryIDs.remove(recoveryID)
+        }
+        releaseOutstandingProvisionalMCPSessionTarget(target)
     }
 
     /// Discard a session target created by `mcpResolveOrCreateSessionTarget` when a later step
-    /// in start/create/resume/steer fails before the target becomes a real session. Only targets
-    /// with origin `.createdNewTab` or `.createdForSessionResume` are eligible for discard.
-    func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async {
-        switch target.origin {
-        case .existingSession, .existingTab:
-            return
-        case .createdNewTab, .createdForSessionResume:
+    /// fails before its acceptance boundary. Claimed targets recover the exact workspace captured
+    /// by durable admission; accepted targets retain their durable ownership.
+    @discardableResult
+    func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async -> MCPSessionTargetDiscardResult {
+        guard let claim = target.recoveryClaim else {
+            switch target.origin {
+            case .existingSession, .existingTab:
+                return .complete
+            case .createdNewTab, .createdForSessionResume:
+                break
+            }
+            await mcpDiscardClaimlessSessionTarget(target)
+            return .complete
+        }
+        switch claim.state {
+        case .accepted, .complete:
+            releaseOutstandingProvisionalMCPSessionTarget(target)
+            return .complete
+        case .provisional, .recoveringWorkspace, .workspaceRecovered, .blockedManual:
             break
         }
+        guard mcpSessionTargetDiscardAuthorityIsCurrent(target) else {
+            if case .blockedManual = claim.state {
+                return .retainedForRetry
+            }
+            claim.markComplete()
+            workspaceManager?.finishProvisionalAgentAdmissionRecovery(claim.identity)
+            releaseOutstandingProvisionalMCPSessionTarget(target)
+            return .complete
+        }
+        let recoveryID = claim.identity.recoveryID
+        if pendingMCPSessionTargetDiscards[recoveryID] == nil {
+            pendingMCPSessionTargetDiscards[recoveryID] = PendingMCPSessionTargetDiscard(
+                target: target,
+                provisionalIndexEntry: target.sessionID.flatMap { ownerValidatedSessionIndex[$0] }
+            )
+        }
+        guard let task = launchPendingMCPSessionTargetDiscardAttempt(recoveryID: recoveryID) else {
+            return claim.state == .complete ? .complete : .retainedForRetry
+        }
+        return await task.value
+    }
+
+    @discardableResult
+    func mcpRetryPendingSessionTargetDiscards() async -> MCPSessionTargetDiscardResult {
+        var aggregate = MCPSessionTargetDiscardResult.complete
+        for recoveryID in pendingMCPSessionTargetDiscards.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+            guard let task = launchPendingMCPSessionTargetDiscardAttempt(recoveryID: recoveryID) else { continue }
+            if await task.value == .retainedForRetry {
+                aggregate = .retainedForRetry
+            }
+        }
+        return aggregate
+    }
+
+    private func triggerPendingMCPSessionTargetDiscardRetries() {
+        for recoveryID in pendingMCPSessionTargetDiscards.keys where
+            pendingMCPSessionTargetDiscards[recoveryID]?.attempt == nil
+        {
+            _ = launchPendingMCPSessionTargetDiscardAttempt(recoveryID: recoveryID)
+        }
+    }
+
+    private func launchPendingMCPSessionTargetDiscardAttempt(
+        recoveryID: UUID,
+        automatic: Bool = false
+    ) -> Task<MCPSessionTargetDiscardResult, Never>? {
+        guard var pending = pendingMCPSessionTargetDiscards[recoveryID] else { return nil }
+        if let attempt = pending.attempt {
+            return attempt.task
+        }
+        let attemptID = UUID()
+        let task = Task<MCPSessionTargetDiscardResult, Never> { @MainActor [weak self] in
+            guard let self else { return .retainedForRetry }
+            #if DEBUG
+                if automatic {
+                    await test_beforeAutomaticMCPSessionTargetDiscardRetry?()
+                }
+            #endif
+            let result = await performPendingMCPSessionTargetDiscard(recoveryID: recoveryID)
+            finishPendingMCPSessionTargetDiscardAttempt(
+                recoveryID: recoveryID,
+                attemptID: attemptID,
+                result: result
+            )
+            return result
+        }
+        pending.attempt = (attemptID, task)
+        pendingMCPSessionTargetDiscards[recoveryID] = pending
+        return task
+    }
+
+    private func finishPendingMCPSessionTargetDiscardAttempt(
+        recoveryID: UUID,
+        attemptID: UUID,
+        result: MCPSessionTargetDiscardResult
+    ) {
+        guard var pending = pendingMCPSessionTargetDiscards[recoveryID],
+              pending.attempt?.id == attemptID
+        else { return }
+        pending.attempt = nil
+        if result == .complete {
+            pendingMCPSessionTargetDiscards.removeValue(forKey: recoveryID)
+            retiringMCPSessionTargetDiscardSessionIDByRecoveryID.removeValue(forKey: recoveryID)
+            bindingOnlyMCPSessionTargetRecoveryIDs.remove(recoveryID)
+            releaseOutstandingProvisionalMCPSessionTarget(pending.target)
+            return
+        }
+        let shouldStartAutomaticRetry = !pending.automaticRetryStarted
+        pending.automaticRetryStarted = true
+        pendingMCPSessionTargetDiscards[recoveryID] = pending
+        if shouldStartAutomaticRetry {
+            _ = launchPendingMCPSessionTargetDiscardAttempt(
+                recoveryID: recoveryID,
+                automatic: true
+            )
+        }
+    }
+
+    private func performPendingMCPSessionTargetDiscard(
+        recoveryID: UUID
+    ) async -> MCPSessionTargetDiscardResult {
+        guard let pending = pendingMCPSessionTargetDiscards[recoveryID],
+              let claim = pending.target.recoveryClaim,
+              let workspaceManager
+        else { return .complete }
+        let target = pending.target
+        let identity = claim.identity
+        guard pendingMCPSessionTargetDiscardIsCurrent(
+            recoveryID: recoveryID,
+            target: target,
+            claim: claim
+        ) else {
+            claim.markComplete()
+            return .complete
+        }
+        do {
+            return try await workspaceManager.withAgentSessionAdmission(
+                workspaceID: identity.workspaceID,
+                admissionID: identity.recoveryID
+            ) {
+                switch claim.state {
+                case .accepted, .complete:
+                    return .complete
+                case .provisional:
+                    guard provisionalTargetStillOwnsCanonicalRecovery(target, claim: claim) else {
+                        claim.markComplete()
+                        return .complete
+                    }
+                    await capturePendingMCPSessionTargetDiscardArtifacts(recoveryID: recoveryID)
+                    guard pendingMCPSessionTargetDiscards[recoveryID] != nil,
+                          provisionalTargetStillOwnsCanonicalRecovery(target, claim: claim)
+                    else {
+                        claim.markComplete()
+                        return .complete
+                    }
+                    guard claim.beginWorkspaceRecovery() else { return .retainedForRetry }
+                    await detachProvisionalMCPSessionTarget(target)
+                    guard pendingMCPSessionTargetDiscardIsCurrent(
+                        recoveryID: recoveryID,
+                        target: target,
+                        claim: claim
+                    ) else { return .complete }
+                case .recoveringWorkspace:
+                    break
+                case .workspaceRecovered:
+                    await detachProvisionalMCPSessionTarget(target)
+                    guard pendingMCPSessionTargetDiscardIsCurrent(
+                        recoveryID: recoveryID,
+                        target: target,
+                        claim: claim
+                    ) else { return .complete }
+                    return await finishProvisionalMCPSessionTargetArtifacts(
+                        recoveryID: recoveryID,
+                        target: target,
+                        claim: claim
+                    )
+                case .blockedManual:
+                    guard claim.resumeBlockedWorkspaceRecovery() else {
+                        return .retainedForRetry
+                    }
+                }
+
+                let outcome = if bindingOnlyMCPSessionTargetRecoveryIDs.contains(recoveryID) {
+                    await workspaceManager.recoverProvisionalAgentSessionBinding(identity)
+                } else {
+                    await workspaceManager.recoverProvisionalAgentAdmission(identity)
+                }
+                guard pendingMCPSessionTargetDiscardIsCurrent(
+                    recoveryID: recoveryID,
+                    target: target,
+                    claim: claim
+                ) else { return .complete }
+                switch outcome {
+                case .recovered, .alreadyRecovered, .localOnly:
+                    guard claim.markWorkspaceRecovered() else {
+                        return claim.state == .complete ? .complete : .retainedForRetry
+                    }
+                case .ownershipChanged:
+                    claim.markComplete()
+                    return .complete
+                case let .blockedManual(category):
+                    claim.markBlockedForManualRecovery(category)
+                    return .retainedForRetry
+                case .retryablePartial, .failed:
+                    return .retainedForRetry
+                }
+                await detachProvisionalMCPSessionTarget(target)
+                guard pendingMCPSessionTargetDiscardIsCurrent(
+                    recoveryID: recoveryID,
+                    target: target,
+                    claim: claim
+                ) else { return .complete }
+                return await finishProvisionalMCPSessionTargetArtifacts(
+                    recoveryID: recoveryID,
+                    target: target,
+                    claim: claim
+                )
+            }
+        } catch {
+            return .retainedForRetry
+        }
+    }
+
+    private func establishMCPSessionTargetDiscardAuthority(
+        _ discardAuthorityID: UUID,
+        sessionID: UUID,
+        workspaceID: UUID
+    ) async throws {
+        #if DEBUG
+            await test_beforeMCPSessionTargetDiscardAuthorityEstablishment?(sessionID)
+        #endif
+        let supersededRecoveryIDs = pendingMCPSessionTargetDiscards.compactMap { recoveryID, pending -> UUID? in
+            guard pending.target.sessionID == sessionID,
+                  pending.target.discardAuthorityID != discardAuthorityID
+            else { return nil }
+            return recoveryID
+        }
+        // Retirement keeps the older attempt's mutation authority while the successor waits.
+        // Both paths acquire this boundary before the workspace lease, so neither can deadlock
+        // by holding one lease while waiting for the other.
+        for recoveryID in supersededRecoveryIDs {
+            retiringMCPSessionTargetDiscardSessionIDByRecoveryID[recoveryID] = sessionID
+        }
+
+        for recoveryID in supersededRecoveryIDs {
+            if pendingMCPSessionTargetDiscards[recoveryID]?.attempt == nil {
+                _ = launchPendingMCPSessionTargetDiscardAttempt(recoveryID: recoveryID)
+            }
+            while let attempt = pendingMCPSessionTargetDiscards[recoveryID]?.attempt?.task {
+                _ = await attempt.value
+                try Task.checkCancellation()
+            }
+        }
+        let unsettledRecoveryIDs = supersededRecoveryIDs.filter {
+            pendingMCPSessionTargetDiscards[$0] != nil
+        }
+        for recoveryID in supersededRecoveryIDs where !unsettledRecoveryIDs.contains(recoveryID) {
+            retiringMCPSessionTargetDiscardSessionIDByRecoveryID.removeValue(forKey: recoveryID)
+        }
+        guard unsettledRecoveryIDs.isEmpty else {
+            throw MCPError.internalError(
+                "The previous Agent session target is still retiring. Retry after cleanup settles."
+            )
+        }
+        let outstandingRecoveryIDs: [UUID] = outstandingProvisionalMCPSessionTargets.compactMap { recoveryID, target in
+            guard target.sessionID == sessionID,
+                  target.discardAuthorityID != discardAuthorityID,
+                  target.recoveryClaim?.state != .accepted,
+                  target.recoveryClaim?.state != .complete
+            else { return nil }
+            return recoveryID
+        }
+        guard outstandingRecoveryIDs.isEmpty,
+              mcpSessionTargetDiscardAuthorityBySessionID[sessionID] == nil
+        else {
+            throw MCPError.internalError(
+                "The previous Agent session target is still provisional. Retry after it settles."
+            )
+        }
+        guard workspaceManager?.reserveProvisionalAgentSession(
+            workspaceID: workspaceID,
+            sessionID: sessionID,
+            ownerID: discardAuthorityID
+        ) == true else {
+            throw MCPError.internalError(
+                "The Agent session target is still provisional in another window. Retry after it settles."
+            )
+        }
+        mcpSessionTargetDiscardAuthorityBySessionID[sessionID] = MCPSessionTargetDiscardAuthority(
+            authorityID: discardAuthorityID,
+            workspaceID: workspaceID
+        )
+        #if DEBUG
+            await test_afterMCPSessionTargetDiscardRetired?(sessionID)
+        #endif
+        do {
+            try Task.checkCancellation()
+        } catch {
+            releaseMCPSessionTargetDiscardAuthority(discardAuthorityID, sessionID: sessionID)
+            throw error
+        }
+    }
+
+    private func registerOutstandingProvisionalMCPSessionTarget(_ target: MCPSessionTarget) {
+        guard let recoveryID = target.recoveryClaim?.identity.recoveryID else { return }
+        outstandingProvisionalMCPSessionTargets[recoveryID] = target
+        if let lifecycleIdentity = target.lifecycleIdentity,
+           let sessionID = target.sessionID,
+           let session = sessions[target.tabID],
+           agentSessionLifecycleIdentity(
+               tabID: target.tabID,
+               expectedSessionID: sessionID
+           ) == lifecycleIdentity
+        {
+            provisionalRuntimeTargetIdentityByRecoveryID[recoveryID] = .init(
+                sessionObjectIdentifier: ObjectIdentifier(session),
+                lifecycleIdentity: lifecycleIdentity
+            )
+        }
+    }
+
+    private func outstandingProvisionalMCPSessionTargetMatches(_ target: MCPSessionTarget) -> Bool {
+        guard let claim = target.recoveryClaim,
+              claim.identity.tabID == target.tabID,
+              claim.identity.sessionID == target.sessionID,
+              let registered = outstandingProvisionalMCPSessionTargets[claim.identity.recoveryID]
+        else { return false }
+        return registered.tabID == target.tabID
+            && registered.sessionID == target.sessionID
+            && registered.origin == target.origin
+            && registered.lifecycleIdentity == target.lifecycleIdentity
+            && registered.discardAuthorityID == target.discardAuthorityID
+            && registered.recoveryClaim === claim
+    }
+
+    private func requireSettledClaimlessMCPSessionTarget(
+        _ target: MCPSessionTarget,
+        discardAuthorityID: UUID?
+    ) throws {
+        guard let sessionID = target.sessionID else { return }
+        if let discardAuthorityID {
+            guard mcpSessionTargetDiscardAuthorityBySessionID[sessionID]?.authorityID == discardAuthorityID else {
+                throw MCPError.invalidParams("The Agent session target authority changed during resolution.")
+            }
+        } else {
+            guard mcpSessionTargetDiscardAuthorityBySessionID[sessionID] == nil else {
+                throw MCPError.invalidParams("The Agent session target is still provisional.")
+            }
+        }
+        guard !outstandingProvisionalMCPSessionTargets.values.contains(where: {
+            $0.sessionID == sessionID
+                && $0.recoveryClaim?.state != .accepted
+                && $0.recoveryClaim?.state != .complete
+        }),
+            !pendingMCPSessionTargetDiscards.values.contains(where: { $0.target.sessionID == sessionID }),
+            !retiringMCPSessionTargetDiscardSessionIDByRecoveryID.values.contains(sessionID)
+        else {
+            throw MCPError.invalidParams("The Agent session target is still provisional.")
+        }
+    }
+
+    /// Stop is a control read, so it must not mutate a session whose recovery owner has not settled.
+    func mcpSettledLiveSessionForStop(sessionID: UUID) throws -> TabSession? {
+        if let workspaceManager,
+           let workspaceID = workspaceManager.activeWorkspaceID,
+           workspaceManager.hasActiveProvisionalAgentSession(
+               workspaceID: workspaceID,
+               sessionID: sessionID
+           )
+        {
+            return nil
+        }
+        guard !outstandingProvisionalMCPSessionTargets.values.contains(where: { target in
+            target.sessionID == sessionID
+                && target.recoveryClaim?.state != .accepted
+                && target.recoveryClaim?.state != .complete
+        }) else { return nil }
+        return try authoritativeLiveSession(for: sessionID)
+    }
+
+    private func releaseOutstandingProvisionalMCPSessionTarget(_ target: MCPSessionTarget) {
+        guard let recoveryID = target.recoveryClaim?.identity.recoveryID else { return }
+        if outstandingProvisionalMCPSessionTargetMatches(target) {
+            outstandingProvisionalMCPSessionTargets.removeValue(forKey: recoveryID)
+            provisionalRuntimeTargetIdentityByRecoveryID.removeValue(forKey: recoveryID)
+        }
+        bindingOnlyMCPSessionTargetRecoveryIDs.remove(recoveryID)
+        guard let sessionID = target.sessionID,
+              let discardAuthorityID = target.discardAuthorityID
+        else { return }
+        releaseMCPSessionTargetDiscardAuthority(discardAuthorityID, sessionID: sessionID)
+    }
+
+    private func releaseMCPSessionTargetDiscardAuthority(
+        _ discardAuthorityID: UUID,
+        sessionID: UUID
+    ) {
+        guard mcpSessionTargetDiscardAuthorityBySessionID[sessionID]?.authorityID == discardAuthorityID,
+              let authority = mcpSessionTargetDiscardAuthorityBySessionID.removeValue(forKey: sessionID)
+        else { return }
+        if let workspaceID = authority.workspaceID {
+            workspaceManager?.releaseProvisionalAgentSession(
+                workspaceID: workspaceID,
+                sessionID: sessionID,
+                ownerID: discardAuthorityID
+            )
+        }
+    }
+
+    private func mcpSessionTargetDiscardAuthorityIsCurrent(_ target: MCPSessionTarget) -> Bool {
+        guard let sessionID = target.sessionID,
+              let discardAuthorityID = target.discardAuthorityID
+        else { return false }
+        return mcpSessionTargetDiscardAuthorityBySessionID[sessionID]?.authorityID == discardAuthorityID
+    }
+
+    private func pendingMCPSessionTargetDiscardIsCurrent(
+        recoveryID: UUID,
+        target: MCPSessionTarget,
+        claim: AgentProvisionalAdmissionClaim
+    ) -> Bool {
+        let ownsMutationBoundary = mcpSessionTargetDiscardAuthorityIsCurrent(target)
+            || retiringMCPSessionTargetDiscardSessionIDByRecoveryID[recoveryID] == target.sessionID
+        return pendingMCPSessionTargetDiscards[recoveryID]?.target.discardAuthorityID == target.discardAuthorityID
+            && ownsMutationBoundary
+            && claim.state != .complete
+            && claim.state != .accepted
+    }
+
+    private func capturePendingMCPSessionTargetDiscardArtifacts(recoveryID: UUID) async {
+        guard var pending = pendingMCPSessionTargetDiscards[recoveryID],
+              let sessionID = pending.target.sessionID
+        else { return }
+        if let store = workspaceFileContextStore {
+            pending.worktreeOwnershipToken = await store.currentSessionWorktreeOwnershipToken(ownerID: sessionID)
+        }
+        pendingMCPSessionTargetDiscards[recoveryID] = pending
+    }
+
+    private func provisionalTargetStillOwnsCanonicalRecovery(
+        _ target: MCPSessionTarget,
+        claim: AgentProvisionalAdmissionClaim
+    ) -> Bool {
+        let identity = claim.identity
+        return claim.state == .provisional
+            && identity.tabID == target.tabID
+            && identity.sessionID == target.sessionID
+            && mcpSessionTargetDiscardAuthorityIsCurrent(target)
+            && outstandingProvisionalMCPSessionTargetMatches(target)
+    }
+
+    private func detachProvisionalMCPSessionTarget(_ target: MCPSessionTarget) async {
+        guard let claim = target.recoveryClaim,
+              let sessionID = target.sessionID,
+              let runtimeIdentity = provisionalRuntimeTargetIdentityByRecoveryID[
+                  claim.identity.recoveryID
+              ],
+              runtimeIdentity.lifecycleIdentity == target.lifecycleIdentity,
+              let session = sessions[target.tabID],
+              ObjectIdentifier(session) == runtimeIdentity.sessionObjectIdentifier,
+              agentSessionLifecycleIdentity(
+                  tabID: target.tabID,
+                  expectedSessionID: sessionID
+              ) == runtimeIdentity.lifecycleIdentity
+        else { return }
+        mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
+        if session.activeAgentSessionID == sessionID {
+            if session.runState.isActive {
+                await runService.cancelRun(
+                    tabID: target.tabID,
+                    session: session,
+                    intent: .runtimeShutdown,
+                    completion: .terminalTeardownCompleted
+                )
+            }
+            cancelPersistedLoad(for: session)
+            session.cancelEphemeralRuntimeState()
+            session.derivedTranscriptRefreshGeneration &+= 1
+            session.derivedTranscriptRefreshTask?.cancel()
+            session.derivedTranscriptRefreshTask = nil
+            session.pendingDerivedTranscriptRefreshReason = nil
+            await mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+            await cleanupMCPRunRoutingIfPresent(
+                boundSessionID: sessionID,
+                liveSession: session,
+                reason: "provisional_admission_recovery"
+            )
+            sessions.removeValue(forKey: target.tabID)
+        }
+        if pendingTabIDForLoad == target.tabID {
+            pendingTabIDForLoad = nil
+        }
+        if activeSessionLoadInProgressTabID == target.tabID {
+            activeSessionLoadInProgressTabID = nil
+        }
+        removePendingUIRefresh(for: target.tabID)
+        tabsWithActiveAgentRun.remove(target.tabID)
+        mcpControlledTabIDs.remove(target.tabID)
+        if provisionalParentSessionIDBySessionID[sessionID] != nil {
+            provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID)
+        }
+    }
+
+    private func finishProvisionalMCPSessionTargetArtifacts(
+        recoveryID: UUID,
+        target: MCPSessionTarget,
+        claim: AgentProvisionalAdmissionClaim
+    ) async -> MCPSessionTargetDiscardResult {
+        guard claim.state == .workspaceRecovered,
+              let sessionID = target.sessionID,
+              let workspaceManager,
+              let workspace = workspaceManager.workspace(withID: claim.identity.workspaceID),
+              let pending = pendingMCPSessionTargetDiscards[recoveryID]
+        else { return claim.state == .complete ? .complete : .retainedForRetry }
+
+        guard !provisionalArtifactsHaveSuccessor(pending, sessionID: sessionID) else {
+            claim.markComplete()
+            return .complete
+        }
+
+        if bindingOnlyMCPSessionTargetRecoveryIDs.contains(recoveryID) {
+            do {
+                try await agentSessionDeleter(sessionID, workspace)
+            } catch {
+                return .retainedForRetry
+            }
+            guard pendingMCPSessionTargetDiscardIsCurrent(
+                recoveryID: recoveryID,
+                target: target,
+                claim: claim
+            ), let current = pendingMCPSessionTargetDiscards[recoveryID],
+            !provisionalArtifactsHaveSuccessor(current, sessionID: sessionID)
+            else {
+                claim.markComplete()
+                return .complete
+            }
+        } else if target.origin == .createdNewTab {
+            let failures = await agentSessionsBatchDeleter([target.tabID], workspace)
+            guard failures[target.tabID] == nil else { return .retainedForRetry }
+            guard pendingMCPSessionTargetDiscardIsCurrent(
+                recoveryID: recoveryID,
+                target: target,
+                claim: claim
+            ), let current = pendingMCPSessionTargetDiscards[recoveryID],
+            !provisionalArtifactsHaveSuccessor(current, sessionID: sessionID)
+            else {
+                claim.markComplete()
+                return .complete
+            }
+        }
+
+        if let token = pending.worktreeOwnershipToken,
+           let store = workspaceFileContextStore
+        {
+            _ = await store.releaseSessionWorktreeOwnership(ifOwnedBy: token)
+            guard pendingMCPSessionTargetDiscardIsCurrent(
+                recoveryID: recoveryID,
+                target: target,
+                claim: claim
+            ), let current = pendingMCPSessionTargetDiscards[recoveryID],
+            !provisionalArtifactsHaveSuccessor(current, sessionID: sessionID)
+            else {
+                claim.markComplete()
+                return .complete
+            }
+        }
+
+        if sessionIndexStore.sessionIndexOwner?.workspaceID == claim.identity.workspaceID,
+           let provisionalIndexEntry = pending.provisionalIndexEntry,
+           ownerValidatedSessionIndex[sessionID] == provisionalIndexEntry
+        {
+            if target.origin == .createdForSessionResume,
+               let restoreEntry = target.discardRestoreIndexEntry
+            {
+                applyLocalSessionIndexUpsert(restoreEntry)
+            } else {
+                removeSessionIndex(sessionID: sessionID)
+            }
+        }
+        claim.markComplete()
+        if let discardAuthorityID = target.discardAuthorityID {
+            releaseMCPSessionTargetDiscardAuthority(
+                discardAuthorityID,
+                sessionID: sessionID
+            )
+        }
+        return .complete
+    }
+
+    private func provisionalArtifactsHaveSuccessor(
+        _ pending: PendingMCPSessionTargetDiscard,
+        sessionID: UUID
+    ) -> Bool {
+        if sessions.values.contains(where: { $0.activeAgentSessionID == sessionID }) {
+            return true
+        }
+        let workspaces = workspaceManager?.workspaces
+            ?? lastKnownWorkspaceSnapshot.map { [$0] }
+            ?? []
+        if workspaces.contains(where: { workspace in
+            workspace.composeTabs.contains(where: { $0.activeAgentSessionID == sessionID })
+                || workspace.stashedTabs.contains(where: { $0.tab.activeAgentSessionID == sessionID })
+        }) {
+            return true
+        }
+        if let currentIndexEntry = ownerValidatedSessionIndex[sessionID] {
+            return currentIndexEntry != pending.provisionalIndexEntry
+        }
+        return false
+    }
+
+    private func mcpDiscardClaimlessSessionTarget(_ target: MCPSessionTarget) async {
         if let sessionID = target.sessionID {
-            // Release logical worktree ownership before tearing down session/tab state. This is
-            // intentionally idempotent: a concurrent transition or repeated discard observes the
-            // generation invalidation and cannot republish stale ownership.
             await releaseSessionWorktreeOwnership(sessionID: sessionID)
             mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
-            await mcpDeactivateControlContext(
-                sessionID: sessionID,
-                cleanupSessionStore: true
-            )
+            await mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
             if let entry = ownerValidatedSessionIndex[sessionID], entry.tabID == target.tabID {
                 if target.origin == .createdForSessionResume,
                    let restoreEntry = target.discardRestoreIndexEntry
@@ -17815,10 +19198,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if let session = sessions[tabID] {
             if session.activeAgentSessionID == nil {
-                _ = installPersistentSessionBinding(
+                _ = installPersistentSessionBindingUpdatingInferredWorkspace(
                     sessionID: sessionID,
                     on: session,
-                    updateWorkspaceMetadata: true,
                     invalidateAsyncWork: true
                 )
             }

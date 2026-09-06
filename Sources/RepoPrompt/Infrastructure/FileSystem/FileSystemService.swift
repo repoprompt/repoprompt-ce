@@ -22,6 +22,148 @@ enum FileSystemUncancellableMutation: Equatable {
     case trash
 }
 
+/// Callback-owned invalidation that cannot be erased by a later actor stop/restart.
+/// FSEvents may report EventIdsWrapped while the actor is suspended in an activation
+/// cut; this gate records that fact synchronously on the callback side and also
+/// serializes the synchronous seeded-publication linearization point.
+final class FileSystemServiceFSEventRecoveryGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var required = false
+    private var handler: (@Sendable () -> Void)?
+
+    /// Marks callback invalidation and removes the owner signal while holding the
+    /// same lock used by publication permits. `whileLocked` is synchronous and
+    /// must not perform actor hops or await work.
+    func markRequiredAndTakeHandler(
+        whileLocked: (() -> Void)? = nil
+    ) -> (@Sendable () -> Void)? {
+        lock.lock()
+        required = true
+        whileLocked?()
+        let handler = handler
+        self.handler = nil
+        lock.unlock()
+        return handler
+    }
+
+    func installHandler(_ handler: (@Sendable () -> Void)?) -> (@Sendable () -> Void)? {
+        lock.lock()
+        self.handler = handler
+        let handlerToSignal: (@Sendable () -> Void)?
+        if required {
+            self.handler = nil
+            handlerToSignal = handler
+        } else {
+            handlerToSignal = nil
+        }
+        lock.unlock()
+        return handlerToSignal
+    }
+
+    func clearHandler() {
+        lock.lock()
+        handler = nil
+        lock.unlock()
+    }
+
+    func takeHandler() -> (@Sendable () -> Void)? {
+        lock.lock()
+        let handler = handler
+        self.handler = nil
+        lock.unlock()
+        return handler
+    }
+
+    func acquirePublicationPermit() -> FileSystemServiceFSEventRecoveryPublicationPermit? {
+        lock.lock()
+        guard !required else {
+            lock.unlock()
+            return nil
+        }
+        return FileSystemServiceFSEventRecoveryPublicationPermit(gate: self)
+    }
+
+    fileprivate func releasePublicationPermit() {
+        lock.unlock()
+    }
+
+    /// Serializes stream-generation invalidation with publication permits.
+    /// The closure is synchronous and must not perform actor hops or await work.
+    @discardableResult
+    func withRecoveryLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    /// Starts a stream-local generation transition only if callback recovery has
+    /// not already won the service cut.
+    func withRecoveryLockIfClear<T>(_ body: () -> T) -> T? {
+        lock.lock()
+        guard !required else {
+            lock.unlock()
+            return nil
+        }
+        defer { lock.unlock() }
+        return body()
+    }
+
+    var isRequired: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return required
+    }
+}
+
+/// Owns one service's recovery lock until the synchronous publication assignment
+/// has completed. Locks are acquired by the owning store in deterministic token
+/// order and released in reverse order.
+final class FileSystemServiceFSEventRecoveryPublicationPermit: @unchecked Sendable {
+    private let gate: FileSystemServiceFSEventRecoveryGate
+    private var released = false
+
+    fileprivate init(gate: FileSystemServiceFSEventRecoveryGate) {
+        self.gate = gate
+    }
+
+    func release() {
+        guard !released else { return }
+        released = true
+        gate.releasePublicationPermit()
+    }
+
+    deinit {
+        release()
+    }
+}
+
+/// A one-shot callback-side signal for the owning store. The handler is held by
+/// the same recovery coordinator as the publication permit, so installation,
+/// callback invalidation, and clearing cannot cross the publication cut.
+final class FileSystemServiceFSEventRecoverySignal: @unchecked Sendable {
+    private let gate: FileSystemServiceFSEventRecoveryGate
+
+    init(gate: FileSystemServiceFSEventRecoveryGate) {
+        self.gate = gate
+    }
+
+    func install(_ handler: (@Sendable () -> Void)?) {
+        let handlerToSignal = gate.installHandler(handler)
+        // A handler installed after callback invalidation must not miss the
+        // sticky recovery notification. Signal only after releasing the lock.
+        handlerToSignal?()
+    }
+
+    func clear() {
+        gate.clearHandler()
+    }
+
+    func signalOnce() {
+        let handler = gate.takeHandler()
+        handler?()
+    }
+}
+
 struct FileSystemMutationWaiter {
     let continuation: CheckedContinuation<Void, any Error>
 }
@@ -33,6 +175,16 @@ struct FileSystemInFlightMutation {
 struct FileSystemMutationDrainWaiter {
     let relativePaths: Set<String>
     let continuation: CheckedContinuation<Void, Never>
+}
+
+struct FileSystemExplicitlyManagedIgnoredRegistrationState {
+    let priorVisitedPathMembership: Bool
+    let priorVisitedItem: Bool?
+    let priorCatalogOwnership: Bool
+    let priorWatcherOwnership: Bool
+    var pendingOwnerIDs: Set<UUID>
+    var hasCommittedIgnoredOwner: Bool
+    var hasCommittedEligibleOwner: Bool
 }
 
 enum FileSystemMutationCompletion {
@@ -49,11 +201,70 @@ enum FileSystemMutationCompletion {
     }
 }
 
-final class FileSystemServiceFSEventCallbackContext {
-    weak var service: FileSystemService?
+final class FileSystemServiceFSEventCallbackContext: @unchecked Sendable {
+    let deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
+    let streamGeneration: UInt64
+    let ingressGeneration: UInt64
 
-    init(service: FileSystemService) {
-        self.service = service
+    private let lock = NSLock()
+    private weak var storedService: FileSystemService?
+
+    init(
+        service: FileSystemService,
+        deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation,
+        streamGeneration: UInt64,
+        ingressGeneration: UInt64
+    ) {
+        storedService = service
+        self.deliveryGeneration = deliveryGeneration
+        self.streamGeneration = streamGeneration
+        self.ingressGeneration = ingressGeneration
+    }
+
+    var service: FileSystemService? {
+        lock.withLock { storedService }
+    }
+
+    func detach() {
+        lock.withLock { storedService = nil }
+    }
+}
+
+final class FileSystemServiceFSEventCallbackReleaseHandle: @unchecked Sendable {
+    private let callbackContextPointer: UnsafeMutableRawPointer
+
+    init(callbackContextPointer: UnsafeMutableRawPointer) {
+        self.callbackContextPointer = callbackContextPointer
+    }
+
+    func finish() {
+        Unmanaged<FileSystemServiceFSEventCallbackContext>
+            .fromOpaque(callbackContextPointer)
+            .release()
+    }
+}
+
+final class FileSystemServiceFSEventTeardownHandle: @unchecked Sendable {
+    private let stream: FSEventStreamRef
+    private let callbackContextPointer: UnsafeMutableRawPointer?
+
+    init(
+        stream: FSEventStreamRef,
+        callbackContextPointer: UnsafeMutableRawPointer?
+    ) {
+        self.stream = stream
+        self.callbackContextPointer = callbackContextPointer
+    }
+
+    func finish() {
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        if let callbackContextPointer {
+            Unmanaged<FileSystemServiceFSEventCallbackContext>
+                .fromOpaque(callbackContextPointer)
+                .release()
+        }
     }
 }
 
@@ -64,6 +275,16 @@ actor FileSystemService {
     nonisolated let diagnosticRootToken = UUID()
     nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
     nonisolated let watcherEarlyFilter: FileSystemWatcherEarlyFilter
+    nonisolated let fseventDeliveryBarrier = FSEventAsyncDeliveryBarrier()
+    nonisolated let fseventRecoveryGate = FileSystemServiceFSEventRecoveryGate()
+    nonisolated var fseventRecoverySignal: FileSystemServiceFSEventRecoverySignal {
+        FileSystemServiceFSEventRecoverySignal(gate: fseventRecoveryGate)
+    }
+
+    nonisolated let fseventCallbackQueue = DispatchQueue(
+        label: "com.repoprompt.filesystem.fsevents.\(UUID().uuidString)",
+        qos: .utility
+    )
     static let maxPendingRawEvents = 50000
     static let overflowRescanEventFlags = FSEventStreamEventFlags(
         kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
@@ -247,12 +468,14 @@ actor FileSystemService {
     /// Ignored regular files retained only because an explicit app/MCP request manages them.
     /// Ordinary catalog files that later become ignored must not acquire this provenance.
     var explicitlyManagedIgnoredFilePaths = Set<String>()
+    var explicitlyManagedIgnoredRegistrationStates: [String: FileSystemExplicitlyManagedIgnoredRegistrationState] = [:]
 
     /// True => directory, False => file
     lazy var visitedItems = visitedInventory.items
 
     /// The FSEvent stream reference
     var fseventStreamRef: FSEventStreamRef?
+    var fseventStreamGeneration: UInt64 = 0
     /// The last durable FSEvents journal cut. Captured before the initial crawl so
     /// watcher startup can replay mutations that happen while the crawl is running.
     var nextFSEventStreamStartEventID: FSEventStreamEventId
@@ -287,8 +510,6 @@ actor FileSystemService {
     /// Retained FSEvent callback context. The context holds the service weakly so an
     /// un-stopped stream cannot keep the actor alive forever.
     var fseventCallbackContextPointer: UnsafeMutableRawPointer?
-    var seedWatcherActivationFlushInProgress = false
-    var seedWatcherActivationStopRequested = false
 
     /// The in-memory IgnoreRules instance for our path
     var ignoreRules: IgnoreRules
@@ -341,6 +562,10 @@ actor FileSystemService {
     var watcherBatchProcessingToken: UInt64?
     var nextWatcherBatchProcessingToken: UInt64 = 0
     var watcherIngressGeneration: UInt64 = 0
+    /// Once FSEvents reports EventIdsWrapped, this service cannot establish a
+    /// valid continuation of its existing stream. Keep it unavailable until a
+    /// fresh service/root activation establishes a new stream-scoped cut.
+    var fseventRecoveryRequired = false
     let coalescingDelay: TimeInterval = 0.2
 
     // MARK: - Event ID-based scan coalescing (prevents dropped events while deduping bursts)
