@@ -687,26 +687,74 @@ import XCTest
                 snapshotCaptured.fulfill()
                 await gate.wait()
             }
-            let saveTask = Task { () -> String? in
+            let saveTask = Task {
+                () -> (
+                    succeeded: Bool,
+                    authorityOutcome: DomainCommandOutcome?,
+                    workingCommitted: Bool,
+                    localProjectionPresentAtFailure: Bool,
+                    errorDescription: String?
+                ) in
                 do {
                     _ = try await manager.saveWorkspaceToFileAsync(
                         staleRename,
                         source: .renameWorkspace
                     )
-                    return nil
+                    return (true, nil, false, false, nil)
+                } catch let error as DomainWorkspaceAuthorityOperationError {
+                    return (
+                        false,
+                        error.outcome,
+                        error.workingCommitted,
+                        manager.workspace(withID: target.id) != nil,
+                        nil
+                    )
                 } catch {
-                    return error.localizedDescription
+                    return (
+                        false,
+                        nil,
+                        false,
+                        manager.workspace(withID: target.id) != nil,
+                        error.localizedDescription
+                    )
                 }
             }
             await fulfillment(of: [snapshotCaptured], timeout: 2)
+            XCTAssertNotNil(
+                manager.workspace(withID: target.id),
+                "The save must retain its local projection while the authority snapshot is suspended."
+            )
 
             let deletion = await manager.deleteWorkspacesAsync(workspaceIDs: [target.id])
             XCTAssertEqual(deletion.deletedWorkspaceIDs, [target.id])
 
             await gate.open()
-            let saveError = await saveTask.value
+            let saveResult = await saveTask.value
             manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil)
-            XCTAssertEqual(saveError, "The workspace is no longer available for persistence.")
+            XCTAssertFalse(
+                saveResult.succeeded,
+                "The stale direct save unexpectedly succeeded after confirmed deletion."
+            )
+            if let saveOutcome = saveResult.authorityOutcome {
+                XCTAssertEqual(saveOutcome.disposition, .invalid)
+                XCTAssertEqual(saveOutcome.errorCode, .workspaceUnavailable)
+                XCTAssertFalse(saveResult.workingCommitted)
+                XCTAssertEqual(
+                    WorkspacePersistenceFailureCategory.classify(domainErrorCode: saveOutcome.errorCode),
+                    .workspaceChanged
+                )
+            } else {
+                // WorkspaceDirectWriteError is file-private; its exact localized error is the
+                // only observable signal for the local-projection guard.
+                XCTAssertFalse(
+                    saveResult.localProjectionPresentAtFailure,
+                    "A local unavailable error must follow removal of the manager projection."
+                )
+                XCTAssertEqual(
+                    saveResult.errorDescription,
+                    "The workspace is no longer available for persistence."
+                )
+            }
 
             let authoritativeAfter = await runtime.workspaceStore.snapshot()
             XCTAssertFalse(authoritativeAfter.workspaces.contains {
