@@ -1,3 +1,6 @@
+import Darwin
+import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -620,6 +623,572 @@ final class MCPReadMutationPathContractTests: XCTestCase {
         )
     }
 
+    /// Exercises the shared WorkspaceFileEditHost create path. The data-preparation gate leaves
+    /// the real filesystem commit pending while an external creator claims the destination.
+    func testWorkspaceFileEditHostCreateLosingCreatorReturnsFileAlreadyExistsWithoutClobberingWinner() async throws {
+        try await assertWorkspaceFileEditHostCreatePreservesCompetingWinner(
+            fixtureName: "AtomicCreateCompetingCreator",
+            forcedRenameError: nil
+        )
+    }
+
+    /// Forces the supported-filesystem fallback so the regression exercises O_EXCL directly,
+    /// rather than only observing RENAME_EXCL returning EEXIST.
+    func testWorkspaceFileEditHostCreateOEXCLFallbackPreservesCompetingWinner() async throws {
+        try await assertWorkspaceFileEditHostCreatePreservesCompetingWinner(
+            fixtureName: "AtomicCreateOEXCLFallback",
+            forcedRenameError: ENOTSUP
+        )
+    }
+
+    func testWorkspaceFileEditHostCreateNativeRenameExclPublishesNewFile() async throws {
+        let root = try makeTemporaryDirectory(name: "AtomicCreateNativeRenameExclSuccess")
+        let destination = root.appendingPathComponent("nested/NewFile.swift")
+        let content = "native RENAME_EXCL publication succeeds\n"
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        let resolvedService = await store.fileSystemServiceForTesting(rootID: rootRecord.id)
+        let service = try XCTUnwrap(resolvedService)
+        let nativeSuccessProbe = Issue859ExclusiveRenameProbe()
+        await service.setCreateFileExclusiveRenameForTesting { source, destination in
+            let result = renamex_np(source, destination, UInt32(RENAME_EXCL))
+            if result == 0 {
+                nativeSuccessProbe.recordInvocation()
+                return 0
+            }
+            return errno
+        }
+
+        let host = WorkspaceFileEditHost(
+            store: store,
+            target: .create(path: destination.path),
+            lookupRootScope: .visibleWorkspace,
+            selectCreatedFiles: false
+        )
+        do {
+            try await host.writeText(
+                path: destination.path,
+                content: content,
+                overwrite: false
+            )
+        } catch {
+            await service.setCreateFileExclusiveRenameForTesting(nil)
+            throw error
+        }
+        await service.setCreateFileExclusiveRenameForTesting(nil)
+
+        XCTAssertTrue(nativeSuccessProbe.wasInvoked, "The local fixture must publish through native RENAME_EXCL, not its fallback")
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), content)
+    }
+
+    func testWorkspaceFileEditHostCreateOEXCLFallbackPublishesNewFile() async throws {
+        let root = try makeTemporaryDirectory(name: "AtomicCreateOEXCLFallbackSuccess")
+        let destination = root.appendingPathComponent("nested/NewFile.swift")
+        let content = "fallback publication succeeds\n"
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        guard let service = await store.fileSystemServiceForTesting(rootID: rootRecord.id) else {
+            return XCTFail("The isolated root must expose its filesystem service")
+        }
+        let renameProbe = Issue859ExclusiveRenameProbe()
+        await service.setCreateFileExclusiveRenameForTesting { _, _ in
+            renameProbe.recordInvocation()
+            return ENOTSUP
+        }
+
+        let host = WorkspaceFileEditHost(
+            store: store,
+            target: .create(path: destination.path),
+            lookupRootScope: .visibleWorkspace,
+            selectCreatedFiles: false
+        )
+        do {
+            try await host.writeText(
+                path: destination.path,
+                content: content,
+                overwrite: false
+            )
+        } catch {
+            await service.setCreateFileExclusiveRenameForTesting(nil)
+            throw error
+        }
+        await service.setCreateFileExclusiveRenameForTesting(nil)
+
+        XCTAssertTrue(renameProbe.wasInvoked)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), content)
+    }
+
+    func testWorkspaceFileEditHostCreateCleansOwnedTempAfterPostOpenFailure() async throws {
+        let root = try makeTemporaryDirectory(name: "AtomicCreateOwnedTempCleanup")
+        let destination = root.appendingPathComponent("nested/NewFile.swift")
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        guard let service = await store.fileSystemServiceForTesting(rootID: rootRecord.id) else {
+            return XCTFail("The isolated root must expose its filesystem service")
+        }
+        await service.setCreateFilePOSIXFailureAfterOpenForTesting(EIO)
+
+        let host = WorkspaceFileEditHost(
+            store: store,
+            target: .create(path: destination.path),
+            lookupRootScope: .visibleWorkspace,
+            selectCreatedFiles: false
+        )
+        do {
+            try await host.writeText(
+                path: destination.path,
+                content: "the owned temporary file must be removed\n",
+                overwrite: false
+            )
+            XCTFail("Expected the injected post-open write failure")
+        } catch FileSystemError.failedToCreateFile {
+            // The detached reconciler preserves the failed-create classification.
+        } catch {
+            XCTFail("Expected failedToCreateFile, got \(error)")
+        }
+        await service.setCreateFilePOSIXFailureAfterOpenForTesting(nil)
+
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: destination.deletingLastPathComponent(),
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertFalse(contents.contains { $0.lastPathComponent.hasPrefix(".repoprompt.create.") })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    func testWorkspaceFileEditHostCreateFallbackPostOpenFailurePreservesCompetingReplacement() async throws {
+        let root = try makeTemporaryDirectory(name: "AtomicCreateOEXCLFallbackPostOpenFailure")
+        let destination = root.appendingPathComponent("nested/NewFile.swift")
+        let winnerContent = "replacement after exclusive claim must survive\n"
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        guard let service = await store.fileSystemServiceForTesting(rootID: rootRecord.id) else {
+            return XCTFail("The isolated root must expose its filesystem service")
+        }
+        let renameProbe = Issue859ExclusiveRenameProbe()
+        await service.setCreateFileExclusiveRenameForTesting { _, _ in
+            renameProbe.recordInvocation()
+            return ENOTSUP
+        }
+        await service.setCreateFileFallbackPOSIXFailureAfterOpenForTesting { path in
+            try? winnerContent.write(toFile: path, atomically: true, encoding: .utf8)
+            return EIO
+        }
+
+        let host = WorkspaceFileEditHost(
+            store: store,
+            target: .create(path: destination.path),
+            lookupRootScope: .visibleWorkspace,
+            selectCreatedFiles: false
+        )
+        do {
+            try await host.writeText(
+                path: destination.path,
+                content: "incomplete bytes must not be retried blindly\n",
+                overwrite: false
+            )
+            XCTFail("Expected the injected fallback post-open failure")
+        } catch let error as FileSystemError {
+            guard case .incompleteFileCreation = error else {
+                return XCTFail("Expected incompleteFileCreation, got \(error)")
+            }
+            let message = error.localizedDescription
+            XCTAssertTrue(message.contains("incomplete output may remain"), message)
+            XCTAssertTrue(message.contains("do not blindly retry"), message)
+        } catch {
+            XCTFail("Expected incompleteFileCreation, got \(error)")
+        }
+        await service.setCreateFileExclusiveRenameForTesting(nil)
+        await service.setCreateFileFallbackPOSIXFailureAfterOpenForTesting(nil)
+
+        XCTAssertTrue(renameProbe.wasInvoked)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), winnerContent)
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: destination.deletingLastPathComponent(),
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertFalse(contents.contains { $0.lastPathComponent.hasPrefix(".repoprompt.create.") })
+    }
+
+    @MainActor
+    func testPublicMCPFileActionsCollisionReturnsExistingPathError() async throws {
+        let root = try makeTemporaryDirectory(name: "PublicMCPCreateCompetingCreator")
+        let destination = root.appendingPathComponent("nested/NewFile.swift")
+        let winnerContent = "public winner bytes must survive\n"
+        let loserContent = "public loser bytes must never replace\n"
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let (server, _) = try makeInProcessMCPFileActionsServer(store: store, root: root)
+        guard let rootID = await store.rootRefs(scope: .visibleWorkspace).first?.id,
+              let service = await store.fileSystemServiceForTesting(rootID: rootID)
+        else {
+            return XCTFail("The isolated root must expose its filesystem service")
+        }
+        let tool = try await inProcessFileActionsTool(from: server)
+        let gate = Issue859CreateGate()
+        await service.setCreateFileDataPreparationForTesting { content in
+            await gate.wait()
+            return Data(content.utf8)
+        }
+        let createTask = Task {
+            try await tool(fileActionArguments(
+                path: destination.path,
+                content: loserContent,
+                ifExists: "error"
+            ))
+        }
+        addTeardownBlock {
+            await gate.open()
+            _ = await createTask.result
+            await service.setCreateFileDataPreparationForTesting(nil)
+        }
+
+        guard await gate.waitUntilEntered() else {
+            await gate.open()
+            switch await createTask.result {
+            case .success:
+                XCTFail("The public losing create did not reach the data-preparation gate before the bounded observation expired")
+            case let .failure(error):
+                XCTFail("The public losing create failed before reaching the data-preparation gate: \(error)")
+            }
+            return
+        }
+        do {
+            try write(winnerContent, to: destination)
+        } catch {
+            await gate.open()
+            switch await createTask.result {
+            case .success:
+                XCTFail("The public losing create unexpectedly succeeded while recovering from the winner-write failure")
+            case let .failure(taskError):
+                guard let mcpError = taskError as? MCPError,
+                      String(describing: mcpError).contains("path already exists")
+                else {
+                    XCTFail("Unexpected public losing create failure while recovering from the winner-write failure: \(taskError)")
+                    throw taskError
+                }
+            }
+            throw error
+        }
+        await gate.open()
+
+        do {
+            _ = try await createTask.value
+            XCTFail("The public losing create must fail")
+        } catch let error as MCPError {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("path already exists"), message)
+        } catch {
+            XCTFail("Expected a public MCP existing-path error, got \(error)")
+        }
+        await service.setCreateFileDataPreparationForTesting(nil)
+
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), winnerContent)
+    }
+
+    @MainActor
+    func testPublicMCPFileActionsOverwriteReplacesRacedMissingDestination() async throws {
+        let root = try makeTemporaryDirectory(name: "PublicMCPCreateOverwriteRace")
+        let destination = root.appendingPathComponent("nested/NewFile.swift")
+        let winnerContent = "raced winner must be replaced\n"
+        let overwriteContent = "explicit overwrite content\n"
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let (server, _) = try makeInProcessMCPFileActionsServer(store: store, root: root)
+        guard let rootID = await store.rootRefs(scope: .visibleWorkspace).first?.id,
+              let service = await store.fileSystemServiceForTesting(rootID: rootID)
+        else {
+            return XCTFail("The isolated root must expose its filesystem service")
+        }
+        let tool = try await inProcessFileActionsTool(from: server)
+        let gate = Issue859CreateGate()
+        await service.setCreateFileDataPreparationForTesting { content in
+            await gate.wait()
+            return Data(content.utf8)
+        }
+        let createTask = Task {
+            try await tool(fileActionArguments(
+                path: destination.path,
+                content: overwriteContent,
+                ifExists: "overwrite"
+            ))
+        }
+        addTeardownBlock {
+            await gate.open()
+            _ = await createTask.result
+            await service.setCreateFileDataPreparationForTesting(nil)
+        }
+
+        guard await gate.waitUntilEntered() else {
+            await gate.open()
+            switch await createTask.result {
+            case .success:
+                XCTFail("The public overwrite create did not reach the data-preparation gate before the bounded observation expired")
+            case let .failure(error):
+                XCTFail("The public overwrite create failed before reaching the data-preparation gate: \(error)")
+            }
+            return
+        }
+        do {
+            try write(winnerContent, to: destination)
+        } catch {
+            await gate.open()
+            switch await createTask.result {
+            case .success:
+                break
+            case let .failure(taskError):
+                XCTFail("The public overwrite create failed while recovering from the winner-write failure: \(taskError)")
+            }
+            throw error
+        }
+        await gate.open()
+
+        let result = try await createTask.value
+        await service.setCreateFileDataPreparationForTesting(nil)
+        let reply = try XCTUnwrap(result.decode(ToolResultDTOs.FileActionReply.self))
+        XCTAssertEqual(reply.status, "ok")
+        XCTAssertEqual(reply.mutationState, "applied")
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), overwriteContent)
+    }
+
+    @MainActor
+    func testPublicMCPFileActionsOverwritePreservesRacedDirectory() async throws {
+        let root = try makeTemporaryDirectory(name: "PublicMCPCreateOverwriteRacedDirectory")
+        let destination = root.appendingPathComponent("nested/NewFile.swift")
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let (server, _) = try makeInProcessMCPFileActionsServer(store: store, root: root)
+        guard let rootID = await store.rootRefs(scope: .visibleWorkspace).first?.id,
+              let service = await store.fileSystemServiceForTesting(rootID: rootID)
+        else {
+            return XCTFail("The isolated root must expose its filesystem service")
+        }
+        let tool = try await inProcessFileActionsTool(from: server)
+        await service.setCreateFileDataPreparationForTesting { content in
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            return Data(content.utf8)
+        }
+        addTeardownBlock {
+            await service.setCreateFileDataPreparationForTesting(nil)
+        }
+
+        do {
+            _ = try await tool(fileActionArguments(
+                path: destination.path,
+                content: "directory must survive explicit overwrite\n",
+                ifExists: "overwrite"
+            ))
+            XCTFail("Expected explicit overwrite of a raced directory to fail")
+        } catch let error as MCPError {
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("directory"), message)
+        } catch {
+            XCTFail("Expected a public MCP directory error, got \(error)")
+        }
+        await service.setCreateFileDataPreparationForTesting(nil)
+
+        var isDirectory = ObjCBool(false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+    }
+
+    private func assertWorkspaceFileEditHostCreatePreservesCompetingWinner(
+        fixtureName: String,
+        forcedRenameError: Int32?
+    ) async throws {
+        let root = try makeTemporaryDirectory(name: fixtureName)
+        let destination = root.appendingPathComponent("nested/NewFile.swift")
+        let winnerContent = "winner bytes must survive\n"
+        let loserContent = "loser bytes must never replace\n"
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        guard let service = await store.fileSystemServiceForTesting(rootID: rootRecord.id) else {
+            return XCTFail("The isolated root must expose its filesystem service")
+        }
+        let gate = Issue859CreateGate()
+        let renameProbe = Issue859ExclusiveRenameProbe()
+        let mutationService = WorkspaceFileMutationService(store: store)
+        let target: WorkspaceFileEditHost.Target = if let existing = await mutationService.exactExistingFile(
+            destination.path,
+            rootScope: .visibleWorkspace
+        ) {
+            .existing(existing)
+        } else {
+            .create(path: destination.path)
+        }
+        guard case .create = target else {
+            return XCTFail("The isolated destination must be missing before the competing create")
+        }
+        let host = WorkspaceFileEditHost(
+            store: store,
+            target: target,
+            lookupRootScope: .visibleWorkspace,
+            selectCreatedFiles: false
+        )
+        if let forcedRenameError {
+            await service.setCreateFileExclusiveRenameForTesting { _, _ in
+                renameProbe.recordInvocation()
+                return forcedRenameError
+            }
+        }
+        await service.setCreateFileDataPreparationForTesting { content in
+            await gate.wait()
+            return Data(content.utf8)
+        }
+        let createTask = Task {
+            try await host.writeText(
+                path: destination.path,
+                content: loserContent,
+                overwrite: false
+            )
+        }
+        addTeardownBlock {
+            await gate.open()
+            _ = await createTask.result
+            await service.setCreateFileDataPreparationForTesting(nil)
+            await service.setCreateFileExclusiveRenameForTesting(nil)
+        }
+
+        guard await gate.waitUntilEntered() else {
+            await gate.open()
+            switch await createTask.result {
+            case .success:
+                XCTFail("The losing create did not reach the data-preparation gate before the bounded observation expired")
+            case let .failure(error):
+                XCTFail("The losing create failed before reaching the data-preparation gate: \(error)")
+            }
+            return
+        }
+        do {
+            try write(winnerContent, to: destination)
+        } catch {
+            await gate.open()
+            switch await createTask.result {
+            case .success:
+                XCTFail("The losing create unexpectedly succeeded while recovering from the winner-write failure")
+            case let .failure(taskError):
+                guard let filesystemError = taskError as? FileSystemError,
+                      case .fileAlreadyExists = filesystemError
+                else {
+                    XCTFail("Unexpected losing create failure while recovering from the winner-write failure: \(taskError)")
+                    throw taskError
+                }
+            }
+            throw error
+        }
+        await gate.open()
+
+        do {
+            try await createTask.value
+            XCTFail("The losing create must fail with fileAlreadyExists")
+        } catch FileSystemError.fileAlreadyExists {
+            // The exclusive commit reported the expected typed outcome.
+        } catch {
+            XCTFail("Expected fileAlreadyExists, got \(error)")
+        }
+        await service.setCreateFileDataPreparationForTesting(nil)
+        await service.setCreateFileExclusiveRenameForTesting(nil)
+        if forcedRenameError != nil {
+            XCTAssertTrue(
+                renameProbe.wasInvoked,
+                "The fallback regression must invoke the exclusive-rename seam"
+            )
+        }
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), winnerContent)
+    }
+
+    @MainActor
+    private func makeInProcessMCPFileActionsServer(
+        store: WorkspaceFileContextStore,
+        root: URL
+    ) throws -> (server: MCPServerViewModel, connectionID: UUID) {
+        let fileManager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let aiQueriesService = AIQueriesService(keyManager: keyManager)
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: aiQueriesService,
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let settingsManager = WindowSettingsManager(windowID: -859)
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            aiQueriesService: aiQueriesService,
+            apiSettingsViewModel: apiSettings,
+            windowID: -859,
+            settingsManager: settingsManager
+        )
+        let workspaceManager = WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+        let workspace = WorkspaceModel(name: "Issue 859", repoPaths: [root.path])
+        workspaceManager.workspaces = [workspace]
+        workspaceManager.activeWorkspace = workspace
+        let oracle = OracleViewModel(
+            aiQueriesService: aiQueriesService,
+            promptViewModel: prompt,
+            workspaceManager: workspaceManager,
+            chatData: ChatDataService()
+        )
+        let service = MCPService(
+            hostBootstrapOperation: {},
+            controllerStartOperation: {},
+            controllerFullShutdownOperation: {}
+        )
+        let server = MCPServerViewModel(
+            service: service,
+            promptVM: prompt,
+            oracleVM: oracle,
+            workspaceManager: workspaceManager,
+            windowID: -859,
+            workspaceSearch: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                throw MCPError.internalError("search is not used by the file_actions regression")
+            },
+            ensureGitDataRootLoaded: { _, _ in
+                throw MCPError.internalError("Git-data loading is not used by the file_actions regression")
+            }
+        )
+        let connectionID = UUID()
+        try server.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: nil,
+            tabID: XCTUnwrap(workspace.activeComposeTabID),
+            workspaceID: workspace.id,
+            windowID: -859
+        )
+        server.setRequestMetadataOverrideForTesting(
+            MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: nil,
+                windowID: -859
+            )
+        )
+        return (server, connectionID)
+    }
+
+    @MainActor
+    private func inProcessFileActionsTool(from server: MCPServerViewModel) async throws -> RepoPromptApp.Tool {
+        let tools = await server.windowMCPTools
+        return try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.fileActions })
+    }
+
+    private func fileActionArguments(
+        path: String,
+        content: String,
+        ifExists: String
+    ) -> [String: Value] {
+        [
+            "action": .string("create"),
+            "path": .string(path),
+            "content": .string(content),
+            "if_exists": .string(ifExists)
+        ]
+    }
+
     func testMissingResolvedTargetFailsInsteadOfReadingEmptyContent() async throws {
         let root = try makeTemporaryDirectory(name: "MissingResolvedTarget")
         let fileURL = root.appendingPathComponent("Target.swift")
@@ -658,5 +1227,109 @@ final class MCPReadMutationPathContractTests: XCTestCase {
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+private final class Issue859ExclusiveRenameProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var invocationCount = 0
+
+    func recordInvocation() {
+        lock.lock()
+        invocationCount += 1
+        lock.unlock()
+    }
+
+    var wasInvoked: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return invocationCount > 0
+    }
+}
+
+private actor Issue859CreateGate {
+    private enum EntryObservation: Equatable {
+        case entered
+        case timedOut
+    }
+
+    private static let entryObservationTimeoutNanoseconds: UInt64 = 1_000_000_000
+
+    private var enteredContinuation: CheckedContinuation<EntryObservation, Never>?
+    private var openContinuation: CheckedContinuation<Void, Never>?
+    private var hasEntered = false
+    private var isOpen = false
+    private var entryWaitCancelled = false
+
+    func wait() async {
+        if !hasEntered {
+            hasEntered = true
+            enteredContinuation?.resume(returning: .entered)
+            enteredContinuation = nil
+        }
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            if isOpen {
+                continuation.resume()
+            } else {
+                openContinuation = continuation
+            }
+        }
+    }
+
+    func waitUntilEntered() async -> Bool {
+        guard !hasEntered else { return true }
+        return await withTaskCancellationHandler(operation: {
+            await withTaskGroup(of: EntryObservation.self) { group in
+                group.addTask {
+                    await self.waitForEntry()
+                }
+                group.addTask {
+                    do {
+                        try await Task.sleep(nanoseconds: Self.entryObservationTimeoutNanoseconds)
+                    } catch {
+                        // Cancellation only ends the timer; entry remains event-driven.
+                    }
+                    return .timedOut
+                }
+                let observation = await group.next() ?? .timedOut
+                if observation == .timedOut {
+                    await self.cancelEntryWaiter()
+                }
+                group.cancelAll()
+                return observation == .entered
+            }
+        }, onCancel: {
+            Task { await self.cancelEntryWaiter() }
+        })
+    }
+
+    private func waitForEntry() async -> EntryObservation {
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if hasEntered {
+                    continuation.resume(returning: .entered)
+                } else if entryWaitCancelled {
+                    continuation.resume(returning: .timedOut)
+                } else {
+                    enteredContinuation = continuation
+                }
+            }
+        }, onCancel: {
+            Task { await self.cancelEntryWaiter() }
+        })
+    }
+
+    private func cancelEntryWaiter() {
+        entryWaitCancelled = true
+        enteredContinuation?.resume(returning: .timedOut)
+        enteredContinuation = nil
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        openContinuation?.resume()
+        openContinuation = nil
     }
 }

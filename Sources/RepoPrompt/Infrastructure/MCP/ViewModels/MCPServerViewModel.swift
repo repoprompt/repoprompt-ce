@@ -6489,6 +6489,10 @@ final class MCPServerViewModel: ObservableObject {
             try await host.writeText(path: path, content: content, overwrite: overwrite)
         } catch is CancellationError {
             throw CancellationError()
+        } catch FileSystemError.fileAlreadyExists {
+            throw MCPError.invalidParams("path already exists: \(path)")
+        } catch FileSystemError.isDirectory {
+            throw MCPError.invalidParams("path resolves to a directory: \(path)")
         } catch let fmErr as FileManagerError {
             throw await mapFileManagerErrorToMCP(fmErr, action: "create", path: path)
         } catch let mcpErr as MCPError {
