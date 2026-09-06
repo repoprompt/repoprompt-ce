@@ -6,6 +6,45 @@ import RepoPromptShared
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
+    func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
+        let root = try RepoRoot.url()
+        let snapshotURL = root.appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")
+        let updateMarker = root.appendingPathComponent(".build/update-mcp-domain-schema-review-snapshot")
+        let generated = try MCPDomainCanonicalToolDefinitions.reviewSnapshotData()
+        if FileManager.default.fileExists(atPath: updateMarker.path) {
+            try generated.write(to: snapshotURL, options: .atomic)
+            try FileManager.default.removeItem(at: updateMarker)
+        }
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), generated)
+    }
+
+    func testCanonicalAgentSchemasAdvertiseCursorModelParameterInputs() throws {
+        for toolName in ["agent_run", "agent_manage"] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+            let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+            let parameters = try XCTUnwrap(properties["model_parameters"]?.objectValue, toolName)
+            XCTAssertEqual(parameters["type"], .string("array"))
+            let items = try XCTUnwrap(parameters["items"]?.objectValue)
+            XCTAssertEqual(items["required"], .array([.string("config_id"), .string("value")]))
+            let itemProperties = try XCTUnwrap(items["properties"]?.objectValue)
+            XCTAssertEqual(itemProperties["config_id"]?.objectValue?["type"], .string("string"))
+            XCTAssertEqual(itemProperties["value"]?.objectValue?["type"], .string("string"))
+            XCTAssertTrue(definition.description.contains("model_parameters"), toolName)
+        }
+    }
+
+    func testHeadlessLaunchRejectsUnsupportedModelParametersBeforeProviderStartup() throws {
+        XCTAssertThrowsError(try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
+            "message": .string("Reply OK"),
+            "model_parameters": .array([
+                .object(["config_id": .string("effort"), "value": .string("low")])
+            ])
+        ])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("app-backed Cursor"))
+        }
+    }
+
     func testHeadlessAgentManageSchemaAdvertisesListWorkflows() throws {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "agent_manage"))
         let encoded = try JSONEncoder().encode(definition.inputSchema)

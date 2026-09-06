@@ -145,8 +145,8 @@
         "behavior": "defaults_to_action",
         "default_action": "snapshot",
         "source_evidence": {
-          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift",
-          "marker": "args[\"op\"]?.stringValue ?? \"snapshot\""
+          "path": "Sources/RepoPromptDomainRuntime/MCPPromptContextOperation.swift",
+          "marker": "let defaultOperation = toolName == \"workspace_context\" ? \"snapshot\" : \"get\""
         }
       },
       {
@@ -154,8 +154,8 @@
         "behavior": "defaults_to_action",
         "default_action": "get",
         "source_evidence": {
-          "path": "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift",
-          "marker": "args[\"op\"]?.stringValue ?? \"get\""
+          "path": "Sources/RepoPromptDomainRuntime/MCPPromptContextOperation.swift",
+          "marker": "let defaultOperation = toolName == \"workspace_context\" ? \"snapshot\" : \"get\""
         }
       },
       {

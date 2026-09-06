@@ -5702,6 +5702,20 @@ extension ToolOutputFormatter {
                 agentLine += " · reasoning `\(reasoning)`"
             }
             lines.append(agentLine)
+            if let parameters = agent?["model_parameters"]?.arrayValue,
+               !parameters.isEmpty
+            {
+                let selected = parameters.compactMap { parameter -> String? in
+                    guard let selection = parameter.objectValue,
+                          let configID = selection["config_id"]?.stringValue,
+                          let value = selection["value"]?.stringValue
+                    else { return nil }
+                    return "`\(configID)=\(value)`"
+                }
+                if !selected.isEmpty {
+                    lines.append("- Model parameters: \(selected.joined(separator: ", "))")
+                }
+            }
         }
         if let interactionKind, !interactionKind.isEmpty {
             lines.append("- Interaction: **\(interactionKind)**")
@@ -6049,6 +6063,20 @@ extension ToolOutputFormatter {
                     agentLine += " · `\(model)`"
                 }
                 lines.append(agentLine)
+                if let parameters = agentObject["model_parameters"]?.arrayValue,
+                   !parameters.isEmpty
+                {
+                    let selected = parameters.compactMap { parameter -> String? in
+                        guard let object = parameter.objectValue,
+                              let configID = object["config_id"]?.stringValue,
+                              let value = object["value"]?.stringValue
+                        else { return nil }
+                        return "`\(configID)=\(value)`"
+                    }
+                    if !selected.isEmpty {
+                        lines.append("- Model parameters: \(selected.joined(separator: ", "))")
+                    }
+                }
             }
         } else if let agent = object["agent"]?.stringValue, !agent.isEmpty {
             lines.append("- Agent: **\(agent)**")
@@ -6139,6 +6167,27 @@ extension ToolOutputFormatter {
                         lines.append("  `\(agentPrefix)\(family.base)-{\(effortList)}` — \(family.name)")
                     }
                 }
+                for model in models {
+                    guard let modelObject = model.objectValue,
+                          let modelID = modelObject["model_id"]?.stringValue,
+                          let parameters = modelObject["model_parameters"]?.arrayValue,
+                          !parameters.isEmpty
+                    else { continue }
+                    lines.append("  Parameters for `\(modelID)`:")
+                    for parameter in parameters {
+                        guard let parameterObject = parameter.objectValue,
+                              let configID = parameterObject["config_id"]?.stringValue,
+                              let parameterName = parameterObject["name"]?.stringValue,
+                              let choices = parameterObject["choices"]?.arrayValue
+                        else { continue }
+                        let choiceValues = choices.compactMap {
+                            $0.objectValue?["value"]?.stringValue
+                        }.joined(separator: "|")
+                        let current = parameterObject["current_value"]?.stringValue
+                        let currentSuffix = current.map { " (current: `\($0)`)" } ?? ""
+                        lines.append("    `\(configID)` — \(parameterName): `{\(choiceValues)}`\(currentSuffix)")
+                    }
+                }
             }
         }
         if let sessions = object["sessions"]?.arrayValue {
@@ -6155,6 +6204,16 @@ extension ToolOutputFormatter {
                 }
                 if !state.isEmpty { parts.append(state) }
                 if !agent.isEmpty { parts.append(agent) }
+                if let parameters = agentObject?["model_parameters"]?.arrayValue {
+                    let selected = parameters.compactMap { parameter -> String? in
+                        guard let object = parameter.objectValue,
+                              let configID = object["config_id"]?.stringValue,
+                              let value = object["value"]?.stringValue
+                        else { return nil }
+                        return "\(configID)=\(value)"
+                    }
+                    if !selected.isEmpty { parts.append(selected.joined(separator: ",")) }
+                }
                 lines.append("  - \(parts.joined(separator: " · "))")
             }
         }

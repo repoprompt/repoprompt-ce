@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-09-05. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-09-06. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -31,7 +31,7 @@ same numeric version.
 | absent | `<= legacyUnlineagedSchemaVersionCeiling` | Accept as legacy OSS CE. |
 | absent | `> legacyUnlineagedSchemaVersionCeiling` | Preserve and block saves as incompatible/foreign, permanently. |
 | header is undecodable but bytes are valid JSON | n/a | Preserve and block saves as incompatible/foreign. |
-| bytes are not JSON | n/a | Back up as corrupt and write current defaults if the backup succeeds. |
+| bytes are not JSON | n/a | Preserve in place and block saves for explicit recovery; startup never replaces it with defaults. |
 
 ## Minimum schema stamping
 
@@ -81,10 +81,30 @@ is frozen from released v1.3.0 commit `b8042678fac558842ef4bc37027d0cd26246fdd6`
 That typed scalar shape supports through v4 and has no Context Builder group, so it
 rejects a v5 file rather than silently dropping that group. Existing same-lineage v4
 files containing Context Builder content are upgraded raw-preservingly before a subsequent
-old write on the non-interleaved, single-writer path. This does not claim cross-process ordering;
-#806 remains unresolved. Do not treat this as a lossless v1.3 round-trip guarantee for
-v4 files; genuine v4 workspace-profile compatibility remains outside the v1.0.28
-rollback guarantee.
+ordinary save. Current CE writers serialize this transaction and fence their observed raw
+generation; older released binaries remain outside that cooperative contract. Do not treat
+this as a lossless v1.3 round-trip guarantee for v4 files; genuine v4 workspace-profile
+compatibility remains outside the v1.0.28 rollback guarantee.
+
+## Verified recovery and unknown-field preservation
+
+Schema v5 is supported for Context Builder behavior. Valid v5 documents load
+normally; do not reinterpret their marker as an unsupported experimental schema
+or downgrade them during load. This includes files written while older builds
+still supported only v4.
+
+The existing redundant-v4 repair now verifies its backup byte-for-byte, checks
+that the source has not changed during backup, and verifies the atomic replacement
+before unblocking persistence. Backup or replacement verification failures keep
+saves blocked. Unknown fields remain in the raw repaired document.
+
+Ordinary saves now apply the difference between the last typed projection and the
+new projection to the current raw JSON. Unknown fields and unchanged external
+fields survive unrelated preference edits, including after restart. Removing a
+known setting removes that setting; replacing a scalar or array intentionally
+replaces that value. Explicitly removed workspace-setting entries are removed as a
+whole. Startup migrations retain their existing targeted raw-JSON migration path.
+The on-disk future/foreign header guard still runs before saving.
 
 ## Frozen legacy ceiling
 
@@ -112,10 +132,12 @@ the preserved file until the user chooses an action:
 - **Incompatible/foreign JSON**: offer compatible import. Import backs up the original
   byte-for-byte, decodes CE-known fields, writes a current-schema CE file, and leaves
   unknown fields only in the backup.
+- **Malformed/unreadable settings**: preserve the primary file in place and offer explicit
+  backup/reset recovery. Startup never backs it up or replaces it with provisional defaults.
 - **Save failure**: offer retry before reset. If a raw-preserving startup migration
   failed, retry repeats that same raw-preserving transaction; it records the typed document
   from the failed attempt and overlays only changed, explicitly owned known fields onto the
-  latest raw JSON, including known optional removals. Unknown root and nested fields remain,
+  unchanged observed raw JSON, including known optional removals. Unknown root and nested fields remain,
   and ordinary typed saves remain blocked until the preserving retry succeeds or the user
   explicitly chooses backup/reset.
 
@@ -128,12 +150,35 @@ stale mirror so the build default applies, and successful user-initiated recover
 resynchronizes the mirror from the replacement current-schema document. None of these
 mirror decisions bypass the blocked file's byte-preservation and save latch.
 
-Every save re-checks the on-disk header before writing. This matters because CE dev builds
-can share the live app support folder; a future/foreign file may appear after launch. This
-is a fail-closed header preflight, not a compare-and-swap transaction: it does not protect
-the read/merge/write interval from a non-cooperating older writer. The supported-writer
-ownership and atomic-CAS design for that interval remains unresolved in #806 and must not
-be represented as closed by this preflight.
+Current CE writers share a nonblocking transaction lock in `globalSettings.json.lock`.
+The stable sidecar is never deleted and contains no PID ownership protocol; the kernel
+releases the descriptor lock when a transaction finishes or its process exits. All settings
+mutation paths, including initialization, normalization, migrations, imports and recovery,
+hold that lock from raw read through backup/replacement and generation bookkeeping.
+Ordinary saves and migrations compare the exact on-disk bytes with the snapshot from which
+the live typed document was loaded. Another writer's change therefore requires reload even
+when both files have the same supported schema. Atomic replacement alone does not prevent
+lost updates, and a lock without this stale-input check would still permit them.
+
+A busy save offers retry. If a previously observed file is missing, explicit “Save current
+settings” can recreate it from retained in-memory values, but only after rechecking absence
+under the lock; an intervening replacement is rejected. Changed content or an initial
+read/lock failure offers explicit
+reload with a warning that unsaved in-memory edits will be replaced. Failed reload retains
+the live document. Provisional startup defaults are never authorized to overwrite a file;
+only confirmed first-time absence under the lock may create defaults. Successful reload
+retires old pending migration intent and computes migration from the newly loaded document.
+A failed explicit recovery retains its intended missing-file generation for retry after
+moving the original aside, and rejects any intervening replacement by another writer.
+Compatible import copies its backup before atomic replacement; a failed write keeps the
+original primary file and its preservation block, so retry repeats explicit import instead
+of saving provisional defaults.
+
+Close older CE versions before upgrading or using this shared settings location. Older
+released binaries and arbitrary external editors do not honor this cooperative protocol;
+the sidecar does not make them safe concurrent writers. Current debug and release builds
+use the same protocol and file identity. No lifetime app lock or new settings namespace is
+required for the supported cooperative-current-writer contract.
 
 Blocked-persistence warnings may be dismissed in workspace windows for the current app
 session. The store owns dismissal across workspace windows and clears it when the reason
@@ -320,3 +365,12 @@ Those keys write the global backing fields. Workspace-specific Agent Models over
 - Do not add a second global Agent Models blob unless there is a separate migration plan; the global profile intentionally maps to existing fields.
 - Existing workspaces default to `Use global settings`. Workspace overrides are opt-in and materialized from the current global profile.
 - Orphaned workspace-keyed settings are intentionally retained. Pruning remains deferred until authoritative workspace IDs can drive one atomic sweep across every workspace-keyed settings map.
+
+## Unit-test defaults
+
+Debug builds detect SwiftPM/hosted XCTest when resolving the default settings file
+and UserDefaults suite. Those defaults use a per-run temporary settings directory
+and a separate defaults suite, so incidental initialization of GlobalSettingsStore.shared
+cannot normalize, seed, or overwrite the real user's settings. Tests that need
+specific files still inject GlobalSettingsFileStore(fileURL:) and their own suite.
+Packaged application processes retain the ordinary Application Support location.

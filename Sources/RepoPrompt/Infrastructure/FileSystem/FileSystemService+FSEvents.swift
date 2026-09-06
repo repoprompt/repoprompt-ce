@@ -18,7 +18,44 @@ struct FSEventCallbackPayload {
     }
 }
 
+struct FileSystemExplicitlyManagedRegularFileRegistrationToken: Hashable {
+    fileprivate let ownerID: UUID
+    fileprivate let serviceID: UUID
+    fileprivate let relativePath: String
+    fileprivate let preservesIgnoredProvenance: Bool
+}
+
+struct FileSystemExplicitlyManagedRegularFileRegistration {
+    let eligibility: CatalogRegularFileEligibility
+    let token: FileSystemExplicitlyManagedRegularFileRegistrationToken?
+}
+
+#if DEBUG
+    struct FileSystemExplicitlyManagedIgnoredRegistrationSnapshot: Equatable {
+        let pendingOwnerCount: Int
+        let hasCommittedOwner: Bool
+        let visitedItem: Bool?
+        let isVisited: Bool
+        let isRegistered: Bool
+        let watcherExemptsPath: Bool
+    }
+#endif
+
 extension FileSystemService {
+    func watcherConfigurationForRootRecovery() -> (
+        respectRepoIgnore: Bool,
+        respectCursorignore: Bool,
+        skipSymlinks: Bool,
+        enableHierarchicalIgnores: Bool
+    ) {
+        (
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: respectCursorignore,
+            skipSymlinks: skipSymlinks,
+            enableHierarchicalIgnores: enableHierarchicalIgnores
+        )
+    }
+
     // MARK: - Public watchers API
 
     /// Returns ordered publications whenever changes or watcher progress are detected.
@@ -36,12 +73,64 @@ extension FileSystemService {
         guard seedInitializationState == nil else {
             throw FileSystemSeedReplayError.initializationAlreadyActive
         }
+        guard !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired
+        else {
+            throw FileSystemWatcherActivationError.eventIDsWrapped(path: path)
+        }
         try startFSEventStream()
+        var activationStreamGeneration: UInt64?
+        var activationDeliveryGeneration: FSEventAsyncDeliveryBarrier.Generation?
         if let stream = fseventStreamRef {
-            FSEventStreamFlushSync(stream)
+            let streamGeneration = fseventStreamGeneration
+            activationStreamGeneration = streamGeneration
+            let deliveryGeneration = fseventDeliveryBarrier.currentGeneration
+            activationDeliveryGeneration = deliveryGeneration
+            let flushTarget = FSEventStreamFlushAsync(stream)
+            let delivered = await fseventDeliveryBarrier.waitUntilDelivered(
+                flushTarget,
+                generation: deliveryGeneration
+            )
+            guard fseventStreamGeneration == streamGeneration else {
+                if fseventRecoveryRequired || fseventRecoveryGate.isRequired {
+                    throw FileSystemWatcherActivationError.eventIDsWrapped(path: path)
+                }
+                return
+            }
+            guard delivered else {
+                if fseventDeliveryBarrier.currentGeneration != deliveryGeneration {
+                    fseventRecoveryRequired = true
+                    stopFSEventStream(expectedGeneration: streamGeneration)
+                    throw FileSystemWatcherActivationError.eventIDsWrapped(path: path)
+                }
+                stopFSEventStream(expectedGeneration: streamGeneration)
+                throw FileSystemWatcherActivationError.deliveryBarrierTimedOut(path: path)
+            }
+            // FSEventStreamFlushAsync is scoped to this stream. Crossing the
+            // same stream's dispatch queue makes callbacks queued before the
+            // flush marker visible before the accepted-ingress cut; it does not
+            // impose a global event-ID watermark across roots.
+            fseventCallbackQueue.sync {}
+            guard fseventDeliveryBarrier.currentGeneration == deliveryGeneration,
+                  !fseventRecoveryGate.isRequired
+            else {
+                fseventRecoveryRequired = true
+                stopFSEventStream(expectedGeneration: streamGeneration)
+                throw FileSystemWatcherActivationError.eventIDsWrapped(path: path)
+            }
         }
         let acceptedCut = captureAcceptedWatcherWatermark()
         _ = await flushPendingEventsNow(throughAcceptedWatcherWatermark: acceptedCut)
+        guard !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired,
+              activationDeliveryGeneration.map({ fseventDeliveryBarrier.currentGeneration == $0 }) ?? true
+        else {
+            fseventRecoveryRequired = true
+            if let activationStreamGeneration {
+                _ = stopFSEventStream(expectedGeneration: activationStreamGeneration)
+            }
+            throw FileSystemWatcherActivationError.eventIDsWrapped(path: path)
+        }
     }
 
     public func fileExistsOnDisk(relativePath: String) -> Bool {
@@ -80,10 +169,16 @@ extension FileSystemService {
         var isDirectory = ObjCBool(false)
         guard fm.fileExists(atPath: standardizedAbsolutePath, isDirectory: &isDirectory), !isDirectory.boolValue else { return false }
         if let values = try? URL(fileURLWithPath: standardizedAbsolutePath).resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-            if values.isSymbolicLink == true { return false }
-            if values.isRegularFile == false { return false }
+            if values.isSymbolicLink == true {
+                return false
+            }
+            if values.isRegularFile == false {
+                return false
+            }
         }
-        if skipSymlinks, pathContainsSymlinkComponent(relativePath: relativePath) { return false }
+        if skipSymlinks, pathContainsSymlinkComponent(relativePath: relativePath) {
+            return false
+        }
         outcome = "current"
         return true
     }
@@ -102,7 +197,9 @@ extension FileSystemService {
 
         var isDirectory = ObjCBool(false)
         guard fm.fileExists(atPath: standardizedAbsolutePath, isDirectory: &isDirectory), isDirectory.boolValue else { return false }
-        if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) { return false }
+        if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) {
+            return false
+        }
         let canonicalPath = URL(fileURLWithPath: standardizedAbsolutePath).resolvingSymlinksInPath().path
         let canonicalPrefix = canonicalRootPath.hasSuffix("/") ? canonicalRootPath : canonicalRootPath + "/"
         guard canonicalPath == canonicalRootPath || canonicalPath.hasPrefix(canonicalPrefix) else { return false }
@@ -129,8 +226,12 @@ extension FileSystemService {
         }
         let url = URL(fileURLWithPath: standardizedAbsolutePath)
         if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-            if values.isSymbolicLink == true { return .ineligible(.symbolicLink) }
-            if values.isRegularFile == false { return .ineligible(.nonRegularFile) }
+            if values.isSymbolicLink == true {
+                return .ineligible(.symbolicLink)
+            }
+            if values.isRegularFile == false {
+                return .ineligible(.nonRegularFile)
+            }
         }
         if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) {
             return .ineligible(.symlinkComponent)
@@ -191,21 +292,205 @@ extension FileSystemService {
         )
     }
 
-    func registerExplicitlyManagedRegularFile(relativePath rawRelativePath: String) async -> CatalogRegularFileEligibility {
+    func beginExplicitlyManagedRegularFileRegistration(
+        relativePath rawRelativePath: String
+    ) async -> FileSystemExplicitlyManagedRegularFileRegistration {
         let eligibility = await catalogRegularFileEligibility(relativePath: rawRelativePath)
+        let relativePath = (rawRelativePath as NSString).standardizingPath
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         switch eligibility {
-        case .eligible, .ineligible(.ignored):
-            let relativePath = (rawRelativePath as NSString).standardizingPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        case .eligible:
+            let token: FileSystemExplicitlyManagedRegularFileRegistrationToken?
+            if var registrationState = explicitlyManagedIgnoredRegistrationStates[relativePath] {
+                let eligibleToken = FileSystemExplicitlyManagedRegularFileRegistrationToken(
+                    ownerID: UUID(),
+                    serviceID: diagnosticRootToken,
+                    relativePath: relativePath,
+                    preservesIgnoredProvenance: false
+                )
+                registrationState.pendingOwnerIDs.insert(eligibleToken.ownerID)
+                explicitlyManagedIgnoredRegistrationStates[relativePath] = registrationState
+                token = eligibleToken
+            } else {
+                token = nil
+            }
             visitedPaths.insert(relativePath)
             visitedItems[relativePath] = false
-            if case .ineligible(.ignored) = eligibility {
+            return FileSystemExplicitlyManagedRegularFileRegistration(
+                eligibility: eligibility,
+                token: token
+            )
+        case .ineligible(.ignored):
+            let token = FileSystemExplicitlyManagedRegularFileRegistrationToken(
+                ownerID: UUID(),
+                serviceID: diagnosticRootToken,
+                relativePath: relativePath,
+                preservesIgnoredProvenance: true
+            )
+            var registrationState = explicitlyManagedIgnoredRegistrationStates[relativePath] ??
+                FileSystemExplicitlyManagedIgnoredRegistrationState(
+                    priorVisitedPathMembership: visitedPaths.contains(relativePath),
+                    priorVisitedItem: visitedItems[relativePath],
+                    priorCatalogOwnership: explicitlyManagedIgnoredFilePaths.contains(relativePath),
+                    priorWatcherOwnership: watcherEarlyFilter.containsExplicitlyManagedIgnoredFile(relativePath),
+                    pendingOwnerIDs: [],
+                    hasCommittedIgnoredOwner: explicitlyManagedIgnoredFilePaths.contains(relativePath),
+                    hasCommittedEligibleOwner: false
+                )
+            registrationState.pendingOwnerIDs.insert(token.ownerID)
+            explicitlyManagedIgnoredRegistrationStates[relativePath] = registrationState
+            visitedPaths.insert(relativePath)
+            visitedItems[relativePath] = false
+            explicitlyManagedIgnoredFilePaths.insert(relativePath)
+            watcherEarlyFilter.addExplicitlyManagedIgnoredFile(relativePath)
+            return FileSystemExplicitlyManagedRegularFileRegistration(
+                eligibility: eligibility,
+                token: token
+            )
+        case .ineligible:
+            return FileSystemExplicitlyManagedRegularFileRegistration(
+                eligibility: eligibility,
+                token: nil
+            )
+        }
+    }
+
+    @discardableResult
+    func commitExplicitlyManagedRegularFileRegistration(
+        _ token: FileSystemExplicitlyManagedRegularFileRegistrationToken
+    ) -> Bool {
+        guard token.serviceID == diagnosticRootToken,
+              var registrationState = explicitlyManagedIgnoredRegistrationStates[token.relativePath],
+              registrationState.pendingOwnerIDs.remove(token.ownerID) != nil
+        else { return false }
+
+        if token.preservesIgnoredProvenance {
+            registrationState.hasCommittedIgnoredOwner = true
+        } else {
+            registrationState.hasCommittedEligibleOwner = true
+        }
+        settleExplicitlyManagedRegularFileRegistrationIfPossible(
+            relativePath: token.relativePath,
+            state: registrationState
+        )
+        return true
+    }
+
+    @discardableResult
+    func rollbackExplicitlyManagedRegularFileRegistration(
+        _ token: FileSystemExplicitlyManagedRegularFileRegistrationToken
+    ) -> Bool {
+        guard token.serviceID == diagnosticRootToken,
+              var registrationState = explicitlyManagedIgnoredRegistrationStates[token.relativePath],
+              registrationState.pendingOwnerIDs.remove(token.ownerID) != nil
+        else { return false }
+
+        settleExplicitlyManagedRegularFileRegistrationIfPossible(
+            relativePath: token.relativePath,
+            state: registrationState
+        )
+        return true
+    }
+
+    private func settleExplicitlyManagedRegularFileRegistrationIfPossible(
+        relativePath: String,
+        state: FileSystemExplicitlyManagedIgnoredRegistrationState
+    ) {
+        guard state.pendingOwnerIDs.isEmpty else {
+            explicitlyManagedIgnoredRegistrationStates[relativePath] = state
+            return
+        }
+        explicitlyManagedIgnoredRegistrationStates.removeValue(forKey: relativePath)
+        guard !state.hasCommittedIgnoredOwner else { return }
+
+        if !state.hasCommittedEligibleOwner, visitedItems[relativePath] == false {
+            visitedItems[relativePath] = state.priorVisitedItem
+            if state.priorVisitedPathMembership {
+                visitedPaths.insert(relativePath)
+            } else {
+                visitedPaths.remove(relativePath)
+            }
+        }
+        if explicitlyManagedIgnoredFilePaths.contains(relativePath),
+           !state.priorCatalogOwnership
+        {
+            explicitlyManagedIgnoredFilePaths.remove(relativePath)
+        }
+        if watcherEarlyFilter.containsExplicitlyManagedIgnoredFile(relativePath),
+           !state.priorWatcherOwnership
+        {
+            watcherEarlyFilter.removeExplicitlyManagedIgnoredFile(relativePath)
+        }
+    }
+
+    #if DEBUG
+        func explicitlyManagedIgnoredRegistrationSnapshotForTesting(
+            relativePath rawRelativePath: String
+        ) -> FileSystemExplicitlyManagedIgnoredRegistrationSnapshot {
+            let relativePath = (rawRelativePath as NSString).standardizingPath
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let registrationState = explicitlyManagedIgnoredRegistrationStates[relativePath]
+            return FileSystemExplicitlyManagedIgnoredRegistrationSnapshot(
+                pendingOwnerCount: registrationState?.pendingOwnerIDs.count ?? 0,
+                hasCommittedOwner: registrationState?.hasCommittedIgnoredOwner ?? explicitlyManagedIgnoredFilePaths.contains(relativePath),
+                visitedItem: visitedItems[relativePath],
+                isVisited: visitedPaths.contains(relativePath),
+                isRegistered: explicitlyManagedIgnoredFilePaths.contains(relativePath),
+                watcherExemptsPath: watcherEarlyFilter.containsExplicitlyManagedIgnoredFile(relativePath)
+            )
+        }
+
+        func watcherFiltersIgnoredRegularFileEventForTesting(relativePath: String) -> Bool {
+            let result = watcherEarlyFilter.filter(
+                FSEventCallbackPayload(entries: [
+                    FSEventCallbackEntry(
+                        path: fullPath(forRelativePath: relativePath),
+                        flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsFile),
+                        id: 1
+                    )
+                ])
+            )
+            return result.payload == nil && result.filteredEntryCount == 1
+        }
+    #endif
+
+    /// Merges the store-owned managed-only inventory into a replacement service.
+    /// Missing paths remain installed so their deletion callback is not discarded
+    /// by the replacement's early filter. Existing ownership is intentionally
+    /// preserved: Store actor reentrancy can register a new path before this
+    /// final restore runs, and that owner is not in the captured inventory. A
+    /// directory marker already established by the crawl wins over regular-file
+    /// ownership and must not acquire a regular-file exemption.
+    func restoreExplicitlyManagedIgnoredFilePathsForRecovery(_ rawPaths: Set<String>) {
+        let normalizedPaths = Set(rawPaths.compactMap { rawPath -> String? in
+            let relativePath = (rawPath as NSString).standardizingPath
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !relativePath.isEmpty,
+                  relativePath != ".",
+                  relativePath != "..",
+                  !relativePath.hasPrefix("../"),
+                  !relativePath.hasPrefix("/")
+            else { return nil }
+            return relativePath
+        })
+
+        for relativePath in normalizedPaths {
+            let isDirectory = visitedItems[relativePath] == true || fileOrFolderIsDir(relativePath)
+            visitedPaths.insert(relativePath)
+            visitedItems[relativePath] = isDirectory
+            if isDirectory {
+                explicitlyManagedIgnoredFilePaths.remove(relativePath)
+                watcherEarlyFilter.removeExplicitlyManagedIgnoredFile(relativePath)
+            } else {
+                // Restored Store ownership survives rollback of any pending registration.
+                if var state = explicitlyManagedIgnoredRegistrationStates[relativePath] {
+                    state.hasCommittedIgnoredOwner = true
+                    explicitlyManagedIgnoredRegistrationStates[relativePath] = state
+                }
                 explicitlyManagedIgnoredFilePaths.insert(relativePath)
                 watcherEarlyFilter.addExplicitlyManagedIgnoredFile(relativePath)
             }
-        case .ineligible:
-            break
         }
-        return eligibility
     }
 
     func pathContainsSymlinkComponent(relativePath: String) -> Bool {
@@ -334,11 +619,28 @@ extension FileSystemService {
     // MARK: - FSEvent Setup
 
     func startFSEventStream() throws {
+        guard !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired
+        else {
+            throw FileSystemWatcherActivationError.eventIDsWrapped(path: path)
+        }
         guard fseventStreamRef == nil else { return }
 
-        watcherIngressMailbox.startAccepting()
+        let ingressGeneration = watcherIngressGeneration
+        guard let (streamGeneration, deliveryGeneration) = fseventRecoveryGate.withRecoveryLockIfClear({
+            fseventStreamGeneration &+= 1
+            watcherIngressMailbox.startAccepting(for: ingressGeneration)
+            return (fseventStreamGeneration, fseventDeliveryBarrier.reset())
+        }) else {
+            throw FileSystemWatcherActivationError.eventIDsWrapped(path: path)
+        }
         fseventCallbackContextPointer = Unmanaged.passRetained(
-            FileSystemServiceFSEventCallbackContext(service: self)
+            FileSystemServiceFSEventCallbackContext(
+                service: self,
+                deliveryGeneration: deliveryGeneration,
+                streamGeneration: streamGeneration,
+                ingressGeneration: ingressGeneration
+            )
         ).toOpaque()
 
         var streamContext = FSEventStreamContext(
@@ -387,7 +689,7 @@ extension FileSystemService {
             throw FileSystemWatcherActivationError.streamCreationFailed(path: path)
         }
 
-        FSEventStreamSetDispatchQueue(stream, .main)
+        FSEventStreamSetDispatchQueue(stream, fseventCallbackQueue)
         #if DEBUG
             let didStart = watcherActivationFailurePointForTesting == .streamStart ? false : FSEventStreamStart(stream)
         #else
@@ -405,37 +707,63 @@ extension FileSystemService {
         fileSystemDebugLog("FSEventStream started for path: \(path) from event ID \(nextFSEventStreamStartEventID)")
     }
 
-    func stopFSEventStream() {
-        if seedWatcherActivationFlushInProgress {
-            seedWatcherActivationStopRequested = true
-            resetWatcherIngressState()
-            return
+    @discardableResult
+    func stopFSEventStream(expectedGeneration: UInt64? = nil) -> Bool {
+        let didAdvanceGeneration = fseventRecoveryGate.withRecoveryLock {
+            guard expectedGeneration == nil || expectedGeneration == fseventStreamGeneration else {
+                return false
+            }
+            fseventStreamGeneration &+= 1
+            fseventDeliveryBarrier.reset()
+            return true
         }
-        if let stream = fseventStreamRef {
-            nextFSEventStreamStartEventID = max(
-                nextFSEventStreamStartEventID,
-                FSEventStreamGetLatestEventId(stream)
-            )
-            FSEventStreamStop(stream)
-            FSEventStreamFlushSync(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            fseventStreamRef = nil
+        guard didAdvanceGeneration else { return false }
 
+        guard let stream = fseventStreamRef else {
             releaseFSEventCallbackContext()
-
-            fileSystemDebugLog("FSEventStream stopped for path: \(path)")
-        } else {
+            resetWatcherIngressState()
             fileSystemDebugLog("stream could not be stopped")
+            return true
         }
-
+        nextFSEventStreamStartEventID = max(
+            nextFSEventStreamStartEventID,
+            FSEventStreamGetLatestEventId(stream)
+        )
+        let callbackContextPointer = fseventCallbackContextPointer
+        if let callbackContextPointer {
+            Unmanaged<FileSystemServiceFSEventCallbackContext>
+                .fromOpaque(callbackContextPointer)
+                .takeUnretainedValue()
+                .detach()
+        }
+        fseventStreamRef = nil
+        fseventCallbackContextPointer = nil
         resetWatcherIngressState()
+
+        let teardown = FileSystemServiceFSEventTeardownHandle(
+            stream: stream,
+            callbackContextPointer: callbackContextPointer
+        )
+        fseventCallbackQueue.async {
+            teardown.finish()
+        }
+        fileSystemDebugLog("FSEventStream stopped for path: \(path)")
+        return true
     }
 
     private func releaseFSEventCallbackContext() {
         guard let ptr = fseventCallbackContextPointer else { return }
         fseventCallbackContextPointer = nil
-        Unmanaged<FileSystemServiceFSEventCallbackContext>.fromOpaque(ptr).release()
+        let context = Unmanaged<FileSystemServiceFSEventCallbackContext>
+            .fromOpaque(ptr)
+            .takeUnretainedValue()
+        context.detach()
+        let releaseHandle = FileSystemServiceFSEventCallbackReleaseHandle(
+            callbackContextPointer: ptr
+        )
+        fseventCallbackQueue.async {
+            releaseHandle.finish()
+        }
     }
 
     nonisolated static func deepCopySwiftString(_ source: String) -> String {
@@ -444,7 +772,9 @@ extension FileSystemService {
 
     nonisolated static func deepCopyEventPath(_ source: CFString) -> String? {
         let length = CFStringGetLength(source)
-        if length == 0 { return "" }
+        if length == 0 {
+            return ""
+        }
 
         let utf8Encoding = CFStringBuiltInEncodings.UTF8.rawValue
         if let directUTF8 = CFStringGetCStringPtr(source, utf8Encoding) {
@@ -513,6 +843,17 @@ extension FileSystemService {
         return FSEventCallbackPayload(entries: entries)
     }
 
+    /// Invalidates the callback-owned stream cut while holding the same lock
+    /// used by seeded publication permits. The returned owner notification must
+    /// be invoked only after this method returns.
+    nonisolated func markFSEventRecoveryAtCallback(
+        deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
+    ) -> (@Sendable () -> Void)? {
+        fseventRecoveryGate.markRequiredAndTakeHandler {
+            _ = self.fseventDeliveryBarrier.reset(ifCurrent: deliveryGeneration)
+        }
+    }
+
     /// The static callback that FSEvents uses to report changes. We hand off to Task to enter the actor context.
     static let fseventCallback: FSEventStreamCallback = {
         _, context, numEvents, eventPaths, eventFlags, eventIds in
@@ -527,16 +868,54 @@ extension FileSystemService {
         guard count > 0 else { return }
 
         // Although these are non-optional in the API, guard against unexpected null pointers defensively
-        if Int(bitPattern: eventPaths) == 0 { return }
-        if Int(bitPattern: eventFlags) == 0 { return }
-        if Int(bitPattern: eventIds) == 0 { return }
+        if Int(bitPattern: eventPaths) == 0 {
+            return
+        }
+        if Int(bitPattern: eventFlags) == 0 {
+            return
+        }
+        if Int(bitPattern: eventIds) == 0 {
+            return
+        }
 
+        guard service.fseventDeliveryBarrier.currentGeneration == callbackContext.deliveryGeneration else {
+            return
+        }
         guard let payload = buildOwnedFSEventPayload(
             numEvents: count,
             eventPaths: eventPaths,
             eventFlags: eventFlags,
             eventIds: eventIds
         ) else { return }
+        let hasWrappedJournal = payload.entries.contains { entry in
+            (entry.flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)) != 0
+        }
+        if hasWrappedJournal {
+            // Record this before yielding to the actor. A concurrent stop/restart
+            // must not reopen from the old stream's resume cut. The sticky mark
+            // and stream-local barrier reset share the publication lock.
+            let recoveryHandler = service.markFSEventRecoveryAtCallback(
+                deliveryGeneration: callbackContext.deliveryGeneration
+            )
+            recoveryHandler?()
+            // Event IDs are no longer valid as a continuation of this stream.
+            // Drop the payload, invalidate all waiters/cuts, and let the actor
+            // fail this service closed instead of admitting an untrusted event.
+            Task { [weak service] in
+                await service?.handleFSEventIDsWrapped(
+                    streamGeneration: callbackContext.streamGeneration,
+                    ingressGeneration: callbackContext.ingressGeneration,
+                    deliveryGeneration: callbackContext.deliveryGeneration
+                )
+            }
+            return
+        }
+        defer {
+            service.fseventDeliveryBarrier.recordDelivered(
+                eventIDs: payload.entries.map(\.id),
+                generation: callbackContext.deliveryGeneration
+            )
+        }
 
         #if DEBUG
             if payload.count != count {
@@ -556,22 +935,13 @@ extension FileSystemService {
             }
         #endif
 
-        // A wrapped journal can never be proven safe by path filtering. Preserve
-        // the signal so strict seeded replay rejects it even when its path would
-        // otherwise be ignored by the immutable early-filter snapshot.
-        let hasWrappedJournal = payload.entries.contains { entry in
-            (entry.flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)) != 0
-        }
-        let filterResult = if hasWrappedJournal {
-            FileSystemWatcherEarlyFilter.Result(payload: payload, filteredEntryCount: 0)
-        } else {
-            service.watcherEarlyFilter.filter(payload)
-        }
+        let filterResult = service.watcherEarlyFilter.filter(payload)
         guard let retainedPayload = filterResult.payload else { return }
 
         let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
         let acceptedWatermark = service.watcherIngressMailbox.accept(
             retainedPayload,
+            ingressGeneration: callbackContext.ingressGeneration,
             lifecycleCorrelation: lifecycleCorrelation
         ) { [weak service] in
             await service?.drainAcceptedWatcherIngressMailbox()
@@ -590,6 +960,67 @@ extension FileSystemService {
         )
     }
 
+    func handleFSEventIDsWrapped(
+        streamGeneration: UInt64,
+        ingressGeneration: UInt64,
+        deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
+    ) {
+        let recoveryHandler = markFSEventRecoveryAtCallback(
+            deliveryGeneration: deliveryGeneration
+        )
+        recoveryHandler?()
+        guard fseventStreamGeneration == streamGeneration,
+              watcherIngressGeneration == ingressGeneration,
+              fseventStreamRef != nil
+        else { return }
+        fseventRecoveryRequired = true
+        // The callback already invalidated this delivery generation. Stop the
+        // stream on the actor while retaining the existing callback-queue
+        // teardown, which keeps callback ownership/liveness unchanged.
+        _ = stopFSEventStream(expectedGeneration: streamGeneration)
+    }
+
+    #if DEBUG
+        func fseventRecoveryRequiredForTesting() -> Bool {
+            fseventRecoveryRequired
+        }
+
+        func markFSEventIDsWrappedAtCallbackForTesting(
+            deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
+        ) {
+            guard fseventDeliveryBarrier.currentGeneration == deliveryGeneration else { return }
+            let recoveryHandler = markFSEventRecoveryAtCallback(
+                deliveryGeneration: deliveryGeneration
+            )
+            recoveryHandler?()
+        }
+
+        nonisolated func markFSEventIDsWrappedAtPublicationPermitForTesting(
+            deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
+        ) {
+            guard fseventDeliveryBarrier.currentGeneration == deliveryGeneration else { return }
+            let recoveryHandler = markFSEventRecoveryAtCallback(
+                deliveryGeneration: deliveryGeneration
+            )
+            recoveryHandler?()
+        }
+
+        func handleFSEventIDsWrappedForTesting(
+            streamGeneration: UInt64,
+            ingressGeneration: UInt64,
+            deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
+        ) {
+            guard fseventStreamGeneration == streamGeneration,
+                  watcherIngressGeneration == ingressGeneration
+            else { return }
+            let recoveryHandler = markFSEventRecoveryAtCallback(
+                deliveryGeneration: deliveryGeneration
+            )
+            recoveryHandler?()
+            fseventRecoveryRequired = true
+        }
+    #endif
+
     // MARK: - Core event coalescing & handling
 
     func drainAcceptedWatcherIngressMailbox() async {
@@ -605,6 +1036,7 @@ extension FileSystemService {
     }
 
     func enqueueAcceptedWatcherPayload(_ payload: FileSystemWatcherIngressMailbox.AcceptedPayload) {
+        guard payload.ingressGeneration == watcherIngressGeneration else { return }
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.FileSystem.serviceEnqueueEntered,
             correlation: payload.lifecycleCorrelation,
@@ -867,7 +1299,9 @@ extension FileSystemService {
             var parts: [String] = []
 
             func check(_ flag: Int, _ name: String) {
-                if (raw & UInt32(flag)) != 0 { parts.append(name) }
+                if (raw & UInt32(flag)) != 0 {
+                    parts.append(name)
+                }
             }
 
             check(kFSEventStreamEventFlagItemCreated, "Created")
@@ -974,7 +1408,9 @@ extension FileSystemService {
         }
 
         // Vim-style hidden swap: .filename.swp
-        if name.hasPrefix("."), name.contains(".sw") { return true }
+        if name.hasPrefix("."), name.contains(".sw") {
+            return true
+        }
 
         return false
     }
@@ -1251,7 +1687,9 @@ extension FileSystemService {
                 // Renamed events sometimes arrive WITHOUT Created/Removed (Finder trash moves, cross-dir moves, etc.)
                 if !created, !removed {
                     // Ignore temp-save churn
-                    if isTempFile { continue }
+                    if isTempFile {
+                        continue
+                    }
 
                     let fullPath = fullPath(forRelativePath: relPath)
                     var isDirFlag: ObjCBool = false
@@ -1273,7 +1711,9 @@ extension FileSystemService {
                             immediateModifications.append(diskIsDir ? .folderAdded(relPath) : .fileAdded(relPath))
                             visitedPaths.insert(relPath)
                             visitedItems[relPath] = diskIsDir
-                            if diskIsDir { trackFolder(relPath, eventId: eventId) }
+                            if diskIsDir {
+                                trackFolder(relPath, eventId: eventId)
+                            }
                         }
                     } else if isKnown {
                         // Path no longer exists here => removal from watched root

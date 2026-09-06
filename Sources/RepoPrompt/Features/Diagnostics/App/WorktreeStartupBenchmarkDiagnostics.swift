@@ -310,6 +310,7 @@
             var agentSessionID: UUID?
             var targetTabID: UUID?
             var targetOrigin: AgentModeViewModel.MCPSessionTarget.Origin?
+            var target: AgentModeViewModel.MCPSessionTarget?
             var worktreeID: String?
             var repositoryID: String?
             var repositoryKey: String?
@@ -746,17 +747,31 @@
 
         func registerRecoverableStartTarget(
             correlationID: UUID,
-            agentSessionID: UUID,
-            targetTabID: UUID,
-            targetOrigin: AgentModeViewModel.MCPSessionTarget.Origin
+            target: AgentModeViewModel.MCPSessionTarget
         ) throws {
             try mutateRecoverableStart(correlationID: correlationID) { record in
-                guard record.agentSessionID == nil || record.agentSessionID == agentSessionID,
-                      record.targetTabID == nil || record.targetTabID == targetTabID
+                guard let agentSessionID = target.sessionID,
+                      record.agentSessionID == nil || record.agentSessionID == agentSessionID,
+                      record.targetTabID == nil || record.targetTabID == target.tabID
                 else { throw DebugWorktreeStartupBenchmarkError.invalidRecovery }
+                switch target.origin {
+                case .createdNewTab, .createdForSessionResume:
+                    guard let lifecycleIdentity = target.lifecycleIdentity,
+                          let claim = target.recoveryClaim,
+                          lifecycleIdentity.workspaceID == record.scope.workspaceID,
+                          lifecycleIdentity.tabID == target.tabID,
+                          lifecycleIdentity.sessionID == agentSessionID,
+                          claim.identity.workspaceID == record.scope.workspaceID,
+                          claim.identity.tabID == target.tabID,
+                          claim.identity.sessionID == agentSessionID
+                    else { throw DebugWorktreeStartupBenchmarkError.invalidRecovery }
+                case .existingSession, .existingTab:
+                    break
+                }
                 record.agentSessionID = agentSessionID
-                record.targetTabID = targetTabID
-                record.targetOrigin = targetOrigin
+                record.targetTabID = target.tabID
+                record.targetOrigin = target.origin
+                record.target = target
                 Self.advanceRecoverableStart(&record, to: .targetRegistered)
             }
         }
@@ -893,20 +908,9 @@
                 else { throw DebugWorktreeStartupBenchmarkError.invalidRecovery }
                 record.abortRequested = true
                 recoverableStartsByCorrelationID[correlationID] = record
-                let target: AgentModeViewModel.MCPSessionTarget? = if let tabID = record.targetTabID,
-                                                                      let origin = record.targetOrigin
-                {
-                    AgentModeViewModel.MCPSessionTarget(
-                        tabID: tabID,
-                        sessionID: record.agentSessionID,
-                        origin: origin
-                    )
-                } else {
-                    nil
-                }
                 return RecoverableStartAbortDecision(
                     snapshot: Self.recoverableStartSnapshot(record),
-                    target: target,
+                    target: record.target,
                     requiresAgentCancel: record.providerDispatchStarted
                         && record.phase != .discardCompleted
                 )

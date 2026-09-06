@@ -37,160 +37,6 @@ struct FileSystemSeededInventoryPreparation: @unchecked Sendable {
     }
 }
 
-final class FileSystemSeedWatcherFlushRunner: @unchecked Sendable {
-    struct Attempt {
-        let completedBeforeDeadline: Bool
-        let completion: Task<Void, Never>
-    }
-
-    private final class Race: @unchecked Sendable {
-        private let lock = NSLock()
-        private var result: Bool?
-        private var continuation: CheckedContinuation<Bool, Never>?
-
-        func wait() async -> Bool {
-            await withCheckedContinuation { continuation in
-                lock.lock()
-                if let result {
-                    lock.unlock()
-                    continuation.resume(returning: result)
-                } else {
-                    self.continuation = continuation
-                    lock.unlock()
-                }
-            }
-        }
-
-        func resolve(_ result: Bool) {
-            lock.lock()
-            guard self.result == nil else {
-                lock.unlock()
-                return
-            }
-            self.result = result
-            let continuation = continuation
-            self.continuation = nil
-            lock.unlock()
-            continuation?.resume(returning: result)
-        }
-    }
-
-    static let shared = FileSystemSeedWatcherFlushRunner()
-
-    private let queue: DispatchQueue
-    private let admissionLock = NSLock()
-    private var operationInFlight = false
-
-    init(label: String = "com.repoprompt.filesystem.seed-watcher-flush") {
-        queue = DispatchQueue(label: label, qos: .userInitiated)
-    }
-
-    func run(
-        timeoutNanoseconds: UInt64,
-        operation: @escaping @Sendable () -> Void
-    ) async -> Attempt {
-        let admitted = admissionLock.withLock {
-            guard !operationInFlight else { return false }
-            operationInFlight = true
-            return true
-        }
-        guard admitted else {
-            return Attempt(
-                completedBeforeDeadline: false,
-                completion: Task {}
-            )
-        }
-
-        let queue = queue
-        let completion = Task.detached(priority: .userInitiated) { [self] in
-            await withCheckedContinuation { continuation in
-                queue.async {
-                    operation()
-                    admissionLock.withLock {
-                        operationInFlight = false
-                    }
-                    continuation.resume()
-                }
-            }
-        }
-        let race = Race()
-        let completionNotifier = Task {
-            await completion.value
-            race.resolve(true)
-        }
-        let clampedTimeoutNanoseconds = Int(min(timeoutNanoseconds, UInt64(Int.max)))
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(
-            deadline: .now() + .nanoseconds(clampedTimeoutNanoseconds)
-        ) {
-            race.resolve(false)
-        }
-        let completedBeforeDeadline = await race.wait()
-        if !completedBeforeDeadline {
-            completionNotifier.cancel()
-        }
-        return Attempt(
-            completedBeforeDeadline: completedBeforeDeadline,
-            completion: completion
-        )
-    }
-}
-
-private final class FileSystemSeedWatcherFlushCircuitBreaker: @unchecked Sendable {
-    static let shared = FileSystemSeedWatcherFlushCircuitBreaker()
-
-    private let lock = NSLock()
-    private var open = false
-
-    var isOpen: Bool {
-        lock.withLock { open }
-    }
-
-    func trip() {
-        lock.withLock { open = true }
-    }
-}
-
-private final class FileSystemSeedWatcherFlushHandle: @unchecked Sendable {
-    let stream: FSEventStreamRef
-
-    init(stream: FSEventStreamRef) {
-        self.stream = stream
-    }
-}
-
-private final class FileSystemSeedWatcherFlushQuarantine: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stream: FSEventStreamRef?
-    private var callbackContextPointer: UnsafeMutableRawPointer?
-
-    init(
-        stream: FSEventStreamRef,
-        callbackContextPointer: UnsafeMutableRawPointer?
-    ) {
-        self.stream = stream
-        self.callbackContextPointer = callbackContextPointer
-    }
-
-    func finish() {
-        let resources: (FSEventStreamRef, UnsafeMutableRawPointer?)? = lock.withLock {
-            guard let stream else { return nil }
-            let resources = (stream, callbackContextPointer)
-            self.stream = nil
-            callbackContextPointer = nil
-            return resources
-        }
-        guard let (stream, callbackContextPointer) = resources else { return }
-        FSEventStreamStop(stream)
-        FSEventStreamInvalidate(stream)
-        FSEventStreamRelease(stream)
-        if let callbackContextPointer {
-            Unmanaged<FileSystemServiceFSEventCallbackContext>
-                .fromOpaque(callbackContextPointer)
-                .release()
-        }
-    }
-}
-
 struct FileSystemSeedReplayResult {
     let initializationID: FileSystemSeedInitializationID
     let watcherIngressGeneration: UInt64
@@ -208,6 +54,7 @@ struct FileSystemSeedReplayResult {
 struct FileSystemSeedPublicationActivationProof: Equatable {
     let initializationID: FileSystemSeedInitializationID
     let watcherIngressGeneration: UInt64
+    let deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
     let acceptedWatcherWatermark: FileSystemWatcherIngressMailbox.Watermark
     let servicePublicationSequence: UInt64
 }
@@ -249,6 +96,7 @@ struct FileSystemSeedInitializationState {
     let replayBaseAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark
     let replayBasePublicationSequence: UInt64
     var initialAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark
+    var deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation?
     var phase: Phase
     var lastReplayPublicationSequence: UInt64
 }
@@ -266,16 +114,17 @@ extension FileSystemService {
         else {
             throw FileSystemSeedReplayError.invalidJournalCut
         }
+        guard !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired
+        else {
+            throw FileSystemSeedReplayError.recoveryRequired
+        }
         guard fseventStreamRef == nil else {
             throw FileSystemSeedReplayError.watcherAlreadyActive
         }
         guard seedInitializationState == nil else {
             throw FileSystemSeedReplayError.initializationAlreadyActive
         }
-        guard !FileSystemSeedWatcherFlushCircuitBreaker.shared.isOpen else {
-            throw FileSystemSeedReplayError.watcherActivationTimedOut
-        }
-
         watcherIngressMailbox.pauseAutomaticDraining()
         nextFSEventStreamStartEventID = journalCut.fseventID
         seedInitializationState = FileSystemSeedInitializationState(
@@ -285,6 +134,7 @@ extension FileSystemService {
             replayBaseAcceptedWatermark: lastPublishedWatcherAcceptedWatermark,
             replayBasePublicationSequence: lastServicePublicationSequence,
             initialAcceptedWatermark: captureAcceptedWatcherWatermark(),
+            deliveryGeneration: nil,
             phase: .capturing,
             lastReplayPublicationSequence: lastServicePublicationSequence
         )
@@ -292,48 +142,24 @@ extension FileSystemService {
         do {
             try startFSEventStream()
             if let stream = fseventStreamRef {
-                let handle = FileSystemSeedWatcherFlushHandle(stream: stream)
-                seedWatcherActivationFlushInProgress = true
-                seedWatcherActivationStopRequested = false
-                let attempt = await FileSystemSeedWatcherFlushRunner.shared.run(
-                    timeoutNanoseconds: 2 * NSEC_PER_SEC
-                ) {
-                    FSEventStreamFlushSync(handle.stream)
-                }
-                let stopRequested = seedWatcherActivationStopRequested
-                seedWatcherActivationFlushInProgress = false
-                seedWatcherActivationStopRequested = false
-                guard attempt.completedBeforeDeadline, !stopRequested else {
-                    if !attempt.completedBeforeDeadline {
-                        FileSystemSeedWatcherFlushCircuitBreaker.shared.trip()
-                    }
-                    let callbackContextPointer = fseventCallbackContextPointer
-                    if let callbackContextPointer {
-                        Unmanaged<FileSystemServiceFSEventCallbackContext>
-                            .fromOpaque(callbackContextPointer)
-                            .takeUnretainedValue()
-                            .service = nil
-                    }
-                    let quarantine = FileSystemSeedWatcherFlushQuarantine(
-                        stream: handle.stream,
-                        callbackContextPointer: callbackContextPointer
-                    )
-                    fseventStreamRef = nil
-                    fseventCallbackContextPointer = nil
-                    if !stopRequested {
-                        resetWatcherIngressState()
-                    }
+                let streamGeneration = fseventStreamGeneration
+                let deliveryGeneration = fseventDeliveryBarrier.currentGeneration
+                let flushTarget = FSEventStreamFlushAsync(stream)
+                let delivered = await fseventDeliveryBarrier.waitUntilDelivered(
+                    flushTarget,
+                    generation: deliveryGeneration
+                )
+                guard fseventStreamGeneration == streamGeneration else {
                     seedInitializationState = nil
-                    Task.detached(priority: .utility) {
-                        await attempt.completion.value
-                        quarantine.finish()
-                    }
-                    if stopRequested {
-                        throw FileSystemSeedReplayError.watcherNotActive
-                    }
+                    throw FileSystemSeedReplayError.watcherNotActive
+                }
+                guard delivered else {
+                    stopFSEventStream(expectedGeneration: streamGeneration)
+                    seedInitializationState = nil
                     throw FileSystemSeedReplayError.watcherActivationTimedOut
                 }
             }
+            seedInitializationState?.deliveryGeneration = fseventDeliveryBarrier.currentGeneration
             try requireCurrentSeedInitialization(initializationID)
             let initialAcceptedWatermark = captureAcceptedWatcherWatermark()
             seedInitializationState?.initialAcceptedWatermark = initialAcceptedWatermark
@@ -345,6 +171,9 @@ extension FileSystemService {
             )
         } catch FileSystemSeedReplayError.watcherActivationTimedOut {
             throw FileSystemSeedReplayError.watcherActivationTimedOut
+        } catch FileSystemSeedReplayError.watcherNotActive {
+            seedInitializationState = nil
+            throw FileSystemSeedReplayError.watcherNotActive
         } catch {
             if fseventStreamRef != nil {
                 stopFSEventStream()
@@ -493,7 +322,11 @@ extension FileSystemService {
               state.initializationID == initializationID,
               state.watcherIngressGeneration == watcherIngressGeneration,
               state.phase == .readyForPublication,
-              fseventStreamRef != nil
+              fseventStreamRef != nil,
+              let deliveryGeneration = state.deliveryGeneration,
+              fseventDeliveryBarrier.currentGeneration == deliveryGeneration,
+              !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired
         else { return nil }
         #if DEBUG
             guard !seededPublicationActivationShouldFailForTesting else { return nil }
@@ -501,6 +334,7 @@ extension FileSystemService {
         let proof = FileSystemSeedPublicationActivationProof(
             initializationID: initializationID,
             watcherIngressGeneration: watcherIngressGeneration,
+            deliveryGeneration: deliveryGeneration,
             acceptedWatcherWatermark: captureAcceptedWatcherWatermark(),
             servicePublicationSequence: lastServicePublicationSequence
         )
@@ -519,16 +353,77 @@ extension FileSystemService {
               state.watcherIngressGeneration == proof.watcherIngressGeneration,
               state.phase == .activatedForPublication(proof),
               watcherIngressGeneration == proof.watcherIngressGeneration,
-              fseventStreamRef != nil
+              fseventStreamRef != nil,
+              let deliveryGeneration = state.deliveryGeneration,
+              proof.deliveryGeneration == deliveryGeneration,
+              fseventDeliveryBarrier.currentGeneration == deliveryGeneration,
+              !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired
         else { return false }
         return true
     }
+
+    /// Acquires the service-local recovery publication permit only while the
+    /// callback-owned sticky gate and this stream's delivery generation agree.
+    /// The caller owns the permit until its complete synchronous publication
+    /// assignment has finished; no await is permitted while it is held.
+    nonisolated func acquireSeededPublicationRecoveryPermit(
+        _ proof: FileSystemSeedPublicationActivationProof
+    ) -> FileSystemServiceFSEventRecoveryPublicationPermit? {
+        guard let permit = fseventRecoveryGate.acquirePublicationPermit() else {
+            return nil
+        }
+        guard fseventDeliveryBarrier.currentGeneration == proof.deliveryGeneration else {
+            permit.release()
+            return nil
+        }
+        return permit
+    }
+
+    nonisolated func seededPublicationRecoveryCutIsCurrent(
+        _ proof: FileSystemSeedPublicationActivationProof
+    ) -> Bool {
+        guard let permit = acquireSeededPublicationRecoveryPermit(proof) else {
+            return false
+        }
+        permit.release()
+        return true
+    }
+
+    #if DEBUG
+        /// Test seam for the real service permit. The callback-side action may
+        /// be queued by `onAcquired`; the production publication body remains
+        /// synchronous and the permit is released before the callback can mark.
+        nonisolated func withSeededPublicationRecoveryPermitForTesting<T>(
+            _ proof: FileSystemSeedPublicationActivationProof,
+            onAcquired: (() -> Void)? = nil,
+            body: () -> T
+        ) -> T? {
+            guard let permit = acquireSeededPublicationRecoveryPermit(proof) else {
+                return nil
+            }
+            onAcquired?()
+            defer { permit.release() }
+            return body()
+        }
+    #endif
 
     @discardableResult
     func finalizeSeededPublication(
         _ proof: FileSystemSeedPublicationActivationProof
     ) -> Bool {
-        guard seededPublicationActivationIsCurrent(proof) else { return false }
+        guard let state = seedInitializationState,
+              state.initializationID == proof.initializationID,
+              state.phase == .activatedForPublication(proof)
+        else { return false }
+        guard seededPublicationActivationIsCurrent(proof) else {
+            // Once visible publication has linearized, any lost proof is a
+            // recovery outcome, not a stale publication error. Retire the
+            // private seed phase so the owner can replace or reconcile the
+            // service through the normal recovery flight.
+            seedInitializationState = nil
+            return false
+        }
         seedInitializationState = nil
         return true
     }
@@ -742,6 +637,13 @@ extension FileSystemService {
         let state = try currentSeedInitialization(initializationID)
         guard state.watcherIngressGeneration == watcherIngressGeneration else {
             throw FileSystemSeedReplayError.watcherIngressChanged
+        }
+        guard !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired,
+              let deliveryGeneration = state.deliveryGeneration,
+              fseventDeliveryBarrier.currentGeneration == deliveryGeneration
+        else {
+            throw FileSystemSeedReplayError.recoveryRequired
         }
         guard fseventStreamRef != nil else {
             throw FileSystemSeedReplayError.watcherNotActive

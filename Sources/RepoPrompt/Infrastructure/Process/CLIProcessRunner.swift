@@ -220,6 +220,7 @@ final class CLIProcessRunner {
         stdin: String?,
         outputMode: OutputFlagMode = .auto(.json),
         timeout: TimeInterval?,
+        timeoutCleanupPolicy: ProcessTermination.TimeoutCleanupPolicy? = nil,
         additionalEnvironment: [String: String] = [:],
         additionalRemovedKeys: Set<String> = [],
         cancelChildOnTaskCancellation: Bool = false
@@ -384,7 +385,8 @@ final class CLIProcessRunner {
                     try await Self.waitForTerminationAsync(
                         pid: spawned.pid,
                         processGroupID: spawned.processGroupID,
-                        timeout: timeout
+                        timeout: timeout,
+                        timeoutCleanupPolicy: timeoutCleanupPolicy
                     ) { [weak self] warning in
                         self?.log(warning)
                     }
@@ -960,6 +962,7 @@ final class CLIProcessRunner {
         pid: pid_t,
         processGroupID: pid_t?,
         timeout: TimeInterval?,
+        timeoutCleanupPolicy: ProcessTermination.TimeoutCleanupPolicy? = nil,
         logger: (String) -> Void
     ) async throws -> (Int32, Bool) {
         do {
@@ -967,6 +970,7 @@ final class CLIProcessRunner {
                 pid: pid,
                 processGroupID: processGroupID,
                 timeout: timeout,
+                timeoutCleanupPolicy: timeoutCleanupPolicy,
                 logger: logger
             )
             return (exitCode, timedOut)

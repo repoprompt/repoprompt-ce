@@ -183,6 +183,7 @@ actor GitWorkspaceMetadataMonitor {
     private struct Record {
         var targetKeysByTokenID: [UUID: Set<String>]
         var sourcesByTargetKey: [String: GitMetadataFSEventSource]
+        var sourceIDsByTargetKey: [String: UUID]
         let onEvent: @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
     }
 
@@ -298,7 +299,8 @@ actor GitWorkspaceMetadataMonitor {
                 targets: newTargets,
                 repositoryKey: repositoryKey
             )
-            record.sourcesByTargetKey.merge(newSources) { existing, _ in existing }
+            record.sourcesByTargetKey.merge(newSources.sources) { existing, _ in existing }
+            record.sourceIDsByTargetKey.merge(newSources.sourceIDs) { existing, _ in existing }
             record.targetKeysByTokenID[token.id] = token.coveredTargetKeys
             records[repositoryKey] = record
             return token
@@ -319,7 +321,8 @@ actor GitWorkspaceMetadataMonitor {
         let sources = try makeSources(targets: requestedTargets, repositoryKey: repositoryKey)
         records[repositoryKey] = Record(
             targetKeysByTokenID: [token.id: token.coveredTargetKeys],
-            sourcesByTargetKey: sources,
+            sourcesByTargetKey: sources.sources,
+            sourceIDsByTargetKey: sources.sourceIDs,
             onEvent: onEvent
         )
         return token
@@ -335,7 +338,7 @@ actor GitWorkspaceMetadataMonitor {
         repositoryRoot: URL,
         prefix: GitRepositoryRelativeRootPrefix,
         expectedAcceptedWatermark: UInt64
-    ) -> Bool {
+    ) async -> Bool {
         guard token.repositoryKey == repositoryKey,
               let requested = try? Self.resolvePrefixControlWatchTarget(
                   repositoryRoot: repositoryRoot,
@@ -347,12 +350,14 @@ actor GitWorkspaceMetadataMonitor {
               token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys))
         else { return false }
         for key in token.coveredTargetKeys.sorted() {
-            guard let source = record.sourcesByTargetKey[key] else { return false }
-            source.flushSync()
+            guard let source = record.sourcesByTargetKey[key],
+                  await source.flush()
+            else { return false }
         }
         guard let currentRecord = records[repositoryKey],
               currentRecord.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
               token.coveredTargetKeys.isSubset(of: Set(currentRecord.sourcesByTargetKey.keys)),
+              currentRecord.sourcesByTargetKey.values.allSatisfy({ $0.isCurrent() }),
               acceptedWatermark(for: repositoryKey) == expectedAcceptedWatermark
         else { return false }
         return true
@@ -370,6 +375,7 @@ actor GitWorkspaceMetadataMonitor {
               let record = records[repositoryKey],
               record.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
               token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys)),
+              record.sourcesByTargetKey.values.allSatisfy({ $0.isCurrent() }),
               acceptedWatermark(for: repositoryKey) == expectedAcceptedWatermark
         else { return false }
         return true
@@ -383,7 +389,7 @@ actor GitWorkspaceMetadataMonitor {
         repositoryKey: GitWorkspaceAuthorityRepositoryKey,
         paths: [URL],
         expectedAcceptedWatermark: UInt64
-    ) -> Bool {
+    ) async -> Bool {
         guard token.repositoryKey == repositoryKey,
               let requestedTargets = try? Self.resolveWatchTargets(paths),
               token.coveredTargetKeys == Set(requestedTargets.map(\.key)),
@@ -392,12 +398,14 @@ actor GitWorkspaceMetadataMonitor {
               token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys))
         else { return false }
         for key in token.coveredTargetKeys.sorted() {
-            guard let source = record.sourcesByTargetKey[key] else { return false }
-            source.flushSync()
+            guard let source = record.sourcesByTargetKey[key],
+                  await source.flush()
+            else { return false }
         }
         guard let currentRecord = records[repositoryKey],
               currentRecord.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
               token.coveredTargetKeys.isSubset(of: Set(currentRecord.sourcesByTargetKey.keys)),
+              currentRecord.sourcesByTargetKey.values.allSatisfy({ $0.isCurrent() }),
               acceptedWatermark(for: repositoryKey) == expectedAcceptedWatermark
         else { return false }
         return true
@@ -409,6 +417,9 @@ actor GitWorkspaceMetadataMonitor {
         else { return }
         if record.targetKeysByTokenID.isEmpty {
             record.sourcesByTargetKey.values.forEach { $0.cancel() }
+            for value in record.sourceIDsByTargetKey.values {
+                acceptedWatermarks.remove(token.repositoryKey, sourceID: value)
+            }
             records.removeValue(forKey: token.repositoryKey)
         } else {
             let retainedTargetKeys = record.targetKeysByTokenID.values.reduce(into: Set<String>()) {
@@ -417,6 +428,9 @@ actor GitWorkspaceMetadataMonitor {
             let obsoleteKeys = Set(record.sourcesByTargetKey.keys).subtracting(retainedTargetKeys)
             for key in obsoleteKeys {
                 record.sourcesByTargetKey.removeValue(forKey: key)?.cancel()
+                if let sourceID = record.sourceIDsByTargetKey.removeValue(forKey: key) {
+                    acceptedWatermarks.remove(token.repositoryKey, sourceID: sourceID)
+                }
             }
             records[token.repositoryKey] = record
         }
@@ -425,29 +439,69 @@ actor GitWorkspaceMetadataMonitor {
     private func makeSources(
         targets: [WatchTarget],
         repositoryKey: GitWorkspaceAuthorityRepositoryKey
-    ) throws -> [String: GitMetadataFSEventSource] {
+    ) throws -> (
+        sources: [String: GitMetadataFSEventSource],
+        sourceIDs: [String: UUID]
+    ) {
         var created: [String: GitMetadataFSEventSource] = [:]
+        var sourceIDs: [String: UUID] = [:]
         do {
             for target in targets {
-                let source = try GitMetadataFSEventSource(target: target) { [weak self] (kinds: Set<GitWorkspaceMetadataEventKind>) in
-                    guard let self else { return }
-                    acceptedWatermarks.accept(repositoryKey)
-                    Task { await self.acceptedEvent(repositoryKey: repositoryKey, kinds: kinds) }
+                let sourceID = UUID()
+                acceptedWatermarks.install(repositoryKey, sourceID: sourceID)
+                do {
+                    let source = try GitMetadataFSEventSource(target: target) { [weak self] (
+                        kinds: Set<GitWorkspaceMetadataEventKind>,
+                        eventIDsWrapped: Bool
+                    ) in
+                        guard let self else { return }
+                        if eventIDsWrapped {
+                            acceptedWatermarks.invalidate(repositoryKey, sourceID: sourceID)
+                            Task {
+                                await self.acceptedEvent(
+                                    repositoryKey: repositoryKey,
+                                    sourceID: sourceID,
+                                    kinds: kinds
+                                )
+                            }
+                            return
+                        }
+                        guard acceptedWatermarks.accept(repositoryKey, sourceID: sourceID) else {
+                            return
+                        }
+                        Task {
+                            await self.acceptedEvent(
+                                repositoryKey: repositoryKey,
+                                sourceID: sourceID,
+                                kinds: kinds
+                            )
+                        }
+                    }
+                    created[target.key] = source
+                    sourceIDs[target.key] = sourceID
+                } catch {
+                    acceptedWatermarks.remove(repositoryKey, sourceID: sourceID)
+                    throw error
                 }
-                created[target.key] = source
             }
-            return created
+            return (created, sourceIDs)
         } catch {
             created.values.forEach { $0.cancel() }
+            for value in sourceIDs.values {
+                acceptedWatermarks.remove(repositoryKey, sourceID: value)
+            }
             throw error
         }
     }
 
     private func acceptedEvent(
         repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        sourceID: UUID?,
         kinds: Set<GitWorkspaceMetadataEventKind>
     ) {
-        guard let record = records[repositoryKey] else { return }
+        guard let record = records[repositoryKey],
+              sourceID.map({ record.sourceIDsByTargetKey.values.contains($0) }) ?? true
+        else { return }
         acceptedEventCount &+= 1
         record.onEvent(kinds)
     }
@@ -460,8 +514,8 @@ actor GitWorkspaceMetadataMonitor {
             repositoryKey: GitWorkspaceAuthorityRepositoryKey,
             kinds: Set<GitWorkspaceMetadataEventKind>
         ) {
-            acceptedWatermarks.accept(repositoryKey)
-            acceptedEvent(repositoryKey: repositoryKey, kinds: kinds)
+            guard acceptedWatermarks.accept(repositoryKey) else { return }
+            acceptedEvent(repositoryKey: repositoryKey, sourceID: nil, kinds: kinds)
         }
 
         /// Models the callback acceptance cut before the actor-delivery task is
@@ -473,8 +527,21 @@ actor GitWorkspaceMetadataMonitor {
             acceptedWatermarks.accept(repositoryKey)
         }
 
+        func injectEventForTesting(
+            repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+            path: String,
+            flags: FSEventStreamEventFlags,
+            eventID: FSEventStreamEventId
+        ) {
+            guard let source = records[repositoryKey]?.sourcesByTargetKey.values.first else { return }
+            source.injectEventForTesting(path: path, flags: flags, eventID: eventID)
+        }
+
         func flushForTesting(repositoryKey: GitWorkspaceAuthorityRepositoryKey) async {
-            records[repositoryKey]?.sourcesByTargetKey.values.forEach { $0.flushSync() }
+            guard let sources = records[repositoryKey]?.sourcesByTargetKey.values else { return }
+            for source in sources {
+                _ = await source.flush()
+            }
         }
 
         func snapshotForTesting() -> Snapshot {
@@ -591,23 +658,76 @@ actor GitWorkspaceMetadataMonitor {
 private final class GitMetadataAcceptedWatermarks: @unchecked Sendable {
     private let lock = NSLock()
     private var values: [GitWorkspaceAuthorityRepositoryKey: UInt64] = [:]
+    private var activeSourceIDs: [GitWorkspaceAuthorityRepositoryKey: Set<UUID>] = [:]
+    private var invalidatedKeys = Set<GitWorkspaceAuthorityRepositoryKey>()
 
-    func accept(_ key: GitWorkspaceAuthorityRepositoryKey) {
-        lock.lock()
-        values[key, default: 0] &+= 1
-        lock.unlock()
+    func install(
+        _ key: GitWorkspaceAuthorityRepositoryKey,
+        sourceID: UUID
+    ) {
+        lock.withLock {
+            if activeSourceIDs[key, default: []].isEmpty {
+                invalidatedKeys.remove(key)
+            }
+            activeSourceIDs[key, default: []].insert(sourceID)
+        }
+    }
+
+    func remove(
+        _ key: GitWorkspaceAuthorityRepositoryKey,
+        sourceID: UUID
+    ) {
+        lock.withLock {
+            activeSourceIDs[key]?.remove(sourceID)
+            if activeSourceIDs[key]?.isEmpty == true {
+                activeSourceIDs.removeValue(forKey: key)
+                invalidatedKeys.remove(key)
+            }
+        }
+    }
+
+    func invalidate(
+        _ key: GitWorkspaceAuthorityRepositoryKey,
+        sourceID: UUID
+    ) {
+        lock.withLock {
+            guard activeSourceIDs[key]?.contains(sourceID) == true else { return }
+            invalidatedKeys.insert(key)
+        }
+    }
+
+    @discardableResult
+    func accept(
+        _ key: GitWorkspaceAuthorityRepositoryKey,
+        sourceID: UUID
+    ) -> Bool {
+        lock.withLock {
+            guard activeSourceIDs[key]?.contains(sourceID) == true,
+                  !invalidatedKeys.contains(key)
+            else { return false }
+            values[key, default: 0] &+= 1
+            return true
+        }
+    }
+
+    /// Test-equivalent acceptance for an already-active source set.
+    @discardableResult
+    func accept(_ key: GitWorkspaceAuthorityRepositoryKey) -> Bool {
+        lock.withLock {
+            guard activeSourceIDs[key]?.isEmpty == false,
+                  !invalidatedKeys.contains(key)
+            else { return false }
+            values[key, default: 0] &+= 1
+            return true
+        }
     }
 
     func value(for key: GitWorkspaceAuthorityRepositoryKey) -> UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return values[key] ?? 0
+        lock.withLock { values[key] ?? 0 }
     }
 
     func snapshot() -> [GitWorkspaceAuthorityRepositoryKey: UInt64] {
-        lock.lock()
-        defer { lock.unlock() }
-        return values
+        lock.withLock { values }
     }
 
     func withCurrentValue<T>(
@@ -615,36 +735,46 @@ private final class GitMetadataAcceptedWatermarks: @unchecked Sendable {
         expected: UInt64,
         _ body: () -> T
     ) -> T? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard values[key, default: 0] == expected else { return nil }
-        return body()
+        lock.withLock {
+            guard values[key, default: 0] == expected,
+                  activeSourceIDs[key]?.isEmpty == false,
+                  !invalidatedKeys.contains(key)
+            else { return nil }
+            return body()
+        }
     }
 
     func withCurrentValues<T>(
         _ expected: [GitWorkspaceAuthorityRepositoryKey: UInt64],
         _ body: () -> T
     ) -> T? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard expected.allSatisfy({ values[$0.key, default: 0] == $0.value }) else { return nil }
-        return body()
+        lock.withLock {
+            guard expected.allSatisfy({ entry in
+                values[entry.key, default: 0] == entry.value
+                    && activeSourceIDs[entry.key]?.isEmpty == false
+                    && !invalidatedKeys.contains(entry.key)
+            }) else { return nil }
+            return body()
+        }
     }
 }
 
 private final class GitMetadataFSEventSource: @unchecked Sendable {
     private let target: GitWorkspaceMetadataMonitor.WatchTarget
-    private let onEvent: @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
+    private let onEvent: @Sendable (Set<GitWorkspaceMetadataEventKind>, Bool) -> Void
     private let queue: DispatchQueue
+    private let deliveryBarrier = FSEventAsyncDeliveryBarrier()
+    private let deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
     private let lock = NSLock()
     private var stream: FSEventStreamRef?
     private var directorySource: DispatchSourceFileSystemObject?
     private var selfPointer: UnsafeMutableRawPointer?
     private var isCancelled = false
+    private var requiresRecovery = false
 
     init(
         target: GitWorkspaceMetadataMonitor.WatchTarget,
-        onEvent: @escaping @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
+        onEvent: @escaping @Sendable (Set<GitWorkspaceMetadataEventKind>, Bool) -> Void
     ) throws {
         self.target = target
         self.onEvent = onEvent
@@ -652,6 +782,7 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             label: "com.repoprompt.git-workspace-metadata.\(UUID().uuidString)",
             qos: .utility
         )
+        deliveryGeneration = deliveryBarrier.currentGeneration
         if case .exactFile = target.scope {
             let descriptor = open(target.watchRootURL.path, O_EVTONLY | O_CLOEXEC)
             guard descriptor >= 0 else {
@@ -668,7 +799,7 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
                 if !source.data.intersection([.rename, .delete, .revoke]).isEmpty {
                     kinds.insert(.monitorGap)
                 }
-                self.onEvent(kinds)
+                self.onEvent(kinds, false)
             }
             source.setCancelHandler {
                 close(descriptor)
@@ -711,27 +842,40 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             releaseSelfPointer()
             throw GitWorkspaceMetadataMonitorError.streamStartFailed
         }
-        // Retain does not succeed until the dispatch-backed stream has crossed
-        // an activation barrier. This closes the create/delete race where a
-        // caller mutates a newly retained external source immediately after
-        // retain returns.
-        FSEventStreamFlushSync(stream)
-        queue.sync {}
+        // `FSEventStreamStart` installs observation before retain returns. The
+        // authority layer crosses an asynchronous delivery cut before admitting
+        // or reusing evidence, so activation never blocks this actor on
+        // `FSEventStreamFlushSync`.
     }
 
-    func flushSync() {
-        lock.lock()
-        let stream = isCancelled ? nil : stream
-        lock.unlock()
-        if let stream {
-            FSEventStreamFlushSync(stream)
-            // FlushSync requests delivery, but callbacks target this private
-            // dispatch queue. A queue barrier makes the accepted watermark a
-            // true synchronous cut for conditional authority installation.
-            queue.sync {}
-        } else {
-            queue.sync {}
+    func flush() async -> Bool {
+        let sourceState: (flushTarget: FSEventStreamEventId?, hasDirectorySource: Bool) = lock.withLock {
+            guard !isCancelled, !requiresRecovery else { return (nil, false) }
+            if let stream {
+                return (FSEventStreamFlushAsync(stream), false)
+            }
+            return (nil, directorySource != nil)
         }
+        if let flushTarget = sourceState.flushTarget {
+            guard await deliveryBarrier.waitUntilDelivered(
+                flushTarget,
+                generation: deliveryGeneration
+            ) else { return false }
+        } else if !sourceState.hasDirectorySource {
+            return false
+        }
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume()
+            }
+        }
+        guard deliveryBarrier.currentGeneration == deliveryGeneration else { return false }
+        return lock.withLock { !isCancelled && !requiresRecovery }
+    }
+
+    func isCurrent() -> Bool {
+        deliveryBarrier.currentGeneration == deliveryGeneration
+            && lock.withLock { !isCancelled && !requiresRecovery }
     }
 
     func cancel() {
@@ -741,6 +885,7 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             return
         }
         isCancelled = true
+        requiresRecovery = true
         let stream = stream
         self.stream = nil
         let directorySource = directorySource
@@ -771,6 +916,26 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             eventFlags: eventFlags,
             eventIds: eventIDs
         ) else { return }
+        handle(payload: payload)
+    }
+
+    private func handle(payload: FSEventCallbackPayload) {
+        guard deliveryBarrier.currentGeneration == deliveryGeneration,
+              lock.withLock({ !isCancelled && !requiresRecovery })
+        else { return }
+
+        let hasWrappedJournal = payload.entries.contains { entry in
+            entry.flags & FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped) != 0
+        }
+        if hasWrappedJournal {
+            // A wrapped ID is a stream discontinuity. Invalidate the old
+            // stream-scoped cut before notifying the authority; later callbacks
+            // from this source cannot re-establish freshness with the old
+            // immutable callback generation.
+            _ = deliveryBarrier.reset(ifCurrent: deliveryGeneration)
+            lock.withLock { requiresRecovery = true }
+        }
+
         var kinds = Set<GitWorkspaceMetadataEventKind>()
         for entry in payload.entries {
             let gapMask = FSEventStreamEventFlags(
@@ -786,9 +951,26 @@ private final class GitMetadataFSEventSource: @unchecked Sendable {
             kinds.formUnion(target.matchingEventKinds(entry.path, flags: entry.flags))
         }
         if !kinds.isEmpty {
-            onEvent(kinds)
+            onEvent(kinds, hasWrappedJournal)
         }
+        guard !hasWrappedJournal else { return }
+        deliveryBarrier.recordDelivered(
+            eventIDs: payload.entries.map(\.id),
+            generation: deliveryGeneration
+        )
     }
+
+    #if DEBUG
+        func injectEventForTesting(
+            path: String,
+            flags: FSEventStreamEventFlags,
+            eventID: FSEventStreamEventId
+        ) {
+            handle(payload: FSEventCallbackPayload(entries: [
+                FSEventCallbackEntry(path: path, flags: flags, id: eventID)
+            ]))
+        }
+    #endif
 
     private func releaseSelfPointer() {
         lock.lock()

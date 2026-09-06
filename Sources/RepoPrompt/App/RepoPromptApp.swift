@@ -199,6 +199,11 @@ public enum RepoPromptApplication {
                 "preserved": defaultsReport.preservedKeyCount
             ]
         )
+
+        // Capture after the defaults migration attempt because it may copy a persisted Codex
+        // selection, but before bootstrap can create Settings or provider clients.
+        CodexRuntimeAuthority.initializeLaunchSnapshot()
+
         SecureStorageIdentityMigrationBootstrap.prepareIfConfigured()
         RepoPromptSwiftUIApp.main()
     }

@@ -325,6 +325,14 @@ final class AppSettingsMCPService: Service {
             "corrupt_unrecoverable"
         case .saveFailed:
             "save_failed"
+        case .writerBusy:
+            "settings_writer_busy"
+        case .changedOnDisk:
+            "settings_changed_on_disk"
+        case .missingOnDisk:
+            "settings_missing_on_disk"
+        case .loadFailed:
+            "settings_load_failed"
         case .automaticSchemaNormalizationFailed:
             "automatic_schema_normalization_failed"
         }
@@ -337,9 +345,17 @@ final class AppSettingsMCPService: Service {
         case .incompatibleSchema:
             "Setting was applied in memory, but globalSettings.json was written by a different or unrecognized RepoPrompt settings schema; it will not persist until the settings file is imported or recovered."
         case .corruptUnrecoverable:
-            "Setting was applied in memory, but globalSettings.json is unreadable and could not be backed up; it will not persist until the settings file is recovered."
+            "Setting was applied in memory, but globalSettings.json is unreadable or malformed and remains preserved; it will not persist until the settings file is explicitly recovered."
         case .saveFailed:
             "Setting was applied in memory, but RepoPrompt could not write globalSettings.json; it will not persist until saving succeeds."
+        case .writerBusy:
+            "Setting was applied in memory, but another RepoPrompt CE process is updating settings. Retry saving after that update finishes."
+        case .changedOnDisk:
+            "Setting was applied in memory, but settings changed on disk. Reload settings in Settings before making further changes; reloading replaces unsaved in-memory changes."
+        case .missingOnDisk:
+            "Setting was applied in memory, but the settings file is missing. In Settings, explicitly save the current in-memory settings to a new file, or restore the file and reload."
+        case .loadFailed:
+            "Setting was applied in memory, but settings could not be loaded safely. Retry loading in Settings before making further changes; reloading replaces unsaved in-memory changes."
         case .automaticSchemaNormalizationFailed:
             "Setting was applied in memory, but RepoPrompt could not safely back up and normalize the existing globalSettings.json schema header; the original file is preserved and the setting will not persist until explicit recovery."
         }

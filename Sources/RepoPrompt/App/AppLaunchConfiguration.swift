@@ -1,6 +1,18 @@
 import Foundation
 
 struct AppLaunchConfiguration {
+    /// SwiftPM and hosted XCTest can initialize application singletons. They must
+    /// not adopt the signed-in user's durable settings as their default fixture.
+    static var isUnitTestProcess: Bool {
+        #if DEBUG
+            Bundle.main.bundleURL.pathExtension == "xctest"
+                || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+                || NSClassFromString("XCTestCase") != nil
+        #else
+            false
+        #endif
+    }
+
     enum ForcedRootRoute: Equatable {
         case main
     }

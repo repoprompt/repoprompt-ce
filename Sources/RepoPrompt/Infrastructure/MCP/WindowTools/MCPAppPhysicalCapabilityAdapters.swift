@@ -23,6 +23,22 @@ enum MCPAppFileReadResult {
 /// Namespace for independently injected app-process capability families.
 /// No provider receives an unrestricted aggregate of every app capability.
 enum MCPAppPhysicalCapabilityAdapters {
+    enum PromptExportPhaseHookPoint: String, Hashable {
+        case beforeDurableWrite
+        case afterDurableWrite
+    }
+
+    typealias PromptExportPhaseHook = @MainActor @Sendable (PromptExportPhaseHookPoint) async -> Void
+
+    #if DEBUG
+        @MainActor private static var promptExportPhaseHookForTesting: PromptExportPhaseHook?
+
+        @MainActor
+        static func setPromptExportPhaseHookForTesting(_ hook: PromptExportPhaseHook?) {
+            promptExportPhaseHookForTesting = hook
+        }
+    #endif
+
     struct ContextBuilderTabResolution {
         let identity: WorkspaceSelectionIdentity
         let nestedTabContext: MCPServerViewModel.TabContextSnapshot
@@ -432,5 +448,12 @@ enum MCPAppPhysicalCapabilityAdapters {
         let buildTabClipboardContent: BuildTabClipboardContent
         let writePromptExportFile: WritePromptExportFile
         let latestTokenBreakdown: LatestTokenBreakdown
+
+        @MainActor
+        func reachExportPhaseHook(_ phase: PromptExportPhaseHookPoint) async {
+            #if DEBUG
+                await MCPAppPhysicalCapabilityAdapters.promptExportPhaseHookForTesting?(phase)
+            #endif
+        }
     }
 }

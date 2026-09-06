@@ -24,6 +24,13 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
     private var terminationInProgress = false
     private let dockMenuController = DockMenuController()
+    /// The app delegate retains signal routing so its Dispatch sources remain active for the
+    /// entire application lifetime.
+    private lazy var terminationSignalRouter = AppTerminationSignalRouter(
+        observer: DispatchTerminationSignalObserver()
+    ) {
+        NSApp.terminate(nil)
+    }
 
     /// App startup owns one explicit registration attempt; readiness only observes it.
     private var domainRuntimeStartupTask: Task<Void, Never>?
@@ -124,6 +131,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let launchConfiguration = AppLaunchConfiguration.current
         ProcessTermination.resetAppTerminationFastPath()
+        terminationSignalRouter.install()
 
         if launchConfiguration.isUITestSession {
             NSApp.setActivationPolicy(.regular)

@@ -1,5 +1,39 @@
 import Foundation
 
+package struct MCPDomainAdmissionDeadline: Sendable {
+    package struct Expired: Error, Equatable {}
+
+    package let instant: Duration
+    private let nowProvider: @Sendable () -> Duration
+    private let sleepProvider: @Sendable (Duration) async throws -> Void
+
+    package init(
+        instant: Duration,
+        now: @escaping @Sendable () -> Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void
+    ) {
+        self.instant = instant
+        nowProvider = now
+        sleepProvider = sleep
+    }
+
+    package func remaining() -> Duration {
+        max(.zero, instant - nowProvider())
+    }
+
+    package func check() throws {
+        guard nowProvider() < instant else { throw Expired() }
+    }
+
+    package func waitUntilExpired() async throws -> Never {
+        let delay = remaining()
+        guard delay > .zero else { throw Expired() }
+        try await sleepProvider(delay)
+        try Task.checkCancellation()
+        throw Expired()
+    }
+}
+
 package struct MCPDomainConnectionCallAdmissionEntry: Sendable {
     package let limiters: MCPDomainConnectionCallLimiters
     package let replacementGeneration: UInt64
@@ -80,9 +114,14 @@ package actor MCPDomainConnectionCallLimiters {
     private let fileRead: MCPDomainAsyncLimiter
     private let gitRead: MCPDomainAsyncLimiter
     private let fileSearch: MCPDomainAsyncLimiter
+    private struct AdmissionRetryWaiter {
+        let continuation: CheckedContinuation<MCPDomainConnectionCallLimiters?, Error>
+        let deadlineTask: Task<Void, Never>?
+    }
+
     private var admittedCallCount = 0
     private var admissionCloseState: AdmissionCloseState = .open
-    private var admissionRetryWaiters: [UUID: CheckedContinuation<MCPDomainConnectionCallLimiters?, Never>] = [:]
+    private var admissionRetryWaiters: [UUID: AdmissionRetryWaiter] = [:]
 
     #if DEBUG
         package init(
@@ -116,6 +155,7 @@ package actor MCPDomainConnectionCallLimiters {
 
     package func withPermit<T: Sendable>(
         lane: MCPDomainConnectionCallLane,
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil,
         cancellationResult: @Sendable () -> T,
         _ operation: @Sendable () async -> T
     ) async -> T {
@@ -123,6 +163,7 @@ package actor MCPDomainConnectionCallLimiters {
         admittedCallCount += 1
         defer { admittedCallCount -= 1 }
         return await limiter(for: lane).withPermit(
+            admissionDeadline: admissionDeadline,
             cancellationResult: cancellationResult,
             operation
         )
@@ -130,12 +171,16 @@ package actor MCPDomainConnectionCallLimiters {
 
     package func withPermit<T: Sendable>(
         lane: MCPDomainConnectionCallLane,
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil,
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {
         guard case .open = admissionCloseState else { throw AdmissionRejected() }
         admittedCallCount += 1
         defer { admittedCallCount -= 1 }
-        return try await limiter(for: lane).withPermit(operation)
+        return try await limiter(for: lane).withPermit(
+            admissionDeadline: admissionDeadline,
+            operation
+        )
     }
 
     package func hasInFlightCalls() -> Bool {
@@ -147,14 +192,21 @@ package actor MCPDomainConnectionCallLimiters {
     }
 
     package func admissionRetryReplacement() async -> MCPDomainConnectionCallLimiters? {
-        guard !Task.isCancelled else { return nil }
+        try? await admissionRetryReplacement(admissionDeadline: nil)
+    }
+
+    package func admissionRetryReplacement(
+        admissionDeadline: MCPDomainAdmissionDeadline?
+    ) async throws -> MCPDomainConnectionCallLimiters? {
+        try Task.checkCancellation()
+        try admissionDeadline?.check()
         switch admissionCloseState {
         case .open, .committed:
             return nil
         case let .restored(replacement):
             return replacement
         case .tentative:
-            return await waitForAdmissionCloseOutcome()
+            return try await waitForAdmissionCloseOutcome(admissionDeadline: admissionDeadline)
         }
     }
 
@@ -248,12 +300,15 @@ package actor MCPDomainConnectionCallLimiters {
         }
     #endif
 
-    private func waitForAdmissionCloseOutcome() async -> MCPDomainConnectionCallLimiters? {
+    private func waitForAdmissionCloseOutcome(
+        admissionDeadline: MCPDomainAdmissionDeadline?
+    ) async throws -> MCPDomainConnectionCallLimiters? {
+        try admissionDeadline?.check()
         let waiterID = UUID()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
                 guard !Task.isCancelled else {
-                    continuation.resume(returning: nil)
+                    continuation.resume(throwing: CancellationError())
                     return
                 }
                 switch admissionCloseState {
@@ -262,7 +317,21 @@ package actor MCPDomainConnectionCallLimiters {
                 case let .restored(replacement):
                     continuation.resume(returning: replacement)
                 case .tentative:
-                    admissionRetryWaiters[waiterID] = continuation
+                    let deadlineTask = admissionDeadline.map { deadline in
+                        Task {
+                            do {
+                                try await deadline.waitUntilExpired()
+                            } catch is MCPDomainAdmissionDeadline.Expired {
+                                await self.expireAdmissionRetryWaiter(waiterID)
+                            } catch {
+                                // Cancellation is the normal path when another close outcome wins.
+                            }
+                        }
+                    }
+                    admissionRetryWaiters[waiterID] = AdmissionRetryWaiter(
+                        continuation: continuation,
+                        deadlineTask: deadlineTask
+                    )
                 }
             }
         } onCancel: {
@@ -271,14 +340,22 @@ package actor MCPDomainConnectionCallLimiters {
     }
 
     private func cancelAdmissionRetryWaiter(_ waiterID: UUID) {
-        admissionRetryWaiters.removeValue(forKey: waiterID)?.resume(returning: nil)
+        guard let waiter = admissionRetryWaiters.removeValue(forKey: waiterID) else { return }
+        waiter.deadlineTask?.cancel()
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func expireAdmissionRetryWaiter(_ waiterID: UUID) {
+        guard let waiter = admissionRetryWaiters.removeValue(forKey: waiterID) else { return }
+        waiter.continuation.resume(throwing: MCPDomainAdmissionDeadline.Expired())
     }
 
     private func resumeAdmissionRetryWaiters(with replacement: MCPDomainConnectionCallLimiters?) {
         let waiters = Array(admissionRetryWaiters.values)
         admissionRetryWaiters.removeAll()
         for waiter in waiters {
-            waiter.resume(returning: replacement)
+            waiter.deadlineTask?.cancel()
+            waiter.continuation.resume(returning: replacement)
         }
     }
 
@@ -320,7 +397,6 @@ package actor MCPDomainConnectionCallLimiters {
         ]
     }
 }
-
 
 #if DEBUG
 package struct MCPDomainConnectionCallLimiterDebugSnapshot: Equatable, Sendable {
@@ -441,6 +517,7 @@ private let idleWaitSleep: @Sendable (Duration) async throws -> Void
 
     private let debugNowNanoseconds: @Sendable () -> UInt64
     private var debugStateObserver: ((DebugSnapshot) -> Void)?
+    private var debugImmediatePermitAcquiredHandler: (@Sendable () async -> Void)?
     private var debugQueuedPermitHandoffHandler: (@Sendable () async -> Void)?
 #endif
 
@@ -467,7 +544,65 @@ private let idleWaitSleep: @Sendable (Duration) async throws -> Void
     }
 #endif
 
-private func acquirePermit() async throws {
+private enum PermitAcquisitionRace: Sendable {
+    case acquired
+    case failed(any Error)
+}
+
+private func acquirePermit(admissionDeadline: MCPDomainAdmissionDeadline?) async throws {
+    guard let admissionDeadline else {
+        try await acquirePermitWithoutDeadline()
+        return
+    }
+    try admissionDeadline.check()
+    let (first, remaining) = await withTaskGroup(of: PermitAcquisitionRace.self) { group in
+        group.addTask {
+            do {
+                try await self.acquirePermitWithoutDeadline()
+                return .acquired
+            } catch {
+                return .failed(error)
+            }
+        }
+        group.addTask {
+            do {
+                try await admissionDeadline.waitUntilExpired()
+            } catch {
+                return .failed(error)
+            }
+        }
+
+        let first = await group.next()!
+        group.cancelAll()
+        var remaining: [PermitAcquisitionRace] = []
+        while let result = await group.next() {
+            remaining.append(result)
+        }
+        return (first, remaining)
+    }
+
+    switch first {
+    case .acquired:
+        break
+    case let .failed(error):
+        if remaining.contains(where: { result in
+            if case .acquired = result { return true }
+            return false
+        }) {
+            releasePermit()
+        }
+        throw error
+    }
+
+    do {
+        try admissionDeadline.check()
+    } catch {
+        releasePermit()
+        throw error
+    }
+}
+
+private func acquirePermitWithoutDeadline() async throws {
     try Task.checkCancellation()
     guard !isClosed else { throw CancellationError() }
 
@@ -475,6 +610,11 @@ private func acquirePermit() async throws {
         permits -= 1
         activePermitCount += 1
         notifyDebugStateChanged()
+        #if DEBUG
+            if let debugImmediatePermitAcquiredHandler {
+                await debugImmediatePermitAcquiredHandler()
+            }
+        #endif
         return
     }
 
@@ -503,9 +643,12 @@ private func acquirePermit() async throws {
             await debugQueuedPermitHandoffHandler()
         }
     #endif
-    guard !isClosed else {
+    do {
+        try Task.checkCancellation()
+        guard !isClosed else { throw CancellationError() }
+    } catch {
         releasePermit()
-        throw CancellationError()
+        throw error
     }
 }
 
@@ -659,6 +802,12 @@ private func resumeIdleWaitersIfNeeded() {
         debugQueuedPermitHandoffHandler = handler
     }
 
+    package func setDebugImmediatePermitAcquiredHandler(
+        _ handler: (@Sendable () async -> Void)?
+    ) {
+        debugImmediatePermitAcquiredHandler = handler
+    }
+
     private func makeDebugSnapshot() -> DebugSnapshot {
         let now = debugNowNanoseconds()
         let oldestWaiterAgeMilliseconds = firstWaiterID
@@ -699,6 +848,7 @@ private func resumeIdleWaitersIfNeeded() {
 
 /// Executes an operation with a permit, limiting concurrency.
 package func withPermit<T: Sendable>(
+    admissionDeadline: MCPDomainAdmissionDeadline? = nil,
     _ op: @Sendable () async throws -> T
 ) async throws -> T {
     inFlight += 1
@@ -709,18 +859,19 @@ package func withPermit<T: Sendable>(
         resumeIdleWaitersIfNeeded()
     }
 
-    try await acquirePermit()
+    try await acquirePermit(admissionDeadline: admissionDeadline)
     defer { releasePermit() }
     try Task.checkCancellation()
     return try await op()
 }
 
 package func withPermit<T: Sendable>(
+    admissionDeadline: MCPDomainAdmissionDeadline? = nil,
     cancellationResult: @Sendable () -> T,
     _ op: @Sendable () async -> T
 ) async -> T {
     do {
-        return try await withPermit {
+        return try await withPermit(admissionDeadline: admissionDeadline) {
             await op()
         }
     } catch {

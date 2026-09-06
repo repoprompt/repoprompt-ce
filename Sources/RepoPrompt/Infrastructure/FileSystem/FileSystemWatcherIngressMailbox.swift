@@ -31,6 +31,11 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         let lowestAcceptedWatermark: Watermark
         let acceptedHighWatermark: Watermark
         let contents: Contents
+        /// The stream/root lifetime that accepted this payload. Production
+        /// callbacks must carry this through mailbox admission so a callback
+        /// already in flight during restart cannot be attributed to the new
+        /// lifetime.
+        let ingressGeneration: UInt64?
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
 
         var rawEntryCount: Int {
@@ -57,6 +62,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
     private let lock = NSLock()
     private let maxQueuedRawEntries: Int
     private var isAccepting = true
+    private var acceptingIngressGeneration: UInt64?
     private var isAutomaticDrainPaused = false
     private var nextAcceptedSequence: UInt64 = 0
     private var acceptedHighWatermark = Watermark.zero
@@ -73,8 +79,17 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
     }
 
     func startAccepting() {
+        startAccepting(for: nil)
+    }
+
+    func startAccepting(for ingressGeneration: UInt64) {
+        startAccepting(for: Optional(ingressGeneration))
+    }
+
+    private func startAccepting(for ingressGeneration: UInt64?) {
         lock.lock()
         isAccepting = true
+        acceptingIngressGeneration = ingressGeneration
         lock.unlock()
     }
 
@@ -100,6 +115,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
     func stopAcceptingAndDiscardPending() {
         lock.lock()
         isAccepting = false
+        acceptingIngressGeneration = nil
         isAutomaticDrainPaused = false
         queuedPayloads.removeAll(keepingCapacity: false)
         queuedPayloadHead = 0
@@ -121,13 +137,16 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
     @discardableResult
     func accept(
         _ payload: FSEventCallbackPayload,
+        ingressGeneration: UInt64? = nil,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
         scheduleDrain: (@Sendable () async -> Void)?
     ) -> Watermark? {
         guard !payload.entries.isEmpty else { return nil }
 
         lock.lock()
-        guard isAccepting else {
+        guard isAccepting,
+              ingressGeneration == acceptingIngressGeneration
+        else {
             lock.unlock()
             return nil
         }
@@ -139,6 +158,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
             lowestAcceptedWatermark: watermark,
             acceptedHighWatermark: watermark,
             contents: .entries(payload.entries),
+            ingressGeneration: ingressGeneration,
             lifecycleCorrelation: lifecycleCorrelation
         )
         appendOrCollapse(acceptedPayload)
@@ -224,6 +244,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
                 highestEventID: highestEventID,
                 changedIgnoreAbsolutePaths: changedIgnoreAbsolutePaths
             ),
+            ingressGeneration: payload.ingressGeneration,
             lifecycleCorrelation: payload.lifecycleCorrelation
         )]
         queuedPayloadHead = 0

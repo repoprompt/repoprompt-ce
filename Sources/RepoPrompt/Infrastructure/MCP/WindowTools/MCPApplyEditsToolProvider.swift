@@ -4,6 +4,31 @@ import MCP
 import Ontology
 import RepoPromptShared
 
+enum MCPApplyEditsMissingTargetPolicy {
+    static func requiresExistingFile(
+        _ input: WorkspaceExactFileInput,
+        namespace: WorkspaceExactFileNamespace
+    ) -> Bool {
+        // Root-qualified replay identities must not become create destinations after their binding disappears.
+        switch input {
+        case .absolute:
+            false
+        case .explicitRoot:
+            true
+        case let .relative(relativePath):
+            // A resolved alias names one binding, so losing that binding must not redirect the request into creation.
+            switch WorkspaceAliasResolver.resolve(
+                userPath: relativePath,
+                roots: namespace.clientRoots,
+                options: RootAliasOptions(requireRemainder: true)
+            ) {
+            case .prefixed: true
+            case .ambiguous, .bareRoot, .notAliasPrefixed: false
+            }
+        }
+    }
+}
+
 @MainActor
 final class MCPApplyEditsToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .applyEdits
@@ -44,7 +69,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             `{"path": "file.swift", "edits": [{"search": "old1", "replace": "new1"}, {"search": "old2", "replace": "new2"}]}`
 
             Note: Modes are mutually exclusive. Providing more than one will result in an error.
-            Existing workspace files use exact, literal-first paths. Reuse the path returned by `read_file`; `<root-alias>//<relative-path>` explicitly selects a root when needed. Approved external read paths are not editable. Missing-file creation keeps its separate destination rules and does not accept the explicit `//` form.
+            Existing workspace files use exact, literal-first paths. Reuse the path returned by `read_file`; `<root-alias>//<relative-path>` explicitly selects a root when needed. Approved external read paths are not editable. Missing-file creation accepts contained absolute paths and unqualified relative destinations; explicit `//` paths and resolved display aliases identify existing files only.
 
             Options: `verbose` (show diff), `on_missing` (for rewrite only: "error" | "create", default: "error")
             Edits are literal. Use real JSON newlines for multi-line search/replace (not `\\n`). If a match fails, the tool may retry internally with escape decoding.
@@ -82,6 +107,24 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
         }
     }
 
+    static func resolveMutationTargetAfterFreshness(
+        _ input: WorkspaceExactFileInput,
+        namespace: WorkspaceExactFileNamespace,
+        store: WorkspaceFileContextStore,
+        timeout: Duration = .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
+    ) async throws -> WorkspaceExactExistingFileResolution {
+        _ = try await store.awaitAppliedIngressForExplicitRequest(
+            input,
+            namespace: namespace,
+            timeout: timeout
+        )
+        try Task.checkCancellation()
+        let resolution = try await WorkspaceFileMutationService(store: store)
+            .resolveExactExistingFile(input, namespace: namespace)
+        try Task.checkCancellation()
+        return resolution
+    }
+
     private func executeApplyEdits(args: [String: Value]) async throws -> EditSummary {
         var requestPath: String? = nil
         do {
@@ -117,15 +160,12 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             let store = await MainActor.run { dependencies.context.promptVM.workspaceFileContextStore }
             let roots = await store.rootRefs(scope: lookupContext.rootScope)
             let namespace = lookupContext.exactFileNamespace(storeRoots: roots)
-            let freshnessPath = switch exactInput {
-            case let .absolute(path): lookupContext.translateInputPath(path)
-            case .explicitRoot, .relative: exactInput.renderedPath
-            }
+            let resolution: WorkspaceExactExistingFileResolution
             do {
-                _ = try await store.awaitAppliedIngressForExplicitRequest(
-                    userPath: freshnessPath,
-                    fallbackScope: lookupContext.rootScope,
-                    timeout: .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
+                resolution = try await Self.resolveMutationTargetAfterFreshness(
+                    exactInput,
+                    namespace: namespace,
+                    store: store
                 )
             } catch is WorkspaceAppliedIngressWaitError {
                 return Self.retryableFailureSummary(
@@ -133,9 +173,6 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                     failure: .workspaceFreshnessUnavailable()
                 )
             }
-
-            let mutationService = WorkspaceFileMutationService(store: store)
-            let resolution = try await mutationService.resolveExactExistingFile(exactInput, namespace: namespace)
             let effectivePath: String
             let displayPath: String
             let target: WorkspaceFileEditHost.Target
@@ -149,8 +186,10 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             case .directory:
                 throw MCPError.invalidParams("'\(request.path)' is a folder; apply_edits requires a file path.")
             case .claimedMissing, .noCandidate:
-                if case .explicitRoot = exactInput {
-                    throw MCPError.invalidParams("File '\(request.path)' does not exist. Explicit root-qualified paths identify existing files only.")
+                if MCPApplyEditsMissingTargetPolicy.requiresExistingFile(exactInput, namespace: namespace) {
+                    throw MCPError.invalidParams(
+                        "File '\(request.path)' does not exist. Explicit root and resolved display-alias paths identify existing files only."
+                    )
                 }
                 effectivePath = lookupContext.translateInputPath(request.path)
                 displayPath = request.path
@@ -212,6 +251,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             }
 
             if shouldRequireApproval, let approvalScope {
+                try Task.checkCancellation()
                 let previewRequest = ApplyEditsRequest(
                     path: effectivePath,
                     mode: request.mode,
@@ -234,10 +274,12 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
 
                 switch decision {
                 case .accept:
+                    try Task.checkCancellation()
                     try await EditFlowPerf.measure(
                         EditFlowPerf.Stage.ApplyEdits.hostWrite,
                         EditFlowPerf.Dimensions(fileBytes: previewResult.updatedText.utf8.count, appliedCount: previewResult.editsApplied)
                     ) {
+                        try Task.checkCancellation()
                         if preview.exists {
                             guard let originalText = preview.originalText else {
                                 throw MCPError.internalError("Existing-file preview did not capture its original content.")
@@ -312,6 +354,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             }
 
             let effectiveRequest = ApplyEditsRequest(path: effectivePath, mode: request.mode, verbose: request.verbose)
+            try Task.checkCancellation()
             let result = try await service.run(effectiveRequest)
             let freshness: String?
             if result.editsApplied > 0 {
@@ -343,6 +386,8 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                 operationID: result.editsApplied > 0 ? operationID : nil,
                 freshness: freshness
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as FileManagerError {
             throw await dependencies.context.mapFileManagerErrorToMCP(error, MCPWindowToolName.applyEdits, requestPath)
         } catch let error as ApplyEditsError {

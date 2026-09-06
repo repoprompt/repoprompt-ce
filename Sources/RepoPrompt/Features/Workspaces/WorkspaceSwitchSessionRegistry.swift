@@ -1,9 +1,35 @@
 import Foundation
 
 @MainActor
+final class WorkspaceDeletionCancellationToken {
+    let workspaceID: UUID
+    private(set) var isCancelled = false
+
+    init(workspaceID: UUID) {
+        self.workspaceID = workspaceID
+    }
+
+    var isActive: Bool {
+        !isCancelled
+    }
+
+    func cancel() {
+        isCancelled = true
+    }
+}
+
+@MainActor
 protocol WorkspaceSwitchSessionProvider: AnyObject {
     func switchSessionItems() -> [WorkspaceSwitchSessionItem]
     func cancelSwitchSessions() async
+    func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async
+}
+
+extension WorkspaceSwitchSessionProvider {
+    func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
+        guard deletionToken?.isActive ?? true else { return }
+        await cancelSwitchSessions()
+    }
 }
 
 @MainActor
@@ -37,8 +63,13 @@ final class WorkspaceSwitchSessionRegistry {
     }
 
     func cancelActiveSessions() async {
+        await cancelActiveSessions(for: nil)
+    }
+
+    func cancelActiveSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
         for provider in providers {
-            await provider.cancelSwitchSessions()
+            guard deletionToken?.isActive ?? true else { return }
+            await provider.cancelSwitchSessions(for: deletionToken)
         }
     }
 }

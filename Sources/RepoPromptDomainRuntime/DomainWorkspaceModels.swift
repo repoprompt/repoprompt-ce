@@ -196,6 +196,13 @@ package struct DomainWorkspaceSnapshot: Codable, Equatable {
     package let contexts: [DomainContextSnapshot]
 }
 
+/// A target-only activation read. It never claims that the full catalog is ready.
+package struct DomainWorkspaceActivationSnapshot {
+    package let workspace: DomainWorkspaceSnapshot?
+    package let publicationSequence: UInt64
+    package let catalogRevision: UInt64
+}
+
 package struct DomainWorkspaceCatalogSnapshot: Equatable {
     package let runtimeIdentity: DomainRuntimeIdentity
     package let isBootstrapped: Bool

@@ -63,6 +63,20 @@ struct WorkspaceReadableFileService {
         }
     }
 
+    func awaitFreshnessForExplicitRequest(
+        _ input: WorkspaceExactFileInput,
+        namespace: WorkspaceExactFileNamespace,
+        timeout: Duration
+    ) async throws {
+        try await awaitFreshnessForExplicitRequest {
+            try await store.awaitAppliedIngressForExplicitRequest(
+                input,
+                namespace: namespace,
+                timeout: timeout
+            )
+        }
+    }
+
     private func awaitFreshnessForExplicitRequest(
         samples operation: () async throws -> [WorkspaceIngressBarrierSample]
     ) async throws {

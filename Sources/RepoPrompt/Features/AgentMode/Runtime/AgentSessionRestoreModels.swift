@@ -11,6 +11,7 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var agentKindRaw: String?
     var agentModelRaw: String?
     var agentReasoningEffortRaw: String?
+    var acpModelParameterSelections: [ACPModelParameterSelection] = []
     var autoEditEnabled: Bool
     var parentSessionID: UUID?
     var hasUnknownConversationContent: Bool

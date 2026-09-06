@@ -93,6 +93,38 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         }
     }
 
+    package struct ModelParameterSelection: Codable, Equatable, Sendable {
+        package let providerID: String
+        package let baseModelRaw: String
+        package let kind: String
+        package let configID: String
+        package let valueRaw: String
+
+        package init(
+            providerID: String,
+            baseModelRaw: String,
+            kind: String,
+            configID: String,
+            valueRaw: String
+        ) {
+            self.providerID = providerID
+            self.baseModelRaw = baseModelRaw
+            self.kind = kind
+            self.configID = configID
+            self.valueRaw = valueRaw
+        }
+
+        package func asObject() -> [String: Value] {
+            [
+                "provider_id": .string(providerID),
+                "base_model": .string(baseModelRaw),
+                "kind": .string(kind),
+                "config_id": .string(configID),
+                "value": .string(valueRaw)
+            ]
+        }
+    }
+
     package struct WorktreeBinding: Codable, Equatable, Sendable {
         package let id: String
         package let repositoryID: String
@@ -467,6 +499,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
     package let agentDisplayName: String?
     package let modelRaw: String?
     package let reasoningEffortRaw: String?
+    package let modelParameterSelections: [ModelParameterSelection]
     package let status: Status
     package let statusText: String?
     package let latestAssistantPreview: String?
@@ -488,6 +521,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         agentDisplayName: String?,
         modelRaw: String?,
         reasoningEffortRaw: String?,
+        modelParameterSelections: [ModelParameterSelection] = [],
         status: Status,
         statusText: String?,
         latestAssistantPreview: String?,
@@ -508,6 +542,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         self.agentDisplayName = agentDisplayName
         self.modelRaw = modelRaw
         self.reasoningEffortRaw = reasoningEffortRaw
+        self.modelParameterSelections = modelParameterSelections
         self.status = status
         self.statusText = statusText
         self.latestAssistantPreview = latestAssistantPreview
@@ -569,12 +604,16 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         object["session"] = .object(session)
 
         if agentRaw != nil || modelRaw != nil {
-            object["agent"] = .object([
+            var agent: [String: Value] = [
                 "id": agentRaw.map(Value.string) ?? .null,
                 "name": agentDisplayName.map(Value.string) ?? .null,
                 "model": modelRaw.map(Value.string) ?? .null,
                 "reasoning_effort": reasoningEffortRaw.map(Value.string) ?? .null
-            ])
+            ]
+            if !modelParameterSelections.isEmpty {
+                agent["model_parameters"] = .array(modelParameterSelections.map { .object($0.asObject()) })
+            }
+            object["agent"] = .object(agent)
         }
         if !worktreeBindings.isEmpty {
             let values = worktreeBindings.map { Value.object($0.asObject()) }

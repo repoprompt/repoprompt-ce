@@ -38,7 +38,7 @@ final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
 
         XCTAssertEqual(decoded.serializationVersion, AgentSession.currentSerializationVersion)
-        XCTAssertEqual(decoded.serializationVersion, 7)
+        XCTAssertEqual(decoded.serializationVersion, 8)
         XCTAssertEqual(decoded.worktreeMergeOperations, [operation])
         XCTAssertEqual(decoded.worktreeMergeOperations.activeWorktreeMergeSummaries, try [XCTUnwrap(operation.activeSummary)])
     }

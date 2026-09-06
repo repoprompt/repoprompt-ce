@@ -27,6 +27,7 @@ struct AgentComposerActions {
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
+    let selectCursorModelParameter: (_ configID: String, _ valueRaw: String) -> Void
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
     let setProviderPermissionLevel: (_ id: AgentProviderPermissionLevelID) -> Void
     let applyCodexToolSettingMutation: (_ mutation: CodexToolSettingMutation) -> Void
@@ -138,6 +139,9 @@ struct AgentInputBar: View {
             },
             reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
+            selectCursorModelParameter: { configID, valueRaw in
+                agentModeVM.selectCursorModelParameter(configID: configID, valueRaw: valueRaw)
+            },
             setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
             setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
             applyCodexToolSettingMutation: { mutation in
@@ -357,7 +361,13 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var modelControlsDisabledTooltip: String {
-        "Model and effort controls are locked while this session is controlled by an MCP agent."
+        if props.isCurrentTabMCPControlled {
+            return "Model and effort controls are locked while this session is controlled by an MCP agent."
+        }
+        if props.selectedAgent == .cursor, props.runState.isActive {
+            return "Cursor model, effort, and speed controls are locked while this run is active."
+        }
+        return "Model controls are temporarily unavailable."
     }
 
     private var permissionBinding: AgentPermissionChromeBinding? {
@@ -643,6 +653,7 @@ struct AgentComposerView: View, Equatable {
                     }
                     if props.hasAvailableAgentProviders {
                         agentProviderModelPicker
+                        cursorModelParameterPickers
                         reasoningEffortPicker
                         claudeEffortPicker
                         codexToolsButton
@@ -977,6 +988,51 @@ struct AgentComposerView: View, Equatable {
             .opacity(modelControlsDisabled ? 0.55 : 1.0)
             .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : "Codex reasoning effort")
             .fixedSize()
+        }
+    }
+
+    @ViewBuilder
+    private var cursorModelParameterPickers: some View {
+        if props.selectedAgent == .cursor {
+            ForEach(props.cursorModelParameterControls) { control in
+                Menu {
+                    ForEach(control.choices, id: \.rawValue) { choice in
+                        Button {
+                            actions.selectCursorModelParameter(control.configID, choice.rawValue)
+                        } label: {
+                            HStack {
+                                Text(choice.displayName)
+                                if choice.rawValue == control.selectedValueRaw {
+                                    Spacer()
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(control.selectedDisplayName)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    }
+                    .foregroundColor(
+                        control.kind == .speed
+                            && control.selectedDisplayName.caseInsensitiveCompare("fast") == .orderedSame
+                            ? .orange
+                            : .secondary
+                    )
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(pickerChipColor)
+                    .cornerRadius(4)
+                }
+                .menuStyle(.borderlessButton)
+                .accessibilityLabel(Text(control.accessibilityLabel))
+                .accessibilityValue(Text(control.accessibilityValue))
+                .disabled(modelControlsDisabled || control.choices.isEmpty)
+                .opacity(modelControlsDisabled ? 0.55 : 1.0)
+                .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : "Cursor \(control.displayName)")
+                .fixedSize()
+            }
         }
     }
 

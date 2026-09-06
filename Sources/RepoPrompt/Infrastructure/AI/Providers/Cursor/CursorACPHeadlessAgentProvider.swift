@@ -93,9 +93,6 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
         if model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) == .orderedSame {
             return model
         }
-        guard AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.contains(rawModel: model) == true else {
-            return nil
-        }
         return model
     }
 }

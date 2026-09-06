@@ -1376,7 +1376,7 @@ final class WindowRoutingService: Service {
         repoPaths: [String],
         switchToCreated: Bool
     ) async throws -> WorkspaceModel {
-        let newWorkspace = window.workspaceManager.createWorkspace(name: name, repoPaths: repoPaths)
+        let newWorkspace = window.workspaceManager.createWorkspace(name: name, repoPaths: repoPaths, savedInLibrary: false)
         if switchToCreated {
             let switchResult = await window.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true)
             if !switchResult.didSwitch {
@@ -2578,7 +2578,7 @@ final class WindowRoutingService: Service {
 
                         // Create the workspace in the new window
                         let newWorkspace = await MainActor.run {
-                            newWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths)
+                            newWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths, savedInLibrary: false)
                         }
                         if switchToCreated {
                             let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true)
@@ -2607,7 +2607,7 @@ final class WindowRoutingService: Service {
 
                     // Create the workspace in the target window
                     let newWorkspace = await MainActor.run {
-                        approvalWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths)
+                        approvalWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths, savedInLibrary: false)
                     }
 
                     if switchToCreated {

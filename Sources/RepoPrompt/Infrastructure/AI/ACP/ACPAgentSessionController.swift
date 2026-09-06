@@ -4,9 +4,16 @@ import Foundation
 actor ACPAgentSessionController {
     struct RequestTimeouts {
         let bootstrapSeconds: TimeInterval
+        let operationalSeconds: TimeInterval
+
+        init(bootstrapSeconds: TimeInterval, operationalSeconds: TimeInterval = 30) {
+            self.bootstrapSeconds = bootstrapSeconds
+            self.operationalSeconds = operationalSeconds
+        }
 
         static let `default` = RequestTimeouts(
-            bootstrapSeconds: 30
+            bootstrapSeconds: 30,
+            operationalSeconds: 30
         )
     }
 
@@ -291,6 +298,44 @@ actor ACPAgentSessionController {
         private let rawACPCaptureURL: URL?
     #endif
 
+    func currentDiscoveredSessionModels() -> ACPDiscoveredSessionModels? {
+        discoveredSessionModels
+    }
+
+    func cursorAvailableModelCatalog() async throws -> ACPDiscoveredSessionModels {
+        guard provider.providerID == .cursor else {
+            throw ControllerError.requestFailed("Cursor model catalog is only available for Cursor ACP sessions.")
+        }
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        let response = try await sendRequest(method: "cursor/list_available_models", params: [:])
+        guard let rawModels = response["models"] as? [[String: Any]] else {
+            throw ControllerError.protocolViolation("cursor/list_available_models response missing models")
+        }
+
+        var options: [AgentModelOption] = []
+        var parameterSets: [ACPModelParameterSet] = []
+        for rawModel in rawModels {
+            guard let option = parseDiscoveredConfigModelOption(from: rawModel) else { continue }
+            options.append(option)
+            guard let configOptions = rawModel["configOptions"] as? [[String: Any]] else { continue }
+            parameterSets.append(contentsOf: parseModelParameterSets(
+                from: configOptions,
+                baseModelRaw: option.rawValue
+            ))
+        }
+        let mergedOptions = mergeModelOptions(options)
+        guard !mergedOptions.isEmpty else {
+            throw ControllerError.protocolViolation("cursor/list_available_models response has no usable models")
+        }
+        return ACPDiscoveredSessionModels(
+            options: mergedOptions,
+            currentModelRaw: discoveredSessionModels?.currentModelRaw,
+            modelParameterSets: parameterSets
+        )
+    }
+
     init(
         provider: any ACPAgentProvider,
         runRequest: ACPRunRequest,
@@ -472,6 +517,16 @@ actor ACPAgentSessionController {
 
         log("ACP initialize")
         diagnose(.phaseStarted("initialize"))
+        var clientCapabilities: [String: Any] = [
+            "fs": [
+                "readTextFile": false,
+                "writeTextFile": false
+            ],
+            "terminal": false
+        ]
+        if provider.supportsParameterizedModelPicker {
+            clientCapabilities["_meta"] = ["parameterizedModelPicker": true]
+        }
         let initializeResponse = try await sendRequest(
             method: "initialize",
             params: [
@@ -480,13 +535,7 @@ actor ACPAgentSessionController {
                     "name": "RepoPrompt",
                     "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
                 ],
-                "clientCapabilities": [
-                    "fs": [
-                        "readTextFile": false,
-                        "writeTextFile": false
-                    ],
-                    "terminal": false
-                ]
+                "clientCapabilities": clientCapabilities
             ]
         )
         diagnose(.phaseCompleted("initialize"))
@@ -570,6 +619,7 @@ actor ACPAgentSessionController {
                     )
                 }
             #endif
+            try validatePromptModelParameterSelections(promptRequest)
             response = try await sendRequest(
                 method: "session/prompt",
                 params: [
@@ -808,7 +858,7 @@ actor ACPAgentSessionController {
                     currentEffortRaw: resolvedEffort == nil ? discoveredSessionModels?.currentEffortRaw : nil
                 )
                 discoveredSessionModels = updated
-                _ = AgentACPModelRegistry.shared.updateDiscoveredModels(updated, for: provider.providerID)
+                publishDiscoveredSessionModelsIfGloballyAuthoritative(updated)
                 return
             }
             if provider.providerID == .cursor,
@@ -888,7 +938,7 @@ actor ACPAgentSessionController {
             currentEffortRaw: nil
         )
         discoveredSessionModels = cleared
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(cleared, for: provider.providerID)
+        publishDiscoveredSessionModelsIfGloballyAuthoritative(cleared)
     }
 
     func setSessionMode(_ modeID: String) async throws {
@@ -896,6 +946,84 @@ actor ACPAgentSessionController {
             guard let self else { throw CancellationError() }
             try await setSessionModeSerialized(modeID)
         }
+    }
+
+    func applySessionModelParameterSelections(
+        _ selections: [ACPModelParameterSelection]
+    ) async throws -> ACPModelParameterApplicationReport {
+        try await configurationMutationMutex.withLock { [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await applySessionModelParameterSelectionsSerialized(selections)
+        }
+    }
+
+    private func applySessionModelParameterSelectionsSerialized(
+        _ selections: [ACPModelParameterSelection]
+    ) async throws -> ACPModelParameterApplicationReport {
+        guard let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        guard provider.supportsParameterizedModelPicker else {
+            return .init(applied: [], skipped: selections)
+        }
+
+        let normalized = ACPModelParameterSelection.normalized(selections).sorted {
+            if $0.kind.sortOrder != $1.kind.sortOrder {
+                return $0.kind.sortOrder < $1.kind.sortOrder
+            }
+            return $0.configID < $1.configID
+        }
+        var applied: [ACPModelParameterSelection] = []
+        var alreadyCurrent: [ACPModelParameterSelection] = []
+        var skipped: [ACPModelParameterSelection] = []
+        for selection in normalized {
+            guard selection.providerID == provider.providerID,
+                  let models = discoveredSessionModels,
+                  let currentModel = models.currentModelRaw,
+                  let parameterSet = models.modelParameterSets.first(where: {
+                      normalizedCursorModelAlias($0.baseModelRaw) == normalizedCursorModelAlias(currentModel)
+                  }),
+                  let definition = parameterSet.definition(kind: selection.kind),
+                  selection.identity == ACPModelParameterIdentity(
+                      providerID: provider.providerID,
+                      baseModelRaw: parameterSet.baseModelRaw,
+                      kind: definition.kind
+                  ),
+                  let choice = definition.choice(matching: selection.valueRaw)
+            else {
+                skipped.append(selection)
+                continue
+            }
+            if definition.currentValueRaw == choice.rawValue {
+                alreadyCurrent.append(selection)
+                continue
+            }
+            let response = try await sendRequestResponse(
+                method: "session/set_config_option",
+                params: [
+                    "sessionId": sessionID,
+                    "configId": definition.configID,
+                    "value": choice.rawValue
+                ]
+            )
+            try await applyVerifiedConfigOptionsMutationResponse(
+                response,
+                requiredModeValue: nil,
+                requiredModelValue: nil,
+                requiredParameter: (definition.configID, choice.rawValue)
+            )
+            applied.append(.init(
+                providerID: selection.providerID,
+                baseModelRaw: currentModel,
+                kind: selection.kind,
+                configID: definition.configID,
+                valueRaw: choice.rawValue
+            ))
+        }
+        return .init(applied: applied, alreadyCurrent: alreadyCurrent, skipped: skipped)
     }
 
     private func setSessionModeSerialized(_ modeID: String) async throws {
@@ -1319,7 +1447,9 @@ actor ACPAgentSessionController {
             // Skip a CSI sequence: ESC [ parameters…final-byte (@–~).
             guard let opener = iterator.next(), opener == "[" else { continue }
             while let byte = iterator.next() {
-                if ("@" ... "~").contains(byte) { break }
+                if ("@" ... "~").contains(byte) {
+                    break
+                }
             }
         }
         return result
@@ -1793,6 +1923,8 @@ actor ACPAgentSessionController {
         switch method {
         case "initialize", "authenticate", "session/new", "session/load":
             requestTimeouts.bootstrapSeconds
+        case "cursor/list_available_models", "session/set_config_option":
+            requestTimeouts.operationalSeconds
         default:
             nil
         }
@@ -1880,6 +2012,44 @@ actor ACPAgentSessionController {
 
     // MARK: - Helpers
 
+    /// A later parameter or mode mutation can invalidate an earlier successful
+    /// selection. Admit the complete effective request using only live session
+    /// authority, immediately before dispatching the prompt.
+    private func validatePromptModelParameterSelections(_ request: ACPRunRequest) throws {
+        guard provider.supportsParameterizedModelPicker,
+              !request.modelParameterSelections.isEmpty
+        else { return }
+        guard sessionModelSnapshotHasLiveAuthority,
+              let models = discoveredSessionModels,
+              let currentModel = models.currentModelRaw,
+              let parameterSet = models.modelParameterSets.first(where: {
+                  normalizedCursorModelAlias($0.baseModelRaw) == normalizedCursorModelAlias(currentModel)
+              })
+        else {
+            throw ControllerError.requestFailed("Cursor model parameters are unavailable before prompt submission.")
+        }
+        if let requestedModel = normalizedModelString(request.modelString),
+           normalizedCursorModelAlias(requestedModel) != normalizedCursorModelAlias(currentModel)
+        {
+            throw ControllerError.requestFailed("Cursor model changed before prompt submission. Retry the requested configuration.")
+        }
+        for selection in ACPModelParameterSelection.normalized(request.modelParameterSelections) {
+            guard selection.identity == ACPModelParameterIdentity(
+                providerID: provider.providerID,
+                baseModelRaw: currentModel,
+                kind: selection.kind
+            ),
+                let definition = parameterSet.definition(kind: selection.kind),
+                let choice = definition.choice(matching: selection.valueRaw),
+                definition.currentValueRaw == choice.rawValue
+            else {
+                throw ControllerError.requestFailed(
+                    "Cursor \(selection.kind.rawValue) selection is no longer current before prompt submission. Retry the requested configuration."
+                )
+            }
+        }
+    }
+
     private func effectivePromptRunRequest(override: ACPRunRequest?) -> ACPRunRequest {
         let request = override ?? runRequest
         let resume = request.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1897,7 +2067,8 @@ actor ACPAgentSessionController {
             attachments: request.attachments,
             taskLabelKind: request.taskLabelKind,
             sessionModeID: request.sessionModeID,
-            autoApproveAllToolPermissions: request.autoApproveAllToolPermissions
+            autoApproveAllToolPermissions: request.autoApproveAllToolPermissions,
+            modelParameterSelections: request.modelParameterSelections
         )
     }
 
@@ -2392,7 +2563,8 @@ actor ACPAgentSessionController {
     private func applyVerifiedConfigOptionsMutationResponse(
         _ response: RequestResponse,
         requiredModeValue: String?,
-        requiredModelValue: String?
+        requiredModelValue: String?,
+        requiredParameter: (configID: String, valueRaw: String)? = nil
     ) async throws {
         guard let configOptions = response.result["configOptions"] as? [[String: Any]] else {
             throw ControllerError.protocolViolation("session/set_config_option response missing complete configOptions snapshot")
@@ -2414,6 +2586,16 @@ actor ACPAgentSessionController {
         case let .valid(_, models):
             if let requiredModelValue, models.currentModelRaw != requiredModelValue {
                 throw ControllerError.protocolViolation("session/set_config_option response did not confirm requested model '\(requiredModelValue)'")
+            }
+            if let requiredParameter {
+                let definitions = models.modelParameterSets.flatMap(\.parameters)
+                guard let definition = definitions.first(where: { $0.configID == requiredParameter.configID }),
+                      definition.currentValueRaw == requiredParameter.valueRaw
+                else {
+                    throw ControllerError.protocolViolation(
+                        "session/set_config_option response did not confirm parameter '\(requiredParameter.configID)' value '\(requiredParameter.valueRaw)'"
+                    )
+                }
             }
         case .absent:
             if requiredModelValue != nil || sessionModelConfigOptionID != nil {
@@ -2442,6 +2624,16 @@ actor ACPAgentSessionController {
            discoveredSessionModels?.currentModelRaw != requiredModelValue
         {
             throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(requiredModelValue)'")
+        }
+        if let requiredParameter {
+            let definitions = discoveredSessionModels?.modelParameterSets.flatMap(\.parameters) ?? []
+            guard let definition = definitions.first(where: { $0.configID == requiredParameter.configID }),
+                  definition.currentValueRaw == requiredParameter.valueRaw
+            else {
+                throw ControllerError.protocolViolation(
+                    "newer ACP configuration state no longer confirms parameter '\(requiredParameter.configID)' value '\(requiredParameter.valueRaw)'"
+                )
+            }
         }
     }
 
@@ -2582,7 +2774,12 @@ actor ACPAgentSessionController {
         discoveredSessionModels = parsed
         sessionModelSnapshotHasLiveAuthority = parsed != nil
         guard let parsed else { return }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(parsed, for: provider.providerID)
+        publishDiscoveredSessionModelsIfGloballyAuthoritative(parsed)
+    }
+
+    private func publishDiscoveredSessionModelsIfGloballyAuthoritative(_ models: ACPDiscoveredSessionModels) {
+        guard !provider.supportsParameterizedModelPicker else { return }
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(models, for: provider.providerID)
     }
 
     private func parseModernModelSnapshot(from response: [String: Any]) -> ParsedModernModelSnapshot {
@@ -2614,10 +2811,90 @@ actor ACPAgentSessionController {
                 configID: option.id,
                 models: ACPDiscoveredSessionModels(
                     options: options,
-                    currentModelRaw: currentModelRaw
+                    currentModelRaw: currentModelRaw,
+                    modelParameterSets: parseModelParameterSets(
+                        from: configOptions,
+                        baseModelRaw: currentModelRaw
+                    )
                 )
             )
         }
+    }
+
+    private func parseModelParameterSets(
+        from configOptions: [[String: Any]],
+        baseModelRaw: String
+    ) -> [ACPModelParameterSet] {
+        guard provider.supportsParameterizedModelPicker else { return [] }
+        var definitionsByKind: [ACPModelParameterKind: [ACPModelParameterDefinition]] = [:]
+        for rawOption in configOptions {
+            let category = normalizedConfigValue(rawOption["category"] as? String)
+            if category?.caseInsensitiveCompare("model") == .orderedSame
+                || category?.caseInsensitiveCompare("mode") == .orderedSame
+            {
+                continue
+            }
+            guard normalizedConfigValue(rawOption["type"] as? String)?.lowercased() == "select",
+                  let exactID = exactNonEmptyConfigString(rawOption["id"] as? String),
+                  let exactCurrentValue = exactNonEmptyConfigString(rawOption["currentValue"] as? String),
+                  let rawChoices = flattenedConfigOptionChoices(from: rawOption["options"]),
+                  !rawChoices.isEmpty
+            else { continue }
+            let choices = rawChoices.compactMap { rawChoice -> ACPModelParameterChoice? in
+                guard let rawValue = exactNonEmptyConfigString(rawChoice["value"] as? String) else { return nil }
+                let displayName = normalizedConfigValue(
+                    (rawChoice["name"] as? String) ?? (rawChoice["displayName"] as? String)
+                ) ?? rawValue
+                return .init(
+                    rawValue: rawValue,
+                    displayName: displayName,
+                    description: normalizedConfigValue(rawChoice["description"] as? String)
+                )
+            }
+            guard !choices.isEmpty else { continue }
+            let displayName = normalizedConfigValue(
+                (rawOption["name"] as? String) ?? (rawOption["displayName"] as? String)
+            ) ?? exactID
+            let classification = ACPModelParameterClassificationInput(
+                configID: exactID,
+                category: category,
+                displayName: displayName,
+                choices: choices
+            )
+            guard let kind = provider.modelParameterKind(for: classification) else { continue }
+            let prototype = ACPModelParameterDefinition(
+                kind: kind,
+                configID: exactID,
+                displayName: displayName,
+                choices: choices,
+                currentValueRaw: exactCurrentValue
+            )
+            guard let canonicalCurrent = prototype.choice(matching: exactCurrentValue) else { continue }
+            definitionsByKind[kind, default: []].append(.init(
+                kind: kind,
+                configID: exactID,
+                displayName: displayName,
+                choices: choices,
+                currentValueRaw: canonicalCurrent.rawValue
+            ))
+        }
+
+        let definitions = ACPModelParameterKind.allCases.compactMap { kind -> ACPModelParameterDefinition? in
+            let candidates = definitionsByKind[kind] ?? []
+            guard candidates.count == 1 else {
+                if candidates.count > 1 {
+                    diagnose(.info("Ignoring conflicting Cursor \(kind.rawValue) selectors: \(candidates.map(\.configID).joined(separator: ", "))"))
+                }
+                return nil
+            }
+            return candidates[0]
+        }
+        return definitions.isEmpty ? [] : [.init(baseModelRaw: baseModelRaw, parameters: definitions)]
+    }
+
+    private func exactNonEmptyConfigString(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return value
     }
 
     private func mergeModelOptions(_ rawOptions: [AgentModelOption]) -> [AgentModelOption] {
@@ -2845,7 +3122,9 @@ actor ACPAgentSessionController {
         case let value as Int:
             return .int(value)
         case let value as NSNumber:
-            if CFGetTypeID(value) == CFBooleanGetTypeID() { return nil }
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                return nil
+            }
             let doubleValue = value.doubleValue
             if floor(doubleValue) == doubleValue {
                 return .int(value.intValue)

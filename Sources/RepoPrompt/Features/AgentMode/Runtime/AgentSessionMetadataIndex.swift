@@ -1,7 +1,7 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 5
+    static let currentSchemaVersion = 6
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -55,6 +55,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var agentKindRaw: String?
     var agentModelRaw: String?
     var agentReasoningEffortRaw: String?
+    var acpModelParameterSelections: [ACPModelParameterSelection]
     var lastRunStateRaw: String?
     var autoEditEnabled: Bool
     var parentSessionID: UUID?
@@ -122,6 +123,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentKindRaw: String?,
         agentModelRaw: String?,
         agentReasoningEffortRaw: String?,
+        acpModelParameterSelections: [ACPModelParameterSelection] = [],
         lastRunStateRaw: String?,
         autoEditEnabled: Bool,
         parentSessionID: UUID?,
@@ -152,6 +154,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.agentKindRaw = agentKindRaw
         self.agentModelRaw = agentModelRaw
         self.agentReasoningEffortRaw = agentReasoningEffortRaw
+        self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunStateRaw = lastRunStateRaw
         self.autoEditEnabled = autoEditEnabled
         self.parentSessionID = parentSessionID
@@ -184,6 +187,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case agentKindRaw
         case agentModelRaw
         case agentReasoningEffortRaw
+        case acpModelParameterSelections
         case lastRunStateRaw
         case autoEditEnabled
         case parentSessionID
@@ -217,6 +221,12 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentKindRaw = try container.decodeIfPresent(String.self, forKey: .agentKindRaw)
         agentModelRaw = try container.decodeIfPresent(String.self, forKey: .agentModelRaw)
         agentReasoningEffortRaw = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffortRaw)
+        acpModelParameterSelections = try ACPModelParameterSelection.normalized(
+            container.decodeIfPresent(
+                [ACPModelParameterSelection].self,
+                forKey: .acpModelParameterSelections
+            ) ?? []
+        )
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
@@ -248,6 +258,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKindRaw: agentKindRaw,
             agentModelRaw: agentModelRaw,
             agentReasoningEffortRaw: agentReasoningEffortRaw,
+            acpModelParameterSelections: acpModelParameterSelections,
             autoEditEnabled: autoEditEnabled,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
@@ -267,6 +278,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKind: agentKindRaw,
             agentModel: agentModelRaw,
             lastRunState: lastRunStateRaw,
+            acpModelParameterSelections: acpModelParameterSelections,
             parentSessionID: parentSessionID,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -288,6 +300,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && agentKindRaw == other.agentKindRaw
             && agentModelRaw == other.agentModelRaw
             && agentReasoningEffortRaw == other.agentReasoningEffortRaw
+            && acpModelParameterSelections == other.acpModelParameterSelections
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
             && parentSessionID == other.parentSessionID
@@ -332,6 +345,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKindRaw: session.agentKind,
             agentModelRaw: session.agentModel,
             agentReasoningEffortRaw: session.agentReasoningEffort,
+            acpModelParameterSelections: session.acpModelParameterSelections,
             lastRunStateRaw: session.lastRunState,
             autoEditEnabled: session.autoEditEnabled,
             parentSessionID: session.parentSessionID,

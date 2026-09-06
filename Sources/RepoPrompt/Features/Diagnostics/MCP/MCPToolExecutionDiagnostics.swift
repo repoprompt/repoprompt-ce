@@ -19,6 +19,16 @@ enum MCPToolExecutionHandlerPhase: String, Equatable {
     case getFileTreeRequestResolution = "get_file_tree.request_resolution"
     case getFileTreeIngressWait = "get_file_tree.ingress_wait"
     case getFileTreeConstruction = "get_file_tree.construction"
+    case promptExportSelectionDrain = "prompt_export.selection_drain"
+    case promptExportPresetResolution = "prompt_export.preset_resolution"
+    case promptExportContentAssembly = "prompt_export.content_assembly"
+    case promptExportMetadataAssembly = "prompt_export.metadata_assembly"
+    case promptExportDestinationAuthorization = "prompt_export.destination_authorization"
+    case promptExportDurableWrite = "prompt_export.durable_write"
+    case promptExportIngressWait = "prompt_export.ingress_wait"
+    case promptExportReplyAssembly = "prompt_export.reply_assembly"
+    case promptExportFormatting = "prompt_export.formatting"
+    case promptExportPublication = "prompt_export.publication"
     // Graph-first get_code_structure execution stages.
     case getCodeStructureSeedResolution = "get_code_structure.seed_resolution"
     case getCodeStructureGraphSnapshot = "get_code_structure.graph_snapshot"
@@ -57,16 +67,19 @@ final class MCPToolExecutionHandlerPhaseRecorder: @unchecked Sendable {
         self.now = now
     }
 
+    @discardableResult
     func report(
         _ phase: MCPToolExecutionHandlerPhase,
         transition: MCPToolExecutionHandlerPhaseTransition
-    ) async {
+    ) async -> MCPToolExecutionHandlerPhaseSnapshot {
         let current = await now()
-        store(MCPToolExecutionHandlerPhaseSnapshot(
+        let snapshot = MCPToolExecutionHandlerPhaseSnapshot(
             phase: phase,
             transition: transition,
             elapsedMilliseconds: max(0, current.mcpMilliseconds - origin.mcpMilliseconds)
-        ))
+        )
+        store(snapshot)
+        return snapshot
     }
 
     func snapshot() -> MCPToolExecutionHandlerPhaseSnapshot? {
@@ -86,13 +99,44 @@ enum MCPToolExecutionHandlerPhaseContext {
     @TaskLocal
     static var recorder: MCPToolExecutionHandlerPhaseRecorder?
 
+    #if DEBUG
+        private final class DebugState: @unchecked Sendable {
+            let lock = NSLock()
+            var sink: (@Sendable (MCPToolExecutionHandlerPhaseSnapshot) -> Void)?
+        }
+
+        private static let debugState = DebugState()
+    #endif
+
     static func report(
         _ phase: MCPToolExecutionHandlerPhase,
         transition: MCPToolExecutionHandlerPhaseTransition = .started
     ) async {
         guard let recorder else { return }
-        await recorder.report(phase, transition: transition)
+        await report(phase, transition: transition, using: recorder)
     }
+
+    @discardableResult
+    static func report(
+        _ phase: MCPToolExecutionHandlerPhase,
+        transition: MCPToolExecutionHandlerPhaseTransition = .started,
+        using recorder: MCPToolExecutionHandlerPhaseRecorder
+    ) async -> MCPToolExecutionHandlerPhaseSnapshot {
+        let snapshot = await recorder.report(phase, transition: transition)
+        #if DEBUG
+            let sink = debugState.lock.withLock { debugState.sink }
+            sink?(snapshot)
+        #endif
+        return snapshot
+    }
+
+    #if DEBUG
+        static func setTestSink(_ sink: (@Sendable (MCPToolExecutionHandlerPhaseSnapshot) -> Void)?) {
+            debugState.lock.lock()
+            debugState.sink = sink
+            debugState.lock.unlock()
+        }
+    #endif
 }
 
 struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
@@ -100,6 +144,7 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
         case contractSelected = "execution_contract_selected"
         case started = "execution_started"
         case handlerCompleted = "execution_handler_completed"
+        case handlerPhaseTransition = "execution_handler_phase_transition"
         case deadlineExpired = "execution_deadline_expired"
         case cancellationRequested = "execution_cancellation_requested"
         case settledDuringGrace = "execution_settled_during_grace"
@@ -114,7 +159,7 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
                  .cleanupGraceExpired, .detachedForSettlement, .detachedSettled,
                  .connectionForceDisconnectRequested:
                 true
-            case .contractSelected, .started, .handlerCompleted:
+            case .contractSelected, .started, .handlerCompleted, .handlerPhaseTransition:
                 false
             }
         }
@@ -125,6 +170,7 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
     let connectionID: UUID
     let invocationID: UUID
     let runID: UUID?
+    let requestIdentity: MCPRequestTimelineIdentity?
     let contractKind: MCPToolExecutionContract.Kind
     let executionDeadlineSeconds: Double?
     let cleanupGraceSeconds: Double?
@@ -139,6 +185,50 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
     let escalationReason: String?
     let handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?
     let handlerPhaseAgeMilliseconds: Double?
+
+    init(
+        toolName: String,
+        operationIdentity: MCPToolOperationIdentity,
+        connectionID: UUID,
+        invocationID: UUID,
+        runID: UUID?,
+        requestIdentity: MCPRequestTimelineIdentity? = nil,
+        contractKind: MCPToolExecutionContract.Kind,
+        executionDeadlineSeconds: Double?,
+        cleanupGraceSeconds: Double?,
+        cleanupDisposition: MCPToolExecutionCleanupDisposition?,
+        phase: Phase,
+        elapsedMilliseconds: Double,
+        cancellationRequested: Bool?,
+        cancellationOutcome: String?,
+        cancellationOrigin: MCPToolExecutionCancellationOrigin?,
+        settlement: String?,
+        graceOutcome: String?,
+        escalationReason: String?,
+        handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?,
+        handlerPhaseAgeMilliseconds: Double?
+    ) {
+        self.toolName = toolName
+        self.operationIdentity = operationIdentity
+        self.connectionID = connectionID
+        self.invocationID = invocationID
+        self.runID = runID
+        self.requestIdentity = requestIdentity
+        self.contractKind = contractKind
+        self.executionDeadlineSeconds = executionDeadlineSeconds
+        self.cleanupGraceSeconds = cleanupGraceSeconds
+        self.cleanupDisposition = cleanupDisposition
+        self.phase = phase
+        self.elapsedMilliseconds = elapsedMilliseconds
+        self.cancellationRequested = cancellationRequested
+        self.cancellationOutcome = cancellationOutcome
+        self.cancellationOrigin = cancellationOrigin
+        self.settlement = settlement
+        self.graceOutcome = graceOutcome
+        self.escalationReason = escalationReason
+        self.handlerPhase = handlerPhase
+        self.handlerPhaseAgeMilliseconds = handlerPhaseAgeMilliseconds
+    }
 
     var isAlwaysEmitted: Bool {
         phase.isAlwaysEmitted
@@ -155,6 +245,20 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
             "elapsed_ms=\(String(format: "%.3f", elapsedMilliseconds))"
         ]
         if let runID { fields.append("run_id=\(runID.uuidString)") }
+        if let requestIdentity {
+            if let requestID = requestIdentity.jsonRPCRequestID {
+                fields.append("request_id=\(requestID)")
+            }
+            if let requestConnectionID = requestIdentity.connectionID {
+                fields.append("request_connection_id=\(requestConnectionID)")
+            }
+            if let requestGeneration = requestIdentity.connectionGeneration {
+                fields.append("request_generation=\(requestGeneration)")
+            }
+            if let requestOrdinal = requestIdentity.requestOrdinal {
+                fields.append("request_ordinal=\(requestOrdinal)")
+            }
+        }
         if let executionDeadlineSeconds { fields.append("deadline_s=\(executionDeadlineSeconds)") }
         if let cleanupGraceSeconds { fields.append("grace_s=\(cleanupGraceSeconds)") }
         if let cleanupDisposition { fields.append("cleanup_disposition=\(cleanupDisposition.rawValue)") }

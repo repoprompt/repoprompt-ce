@@ -61,6 +61,10 @@ struct AgentManageMCPToolService {
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
     let cleanupDependencies: CleanupDependencies
+    #if DEBUG
+        var test_resumeSetupBoundary: (@MainActor (_ afterActivation: Bool) async -> Void)?
+        var testAfterTargetResolution: ((AgentModeViewModel.MCPSessionTarget) async -> Void)?
+    #endif
 
     init(
         toolName: String,
@@ -138,7 +142,8 @@ struct AgentManageMCPToolService {
         let rolesOnly = try parseBool(args["roles_only"], name: "roles_only", defaultValue: false)
         let restrictedDiscovery = restrictDiscoveryToRoleLabels(workspaceID)
         let omitAgentCatalog = rolesOnly || restrictedDiscovery
-        let agents: [Value] = omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability).map { entry -> Value in
+        var agents: [Value] = []
+        for entry in omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability) {
             // Flatten all models — each start target becomes its own entry.
             //
             // Role-label mappings (explore/engineer/pair/design) are the sole
@@ -157,6 +162,12 @@ struct AgentManageMCPToolService {
                         if let effort = target.reasoningEffort {
                             obj["reasoning_effort"] = .string(effort.rawValue)
                         }
+                        if entry.agent == .cursor {
+                            let parameters = AgentMCPModelParameterSupport.definitionValues(modelRaw: target.modelRaw)
+                            if !parameters.isEmpty {
+                                obj["model_parameters"] = .array(parameters)
+                            }
+                        }
                         modelObjects.append(.object(obj))
                     }
                 } else {
@@ -165,6 +176,12 @@ struct AgentManageMCPToolService {
                     ]
                     if let modelID = model.modelID {
                         obj["model_id"] = .string(modelID)
+                    }
+                    if entry.agent == .cursor {
+                        let parameters = AgentMCPModelParameterSupport.definitionValues(modelRaw: model.id)
+                        if !parameters.isEmpty {
+                            obj["model_parameters"] = .array(parameters)
+                        }
                     }
                     modelObjects.append(.object(obj))
                 }
@@ -179,7 +196,7 @@ struct AgentManageMCPToolService {
             if let selID = entry.defaults.selectionID {
                 agentObj["default_model_id"] = .string(selID.rawValue)
             }
-            return .object(agentObj)
+            agents.append(.object(agentObj))
         }
         // Build task labels with effective workspace/global role defaults. These remain
         // visible even when restricted discovery hides the extra per-agent
@@ -237,7 +254,8 @@ struct AgentManageMCPToolService {
                 stateRaw: meta.lastRunState,
                 isLive: false,
                 parentSessionID: meta.parentSessionID,
-                isMCPOriginated: meta.isMCPOriginated
+                isMCPOriginated: meta.isMCPOriginated,
+                modelParameterSelections: meta.acpModelParameterSelections
             )
         }
 
@@ -252,7 +270,8 @@ struct AgentManageMCPToolService {
                 stateRaw: entry.lastRunStateRaw,
                 isLive: agentModeVM.sessions[entry.tabID] != nil,
                 parentSessionID: entry.parentSessionID,
-                isMCPOriginated: entry.isMCPOriginated
+                isMCPOriginated: entry.isMCPOriginated,
+                modelParameterSelections: entry.acpModelParameterSelections
             )
         }
 
@@ -269,7 +288,8 @@ struct AgentManageMCPToolService {
                 stateRaw: session.runState.rawValue,
                 isLive: true,
                 parentSessionID: session.parentSessionID,
-                isMCPOriginated: session.isMCPOriginated
+                isMCPOriginated: session.isMCPOriginated,
+                modelParameterSelections: session.acpModelParameterSelections
             )
         }
 
@@ -472,6 +492,9 @@ struct AgentManageMCPToolService {
     private func executeCreateSession(args: [String: Value]) async throws -> Value {
         let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.create_session.")
+        }
         let agentModeVM = targetWindow.agentModeViewModel
         let sourceTabID = await resolveSpawnSourceTabID(metadata)
         try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
@@ -482,25 +505,55 @@ struct AgentManageMCPToolService {
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: .engineer,
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: targetWindow.workspaceManager.activeWorkspace?.id
+            workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
+        let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
+            value: args["model_parameters"],
+            agent: resolved.agent.flatMap { AgentProviderKind(rawValue: $0) },
+            modelRaw: resolved.model
+        )
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: nil,
             createIfNeeded: true,
             sessionName: normalizedString(args["session_name"]),
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            expectedWorkspaceID: workspace.id
         )
         do {
+            #if DEBUG
+                await testAfterTargetResolution?(target)
+            #endif
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: resolved.agent,
                 modelRaw: resolved.model,
-                reasoningEffortRaw: resolved.effort
+                reasoningEffortRaw: resolved.effort,
+                workspaceAuthority: .init(
+                    target: target,
+                    expectedWorkspaceID: workspace.id,
+                    allowMatchingControlledSession: false
+                )
+            )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
+            try agentModeVM.mcpApplyModelParameterSelections(
+                tabID: target.tabID,
+                selections: modelParameterSelections
             )
             try await bindCurrentRequestToTab(target.tabID, metadata)
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
             guard let sessionID = target.sessionID else {
                 throw MCPError.internalError("Failed to resolve created agent session ID.")
             }
@@ -511,6 +564,10 @@ struct AgentManageMCPToolService {
                 taskLabelKind: selection.taskLabelKind,
                 startPending: false
             )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
         } catch {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error
@@ -519,6 +576,7 @@ struct AgentManageMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("Failed to create agent session state.")
         }
+        agentModeVM.mcpAcceptSessionTarget(target)
         let sessionName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
         return .object(sessionSummaryObject(
             sessionID: session.activeAgentSessionID,
@@ -530,7 +588,8 @@ struct AgentManageMCPToolService {
             stateRaw: session.runState.rawValue,
             isLive: true,
             parentSessionID: session.parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            modelParameterSelections: session.acpModelParameterSelections
         ))
     }
 
@@ -560,34 +619,113 @@ struct AgentManageMCPToolService {
             createIfNeeded: true,
             sessionName: nil,
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            expectedWorkspaceID: workspace.id
         )
         let hadMatchingMCPControl = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext?.sessionID == sessionID
+        let expectedConfigurationTarget = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.persistentBindingTransitionToken()
+        var ownedActivation: AgentModeViewModel.AgentMCPControlContext?
         do {
+            #if DEBUG
+                await testAfterTargetResolution?(target)
+            #endif
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
+            )
+            let hydratedSession = await agentModeVM.ensureSessionReady(tabID: target.tabID)
+            let hasExplicitConfigurationChange = normalizedString(args["model_id"]) != nil
+                || normalizedString(args["reasoning_effort"]) != nil
+                || args["model_parameters"] != nil
+            if hydratedSession.runState.isActive, hasExplicitConfigurationChange {
+                throw MCPError.invalidParams(
+                    "Cannot change model settings while this session is actively running. Retry resume_session after the current run completes."
+                )
+            }
+            let parameterAgentRaw = resolved.agent ?? hydratedSession.selectedAgent.rawValue
+            let parameterModelRaw = resolved.model ?? hydratedSession.selectedModelRaw
+            let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
+                value: args["model_parameters"],
+                agent: AgentProviderKind(rawValue: parameterAgentRaw),
+                modelRaw: parameterModelRaw
+            )
             // Resume adopts the live session's existing control registration. Re-registering the
             // same persistent session expires in-flight waiters and splits poll state from the UI.
+            #if DEBUG
+                await test_resumeSetupBoundary?(false)
+            #endif
             if !hadMatchingMCPControl {
-                try await agentModeVM.mcpActivateControlContext(
+                ownedActivation = try await agentModeVM.mcpActivateControlContext(
                     forTabID: target.tabID,
                     sessionID: sessionID,
                     originatingConnectionID: metadata.connectionID,
                     taskLabelKind: selection.taskLabelKind,
-                    startPending: false
+                    startPending: false,
+                    requireInactiveRunState: hasExplicitConfigurationChange
+                )
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                    target,
+                    expectedWorkspaceID: workspace.id
                 )
             }
+            #if DEBUG
+                await test_resumeSetupBoundary?(true)
+            #endif
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: resolved.agent,
                 modelRaw: resolved.model,
-                reasoningEffortRaw: resolved.effort
+                reasoningEffortRaw: resolved.effort,
+                modelParameterSelections: modelParameterSelections,
+                requireInactiveRunState: hasExplicitConfigurationChange,
+                expectedTarget: hasExplicitConfigurationChange ? expectedConfigurationTarget : nil,
+                workspaceAuthority: .init(
+                    target: target,
+                    expectedWorkspaceID: workspace.id,
+                    allowMatchingControlledSession: hadMatchingMCPControl
+                )
+            )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
             )
             try await bindCurrentRequestToTab(target.tabID, metadata)
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
+            )
         } catch {
+            // A run admitted during awaited setup owns its live context and tab.
+            // Settle this request's captured target without tearing down that newer owner.
+            if let current = agentModeVM.session(for: target.tabID, createIfNeeded: false),
+               current.runState.isActive || current.persistentBindingTransitionToken() != expectedConfigurationTarget
+            {
+                if target.recoveryClaim != nil {
+                    do {
+                        try agentModeVM.requireCurrentAgentSessionLifecycleAdmission(target)
+                        agentModeVM.mcpAcceptSessionTarget(target)
+                    } catch {
+                        _ = await agentModeVM.mcpDiscardSessionTarget(target)
+                    }
+                } else {
+                    _ = await agentModeVM.mcpDiscardSessionTarget(target)
+                }
+                throw error
+            }
             if !hadMatchingMCPControl {
-                await agentModeVM.mcpDeactivateControlContext(
-                    sessionID: sessionID,
-                    cleanupSessionStore: true
-                )
+                if let ownedActivation {
+                    guard await agentModeVM.mcpDeactivateOwnedControlContext(
+                        sessionID: sessionID,
+                        expectedContext: ownedActivation
+                    ) else { throw error }
+                } else if agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext != nil {
+                    // Failed activation cleaned its own registration. A current
+                    // context belongs to another attempt and must survive.
+                    throw error
+                }
             }
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error
@@ -596,6 +734,7 @@ struct AgentManageMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("Failed to hydrate resumed session.")
         }
+        agentModeVM.mcpAcceptSessionTarget(target)
         let sessionName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
         return .object(sessionSummaryObject(
             sessionID: sessionID,
@@ -607,7 +746,8 @@ struct AgentManageMCPToolService {
             stateRaw: session.runState.rawValue,
             isLive: true,
             parentSessionID: session.parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            modelParameterSelections: session.acpModelParameterSelections
         ))
     }
 
@@ -622,26 +762,16 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
         }
 
-        let target: AgentModeViewModel.MCPSessionTarget
-        do {
-            target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
-                tabID: nil,
-                sessionID: sessionID,
-                createIfNeeded: false,
-                sessionName: nil
-            )
-        } catch {
+        guard let session = try agentModeVM.mcpSettledLiveSessionForStop(sessionID: sessionID) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' is not currently live and cannot be stopped.")
         }
-
-        let session = await agentModeVM.ensureSessionReady(tabID: target.tabID)
         let wasActive = session.runState.isActive
         if wasActive {
-            await agentModeVM.cancelAgentRun(tabID: target.tabID, completion: .terminalPublished)
+            await agentModeVM.cancelAgentRun(tabID: session.tabID, completion: .terminalPublished)
             await Task.yield()
         }
 
-        let tabName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
+        let tabName = targetWindow.workspaceManager.composeTab(with: session.tabID)?.name ?? "Agent Session"
         var summary = sessionSummaryObject(
             sessionID: sessionID,
             name: tabName,
@@ -650,7 +780,8 @@ struct AgentManageMCPToolService {
             agentRaw: session.selectedAgent.rawValue,
             modelRaw: session.selectedModelRaw,
             stateRaw: session.runState.rawValue,
-            isLive: true
+            isLive: true,
+            modelParameterSelections: session.acpModelParameterSelections
         )
         summary["stop_requested"] = .bool(wasActive)
         return .object(summary)
@@ -1184,7 +1315,8 @@ struct AgentManageMCPToolService {
         stateRaw: String?,
         isLive: Bool,
         parentSessionID: UUID? = nil,
-        isMCPOriginated: Bool = false
+        isMCPOriginated: Bool = false,
+        modelParameterSelections: [ACPModelParameterSelection] = []
     ) -> [String: Value] {
         let publicState = publicSessionState(raw: stateRaw)
         var obj: [String: Value] = [
@@ -1201,10 +1333,21 @@ struct AgentManageMCPToolService {
             obj["raw_state"] = .string(stateRaw)
         }
         if agentRaw != nil || modelRaw != nil {
-            obj["agent"] = .object([
+            var agent: [String: Value] = [
                 "id": agentRaw.map(Value.string) ?? .null,
                 "model": modelRaw.map(Value.string) ?? .null
-            ])
+            ]
+            let effectiveModelParameterSelections = AgentMCPModelParameterSupport.effectiveSelections(
+                modelParameterSelections,
+                agentRaw: agentRaw,
+                modelRaw: modelRaw
+            )
+            if !effectiveModelParameterSelections.isEmpty {
+                agent["model_parameters"] = .array(
+                    AgentMCPModelParameterSupport.selectionValues(effectiveModelParameterSelections)
+                )
+            }
+            obj["agent"] = .object(agent)
         }
         if let parentSessionID {
             obj["parent_session_id"] = .string(parentSessionID.uuidString)

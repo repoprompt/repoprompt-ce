@@ -489,6 +489,9 @@ actor DirectHeadlessProviderCoordinator {
         args: [String: Value],
         includeSessionCleanupGuidance: Bool = true
     ) throws -> String {
+        if let parameters = args["model_parameters"], parameters != .null, parameters != .array([]) {
+            throw MCPError.invalidParams("model_parameters are supported only for app-backed Cursor sessions.")
+        }
         guard let message = args["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
             throw MCPError.invalidParams("agent_run start requires message")
         }

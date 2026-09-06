@@ -28,6 +28,7 @@ struct AgentSessionMeta {
     let agentKind: String?
     let agentModel: String?
     let lastRunState: String?
+    let acpModelParameterSelections: [ACPModelParameterSelection]
     let parentSessionID: UUID?
     let isMCPOriginated: Bool
     let worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
@@ -225,6 +226,7 @@ actor AgentSessionDataService {
         let agentKind: String?
         let agentModel: String?
         let agentReasoningEffort: String?
+        let acpModelParameterSelections: [ACPModelParameterSelection]?
         let lastRunState: String?
         let providerSessionID: String?
         let providerCleanupHandle: ProviderConversationCleanupHandle?
@@ -1376,6 +1378,7 @@ actor AgentSessionDataService {
                 agentKind: header.agentKind,
                 agentModel: header.agentModel,
                 agentReasoningEffort: header.agentReasoningEffort,
+                acpModelParameterSelections: header.acpModelParameterSelections ?? [],
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
                 providerSessionID: header.providerSessionID,
                 providerCleanupHandle: header.providerCleanupHandle,
@@ -1449,6 +1452,7 @@ actor AgentSessionDataService {
                         agentKind: session.agentKind,
                         agentModel: session.agentModel,
                         lastRunState: session.lastRunState,
+                        acpModelParameterSelections: session.acpModelParameterSelections,
                         parentSessionID: session.parentSessionID,
                         isMCPOriginated: session.isMCPOriginated,
                         worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
@@ -1503,6 +1507,7 @@ actor AgentSessionDataService {
                             agentKind: session.agentKind,
                             agentModel: session.agentModel,
                             lastRunState: session.lastRunState,
+                            acpModelParameterSelections: session.acpModelParameterSelections,
                             parentSessionID: session.parentSessionID,
                             isMCPOriginated: session.isMCPOriginated,
                             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
