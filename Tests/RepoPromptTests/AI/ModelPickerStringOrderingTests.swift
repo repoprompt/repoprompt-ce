@@ -47,4 +47,71 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max"), "GPT-5.1 Codex Max")
         XCTAssertEqual(AIModel.stripCodexReasoningSuffix(from: "GPT-5.1 Codex Max High"), "GPT-5.1 Codex Max")
     }
+
+    func testAstraSelectionsRoundTripAndProduceSeparateModelAndEffortArguments() throws {
+        let efforts: [CodexReasoningEffort] = [.low, .medium, .high, .xhigh, .max, .ultra]
+        for effort in efforts {
+            let raw = "gpt-6-astra-\(effort.rawValue)"
+            let agentModel = try XCTUnwrap(AgentModel.resolvedModel(forRaw: raw, agentKind: .codexExec))
+            XCTAssertEqual(agentModel.rawValue, raw)
+            XCTAssertTrue(AgentModel.modelsForAgent(.codexExec).contains(agentModel))
+            XCTAssertEqual(try JSONDecoder().decode(AgentModel.self, from: JSONEncoder().encode(agentModel)), agentModel)
+
+            let model = try XCTUnwrap(AIModel.fromModelName("codex_cli_\(raw)"))
+            XCTAssertEqual(model.providerType, .codex)
+            XCTAssertEqual(model.modelName, "gpt-6-astra")
+            XCTAssertEqual(model.defaultReasoningEffort, effort.rawValue)
+            XCTAssertEqual(AIModel.fromModelName(model.rawValue), model)
+
+            for tier in ["", "-fast"] {
+                let specifier = CodexModelSpecifier(raw: "gpt-6-astra\(tier)-\(effort.rawValue)")
+                XCTAssertEqual(specifier.cliModelArgs, ["--model", "gpt-6-astra"])
+                XCTAssertEqual(specifier.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=\(effort.rawValue)"])
+                XCTAssertEqual(specifier.appServerModelParam, "gpt-6-astra")
+                XCTAssertEqual(specifier.appServerEffortParam, effort.rawValue)
+                XCTAssertEqual(specifier.appServerServiceTierParam, tier.isEmpty ? nil : "fast")
+            }
+        }
+        XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-6-astra", agentKind: .codexExec), .gpt6AstraMedium)
+        XCTAssertNil(CodexModelSpecifier(raw: "gpt-6-astra-preview-ultra").reasoningEffort)
+    }
+
+    func testAstraPickerGroupsKeepAllEffortsTogetherAndSortBeforeGPT5() {
+        let efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+        let models: [AIModel] = efforts.reversed().flatMap { effort in
+            [AIModel.codexCustom(name: "gpt-6-astra-\(effort)"), .codexCustom(name: "gpt-6-astra-fast-\(effort)")]
+        } + [.codexCliGpt56SolHigh]
+        let groups = AIModel.codexMenuGroups(for: models)
+        XCTAssertEqual(groups.map(\.baseModelID), ["gpt-6-astra", "gpt-6-astra-fast", "gpt-5.6-sol"])
+        XCTAssertEqual(groups[0].displayName, "GPT-6 Astra")
+        XCTAssertEqual(groups[1].displayName, "GPT-6 Astra Fast")
+        XCTAssertEqual(groups[0].models.map(\.defaultReasoningEffort), efforts)
+
+        let options = models.map { model in
+            AgentModelOption(rawValue: model.modelName, displayName: model.displayName, description: nil, isDefault: false)
+        }
+        let menu = AgentModelCatalog.codexMenu(for: options)
+        XCTAssertEqual(menu.groups.map(\.baseModelID), ["gpt-6-astra", "gpt-6-astra-fast", "gpt-5.6-sol"])
+        XCTAssertEqual(menu.groups[0].options.map(\.rawValue), efforts.map { "gpt-6-astra-\($0)" })
+        XCTAssertEqual(menu.groups[1].options.map(\.rawValue), efforts.map { "gpt-6-astra-fast-\($0)" })
+    }
+
+    func testLiveAstraCataloguePreservesDefaultAndSynthesizesFastEfforts() {
+        let efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+        let remote = CodexAppServerClient.RemoteModel(
+            id: "gpt-6-astra", model: "gpt-6-astra", displayName: "GPT-6-Astra",
+            description: "Astra", isDefault: true,
+            supportedReasoningEfforts: efforts.map {
+                CodexAppServerClient.RemoteReasoningEffort(reasoningEffort: $0, description: $0)
+            },
+            defaultReasoningEffort: "medium"
+        )
+        let options = AgentCodexModelRegistry.shared.resolvedOptions(staticOptions: [], preferredLiveModels: [remote])
+        let menu = AgentModelCatalog.codexMenu(for: options)
+        XCTAssertEqual(menu.groups.map(\.baseModelID), ["gpt-6-astra", "gpt-6-astra-fast"])
+        XCTAssertEqual(menu.groups[0].options.map(\.rawValue), efforts.map { "gpt-6-astra-\($0)" })
+        XCTAssertEqual(menu.groups[1].options.map(\.rawValue), efforts.map { "gpt-6-astra-fast-\($0)" })
+        XCTAssertEqual(options.filter(\.isProviderDefault).map(\.rawValue), ["gpt-6-astra-medium"])
+        XCTAssertEqual(menu.groups[0].displayName, "GPT-6 Astra")
+    }
 }

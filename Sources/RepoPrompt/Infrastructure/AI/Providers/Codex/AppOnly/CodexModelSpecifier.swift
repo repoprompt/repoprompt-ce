@@ -34,7 +34,7 @@ struct CodexModelSpecifier: Equatable {
 
         // First strip any reasoning effort suffix. Legacy efforts remain broadly decoded for
         // stored selections such as `gpt-5.5-xhigh` and `gpt-5.1-codex-max-low`.
-        // Extended efforts are gated to known GPT-5.6 families so the legitimate base ID
+        // Extended efforts are gated to known model families so the legitimate base ID
         // `gpt-5.1-codex-max` is not misread as `gpt-5.1-codex` + max effort.
         let suffixes: [(suffix: String, effort: ReasoningEffort, requiresKnownFamilySupport: Bool)] = [
             ("-xhigh", .xhigh, false),
@@ -85,7 +85,7 @@ struct CodexModelSpecifier: Equatable {
         let supportBase = serviceTierStrippedBase(candidate).lowercased()
         let supported: Set<ReasoningEffort>
         switch supportBase {
-        case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":
+        case "gpt-6-astra", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":
             supported = [.max, .ultra]
         case "gpt-5.6-luna":
             supported = [.max]
