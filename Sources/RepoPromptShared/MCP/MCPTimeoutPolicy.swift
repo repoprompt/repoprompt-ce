@@ -1,10 +1,68 @@
 import Foundation
 
+public struct MCPToolCallDeadlineEnvelope: Codable, Equatable, Sendable {
+    public enum Kind: String, Codable, Sendable {
+        case ordinaryPromptExportV1 = "ordinary_prompt_export_v1"
+    }
+
+    public enum TimeoutMode: String, Codable, Sendable {
+        case ordinaryDefault = "default"
+        case explicitFinite = "explicit_finite"
+        case explicitUnbounded = "explicit_unbounded"
+    }
+
+    public let kind: Kind
+    public let expiresAtUnixMilliseconds: Int64?
+    public let timeoutMode: TimeoutMode
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case expiresAtUnixMilliseconds = "expires_at_unix_milliseconds"
+        case timeoutMode = "timeout_mode"
+    }
+
+    public init(
+        kind: Kind,
+        expiresAtUnixMilliseconds: Int64? = nil,
+        timeoutMode: TimeoutMode = .ordinaryDefault
+    ) {
+        self.kind = kind
+        self.expiresAtUnixMilliseconds = expiresAtUnixMilliseconds
+        self.timeoutMode = timeoutMode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(Kind.self, forKey: .kind)
+        expiresAtUnixMilliseconds = try container.decodeIfPresent(
+            Int64.self,
+            forKey: .expiresAtUnixMilliseconds
+        )
+        timeoutMode = try container.decodeIfPresent(TimeoutMode.self, forKey: .timeoutMode)
+            ?? .ordinaryDefault
+        if timeoutMode == .ordinaryDefault, expiresAtUnixMilliseconds == nil {
+            throw DecodingError.keyNotFound(
+                CodingKeys.expiresAtUnixMilliseconds,
+                .init(
+                    codingPath: container.codingPath,
+                    debugDescription: "Default export metadata requires an expiration"
+                )
+            )
+        }
+    }
+}
+
 /// RepoPrompt CE-owned timeout policy for MCP execution, delivery, and caller-driven defaults.
 /// Caller-supplied timeout values remain dynamic; these constants only define CE defaults and guards.
 public enum MCPTimeoutPolicy {
     public static let boundedToolExecutionDeadlineSeconds = 30
     public static let boundedToolExecutionDeadline: Duration = .seconds(boundedToolExecutionDeadlineSeconds)
+
+    public static let promptExportAdmissionHeadroomSeconds = 25
+    public static let promptExportExecutionDeadlineSeconds = 240
+    public static let promptExportExecutionDeadline: Duration = .seconds(
+        promptExportExecutionDeadlineSeconds
+    )
 
     /// macOS Finder Trash can legitimately retain synchronous post-move work after the source
     /// path disappears. Keep destructive file_actions bounded, but allow that system tail to
@@ -43,7 +101,19 @@ public enum MCPTimeoutPolicy {
         bootstrapReplacementPredecessorStopGraceSeconds
     )
 
-    public static let responseSendDeadlineSeconds = 30
+    public static let promptExportResponseDeliveryAllowanceSeconds = 30
+    public static let promptExportResponseDeliveryAllowance: Duration = .seconds(
+        promptExportResponseDeliveryAllowanceSeconds
+    )
+    public static let promptExportReservedEnvelopeArgumentKey = "_repoprompt_execution_envelope"
+    public static let promptExportReservedProviderAndCleanupSeconds =
+        promptExportExecutionDeadlineSeconds
+            + boundedToolCancellationCleanupGraceSeconds
+            + promptExportResponseDeliveryAllowanceSeconds
+    public static let promptExportTotalEnvelopeSeconds =
+        promptExportAdmissionHeadroomSeconds + promptExportReservedProviderAndCleanupSeconds
+
+    public static let responseSendDeadlineSeconds = promptExportResponseDeliveryAllowanceSeconds
     public static let responseSendDeadline: Duration = .seconds(responseSendDeadlineSeconds)
     public static let transportWriteStallTimeoutSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
 
