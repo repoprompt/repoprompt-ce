@@ -5,6 +5,15 @@ enum MCPToolExecutionHandlerPhase: String, Equatable {
     case manageSelectionAutoSelectionDrain = "manage_selection.auto_selection_drain"
     case manageSelectionIngressWait = "manage_selection.ingress_wait"
     case manageSelectionConstruction = "manage_selection.selection_construction"
+    /// Child intervals of the aggregate construction phase. The aggregate raw value stays their
+    /// prefix so existing log grouping keeps working, while the watchdog packet can name the exact
+    /// awaited dependency instead of the combined interval.
+    case manageSelectionConstructionVirtualSelectionStabilization =
+        "manage_selection.selection_construction.virtual_selection_stabilization"
+    case manageSelectionConstructionGitReviewContextFreeze =
+        "manage_selection.selection_construction.git_review_context_freeze"
+    case manageSelectionConstructionArtifactInputResolution =
+        "manage_selection.selection_construction.artifact_input_resolution"
     case manageSelectionPersistence = "manage_selection.persistence"
     case manageSelectionReplyConstruction = "manage_selection.reply_construction"
     case fileActionsPreMutationChecks = "file_actions.pre_mutation_checks"
