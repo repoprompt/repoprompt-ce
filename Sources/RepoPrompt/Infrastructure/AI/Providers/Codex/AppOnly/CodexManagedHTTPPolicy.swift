@@ -1,4 +1,5 @@
 import CoreFoundation
+import Darwin
 import Foundation
 
 /// A deliberately narrow policy for newly created, explicitly paired backends.
@@ -6,6 +7,23 @@ import Foundation
 enum CodexManagedHTTPPolicy {
     static let providerID = "switchboard-managed-http"
     static let baseURL = "https://chatgpt.com/backend-api/codex"
+    /// Upgrade only after repeating the outgoing HTTP identity and history probes.
+    static let supportedRuntimeVersion = "0.149.0"
+
+    static func verifyRuntimeVersion(_ version: String, bundledVersion: String) throws {
+        guard version == supportedRuntimeVersion, version == bundledVersion else { throw Failure.unsupportedConfiguration }
+    }
+
+    /// Privileged native frames must never hold the consent lock while waiting
+    /// for pipe capacity. EAGAIN/partial-write failure fences the owned backend.
+    static func withNonblockingPipeWrite<T>(descriptor: Int32, _ body: () throws -> T) throws -> T {
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw Failure.unsupportedConfiguration
+        }
+        defer { _ = fcntl(descriptor, F_SETFL, flags) }
+        return try body()
+    }
 
     enum Failure: Error, LocalizedError {
         case unsupportedConfiguration
@@ -21,6 +39,17 @@ enum CodexManagedHTTPPolicy {
         private var hasStarted = false
         private var lease: UUID?
         private var permitsTurns = false
+        private let expectedResumeThreadID: String?
+        private var hasRequestedThread = false
+        private var hasDispatchedProviderWork = false
+
+        var permitsUnmaterializedThreadProof: Bool {
+            threadID != nil && expectedResumeThreadID == nil && !hasDispatchedProviderWork
+        }
+
+        init(expectedResumeThreadID: String? = nil) {
+            self.expectedResumeThreadID = expectedResumeThreadID
+        }
 
         mutating func claimStartup() throws {
             guard !hasStarted else { throw Failure.unsupportedConfiguration }
@@ -28,7 +57,8 @@ enum CodexManagedHTTPPolicy {
         }
 
         mutating func bindThread(_ id: String) throws {
-            guard hasStarted, threadID == nil, !id.isEmpty else { throw Failure.unsupportedConfiguration }
+            guard hasStarted, threadID == nil, !id.isEmpty,
+                  expectedResumeThreadID == nil || expectedResumeThreadID == id else { throw Failure.unsupportedConfiguration }
             threadID = id
         }
 
@@ -45,25 +75,76 @@ enum CodexManagedHTTPPolicy {
             permitsTurns = allowTurns
         }
 
-        func authorize(method: String, permitsAccountLogin: Bool = false) throws {
+        mutating func authorize(method: String, permitsAccountLogin: Bool = false, requestedThreadID: String? = nil) throws {
             if method == "account/login/start" {
                 guard permitsAccountLogin, lease != nil else { throw Failure.unsupportedConfiguration }
                 return
             }
-            if ["account/logout", "thread/resume", "thread/fork", "thread/goal/set", "thread/goal/clear"].contains(method) {
+            if ["account/logout", "thread/fork", "thread/goal/set", "thread/goal/clear"].contains(method) {
                 throw Failure.unsupportedConfiguration
             }
-            if method == "thread/start" {
-                guard hasStarted, threadID == nil, lease == nil else { throw Failure.unsupportedConfiguration }
+            if method == "thread/start" || method == "thread/resume" {
+                guard hasStarted, threadID == nil, lease == nil, !hasRequestedThread else { throw Failure.unsupportedConfiguration }
+                if method == "thread/resume" {
+                    guard let expectedResumeThreadID, requestedThreadID == expectedResumeThreadID else { throw Failure.unsupportedConfiguration }
+                } else {
+                    guard expectedResumeThreadID == nil else { throw Failure.unsupportedConfiguration }
+                }
+                hasRequestedThread = true
                 return
             }
             if ["turn/start", "turn/steer", "review/start", "thread/compact/start", "thread/shellCommand"].contains(method) {
                 guard permitsTurns, lease == nil else { throw Failure.unsupportedConfiguration }
+                hasDispatchedProviderWork = true
             }
             if lease != nil, method.hasPrefix("config/"), method != "config/read" {
                 throw Failure.unsupportedConfiguration
             }
+            if lease != nil, !["/read", "/list", "/get"].contains(where: method.hasSuffix) {
+                throw Failure.unsupportedConfiguration
+            }
         }
+    }
+
+    static func threadProof(
+        response: [String: Any], loaded: [String: Any], expectedThreadID: String,
+        pendingMutation: Bool, persistedTools: [String]
+    ) throws -> CodexAccountAdoptionRuntimeProof {
+        guard !expectedThreadID.isEmpty,
+              let ids = loaded["data"] as? [String], ids == [expectedThreadID],
+              loaded["nextCursor"] == nil || loaded["nextCursor"] is NSNull,
+              let thread = response["thread"] as? [String: Any],
+              thread["id"] as? String == expectedThreadID,
+              thread["modelProvider"] as? String == providerID,
+              let status = thread["status"] as? [String: Any],
+              let statusType = status["type"] as? String, ["idle", "active"].contains(statusType),
+              let turns = thread["turns"] as? [[String: Any]] else { throw Failure.unsupportedConfiguration }
+        var hasActiveTurn = statusType == "active"
+        var hasTools = !persistedTools.isEmpty
+        for turn in turns {
+            guard let id = turn["id"] as? String, !id.isEmpty,
+                  let turnStatus = turn["status"] as? String,
+                  ["completed", "interrupted", "failed", "inProgress"].contains(turnStatus),
+                  let items = turn["items"] as? [[String: Any]] else { throw Failure.unsupportedConfiguration }
+            hasActiveTurn = hasActiveTurn || turnStatus == "inProgress"
+            for item in items {
+                guard let type = item["type"] as? String else { throw Failure.unsupportedConfiguration }
+                if ["commandExecution", "mcpToolCall", "dynamicToolCall", "fileChange", "collabAgentToolCall"].contains(type) {
+                    guard let itemStatus = item["status"] as? String,
+                          ["completed", "failed", "declined", "interrupted", "inProgress"].contains(itemStatus)
+                    else { throw Failure.unsupportedConfiguration }
+                    hasTools = hasTools || itemStatus == "inProgress"
+                }
+            }
+        }
+        return .init(
+            threadID: expectedThreadID,
+            loadedThreadIDs: ids,
+            isAuthoritativelyIdle: !hasActiveTurn && !pendingMutation,
+            hasInProgressTools: hasTools,
+            managedHTTP: true,
+            pinnedRuntime: true
+        )
     }
 
     static var launchArguments: [String] {
@@ -172,7 +253,7 @@ enum CodexManagedHTTPPolicy {
         "auth", "httpheaders", "envhttpheaders", "queryparams", "requiresopenaiauth", "wireapi",
         "supportswebsockets", "forcedloginmethod", "forcedchatgptworkspaceid", "cliauthcredentialsstore",
         "profile", "configfile", "configfilepath", "configprofile", "experimentalrealtimewsbaseurl",
-        "experimentalrealtimewebrtccallbaseurl", "goals"
+        "experimentalrealtimewebrtccallbaseurl", "goals", "otel", "logdir"
     ]
 
     private static func keyPath(_ key: String) -> [String] {
@@ -198,7 +279,7 @@ enum CodexManagedHTTPPolicy {
             if path == ["features", "goals"], strictBoolean(value, equals: false) { continue }
             if isBlocked(path: path) {
                 if effective, path.count == 1 {
-                    if ["forcedchatgptworkspaceid", "ossprovider", "profile", "openaibaseurl", "experimentalrealtimewsbaseurl", "experimentalrealtimewebrtccallbaseurl"].contains(path[0]), value is NSNull { continue }
+                    if ["forcedchatgptworkspaceid", "ossprovider", "profile", "openaibaseurl", "experimentalrealtimewsbaseurl", "experimentalrealtimewebrtccallbaseurl", "goals", "otel", "logdir"].contains(path[0]), value is NSNull { continue }
                     if path[0] == "forcedloginmethod", value is NSNull || value as? String == "chatgpt" { continue }
                     if path[0] == "chatgptbaseurl", value as? String == "https://chatgpt.com/backend-api/" { continue }
                 }

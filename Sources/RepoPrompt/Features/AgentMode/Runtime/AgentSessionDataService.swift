@@ -185,6 +185,7 @@ actor AgentSessionDataService {
         let autoEditEnabled: Bool
         let codexConversationID: String?
         let codexRolloutPath: String?
+        let requiresSwitchboardPairing: Bool?
         let codexModel: String?
         let codexReasoningEffort: String?
         let codexContextWindow: Int?
@@ -1118,6 +1119,7 @@ actor AgentSessionDataService {
                 autoEditEnabled: header.autoEditEnabled,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
+                requiresSwitchboardPairing: header.requiresSwitchboardPairing,
                 codexModel: header.codexModel,
                 codexReasoningEffort: header.codexReasoningEffort,
                 codexContextWindow: header.codexContextWindow,

@@ -129,7 +129,7 @@ protocol CodexSessionControlling: AnyObject {
     func inspectAccountAdoptionRuntime() async throws -> CodexAccountAdoptionRuntimeProof
     func reserveAccountAdoption() async throws -> UUID
     func finishAccountAdoption(_ lease: UUID, allowTurns: Bool) async
-    func installAccountAdoptionGrant(_ grant: CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionLoginReceipt
+    func installAccountAdoptionGrant(_ grant: CodexAccountAdoptionGrant, authorization: CodexAccountAdoptionAuthorization) async throws -> CodexAccountAdoptionLoginReceipt
 
     func ensureEventsStreamReady()
     func startOrResume(
@@ -209,7 +209,7 @@ extension CodexSessionControlling {
 
     func finishAccountAdoption(_: UUID, allowTurns _: Bool) async {}
 
-    func installAccountAdoptionGrant(_: CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionLoginReceipt {
+    func installAccountAdoptionGrant(_: CodexAccountAdoptionGrant, authorization _: CodexAccountAdoptionAuthorization) async throws -> CodexAccountAdoptionLoginReceipt {
         throw CodexAccountAdoptionReason.runtimeUnavailable
     }
 
@@ -444,6 +444,12 @@ final class CodexNativeSessionController {
         let accessToken: String
         let chatgptAccountID: String
         let chatgptPlanType: String?
+        var managedAuthorization: CodexAccountAdoptionAuthorization?
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.accessToken == rhs.accessToken && lhs.chatgptAccountID == rhs.chatgptAccountID
+                && lhs.chatgptPlanType == rhs.chatgptPlanType && lhs.managedAuthorization === rhs.managedAuthorization
+        }
 
         var payload: [String: Any] {
             var result: [String: Any] = [
@@ -2090,10 +2096,18 @@ final class CodexNativeSessionController {
         let configuration = try await performRequest(method: "config/read", params: [:], timeout: 5)
         try CodexManagedHTTPPolicy.verifyEffectiveConfiguration(configuration)
         let loaded = try await performRequest(method: "thread/loaded/list", params: [:], timeout: 5)
-        guard let ids = loaded["data"] as? [String] else { throw CodexAccountAdoptionReason.identityChanged }
+        // A brand-new unmaterialized thread cannot service includeTurns on 0.149.
+        // Only actor-owned no-dispatch provenance permits metadata-only evidence.
+        let metadataOnly = await client.permitsUnmaterializedManagedThreadProof()
         let result = try await performRequest(
-            method: "thread/read", params: ["threadId": reference.conversationID, "includeTurns": true], timeout: 5
+            method: "thread/read", params: ["threadId": reference.conversationID, "includeTurns": !metadataOnly], timeout: 5
         )
+        if metadataOnly {
+            guard await client.permitsUnmaterializedManagedThreadProof(),
+                  let thread = result["thread"] as? [String: Any],
+                  let turns = thread["turns"] as? [[String: Any]], turns.isEmpty
+            else { throw CodexAccountAdoptionReason.identityChanged }
+        }
         guard let thread = result["thread"] as? [String: Any],
               thread["modelProvider"] as? String == CodexManagedHTTPPolicy.providerID,
               currentSessionReference?.conversationID == reference.conversationID,
@@ -2101,20 +2115,15 @@ final class CodexNativeSessionController {
         else {
             throw CodexAccountAdoptionReason.identityChanged
         }
-        let snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
         let persistedTools = await outstandingBlockingNativeToolCallNames()
         let pendingMutation = await client.hasPendingManagedMutation()
-        return CodexAccountAdoptionRuntimeProof(
-            threadID: snapshot.conversationID,
-            loadedThreadIDs: ids,
-            isAuthoritativelyIdle: snapshot.runtimeStatus == .idle && snapshot.activeTurnIDs.isEmpty && !pendingMutation,
-            hasInProgressTools: !snapshot.activeToolItems.isEmpty || !persistedTools.isEmpty,
-            managedHTTP: true,
-            pinnedRuntime: true
+        return try CodexManagedHTTPPolicy.threadProof(
+            response: result, loaded: loaded, expectedThreadID: reference.conversationID,
+            pendingMutation: pendingMutation, persistedTools: persistedTools
         )
     }
 
-    func installAccountAdoptionGrant(_ grant: CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionLoginReceipt {
+    func installAccountAdoptionGrant(_ grant: CodexAccountAdoptionGrant, authorization: CodexAccountAdoptionAuthorization) async throws -> CodexAccountAdoptionLoginReceipt {
         guard usesManagedHTTPAccountAdoption else { throw CodexAccountAdoptionReason.transportUnverified }
         var params: [String: Any] = [
             "type": "chatgptAuthTokens", "accessToken": grant.accessToken, "chatgptAccountId": grant.accountID
@@ -2122,7 +2131,8 @@ final class CodexNativeSessionController {
         if let plan = grant.plan { params["chatgptPlanType"] = plan }
         do {
             let installed = try await client.requestWithSettlementDeadline(
-                method: "account/login/start", params: params, deadline: 5, permitsManagedAccountLogin: true
+                method: "account/login/start", params: params, deadline: 5, permitsManagedAccountLogin: true,
+                managedAuthorization: authorization
             )
             let response = try await client.request(method: "account/read", params: ["refreshToken": false], timeout: 5)
             guard let account = response["account"] as? [String: Any],
@@ -4936,7 +4946,7 @@ final class CodexNativeSessionController {
             return
         }
         do {
-            try await client.respondToServerRequest(id: requestID, result: response.payload)
+            try await client.respondToServerRequest(id: requestID, result: response.payload, managedAuthorization: response.managedAuthorization)
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
         }

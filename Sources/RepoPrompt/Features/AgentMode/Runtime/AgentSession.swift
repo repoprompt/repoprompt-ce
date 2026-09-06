@@ -180,6 +180,9 @@ struct AgentSession: Codable, Identifiable {
     /// Codex native session identifiers (v2 thread and rollout path)
     var codexConversationID: String?
     var codexRolloutPath: String?
+    /// No credential or consent is persisted. This marker prevents a managed
+    /// history from silently reopening under ordinary global authentication.
+    var requiresSwitchboardPairing: Bool?
 
     /// Codex native session metadata
     var codexModel: String?
@@ -234,6 +237,7 @@ struct AgentSession: Codable, Identifiable {
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
+        requiresSwitchboardPairing: Bool? = nil,
         codexModel: String? = nil,
         codexReasoningEffort: String? = nil,
         codexContextWindow: Int? = nil,
@@ -271,6 +275,7 @@ struct AgentSession: Codable, Identifiable {
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
+        self.requiresSwitchboardPairing = requiresSwitchboardPairing
         self.codexModel = codexModel
         self.codexReasoningEffort = codexReasoningEffort
         self.codexContextWindow = codexContextWindow
@@ -310,6 +315,7 @@ struct AgentSession: Codable, Identifiable {
         case providerTokenUsageByTurn
         case codexConversationID
         case codexRolloutPath
+        case requiresSwitchboardPairing
         case codexModel
         case codexReasoningEffort
         case codexContextWindow
@@ -352,6 +358,7 @@ struct AgentSession: Codable, Identifiable {
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)
+        requiresSwitchboardPairing = try container.decodeIfPresent(Bool.self, forKey: .requiresSwitchboardPairing)
         codexModel = try container.decodeIfPresent(String.self, forKey: .codexModel)
         codexReasoningEffort = try container.decodeIfPresent(String.self, forKey: .codexReasoningEffort)
         codexContextWindow = try container.decodeIfPresent(Int.self, forKey: .codexContextWindow)

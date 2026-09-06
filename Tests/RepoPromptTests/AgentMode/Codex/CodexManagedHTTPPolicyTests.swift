@@ -1,7 +1,39 @@
+import Darwin
 @testable import RepoPromptApp
 import XCTest
 
 final class CodexManagedHTTPPolicyTests: XCTestCase {
+    func testPrivilegedWriteIsNonblockingAndRestoresFlagsOnFailure() throws {
+        let pipe = Pipe()
+        let descriptor = pipe.fileHandleForWriting.fileDescriptor
+        let original = fcntl(descriptor, F_GETFL)
+        XCTAssertThrowsError(try CodexManagedHTTPPolicy.withNonblockingPipeWrite(descriptor: descriptor) {
+            XCTAssertNotEqual(fcntl(descriptor, F_GETFL) & O_NONBLOCK, 0)
+            throw CodexAccountAdoptionReason.revoked
+        })
+        XCTAssertEqual(fcntl(descriptor, F_GETFL), original)
+    }
+
+    func testReservationRefusesOtherNativeMutators() throws {
+        var gate = CodexManagedHTTPPolicy.RequestGate()
+        try gate.claimStartup()
+        try gate.bindThread("owned")
+        _ = try gate.reserve()
+        XCTAssertThrowsError(try gate.authorize(method: "thread/rollback"))
+        XCTAssertThrowsError(try gate.authorize(method: "command/exec"))
+        try gate.authorize(method: "thread/read")
+    }
+
+    func testFutureBundledRuntimeDoesNotInheritReviewedTransportProof() throws {
+        try CodexManagedHTTPPolicy.verifyRuntimeVersion("0.149.0", bundledVersion: "0.149.0")
+        XCTAssertThrowsError(try CodexManagedHTTPPolicy.verifyRuntimeVersion("0.150.0", bundledVersion: "0.150.0"))
+        XCTAssertThrowsError(try CodexManagedHTTPPolicy.verifyRuntimeVersion("0.149.0", bundledVersion: "0.150.0"))
+    }
+
+    func testPinnedRuntimeEffectiveConfigurationFixture() throws {
+        try CodexManagedHTTPPolicy.verifyEffectiveConfiguration(CodexManagedHTTPRuntimeFixture.configuration())
+    }
+
     func testOnlyEffectiveHTTPAndEphemeralConfigurationIsEligible() throws {
         try CodexManagedHTTPPolicy.verifyEffectiveConfiguration(Self.validConfiguration())
         for (key, value) in [

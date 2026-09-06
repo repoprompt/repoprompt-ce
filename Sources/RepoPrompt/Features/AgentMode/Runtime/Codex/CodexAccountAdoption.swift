@@ -1,6 +1,26 @@
 import Combine
 import Foundation
 
+/// Linearizes consent revocation against the actual child-process write. The
+/// protected body must remain synchronous and must never call external code.
+final class CodexAccountAdoptionAuthorization: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+
+    func invalidate() {
+        lock.lock()
+        defer { lock.unlock() }
+        valid = false
+    }
+
+    func withAuthorization<T>(_ body: () throws -> T) throws -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        guard valid else { throw CodexAccountAdoptionReason.revoked }
+        return try body()
+    }
+}
+
 /// Account adoption is a separate authority from MCP routing and ordinary login.
 /// This value contains no credentials and is pinned to one live native controller.
 struct CodexAccountAdoptionScope: Equatable {
@@ -204,6 +224,11 @@ final class CodexAccountAdoption: ObservableObject {
         applied = nil
         blocksDispatch = true
         state = .revoked
+    }
+
+    func suspend(_ reason: CodexAccountAdoptionReason) {
+        guard !isRevoked else { return }
+        fail(reason)
     }
 
     func refresh(previousAccountID: String) async throws -> CodexAccountAdoptionGrant {
