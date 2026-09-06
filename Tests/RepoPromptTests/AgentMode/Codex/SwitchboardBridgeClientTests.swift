@@ -2,6 +2,20 @@
 import XCTest
 
 final class SwitchboardBridgeClientTests: XCTestCase {
+    func testRevokingRegisteredNullThreadNotifiesBridgeWithoutBindingThread() async throws {
+        let server = StubBridge()
+        let scope = SwitchboardBridgeTestData.scope(threadID: nil)
+        let client = try makeClient(server: server, scope: scope)
+        try await client.register(threadID: nil)
+        await client.revoke()
+        let requests = await server.requests
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.last?["op"], .string("revoke"))
+        XCTAssertEqual(requests.last?["thread_id"], .null)
+        XCTAssertEqual(requests.last?["consent_id"], .string(scope.consentID.uuidString.lowercased()))
+        await assertError(.revoked) { try await client.register(threadID: "must-not-bind") }
+    }
+
     func testRegisterNullThenExactNativeBindAndEveryRequestPinsScope() async throws {
         let server = StubBridge()
         let scope = SwitchboardBridgeTestData.scope(threadID: nil)

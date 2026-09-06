@@ -118,7 +118,8 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
     func revoke() async {
         guard let previous = pairing else { return }
         pairing = nil
-        guard registered, let threadID = scope.threadID else { return }
+        guard registered else { return }
+        let threadID = scope.threadID
         let requestID = UUID()
         do {
             let data = try makeRequest(op: "revoke", requestID: requestID, pairing: previous, threadID: threadID, additional: [:])
