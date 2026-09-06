@@ -34,6 +34,10 @@ struct DomainWorkspaceAuthorityClient {
         await store.snapshot()
     }
 
+    func activationSnapshot(workspaceID: UUID, fileURL: URL) async -> DomainWorkspaceActivationSnapshot {
+        await store.activationSnapshot(workspaceID: workspaceID, fileURL: fileURL)
+    }
+
     func canonicalWorkspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
         await store.canonicalWorkspaceSnapshot(workspaceID)
     }

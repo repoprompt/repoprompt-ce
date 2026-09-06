@@ -22,10 +22,18 @@ final class ChatWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvider {
     }
 
     func cancelSwitchSessions() async {
+        await cancelSwitchSessions(for: nil)
+    }
+
+    func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
         guard let workspaceManager, let oracleViewModel else { return }
         guard activeChatCount() > 0 else { return }
+        let expectedWorkspaceID = workspaceManager.activeWorkspaceID
 
         await oracleViewModel.cancelAllActiveSessionStreams()
+        guard deletionToken?.isActive ?? true,
+              workspaceManager.activeWorkspaceID == expectedWorkspaceID
+        else { return }
         workspaceManager.setActiveChatTabs([])
         workspaceManager.isChatBusy = false
     }
@@ -86,10 +94,18 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
     }
 
     func cancelSwitchSessions() async {
+        await cancelSwitchSessions(for: nil)
+    }
+
+    func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
         guard let agentModeViewModel else { return }
+        let expectedWorkspaceID = agentModeViewModel.workspaceManager?.activeWorkspaceID
         let activeTabs = agentModeViewModel.tabsWithActiveAgentRun
         for tabID in activeTabs {
             await agentModeViewModel.cancelAgentRun(tabID: tabID, completion: .terminalPublished)
+            guard deletionToken?.isActive ?? true,
+                  agentModeViewModel.workspaceManager?.activeWorkspaceID == expectedWorkspaceID
+            else { return }
         }
     }
 

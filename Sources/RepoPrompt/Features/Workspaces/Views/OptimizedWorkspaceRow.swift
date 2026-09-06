@@ -57,7 +57,7 @@ struct OptimizedWorkspaceRow: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Delete workspace?")
                             .font(fontPreset.headlineFont)
-                        Text("This will delete \"\(workspace.name)\" from your workspace list.")
+                        Text("This will delete \"\(workspace.name)\" and its saved tabs and session history, including pinned tabs. Running work will be stopped and affected windows will return to the welcome screen. Your project folders are kept.")
                             .font(fontPreset.subheadlineFont)
                             .foregroundColor(.secondary)
                         HStack {

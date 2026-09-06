@@ -330,6 +330,12 @@ protocol CodexHookApprovalSettingsProviding {
 @MainActor
 class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding {
     static let shared = GlobalSettingsStore()
+    private static let defaultUserDefaults: UserDefaults = {
+        if AppLaunchConfiguration.isUnitTestProcess {
+            return UserDefaults(suiteName: "RepoPromptCE.unit-settings.\(UUID().uuidString)")!
+        }
+        return .standard
+    }()
 
     private let defaults: UserDefaults
     private let fileStore: GlobalSettingsFileStoring
@@ -340,7 +346,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
-    /// UI surfaces this so the user can recover; RepoPrompt never auto-recovers.
+    /// UI surfaces this when the store cannot safely repair the document automatically.
     @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason? {
         didSet { reconcilePersistenceBlockDismissal() }
     }
@@ -367,11 +373,11 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     private var settingsWriteDiagnostics: [GlobalSettingsWriteDiagnostic] = []
 
     init(
-        defaults: UserDefaults = .standard,
+        defaults: UserDefaults? = nil,
         fileStore: GlobalSettingsFileStoring = GlobalSettingsFileStore(),
         invalidAgentModelsProfileAssertion: @escaping (String) -> Void = { assertionFailure($0) }
     ) {
-        self.defaults = defaults
+        self.defaults = defaults ?? Self.defaultUserDefaults
         self.fileStore = fileStore
         self.invalidAgentModelsProfileAssertion = invalidAgentModelsProfileAssertion
         load()
@@ -2427,6 +2433,14 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     /// backing up or resetting the user's settings. Returns true when persistence is unblocked.
     @discardableResult
     func retryBlockedPersistenceSave() -> Bool {
+        // Reload is an explicit, separate action: never overwrite another writer or
+        // persist provisional defaults through the generic save retry.
+        guard persistenceBlockReason != .changedOnDisk,
+              persistenceBlockReason != .missingOnDisk,
+              persistenceBlockReason != .loadFailed
+        else {
+            return false
+        }
         if fileStore.hasPendingStartupMigration {
             return persist {
                 try fileStore.retryStartupMigrationPreservingUnknownFields(makeDocument())

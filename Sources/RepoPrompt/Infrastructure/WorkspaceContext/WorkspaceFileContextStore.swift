@@ -6100,6 +6100,30 @@ actor WorkspaceFileContextStore {
         await cleanupOrphanedSessionWorktreeResources(resources)
     }
 
+    func currentSessionWorktreeOwnershipToken(
+        ownerID: UUID
+    ) -> WorkspaceSessionWorktreeOwnershipToken? {
+        guard let generation = latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID],
+              generation > 0
+        else { return nil }
+        return WorkspaceSessionWorktreeOwnershipToken(ownerID: ownerID, generation: generation)
+    }
+
+    @discardableResult
+    func releaseSessionWorktreeOwnership(
+        ifOwnedBy token: WorkspaceSessionWorktreeOwnershipToken
+    ) async -> Bool {
+        // The latest generation also fences an in-flight preparation that has not installed yet.
+        // A newer preparation belongs to a successor and must remain untouched.
+        guard latestSessionWorktreeOwnershipGenerationByOwnerID[token.ownerID] == token.generation,
+              installedSessionWorktreeOwnershipTokenByOwnerID[token.ownerID].map({
+                  $0.generation <= token.generation
+              }) ?? true
+        else { return false }
+        await releaseSessionWorktreeOwnership(ownerID: token.ownerID)
+        return true
+    }
+
     func sessionWorktreeOwnershipCovers(
         ownerID: UUID,
         bindingFingerprint: String,

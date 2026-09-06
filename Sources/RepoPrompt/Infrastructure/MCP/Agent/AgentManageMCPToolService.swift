@@ -61,6 +61,9 @@ struct AgentManageMCPToolService {
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
     let cleanupDependencies: CleanupDependencies
+    #if DEBUG
+        var testAfterTargetResolution: ((AgentModeViewModel.MCPSessionTarget) async -> Void)?
+    #endif
 
     init(
         toolName: String,
@@ -472,6 +475,9 @@ struct AgentManageMCPToolService {
     private func executeCreateSession(args: [String: Value]) async throws -> Value {
         let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.create_session.")
+        }
         let agentModeVM = targetWindow.agentModeViewModel
         let sourceTabID = await resolveSpawnSourceTabID(metadata)
         try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
@@ -482,7 +488,7 @@ struct AgentManageMCPToolService {
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: .engineer,
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: targetWindow.workspaceManager.activeWorkspace?.id
+            workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
@@ -491,16 +497,37 @@ struct AgentManageMCPToolService {
             createIfNeeded: true,
             sessionName: normalizedString(args["session_name"]),
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            expectedWorkspaceID: workspace.id
         )
         do {
+            #if DEBUG
+                await testAfterTargetResolution?(target)
+            #endif
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: resolved.agent,
                 modelRaw: resolved.model,
-                reasoningEffortRaw: resolved.effort
+                reasoningEffortRaw: resolved.effort,
+                workspaceAuthority: .init(
+                    target: target,
+                    expectedWorkspaceID: workspace.id,
+                    allowMatchingControlledSession: false
+                )
+            )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
             )
             try await bindCurrentRequestToTab(target.tabID, metadata)
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
             guard let sessionID = target.sessionID else {
                 throw MCPError.internalError("Failed to resolve created agent session ID.")
             }
@@ -511,6 +538,10 @@ struct AgentManageMCPToolService {
                 taskLabelKind: selection.taskLabelKind,
                 startPending: false
             )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
         } catch {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error
@@ -519,6 +550,7 @@ struct AgentManageMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("Failed to create agent session state.")
         }
+        agentModeVM.mcpAcceptSessionTarget(target)
         let sessionName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
         return .object(sessionSummaryObject(
             sessionID: session.activeAgentSessionID,
@@ -560,10 +592,19 @@ struct AgentManageMCPToolService {
             createIfNeeded: true,
             sessionName: nil,
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            expectedWorkspaceID: workspace.id
         )
         let hadMatchingMCPControl = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext?.sessionID == sessionID
         do {
+            #if DEBUG
+                await testAfterTargetResolution?(target)
+            #endif
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
+            )
             // Resume adopts the live session's existing control registration. Re-registering the
             // same persistent session expires in-flight waiters and splits poll state from the UI.
             if !hadMatchingMCPControl {
@@ -574,14 +615,33 @@ struct AgentManageMCPToolService {
                     taskLabelKind: selection.taskLabelKind,
                     startPending: false
                 )
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                    target,
+                    expectedWorkspaceID: workspace.id
+                )
             }
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: resolved.agent,
                 modelRaw: resolved.model,
-                reasoningEffortRaw: resolved.effort
+                reasoningEffortRaw: resolved.effort,
+                workspaceAuthority: .init(
+                    target: target,
+                    expectedWorkspaceID: workspace.id,
+                    allowMatchingControlledSession: hadMatchingMCPControl
+                )
+            )
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
             )
             try await bindCurrentRequestToTab(target.tabID, metadata)
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id,
+                allowMatchingControlledSession: hadMatchingMCPControl
+            )
         } catch {
             if !hadMatchingMCPControl {
                 await agentModeVM.mcpDeactivateControlContext(
@@ -596,6 +656,7 @@ struct AgentManageMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("Failed to hydrate resumed session.")
         }
+        agentModeVM.mcpAcceptSessionTarget(target)
         let sessionName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
         return .object(sessionSummaryObject(
             sessionID: sessionID,
@@ -622,26 +683,16 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
         }
 
-        let target: AgentModeViewModel.MCPSessionTarget
-        do {
-            target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
-                tabID: nil,
-                sessionID: sessionID,
-                createIfNeeded: false,
-                sessionName: nil
-            )
-        } catch {
+        guard let session = try agentModeVM.mcpSettledLiveSessionForStop(sessionID: sessionID) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' is not currently live and cannot be stopped.")
         }
-
-        let session = await agentModeVM.ensureSessionReady(tabID: target.tabID)
         let wasActive = session.runState.isActive
         if wasActive {
-            await agentModeVM.cancelAgentRun(tabID: target.tabID, completion: .terminalPublished)
+            await agentModeVM.cancelAgentRun(tabID: session.tabID, completion: .terminalPublished)
             await Task.yield()
         }
 
-        let tabName = targetWindow.workspaceManager.composeTab(with: target.tabID)?.name ?? "Agent Session"
+        let tabName = targetWindow.workspaceManager.composeTab(with: session.tabID)?.name ?? "Agent Session"
         var summary = sessionSummaryObject(
             sessionID: sessionID,
             name: tabName,

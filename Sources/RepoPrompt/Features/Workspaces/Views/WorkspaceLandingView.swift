@@ -20,7 +20,8 @@ struct WorkspaceLandingView: View {
     var footer: AnyView?
     var onSetupGuide: (() -> Void)?
 
-    @State private var refreshTrigger = UUID()
+    @State private var searchText = ""
+    @State private var showTemporaryWorkspaces = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     @ObservedObject private var windowStatesManager = WindowStatesManager.shared
     private var fontPreset: FontScalePreset {
@@ -39,10 +40,6 @@ struct WorkspaceLandingView: View {
         .frame(maxWidth: maxWidth, maxHeight: .infinity, alignment: layoutStyle == .expanded ? .center : .top)
         .padding(.top, topPadding)
         .padding(.horizontal, horizontalPadding)
-        .id(refreshTrigger)
-        .onReceive(NotificationCenter.default.publisher(for: .workspaceListDidChange).receive(on: RunLoop.main)) { _ in
-            refreshTrigger = UUID()
-        }
     }
 
     // MARK: - Compact Layout (unchanged)
@@ -66,144 +63,101 @@ struct WorkspaceLandingView: View {
     // MARK: - Expanded Stacked Layout
 
     private var expandedContent: some View {
-        VStack(alignment: .leading, spacing: 32) {
-            // Top: New workspace section
-            newWorkspaceSection
-
-            // Bottom: Recent workspaces in two columns
-            if !userWorkspaces.isEmpty {
-                recentWorkspacesGrid
-            }
-
-            if let footer {
-                footer
-            }
-        }
-        .frame(maxWidth: maxWidth, alignment: .center)
-    }
-
-    private var newWorkspaceSection: some View {
-        ZStack(alignment: .topTrailing) {
-            // Main content: left side + right links
-            HStack(alignment: .top, spacing: 32) {
-                // Left: Welcome + Open Folder
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(effectiveGreetingText)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.primary)
-
-                    Text("Open a folder to create a new workspace")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-
-                    Button(action: onSelectFolder) {
-                        HStack(spacing: 10) {
-                            Image(systemName: "folder.badge.plus")
-                                .font(.system(size: 16))
-                            Text("Open Folder")
-                                .font(.system(size: 14, weight: .medium))
-                        }
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 20)
-                    }
-                    .buttonStyle(CustomButtonStyle())
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Workspaces")
+                        .font(.system(size: 25, weight: .semibold))
+                    Text("Choose a project to continue, or open a folder.")
+                        .foregroundStyle(.secondary)
                 }
-
                 Spacer()
+                Button(action: onSelectFolder) {
+                    Label("Open Folder…", systemImage: "folder.badge.plus")
+                }
+                .buttonStyle(CustomButtonStyle())
+            }
 
-                // Right: Helpful links (with top padding to clear version)
-                VStack(alignment: .trailing, spacing: 8) {
-                    if let onSetupGuide {
-                        HelpLinkButton(title: "Setup Guide", icon: "sparkles", action: onSetupGuide)
+            HStack(spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search by name or folder", text: $searchText)
+                        .textFieldStyle(.plain)
+                        .accessibilityLabel("Search workspaces")
+                    if !searchText.isEmpty {
+                        Button { searchText = "" } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Clear workspace search")
                     }
-                    helpLink(title: "Documentation", icon: "book", url: "https://repoprompt.com/docs")
-                    helpLink(title: "Discord", icon: "bubble.left.and.bubble.right", url: "https://discord.gg/NtbFDAJPGM")
-                    helpLink(title: "Changelog", icon: "list.bullet.rectangle", url: "https://repoprompt.com/docs#s=changelog")
                 }
-                .padding(.top, 20)
-            }
-            .padding(20)
+                .padding(9)
+                .background(Color(NSColor.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
 
-            // Version number overlay
-            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary.opacity(0.7))
-                .padding(12)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(.regularMaterial)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.1), lineWidth: 1)
-        )
-    }
-
-    private func helpLink(title: String, icon: String, url: String) -> some View {
-        HelpLinkButton(title: title, icon: icon) {
-            if let linkURL = URL(string: url) {
-                NSWorkspace.shared.open(linkURL)
-            }
-        }
-    }
-
-    private var recentWorkspacesGrid: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 10) {
-                Text("Recent Workspaces")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.secondary)
-
+                Picker("Workspace collection", selection: $showTemporaryWorkspaces) {
+                    Text("Saved").tag(false)
+                    Text("Temporary").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 180)
                 ManageButton(action: onManageWorkspaces)
-
-                Spacer(minLength: 12)
-
-                restoreWorkspacesChip
             }
 
-            // Two-column grid
-            let columns = [
-                GridItem(.flexible(), spacing: 12),
-                GridItem(.flexible(), spacing: 12)
-            ]
-
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
-                ForEach(userWorkspaces.prefix(maxRecent)) { ws in
-                    workspaceCard(ws)
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(filteredWorkspaces) { workspace in
+                        workspaceCard(workspace)
+                            .contextMenu {
+                                if !workspace.isEphemeral {
+                                    Button(workspace.isTemporaryWorkspace ? "Keep in Saved Workspaces" : "Move to Temporary Workspaces") {
+                                        Task {
+                                            await workspaceManager.setWorkspaceLibraryMembership(workspace, saved: workspace.isTemporaryWorkspace)
+                                        }
+                                    }
+                                }
+                            }
+                    }
+                    if filteredWorkspaces.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: searchText.isEmpty ? "folder" : "magnifyingglass")
+                                .font(.title)
+                            Text(searchText.isEmpty ? "No \(showTemporaryWorkspaces ? "temporary" : "saved") workspaces" : "No matching workspaces")
+                            Text(searchText.isEmpty ? "Open a folder to get started." : "Try another name or folder path.")
+                                .font(.callout)
+                        }
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 180)
+                    }
                 }
             }
+            .frame(minHeight: 180, idealHeight: 350, maxHeight: 440)
+
+            Divider()
+            HStack {
+                Toggle("Restore windows on launch", isOn: $windowStatesManager.autoRestoreWorkspacesEnabled)
+                    .toggleStyle(.checkbox)
+                Spacer()
+                if let onSetupGuide {
+                    Button("Setup Guide", action: onSetupGuide).buttonStyle(.link)
+                }
+                Link("Documentation", destination: URL(string: "https://repoprompt.com/docs")!)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            if let footer { footer }
         }
+        .frame(maxWidth: maxWidth)
     }
 
-    private var restoreWorkspacesChip: some View {
-        Toggle(isOn: $windowStatesManager.autoRestoreWorkspacesEnabled) {
-            HStack(spacing: 8) {
-                Image(systemName: windowStatesManager.autoRestoreWorkspacesEnabled ? "sparkles.rectangle.stack.fill" : "rectangle.stack.badge.clock")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.accentColor)
-
-                Text("Auto restore on app launch")
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-            }
+    private var filteredWorkspaces: [WorkspaceModel] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return workspaceManager.workspacesForMenu(.init(includeTemporary: true)).filter {
+            $0.isTemporaryWorkspace == showTemporaryWorkspaces
+                && (
+                    query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)
+                        || $0.repoPaths.contains { $0.localizedCaseInsensitiveContains(query) }
+                )
         }
-        .toggleStyle(.switch)
-        .controlSize(.regular)
-        .padding(.vertical, 8)
-        .padding(.leading, 10)
-        .padding(.trailing, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.accentColor.opacity(windowStatesManager.autoRestoreWorkspacesEnabled ? 0.08 : 0.04))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.accentColor.opacity(windowStatesManager.autoRestoreWorkspacesEnabled ? 0.20 : 0.10), lineWidth: 1)
-        )
-        .hoverTooltip("Reopen the workspace windows that were open the last time RepoPrompt quit.", .top)
     }
 
     private func workspaceCard(_ ws: WorkspaceModel) -> some View {
@@ -275,23 +229,23 @@ struct WorkspaceLandingView: View {
                     .buttonStyle(LinkButtonStyle())
                 }
             }
-
-            Divider()
-                .padding(.vertical, 6)
-
-            Button(action: onManageWorkspaces) {
-                HStack(spacing: 4) {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(fontPreset.captionFont)
-                    Text("Manage Workspaces...")
-                        .font(fontPreset.subheadlineFont)
-                }
-                .foregroundColor(.secondary)
-            }
-            .buttonStyle(PlainButtonStyle())
-            .hoverEffect()
-            .hoverTooltip("Edit, rename, or delete workspaces", .top)
         }
+
+        Divider()
+            .padding(.vertical, 6)
+
+        Button(action: onManageWorkspaces) {
+            HStack(spacing: 4) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(fontPreset.captionFont)
+                Text("Manage Workspaces...")
+                    .font(fontPreset.subheadlineFont)
+            }
+            .foregroundColor(.secondary)
+        }
+        .buttonStyle(PlainButtonStyle())
+        .hoverEffect()
+        .hoverTooltip("Edit, rename, or delete workspaces", .top)
     }
 
     private var userWorkspaces: [WorkspaceModel] {

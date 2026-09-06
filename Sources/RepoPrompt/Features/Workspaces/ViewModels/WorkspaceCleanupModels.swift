@@ -1,9 +1,5 @@
 import Foundation
 
-enum WorkspaceBulkDeletePolicy {
-    static let maximumWorkspaceCount = 500
-}
-
 enum WorkspaceLeakedTestFixtureIdentity {
     enum Match: Equatable {
         case chatSwitch
@@ -146,7 +142,6 @@ struct WorkspaceBulkDeleteResult: Equatable {
 enum WorkspaceSelectionMutationResult: Equatable {
     case changed
     case unchanged
-    case limitExceeded(maximum: Int, attemptedCount: Int)
 }
 
 struct WorkspaceManagementSelectionState: Equatable {
@@ -167,16 +162,10 @@ struct WorkspaceManagementSelectionState: Equatable {
     }
 
     @discardableResult
-    mutating func toggle(_ workspaceID: UUID, isDeletable: Bool) -> WorkspaceSelectionMutationResult {
-        guard isSelecting, isDeletable else { return .unchanged }
+    mutating func toggle(_ workspaceID: UUID) -> WorkspaceSelectionMutationResult {
+        guard isSelecting else { return .unchanged }
         if selectedWorkspaceIDs.remove(workspaceID) != nil {
             return .changed
-        }
-        guard selectedWorkspaceIDs.count < WorkspaceBulkDeletePolicy.maximumWorkspaceCount else {
-            return .limitExceeded(
-                maximum: WorkspaceBulkDeletePolicy.maximumWorkspaceCount,
-                attemptedCount: selectedWorkspaceIDs.count + 1
-            )
         }
         selectedWorkspaceIDs.insert(workspaceID)
         return .changed
@@ -186,12 +175,6 @@ struct WorkspaceManagementSelectionState: Equatable {
     mutating func selectAllResults(_ workspaceIDs: [UUID]) -> WorkspaceSelectionMutationResult {
         guard isSelecting else { return .unchanged }
         let combined = selectedWorkspaceIDs.union(workspaceIDs)
-        guard combined.count <= WorkspaceBulkDeletePolicy.maximumWorkspaceCount else {
-            return .limitExceeded(
-                maximum: WorkspaceBulkDeletePolicy.maximumWorkspaceCount,
-                attemptedCount: combined.count
-            )
-        }
         guard combined != selectedWorkspaceIDs else { return .unchanged }
         selectedWorkspaceIDs = combined
         return .changed

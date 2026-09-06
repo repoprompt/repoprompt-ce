@@ -2,18 +2,18 @@
 import XCTest
 
 final class WorkspaceManagementSelectionStateTests: XCTestCase {
-    func testSelectAllResultsScopesToCurrentFilteredEligibleSet() {
+    func testSelectAllIncludesEntireInventoryOutsideCurrentFilter() {
         var state = WorkspaceManagementSelectionState()
         let first = UUID()
         let second = UUID()
         let outsideFilter = UUID()
 
         state.begin()
-        state.selectAllResults([first, second])
+        state.selectAllResults([first, second, outsideFilter])
 
-        XCTAssertEqual(state.selectedWorkspaceIDs, [first, second])
-        XCTAssertFalse(state.selectedWorkspaceIDs.contains(outsideFilter))
-        XCTAssertEqual(state.selectedCount(in: [first, second, outsideFilter]), 2)
+        XCTAssertEqual(state.selectedWorkspaceIDs, [first, second, outsideFilter])
+        XCTAssertTrue(state.selectedWorkspaceIDs.contains(outsideFilter))
+        XCTAssertEqual(state.selectedCount(in: [first]), 1)
     }
 
     func testFilterChangePreservesSelectionAndNextSelectAllAddsNewResults() {
@@ -30,14 +30,14 @@ final class WorkspaceManagementSelectionStateTests: XCTestCase {
         XCTAssertEqual(state.selectedCount(in: [secondFilter]), 1)
     }
 
-    func testProtectedWorkspaceCannotBeSelected() {
+    func testAnyWorkspaceCanBeSelected() {
         var state = WorkspaceManagementSelectionState()
         let protected = UUID()
 
         state.begin()
-        state.toggle(protected, isDeletable: false)
+        state.toggle(protected)
 
-        XCTAssertTrue(state.selectedWorkspaceIDs.isEmpty)
+        XCTAssertEqual(state.selectedWorkspaceIDs, [protected])
     }
 
     func testClearAndCancelHaveDistinctSelectionModeSemantics() {
@@ -45,12 +45,12 @@ final class WorkspaceManagementSelectionStateTests: XCTestCase {
         let workspaceID = UUID()
 
         state.begin()
-        state.toggle(workspaceID, isDeletable: true)
+        state.toggle(workspaceID)
         state.clear()
         XCTAssertTrue(state.isSelecting)
         XCTAssertTrue(state.selectedWorkspaceIDs.isEmpty)
 
-        state.toggle(workspaceID, isDeletable: true)
+        state.toggle(workspaceID)
         state.cancel()
         XCTAssertFalse(state.isSelecting)
         XCTAssertTrue(state.selectedWorkspaceIDs.isEmpty)
@@ -68,20 +68,11 @@ final class WorkspaceManagementSelectionStateTests: XCTestCase {
         XCTAssertEqual(state.selectedWorkspaceIDs, [retained])
     }
 
-    func testSelectAllRejectsOversizedResultWithoutPartialSelection() {
+    func testSelectAllHasNoArbitraryCatalogSizeLimit() {
         var state = WorkspaceManagementSelectionState()
-        let workspaceIDs = (0 ... WorkspaceBulkDeletePolicy.maximumWorkspaceCount).map { _ in UUID() }
-
+        let workspaceIDs = (0 ..< 1200).map { _ in UUID() }
         state.begin()
-        let result = state.selectAllResults(workspaceIDs)
-
-        XCTAssertEqual(
-            result,
-            .limitExceeded(
-                maximum: WorkspaceBulkDeletePolicy.maximumWorkspaceCount,
-                attemptedCount: WorkspaceBulkDeletePolicy.maximumWorkspaceCount + 1
-            )
-        )
-        XCTAssertTrue(state.selectedWorkspaceIDs.isEmpty)
+        XCTAssertEqual(state.selectAllResults(workspaceIDs), .changed)
+        XCTAssertEqual(state.selectedWorkspaceIDs, Set(workspaceIDs))
     }
 }

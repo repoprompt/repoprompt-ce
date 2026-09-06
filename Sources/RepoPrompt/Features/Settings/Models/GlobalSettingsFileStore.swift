@@ -29,16 +29,24 @@ protocol GlobalSettingsFileStoring {
 
 /// Why global-settings persistence is currently blocked: the store loads in-memory defaults
 /// and refuses to overwrite the on-disk file. Surfaced to the user so they can take a recovery
-/// action; RepoPrompt never auto-recovers from a schema it did not write.
+/// action. Proven redundant CE schema stamps can be repaired without discarding content.
 enum GlobalSettingsPersistenceBlockReason: Equatable {
     /// On-disk schema is newer than this build supports (`onDiskVersion` > `supportedVersion`).
     case unsupportedFutureSchema(onDiskVersion: Int, supportedVersion: Int)
     /// On-disk settings are JSON, but belong to a different or unrecognized settings schema lineage.
     case incompatibleSchema
-    /// The on-disk file is unreadable and could not be moved to the Backups folder.
+    /// The on-disk file is unreadable or malformed and remains preserved for explicit recovery.
     case corruptUnrecoverable
     /// The settings file could not be written, for example due to permissions or disk space.
     case saveFailed
+    /// Another current process is completing a settings transaction; retry is nonblocking.
+    case writerBusy
+    /// The live document was derived from different on-disk bytes; reload before saving.
+    case changedOnDisk
+    /// A previously observed file is absent; explicit recreation may retain live values.
+    case missingOnDisk
+    /// No safely loaded document is available; provisional defaults must never be saved.
+    case loadFailed
     /// A same-lineage false-v4 file could not be safely verified, backed up, or atomically normalized.
     case automaticSchemaNormalizationFailed
 }
@@ -54,16 +62,32 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     static let appSupportDirectoryName = "RepoPrompt CE"
     static let settingsDirectoryName = "Settings"
     static let filename = "globalSettings.json"
+    private static let unitTestSettingsDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("RepoPromptCE-unit-settings-\(UUID().uuidString)", isDirectory: true)
 
     let fileURL: URL
     private let fileManager: FileManager
     private let now: () -> Date
     private let normalizationBackupWriter: (Data, URL) throws -> Void
     private let normalizationAtomicWriter: (Data, URL) throws -> Void
+    /// Encoded typed projection used to calculate known-field changes. The exact raw
+    /// generation used for stale-input detection lives separately in `observedGeneration`.
+    private var lastKnownTypedDocumentData: Data?
     private let startupMigrationAtomicWriter: (Data, URL) throws -> Void
+    private let atomicWriter: (Data, URL) throws -> Void
     private var preservingUnsupportedFutureDocument = false
     private var preservingUnbackedCorruptDocument = false
     private var preservingFailedAutomaticNormalization = false
+
+    private enum ObservedGeneration: Equatable {
+        case unobserved
+        case missing
+        case contents(Data)
+    }
+
+    private var observedGeneration: ObservedGeneration = .unobserved
+    private var requiresReload = false
+    private var hasLoadedDocument = false
 
     private struct PendingStartupMigration {
         /// The typed document used for the failed attempt. Retry compares against this
@@ -79,7 +103,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     }
 
     /// Non-nil when the on-disk file cannot be safely read or overwritten, so the store falls
-    /// back to in-memory defaults and refuses saves. Surfaced to the user (never auto-recovered).
+    /// back to in-memory defaults and refuses saves. Proven redundant version stamps are repaired on load.
     /// Cleared by `performUserInitiatedRecovery()`.
     private(set) var blockReason: GlobalSettingsPersistenceBlockReason?
 
@@ -95,6 +119,9 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         },
         startupMigrationAtomicWriter: @escaping (Data, URL) throws -> Void = { data, url in
             try data.write(to: url, options: .atomic)
+        },
+        atomicWriter: @escaping (Data, URL) throws -> Void = { data, url in
+            try data.write(to: url, options: .atomic)
         }
     ) {
         self.fileURL = fileURL
@@ -103,6 +130,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         self.normalizationBackupWriter = normalizationBackupWriter
         self.normalizationAtomicWriter = normalizationAtomicWriter
         self.startupMigrationAtomicWriter = startupMigrationAtomicWriter
+        self.atomicWriter = atomicWriter
     }
 
     static func defaultFileURL(fileManager: FileManager = .default) -> URL {
@@ -111,6 +139,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     }
 
     static func settingsDirectoryURL(fileManager: FileManager = .default) -> URL {
+        if AppLaunchConfiguration.isUnitTestProcess { return unitTestSettingsDirectory }
         let supportDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
         return supportDirectory
@@ -119,7 +148,35 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     }
 
     func load() throws -> GlobalSettingsDocument {
-        let data = try Data(contentsOf: fileURL)
+        requiresReload = true
+        return try withTransaction {
+            guard let data = try readCurrentData() else {
+                // Explicit retry after initial contention can initialize a still-absent
+                // file, but never recreate a previously observed or recovered document.
+                guard observedGeneration == .unobserved, !hasLoadedDocument else {
+                    blockReason = .missingOnDisk
+                    throw GlobalSettingsFileStoreError.reloadRequired
+                }
+                requiresReload = false
+                observedGeneration = .missing
+                let document = defaultDocument()
+                try saveLocked(document)
+                return document
+            }
+            do {
+                return try loadLocked(data)
+            } catch is DecodingError {
+                preservingUnbackedCorruptDocument = true
+                blockReason = .corruptUnrecoverable
+                throw GlobalSettingsFileStoreError.corruptDocumentPreserved
+            }
+        }
+    }
+
+    private func loadLocked(_ data: Data) throws -> GlobalSettingsDocument {
+        // Even an incompatible/corrupt document needs an identity for explicit recovery.
+        observedGeneration = .contents(data)
+        requiresReload = true
         let header: GlobalSettingsDocumentHeader
         do {
             header = try Self.decoder.decode(GlobalSettingsDocumentHeader.self, from: data)
@@ -139,7 +196,8 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                 throw GlobalSettingsFileStoreError.unsupportedFutureSchema(onDiskVersion)
             case .incompatibleSchema:
                 throw GlobalSettingsFileStoreError.incompatibleSchema
-            case .corruptUnrecoverable, .saveFailed, .automaticSchemaNormalizationFailed:
+            case .corruptUnrecoverable, .saveFailed, .automaticSchemaNormalizationFailed,
+                 .writerBusy, .changedOnDisk, .missingOnDisk, .loadFailed:
                 assertionFailure("Unexpected settings preservation reason during header load: \(reason)")
                 throw GlobalSettingsFileStoreError.incompatibleSchema
             }
@@ -164,13 +222,14 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
 
         if Self.shouldNormalizeFalseV4Document(data: data, header: header, document: document) {
             do {
-                let normalizedData = try normalizeFalseV4Document(data)
+                let normalizedData = try normalizeRedundantSchemaDocument(data, targetVersion: GlobalSettingsDocument.baselineSchemaVersion)
                 var normalizedDocument = try Self.decoder.decode(GlobalSettingsDocument.self, from: normalizedData)
                 normalizedDocument.schemaVersion = GlobalSettingsDocument.baselineSchemaVersion
                 preservingFailedAutomaticNormalization = false
                 preservingUnsupportedFutureDocument = false
                 preservingUnbackedCorruptDocument = false
-                blockReason = pendingStartupMigration == nil ? nil : .saveFailed
+                lastKnownTypedDocumentData = try Self.encoder.encode(normalizedDocument)
+                didLoadDocument(data: normalizedData)
                 return normalizedDocument
             } catch {
                 preservingFailedAutomaticNormalization = true
@@ -182,50 +241,55 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         preservingFailedAutomaticNormalization = false
         preservingUnsupportedFutureDocument = false
         preservingUnbackedCorruptDocument = false
-        blockReason = pendingStartupMigration == nil ? nil : .saveFailed
+        lastKnownTypedDocumentData = try Self.encoder.encode(document)
+        didLoadDocument(data: data)
         return document
     }
 
+    private func didLoadDocument(data: Data) {
+        observedGeneration = .contents(data)
+        requiresReload = false
+        hasLoadedDocument = true
+        // Reload adopts the new document; failed migration intent belongs to the old one.
+        pendingStartupMigration = nil
+        blockReason = nil
+    }
+
     func loadOrCreateDefault() -> GlobalSettingsDocument {
-        preservingUnsupportedFutureDocument = false
-        preservingUnbackedCorruptDocument = false
-        if preservingFailedAutomaticNormalization {
-            blockReason = .automaticSchemaNormalizationFailed
+        // A second startup fallback must not turn a failed read into a default write.
+        if blockReason == .loadFailed || blockReason == .changedOnDisk
+            || blockReason == .missingOnDisk || preservingFailedAutomaticNormalization
+        {
             return defaultDocument()
         }
-        blockReason = nil
-        if fileManager.fileExists(atPath: fileURL.path) {
-            do {
-                return try load()
-            } catch GlobalSettingsFileStoreError.automaticSchemaNormalizationFailed {
-                preservingFailedAutomaticNormalization = true
-                blockReason = .automaticSchemaNormalizationFailed
-                print("⚠️ Global settings schema normalization could not complete safely; preserving the original file and using in-memory defaults for this launch.")
-                return defaultDocument()
-            } catch let GlobalSettingsFileStoreError.unsupportedFutureSchema(version) {
-                preservingUnsupportedFutureDocument = true
-                print("⚠️ Global settings JSON schema v\(version) is newer than supported v\(GlobalSettingsDocument.currentSchemaVersion); preserving file and using in-memory defaults for this launch.")
-                return defaultDocument()
-            } catch GlobalSettingsFileStoreError.incompatibleSchema {
-                preservingUnsupportedFutureDocument = true
-                blockReason = .incompatibleSchema
-                print("⚠️ Global settings JSON was written by a different or unrecognized RepoPrompt settings schema; preserving file and using in-memory defaults for this launch.")
-                return defaultDocument()
-            } catch {
-                let fallback = defaultDocument()
-                if backupCorruptFile(error: error) {
-                    writeFallbackDocument(fallback)
-                } else {
+        do {
+            return try withTransaction {
+                guard let data = try readCurrentData() else {
+                    // Only a first, confirmed-absent document may create defaults.
+                    guard observedGeneration == .unobserved, !requiresReload else {
+                        blockReason = .missingOnDisk
+                        throw GlobalSettingsFileStoreError.reloadRequired
+                    }
+                    observedGeneration = .missing
+                    let document = defaultDocument()
+                    try saveLocked(document)
+                    return document
+                }
+                do {
+                    return try loadLocked(data)
+                } catch is DecodingError {
+                    // Keep malformed current-schema input in place for explicit recovery.
+                    // A decode failure must never silently replace user data with defaults.
                     preservingUnbackedCorruptDocument = true
                     blockReason = .corruptUnrecoverable
+                    return defaultDocument()
                 }
-                return fallback
             }
+        } catch {
+            // Schema, lock, read, and decode failures preserve the primary file. These defaults
+            // are provisional; saving remains blocked until reload or explicit recovery.
+            return defaultDocument()
         }
-
-        let document = defaultDocument()
-        writeFallbackDocument(document)
-        return document
     }
 
     /// User-initiated compatible import from a blocked foreign/incompatible settings file:
@@ -234,6 +298,15 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     /// silently discarded without an explicit user action.
     @discardableResult
     func performUserInitiatedCompatibleImport() -> Bool {
+        do {
+            return try withTransaction {
+                try verifyObservedGeneration()
+                return performCompatibleImportLocked()
+            }
+        } catch { return false }
+    }
+
+    private func performCompatibleImportLocked() -> Bool {
         guard blockReason != .automaticSchemaNormalizationFailed else { return false }
         guard fileManager.fileExists(atPath: fileURL.path) else { return false }
         let importedDocument: GlobalSettingsDocument
@@ -247,14 +320,10 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             return false
         }
 
-        guard supersedeExistingFileToBackup(label: "imported") != nil else {
+        guard supersedeExistingFileToBackup(label: "imported", removeOriginal: false) != nil else {
             return false
         }
 
-        preservingFailedAutomaticNormalization = false
-        preservingUnsupportedFutureDocument = false
-        preservingUnbackedCorruptDocument = false
-        pendingStartupMigration = nil
         let documentToWrite = GlobalSettingsDocument(
             updatedAt: importedDocument.updatedAt,
             copySettings: importedDocument.copySettings,
@@ -264,11 +333,19 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             scalarPreferences: importedDocument.scalarPreferences
         )
         do {
-            try save(documentToWrite)
+            try saveLocked(documentToWrite, allowingCompatibleImport: true)
+            preservingFailedAutomaticNormalization = false
+            preservingUnsupportedFutureDocument = false
+            preservingUnbackedCorruptDocument = false
+            pendingStartupMigration = nil
             blockReason = nil
             return true
         } catch {
-            blockReason = .saveFailed
+            // The backup is a copy. Failed atomic replacement leaves the original
+            // primary and its observed generation available for another explicit import.
+            preservingUnsupportedFutureDocument = true
+            requiresReload = true
+            blockReason = .incompatibleSchema
             print("⚠️ Failed to import compatible global settings JSON at \(fileURL.path): \(error)")
             return false
         }
@@ -281,6 +358,25 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     /// a file exists) and replacement write succeed.
     @discardableResult
     func performUserInitiatedRecovery(replacementDocument: GlobalSettingsDocument) -> Bool {
+        do {
+            return try withTransaction {
+                if blockReason == .missingOnDisk {
+                    // The user explicitly chose to recreate from retained live values.
+                    // Adopt absence only if it is still true inside this transaction.
+                    guard try readCurrentData() == nil else {
+                        blockReason = .changedOnDisk
+                        throw GlobalSettingsFileStoreError.settingsChangedOnDisk
+                    }
+                    observedGeneration = .missing
+                } else {
+                    try verifyObservedGeneration()
+                }
+                return performRecoveryLocked(replacementDocument: replacementDocument)
+            }
+        } catch { return false }
+    }
+
+    private func performRecoveryLocked(replacementDocument: GlobalSettingsDocument) -> Bool {
         if fileManager.fileExists(atPath: fileURL.path),
            supersedeExistingFileToBackup(label: "superseded") == nil
         {
@@ -294,10 +390,11 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         preservingUnbackedCorruptDocument = false
         preservingFailedAutomaticNormalization = false
         pendingStartupMigration = nil
+        requiresReload = false
         do {
             var documentToWrite = replacementDocument
             documentToWrite.schemaLineage = GlobalSettingsDocument.schemaLineage
-            try save(documentToWrite)
+            try saveLocked(documentToWrite)
             blockReason = nil
             return true
         } catch {
@@ -308,15 +405,52 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     }
 
     func save(_ document: GlobalSettingsDocument) throws {
-        try validateSavePermission()
+        try withTransaction { try saveLocked(document) }
+    }
+
+    private func saveLocked(
+        _ document: GlobalSettingsDocument,
+        allowingCompatibleImport: Bool = false
+    ) throws {
+        let currentData = try verifyObservedGeneration(allowInitialCreation: true)
+        if !allowingCompatibleImport {
+            try validateSavePermission()
+            guard !requiresReload else {
+                blockReason = observedGeneration == .missing ? .missingOnDisk : .loadFailed
+                throw GlobalSettingsFileStoreError.reloadRequired
+            }
+        }
         try ensureSettingsDirectoryExists()
         var documentToWrite = document
         documentToWrite.schemaVersion = documentToWrite.requiredSchemaVersion
         documentToWrite.schemaLineage = GlobalSettingsDocument.schemaLineage
         documentToWrite.updatedAt = now()
-        let data = try Self.encoder.encode(documentToWrite)
+        let knownData = try Self.encoder.encode(documentToWrite)
+        let data: Data
+        if allowingCompatibleImport {
+            // Compatible import intentionally starts from an incompatible document, so
+            // there is no typed baseline to diff against. The original has already been
+            // copied to Backups/ and the imported current-schema projection is the full
+            // replacement chosen by the user.
+            data = knownData
+        } else if let currentData {
+            guard let baseline = lastKnownTypedDocumentData else {
+                requiresReload = true
+                blockReason = .loadFailed
+                throw GlobalSettingsFileStoreError.reloadRequired
+            }
+            data = try GlobalSettingsJSONPreservation.applyingChanges(
+                from: baseline, to: knownData, preserving: currentData
+            )
+        } else {
+            data = knownData
+        }
         do {
-            try data.write(to: fileURL, options: .atomic)
+            try atomicWriter(data, fileURL)
+            observedGeneration = .contents(data)
+            requiresReload = false
+            hasLoadedDocument = true
+            lastKnownTypedDocumentData = knownData
             blockReason = nil
         } catch {
             blockReason = .saveFailed
@@ -328,24 +462,28 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         _ document: GlobalSettingsDocument,
         includeModelSelectionRepair: Bool
     ) throws {
-        try writeStartupMigrationPreservingUnknownFields(
-            document,
-            retryBaselineDocument: nil,
-            includeModelSelectionRepair: includeModelSelectionRepair,
-            allowRetryOfFailedMigration: false
-        )
+        try withTransaction {
+            try writeStartupMigrationPreservingUnknownFields(
+                document,
+                retryBaselineDocument: nil,
+                includeModelSelectionRepair: includeModelSelectionRepair,
+                allowRetryOfFailedMigration: false
+            )
+        }
     }
 
     func retryStartupMigrationPreservingUnknownFields(_ document: GlobalSettingsDocument) throws {
         guard let pendingStartupMigration else {
             throw GlobalSettingsFileStoreError.startupMigrationRetryUnavailable
         }
-        try writeStartupMigrationPreservingUnknownFields(
-            document,
-            retryBaselineDocument: pendingStartupMigration.initialDocument,
-            includeModelSelectionRepair: pendingStartupMigration.includeModelSelectionRepair,
-            allowRetryOfFailedMigration: true
-        )
+        try withTransaction {
+            try writeStartupMigrationPreservingUnknownFields(
+                document,
+                retryBaselineDocument: pendingStartupMigration.initialDocument,
+                includeModelSelectionRepair: pendingStartupMigration.includeModelSelectionRepair,
+                allowRetryOfFailedMigration: true
+            )
+        }
     }
 
     private func writeStartupMigrationPreservingUnknownFields(
@@ -354,13 +492,18 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         includeModelSelectionRepair: Bool,
         allowRetryOfFailedMigration: Bool
     ) throws {
+        let currentData = try verifyObservedGeneration(allowInitialCreation: true)
         try validateSavePermission(allowRetryOfFailedMigration: allowRetryOfFailedMigration)
-        guard fileManager.fileExists(atPath: fileURL.path) else {
+        guard !requiresReload else {
+            blockReason = observedGeneration == .missing ? .missingOnDisk : .loadFailed
+            throw GlobalSettingsFileStoreError.reloadRequired
+        }
+        guard let currentData else {
             guard !allowRetryOfFailedMigration else {
                 blockReason = .saveFailed
                 throw GlobalSettingsFileStoreError.startupMigrationRetryRequired
             }
-            try save(document)
+            try saveLocked(document)
             return
         }
 
@@ -370,7 +513,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         documentToWrite.updatedAt = now()
         let knownData = try Self.encoder.encode(documentToWrite)
         guard let knownRoot = try JSONSerialization.jsonObject(with: knownData) as? [String: Any],
-              var rawRoot = try JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any],
+              var rawRoot = try JSONSerialization.jsonObject(with: currentData) as? [String: Any],
               let knownScalarPreferences = knownRoot["scalarPreferences"] as? [String: Any],
               let knownContextBuilder = knownScalarPreferences["contextBuilder"],
               let knownFileSystem = knownScalarPreferences["fileSystem"] as? [String: Any],
@@ -517,7 +660,10 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         do {
             try ensureSettingsDirectoryExists()
             try startupMigrationAtomicWriter(migratedData, fileURL)
+            observedGeneration = .contents(migratedData)
+            hasLoadedDocument = true
             pendingStartupMigration = nil
+            lastKnownTypedDocumentData = knownData
             blockReason = nil
         } catch {
             // Keep the first failed attempt as the retry baseline. A later failed retry
@@ -688,7 +834,8 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             case .incompatibleSchema:
                 print("⚠️ Global settings JSON was written by a different or unrecognized RepoPrompt settings schema; preserving file and skipping save.")
                 throw GlobalSettingsFileStoreError.incompatibleSchemaPreserved
-            case .corruptUnrecoverable, .saveFailed, .automaticSchemaNormalizationFailed:
+            case .corruptUnrecoverable, .saveFailed, .automaticSchemaNormalizationFailed,
+                 .writerBusy, .changedOnDisk, .missingOnDisk, .loadFailed:
                 assertionFailure("Unexpected settings preservation reason during save: \(reason)")
                 throw GlobalSettingsFileStoreError.incompatibleSchemaPreserved
             }
@@ -704,12 +851,54 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         )
     }
 
-    private func writeFallbackDocument(_ document: GlobalSettingsDocument) {
+    private func withTransaction<T>(_ operation: () throws -> T) throws -> T {
         do {
-            try save(document)
+            try ensureSettingsDirectoryExists()
         } catch {
-            print("⚠️ Failed to write global settings JSON at \(fileURL.path): \(error)")
+            blockReason = hasLoadedDocument && !requiresReload ? .saveFailed : .loadFailed
+            if blockReason == .loadFailed { requiresReload = true }
+            throw error
         }
+        do {
+            return try GlobalSettingsTransactionLock.withLock(for: fileURL, operation)
+        } catch GlobalSettingsTransactionLock.LockError.busy {
+            blockReason = hasLoadedDocument && !requiresReload ? .writerBusy : .loadFailed
+            if blockReason == .loadFailed { requiresReload = true }
+            throw GlobalSettingsFileStoreError.writerBusy
+        } catch let error as GlobalSettingsTransactionLock.LockError {
+            blockReason = hasLoadedDocument && !requiresReload ? .saveFailed : .loadFailed
+            if blockReason == .loadFailed { requiresReload = true }
+            throw error
+        }
+    }
+
+    private func readCurrentData() throws -> Data? {
+        do {
+            return try Data(contentsOf: fileURL)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        } catch {
+            requiresReload = true
+            blockReason = .loadFailed
+            throw error
+        }
+    }
+
+    @discardableResult
+    private func verifyObservedGeneration(allowInitialCreation: Bool = false) throws -> Data? {
+        let currentData = try readCurrentData()
+        let currentGeneration: ObservedGeneration = currentData.map(ObservedGeneration.contents) ?? .missing
+        if observedGeneration == .unobserved,
+           allowInitialCreation, currentData == nil, !requiresReload
+        {
+            observedGeneration = .missing
+        }
+        guard observedGeneration == currentGeneration else {
+            blockReason = currentData == nil ? .missingOnDisk : .changedOnDisk
+            requiresReload = true
+            throw GlobalSettingsFileStoreError.settingsChangedOnDisk
+        }
+        return currentData
     }
 
     private func ensureSettingsDirectoryExists() throws {
@@ -719,12 +908,11 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         )
     }
 
-    /// Moves (or copies + removes) the current on-disk file into `Backups/` with the given
-    /// label. Returns the backup URL on success, or nil if there was no file to back up or the
-    /// move failed. The original path is left empty so a following `save()` cannot re-trip the
-    /// newer-schema guard.
+    /// Backs up the current file under the transaction lock. Recovery removes the primary
+    /// and records its missing generation; compatible import copies it so a failed atomic
+    /// replacement can retry against the unchanged original.
     @discardableResult
-    private func supersedeExistingFileToBackup(label: String) -> URL? {
+    private func supersedeExistingFileToBackup(label: String, removeOriginal: Bool = true) -> URL? {
         guard fileManager.fileExists(atPath: fileURL.path) else { return nil }
         do {
             let backupDirectory = fileURL
@@ -740,23 +928,22 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                     .appendingPathComponent("globalSettings.\(label)-\(stamp)-\(UUID().uuidString).json")
             }
 
-            do {
-                try fileManager.moveItem(at: fileURL, to: backupURL)
-            } catch {
+            if removeOriginal {
+                do {
+                    try fileManager.moveItem(at: fileURL, to: backupURL)
+                } catch {
+                    try fileManager.copyItem(at: fileURL, to: backupURL)
+                    try fileManager.removeItem(at: fileURL)
+                }
+                observedGeneration = .missing
+            } else {
                 try fileManager.copyItem(at: fileURL, to: backupURL)
-                try? fileManager.removeItem(at: fileURL)
             }
             return backupURL
         } catch {
             print("⚠️ Failed to back up global settings JSON at \(fileURL.path): \(error)")
             return nil
         }
-    }
-
-    private func backupCorruptFile(error: Error) -> Bool {
-        guard let backupURL = supersedeExistingFileToBackup(label: "corrupt") else { return false }
-        print("⚠️ Backed up corrupt global settings JSON to \(backupURL.path): \(error)")
-        return true
     }
 
     private enum RawAgentModelsFieldState: Equatable {
@@ -818,33 +1005,31 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         }
     }
 
-    private func normalizeFalseV4Document(_ originalData: Data) throws -> Data {
+    private func normalizeRedundantSchemaDocument(_ originalData: Data, targetVersion: Int) throws -> Data {
         guard var root = try JSONSerialization.jsonObject(with: originalData) as? [String: Any],
-              root["schemaVersion"] as? Int == GlobalSettingsDocument.workspaceAgentModelsSchemaVersion,
-              (root["schemaLineage"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-              == GlobalSettingsDocument.schemaLineage
-        else {
-            throw GlobalSettingsFileStoreError.automaticSchemaNormalizationFailed
-        }
-        if let rawAgentModels = root["agentModelsSettingsByWorkspaceID"],
-           (rawAgentModels as? [String: Any])?.isEmpty != true
-        {
-            throw GlobalSettingsFileStoreError.automaticSchemaNormalizationFailed
-        }
+              let version = root["schemaVersion"] as? Int,
+              targetVersion < version
+        else { throw GlobalSettingsFileStoreError.automaticSchemaNormalizationFailed }
 
-        let backupURL = try falseV4BackupURL()
+        let backupURL = try redundantSchemaBackupURL(version: version)
         try normalizationBackupWriter(originalData, backupURL)
+        guard try Data(contentsOf: backupURL) == originalData,
+              try Data(contentsOf: fileURL) == originalData
+        else { throw GlobalSettingsFileStoreError.automaticSchemaNormalizationFailed }
 
-        root["schemaVersion"] = GlobalSettingsDocument.baselineSchemaVersion
+        root["schemaVersion"] = targetVersion
         let normalizedData = try JSONSerialization.data(
             withJSONObject: root,
             options: [.prettyPrinted, .sortedKeys]
         )
         try normalizationAtomicWriter(normalizedData, fileURL)
+        guard try Data(contentsOf: fileURL) == normalizedData else {
+            throw GlobalSettingsFileStoreError.automaticSchemaNormalizationFailed
+        }
         return normalizedData
     }
 
-    private func falseV4BackupURL() throws -> URL {
+    private func redundantSchemaBackupURL(version: Int) throws -> URL {
         let backupDirectory = fileURL
             .deletingLastPathComponent()
             .appendingPathComponent("Backups", isDirectory: true)
@@ -852,10 +1037,10 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
 
         let stamp = Self.backupTimestamp(for: now())
         var backupURL = backupDirectory
-            .appendingPathComponent("globalSettings.false-v4-\(stamp).json")
+            .appendingPathComponent("globalSettings.false-v\(version)-\(stamp).json")
         if fileManager.fileExists(atPath: backupURL.path) {
             backupURL = backupDirectory
-                .appendingPathComponent("globalSettings.false-v4-\(stamp)-\(UUID().uuidString).json")
+                .appendingPathComponent("globalSettings.false-v\(version)-\(stamp)-\(UUID().uuidString).json")
         }
         return backupURL
     }
@@ -940,6 +1125,9 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         case startupMigrationRetryRequired
         case startupMigrationRetryUnavailable
         case contextBuilderMigrationEncodingFailed
+        case writerBusy
+        case settingsChangedOnDisk
+        case reloadRequired
     }
 
     private static let encoder: JSONEncoder = {
