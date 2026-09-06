@@ -295,6 +295,57 @@ final class WorkspaceActivityCoordinator {
         }
     }
 
+    /// A confirmed user deletion owns the targets before closing their presentations.
+    /// Automatic cleanup continues to use the non-disruptive claim above.
+    func claimConfirmedDeletion(workspaceIDs: Set<UUID>) async -> DeletionClaim {
+        pruneReleasedWorkspaceManagers()
+        let leaseID = UUID()
+        var claimed = Set<UUID>()
+        var failures: [UUID: String] = [:]
+        for workspaceID in workspaceIDs {
+            if deletionLeaseIDByWorkspaceID[workspaceID] != nil {
+                failures[workspaceID] = "Workspace deletion is already in progress."
+            } else {
+                deletionLeaseIDByWorkspaceID[workspaceID] = leaseID
+                claimed.insert(workspaceID)
+            }
+        }
+        let managers = workspaceManagersByOwnerID.values.compactMap(\.value)
+        for manager in managers {
+            await manager.finishWorkspaceCreation(workspaceIDs: claimed)
+            if let targetID = manager.activeWorkspaceSwitch?.targetWorkspaceID,
+               claimed.contains(targetID)
+            {
+                await manager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+            }
+        }
+        // Existing activations must relinquish their leases before records can be removed.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while !claimed.isDisjoint(with: activationWorkspaceIDByLeaseID.values),
+              !Task.isCancelled, ContinuousClock.now < deadline
+        {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        for workspaceID in claimed.intersection(activationWorkspaceIDByLeaseID.values) {
+            failures[workspaceID] = "The workspace did not finish cancelling its open operation. Try deleting it again."
+        }
+        for manager in managers {
+            guard let workspaceID = manager.activeWorkspaceID,
+                  claimed.contains(workspaceID), failures[workspaceID] == nil
+            else { continue }
+            if let error = await manager.closeForConfirmedWorkspaceDeletion(workspaceID: workspaceID) {
+                failures[workspaceID] = error
+            }
+        }
+        for workspaceID in failures.keys where claimed.remove(workspaceID) != nil {
+            deletionLeaseIDByWorkspaceID.removeValue(forKey: workspaceID)
+        }
+        return DeletionClaim(
+            lease: DeletionLease(id: leaseID, workspaceIDs: claimed),
+            blockedReasonsByWorkspaceID: failures
+        )
+    }
+
     private func pruneReleasedWorkspaceManagers() {
         workspaceManagersByOwnerID = workspaceManagersByOwnerID.filter { $0.value.value != nil }
     }

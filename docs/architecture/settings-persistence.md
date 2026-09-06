@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-08-11. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-09-06. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -26,7 +26,7 @@ same numeric version.
 | `schemaLineage` | `schemaVersion` | Behavior |
 | --- | --- | --- |
 | `repoprompt-ce.global-settings` | `<= currentSchemaVersion` | Load normally without rewriting merely because the schema is older. |
-| `repoprompt-ce.global-settings` | `> currentSchemaVersion` | Preserve and block saves as a same-lineage future CE file. The UI does not offer compatible import for this lane. |
+| `repoprompt-ce.global-settings` | `> currentSchemaVersion` | Preserve and block saves, except the proven redundant v5 marker described below. The UI does not offer compatible import for genuinely newer content. |
 | any other non-empty value | any | Preserve and block saves as an incompatible/foreign schema. |
 | absent | `<= legacyUnlineagedSchemaVersionCeiling` | Accept as legacy OSS CE. |
 | absent | `> legacyUnlineagedSchemaVersionCeiling` | Preserve and block saves as incompatible/foreign, permanently. |
@@ -75,6 +75,33 @@ The rollback boundary uses a test-only codec frozen from annotated tag `v1.0.28`
 root contract. Tests exercise baseline and normalized files across patched → v1.0.28 →
 patched round trips. Genuine same-lineage v4 workspace-profile documents are outside
 that rollback compatibility guarantee.
+
+## Redundant-v5 recovery and unknown-field preservation
+
+The experimental v5 settings contract introduced `secondaryOracleModel` and
+`secondaryOracleModelRaw` (commit `e7872535`). Some development files retain a v5
+stamp without either field. On load, CE repairs this exact case automatically:
+the lineage must match exactly, the version must be exactly 5, the complete typed
+document must decode, and no Secondary Oracle or additional Oracle roster fields
+may be present anywhere in the raw JSON. A present null is still considered present.
+A present workspace-profile collection must be an object. Versions above 5 and
+foreign/unlineaged files remain protected; this is not generic future-version adoption.
+
+The repair writes and verifies a byte-for-byte backup in
+`Settings/Backups/globalSettings.false-v5-*.json`, verifies that the source has not
+changed during backup, and atomically changes only `schemaVersion` to the
+content-required version (2 or 4). It verifies the replacement before unblocking
+persistence. Failed decoding, backup, verification, or replacement keeps saves
+blocked; no default document overwrites the preserved source. Successful repair is
+idempotent, and reopening the repaired file does not create another backup.
+
+Ordinary saves now apply the difference between the last typed projection and the
+new projection to the current raw JSON. Unknown fields and unchanged external
+fields survive unrelated preference edits, including after restart. Removing a
+known setting removes that setting; replacing a scalar or array intentionally
+replaces that value. Explicitly removed workspace-setting entries are removed as a
+whole. Startup migrations retain their existing targeted raw-JSON migration path.
+The on-disk future/foreign header guard still runs before saving.
 
 ## Frozen legacy ceiling
 
@@ -296,3 +323,12 @@ Those keys write the global backing fields. Workspace-specific Agent Models over
 - Do not add a second global Agent Models blob unless there is a separate migration plan; the global profile intentionally maps to existing fields.
 - Existing workspaces default to `Use global settings`. Workspace overrides are opt-in and materialized from the current global profile.
 - Orphaned workspace-keyed settings are intentionally retained. Pruning remains deferred until authoritative workspace IDs can drive one atomic sweep across every workspace-keyed settings map.
+
+## Unit-test defaults
+
+Debug builds detect SwiftPM/hosted XCTest when resolving the default settings file
+and UserDefaults suite. Those defaults use a per-run temporary settings directory
+and a separate defaults suite, so incidental initialization of GlobalSettingsStore.shared
+cannot normalize, seed, or overwrite the real user's settings. Tests that need
+specific files still inject GlobalSettingsFileStore(fileURL:) and their own suite.
+Packaged application processes retain the ordinary Application Support location.

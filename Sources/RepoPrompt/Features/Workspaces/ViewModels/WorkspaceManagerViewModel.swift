@@ -227,6 +227,7 @@ enum WorkspaceOpenBehavior {
 struct WorkspaceMenuQuery {
     var includeSystem: Bool = false
     var includeHidden: Bool = false
+    var includeTemporary: Bool = false
     var sortMostRecentFirst: Bool = true
 }
 
@@ -442,6 +443,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var domainWorkspaceHealthByID: [UUID: DomainAuthorityHealth] = [:]
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
+    private var workspaceCreationTasksByID: [UUID: Task<Void, Never>] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
     #if DEBUG
         private var workspaceSavePreparationDidFinishHandlerForTesting:
@@ -2632,8 +2634,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     // MARK: - CREATE
 
     @discardableResult
-    func createWorkspace(name: String, repoPaths: [String], ephemeral: Bool = false) -> WorkspaceModel {
-        var newWorkspace = WorkspaceModel(name: name, repoPaths: repoPaths)
+    func createWorkspace(name: String, repoPaths: [String], ephemeral: Bool = false, savedInLibrary: Bool = true) -> WorkspaceModel {
+        var newWorkspace = WorkspaceModel(name: name, repoPaths: repoPaths, isSavedWorkspace: savedInLibrary)
 
         // Mark as ephemeral if needed
         newWorkspace.isEphemeral = ephemeral
@@ -2652,7 +2654,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // Only save to disk and index if not ephemeral
         if !ephemeral {
-            Task {
+            workspaceCreationTasksByID[newWorkspace.id] = Task {
+                defer { workspaceCreationTasksByID.removeValue(forKey: newWorkspace.id) }
                 do {
                     _ = try ensureWorkspaceDirectoryExists(for: newWorkspace)
                     // Persist this new workspace file and flush before proceeding
@@ -2695,6 +2698,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         return newWorkspace
+    }
+
+    /// Wait for the target's own creation before taking the window's switch lease.
+    func finishWorkspaceCreation(workspaceIDs: Set<UUID>) async {
+        for workspaceID in workspaceIDs {
+            await workspaceCreationTasksByID[workspaceID]?.value
+        }
     }
 
     // MARK: - Switch
@@ -3029,6 +3039,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
+        await finishWorkspaceCreation(workspaceIDs: [newWorkspace.id])
         let currentBeforeAdmission = workspace(withID: newWorkspace.id)
         if newWorkspace.consolidatedIntoWorkspaceID != nil
             || currentBeforeAdmission?.consolidatedIntoWorkspaceID != nil
@@ -3458,6 +3469,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @discardableResult
     func switchWorkspace(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "internal") async -> WorkspaceSwitchResult {
+        await finishWorkspaceCreation(workspaceIDs: [newWorkspace.id])
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace) {
             return concurrentResult
         }
@@ -4032,6 +4044,30 @@ class WorkspaceManagerViewModel: ObservableObject {
         let fallback = workspaces.first(where: { $0.isSystemWorkspace }) ?? getOrCreateSystemWorkspace()
         guard activeWorkspaceID != fallback.id else { return }
         await switchWorkspace(to: fallback, saveState: false)
+    }
+
+    /// Called only after the user confirms deletion, while the coordinator owns its lease.
+    func closeForConfirmedWorkspaceDeletion(workspaceID: UUID) async -> String? {
+        guard activeWorkspaceID == workspaceID else { return nil }
+        guard activeWorkspace?.isSystemWorkspace != true else {
+            return "The welcome workspace is not a saved workspace."
+        }
+        await cancelActiveSessions()
+        if isSwitchingWorkspace {
+            await cancelCurrentWorkspaceSwitchAndReturnToSystem()
+        }
+        fileManager.cancelAllLoadingTasks()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while isSwitchingWorkspace || isRefreshing || isChatBusy, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        guard activeWorkspaceID == workspaceID else { return nil }
+        let fallback = workspaces.first(where: { $0.isSystemWorkspace }) ?? getOrCreateSystemWorkspace()
+        let result = await switchWorkspace(to: fallback, saveState: false, reason: "confirmedWorkspaceDeletion")
+        guard result.didSwitch else {
+            return "Could not close the workspace after stopping its running work: \(result)"
+        }
+        return nil
     }
 
     /// Runs git data maintenance when a workspace is opened.
@@ -4716,19 +4752,18 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Revalidates one workspace's consolidated-restore state against the authority.
     ///
-    /// `canActivateWorkspaceAfterAuthorityCheck` calls this for every non-ephemeral switch in
-    /// authority mode, so a switch does pay for a catalog snapshot and, when the workspace is
-    /// suspected, a direct saved-document read. That is deliberate: activation must not be decided
-    /// from the decode cache, which is exactly what let a retired workspace be activated.
+    /// Read only the target's authoritative document and recovery state. Catalog-wide bootstrap
+    /// and reconciliation must not hold the window's only workspace switch.
     private func refreshAuthorityConsolidatedRestoreClassification(
         workspaceID: UUID
     ) async -> AuthorityConsolidatedRestoreClassification {
         guard let domainWorkspaceAuthorityClient else { return .clear }
-        let snapshot = await domainWorkspaceAuthorityClient.snapshot()
-        guard snapshot.isBootstrapped,
-              let authoritative = snapshot.workspaces.first(where: {
-                  $0.document.workspaceID == workspaceID
-              }),
+        guard let target = workspace(withID: workspaceID) else { return .unavailable }
+        let snapshot = await domainWorkspaceAuthorityClient.activationSnapshot(
+            workspaceID: workspaceID,
+            fileURL: workspaceFileURL(for: target)
+        )
+        guard let authoritative = snapshot.workspace,
               let working = try? Self.decodeDomainWorkspaceProjection(
                   documentBytes: authoritative.document.documentBytes,
                   fileURL: authoritative.document.fileURL
@@ -4793,6 +4828,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// clear classification, followed by one final local projection check.
     private func canActivateWorkspaceAfterAuthorityCheck(workspaceID: UUID) async -> Bool {
         guard let target = workspace(withID: workspaceID) else { return false }
+        // The empty system workspace is the window shell, not a saved project activation.
+        // Its initialization must be independent of catalog migration and recovery.
+        if target.isSystemWorkspace, target.repoPaths.isEmpty,
+           target.consolidatedIntoWorkspaceID == nil,
+           !pendingConsolidatedRestoreIDs.contains(workspaceID)
+        {
+            return true
+        }
         if domainWorkspaceAuthorityClient != nil, !target.isEphemeral {
             switch await refreshAuthorityConsolidatedRestoreClassification(workspaceID: workspaceID) {
             case .clear:
@@ -7711,8 +7754,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "System workspaces cannot be deleted."
             } else if protectedWorkspaceIDs.contains(metadata.workspaceID) {
                 "Workspace is active in an open window."
-            } else if metadata.agentIdentityClaims.contains(where: \.requiresProtection) {
-                "Workspace contains an active or pinned agent session."
             } else {
                 nil
             }
@@ -7733,19 +7774,20 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func deleteWorkspacesAsync(
         workspaceIDs: Set<UUID>,
+        closeOpenWorkspaces: Bool = false,
         leakedTestFixtureWorkspaceIDs: Set<UUID> = []
     ) async -> WorkspaceBulkDeleteResult {
         var result = WorkspaceBulkDeleteResult()
-        guard workspaceIDs.count <= WorkspaceBulkDeletePolicy.maximumWorkspaceCount else {
-            result.requestFailureReason = "Bulk deletion is limited to \(WorkspaceBulkDeletePolicy.maximumWorkspaceCount) workspaces per request; no records were changed."
-            return result
-        }
         guard let domainWorkspaceAuthorityClient else {
             result.requestFailureReason = "Authoritative workspace runtime is unavailable; no records were changed."
             return result
         }
 
-        let deletionClaim = workspaceActivityCoordinator.claimDeletion(workspaceIDs: workspaceIDs)
+        let deletionClaim: WorkspaceActivityCoordinator.DeletionClaim = if closeOpenWorkspaces {
+            await workspaceActivityCoordinator.claimConfirmedDeletion(workspaceIDs: workspaceIDs)
+        } else {
+            workspaceActivityCoordinator.claimDeletion(workspaceIDs: workspaceIDs)
+        }
         defer { workspaceActivityCoordinator.releaseDeletion(deletionClaim.lease) }
         result.skippedReasonsByWorkspaceID = deletionClaim.blockedReasonsByWorkspaceID
 
@@ -7790,10 +7832,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             if metadata.isSystemWorkspace {
                 result.skippedReasonsByWorkspaceID[workspaceID] = "System workspaces cannot be deleted."
-                continue
-            }
-            if metadata.agentIdentityClaims.contains(where: \.requiresProtection) {
-                result.skippedReasonsByWorkspaceID[workspaceID] = "Workspace contains an active or pinned agent session."
                 continue
             }
 
@@ -7861,10 +7899,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         if workspace.isSystemWorkspace {
             return "System workspaces cannot be deleted."
         }
-        let protectedTabs = workspace.composeTabs + workspace.stashedTabs.map(\.tab)
-        if protectedTabs.contains(where: { $0.activeAgentSessionID != nil || $0.isPinned }) {
-            return "Workspace contains an active or pinned agent session."
-        }
         return nil
     }
 
@@ -7914,9 +7948,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return true
             }
             let metadata = authoritative.document.metadata
-            guard !metadata.isSystemWorkspace,
-                  !metadata.agentIdentityClaims.contains(where: \.requiresProtection)
-            else { return false }
+            guard !metadata.isSystemWorkspace else { return false }
 
             let outcome = await domainWorkspaceAuthorityClient.delete(
                 workspaceID: workspace.id,
@@ -10732,10 +10764,36 @@ class WorkspaceManagerViewModel: ObservableObject {
         if !query.includeHidden {
             items = items.filter { !$0.isHiddenInMenus }
         }
+        if !query.includeTemporary {
+            items = items.filter { !$0.isTemporaryWorkspace }
+        }
         if query.sortMostRecentFirst {
-            items = items.sorted { $0.dateModified > $1.dateModified }
+            items = items.sorted {
+                if $0.lastUsed != $1.lastUsed { return $0.lastUsed > $1.lastUsed }
+                let order = $0.name.localizedCaseInsensitiveCompare($1.name)
+                return order == .orderedSame ? $0.id.uuidString < $1.id.uuidString : order == .orderedAscending
+            }
         }
         return items
+    }
+
+    /// Only explicit UI opens advance library recency; autosave and MCP activity do not.
+    @discardableResult
+    func openWorkspaceFromLibrary(_ workspace: WorkspaceModel) async -> WorkspaceSwitchResult {
+        let result = await requestWorkspaceSwitch(to: workspace, reason: "user")
+        if result.didSwitch, let index = workspaceIndex(for: workspace.id) {
+            workspaces[index].lastUsed = Date()
+            bumpStateVersion(for: workspace.id)
+            await saveWorkspaceAsync(workspaceID: workspace.id, fileURL: workspaceFileURL(for: workspaces[index]), source: "libraryOpen")
+        }
+        return result
+    }
+
+    func setWorkspaceLibraryMembership(_ workspace: WorkspaceModel, saved: Bool) async {
+        guard let index = workspaceIndex(for: workspace.id), !workspaces[index].isEphemeral else { return }
+        workspaces[index].isSavedWorkspace = saved
+        bumpStateVersion(for: workspace.id)
+        await saveWorkspaceAsync(workspaceID: workspace.id, fileURL: workspaceFileURL(for: workspaces[index]), source: "libraryMembership")
     }
 
     @MainActor

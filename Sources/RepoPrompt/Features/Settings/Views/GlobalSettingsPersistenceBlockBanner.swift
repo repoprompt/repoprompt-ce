@@ -152,7 +152,7 @@ struct GlobalSettingsPersistenceBlockBanner: View {
         case .saveFailed:
             "Global settings can't be saved: RepoPrompt couldn't write globalSettings.json. Check file permissions or available disk space, then try again."
         case .automaticSchemaNormalizationFailed:
-            "Global settings can't be saved: RepoPrompt identified a same-lineage schema v4 file that may only require schema v2, but couldn't safely verify, back up, and atomically normalize it. The original file is preserved. You can show the file or explicitly reset after a backup."
+            "Global settings can't be saved: RepoPrompt identified a settings file that may need only a version-marker repair, but couldn't safely verify, back up, and atomically repair it. The original file is preserved. You can show the file or explicitly reset after a backup."
         }
     }
 

@@ -812,14 +812,16 @@ package struct DomainPersistenceCoordinator {
 
     func refreshWorkspace(
         workspaceID: UUID,
-        fallbackFileURL: URL
+        fallbackFileURL: URL,
+        requireCatalogMembership: Bool = false
     ) async -> DomainPersistenceWorkspaceRefresh? {
         do {
             return try await DomainBlockingIO.run { cancellation in
                 try cancellation.check()
                 return blockingWorker(cancellation).refreshWorkspaceBlocking(
                     workspaceID: workspaceID,
-                    fallbackFileURL: fallbackFileURL
+                    fallbackFileURL: fallbackFileURL,
+                    requireCatalogMembership: requireCatalogMembership
                 )
             }
         } catch DomainPersistenceError.cancelled {
@@ -838,8 +840,14 @@ package struct DomainPersistenceCoordinator {
 
     private func refreshWorkspaceBlocking(
         workspaceID: UUID,
-        fallbackFileURL: URL
+        fallbackFileURL: URL,
+        requireCatalogMembership: Bool
     ) -> DomainPersistenceWorkspaceRefresh {
+        if requireCatalogMembership, fileManager.fileExists(atPath: deletionURL(workspaceID).path) {
+            return DomainPersistenceWorkspaceRefresh(
+                workspace: nil, workspaceIsDeleted: true, health: .writable, catalogRevision: 0
+            )
+        }
         guard let catalogData = try? Data(contentsOf: catalogURL) else {
             return DomainPersistenceWorkspaceRefresh(
                 workspace: loadWorkspace(workspaceID: workspaceID, fileURL: fallbackFileURL)?.workspace,
@@ -873,6 +881,9 @@ package struct DomainPersistenceCoordinator {
                 health: .degradedReadOnly(reason: "duplicate_workspace_catalog_id"),
                 catalogRevision: catalog.revision
             )
+        }
+        if requireCatalogMembership, matchingEntries.isEmpty {
+            return DomainPersistenceWorkspaceRefresh(workspace: nil, workspaceIsDeleted: isDeleted, health: .removed, catalogRevision: catalog.revision)
         }
         let fileURL = matchingEntries.first?.fileURL ?? fallbackFileURL
         return DomainPersistenceWorkspaceRefresh(

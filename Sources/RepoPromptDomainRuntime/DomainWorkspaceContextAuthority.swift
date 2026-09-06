@@ -17,6 +17,10 @@ package struct DomainWorkspaceStore {
         await authority.readySnapshot()
     }
 
+    package func activationSnapshot(workspaceID: UUID, fileURL: URL) async -> DomainWorkspaceActivationSnapshot {
+        await authority.activationSnapshot(workspaceID: workspaceID, fileURL: fileURL)
+    }
+
     package func subscribe() async -> DomainWorkspaceSnapshotSubscription {
         await authority.readySubscription()
     }
@@ -251,6 +255,37 @@ actor DomainWorkspaceContextAuthority {
     /// overlay is routing-only and must never leak into recovery health or revision baselines.
     func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
         records[workspaceID].map(makeSnapshot)
+    }
+
+    /// Opening one workspace must not wait for unrelated documents and recovery journals.
+    /// Mutations still use the fully bootstrapped command authority. This cold read uses the
+    /// same persisted catalog, tombstones and working journal as bootstrap, without publishing
+    /// a partial catalog or installing a second mutable record store.
+    func activationSnapshot(workspaceID: UUID, fileURL: URL) async -> DomainWorkspaceActivationSnapshot {
+        if didBootstrap {
+            return .init(workspace: canonicalWorkspaceSnapshot(workspaceID), publicationSequence: publicationSequence, catalogRevision: catalogRevision)
+        }
+        let refreshed = await persistence.refreshWorkspace(workspaceID: workspaceID, fallbackFileURL: fileURL, requireCatalogMembership: true)
+        // Bootstrap may have completed while the file read was suspended. Its current working
+        // state wins over the earlier disk read, including a concurrent retirement or deletion.
+        if didBootstrap {
+            return .init(workspace: canonicalWorkspaceSnapshot(workspaceID), publicationSequence: publicationSequence, catalogRevision: catalogRevision)
+        }
+        let workspace: DomainWorkspaceSnapshot? = if let refreshed, refreshed.health.acceptsMutations, !refreshed.workspaceIsDeleted,
+                                                     let loaded = refreshed.workspace
+        {
+            DomainWorkspaceSnapshot(
+                document: loaded.document,
+                revisions: loaded.revisions,
+                health: loaded.health,
+                contexts: loaded.document.metadata.contexts.map {
+                    DomainContextSnapshot(metadata: $0, revisions: loaded.contextRevisions[$0.identity.contextID] ?? loaded.revisions, health: loaded.health)
+                }
+            )
+        } else {
+            nil
+        }
+        return .init(workspace: workspace, publicationSequence: publicationSequence, catalogRevision: refreshed?.catalogRevision ?? catalogRevision)
     }
 
     func contextSnapshot(_ identity: DomainContextIdentity) -> DomainContextSnapshot? {

@@ -36,6 +36,74 @@ import XCTest
             try await super.tearDown()
         }
 
+        func testLibraryRecencyIgnoresBackgroundSavesAndGroupsTemporaryWork() throws {
+            let manager = makeManager(windowID: -799)
+            let recent = WorkspaceModel(dateModified: .distantPast, name: "Recent project", repoPaths: ["/projects/recent"], lastUsed: Date(timeIntervalSince1970: 200))
+            let background = WorkspaceModel(dateModified: .distantFuture, name: "Background save", repoPaths: ["/projects/background"], lastUsed: Date(timeIntervalSince1970: 100))
+            let automation = WorkspaceModel(name: "Agent review", repoPaths: ["/projects/recent"], isSavedWorkspace: false)
+            let scratch = WorkspaceModel(name: "Old scratch", repoPaths: ["/tmp/review-checkout"])
+            let deliberatelySaved = WorkspaceModel(name: "Saved scratch", repoPaths: ["/tmp/my-project"], lastUsed: .distantPast, isSavedWorkspace: true)
+            manager.workspaces = [background, automation, scratch, deliberatelySaved, recent]
+            XCTAssertEqual(manager.workspacesForMenu().map(\.id), [recent.id, background.id, deliberatelySaved.id])
+            XCTAssertEqual(Set(manager.workspacesForMenu(.init(includeTemporary: true)).map(\.id)), Set(manager.workspaces.map(\.id)))
+            let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: JSONEncoder().encode(deliberatelySaved))
+            XCTAssertEqual(decoded.isSavedWorkspace, true)
+            XCTAssertFalse(decoded.isTemporaryWorkspace)
+            XCTAssertNil(scratch.isSavedWorkspace, "Legacy grouping must not rewrite provenance")
+        }
+
+        func testNewWorkspaceWaitsForItsOwnSaveWithoutBlockingOtherOpens() async throws {
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-creation-ordering-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+            let manager = makeManager(
+                windowID: -796,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -796)
+            )
+            await manager.awaitInitialized()
+            let savePrepared = expectation(description: "creation save prepared")
+            let gate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { _, _, _ in
+                savePrepared.fulfill()
+                await gate.wait()
+            }
+            let created = manager.createWorkspace(name: "New saved project", repoPaths: [])
+            await fulfillment(of: [savePrepared], timeout: 3)
+            let opening = Task { await manager.switchWorkspace(to: created, saveState: false) }
+            await Task.yield()
+            XCTAssertFalse(manager.isSwitchingWorkspace, "A pending creation must not own the window's switch")
+            let temporary = manager.createEphemeralWorkspace(name: "Other workspace", repoPaths: [])
+            let otherOpen = await manager.switchWorkspace(to: temporary, saveState: false)
+            XCTAssertTrue(otherOpen.didSwitch)
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            await gate.open()
+            let opened = await opening.value
+            XCTAssertTrue(opened.didSwitch)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: manager.workspaceFileURL(for: created).path))
+        }
+
+        func testExplicitLibraryChoicePersistsAcrossReload() async throws {
+            let workspace = WorkspaceModel(name: "Automation project", repoPaths: [], isSavedWorkspace: false)
+            try writeWorkspace(workspace)
+            try writeLegacyIndex([workspace])
+            let manager = makeManager(windowID: -798)
+            await manager.awaitInitialized()
+            await manager.setWorkspaceLibraryMembership(workspace, saved: true)
+            let url = manager.workspaceFileURL(for: workspace)
+            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
+            let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+            XCTAssertEqual(saved.isSavedWorkspace, true)
+            XCTAssertFalse(saved.isTemporaryWorkspace)
+        }
+
         func testExplicitSaveAPIsRejectEphemeralWorkspaceWithoutSideEffects() async throws {
             let manager = makeManager(windowID: -772)
             await manager.awaitInitialized()
@@ -204,12 +272,12 @@ import XCTest
             XCTAssertTrue(FileManager.default.fileExists(atPath: indexURL.path))
         }
 
-        func testSingleDeleteRejectsCanonicalPinnedAgentClaim() async throws {
+        func testExplicitDeleteAllowsSavedSessionReferencesAndPinnedTabs() async throws {
             let pinnedWorkspace = WorkspaceModel(
                 name: "Pinned Agent Workspace",
                 repoPaths: [storageRoot.appendingPathComponent("pinned-repo").path],
                 stashedTabs: [
-                    StashedTab(tab: ComposeTabState(name: "Pinned", isPinned: true))
+                    StashedTab(tab: ComposeTabState(name: "Pinned", isPinned: true, activeAgentSessionID: UUID()))
                 ]
             )
             try writeWorkspace(pinnedWorkspace)
@@ -237,9 +305,63 @@ import XCTest
             await manager.awaitInitialized()
 
             let didDelete = await manager.deleteWorkspaceAsync(pinnedWorkspace)
-            XCTAssertFalse(didDelete)
+            XCTAssertTrue(didDelete)
             let authoritativeAfter = await runtime.workspaceStore.snapshot()
-            XCTAssertTrue(authoritativeAfter.workspaces.contains {
+            XCTAssertFalse(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == pinnedWorkspace.id
+            })
+        }
+
+        func testConfirmedDeleteClosesAnOpenWorkspaceAndKeepsProjectFiles() async throws {
+            let pinnedWorkspace = WorkspaceModel(
+                name: "Pinned Agent Workspace",
+                repoPaths: [storageRoot.appendingPathComponent("pinned-repo").path],
+                stashedTabs: [
+                    StashedTab(tab: ComposeTabState(name: "Pinned", isPinned: true, activeAgentSessionID: UUID()))
+                ]
+            )
+            let projectURL = URL(fileURLWithPath: pinnedWorkspace.repoPaths[0])
+            try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+            let projectFile = projectURL.appendingPathComponent("keep.txt")
+            try Data("user project".utf8).write(to: projectFile)
+            try writeWorkspace(pinnedWorkspace)
+            try writeLegacyIndex([pinnedWorkspace])
+
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-single-delete-protection-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let manager = makeManager(
+                windowID: -767,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -767
+                )
+            )
+            await manager.awaitInitialized()
+
+            let activation = await manager.switchWorkspace(to: pinnedWorkspace, saveState: false)
+            XCTAssertTrue(activation.didSwitch)
+            let sessions = DeletionSessionProvider()
+            manager.registerSwitchSessionProvider(sessions)
+            let deletion = await manager.deleteWorkspacesAsync(
+                workspaceIDs: [pinnedWorkspace.id], closeOpenWorkspaces: true
+            )
+            XCTAssertEqual(deletion.deletedWorkspaceIDs, [pinnedWorkspace.id], "\(deletion)")
+            XCTAssertTrue(manager.activeWorkspace?.isSystemWorkspace == true)
+            XCTAssertTrue(sessions.wasCancelled)
+            XCTAssertFalse(manager.hasPendingSwitchConfirmation)
+            XCTAssertEqual(try String(contentsOf: projectFile, encoding: .utf8), "user project")
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(authoritativeAfter.workspaces.contains {
                 $0.document.workspaceID == pinnedWorkspace.id
             })
         }
@@ -542,6 +664,18 @@ import XCTest
             )
             managers.append(manager)
             return manager
+        }
+    }
+
+    @MainActor
+    private final class DeletionSessionProvider: WorkspaceSwitchSessionProvider {
+        var wasCancelled = false
+        func switchSessionItems() -> [WorkspaceSwitchSessionItem] {
+            wasCancelled ? [] : [.init(id: "test-agent", count: 1, singularLabel: "agent", pluralLabel: "agents")]
+        }
+
+        func cancelSwitchSessions() async {
+            wasCancelled = true
         }
     }
 
