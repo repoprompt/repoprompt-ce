@@ -123,6 +123,7 @@ struct WorkspaceFileMutationService {
     func createFile(
         userPath: String,
         content: String,
+        overwrite: Bool = false,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         selectedFileFullPaths: Set<String> = [],
         pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger,
@@ -131,6 +132,7 @@ struct WorkspaceFileMutationService {
         let result = try await createFileWithPostcondition(
             userPath: userPath,
             content: content,
+            overwrite: overwrite,
             rootScope: rootScope,
             selectedFileFullPaths: selectedFileFullPaths,
             pathResolutionPolicy: pathResolutionPolicy,
@@ -148,6 +150,7 @@ struct WorkspaceFileMutationService {
     func createFileWithPostcondition(
         userPath: String,
         content: String,
+        overwrite: Bool = false,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         selectedFileFullPaths: Set<String> = [],
         pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger,
@@ -182,6 +185,7 @@ struct WorkspaceFileMutationService {
                 using: absolute,
                 userPath: userPath,
                 content: content,
+                overwrite: overwrite,
                 rootScope: rootScope,
                 mutationRootMappings: mutationRootMappings,
                 skipCatalogExistenceChecks: true
@@ -195,6 +199,7 @@ struct WorkspaceFileMutationService {
                 using: literal,
                 userPath: userPath,
                 content: content,
+                overwrite: overwrite,
                 rootScope: rootScope,
                 mutationRootMappings: mutationRootMappings
             )
@@ -204,7 +209,7 @@ struct WorkspaceFileMutationService {
             let displayPath = await displayPath(for: folder, rootScope: rootScope)
             throw FileManagerError.fileSystemServiceNotFoundWithContext("'\(displayPath)' resolves to a folder. Provide a file path.")
         }
-        if let existing = await exactExistingFile(standardizedInput, rootScope: rootScope) {
+        if !overwrite, let existing = await exactExistingFile(standardizedInput, rootScope: rootScope) {
             throw await FileManagerError.fileSystemServiceNotFoundWithContext("path already exists: \(displayPath(for: existing, rootScope: rootScope))")
         }
 
@@ -241,6 +246,7 @@ struct WorkspaceFileMutationService {
                 using: result,
                 userPath: userPath,
                 content: content,
+                overwrite: overwrite,
                 rootScope: rootScope,
                 mutationRootMappings: mutationRootMappings
             )
@@ -251,6 +257,7 @@ struct WorkspaceFileMutationService {
         using result: FileCreationResult,
         userPath: String,
         content: String,
+        overwrite: Bool,
         rootScope: WorkspaceLookupRootScope,
         mutationRootMappings: [DomainMutationPhysicalRootMapping],
         skipCatalogExistenceChecks: Bool = false
@@ -270,7 +277,7 @@ struct WorkspaceFileMutationService {
             if let folder = await exactExistingFolder(absolutePath, rootScope: rootScope) {
                 throw await FileManagerError.fileSystemServiceNotFoundWithContext("'\(displayPath(for: folder, rootScope: rootScope))' resolves to a folder. Provide a file path.")
             }
-            if await exactExistingFile(absolutePath, rootScope: rootScope) != nil {
+            if !overwrite, await exactExistingFile(absolutePath, rootScope: rootScope) != nil {
                 throw FileManagerError.fileSystemServiceNotFoundWithContext("path already exists: \(userPath)")
             }
         }
@@ -282,6 +289,7 @@ struct WorkspaceFileMutationService {
             rootID: root.id,
             relativePath: relativePath,
             content: content,
+            overwrite: overwrite,
             validating: rootScope
         )
         return .fromCatalogMaterialization(result)
