@@ -24,6 +24,14 @@ struct DomainWorkspaceFailClosedSaveOutcome {
     }
 }
 
+private enum DomainWorkspaceModelEncoder {
+    static func encode(_ workspace: WorkspaceModel) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(workspace)
+    }
+}
+
 /// Revisioned app-process client for the runtime-owned workspace/context authority.
 /// It is the only production persistence dependency injected into a workspace manager.
 struct DomainWorkspaceAuthorityClient {
@@ -32,6 +40,14 @@ struct DomainWorkspaceAuthorityClient {
 
     func snapshot() async -> DomainWorkspaceCatalogSnapshot {
         await store.snapshot()
+    }
+
+    func exactRootSelection(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        try await store.exactRootSelection(canonicalRootPath: canonicalRootPath)
+    }
+
+    func workspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
+        await store.workspaceSnapshot(workspaceID)
     }
 
     func canonicalWorkspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
@@ -50,18 +66,20 @@ struct DomainWorkspaceAuthorityClient {
     func create(
         _ workspace: WorkspaceModel,
         fileURL: URL,
+        expectedCatalogRevision: UInt64? = nil,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
         let document = try document(for: workspace, fileURL: fileURL)
         let envelope = DomainWorkspaceCommandEnvelope(
             operationID: operationID,
-            expectedCatalogRevision: nil,
+            expectedCatalogRevision: expectedCatalogRevision,
             expectedWorkspaceRevision: 0,
             origin: .appPresentation(windowID: windowID),
             command: .createWorkspace(document)
         )
         let first = await executeStable(envelope)
-        guard first.disposition == .conflict,
+        guard expectedCatalogRevision == nil,
+              first.disposition == .conflict,
               first.errorCode == .stateConflict,
               first.diagnostic == "durable_create_conflict"
               || first.diagnostic == "catalog_revision_mismatch",
@@ -70,6 +88,24 @@ struct DomainWorkspaceAuthorityClient {
         // The authority refreshes its durable catalog before returning a catalog-only conflict.
         // Retry the identical envelope once so the operation ID remains idempotent while work is bounded.
         return await executeStable(envelope)
+    }
+
+    func resolveOrCreatePersistentWorkspace(
+        _ workspace: WorkspaceModel,
+        fileURL: URL,
+        canonicalRootPath: String,
+        operationID: UUID = UUID()
+    ) async throws -> DomainCommandOutcome {
+        let document = try document(for: workspace, fileURL: fileURL)
+        return await executeStable(.init(
+            operationID: operationID,
+            expectedWorkspaceRevision: 0,
+            origin: .appPresentation(windowID: windowID),
+            command: .resolveOrCreateWorkspaceForExactRoot(
+                document: document,
+                canonicalRootPath: canonicalRootPath
+            )
+        ))
     }
 
     func replaceWorking(
@@ -180,7 +216,7 @@ struct DomainWorkspaceAuthorityClient {
     }
 
     private func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
-        let bytes = try JSONEncoder().encode(workspace)
+        let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
         return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
     }
 
