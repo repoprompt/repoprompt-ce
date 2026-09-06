@@ -7986,8 +7986,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         let finalName = newName.trimmingCharacters(in: .whitespaces)
         guard !finalName.isEmpty else { return }
 
+        let previousName = workspaces[index].name
         workspaces[index].name = finalName
         workspaces[index].dateModified = Date()
+        // Fired from the canonical in-memory assignment, not from the save below: presentation
+        // follows live memory, and a later save failure or model revert emits its own refresh.
+        // Compared through the same `(main)` fallback the row renders, so a rename that cannot
+        // change any label repaints nothing.
+        if AgentMonitorLocationLabelFormatter.label(worktreeLabel: nil, workspaceName: previousName)
+            != AgentMonitorLocationLabelFormatter.label(worktreeLabel: nil, workspaceName: finalName)
+        {
+            AgentSessionLinkLocationInvalidationSink.locationLabelsChanged(inWorkspace: workspace.id)
+        }
 
         // Schedule async save of the specific workspace and index update, with flushes before notify.
         // The intent token lets an authority projection replace the array element without

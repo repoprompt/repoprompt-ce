@@ -125,7 +125,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
-    static let currentSerializationVersion = 7
+    // 9 adds the granular observer-session Auto-wake target UUID set.
+    static let currentSerializationVersion = 9
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID
@@ -172,6 +173,16 @@ struct AgentSession: Codable, Identifiable {
     /// a session ID may route cleanup, but does not imply remote deletion support.
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var autoEditEnabled: Bool
+    /// Whether this observer session may reserve one system-origin follow-up turn when sessions it
+    /// oversees change status.
+    ///
+    /// Session configuration rather than link or global state: it is scoped to this observer, saved
+    /// with it, and inert while the session oversees nothing. Nothing else about oversight is
+    /// gated on it — status collection and natural-turn delivery are always on for a live, eligible
+    /// direct link.
+    var autoWakeOnOversightUpdates: Bool
+    /// Granular target selections preserved even while the master setting is on.
+    var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
 
     /// Persisted per-turn token usage for non-Codex providers.
     /// Used to rebuild context usage after reopen/resume when tool payloads are pruned.
@@ -231,6 +242,8 @@ struct AgentSession: Codable, Identifiable {
         providerSessionID: String? = nil,
         providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
         autoEditEnabled: Bool = true,
+        autoWakeOnOversightUpdates: Bool = false,
+        agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
@@ -268,6 +281,8 @@ struct AgentSession: Codable, Identifiable {
         self.providerSessionID = providerSessionID
         self.providerCleanupHandle = providerCleanupHandle
         self.autoEditEnabled = autoEditEnabled
+        self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
+        self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
@@ -307,6 +322,8 @@ struct AgentSession: Codable, Identifiable {
         case providerSessionID
         case providerCleanupHandle
         case autoEditEnabled
+        case autoWakeOnOversightUpdates
+        case agentSessionLinkAutoWakeTargetSessionIDs
         case providerTokenUsageByTurn
         case codexConversationID
         case codexRolloutPath
@@ -349,6 +366,16 @@ struct AgentSession: Codable, Identifiable {
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
+        // Additive and `decodeIfPresent`: every session written before version 8 decodes as off.
+        // Fresh live sessions now start on, but restore deliberately preserves this legacy value.
+        autoWakeOnOversightUpdates = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .autoWakeOnOversightUpdates
+        ) ?? false
+        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
+            Set<UUID>.self,
+            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
+        ) ?? []
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)

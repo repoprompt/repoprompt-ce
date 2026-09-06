@@ -46,6 +46,9 @@ extension AgentModeViewModel {
               let session = sessions[currentTabID]
         else { return }
 
+        // Captured before the metadata update: the new branch can become the effective location
+        // label when the binding carries no visual label or worktree name.
+        let previousLocation = agentSessionLinkLocationProjection(forTabID: currentTabID)
         let didUpdateBinding = updateMatchingBranchSwitchBindingMetadata(
             session: session,
             row: row,
@@ -76,7 +79,31 @@ extension AgentModeViewModel {
             scheduleSave(for: session.tabID)
             requestUIRefresh(tabID: session.tabID, urgent: true)
         }
+        if didUpdateBinding {
+            notifyAgentSessionLinkLocationChange(forTabID: session.tabID, from: previousLocation)
+        }
     }
+
+    #if DEBUG
+        /// The production bookkeeping an in-app branch switch performs once git has already switched.
+        ///
+        /// Exposed so the oversight location tests drive the real site — including its before/after
+        /// effective-label comparison and its notification — rather than calling the notifier
+        /// directly, which would prove nothing about the mutation site that has to call it.
+        func test_recordSuccessfulInAppGitBranchSwitch(
+            row: AgentWorkspaceRootRow,
+            result: GitBranchSwitchResult,
+            currentTabID: UUID?,
+            activeRunAtSwitchStart: Bool = false
+        ) {
+            recordSuccessfulInAppGitBranchSwitch(
+                row: row,
+                result: result,
+                currentTabID: currentTabID,
+                activeRunAtSwitchStart: activeRunAtSwitchStart
+            )
+        }
+    #endif
 
     private func branchSwitchCandidatePaths(row: AgentWorkspaceRootRow, result: GitBranchSwitchResult) -> [String] {
         [

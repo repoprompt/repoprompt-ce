@@ -24,6 +24,11 @@ struct AgentStatusPillsSnapshot: Equatable {
     let executionLocation: AgentExecutionLocationProps?
     let activeAgentSessionID: UUID?
     let activeRunID: UUID?
+    /// Cross-window oversight projection for the tab currently on screen.
+    ///
+    /// It lives in this snapshot so the pill row never has to observe the full view model; the link
+    /// bridge owns the values and republishes them from authority change events.
+    let monitor: AgentMonitorPillProps
 
     static let empty = AgentStatusPillsSnapshot(
         currentTabID: nil,
@@ -36,7 +41,8 @@ struct AgentStatusPillsSnapshot: Equatable {
         interviewFirst: false,
         executionLocation: nil,
         activeAgentSessionID: nil,
-        activeRunID: nil
+        activeRunID: nil,
+        monitor: .empty
     )
 }
 

@@ -204,6 +204,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
         MCPBackgroundModeCoordinator.shared.resetForTermination()
+        // Synchronous oversight freeze, before any async teardown can run: quitting closes every
+        // window, and an unfrozen bridge would treat that cascade as ordinary lifecycle and delete
+        // exactly the saved oversight the next launch is supposed to restore.
+        AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
 
         // 2) Persist the final restorable window session before async shutdown begins.
         // Using .terminateLater lets us do async work without deadlocking.
@@ -211,6 +215,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             if !AppLaunchConfiguration.current.suppressesWindowPersistence {
                 await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
             }
+
+            // 2b) Bounded settlement of durable oversight transactions the user already started.
+            // Total deadline, losing branch never awaited: a stuck filesystem must not hold up quit,
+            // and the write-through store means every *reported* Add or Stop is already durable.
+            await AgentSessionLinkRuntimeBridge.shared.settleIntentTransactions()
 
             // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
             // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
@@ -232,6 +241,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         MCPBackgroundModeCoordinator.shared.resetForTermination()
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
+        // Idempotent and synchronous only. Correctness comes from the write-through store and the
+        // bounded `.terminateLater` settlement above, never from work attempted here.
+        AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }

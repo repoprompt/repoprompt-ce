@@ -40,6 +40,8 @@ struct AgentStatusPillsRow: View {
                     selectWorkflow: { agentModeVM.selectWorkflow($0) }
                 )
 
+                AgentMonitorPill(statusPillsUI: statusPillsUI)
+
                 AgentInterviewPill(
                     isOn: snapshot.interviewFirst,
                     onToggle: { agentModeVM.toggleInterviewFirst() }
