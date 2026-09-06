@@ -239,6 +239,11 @@ final class WorkspaceActivityCoordinator {
     private var workspaceManagersByOwnerID: [UUID: WeakWorkspaceManager] = [:]
     private var activationWorkspaceIDByLeaseID: [UUID: UUID] = [:]
     private var deletionLeaseIDByWorkspaceID: [UUID: UUID] = [:]
+    private let confirmedDeletionTimeout: Duration
+
+    init(confirmedDeletionTimeout: Duration = .seconds(15)) {
+        self.confirmedDeletionTimeout = confirmedDeletionTimeout
+    }
 
     func register(ownerID: UUID, workspaceManager: WorkspaceManagerViewModel) {
         workspaceManagersByOwnerID[ownerID] = WeakWorkspaceManager(workspaceManager)
@@ -302,6 +307,10 @@ final class WorkspaceActivityCoordinator {
         let leaseID = UUID()
         var claimed = Set<UUID>()
         var failures: [UUID: String] = [:]
+        let timeoutReason = "The workspace did not finish preparing for deletion before the timeout. Try deleting it again."
+        let busyReason = "Workspace switch is in progress. Wait for it to finish and try deleting this workspace again."
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: confirmedDeletionTimeout)
         for workspaceID in workspaceIDs {
             if deletionLeaseIDByWorkspaceID[workspaceID] != nil {
                 failures[workspaceID] = "Workspace deletion is already in progress."
@@ -310,32 +319,113 @@ final class WorkspaceActivityCoordinator {
                 claimed.insert(workspaceID)
             }
         }
+        var cancellationTokensByWorkspaceID: [UUID: WorkspaceDeletionCancellationToken] = [:]
+        for workspaceID in claimed {
+            cancellationTokensByWorkspaceID[workspaceID] = WorkspaceDeletionCancellationToken(
+                workspaceID: workspaceID
+            )
+        }
+        defer {
+            for cancellationToken in cancellationTokensByWorkspaceID.values {
+                cancellationToken.cancel()
+            }
+        }
         let managers = workspaceManagersByOwnerID.values.compactMap(\.value)
         for manager in managers {
-            await manager.finishWorkspaceCreation(workspaceIDs: claimed)
-            if let targetID = manager.activeWorkspaceSwitch?.targetWorkspaceID,
-               claimed.contains(targetID)
-            {
-                await manager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+            for workspaceID in claimed.sorted(by: { $0.uuidString < $1.uuidString }) {
+                guard failures[workspaceID] == nil else { continue }
+                guard !Task.isCancelled, clock.now < deadline else {
+                    failures[workspaceID] = timeoutReason
+                    continue
+                }
+                if manager.activeWorkspaceSwitch?.targetWorkspaceID == workspaceID
+                    || (manager.activeWorkspaceID == workspaceID && manager.isSwitchingWorkspace)
+                {
+                    failures[workspaceID] = busyReason
+                    continue
+                }
+                guard let cancellationToken = cancellationTokensByWorkspaceID[workspaceID] else {
+                    failures[workspaceID] = timeoutReason
+                    continue
+                }
+                let outcome = await awaitBoundedDeletionOperation(
+                    until: deadline,
+                    cancellationToken: cancellationToken
+                ) {
+                    await manager.finishWorkspaceCreation(workspaceIDs: [workspaceID])
+                    guard cancellationToken.isActive else { return }
+                }
+                if case .timedOut = outcome {
+                    failures[workspaceID] = timeoutReason
+                } else if manager.activeWorkspaceSwitch?.targetWorkspaceID == workspaceID
+                    || (manager.activeWorkspaceID == workspaceID && manager.isSwitchingWorkspace)
+                {
+                    failures[workspaceID] = busyReason
+                }
+            }
+        }
+        // A switch can begin after preparation completes but before the activation wait. Recheck
+        // the exact target before waiting so confirmed deletion never takes over that user action.
+        for manager in managers {
+            for workspaceID in claimed where failures[workspaceID] == nil {
+                if manager.activeWorkspaceSwitch?.targetWorkspaceID == workspaceID
+                    || (manager.activeWorkspaceID == workspaceID && manager.isSwitchingWorkspace)
+                {
+                    failures[workspaceID] = busyReason
+                }
             }
         }
         // Existing activations must relinquish their leases before records can be removed.
-        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
-        while !claimed.isDisjoint(with: activationWorkspaceIDByLeaseID.values),
-              !Task.isCancelled, ContinuousClock.now < deadline
+        let pendingActivationWorkspaceIDs = Set(claimed.filter { failures[$0] == nil })
+        while !pendingActivationWorkspaceIDs.isDisjoint(with: activationWorkspaceIDByLeaseID.values),
+              !Task.isCancelled, clock.now < deadline
         {
-            try? await Task.sleep(for: .milliseconds(20))
+            let remaining = clock.now.duration(to: deadline)
+            guard remaining > .zero else { break }
+            try? await Task.sleep(for: min(remaining, .milliseconds(20)))
         }
-        for workspaceID in claimed.intersection(activationWorkspaceIDByLeaseID.values) {
+        for workspaceID in pendingActivationWorkspaceIDs.intersection(activationWorkspaceIDByLeaseID.values) {
             failures[workspaceID] = "The workspace did not finish cancelling its open operation. Try deleting it again."
+        }
+        if Task.isCancelled || clock.now >= deadline {
+            for workspaceID in claimed where failures[workspaceID] == nil {
+                failures[workspaceID] = timeoutReason
+            }
         }
         for manager in managers {
             guard let workspaceID = manager.activeWorkspaceID,
                   claimed.contains(workspaceID), failures[workspaceID] == nil
             else { continue }
-            if let error = await manager.closeForConfirmedWorkspaceDeletion(workspaceID: workspaceID) {
-                failures[workspaceID] = error
+            guard !Task.isCancelled, clock.now < deadline else {
+                failures[workspaceID] = timeoutReason
+                continue
             }
+            guard let cancellationToken = cancellationTokensByWorkspaceID[workspaceID] else {
+                failures[workspaceID] = timeoutReason
+                continue
+            }
+            let outcome = await awaitBoundedDeletionOperation(
+                until: deadline,
+                cancellationToken: cancellationToken
+            ) {
+                await manager.closeForConfirmedWorkspaceDeletion(
+                    workspaceID: workspaceID,
+                    deletionToken: cancellationToken
+                )
+            }
+            if case let .completed(error) = outcome, let error {
+                failures[workspaceID] = error
+            } else if case .timedOut = outcome {
+                failures[workspaceID] = timeoutReason
+            }
+        }
+        if Task.isCancelled || clock.now >= deadline {
+            for workspaceID in claimed where failures[workspaceID] == nil {
+                failures[workspaceID] = timeoutReason
+            }
+        }
+        for workspaceID in failures.keys {
+            cancellationTokensByWorkspaceID[workspaceID]?.cancel()
         }
         for workspaceID in failures.keys where claimed.remove(workspaceID) != nil {
             deletionLeaseIDByWorkspaceID.removeValue(forKey: workspaceID)
@@ -344,6 +434,59 @@ final class WorkspaceActivityCoordinator {
             lease: DeletionLease(id: leaseID, workspaceIDs: claimed),
             blockedReasonsByWorkspaceID: failures
         )
+    }
+
+    private enum BoundedDeletionOperationResult<Value: Sendable> {
+        case completed(Value)
+        case timedOut
+    }
+
+    /// Runs one potentially uncooperative teardown step without allowing its late
+    /// completion to continue the confirmed-delete sequence after the lease expires.
+    private func awaitBoundedDeletionOperation<Value: Sendable>(
+        until deadline: ContinuousClock.Instant,
+        cancellationToken: WorkspaceDeletionCancellationToken,
+        operation: @escaping @MainActor @Sendable () async -> Value
+    ) async -> BoundedDeletionOperationResult<Value> {
+        let clock = ContinuousClock()
+        let remaining = clock.now.duration(to: deadline)
+        guard !Task.isCancelled, remaining > .zero else {
+            cancellationToken.cancel()
+            return .timedOut
+        }
+
+        let (stream, continuation) = AsyncStream<BoundedDeletionOperationResult<Value>>.makeStream()
+        let operationTask = Task { @MainActor in
+            await continuation.yield(.completed(operation()))
+            continuation.finish()
+        }
+        let outcome = await withTaskGroup(of: BoundedDeletionOperationResult<Value>.self) { group in
+            group.addTask {
+                var iterator = stream.makeAsyncIterator()
+                return await iterator.next() ?? .timedOut
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: remaining)
+                } catch {
+                    return .timedOut
+                }
+                return .timedOut
+            }
+            let first = await group.next() ?? .timedOut
+            group.cancelAll()
+            return first
+        }
+        continuation.finish()
+
+        switch outcome {
+        case .completed:
+            operationTask.cancel()
+        case .timedOut:
+            cancellationToken.cancel()
+            operationTask.cancel()
+        }
+        return outcome
     }
 
     private func pruneReleasedWorkspaceManagers() {

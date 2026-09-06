@@ -2433,6 +2433,14 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     /// backing up or resetting the user's settings. Returns true when persistence is unblocked.
     @discardableResult
     func retryBlockedPersistenceSave() -> Bool {
+        // Reload is an explicit, separate action: never overwrite another writer or
+        // persist provisional defaults through the generic save retry.
+        guard persistenceBlockReason != .changedOnDisk,
+              persistenceBlockReason != .missingOnDisk,
+              persistenceBlockReason != .loadFailed
+        else {
+            return false
+        }
         if fileStore.hasPendingStartupMigration {
             return persist {
                 try fileStore.retryStartupMigrationPreservingUnknownFields(makeDocument())

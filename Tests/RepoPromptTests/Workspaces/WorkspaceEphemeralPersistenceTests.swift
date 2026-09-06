@@ -384,6 +384,336 @@ import XCTest
             })
         }
 
+        func testConfirmedDeleteBoundsPendingWorkspaceCreationAndReleasesLease() async throws {
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-creation-timeout")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            let manager = makeManager(
+                windowID: -764,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -764
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await manager.awaitInitialized()
+
+            let created = manager.createWorkspace(name: "Pending deletion", repoPaths: [])
+            let createdID = created.id
+            let savePrepared = expectation(description: "creation save prepared")
+            let gate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, _, _ in
+                guard workspaceID == createdID else { return }
+                savePrepared.fulfill()
+                await gate.wait()
+            }
+            await fulfillment(of: [savePrepared], timeout: 2)
+
+            let deletionFinished = expectation(description: "confirmed deletion returns after timeout")
+            let deletionTask = Task {
+                defer { deletionFinished.fulfill() }
+                return await manager.deleteWorkspacesAsync(
+                    workspaceIDs: [created.id],
+                    closeOpenWorkspaces: true
+                )
+            }
+            await fulfillment(of: [deletionFinished], timeout: 2)
+            await gate.open()
+            let deletion = await deletionTask.value
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty, "A timed-out creation must not be deleted")
+            XCTAssertTrue(
+                deletion.skippedReasonsByWorkspaceID[created.id]?.contains("timeout") == true,
+                "Expected a bounded deletion failure, got \(deletion)"
+            )
+
+            let retryClaim = coordinator.claimDeletion(workspaceIDs: [created.id])
+            XCTAssertTrue(retryClaim.lease.workspaceIDs.contains(created.id))
+            coordinator.releaseDeletion(retryClaim.lease)
+
+            await manager.finishWorkspaceCreation(workspaceIDs: [created.id])
+            let authoritativeAfterCreation = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(authoritativeAfterCreation.workspaces.contains {
+                $0.document.workspaceID == created.id
+            })
+        }
+
+        func testConfirmedDeleteTimeoutCannotCloseAWorkspaceAfterLateSessionCancellation() async throws {
+            let target = WorkspaceModel(
+                name: "Gated deletion target",
+                repoPaths: [storageRoot.appendingPathComponent("gated-repo").path]
+            )
+            try writeWorkspace(target)
+            try writeLegacyIndex([target])
+
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-session-timeout")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            let manager = makeManager(
+                windowID: -763,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -763
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await manager.awaitInitialized()
+            let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
+            let activation = await manager.switchWorkspace(to: targetInManager, saveState: false)
+            XCTAssertTrue(activation.didSwitch, "Expected the deletion target to be active")
+
+            let gate = WorkspaceDeleteSuspensionGate()
+            let sessions = GatedDeletionSessionProvider(gate: gate)
+            manager.registerSwitchSessionProvider(sessions)
+
+            let deletionFinished = expectation(description: "confirmed deletion returns while provider is gated")
+            let deletionTask = Task {
+                defer { deletionFinished.fulfill() }
+                return await manager.deleteWorkspacesAsync(
+                    workspaceIDs: [target.id],
+                    closeOpenWorkspaces: true
+                )
+            }
+            await fulfillment(of: [sessions.cancellationStarted], timeout: 2)
+            await fulfillment(of: [deletionFinished], timeout: 2)
+            XCTAssertFalse(sessions.wasCancelled, "The gated provider must still be suspended at timeout")
+
+            let unrelated = manager.createEphemeralWorkspace(name: "Unrelated workspace", repoPaths: [])
+            let unrelatedSwitch = await manager.switchWorkspace(to: unrelated, saveState: false)
+            XCTAssertTrue(unrelatedSwitch.didSwitch, "The timed-out delete must release the window for a new switch")
+
+            let retry = await manager.deleteWorkspacesAsync(
+                workspaceIDs: [target.id],
+                closeOpenWorkspaces: true
+            )
+            XCTAssertEqual(retry.deletedWorkspaceIDs, [target.id])
+
+            await gate.open()
+            let deletion = await deletionTask.value
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty)
+            XCTAssertTrue(deletion.skippedReasonsByWorkspaceID[target.id]?.contains("timeout") == true)
+            await fulfillment(of: [sessions.cancellationFinished], timeout: 2)
+            XCTAssertEqual(manager.activeWorkspaceID, unrelated.id)
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == target.id
+            })
+        }
+
+        func testConfirmedDeleteTimeoutCannotPublishALateFallbackWorkspace() async throws {
+            let target = WorkspaceModel(
+                name: "Late fallback target",
+                repoPaths: [storageRoot.appendingPathComponent("late-fallback-repo").path]
+            )
+            try writeWorkspace(target)
+            try writeLegacyIndex([target])
+
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-late-fallback")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            let manager = makeManager(
+                windowID: -760,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -760
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await manager.awaitInitialized()
+            let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
+            let activation = await manager.switchWorkspace(to: targetInManager, saveState: false)
+            XCTAssertTrue(activation.didSwitch, "Expected the deletion target to be active")
+            let fallback = try XCTUnwrap(manager.workspaces.first(where: { $0.isSystemWorkspace }))
+
+            var publishedWorkspaceIDs: [UUID] = []
+            let listenerToken = manager.addWorkspaceDidSwitchListener(label: "late-fallback-test") { workspace in
+                if let workspace {
+                    publishedWorkspaceIDs.append(workspace.id)
+                }
+            }
+            defer { manager.removeWorkspaceDidSwitchListener(listenerToken) }
+
+            let fallbackLoadStarted = expectation(description: "fallback reached publication gate")
+            let fallbackSwitchFinished = expectation(description: "late fallback operation finished")
+            let gate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { workspaceID in
+                guard workspaceID == fallback.id else { return }
+                fallbackLoadStarted.fulfill()
+                await gate.wait()
+            }
+            manager.setWorkspaceSwitchDidFinishHandlerForTesting { _ in
+                fallbackSwitchFinished.fulfill()
+            }
+
+            let deletionFinished = expectation(description: "confirmed deletion returns after fallback timeout")
+            let deletionTask = Task {
+                defer { deletionFinished.fulfill() }
+                return await manager.deleteWorkspacesAsync(
+                    workspaceIDs: [target.id],
+                    closeOpenWorkspaces: true
+                )
+            }
+            await fulfillment(of: [fallbackLoadStarted, deletionFinished], timeout: 2)
+            let deletion = await deletionTask.value
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty, "\(deletion)")
+            XCTAssertTrue(
+                deletion.skippedReasonsByWorkspaceID[target.id]?.contains("timeout") == true,
+                "Expected the fallback switch to time out, got \(deletion)"
+            )
+            XCTAssertEqual(manager.activeWorkspaceID, target.id)
+
+            await gate.open()
+            await fulfillment(of: [fallbackSwitchFinished], timeout: 2)
+            manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(nil)
+            manager.setWorkspaceSwitchDidFinishHandlerForTesting(nil)
+
+            XCTAssertEqual(manager.activeWorkspaceID, target.id)
+            XCTAssertFalse(
+                publishedWorkspaceIDs.contains(fallback.id),
+                "A timed-out deletion must not publish a late fallback activation"
+            )
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == target.id
+            })
+        }
+
+        func testConfirmedDeleteReturnsRetryableBusyForAnAlreadyRunningSwitch() async throws {
+            let previous = WorkspaceModel(
+                name: "Previous workspace",
+                repoPaths: [storageRoot.appendingPathComponent("previous-repo").path]
+            )
+            let target = WorkspaceModel(
+                name: "Cancelled switch target",
+                repoPaths: [storageRoot.appendingPathComponent("cancelled-switch-repo").path]
+            )
+            try writeWorkspace(previous)
+            try writeWorkspace(target)
+            try writeLegacyIndex([previous, target])
+
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-cancelled-switch")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            let manager = makeManager(
+                windowID: -759,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -759
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await manager.awaitInitialized()
+            let previousInManager = try XCTUnwrap(manager.workspace(withID: previous.id))
+            let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
+            let previousActivation = await manager.switchWorkspace(to: previousInManager, saveState: false)
+            XCTAssertTrue(previousActivation.didSwitch, "Expected the previous workspace to be active")
+
+            let targetPublicationStarted = expectation(description: "target switch reached publication gate")
+            let targetPublicationGate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { workspaceID in
+                guard workspaceID == target.id else { return }
+                targetPublicationStarted.fulfill()
+                await targetPublicationGate.wait()
+            }
+
+            let switchTask = Task {
+                await manager.switchWorkspace(to: targetInManager, saveState: false)
+            }
+            await fulfillment(of: [targetPublicationStarted], timeout: 2)
+
+            let deletionFinished = expectation(description: "deletion returns while switch is active")
+            let deletionTask = Task {
+                defer { deletionFinished.fulfill() }
+                return await manager.deleteWorkspacesAsync(
+                    workspaceIDs: [target.id],
+                    closeOpenWorkspaces: true
+                )
+            }
+            await fulfillment(of: [deletionFinished], timeout: 2)
+            let deletion = await deletionTask.value
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty, "\(deletion)")
+            XCTAssertTrue(
+                deletion.skippedReasonsByWorkspaceID[target.id]?.contains("in progress") == true,
+                "Expected a retryable busy result, got \(deletion)"
+            )
+            XCTAssertEqual(manager.activeWorkspaceID, previous.id)
+            XCTAssertEqual(manager.activeWorkspaceSwitch?.targetWorkspaceID, target.id)
+
+            await targetPublicationGate.open()
+            let switchResult = await switchTask.value
+            manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(nil)
+
+            XCTAssertTrue(switchResult.didSwitch, "Deletion must not cancel the user's switch")
+            XCTAssertEqual(manager.activeWorkspaceID, target.id)
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == target.id
+            })
+        }
+
+        func testDirectSaveRejectsDeletionObservedAfterAuthoritySnapshot() async throws {
+            let target = WorkspaceModel(
+                name: "Stale rename target",
+                repoPaths: [storageRoot.appendingPathComponent("stale-rename-repo").path]
+            )
+            try writeWorkspace(target)
+            try writeLegacyIndex([target])
+
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-stale-direct-save")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let manager = makeManager(
+                windowID: -761,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -761
+                )
+            )
+            await manager.awaitInitialized()
+            let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
+            var staleRename = targetInManager
+            staleRename.name = "Stale rename after deletion"
+
+            let snapshotCaptured = expectation(description: "direct save observed the authority snapshot")
+            let gate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting { workspaceID in
+                guard workspaceID == target.id else { return }
+                snapshotCaptured.fulfill()
+                await gate.wait()
+            }
+            let saveTask = Task { () -> String? in
+                do {
+                    _ = try await manager.saveWorkspaceToFileAsync(
+                        staleRename,
+                        source: .renameWorkspace
+                    )
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }
+            await fulfillment(of: [snapshotCaptured], timeout: 2)
+
+            let deletion = await manager.deleteWorkspacesAsync(workspaceIDs: [target.id])
+            XCTAssertEqual(deletion.deletedWorkspaceIDs, [target.id])
+
+            await gate.open()
+            let saveError = await saveTask.value
+            manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil)
+            XCTAssertEqual(saveError, "The workspace is no longer available for persistence.")
+
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == target.id
+            })
+            XCTAssertFalse(FileManager.default.fileExists(atPath: manager.workspaceFileURL(for: staleRename).path))
+        }
+
         func testActivationLeaseBlocksDeletionClaimUntilSwitchCompletes() async throws {
             let workspace = leakedFixtureWorkspace()
             try writeWorkspace(workspace)
@@ -617,6 +947,20 @@ import XCTest
             )
         }
 
+        private func makeRuntime(profileIdentifier: String) async throws -> MCPDomainRuntime {
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "\(profileIdentifier)-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            return runtime
+        }
+
         private func writeWorkspace(_ workspace: WorkspaceModel) throws {
             let fileURL = workspaceFileURL(for: workspace)
             try FileManager.default.createDirectory(
@@ -694,6 +1038,31 @@ import XCTest
 
         func cancelSwitchSessions() async {
             wasCancelled = true
+        }
+    }
+
+    @MainActor
+    private final class GatedDeletionSessionProvider: WorkspaceSwitchSessionProvider {
+        let cancellationStarted = XCTestExpectation(description: "session cancellation started")
+        let cancellationFinished = XCTestExpectation(description: "session cancellation finished")
+        private let gate: WorkspaceDeleteSuspensionGate
+        private(set) var wasCancelled = false
+
+        init(gate: WorkspaceDeleteSuspensionGate) {
+            self.gate = gate
+        }
+
+        func switchSessionItems() -> [WorkspaceSwitchSessionItem] {
+            wasCancelled
+                ? []
+                : [.init(id: "gated-agent", count: 1, singularLabel: "agent", pluralLabel: "agents")]
+        }
+
+        func cancelSwitchSessions() async {
+            cancellationStarted.fulfill()
+            await gate.wait()
+            wasCancelled = true
+            cancellationFinished.fulfill()
         }
     }
 

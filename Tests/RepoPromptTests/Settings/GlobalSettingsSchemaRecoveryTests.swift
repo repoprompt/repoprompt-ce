@@ -120,14 +120,25 @@ final class GlobalSettingsSchemaRecoveryTests: XCTestCase {
         }
     }
 
-    func testSavePreservesUnchangedExternalFieldsAndBlocksNewFutureReplacement() throws {
+    func testChangedExternalFieldsRequireReloadBeforePreservingUnknownFields() throws {
         try withSettings { url in
             try fixture(version: 2).write(to: url)
             let store = GlobalSettingsFileStore(fileURL: url)
             var document = try store.load()
             var external = try root(Data(contentsOf: url))
             external["externalField"] = ["retain": true]
-            try JSONSerialization.data(withJSONObject: external).write(to: url)
+            let externalData = try JSONSerialization.data(withJSONObject: external)
+            try externalData.write(to: url)
+            document.globalDefaults.discoverAgentRaw = "changed-agent"
+            XCTAssertThrowsError(try store.save(document)) { error in
+                XCTAssertEqual(
+                    error as? GlobalSettingsFileStore.GlobalSettingsFileStoreError,
+                    .settingsChangedOnDisk
+                )
+            }
+            XCTAssertEqual(try Data(contentsOf: url), externalData)
+
+            document = try store.load()
             document.globalDefaults.discoverAgentRaw = "changed-agent"
             try store.save(document)
             XCTAssertEqual(try root(Data(contentsOf: url))["externalField"] as? NSDictionary, ["retain": true] as NSDictionary)
@@ -135,6 +146,36 @@ final class GlobalSettingsSchemaRecoveryTests: XCTestCase {
             try future.write(to: url)
             XCTAssertThrowsError(try store.save(document))
             XCTAssertEqual(try Data(contentsOf: url), future)
+        }
+    }
+
+    func testMalformedCurrentSchemaIsPreservedUntilExplicitRecovery() throws {
+        try withSettings { url in
+            var object = try root(fixture(version: 5))
+            object["globalDefaults"] = "invalid"
+            let original = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            try original.write(to: url)
+
+            let store = GlobalSettingsFileStore(fileURL: url)
+            let fallback = store.loadOrCreateDefault()
+            XCTAssertEqual(store.blockReason, .corruptUnrecoverable)
+            XCTAssertEqual(try Data(contentsOf: url), original)
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: url.deletingLastPathComponent().appendingPathComponent("Backups").path
+                )
+            )
+            XCTAssertThrowsError(try store.save(fallback)) { error in
+                XCTAssertEqual(
+                    error as? GlobalSettingsFileStore.GlobalSettingsFileStoreError,
+                    .corruptDocumentPreserved
+                )
+            }
+            XCTAssertEqual(try Data(contentsOf: url), original)
+
+            XCTAssertTrue(store.performUserInitiatedRecovery(replacementDocument: fallback))
+            XCTAssertNil(store.blockReason)
+            XCTAssertEqual(try store.load().schemaLineage, GlobalSettingsDocument.schemaLineage)
         }
     }
 
@@ -159,6 +200,127 @@ final class GlobalSettingsSchemaRecoveryTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testManagerSaveMatchesCaseInsensitiveWorkspaceKeyAndPreservesUnknownFieldsAcrossRestart() throws {
+        try withSettings { url in
+            let workspaceID = try XCTUnwrap(UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF"))
+            let lowercaseKey = workspaceID.uuidString.lowercased()
+            var object = try root(fixture(version: 5))
+            object["scalarPreferences"] = [
+                "contextBuilder": ["contextTokenBudget": 1234],
+                "fileSystem": ["globalIgnoreDefaults": ""]
+            ]
+            object["agentModelsSettingsByWorkspaceID"] = [
+                lowercaseKey: [
+                    "inheritanceMode": "useWorkspaceOverrides",
+                    "profile": [
+                        "planningModelRaw": "saved-model",
+                        "unknownProfileField": ["keep": true]
+                    ],
+                    "unknownWorkspaceField": ["keep": true]
+                ]
+            ]
+            try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: url)
+
+            let firstSuite = "GlobalSettingsSchemaRecoveryTests.first.\(UUID().uuidString)"
+            let firstDefaults = try XCTUnwrap(UserDefaults(suiteName: firstSuite))
+            defer { firstDefaults.removePersistentDomain(forName: firstSuite) }
+            let settings = GlobalSettingsStore(
+                defaults: firstDefaults,
+                fileStore: GlobalSettingsFileStore(fileURL: url)
+            )
+            XCTAssertNil(settings.persistenceBlockReason)
+
+            // This unrelated typed manager save changes the UUID spelling from
+            // the raw lowercase alias to the canonical document key.
+            settings.setAppearanceModeRaw("Dark")
+            try assertUnknownWorkspaceFields(
+                in: root(Data(contentsOf: url)),
+                canonicalKey: workspaceID.uuidString
+            )
+
+            let secondSuite = "GlobalSettingsSchemaRecoveryTests.second.\(UUID().uuidString)"
+            let secondDefaults = try XCTUnwrap(UserDefaults(suiteName: secondSuite))
+            defer { secondDefaults.removePersistentDomain(forName: secondSuite) }
+            let restarted = GlobalSettingsStore(
+                defaults: secondDefaults,
+                fileStore: GlobalSettingsFileStore(fileURL: url)
+            )
+            XCTAssertEqual(restarted.appearanceModeRaw(), "Dark")
+            restarted.setUseTransparency(false)
+            try assertUnknownWorkspaceFields(
+                in: root(Data(contentsOf: url)),
+                canonicalKey: workspaceID.uuidString
+            )
+        }
+    }
+
+    func testUUIDKeyedWorkspaceAliasesPreserveUnknownFieldsAcrossTypedRewrite() throws {
+        let workspaceID = try XCTUnwrap(UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF"))
+        let canonicalKey = workspaceID.uuidString
+        let lowercaseKey = canonicalKey.lowercased()
+        let mapKeys = [
+            "copySettingsByWorkspaceID",
+            "chatSettingsByWorkspaceID",
+            "agentModelsSettingsByWorkspaceID"
+        ]
+
+        for mapKey in mapKeys {
+            let known = ["known": true]
+            let originalRecord = [
+                "known": true,
+                "unknownNestedField": ["map": mapKey, "keep": true]
+            ] as [String: Any]
+            let before = try JSONSerialization.data(withJSONObject: [
+                mapKey: [lowercaseKey: known]
+            ])
+            let replacement = try JSONSerialization.data(withJSONObject: [
+                mapKey: [canonicalKey: known]
+            ])
+            let original = try JSONSerialization.data(withJSONObject: [
+                mapKey: [lowercaseKey: originalRecord]
+            ])
+
+            let saved = try GlobalSettingsJSONPreservation.applyingChanges(
+                from: before,
+                to: replacement,
+                preserving: original
+            )
+            let savedMap = try XCTUnwrap(root(saved)[mapKey] as? [String: Any])
+            XCTAssertNil(savedMap[lowercaseKey])
+            let savedRecord = try XCTUnwrap(savedMap[canonicalKey] as? [String: Any])
+            XCTAssertEqual(
+                savedRecord["unknownNestedField"] as? NSDictionary,
+                ["map": mapKey, "keep": true] as NSDictionary
+            )
+
+            let duplicateOriginal = try JSONSerialization.data(withJSONObject: [
+                mapKey: [
+                    lowercaseKey: [
+                        "known": true,
+                        "unknownNestedField": ["winner": "sorted-alias"]
+                    ],
+                    canonicalKey: [
+                        "known": true,
+                        "unknownNestedField": ["winner": "canonical"]
+                    ]
+                ]
+            ])
+            let duplicateSaved = try GlobalSettingsJSONPreservation.applyingChanges(
+                from: before,
+                to: replacement,
+                preserving: duplicateOriginal
+            )
+            let duplicateRecord = try XCTUnwrap(
+                try (root(duplicateSaved)[mapKey] as? [String: Any])?[canonicalKey] as? [String: Any]
+            )
+            XCTAssertEqual(
+                duplicateRecord["unknownNestedField"] as? NSDictionary,
+                ["winner": "canonical"] as NSDictionary
+            )
+        }
+    }
+
     func testClearingKnownGroupPreservesUnknownChildrenAndExternalDeletion() throws {
         let before = Data(#"{"scalarPreferences":{"modelSelection":{"known":true}},"globalDefaults":{"known":"old"}}"#.utf8)
         let after = Data(#"{"scalarPreferences":{},"globalDefaults":{"known":"old"},"changed":true}"#.utf8)
@@ -169,11 +331,59 @@ final class GlobalSettingsSchemaRecoveryTests: XCTestCase {
     }
 
     func testRemovingLastWorkspaceSettingsDoesNotResurrectUnknownProfileFields() throws {
-        let id = UUID().uuidString
-        let before = try JSONSerialization.data(withJSONObject: ["agentModelsSettingsByWorkspaceID": [id: ["profile": ["known": true]]]])
-        let original = try JSONSerialization.data(withJSONObject: ["agentModelsSettingsByWorkspaceID": [id: ["profile": ["known": true, "unknown": "keep only while workspace exists"]]]])
-        let saved = try GlobalSettingsJSONPreservation.applyingChanges(from: before, to: Data("{}".utf8), preserving: original)
+        let id = try XCTUnwrap(UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")).uuidString
+        let lowercaseID = id.lowercased()
+        let before = try JSONSerialization.data(withJSONObject: [
+            "agentModelsSettingsByWorkspaceID": [lowercaseID: ["profile": ["known": true]]]
+        ])
+        let original = try JSONSerialization.data(withJSONObject: [
+            "agentModelsSettingsByWorkspaceID": [
+                lowercaseID: ["profile": ["known": true, "unknown": "losing alias"]],
+                id: ["profile": ["known": true, "unknown": "canonical winner"]]
+            ]
+        ])
+        let saved = try GlobalSettingsJSONPreservation.applyingChanges(
+            from: before,
+            to: Data("{}".utf8),
+            preserving: original
+        )
         XCTAssertNil(try root(saved)["agentModelsSettingsByWorkspaceID"])
+    }
+
+    private func assertUnknownWorkspaceFields(
+        in object: [String: Any],
+        canonicalKey: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let workspaceMap = try XCTUnwrap(
+            object["agentModelsSettingsByWorkspaceID"] as? [String: Any],
+            file: file,
+            line: line
+        )
+        XCTAssertNil(workspaceMap[canonicalKey.lowercased()], file: file, line: line)
+        let workspace = try XCTUnwrap(
+            workspaceMap[canonicalKey] as? [String: Any],
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            workspace["unknownWorkspaceField"] as? NSDictionary,
+            ["keep": true] as NSDictionary,
+            file: file,
+            line: line
+        )
+        let profile = try XCTUnwrap(
+            workspace["profile"] as? [String: Any],
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            profile["unknownProfileField"] as? NSDictionary,
+            ["keep": true] as NSDictionary,
+            file: file,
+            line: line
+        )
     }
 
     private func fixture(version: Int = 4) throws -> Data {
