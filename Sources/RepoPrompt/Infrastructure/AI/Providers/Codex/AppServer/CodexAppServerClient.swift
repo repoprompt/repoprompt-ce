@@ -147,7 +147,7 @@ actor CodexAppServerClient {
     struct Config {
         let commandName: String
         let additionalPathHints: [String]
-        let enableDebugLogging: Bool
+        private(set) var enableDebugLogging: Bool
         private(set) var requestTimeout: TimeInterval?
         /// Launch directory for the Codex app-server process. Distinct from the thread/turn
         /// execution cwd, which the controller sends per request.
@@ -179,6 +179,10 @@ actor CodexAppServerClient {
 
         mutating func replaceRequestTimeout(_ timeout: TimeInterval?) {
             requestTimeout = timeout
+        }
+
+        mutating func disableDebugLogging() {
+            enableDebugLogging = false
         }
 
         mutating func replaceProcessLaunchDirectory(_ path: String?) {
@@ -404,6 +408,9 @@ actor CodexAppServerClient {
     }
 
     private var config = Config()
+    nonisolated let usesManagedHTTPAccountAdoption: Bool
+    private var managedRequestGate = CodexManagedHTTPPolicy.RequestGate()
+    private var managedVerifiedTransportGeneration: UInt64?
     private var activeTransport: ActiveTransport?
     private var stdoutChunkChannel: FileHandleChunkChannel?
     private var stderrChunkChannel: FileHandleChunkChannel?
@@ -475,7 +482,8 @@ actor CodexAppServerClient {
             ChildProcessExitObserver(pid: $0)
         },
         expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager,
-        faultInjection: FaultInjection = .init()
+        faultInjection: FaultInjection = .init(),
+        managedHTTPAccountAdoption: Bool = false
     ) {
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
@@ -486,10 +494,12 @@ actor CodexAppServerClient {
         self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
         self.faultInjection = faultInjection
+        usesManagedHTTPAccountAdoption = managedHTTPAccountAdoption
     }
 
     func updateConfig(_ config: Config) {
         self.config = config
+        if usesManagedHTTPAccountAdoption { self.config.disableDebugLogging() }
         preparedRuntimeLaunchContext = nil
     }
 
@@ -526,6 +536,11 @@ actor CodexAppServerClient {
         }
         guard let runtime = resolution.runtime else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: runtime resolution completed without runtime metadata.")
+        }
+        if usesManagedHTTPAccountAdoption {
+            guard case .bundled = runtime.source, runtime.version == CodexRuntimeAuthority.bundledVersion else {
+                throw CodexManagedHTTPPolicy.Failure.unsupportedConfiguration
+            }
         }
         try prepareState(for: runtime)
         environment.merge(resolution.environmentOverrides) { _, ownedValue in ownedValue }
@@ -664,6 +679,32 @@ actor CodexAppServerClient {
             return nil
         }
         return activeTransport.generation
+    }
+
+    func managedHTTPPolicyIsVerified() -> Bool {
+        usesManagedHTTPAccountAdoption && managedVerifiedTransportGeneration != nil
+            && managedVerifiedTransportGeneration == healthyTransportGeneration()
+    }
+
+    func bindManagedAccountThread(_ threadID: String) throws {
+        guard managedHTTPPolicyIsVerified() else { throw CodexManagedHTTPPolicy.Failure.unsupportedConfiguration }
+        try managedRequestGate.bindThread(threadID)
+    }
+
+    func reserveManagedAccountAdoption() throws -> UUID {
+        guard managedHTTPPolicyIsVerified() else { throw CodexManagedHTTPPolicy.Failure.unsupportedConfiguration }
+        return try managedRequestGate.reserve()
+    }
+
+    func finishManagedAccountAdoption(_ lease: UUID, allowTurns: Bool) {
+        managedRequestGate.finish(lease, allowTurns: allowTurns && managedHTTPPolicyIsVerified())
+    }
+
+    func hasPendingManagedMutation() -> Bool {
+        pendingRequestMetadata.values.contains {
+            let method = $0.method
+            return !method.hasSuffix("/read") && !method.hasSuffix("/list") && !method.hasSuffix("/get")
+        }
     }
 
     func subscribeNotificationsWithTransportGeneration() async throws -> NotificationSubscription {
@@ -1086,7 +1127,7 @@ actor CodexAppServerClient {
             launchDirectory: exitObservation.launchDirectory,
             pid: observer.pid,
             status: status,
-            stderrTail: stderr.bytes,
+            stderrTail: usesManagedHTTPAccountAdoption ? Data() : stderr.bytes,
             stderrWasTruncated: stderr.wasTruncated,
             stderrWasSettled: stderrWasSettled
         )
@@ -1247,7 +1288,8 @@ actor CodexAppServerClient {
         method: String,
         params: [String: Any]?,
         deadline: TimeInterval,
-        onUnsettled: @escaping @Sendable (_ generation: UInt64) -> Void = { _ in }
+        onUnsettled: @escaping @Sendable (_ generation: UInt64) -> Void = { _ in },
+        permitsManagedAccountLogin: Bool = false
     ) async throws -> [String: Any] {
         guard let activeTransport, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
@@ -1259,7 +1301,8 @@ actor CodexAppServerClient {
                 params: params,
                 timeout: deadline,
                 useDefaultTimeout: false,
-                onMutationUnsettled: onUnsettled
+                onMutationUnsettled: onUnsettled,
+                permitsManagedAccountLogin: permitsManagedAccountLogin
             )
         } catch {
             let cause: MutationFailureCause
@@ -1319,11 +1362,20 @@ actor CodexAppServerClient {
         params: [String: Any]?,
         timeout: TimeInterval?,
         useDefaultTimeout: Bool,
-        onMutationUnsettled: (@Sendable (_ generation: UInt64) -> Void)? = nil
+        onMutationUnsettled: (@Sendable (_ generation: UInt64) -> Void)? = nil,
+        permitsManagedAccountLogin: Bool = false
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard let activeTransport, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
+        }
+        var guardedParams = params
+        if usesManagedHTTPAccountAdoption {
+            // Actor-confined check and frame publication below contain no await.
+            try managedRequestGate.authorize(method: method, permitsAccountLogin: permitsManagedAccountLogin)
+            guardedParams = try CodexManagedHTTPPolicy.requestParameters(
+                method: method, params: params, permitsAccountLogin: permitsManagedAccountLogin
+            )
         }
         let requestID = makeRequestID()
         let generation = activeTransport.generation
@@ -1332,8 +1384,8 @@ actor CodexAppServerClient {
             "method": method,
             "id": Int(requestID) ?? requestID
         ]
-        if let params {
-            payload["params"] = params
+        if let guardedParams {
+            payload["params"] = guardedParams
         }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -1530,6 +1582,19 @@ actor CodexAppServerClient {
             }
             try ensureStartupAuthority(startupAuthority)
             try await initializeIfNeeded(timeout: initializationTimeout)
+            if usesManagedHTTPAccountAdoption, managedVerifiedTransportGeneration == nil {
+                do {
+                    let effective = try await request(method: "config/read", params: [:], timeout: 5)
+                    try CodexManagedHTTPPolicy.verifyEffectiveConfiguration(effective)
+                    let account = try await request(method: "account/read", params: ["refreshToken": false], timeout: 5)
+                    guard account["account"] is NSNull else { throw CodexManagedHTTPPolicy.Failure.unsupportedConfiguration }
+                    try ensureStartupAuthority(startupAuthority)
+                    managedVerifiedTransportGeneration = activeTransport?.generation
+                } catch {
+                    await terminateTransport(flushStdout: false, reason: .explicitStop)
+                    throw CodexManagedHTTPPolicy.Failure.unsupportedConfiguration
+                }
+            }
         } catch is CancellationError {
             if let termination = transportTerminationTask,
                termination.generation == transportGeneration
@@ -1565,7 +1630,11 @@ actor CodexAppServerClient {
         guard let launchContext = preparedRuntimeLaunchContext else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
         }
-        let environment = Self.processEnvironmentForCurrentLaunch(launchContext.environment)
+        var environment = Self.processEnvironmentForCurrentLaunch(launchContext.environment)
+        if usesManagedHTTPAccountAdoption {
+            try managedRequestGate.claimStartup()
+            environment = CodexManagedHTTPPolicy.environment(environment)
+        }
         let resolution = launchContext.resolution
         if provisionsRepoPromptMCPOnStart {
             let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
@@ -1582,7 +1651,7 @@ actor CodexAppServerClient {
             ),
             featurePolicy: config.processFeaturePolicy
         )
-        let args = processOverrides + ["app-server"]
+        let args = processOverrides + (usesManagedHTTPAccountAdoption ? CodexManagedHTTPPolicy.launchArguments : []) + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
             config.processLaunchDirectory
         )
@@ -1859,7 +1928,10 @@ actor CodexAppServerClient {
                 if config.enableDebugLogging {
                     print("[CodexAppServer] Error for request \(idString): \(failure.message)")
                 }
-                continuation.resume(throwing: ClientError.requestFailed(failure))
+                let visibleFailure = usesManagedHTTPAccountAdoption
+                    ? RequestFailure(method: failure.method, code: failure.code, message: "Managed Codex request failed.", data: nil)
+                    : failure
+                continuation.resume(throwing: ClientError.requestFailed(visibleFailure))
                 return
             }
             if let method = json["method"] as? String,

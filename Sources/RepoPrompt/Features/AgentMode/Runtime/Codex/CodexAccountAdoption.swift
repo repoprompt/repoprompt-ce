@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// Account adoption is a separate authority from MCP routing and ordinary login.
@@ -89,18 +90,20 @@ struct CodexAccountAdoptionLoginReceipt {
 /// dispatch. Dependencies carry secrets only to an authenticated bridge or the
 /// exact owning runtime; external errors are never surfaced verbatim.
 @MainActor
-final class CodexAccountAdoption {
+final class CodexAccountAdoption: ObservableObject {
     struct Dependencies {
         let admission: () -> CodexAccountAdoptionAdmission?
         let inspectRuntime: () async throws -> CodexAccountAdoptionRuntimeProof
         let install: (CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionLoginReceipt
         let renew: (CodexAccountAdoptionGrant, String) async throws -> CodexAccountAdoptionGrant
         let now: () -> Date
+        let beginApplication: (CodexAccountAdoptionGrant) async throws -> Void
+        let acknowledgeApplication: (CodexAccountAdoptionGrant) async throws -> Void
     }
 
     let scope: CodexAccountAdoptionScope
     private let dependencies: Dependencies
-    private(set) var state: CodexAccountAdoptionState = .waitingIdle(.runtimeUnavailable)
+    @Published private(set) var state: CodexAccountAdoptionState = .waitingIdle(.runtimeUnavailable)
     private(set) var blocksDispatch = true
     private(set) var reservesController = false
     private var pending: CodexAccountAdoptionGrant?
@@ -153,6 +156,14 @@ final class CodexAccountAdoption {
                 state = .waitingIdle(.busy)
                 return
             }
+            try await dependencies.beginApplication(grant)
+            try validateAdmission()
+            try validateGrant(grant)
+            try Task.checkCancellation()
+            guard pending?.revision == grant.revision else {
+                state = .waitingIdle(.busy)
+                return
+            }
             pending = nil
             mutationDispatched = true
             let receipt = try await dependencies.install(grant)
@@ -167,6 +178,10 @@ final class CodexAccountAdoption {
             try validateAdmission()
             try validateGrant(grant)
             try validateRuntime(after)
+            try Task.checkCancellation()
+            try await dependencies.acknowledgeApplication(grant)
+            try validateAdmission()
+            try validateGrant(grant)
             try Task.checkCancellation()
             applied = grant
             blocksDispatch = pending != nil
@@ -226,6 +241,7 @@ final class CodexAccountAdoption {
             }
             applied = renewed
             blocksDispatch = pending != nil
+            if pending != nil { state = .waitingIdle(.busy) }
             return renewed
         } catch {
             if !isRevoked { fail(.identityChanged) }
@@ -275,6 +291,9 @@ final class CodexAccountAdoption {
         switch reason {
         case .busy, .pendingInteraction, .activeTools, .activeChildren, .queuedDispatch:
             state = .waitingIdle(reason)
+            // Drain already accepted work under the last applied account. The
+            // actual idle adoption reservation remains exclusive and blocks sends.
+            blocksDispatch = applied == nil
         default:
             fail(reason)
         }

@@ -125,6 +125,11 @@ protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }
     var currentSessionReference: CodexNativeSessionController.SessionRef? { get }
     var events: AsyncStream<CodexNativeSessionController.Event> { get }
+    var usesManagedHTTPAccountAdoption: Bool { get }
+    func inspectAccountAdoptionRuntime() async throws -> CodexAccountAdoptionRuntimeProof
+    func reserveAccountAdoption() async throws -> UUID
+    func finishAccountAdoption(_ lease: UUID, allowTurns: Bool) async
+    func installAccountAdoptionGrant(_ grant: CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionLoginReceipt
 
     func ensureEventsStreamReady()
     func startOrResume(
@@ -190,6 +195,24 @@ protocol CodexSessionControlling: AnyObject {
 }
 
 extension CodexSessionControlling {
+    var usesManagedHTTPAccountAdoption: Bool {
+        false
+    }
+
+    func inspectAccountAdoptionRuntime() async throws -> CodexAccountAdoptionRuntimeProof {
+        throw CodexAccountAdoptionReason.runtimeUnavailable
+    }
+
+    func reserveAccountAdoption() async throws -> UUID {
+        throw CodexAccountAdoptionReason.runtimeUnavailable
+    }
+
+    func finishAccountAdoption(_: UUID, allowTurns _: Bool) async {}
+
+    func installAccountAdoptionGrant(_: CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionLoginReceipt {
+        throw CodexAccountAdoptionReason.runtimeUnavailable
+    }
+
     var currentSessionReference: CodexNativeSessionController.SessionRef? {
         nil
     }
@@ -1442,7 +1465,7 @@ final class CodexNativeSessionController {
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor
         self.hookTrustFaultInjection = hookTrustFaultInjection
-        rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
+        rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled() && !client.usesManagedHTTPAccountAdoption
         rawEventLogFileURL = nil
         rawEventLogFileThreadID = nil
         var continuationRef: AsyncStream<Event>.Continuation?
@@ -1980,6 +2003,10 @@ final class CodexNativeSessionController {
                 throw error
             }
 
+            if usesManagedHTTPAccountAdoption {
+                let snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: reasoningEffort)
+                try await client.bindManagedAccountThread(snapshot.conversationID)
+            }
             let sessionRef = try await eventHandlingMutex.withLock {
                 try ensureBindingCanComplete()
                 let sessionRef = applyThreadResponse(result, fallbackEffort: reasoningEffort)
@@ -2040,6 +2067,78 @@ final class CodexNativeSessionController {
             timeout: timeout
         )
         return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
+    }
+
+    var usesManagedHTTPAccountAdoption: Bool {
+        client.usesManagedHTTPAccountAdoption
+    }
+
+    func reserveAccountAdoption() async throws -> UUID {
+        try await client.reserveManagedAccountAdoption()
+    }
+
+    func finishAccountAdoption(_ lease: UUID, allowTurns: Bool) async {
+        await client.finishManagedAccountAdoption(lease, allowTurns: allowTurns)
+    }
+
+    func inspectAccountAdoptionRuntime() async throws -> CodexAccountAdoptionRuntimeProof {
+        guard usesManagedHTTPAccountAdoption, let reference = currentSessionReference,
+              await client.managedHTTPPolicyIsVerified()
+        else {
+            throw CodexAccountAdoptionReason.transportUnverified
+        }
+        let configuration = try await performRequest(method: "config/read", params: [:], timeout: 5)
+        try CodexManagedHTTPPolicy.verifyEffectiveConfiguration(configuration)
+        let loaded = try await performRequest(method: "thread/loaded/list", params: [:], timeout: 5)
+        guard let ids = loaded["data"] as? [String] else { throw CodexAccountAdoptionReason.identityChanged }
+        let result = try await performRequest(
+            method: "thread/read", params: ["threadId": reference.conversationID, "includeTurns": true], timeout: 5
+        )
+        guard let thread = result["thread"] as? [String: Any],
+              thread["modelProvider"] as? String == CodexManagedHTTPPolicy.providerID,
+              currentSessionReference?.conversationID == reference.conversationID,
+              await client.managedHTTPPolicyIsVerified()
+        else {
+            throw CodexAccountAdoptionReason.identityChanged
+        }
+        let snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
+        let persistedTools = await outstandingBlockingNativeToolCallNames()
+        let pendingMutation = await client.hasPendingManagedMutation()
+        return CodexAccountAdoptionRuntimeProof(
+            threadID: snapshot.conversationID,
+            loadedThreadIDs: ids,
+            isAuthoritativelyIdle: snapshot.runtimeStatus == .idle && snapshot.activeTurnIDs.isEmpty && !pendingMutation,
+            hasInProgressTools: !snapshot.activeToolItems.isEmpty || !persistedTools.isEmpty,
+            managedHTTP: true,
+            pinnedRuntime: true
+        )
+    }
+
+    func installAccountAdoptionGrant(_ grant: CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionLoginReceipt {
+        guard usesManagedHTTPAccountAdoption else { throw CodexAccountAdoptionReason.transportUnverified }
+        var params: [String: Any] = [
+            "type": "chatgptAuthTokens", "accessToken": grant.accessToken, "chatgptAccountId": grant.accountID
+        ]
+        if let plan = grant.plan { params["chatgptPlanType"] = plan }
+        do {
+            let installed = try await client.requestWithSettlementDeadline(
+                method: "account/login/start", params: params, deadline: 5, permitsManagedAccountLogin: true
+            )
+            let response = try await client.request(method: "account/read", params: ["refreshToken": false], timeout: 5)
+            guard let account = response["account"] as? [String: Any],
+                  account["email"] is NSNull || account["email"] is String
+            else {
+                throw CodexAccountAdoptionReason.mutationUnconfirmed
+            }
+            return CodexAccountAdoptionLoginReceipt(
+                externalTokenLogin: installed["type"] as? String == "chatgptAuthTokens",
+                isChatGPTAccount: account["type"] as? String == "chatgpt",
+                email: account["email"] as? String
+            )
+        } catch {
+            // Remote errors may echo request data; never interpolate them.
+            throw CodexAccountAdoptionReason.mutationUnconfirmed
+        }
     }
 
     func outstandingBlockingNativeToolCallNames() async -> [String] {

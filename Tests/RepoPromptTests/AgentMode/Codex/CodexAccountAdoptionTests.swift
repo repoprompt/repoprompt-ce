@@ -154,6 +154,45 @@ final class CodexAccountAdoptionTests: XCTestCase {
         XCTAssertTrue(Mirror(reflecting: grant).children.isEmpty)
     }
 
+    func testNewSelectionDuringRefreshReportsWaitingAndLetsExistingQueueDrain() async throws {
+        let fixture = Fixture()
+        let adoption = fixture.makeAdoption()
+        await adoption.submit(fixture.grant())
+        fixture.blocker = .queuedDispatch
+        fixture.onRenew = { await adoption.submit(fixture.grant(account: "account-c", revision: 2)) }
+        _ = try await adoption.refresh(previousAccountID: "account-b")
+        XCTAssertEqual(adoption.state, .waitingIdle(.busy))
+        await adoption.retryAtIdleBoundary()
+        XCTAssertEqual(adoption.state, .waitingIdle(.queuedDispatch))
+        XCTAssertFalse(adoption.blocksDispatch, "Previously accepted queued work must be able to reach an idle boundary")
+        fixture.blocker = nil
+        await adoption.retryAtIdleBoundary()
+        XCTAssertEqual(adoption.state, .appliedUnverified(revision: 2))
+    }
+
+    func testBridgeTransactionAcknowledgementsPrecedeDispatchRelease() async {
+        let fixture = Fixture()
+        let adoption = fixture.makeAdoption()
+        fixture.onAcknowledge = {
+            XCTAssertTrue(adoption.blocksDispatch)
+            XCTAssertTrue(adoption.reservesController)
+            XCTAssertEqual(adoption.state, .applying)
+        }
+        await adoption.submit(fixture.grant())
+        XCTAssertEqual(fixture.transactionCalls, ["begin", "install", "acknowledge"])
+        XCTAssertEqual(adoption.state, .appliedUnverified(revision: 1))
+    }
+
+    func testLostBridgeAcknowledgementAfterMutationCannotReleaseDispatch() async {
+        let fixture = Fixture()
+        let adoption = fixture.makeAdoption()
+        fixture.onAcknowledge = { throw TestError.secretBearingError("DO-NOT-EMIT-SECRET") }
+        await adoption.submit(fixture.grant())
+        XCTAssertEqual(fixture.installs.count, 1)
+        XCTAssertEqual(adoption.state, .failedUnknown(.mutationUnconfirmed))
+        XCTAssertTrue(adoption.blocksDispatch)
+    }
+
     private enum TestError: Error { case secretBearingError(String) }
 
     @MainActor
@@ -176,7 +215,9 @@ final class CodexAccountAdoptionTests: XCTestCase {
         var renewAccount = "account-b"
         var onInspect: (() async -> Void)?
         var onInstall: (() throws -> Void)?
-        var onRenew: (() -> Void)?
+        var onRenew: (() async -> Void)?
+        var onAcknowledge: (() throws -> Void)?
+        var transactionCalls: [String] = []
         let adoptionID = UUID()
         let selectionID = UUID()
         let now = Date(timeIntervalSince1970: 1000)
@@ -222,16 +263,22 @@ final class CodexAccountAdoptionTests: XCTestCase {
                     )
                 },
                 install: { grant in
+                    self.transactionCalls.append("install")
                     self.installs.append(grant.accountID)
                     try self.onInstall?()
                     return .init(externalTokenLogin: true, isChatGPTAccount: true, email: grant.email)
                 },
                 renew: { _, previous in
                     self.renewals.append(previous)
-                    self.onRenew?()
+                    await self.onRenew?()
                     return self.grant(account: self.renewAccount, token: "synthetic-renewed-token")
                 },
-                now: { self.now }
+                now: { self.now },
+                beginApplication: { _ in self.transactionCalls.append("begin") },
+                acknowledgeApplication: { _ in
+                    self.transactionCalls.append("acknowledge")
+                    try self.onAcknowledge?()
+                }
             ))
         }
     }
