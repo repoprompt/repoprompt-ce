@@ -1340,7 +1340,7 @@ private enum AppSettingsMCPRegistry {
             .claudeCode
         case .codexExec:
             .codex
-        case .openCode:
+        case .openCode, .antigravity:
             .openCode
         case .cursor:
             .cursor

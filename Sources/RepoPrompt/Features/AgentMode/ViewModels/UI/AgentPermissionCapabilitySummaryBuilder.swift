@@ -172,7 +172,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: level.autoApprovesACPToolPermissions ? "Auto-approve: on" : "Auto-approve: off",
                 warnings: warnings
             )
-        case .grokBuild:
+        case .grokBuild, .antigravity:
             let level = grokBuildPermissionLevel(profile: profile)
             let warnings = level == .fullAccess
                 ? ["Grok Build launches with `--always-approve` — its tools run without per-request confirmation."]
@@ -209,7 +209,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .claude: availability.claudeCodeAvailable
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
-        case .grokBuild: availability.grokBuildAvailable
+        case .grokBuild, .antigravity: availability.grokBuildAvailable
         }
     }
 

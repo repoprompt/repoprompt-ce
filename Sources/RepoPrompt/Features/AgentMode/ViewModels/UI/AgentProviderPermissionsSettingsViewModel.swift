@@ -185,6 +185,8 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
             ClaudeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .openCode(level):
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .antigravity(level):
+            AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .grokBuild(level):

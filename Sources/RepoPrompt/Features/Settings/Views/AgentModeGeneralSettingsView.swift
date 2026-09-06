@@ -580,6 +580,7 @@ struct AgentModeGeneralSettingsView: View {
         case .claude: apiSettingsVM.isClaudeCodeConnected
         case .codex: apiSettingsVM.isCodexConnected
         case .openCode: apiSettingsVM.isOpenCodeConnected
+        case .antigravity: AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .cursor: apiSettingsVM.isCursorConnected
         case .grokBuild: apiSettingsVM.isGrokBuildConnected
         }

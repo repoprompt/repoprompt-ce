@@ -41,6 +41,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case openCode
     case cursor
     case grokBuild
+    case antigravity
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
@@ -68,6 +69,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "cursor-agent"
         case .grokBuild:
             "grok"
+        case .antigravity:
+            "agy_acp_server.par"
         }
     }
 
@@ -83,6 +86,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "Cursor CLI"
         case .grokBuild:
             "Grok Build"
+        case .antigravity:
+            "Google Antigravity"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -104,6 +109,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.cursorMCPClientID
         case .grokBuild:
             Self.grokBuildMCPClientID
+        case .antigravity:
+            "antigravity"
         }
     }
 
@@ -115,6 +122,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .cursor
         case .grokBuild:
             .grokBuild
+        case .antigravity:
+            .antigravity
         case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             nil
         }
@@ -124,7 +133,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor, .grokBuild:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
             false
         }
     }
@@ -135,14 +144,14 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
         }
     }
 
     var requiresPrePromptAgentModeMCPRouting: Bool {
         switch self {
-        case .cursor, .grokBuild:
+        case .cursor, .grokBuild, .antigravity:
             false
         case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
@@ -154,13 +163,13 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode:
             return "Anthropic's Claude Code agent. Strong at general-purpose development, code understanding, architecture, and open-ended reasoning tasks."
-        case .codexExec:
+        case .codexExec, .antigravity:
             return "OpenAI's Codex CLI agent. Optimized for tool-driven engineering workflows. Supports configurable reasoning effort levels per model."
         case .openCode:
             return "OpenCode ACP agent. Interactive Agent Mode uses RepoPrompt MCP tools; headless discovery/delegate runs use RepoPrompt's managed no-native-tools mode."
         case .cursor:
             return "Cursor CLI ACP agent. Uses Cursor's ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
-        case .grokBuild:
+        case .grokBuild, .antigravity:
             return "xAI Grok Build ACP agent. Uses Grok Build's ACP runtime (`grok agent stdio`) and injects RepoPrompt MCP tools through ACP session configuration."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
@@ -188,13 +197,13 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             "claude_native"
-        case .codexExec:
+        case .codexExec, .antigravity:
             "codex_native"
         case .openCode:
             "opencode_acp"
         case .cursor:
             "cursor_acp"
-        case .grokBuild:
+        case .grokBuild, .antigravity:
             "grok_build_acp"
         }
     }
@@ -209,7 +218,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor, .grokBuild:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
             nil
         }
     }
@@ -269,7 +278,7 @@ final class AgentRuntimeProviderService {
                 runtimeConfig: runtimeConfig,
                 wrappedProvider: wrappedProvider
             )
-        case .codexExec:
+        case .codexExec, .antigravity:
             let config = CodexExecAgentConfig(
                 modelString: modelString,
                 enableDebugLogging: Self.enableDebugLogging,
@@ -301,7 +310,7 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
             }
             return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
-        case .grokBuild:
+        case .grokBuild, .antigravity:
             let config = GrokBuildAgentConfig(
                 enableDebugLogging: Self.enableDebugLogging,
                 modelString: modelString,

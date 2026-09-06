@@ -47,6 +47,10 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
     @State private var isLoadingGrokBuild = false
+    @State private var isLoadingAntigravity = false
+    @State private var isTestingAntigravity = false
+    @State private var isAntigravityInstalled = false
+    @State private var isAntigravityExpanded = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
@@ -145,6 +149,7 @@ struct CLIProvidersSettingsView: View {
                 openCodeCard
                 cursorCard
                 grokBuildCard
+                antigravityCard
             }
             .padding(16)
         }
@@ -152,6 +157,7 @@ struct CLIProvidersSettingsView: View {
         .onAppear {
             Task {
                 await viewModel.loadCompatibleBackendState()
+                isAntigravityInstalled = AntigravityRuntimeManager.installedRuntimeSync() != nil
                 await viewModel.refreshClaudeCodeBinaryStatus()
             }
         }
@@ -1823,6 +1829,85 @@ struct CLIProvidersSettingsView: View {
             return "\(count) models discovered across \(groupedBaseCount) base models."
         }
         return count == 1 ? "1 model discovered." : "\(count) models discovered."
+    }
+
+    // MARK: - Antigravity Card
+
+    private var antigravityCard: some View {
+        providerCard(
+            title: "Google Antigravity",
+            subtitle: "Managed official Antigravity ACP runtime with Google OAuth authentication.",
+            infoURL: "https://antigravity.google/",
+            isConnected: isAntigravityInstalled,
+            isExpanded: $isAntigravityExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Button {
+                        isLoadingAntigravity = true
+                        Task {
+                            do {
+                                _ = try await AntigravityRuntimeManager.shared.install()
+                                await MainActor.run {
+                                    isAntigravityInstalled = true
+                                    isLoadingAntigravity = false
+                                    alertMessage = "Antigravity runtime installed. It will be authenticated when you start the first session."
+                                    showAlert = true
+                                }
+                            } catch {
+                                await MainActor.run {
+                                    isLoadingAntigravity = false
+                                    alertMessage = error.localizedDescription
+                                    showAlert = true
+                                }
+                            }
+                        }
+                    } label: {
+                        if isLoadingAntigravity {
+                            ProgressView().scaleEffect(0.6).frame(height: 16)
+                        } else {
+                            Label(isAntigravityInstalled ? "Update Runtime" : "Install Runtime", systemImage: "arrow.down.circle")
+                        }
+                    }
+                    .disabled(isLoadingAntigravity)
+                    .buttonStyle(CustomButtonStyle())
+
+                    Button {
+                        isTestingAntigravity = true
+                        Task {
+                            do {
+                                let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+                                _ = try await AntigravityACPAgentProvider().support(for: request)
+                                let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
+                                let count = AgentACPModelRegistry.shared.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
+                                await MainActor.run {
+                                    isTestingAntigravity = false
+                                    alertMessage = discovered && count > 0
+                                        ? "Antigravity ACP connected. (count) models discovered."
+                                        : "Antigravity ACP is available, but it returned no selectable models."
+                                    showAlert = true
+                                }
+                            } catch {
+                                await MainActor.run {
+                                    isTestingAntigravity = false
+                                    alertMessage = error.localizedDescription
+                                    showAlert = true
+                                }
+                            }
+                        }
+                    } label: {
+                        if isTestingAntigravity { ProgressView().scaleEffect(0.6).frame(height: 16) }
+                        else { Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right") }
+                    }
+                    .disabled(isTestingAntigravity || !isAntigravityInstalled)
+                    .buttonStyle(CustomButtonStyle())
+
+                    Text(isAntigravityInstalled ? "Runtime ready. Google login will be requested by ACP." : "Runtime not installed.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
     }
 
     // MARK: - Cursor Card

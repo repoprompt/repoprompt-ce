@@ -374,11 +374,11 @@ final class AutoRecommendationEngine {
             switch $0 {
             case .claudeCode:
                 enabledRecommendationProviders.contains(.claudeCode)
-            case .codexExec:
+            case .codexExec, .antigravity:
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
-            case .grokBuild:
+            case .grokBuild, .antigravity:
                 enabledRecommendationProviders.contains(.grokBuild)
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true

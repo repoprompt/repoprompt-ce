@@ -870,6 +870,11 @@ struct AgentComposerView: View, Equatable {
 
     private func inputBarModelMenuItems(for agent: AgentProviderKind) -> [StableMenuItem] {
         let options = inputBarModelOptions(for: agent)
+        if options.isEmpty {
+            return [.action("Use \(agent.displayName)", isEnabled: true, imageSystemName: agent.iconName) {
+                actions.selectAgentModel(agent, "")
+            }]
+        }
         guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
         }

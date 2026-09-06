@@ -206,7 +206,7 @@ final class AgentModeProviderBindingService {
                 // Claude launch settings are revalidated immediately before dispatch.
                 // Avoid an eager untracked shutdown that could race a newly started run.
                 break
-            case .openCode:
+            case .openCode, .antigravity:
                 let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
                 guard let sessionModeID = runtime.acpSessionModeID,
                       session.runState.isActive,
