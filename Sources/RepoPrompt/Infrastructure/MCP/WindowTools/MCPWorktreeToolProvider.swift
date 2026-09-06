@@ -464,6 +464,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             logicalRootName: logicalRoot.name,
             worktreeID: worktree.worktreeID,
             worktreeRootPath: worktree.path,
+            commonGitDir: worktree.repository.commonGitDir,
+            isMainWorktree: worktree.isMain,
             worktreeName: worktree.name,
             branch: worktree.branch,
             head: worktree.head,

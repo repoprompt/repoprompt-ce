@@ -22,6 +22,78 @@ private actor GateReleaseCoordinator {
     }
 }
 
+/// Serializes bounded termination requests without owning the child's destructive reap.
+/// The `ChildProcessExitObserver` remains the only waitpid owner; timeout and stream
+/// cancellation share this actor so they cannot duplicate process-group escalation or
+/// descendant cleanup.
+private actor OwnedProcessTerminationCoordinator {
+    private let observer: ChildProcessExitObserver
+    private let processGroupID: pid_t?
+    private var terminationTask: Task<Void, Never>?
+
+    init(observer: ChildProcessExitObserver, processGroupID: pid_t?) {
+        self.observer = observer
+        self.processGroupID = processGroupID
+    }
+
+    func terminate(logger: @escaping @Sendable (String) -> Void) async {
+        if let terminationTask {
+            await terminationTask.value
+            return
+        }
+
+        let task = Task.detached { [observer, processGroupID] in
+            await ProcessTermination.terminateObservedProcessFamily(
+                observer: observer,
+                processGroupID: processGroupID,
+                logger: logger
+            )
+        }
+        terminationTask = task
+        await task.value
+    }
+}
+
+/// Idempotently closes the three parent-side descriptors for one spawned child.
+/// The lock deduplicates close requests; it does not synchronize read/write
+/// operations. The reaper/gate owner remains separate.
+private final class ProcessDescriptorCleanup: @unchecked Sendable {
+    private let process: SpawnedProcess
+    private let lock = NSLock()
+    private var stdinClosed = false
+    private var stdoutClosed = false
+    private var stderrClosed = false
+
+    init(process: SpawnedProcess) {
+        self.process = process
+    }
+
+    func closeInput() {
+        guard markClosed(\.stdinClosed) else { return }
+        process.stdin?.closeFile()
+    }
+
+    func closeOutput() {
+        let shouldCloseStdout = markClosed(\.stdoutClosed)
+        let shouldCloseStderr = markClosed(\.stderrClosed)
+        if shouldCloseStdout { process.stdout.closeFile() }
+        if shouldCloseStderr { process.stderr.closeFile() }
+    }
+
+    func closeAll() {
+        closeInput()
+        closeOutput()
+    }
+
+    private func markClosed(_ keyPath: ReferenceWritableKeyPath<ProcessDescriptorCleanup, Bool>) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !self[keyPath: keyPath] else { return false }
+        self[keyPath: keyPath] = true
+        return true
+    }
+}
+
 /// Global cache: remember the absolute path to a command once we've
 /// successfully launched it at least once. This avoids repeating
 /// interactive-shell lookups (which are relatively expensive).
@@ -97,10 +169,18 @@ final class CLIProcessRunner {
     let config: CLIProcessConfiguration
     private let registry = ProcessRegistry()
     private let gate: TaskSemaphore
+    private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
 
-    init(config: CLIProcessConfiguration, concurrencyLimit: Int = 1) {
+    init(
+        config: CLIProcessConfiguration,
+        concurrencyLimit: Int = 1,
+        processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = { pid in
+            ChildProcessExitObserver(pid: pid)
+        }
+    ) {
         self.config = config
         gate = TaskSemaphore(max(concurrencyLimit, 1))
+        self.processExitObserverFactory = processExitObserverFactory
     }
 
     @inline(__always)
@@ -482,6 +562,11 @@ final class CLIProcessRunner {
         }
 
         await registry.add(spawned)
+        let exitObserver = processExitObserverFactory(spawned.pid)
+        let terminationCoordinator = OwnedProcessTerminationCoordinator(
+            observer: exitObserver,
+            processGroupID: spawned.processGroupID
+        )
         await onProcessStarted?(spawned.pid)
 
         let collector = config.logCollector
@@ -497,6 +582,7 @@ final class CLIProcessRunner {
             var stderrTail = Data()
 
             let gateCoordinator = GateReleaseCoordinator()
+            let descriptorCleanup = ProcessDescriptorCleanup(process: spawned)
 
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async {
@@ -538,7 +624,7 @@ final class CLIProcessRunner {
                 group.enter()
                 DispatchQueue.global(qos: .userInitiated).async {
                     defer {
-                        stdinHandle.closeFile()
+                        descriptorCleanup.closeInput()
                         group.leave()
                     }
                     let chunkSize = 64 * 1024
@@ -552,76 +638,76 @@ final class CLIProcessRunner {
                     }
                 }
             } else {
-                spawned.stdin?.closeFile()
+                descriptorCleanup.closeInput()
             }
 
-            let waitTask = Task.detached { () throws -> (Int32, Bool) in
-                // Use async, cooperative waiting to avoid blocking the pool
-                try await Self.waitForTerminationAsync(
-                    pid: spawned.pid,
+            // This task owns only the stream's bounded terminal result. It never
+            // performs registry, descriptor, callback, or gate cleanup.
+            let resultTask = Task.detached { () throws -> (Int32, Bool) in
+                let outcome: ChildProcessExitObserver.Outcome
+                let timedOut: Bool
+                if let timeout {
+                    if let observedOutcome = await exitObserver.wait(timeout: timeout) {
+                        outcome = observedOutcome
+                        timedOut = false
+                    } else {
+                        timedOut = true
+                        ProcessDiagnostics.log("Process timed out after \(timeout) seconds; terminating")
+                        await terminationCoordinator.terminate { message in
+                            ProcessDiagnostics.log(message)
+                        }
+                        guard let settledOutcome = await exitObserver.wait(timeout: 0) else {
+                            throw Self.unresolvedOwnedProcessError(pid: spawned.pid)
+                        }
+                        outcome = settledOutcome
+                    }
+                } else {
+                    guard let observedOutcome = await exitObserver.wait() else {
+                        throw Self.unresolvedOwnedProcessError(pid: spawned.pid)
+                    }
+                    outcome = observedOutcome
+                    timedOut = false
+                }
+                return try Self.streamTerminationResult(from: outcome, timedOut: timedOut)
+            }
+
+            // This is the sole physical finalizer. It may remain pending after a
+            // bounded stream failure, retaining observer/registry/gate ownership
+            // until the existing observer reports a terminal outcome.
+            let finalizationTask = Task.detached { [self, gateCoordinator] in
+                guard let outcome = await exitObserver.wait() else {
+                    ProcessDiagnostics.log(Self.unresolvedOwnedProcessError(pid: spawned.pid).localizedDescription)
+                    return
+                }
+
+                if case let .failed(error) = outcome {
+                    ProcessDiagnostics.log("❌ [REAPER] Observation failed for pid=\(spawned.pid): \(error)")
+                }
+                await ProcessTermination.terminateProcessGroupAfterRootReap(
                     processGroupID: spawned.processGroupID,
-                    timeout: timeout
-                ) { warning in
-                    ProcessDiagnostics.log(warning)
+                    logger: { message in
+                        ProcessDiagnostics.log(message)
+                    }
+                )
+                ProcessDiagnostics.log("🔒 [FD] Closing FDs for pid=\(spawned.pid)")
+                descriptorCleanup.closeAll()
+
+                let groupFinished = await Self.waitForGroup(group, timeout: 5.0, pid: spawned.pid) { msg in
+                    ProcessDiagnostics.log(msg)
                 }
-            }
-
-            // Detached so its lifetime outlives this closure and it always releases the permit
-            let _ = Task.detached { [self, gateCoordinator] in
-                do {
-                    let (status, timedOut) = try await waitTask.value
-
-                    // IMPORTANT: The child has terminated. Close FDs to unblock reads
-                    // and wait for readers to finish.
-                    ProcessDiagnostics.log("🔒 [FD] Closing FDs for pid=\(spawned.pid)")
-                    spawned.stdout.closeFile()
-                    spawned.stderr.closeFile()
-
-                    let groupFinished = await Self.waitForGroup(group, timeout: 5.0, pid: spawned.pid) { msg in
-                        ProcessDiagnostics.log(msg)
-                    }
-                    if !groupFinished {
-                        ProcessDiagnostics.log("⚠️ [GROUP] Reader threads timed out for pid=\(spawned.pid)")
-                    }
-
-                    // Collect whatever has been read so far.
-                    if !stdoutTail.isEmpty {
-                        collector?.appendDataSection(title: "STDOUT", data: stdoutTail)
-                    }
-                    if !stderrTail.isEmpty {
-                        collector?.appendDataSection(title: "STDERR", data: stderrTail)
-                    }
-                    // On success, memorize the absolute path for next time.
-                    if status == 0, !timedOut, resolvedCommand.contains("/"),
-                       Self.isRunnableExecutable(resolvedCommand)
-                    {
-                        await ResolvedCommandCache.shared.put(resolvedCommand, for: config.command)
-                    }
-                    continuation.yield(.terminated(status: status, timedOut: timedOut))
-                    continuation.finish()
-                    ProcessDiagnostics.log("✅ [STREAM] Finished normally for pid=\(spawned.pid)")
-                } catch {
-                    ProcessDiagnostics.log("❌ [ERROR] Wait failed for pid=\(spawned.pid): \(error)")
-                    spawned.stdout.closeFile()
-                    spawned.stderr.closeFile()
-
-                    let groupFinished = await Self.waitForGroup(group, timeout: 5.0, pid: spawned.pid) { msg in
-                        ProcessDiagnostics.log(msg)
-                    }
-                    if !groupFinished {
-                        ProcessDiagnostics.log("⚠️ [GROUP] Reader timeout (error path) pid=\(spawned.pid)")
-                    }
-
-                    if !stdoutTail.isEmpty {
-                        collector?.appendDataSection(title: "STDOUT", data: stdoutTail)
-                    }
-                    if !stderrTail.isEmpty {
-                        collector?.appendDataSection(title: "STDERR", data: stderrTail)
-                    }
-                    continuation.finish(throwing: error)
+                if !groupFinished {
+                    ProcessDiagnostics.log("⚠️ [GROUP] Reader threads timed out for pid=\(spawned.pid)")
                 }
+
+                if !stdoutTail.isEmpty {
+                    collector?.appendDataSection(title: "STDOUT", data: stdoutTail)
+                }
+                if !stderrTail.isEmpty {
+                    collector?.appendDataSection(title: "STDERR", data: stderrTail)
+                }
+
                 ProcessDiagnostics.log("🧹 [CLEANUP] Cleaning up pid=\(spawned.pid)")
-                if await cleanupProcess(pid: spawned.pid) {
+                if await cleanupProcess(pid: spawned.pid, descriptorCleanup: descriptorCleanup) {
                     await onProcessTerminated?(spawned.pid)
                 }
                 ProcessDiagnostics.log("🔴 [GATE] Releasing gate for pid=\(spawned.pid)")
@@ -633,55 +719,60 @@ final class CLIProcessRunner {
                 }
             }
 
-            continuation.onTermination = { [self, gateCoordinator, spawned, group] reason in
-                if case .cancelled = reason {
-                    ProcessDiagnostics.log("🛑 [CANCEL] Cancelled pid=\(spawned.pid)")
-                    // Ask child to exit and proactively complete cleanup ourselves.
-                    terminateChild(spawned, sendSigterm: true)
-
-                    // Fast-path cleanup: wait up to ~3s, escalate to SIGKILL if needed,
-                    // then close FDs, drain readers briefly, and release the gate.
-                    Task.detached { [self, gateCoordinator] in
-                        let timeout = ProcessTermination.cooperativeCancellationWaitTimeout()
-                        _ = try? await Self.waitForTerminationAsync(
-                            pid: spawned.pid,
-                            processGroupID: spawned.processGroupID,
-                            timeout: timeout
-                        ) { msg in
-                            ProcessDiagnostics.log(msg)
-                        }
-                        // Ensure reader threads unblock even if the monitor path stalls.
-                        ProcessDiagnostics.log("🔒 [FD] Closing FDs (onTermination) for pid=\(spawned.pid)")
-                        spawned.stdout.closeFile()
-                        spawned.stderr.closeFile()
-
-                        let _ = await Self.waitForGroup(group, timeout: 2.0, pid: spawned.pid) { msg in
-                            ProcessDiagnostics.log(msg)
-                        }
-                        if await cleanupProcess(pid: spawned.pid) {
-                            await onProcessTerminated?(spawned.pid)
-                        }
-
-                        if await gateCoordinator.markReleased() {
-                            ProcessDiagnostics.log("🟠 [CANCEL] Releasing gate (onTermination) pid=\(spawned.pid)")
-                            await gate.release()
-                        } else {
-                            ProcessDiagnostics.log("⚠️ [GATE] Double-release prevented (onTermination) pid=\(spawned.pid)")
-                        }
+            // Stream publication is separate from physical finalization so a
+            // bounded timeout/failure is observable without returning admission
+            // capacity while the observer still owns the child.
+            Task.detached { [self] in
+                do {
+                    let (status, timedOut) = try await resultTask.value
+                    // A successful terminal result is published only after the sole
+                    // finalizer has closed descriptors and drained the reader group.
+                    // If resultTask throws an unresolved-owner failure, this await is
+                    // skipped so the bounded failure remains observable immediately.
+                    await finalizationTask.value
+                    if status == 0, !timedOut, resolvedCommand.contains("/"),
+                       Self.isRunnableExecutable(resolvedCommand)
+                    {
+                        await ResolvedCommandCache.shared.put(resolvedCommand, for: config.command)
                     }
-                } else {
-                    // Normal finish: let the waitpid-driven cleanup close streams and release the gate.
-                }
-
-                // Safety net: if gate hasn't been released within 15 seconds, force release.
-                Task { [self, gateCoordinator] in
-                    try? await Task.sleep(nanoseconds: 15_000_000_000)
-                    if await gateCoordinator.markReleased() {
-                        ProcessDiagnostics.log("🚨 [WATCHDOG] DEADLOCK! Force releasing gate for pid=\(spawned.pid)")
-                        await gate.release()
-                    }
+                    continuation.yield(.terminated(status: status, timedOut: timedOut))
+                    continuation.finish()
+                    ProcessDiagnostics.log("✅ [STREAM] Finished normally for pid=\(spawned.pid)")
+                } catch {
+                    ProcessDiagnostics.log("❌ [ERROR] Wait failed for pid=\(spawned.pid): \(error)")
+                    continuation.finish(throwing: error)
                 }
             }
+
+            continuation.onTermination = { [spawned, exitObserver, terminationCoordinator, finalizationTask] reason in
+                guard case .cancelled = reason else {
+                    // Normal finish: the observer-driven finalizer owns descriptor,
+                    // registry, callback, and gate cleanup.
+                    return
+                }
+
+                ProcessDiagnostics.log("🛑 [CANCEL] Cancelled pid=\(spawned.pid)")
+                // Cancellation requests bounded TERM→KILL cleanup through the same
+                // observer owner. The finalizer remains responsible for eventual
+                // descriptor, registry, lifecycle-callback, and gate cleanup.
+                Task.detached {
+                    await terminationCoordinator.terminate { message in
+                        ProcessDiagnostics.log(message)
+                    }
+                    guard await exitObserver.wait(timeout: 0) == nil else {
+                        await finalizationTask.value
+                        return
+                    }
+                    let error = Self.unresolvedOwnedProcessError(pid: spawned.pid)
+                    ProcessDiagnostics.log("⚠️ [REAPER] \(error.localizedDescription)")
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            // Keep the finalizer alive independently of stream consumption. Its
+            // task handle is intentionally captured by the stream closure so the
+            // owner remains associated with this child until physical settlement.
+            _ = finalizationTask
         }
     }
 
@@ -689,8 +780,7 @@ final class CLIProcessRunner {
         // Do not steal cleanup ownership from runStreaming; just request termination.
         let processes = await registry.current()
         for process in processes {
-            // Stop further input and ask the child to exit. The waitpid cleanup will close stdout/stderr.
-            process.stdin?.closeFile()
+            // The sole cleanup owner closes all descriptors after observing the child.
             ProcessTermination.signalProcessGroupOrPID(
                 pid: process.pid,
                 processGroupID: process.processGroupID,
@@ -699,7 +789,7 @@ final class CLIProcessRunner {
             )
         }
         for process in processes {
-            // The streaming wait task remains the sole waitpid owner. Escalate only through the
+            // The exit observer remains the sole waitpid owner. Escalate only through the
             // process group so a promptly-exited root cannot leave TERM-ignoring descendants
             // alive or race a second destructive reap.
             guard let processGroupID = process.processGroupID else {
@@ -741,11 +831,18 @@ final class CLIProcessRunner {
     }
 
     @discardableResult
-    private func cleanupProcess(pid: pid_t) async -> Bool {
+    private func cleanupProcess(
+        pid: pid_t,
+        descriptorCleanup: ProcessDescriptorCleanup? = nil
+    ) async -> Bool {
         guard let process = await registry.remove(pid: pid) else { return false }
-        process.stdin?.closeFile()
-        process.stdout.closeFile()
-        process.stderr.closeFile()
+        if let descriptorCleanup {
+            descriptorCleanup.closeAll()
+        } else {
+            process.stdin?.closeFile()
+            process.stdout.closeFile()
+            process.stderr.closeFile()
+        }
         return true
     }
 
@@ -831,6 +928,34 @@ final class CLIProcessRunner {
 
     // MARK: - Cooperative process termination (no blocking sleeps)
 
+    private static func unresolvedOwnedProcessError(pid: pid_t) -> CLIProcessRunnerError {
+        .waitFailed(
+            "Owned process \(pid) did not settle after bounded termination; "
+                + "the exit observer remains responsible for cleanup"
+        )
+    }
+
+    private static func streamTerminationResult(
+        from outcome: ChildProcessExitObserver.Outcome,
+        timedOut: Bool
+    ) throws -> (Int32, Bool) {
+        switch outcome {
+        case let .exited(status):
+            return (status.normalizedExitCode, timedOut)
+        case let .failed(error):
+            throw mapTerminationError(error)
+        }
+    }
+
+    private static func mapTerminationError(_ error: ProcessTerminationError) -> CLIProcessRunnerError {
+        switch error {
+        case let .childOwnershipLost(pid):
+            .waitFailed("waitpid reported ECHILD for sole-reaper child \(pid)")
+        case let .waitFailed(message):
+            .waitFailed(message)
+        }
+    }
+
     private static func waitForTerminationAsync(
         pid: pid_t,
         processGroupID: pid_t?,
@@ -846,14 +971,7 @@ final class CLIProcessRunner {
             )
             return (exitCode, timedOut)
         } catch let terminationError as ProcessTerminationError {
-            switch terminationError {
-            case let .childOwnershipLost(pid):
-                throw CLIProcessRunnerError.waitFailed(
-                    "waitpid reported ECHILD for sole-reaper child \(pid)"
-                )
-            case let .waitFailed(message):
-                throw CLIProcessRunnerError.waitFailed(message)
-            }
+            throw mapTerminationError(terminationError)
         }
     }
 }

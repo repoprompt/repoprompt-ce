@@ -17,6 +17,10 @@ public struct GitRepoDescriptor: Codable, Sendable, Equatable, Hashable {
     /// Human-readable display name (typically last path component)
     public let displayName: String
 
+    /// Fresh repository/worktree identity when the root has a resolvable Git layout.
+    /// A nil value is intentionally not treated as an authorization match for external worktrees.
+    public let worktreeIdentity: GitWorktreeIdentitySnapshot?
+
     /// Initialize from a git root URL
     /// - Parameter rootURL: The canonical git repository root URL
     public init(rootURL: URL) {
@@ -24,14 +28,22 @@ public struct GitRepoDescriptor: Codable, Sendable, Equatable, Hashable {
         rootPath = (rootURL.path as NSString).standardizingPath
         displayName = rootURL.lastPathComponent
         repoKey = Self.makeRepoKey(for: rootPath, displayName: displayName)
+        worktreeIdentity = GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: rootURL)
     }
 
     /// Initialize with all fields (used for decoding or testing)
-    public init(rootURL: URL, rootPath: String, repoKey: String, displayName: String) {
+    public init(
+        rootURL: URL,
+        rootPath: String,
+        repoKey: String,
+        displayName: String,
+        worktreeIdentity: GitWorktreeIdentitySnapshot? = nil
+    ) {
         self.rootURL = rootURL
         self.rootPath = rootPath
         self.repoKey = repoKey
         self.displayName = displayName
+        self.worktreeIdentity = worktreeIdentity
     }
 
     /// Generate a stable, filesystem-safe repo key from the root path.

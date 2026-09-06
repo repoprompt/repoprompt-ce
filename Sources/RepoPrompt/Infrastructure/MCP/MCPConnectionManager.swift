@@ -95,6 +95,18 @@ struct MCPExplicitWindowRoutingHint: @unchecked Sendable, Equatable {
     let provenance: Provenance
 }
 
+struct MCPRoutingWindowSnapshot: Equatable {
+    let workspaceID: UUID?
+    let instanceNumber: Int?
+    let windowID: Int
+}
+
+private enum MCPPersistedRoutingResolution {
+    case none
+    case resolved(windowID: Int)
+    case unresolved
+}
+
 /// ---------------------------------------------------------------------
 /// Shared constants & logger for the connection-layer (ported from iMCP)
 /// ---------------------------------------------------------------------
@@ -666,6 +678,10 @@ actor ServerNetworkManager {
         }
         return "Window \(windowID) not found or MCP tools not enabled.\n" +
             "Call `bind_context` with `{\"op\":\"list\"}` to see available windows."
+    }
+
+    nonisolated static func persistedRoutingAffinityFailureGuidance() -> String {
+        "RepoPrompt retained this connection's workspace routing affinity, but no live window currently matches it. The call was rejected instead of routing to another workspace. Retry after the matching workspace/window is restored, or bind the connection explicitly with bind_context."
     }
 
     private nonisolated static func agentModeRoutingFailureGuidance() -> String {
@@ -1253,6 +1269,19 @@ actor ServerNetworkManager {
     private var sessionTokenBindingGeneration: [String: UInt64] = [:]
     /// Persisted routing state (survives app restarts)
     private var routingState: MCPRoutingState = MCPRoutingStateStore.load()
+    #if DEBUG
+        private var debugRoutingWindowSnapshotOverride: [MCPRoutingWindowSnapshot]?
+        private var debugSuppressRoutingStatePersistenceForTesting = false
+
+        private struct DebugPersistedRoutingFixtureBackup {
+            let routingState: MCPRoutingState
+            let lastWindowByClientSession: [String: [String: Int]]
+            let suppressRoutingStatePersistence: Bool
+            let routingWindowSnapshotOverride: [MCPRoutingWindowSnapshot]?
+        }
+
+        private var debugPersistedRoutingFixtureBackup: DebugPersistedRoutingFixtureBackup?
+    #endif
     /// In-memory last window selection per (clientID, sessionKey) for quick access
     /// Outer key is clientID, inner key is sessionKey -> windowID
     private var lastWindowByClientSession: [String: [String: Int]] = [:]
@@ -2331,15 +2360,40 @@ actor ServerNetworkManager {
     /// Returns the effective window ID if binding is unambiguous, nil if multi-window ambiguity exists.
     ///
     /// Binding logic:
-    /// 1. If connection already has a mapping → use it
-    /// 2. If exactly one MCP-enabled window exists → bind to it
-    /// 3. If connection was established during single-window mode → bind to first MCP-enabled window
-    /// 4. If multi-window mode is not effectively active → bind to first MCP-enabled window
-    /// 5. Otherwise → nil (multi-window ambiguous, caller should fail closed or prompt selection)
+    /// 1. Resolve persisted stable affinity before inferred binding
+    /// 2. Preserve an existing explicit/authoritative mapping
+    /// 3. Retain separately owned live-run affinity
+    /// 4. If exactly one MCP-enabled window exists → bind to it
+    /// 5. If connection was established during single-window mode → bind to first MCP-enabled window
+    /// 6. If multi-window mode is not effectively active → bind to first MCP-enabled window
+    /// 7. Otherwise → nil (multi-window ambiguous, caller should fail closed or prompt selection)
     private func ensureWindowBindingIfUnambiguous(connectionID: UUID, reason: String) async -> Int? {
-        // Check existing mapping first
+        // Resolve persisted stable affinity before considering any inferred binding.
+        // A live-run affinity is checked separately below and remains its own authority.
+        let persistedResolution = await persistedRoutingResolution(for: connectionID)
+
+        // Preserve an explicit or already-authoritative binding exactly as before.
         if let existing = presentationWindowByConnection[connectionID] {
             return existing
+        }
+
+        if let liveAffinity = liveRunAffinity(for: connectionID) {
+            connectionLog("\(reason): retaining live-run affinity for connection \(connectionID) at window \(liveAffinity.windowID)")
+            return liveAffinity.windowID
+        }
+
+        switch persistedResolution {
+        case let .resolved(windowID):
+            guard await setAutomaticConnectionWindowMapping(connectionID, windowID: windowID) else {
+                return nil
+            }
+            connectionLog("\(reason): restored persisted affinity for connection \(connectionID) to window \(windowID)")
+            return windowID
+        case .unresolved:
+            connectionLog("\(reason): retaining unresolved persisted affinity for connection \(connectionID); refusing inferred window binding")
+            return nil
+        case .none:
+            break
         }
 
         // Get window state on MainActor
@@ -2352,7 +2406,9 @@ actor ServerNetworkManager {
         // Single MCP-enabled window → unambiguous binding
         if mcpEnabledWindows.count == 1, let window = mcpEnabledWindows.first {
             let windowID = window.windowID
-            setConnectionWindowMapping(connectionID, windowID: windowID)
+            guard await setAutomaticConnectionWindowMapping(connectionID, windowID: windowID) else {
+                return nil
+            }
             connectionLog("\(reason): auto-bound connection \(connectionID) to single MCP-enabled window \(windowID)")
             return windowID
         }
@@ -2372,7 +2428,9 @@ actor ServerNetworkManager {
         if connectedDuringSingleWindow || !multiWindowEffective {
             if let firstWindow = await WindowStatesManager.shared.firstMCPEnabledWindow() {
                 let windowID = firstWindow.windowID
-                setConnectionWindowMapping(connectionID, windowID: windowID)
+                guard await setAutomaticConnectionWindowMapping(connectionID, windowID: windowID) else {
+                    return nil
+                }
                 let bindReason = connectedDuringSingleWindow ? "single-window-at-connect" : "single-window-mode"
                 connectionLog("\(reason): auto-bound connection \(connectionID) to window \(windowID) (\(bindReason))")
                 return windowID
@@ -2494,8 +2552,23 @@ actor ServerNetworkManager {
     }
 
     private func reusableWindowForClient(newConnectionID: UUID, clientName: String) async -> Int? {
+        // Same-client reuse is inferred routing. It must not outrank a live run or
+        // a persisted stable affinity that is unresolved/different.
+        if liveRunAffinity(for: newConnectionID) != nil {
+            return nil
+        }
+        let persistedResolution = await persistedRoutingResolution(for: newConnectionID)
+        if case .unresolved = persistedResolution {
+            return nil
+        }
+
         for (existingID, windowID) in presentationWindowByConnection where existingID != newConnectionID {
             guard MCPClientIdentity.matches(clientIDByConnection[existingID], clientName) else { continue }
+            if case let .resolved(preferredWindowID) = persistedResolution,
+               preferredWindowID != windowID
+            {
+                continue
+            }
             if let existingManager = connections[existingID] {
                 let existingViable = await existingManager.isViableForRetention()
                 if existingViable {
@@ -2509,6 +2582,33 @@ actor ServerNetworkManager {
             }
         }
         return nil
+    }
+
+    private func liveRunAffinity(for connectionID: UUID) -> LiveRunAffinity? {
+        guard let clientName = clientIdentifier(forConnection: connectionID) else {
+            return nil
+        }
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        return preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
+    }
+
+    private func setAutomaticConnectionWindowMapping(_ connectionID: UUID, windowID: Int) async -> Bool {
+        // Re-check immediately before publication: this setter is the last boundary
+        // before presentationWindowByConnection and durable routing state can change.
+        if liveRunAffinity(for: connectionID) != nil {
+            return false
+        }
+        switch await persistedRoutingResolution(for: connectionID) {
+        case .none:
+            setConnectionWindowMapping(connectionID, windowID: windowID)
+            return true
+        case let .resolved(preferredWindowID) where preferredWindowID == windowID:
+            setConnectionWindowMapping(connectionID, windowID: windowID)
+            return true
+        case .resolved, .unresolved:
+            connectionLog("Refusing automatic window mapping for connection \(connectionID) to window \(windowID) because persisted affinity is not an exact stable match")
+            return false
+        }
     }
 
     /// Get the runID associated with a connection (if any)
@@ -9754,8 +9854,9 @@ actor ServerNetworkManager {
             return restored
         }
 
-        if let preferredWindowID = await preferredWindowID(for: clientName, sessionKey: sessionKey) {
-            setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
+        if let preferredWindowID = await preferredWindowID(for: clientName, sessionKey: sessionKey),
+           await setAutomaticConnectionWindowMapping(connectionID, windowID: preferredWindowID)
+        {
             await updateRoutingRecordForConnection(connectionID, clientID: clientName)
         }
         return false
@@ -9805,9 +9906,10 @@ actor ServerNetworkManager {
             return
         }
 
-        if let preferredWindowID = await preferredWindowID(for: clientName, sessionKey: sessionKey) {
+        if let preferredWindowID = await preferredWindowID(for: clientName, sessionKey: sessionKey),
+           await setAutomaticConnectionWindowMapping(connectionID, windowID: preferredWindowID)
+        {
             connectionLog("Applying persisted routing affinity: client \(clientName) → window \(preferredWindowID)")
-            setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
             await updateRoutingRecordForConnection(connectionID, clientID: clientName)
             await notifyToolListChanged(connectionID: connectionID)
         }
@@ -11428,6 +11530,7 @@ actor ServerNetworkManager {
                                     let existingMapping = bypassWindowRouting ? nil : await self.presentationWindowByConnection[connectionID]
                                     chosenID = bypassWindowRouting ? nil : capturedPreResolvedWindowID
                                     let preassigned = await self.preassignedConnections.contains(connectionID)
+                                    var persistedRoutingAffinityBlocked = false
                                     if let cid = existingMapping {
                                         mcpRoutingLog("Tool=\(toolName) conn=\(connectionID) has existingWindow=\(cid) preassigned=\(preassigned)")
                                     }
@@ -11473,10 +11576,10 @@ actor ServerNetworkManager {
                                     if !bypassWindowRouting,
                                        chosenID == nil,
                                        let clientName = await self.clientIdentifier(forConnection: connectionID),
-                                       let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName)
+                                       let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName),
+                                       await self.setAutomaticConnectionWindowMapping(connectionID, windowID: windowID)
                                     {
                                         chosenID = windowID
-                                        await self.setConnectionWindowMapping(connectionID, windowID: windowID)
                                         connectionLog("Tool call: auto-routed connection \(connectionID) to window \(windowID) via clientName '\(clientName)' reuse")
                                     }
 
@@ -11498,11 +11601,33 @@ actor ServerNetworkManager {
                                                 windowID: liveAffinity.windowID
                                             )
                                             connectionLog("Tool call: restored live run affinity for connection \(connectionID) → runID \(liveAffinity.runID)")
-                                        } else if let preferredWindowID = await self.preferredWindowID(for: clientName, sessionKey: sessionKey) {
-                                            chosenID = preferredWindowID
-                                            await self.setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
-                                            connectionLog("Tool call: auto-routed connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)'")
+                                        } else {
+                                            switch await self.persistedRoutingResolution(for: clientName, sessionKey: sessionKey) {
+                                            case let .resolved(preferredWindowID):
+                                                if await self.setAutomaticConnectionWindowMapping(connectionID, windowID: preferredWindowID) {
+                                                    chosenID = preferredWindowID
+                                                    connectionLog("Tool call: auto-routed connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)'")
+                                                } else {
+                                                    persistedRoutingAffinityBlocked = true
+                                                }
+                                            case .unresolved:
+                                                persistedRoutingAffinityBlocked = true
+                                                connectionLog("Tool call: retained unresolved persisted routing affinity for connection \(connectionID); refusing unrelated window fallback")
+                                            case .none:
+                                                break
+                                            }
                                         }
+                                    }
+
+                                    if !bypassWindowRouting,
+                                       chosenID == nil,
+                                       persistedRoutingAffinityBlocked,
+                                       !Self.isWindowSelectionExempt(toolName: toolName, args: capturedArguments)
+                                    {
+                                        return Self.toolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            message: Self.persistedRoutingAffinityFailureGuidance()
+                                        )
                                     }
 
                                     // PRIORITY 3: Auto-route to active window when:
@@ -11528,9 +11653,11 @@ actor ServerNetworkManager {
                                                 ? "single-window-at-connect"
                                                 : "no policy"
                                             mcpRoutingLog("Auto-routing conn=\(connectionID) to active window=\(activeID) (\(reason))")
-                                            chosenID = activeID
-                                            // Store the mapping for this connection
-                                            await self.setConnectionWindowMapping(connectionID, windowID: activeID)
+                                            if await self.setAutomaticConnectionWindowMapping(connectionID, windowID: activeID) {
+                                                chosenID = activeID
+                                            } else {
+                                                persistedRoutingAffinityBlocked = true
+                                            }
                                         }
                                     }
 
@@ -11543,14 +11670,24 @@ actor ServerNetworkManager {
                                        let fallback = try? await self.domainHost.resolveUniqueWindowTool(toolName: toolName),
                                        case let .window(fallbackWindowID) = fallback.scope
                                     {
-                                        singleWindowFallbackResolvedTool = fallback
-                                        chosenID = fallbackWindowID
-                                        await self.setConnectionWindowMapping(
-                                            connectionID,
-                                            windowID: fallbackWindowID
-                                        )
-                                        mcpRoutingLog(
-                                            "Auto-routing conn=\(connectionID) to unique registered window=\(fallbackWindowID)"
+                                        if await self.setAutomaticConnectionWindowMapping(connectionID, windowID: fallbackWindowID) {
+                                            singleWindowFallbackResolvedTool = fallback
+                                            chosenID = fallbackWindowID
+                                            mcpRoutingLog(
+                                                "Auto-routing conn=\(connectionID) to unique registered window=\(fallbackWindowID)"
+                                            )
+                                        } else {
+                                            persistedRoutingAffinityBlocked = true
+                                        }
+                                    }
+
+                                    if !bypassWindowRouting,
+                                       persistedRoutingAffinityBlocked,
+                                       !Self.isWindowSelectionExempt(toolName: toolName, args: capturedArguments)
+                                    {
+                                        return Self.toolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            message: Self.persistedRoutingAffinityFailureGuidance()
                                         )
                                     }
 
@@ -13336,47 +13473,186 @@ actor ServerNetworkManager {
 
     // MARK: - Routing Persistence Helpers
 
-    /// Removes routing records older than routingRecordTTL, purges token-less records,
-    /// and cleans up stale in-memory session map entries.
-    private func pruneRoutingRecords() async {
-        let now = Date()
-        let keys = Array(routingState.records.keys)
-
-        // Get live windows to also prune records pointing to closed windows
-        let liveWindows: Set<Int> = await MainActor.run {
-            Set(WindowStatesManager.shared.allWindows.map(\.windowID))
-        }
-
-        for clientID in keys {
-            guard let records = routingState.records[clientID] else { continue }
-            // Keep only fresh, token-backed records; drop expired, nil-sessionKey, and invalid window entries
-            let filtered = records.filter {
-                $0.sessionKey != nil &&
-                    now.timeIntervalSince($0.lastSeenAt) < routingRecordTTL &&
-                    ($0.lastWindowID == nil || liveWindows.contains($0.lastWindowID!))
+    private func routingWindowSnapshot() async -> [MCPRoutingWindowSnapshot] {
+        #if DEBUG
+            if let debugRoutingWindowSnapshotOverride {
+                return debugRoutingWindowSnapshotOverride
             }
-            if filtered.isEmpty {
-                routingState.records.removeValue(forKey: clientID)
-                lastWindowByClientSession.removeValue(forKey: clientID)
-            } else {
-                routingState.records[clientID] = filtered
-                // Keep in-memory fast path aligned to surviving sessionKeys
-                let validSessionKeys = Set(filtered.compactMap(\.sessionKey))
-                if var sessionMap = lastWindowByClientSession[clientID] {
-                    sessionMap = sessionMap.filter { validSessionKeys.contains($0.key) }
-                    if sessionMap.isEmpty {
-                        lastWindowByClientSession.removeValue(forKey: clientID)
-                    } else {
-                        lastWindowByClientSession[clientID] = sessionMap
-                    }
-                }
+        #endif
+        return await MainActor.run {
+            WindowStatesManager.shared.allWindows.map {
+                MCPRoutingWindowSnapshot(
+                    workspaceID: $0.workspaceManager.activeWorkspace?.id,
+                    instanceNumber: $0.workspaceInstanceNumber,
+                    windowID: $0.windowID
+                )
             }
         }
     }
 
+    private func stableRoutingIdentityMatches(
+        _ record: MCPRoutingState.ClientRecord,
+        _ window: MCPRoutingWindowSnapshot
+    ) -> Bool {
+        guard let workspaceID = record.lastWorkspaceID,
+              let instanceNumber = record.lastWorkspaceInstanceNumber,
+              let liveWorkspaceID = window.workspaceID,
+              let liveInstanceNumber = window.instanceNumber
+        else {
+            return false
+        }
+        return workspaceID == liveWorkspaceID && instanceNumber == liveInstanceNumber
+    }
+
+    private func stableRoutingWindowID(
+        for record: MCPRoutingState.ClientRecord,
+        in snapshot: [MCPRoutingWindowSnapshot]
+    ) -> Int? {
+        let candidates = snapshot.filter { stableRoutingIdentityMatches(record, $0) }
+        guard candidates.count == 1 else { return nil }
+        return candidates[0].windowID
+    }
+
+    private func freshPersistedRoutingRecords(
+        for clientName: String,
+        sessionKey: String?,
+        now: Date = Date()
+    ) -> [MCPRoutingState.ClientRecord] {
+        guard let sessionKey else { return [] }
+        let keys = matchingClientKeys(for: clientName, in: Array(routingState.records.keys))
+        return keys
+            .flatMap { routingState.records[$0] ?? [] }
+            .filter {
+                $0.sessionKey == sessionKey &&
+                    now.timeIntervalSince($0.lastSeenAt) < routingRecordTTL
+            }
+    }
+
+    /// Removes routing records older than routingRecordTTL, purges token-less records,
+    /// and clears only stale numeric hints from otherwise useful stable affinity.
+    private func pruneRoutingRecords() async {
+        let now = Date()
+        let windowSnapshot = await routingWindowSnapshot()
+        let keys = Array(routingState.records.keys)
+        var routingStateChanged = false
+
+        for clientID in keys {
+            guard let records = routingState.records[clientID] else { continue }
+            var changed = false
+            var filtered: [MCPRoutingState.ClientRecord] = []
+            for var record in records {
+                guard record.sessionKey != nil,
+                      now.timeIntervalSince(record.lastSeenAt) < routingRecordTTL
+                else {
+                    changed = true
+                    continue
+                }
+
+                if let lastWindowID = record.lastWindowID,
+                   !windowSnapshot.contains(where: {
+                       $0.windowID == lastWindowID && stableRoutingIdentityMatches(record, $0)
+                   })
+                {
+                    record.lastWindowID = nil
+                    changed = true
+                }
+                filtered.append(record)
+            }
+
+            if filtered.isEmpty {
+                routingState.records.removeValue(forKey: clientID)
+                lastWindowByClientSession.removeValue(forKey: clientID)
+                routingStateChanged = true
+                continue
+            }
+
+            if changed {
+                routingState.records[clientID] = filtered
+                routingStateChanged = true
+            }
+
+            // A numeric cache entry is usable only while its persisted record still
+            // carries a validated numeric hint. Stable affinity with no live target
+            // remains in routingState.records and is intentionally not pruned.
+            let validSessionKeys = Set<String>(filtered.compactMap { record in
+                guard record.lastWindowID != nil else { return nil }
+                return record.sessionKey
+            })
+            if var sessionMap = lastWindowByClientSession[clientID] {
+                let retained = sessionMap.filter { validSessionKeys.contains($0.key) }
+                if retained.isEmpty {
+                    lastWindowByClientSession.removeValue(forKey: clientID)
+                } else if retained != sessionMap {
+                    sessionMap = retained
+                    lastWindowByClientSession[clientID] = sessionMap
+                }
+            }
+        }
+
+        if routingStateChanged {
+            saveRoutingState()
+        }
+    }
+
+    #if DEBUG
+        func debugInstallPersistedRoutingFixtureForTesting(
+            records: [MCPRoutingState.ClientRecord],
+            cachedWindowIDs: [String: Int] = [:]
+        ) {
+            if debugPersistedRoutingFixtureBackup == nil {
+                debugPersistedRoutingFixtureBackup = DebugPersistedRoutingFixtureBackup(
+                    routingState: routingState,
+                    lastWindowByClientSession: lastWindowByClientSession,
+                    suppressRoutingStatePersistence: debugSuppressRoutingStatePersistenceForTesting,
+                    routingWindowSnapshotOverride: debugRoutingWindowSnapshotOverride
+                )
+            }
+
+            var recordsByClient: [String: [MCPRoutingState.ClientRecord]] = [:]
+            for record in records {
+                recordsByClient[record.clientID, default: []].append(record)
+            }
+            routingState = MCPRoutingState(records: recordsByClient)
+            lastWindowByClientSession = [:]
+            for record in records {
+                guard let sessionKey = record.sessionKey,
+                      let cachedWindowID = cachedWindowIDs[sessionKey]
+                else {
+                    continue
+                }
+                lastWindowByClientSession[record.clientID, default: [:]][sessionKey] = cachedWindowID
+            }
+            debugSuppressRoutingStatePersistenceForTesting = true
+        }
+
+        func debugRestorePersistedRoutingFixtureForTesting() {
+            guard let backup = debugPersistedRoutingFixtureBackup else { return }
+            routingState = backup.routingState
+            lastWindowByClientSession = backup.lastWindowByClientSession
+            debugSuppressRoutingStatePersistenceForTesting = backup.suppressRoutingStatePersistence
+            debugRoutingWindowSnapshotOverride = backup.routingWindowSnapshotOverride
+            debugPersistedRoutingFixtureBackup = nil
+        }
+
+        func debugSetRoutingWindowSnapshotForTesting(_ snapshot: [MCPRoutingWindowSnapshot]?) {
+            debugRoutingWindowSnapshotOverride = snapshot
+        }
+
+        func debugPreferredWindowIDForTesting(clientName: String, sessionKey: String?) async -> Int? {
+            await preferredWindowID(for: clientName, sessionKey: sessionKey)
+        }
+
+        func debugRoutingRecordsForTesting(clientName: String) -> [MCPRoutingState.ClientRecord] {
+            routingState.records[clientName] ?? []
+        }
+    #endif
+
     /// Persists routing state to disk synchronously to avoid race conditions.
     /// Called on the actor so state is always consistent.
     private func saveRoutingState() {
+        #if DEBUG
+            guard !debugSuppressRoutingStatePersistenceForTesting else { return }
+        #endif
         MCPRoutingStateStore.save(routingState)
     }
 
@@ -13455,90 +13731,61 @@ actor ServerNetworkManager {
         saveRoutingState()
     }
 
+    private func persistedRoutingResolution(
+        for clientName: String,
+        sessionKey: String?
+    ) async -> MCPPersistedRoutingResolution {
+        guard sessionKey != nil else {
+            return .none
+        }
+
+        await pruneRoutingRecords()
+        let freshRecords = freshPersistedRoutingRecords(for: clientName, sessionKey: sessionKey)
+        guard let record = freshRecords.sorted(by: { $0.lastSeenAt > $1.lastSeenAt }).first else {
+            return .none
+        }
+
+        let windowSnapshot = await routingWindowSnapshot()
+        for key in matchingClientKeys(for: clientName, in: Array(lastWindowByClientSession.keys)) {
+            guard let sessionKey,
+                  let cachedWindowID = lastWindowByClientSession[key]?[sessionKey],
+                  let liveWindow = windowSnapshot.first(where: { $0.windowID == cachedWindowID }),
+                  stableRoutingIdentityMatches(record, liveWindow)
+            else {
+                continue
+            }
+            return .resolved(windowID: cachedWindowID)
+        }
+
+        if let stableWindowID = stableRoutingWindowID(for: record, in: windowSnapshot) {
+            return .resolved(windowID: stableWindowID)
+        }
+        return .unresolved
+    }
+
+    private func persistedRoutingResolution(for connectionID: UUID) async -> MCPPersistedRoutingResolution {
+        guard let clientName = clientIdentifier(forConnection: connectionID) else {
+            return .none
+        }
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        return await persistedRoutingResolution(for: clientName, sessionKey: sessionKey)
+    }
+
     /// Returns the preferred window ID for a token-backed client session.
     /// Persisted routing is an affinity hint only; live run ownership is resolved separately
     /// from in-memory `liveRunAffinityByClientSession`.
     private func preferredWindowID(for clientName: String, sessionKey: String?) async -> Int? {
-        guard sessionKey != nil else {
-            mcpRoutingInternalDebugLog("[preferredWindowID] no sessionKey for client '\(clientName)' - returning nil")
-            return nil
-        }
-
-        mcpRoutingInternalDebugLog("[preferredWindowID] looking up client '\(clientName)' sessionKey '\(sessionKey!.prefix(8))...'")
-
-        await pruneRoutingRecords()
-
-        for key in matchingClientKeys(for: clientName, in: Array(lastWindowByClientSession.keys)) {
-            if let sessionKey, let win = lastWindowByClientSession[key]?[sessionKey] {
-                let exists = await WindowStatesManager.shared.hasWindow(id: win)
-                if exists {
-                    mcpRoutingInternalDebugLog("[preferredWindowID] fast path hit: client '\(clientName)' matchedKey '\(key)' window \(win)")
-                    return win
-                }
-            }
-        }
-
-        let matchedRecordKeys = matchingClientKeys(for: clientName, in: Array(routingState.records.keys))
-        let records = matchedRecordKeys.flatMap { routingState.records[$0] ?? [] }
-        guard !records.isEmpty else {
-            mcpRoutingInternalDebugLog("[preferredWindowID] no records for client '\(clientName)' - returning nil")
-            return nil
-        }
-
-        let now = Date()
-        let freshRecords = records.filter { record in
-            guard record.sessionKey != nil, now.timeIntervalSince(record.lastSeenAt) < routingRecordTTL else {
-                return false
-            }
-            if let sk = sessionKey {
-                return record.sessionKey == sk
-            }
-            return true
-        }
-
-        guard !freshRecords.isEmpty else {
+        mcpRoutingInternalDebugLog("[preferredWindowID] looking up client '\(clientName)' sessionKey '\(sessionKey?.prefix(8) ?? "nil")...'")
+        switch await persistedRoutingResolution(for: clientName, sessionKey: sessionKey) {
+        case let .resolved(windowID):
+            return windowID
+        case .none:
             mcpRoutingInternalDebugLog("[preferredWindowID] no fresh records matching sessionKey - returning nil")
             return nil
+        case .unresolved:
+            mcpRoutingInternalDebugLog("[preferredWindowID] stable affinity has no unique matching live window - returning nil")
+            return nil
         }
-
-        let sortedRecords = freshRecords.sorted { $0.lastSeenAt > $1.lastSeenAt }
-        let windowSnapshot: [(workspaceID: UUID?, instanceNumber: Int?, windowID: Int)] = await MainActor.run {
-            WindowStatesManager.shared.allWindows.map {
-                ($0.workspaceManager.activeWorkspace?.id, $0.workspaceInstanceNumber, $0.windowID)
-            }
-        }
-
-        for record in sortedRecords {
-            guard let ws = record.lastWorkspaceID, let inst = record.lastWorkspaceInstanceNumber else { continue }
-            if let match = windowSnapshot.first(where: { $0.workspaceID == ws && $0.instanceNumber == inst }) {
-                return match.windowID
-            }
-        }
-
-        for record in sortedRecords {
-            guard let ws = record.lastWorkspaceID else { continue }
-            let candidates = windowSnapshot.filter { $0.workspaceID == ws }
-            if candidates.count == 1 {
-                return candidates[0].windowID
-            }
-        }
-
-        for record in sortedRecords {
-            guard let wid = record.lastWindowID else { continue }
-            if windowSnapshot.contains(where: { $0.windowID == wid }) {
-                return wid
-            }
-        }
-
-        for record in sortedRecords {
-            guard let inst = record.lastWorkspaceInstanceNumber else { continue }
-            let candidates = windowSnapshot.filter { $0.instanceNumber == inst }
-            if candidates.count == 1 {
-                return candidates[0].windowID
-            }
-        }
-
-        return nil
     }
 
     /// Record a tool call occurrence for value scoring and history

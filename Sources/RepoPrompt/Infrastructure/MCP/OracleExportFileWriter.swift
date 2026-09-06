@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 struct GeneratedOracleExportFileWriter {
     let store: WorkspaceFileContextStore
@@ -30,6 +31,7 @@ struct GeneratedOracleExportFileWriter {
             throw MCPError.invalidParams("Cannot create generated Oracle export at '\(logicalPath)': path already exists.")
         }
 
+        let mutationRootMappings = await destination.lookupContext.domainMutationPhysicalRootMappings(store: store)
         let mutationService = WorkspaceFileMutationService(store: store)
         do {
             let writeResult = try await mutationService.createFileWithPostcondition(
@@ -37,7 +39,8 @@ struct GeneratedOracleExportFileWriter {
                 content: content,
                 overwrite: false,
                 rootScope: destination.lookupContext.rootScope,
-                pathResolutionPolicy: .literalPreferredIfStronger
+                pathResolutionPolicy: .literalPreferredIfStronger,
+                mutationRootMappings: mutationRootMappings
             )
             if let reason = writeResult.catalogIneligibility {
                 throw MCPError.invalidParams(
