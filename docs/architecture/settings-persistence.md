@@ -115,7 +115,7 @@ the preserved file until the user chooses an action:
 - **Save failure**: offer retry before reset. If a raw-preserving startup migration
   failed, retry repeats that same raw-preserving transaction; it records the typed document
   from the failed attempt and overlays only changed, explicitly owned known fields onto the
-  latest raw JSON, including known optional removals. Unknown root and nested fields remain,
+  unchanged observed raw JSON, including known optional removals. Unknown root and nested fields remain,
   and ordinary typed saves remain blocked until the preserving retry succeeds or the user
   explicitly chooses backup/reset.
 
@@ -128,12 +128,35 @@ stale mirror so the build default applies, and successful user-initiated recover
 resynchronizes the mirror from the replacement current-schema document. None of these
 mirror decisions bypass the blocked file's byte-preservation and save latch.
 
-Every save re-checks the on-disk header before writing. This matters because CE dev builds
-can share the live app support folder; a future/foreign file may appear after launch. This
-is a fail-closed header preflight, not a compare-and-swap transaction: it does not protect
-the read/merge/write interval from a non-cooperating older writer. The supported-writer
-ownership and atomic-CAS design for that interval remains unresolved in #806 and must not
-be represented as closed by this preflight.
+Current CE writers share a nonblocking transaction lock in `globalSettings.json.lock`.
+The stable sidecar is never deleted and contains no PID ownership protocol; the kernel
+releases the descriptor lock when a transaction finishes or its process exits. All settings
+mutation paths, including initialization, normalization, migrations, imports and recovery,
+hold that lock from raw read through backup/replacement and generation bookkeeping.
+Ordinary saves and migrations compare the exact on-disk bytes with the snapshot from which
+the live typed document was loaded. Another writer's change therefore requires reload even
+when both files have the same supported schema. Atomic replacement alone does not prevent
+lost updates, and a lock without this stale-input check would still permit them.
+
+A busy save offers retry. If a previously observed file is missing, explicit “Save current
+settings” can recreate it from retained in-memory values, but only after rechecking absence
+under the lock; an intervening replacement is rejected. Changed content or an initial
+read/lock failure offers explicit
+reload with a warning that unsaved in-memory edits will be replaced. Failed reload retains
+the live document. Provisional startup defaults are never authorized to overwrite a file;
+only confirmed first-time absence under the lock may create defaults. Successful reload
+retires old pending migration intent and computes migration from the newly loaded document.
+A failed explicit recovery retains its intended missing-file generation for retry after
+moving the original aside, and rejects any intervening replacement by another writer.
+Compatible import copies its backup before atomic replacement; a failed write keeps the
+original primary file and its preservation block, so retry repeats explicit import instead
+of saving provisional defaults.
+
+Close older CE versions before upgrading or using this shared settings location. Older
+released binaries and arbitrary external editors do not honor this cooperative protocol;
+the sidecar does not make them safe concurrent writers. Current debug and release builds
+use the same protocol and file identity. No lifetime app lock or new settings namespace is
+required for the supported cooperative-current-writer contract.
 
 Blocked-persistence warnings may be dismissed in workspace windows for the current app
 session. The store owns dismissal across workspace windows and clears it when the reason
