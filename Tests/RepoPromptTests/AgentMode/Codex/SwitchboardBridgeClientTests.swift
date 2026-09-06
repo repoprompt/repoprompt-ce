@@ -2,6 +2,78 @@
 import XCTest
 
 final class SwitchboardBridgeClientTests: XCTestCase {
+    func testCancelledRegistrationRevokesExactAttemptedBinding() async throws {
+        for variant in 0 ..< 3 {
+            let server = StubBridge()
+            let scope = SwitchboardBridgeTestData.scope(threadID: nil)
+            let client = try makeClient(server: server, scope: scope)
+            if variant == 2 { try await client.register(threadID: nil) }
+            let gate = ExchangeGate()
+            await server.setGate(gate, operation: "register")
+            let nativeID: String? = variant == 0 ? nil : "cancelled-native-thread"
+            let registration = Task { try await client.register(threadID: nativeID) }
+            await gate.waitUntilEntered()
+            registration.cancel()
+            await gate.release()
+            await assertError(.unavailable) { try await registration.value }
+            let requests = await server.requests
+            XCTAssertEqual(requests.count, variant == 2 ? 3 : 2)
+            XCTAssertEqual(requests.last?["op"], .string("revoke"))
+            XCTAssertEqual(requests.last?["thread_id"], nativeID.map(SwitchboardJSONValue.string) ?? .null)
+            XCTAssertEqual(requests.last?["controller_generation"], .string(scope.controllerGeneration.uuidString.lowercased()))
+            await client.revoke()
+            await assertError(.revoked) { _ = try await client.poll(lastSeenRevision: 0) }
+        }
+    }
+
+    func testExpiredRegistrationReplyRevokesExactAttemptedBinding() async throws {
+        for nativeID: String? in [nil, "expired-native-thread"] {
+            let clock = TestClock()
+            let server = StubBridge()
+            let gate = ExchangeGate()
+            await server.setGate(gate, operation: "register")
+            let client = try makeClient(server: server, scope: SwitchboardBridgeTestData.scope(threadID: nil), now: { clock.now })
+            let registration = Task { try await client.register(threadID: nativeID) }
+            await gate.waitUntilEntered()
+            clock.advance(to: 1200)
+            await gate.release()
+            await assertError(.expired) { try await registration.value }
+            let requests = await server.requests
+            XCTAssertEqual(requests.count, 2)
+            XCTAssertEqual(requests.last?["op"], .string("revoke"))
+            XCTAssertEqual(requests.last?["thread_id"], nativeID.map(SwitchboardJSONValue.string) ?? .null)
+            await client.revoke()
+            await assertError(.revoked) { try await client.register(threadID: nativeID) }
+        }
+    }
+
+    func testNativeBindingAfterInitialDeadlinePreservesEstablishedConsent() async throws {
+        let clock = TestClock()
+        let server = StubBridge()
+        let client = try makeClient(server: server, scope: SwitchboardBridgeTestData.scope(threadID: nil), now: { clock.now })
+        try await client.register(threadID: nil)
+        clock.advance(to: 1500)
+        try await client.register(threadID: "bound-after-deadline")
+        let grant = try await client.poll(lastSeenRevision: 0)
+        XCTAssertEqual(grant?.accountID, "synthetic-account-b")
+        let requests = await server.requests
+        XCTAssertFalse(requests.contains { $0["op"] == .string("revoke") })
+    }
+
+    func testMalformedRegistrationAcknowledgmentRevokesAttemptedBinding() async throws {
+        for result: [String: Any] in [["registered": false], ["registered": true, "unexpected": true]] {
+            let server = StubBridge()
+            await server.setRegistrationResult(result)
+            let client = try makeClient(server: server)
+            await assertError(.invalidRequest) { try await client.register(threadID: "original-thread") }
+            let requests = await server.requests
+            XCTAssertEqual(requests.count, 2)
+            XCTAssertEqual(requests.last?["op"], .string("revoke"))
+            XCTAssertEqual(requests.last?["thread_id"], .string("original-thread"))
+            await assertError(.revoked) { _ = try await client.poll(lastSeenRevision: 0) }
+        }
+    }
+
     func testRevocationDuringRegistrationCleansUpExactLateBinding() async throws {
         for variant in 0 ..< 3 {
             let server = StubBridge()
@@ -243,6 +315,7 @@ final class SwitchboardBridgeClientTests: XCTestCase {
 
     private actor StubBridge {
         var requests: [[String: SwitchboardJSONValue]] = []
+        private var registrationResult: [String: Any] = ["registered": true]
         private var selection: [String: Any]? = SwitchboardBridgeTestData.selection()
         private var error: Error?
         private var gate: ExchangeGate?
@@ -250,6 +323,10 @@ final class SwitchboardBridgeClientTests: XCTestCase {
 
         func setSelection(_ value: [String: Any]?) {
             selection = value
+        }
+
+        func setRegistrationResult(_ value: [String: Any]) {
+            registrationResult = value
         }
 
         func setError(_ value: Error?) {
@@ -269,7 +346,7 @@ final class SwitchboardBridgeClientTests: XCTestCase {
             if let error { throw error }
             let result: [String: Any]
             switch op {
-            case "register": result = ["registered": true]
+            case "register": result = registrationResult
             case "poll", "refresh": result = ["selection": selection.map { $0 as Any } ?? NSNull()]
             case "status": result = ["accepted": true]
             case "revoke": result = ["revoked": true]

@@ -46,7 +46,7 @@ def emit(value):
 
 def run():
     source, expected_parent, directory, fault = sys.argv[1:]
-    if int(expected_parent) != os.getppid() or fault not in {"none", "refresh_identity", "hold_register"}:
+    if int(expected_parent) != os.getppid() or fault not in {"none", "refresh_identity", "hold_register", "hold_native_bind"}:
         raise RuntimeError("fixture_invalid")
     sys.addaudithook(audit)
     source_bytes = Path(source).read_bytes()
@@ -81,12 +81,13 @@ def run():
     runtime = bridge.Bridge(provider)
     registration_bound = threading.Event()
     release_registration = threading.Event()
-    if fault == "hold_register":
+    if fault in {"hold_register", "hold_native_bind"}:
         original_handle = runtime.handle
 
         def gated_handle(request, peer, **kwargs):
             response = original_handle(request, peer, **kwargs)
-            if request.get("op") == "register" and response.get("result") == {"registered": True}:
+            if (request.get("op") == "register" and response.get("result") == {"registered": True}
+                    and (fault == "hold_register" or request.get("thread_id") is not None)):
                 registration_bound.set()
                 release_registration.wait(timeout=2.5)
             return response

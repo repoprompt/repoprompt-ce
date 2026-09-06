@@ -5,6 +5,48 @@ import XCTest
 /// Opt-in companion-repository acceptance. Production Swift client and Python
 /// server communicate over a real private socket; only the grant source is fake.
 final class SwitchboardBridgeCrossLanguageTests: XCTestCase {
+    func testActualServerRevokesCancelledRegistrationAndNativeBind() async throws {
+        for variant in 0 ..< 3 {
+            let fixture = try PythonFixture(fault: variant == 2 ? "hold_native_bind" : "hold_register")
+            defer { fixture.finish() }
+            let client = try SwitchboardBridgeClient(pairing: fixture.pairing(), scope: SwitchboardBridgeTestData.scope(threadID: nil))
+            if variant == 2 { try await client.register(threadID: nil) }
+            let nativeID: String? = variant == 0 ? nil : "cancelled-native-thread"
+            let registration = Task { try await client.register(threadID: nativeID) }
+            XCTAssertEqual(try fixture.command("wait_registration")["bound"] as? Bool, true)
+            registration.cancel()
+            XCTAssertEqual(try fixture.command("release_registration")["released"] as? Bool, true)
+            await assertError(.unavailable) { try await registration.value }
+            let receipt = try fixture.command("status")
+            XCTAssertEqual(try fixture.status(receipt)["state"] as? String, "revoked")
+            XCTAssertEqual(try fixture.status(receipt)["switchable"] as? Bool, false)
+            XCTAssertEqual(receipt["redacted"] as? Bool, true)
+            XCTAssertEqual(try fixture.command("queue_a")["queued"] as? Int, 0)
+            await client.revoke()
+        }
+    }
+
+    func testActualServerRevokesRegistrationReplyPastInitialDeadline() async throws {
+        for nativeID: String? in [nil, "expired-native-thread"] {
+            let fixture = try PythonFixture(fault: "hold_register")
+            defer { fixture.finish() }
+            let pairing = try fixture.pairing()
+            let clock = RegistrationClock()
+            let client = SwitchboardBridgeClient(pairing: pairing, scope: SwitchboardBridgeTestData.scope(threadID: nil), now: { clock.now })
+            let registration = Task { try await client.register(threadID: nativeID) }
+            XCTAssertEqual(try fixture.command("wait_registration")["bound"] as? Bool, true)
+            clock.advance(to: pairing.expiresAt)
+            XCTAssertEqual(try fixture.command("release_registration")["released"] as? Bool, true)
+            await assertError(.expired) { try await registration.value }
+            let receipt = try fixture.command("status")
+            XCTAssertEqual(try fixture.status(receipt)["state"] as? String, "revoked")
+            XCTAssertEqual(try fixture.status(receipt)["switchable"] as? Bool, false)
+            XCTAssertEqual(receipt["redacted"] as? Bool, true)
+            XCTAssertEqual(try fixture.command("queue_a")["queued"] as? Int, 0)
+            await client.revoke()
+        }
+    }
+
     func testActualPythonServerPreservesAppliedRefreshWhileNewerAccountWaits() async throws {
         let fixture = try PythonFixture()
         defer { fixture.finish() }
@@ -121,6 +163,18 @@ final class SwitchboardBridgeCrossLanguageTests: XCTestCase {
             XCTFail("Expected stable cross-language refusal", file: file, line: line)
         } catch {
             XCTAssertEqual(error as? SwitchboardBridgeError, expected, file: file, line: line)
+        }
+    }
+
+    private final class RegistrationClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = Date()
+        var now: Date {
+            lock.withLock { value }
+        }
+
+        func advance(to date: Date) {
+            lock.withLock { value = date }
         }
     }
 

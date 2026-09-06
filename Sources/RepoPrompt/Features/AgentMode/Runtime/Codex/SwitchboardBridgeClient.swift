@@ -51,17 +51,24 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
     func register(threadID: String?) async throws {
         guard scope.threadID == nil || scope.threadID == threadID else { throw SwitchboardBridgeError.identityMismatch }
         if let threadID { try validateText(threadID) }
+        guard let attemptedPairing = pairing else { throw SwitchboardBridgeError.revoked }
         let result = try await request(op: "register", threadID: threadID)
-        try result.requireKeys(["registered"])
-        guard result["registered"] == .bool(true) else { throw SwitchboardBridgeError.invalidRequest }
-        guard let pairing else { throw SwitchboardBridgeError.revoked }
-        // A registration must complete within the envelope's initial deadline.
-        if !registered, pairing.expiresAt <= now() {
-            self.pairing = nil
-            throw SwitchboardBridgeError.expired
+        do {
+            guard pairing != nil else { throw SwitchboardBridgeError.revoked }
+            try result.requireKeys(["registered"])
+            guard result["registered"] == .bool(true) else { throw SwitchboardBridgeError.invalidRequest }
+            try Task.checkCancellation()
+            // Only the first registration must complete within this deadline.
+            if !registered, attemptedPairing.expiresAt <= now() { throw SwitchboardBridgeError.expired }
+            registered = true
+            scope.threadID = threadID
+        } catch {
+            // The server may already have bound even a rejected acknowledgment.
+            // Invalidate locally before awaiting exact-attempt remote cleanup.
+            pairing = nil
+            await sendRevocation(attemptedPairing, threadID: threadID)
+            throw error as? SwitchboardBridgeError ?? .unavailable
         }
-        registered = true
-        scope.threadID = threadID
     }
 
     func poll(lastSeenRevision: Int64) async throws -> CodexAccountAdoptionGrant? {
@@ -159,15 +166,13 @@ actor SwitchboardBridgeClient: CustomStringConvertible, CustomDebugStringConvert
             try Task.checkCancellation()
             return try SwitchboardBridgeWire.response(response, requestID: requestID)
         } catch {
-            if self.pairing == nil {
-                // A first registration (or native bind) can complete remotely
-                // after local revocation. Retire that exact late binding before
-                // releasing this operation; never restore local consent.
+            let stable = self.pairing == nil ? .revoked : (error as? SwitchboardBridgeError ?? .unavailable)
+            if op == "register" || [.unauthorized, .revoked, .unavailable, .invalidRequest].contains(stable) {
+                self.pairing = nil
+                // Cancellation, lost replies, and explicit revocation can all
+                // abandon a registration that completed on the server.
                 if op == "register" { await sendRevocation(pairing, threadID: nativeID) }
-                throw SwitchboardBridgeError.revoked
             }
-            let stable = error as? SwitchboardBridgeError ?? .unavailable
-            if [.unauthorized, .revoked, .unavailable, .invalidRequest].contains(stable) { self.pairing = nil }
             throw stable
         }
     }
