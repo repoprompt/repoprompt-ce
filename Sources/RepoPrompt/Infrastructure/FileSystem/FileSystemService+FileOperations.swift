@@ -15,6 +15,7 @@ private let fileSystemMutationIOQueue = DispatchQueue(
 private struct FileSystemMutationIOExecutor {
     let operation: FileSystemUncancellableMutation
     let physicalMutationGuard: DomainMutationPhysicalCommitGuard?
+    let physicalMutationCapability: DomainMutationPhysicalCapability?
     let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)?
 
     func callAsFunction(_ io: @escaping @Sendable () throws -> Void) async throws {
@@ -22,7 +23,9 @@ private struct FileSystemMutationIOExecutor {
             fileSystemMutationIOQueue.async {
                 willExecute?(operation)
                 do {
-                    try physicalMutationGuard?.revalidate()
+                    if physicalMutationCapability == nil {
+                        try physicalMutationGuard?.revalidate()
+                    }
                     try io()
                     continuation.resume()
                 } catch {
@@ -119,11 +122,13 @@ extension FileSystemService {
                 let willBegin: (@Sendable (FileSystemUncancellableMutation) async -> Void)? = nil
                 let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)? = nil
             #endif
+            let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
             try await MCPDomainMutationCommitContext.willCommit()
             let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
             let executor = FileSystemMutationIOExecutor(
                 operation: operation,
                 physicalMutationGuard: physicalMutationGuard,
+                physicalMutationCapability: physicalMutationCapability,
                 willExecute: willExecute
             )
             let task = Task.detached(priority: .utility) {
@@ -312,18 +317,27 @@ extension FileSystemService {
             throw FileSystemError.fileAlreadyExists
         }
 
-        let destDir = (newFull as NSString).deletingLastPathComponent
-        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
-        try physicalMutationGuard?.revalidate()
-        try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
-        _ = try mutationTarget(forRelativePath: newTarget.relativePath)
+        let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
+        if let physicalMutationCapability {
+            try physicalMutationCapability.validateNoReplaceMove(from: oldFull, to: newFull)
+        } else {
+            let destDir = (newFull as NSString).deletingLastPathComponent
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+            try physicalMutationGuard?.revalidate()
+            try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
+            _ = try mutationTarget(forRelativePath: newTarget.relativePath)
+        }
 
         let mutation = try await startUncancellableMutation(
             .move,
             relativePaths: [oldTarget.relativePath, newTarget.relativePath]
         ) { executor in
             try await executor {
-                try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
+                if let capability = executor.physicalMutationCapability {
+                    try capability.moveFile(from: oldFull, to: newFull)
+                } else {
+                    try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
+                }
             }
         }
         Task.detached { [weak self] in
@@ -334,7 +348,8 @@ extension FileSystemService {
                     oldRelativePath: oldTarget.relativePath,
                     newRelativePath: newTarget.relativePath,
                     oldFullPath: oldFull,
-                    newFullPath: newFull
+                    newFullPath: newFull,
+                    physicalMutationCapability: physicalMutationCapability
                 )
             } catch {
                 await self?.completeMutationWaiter(
@@ -351,17 +366,26 @@ extension FileSystemService {
         oldRelativePath: String,
         newRelativePath: String,
         oldFullPath: String,
-        newFullPath: String
+        newFullPath: String,
+        physicalMutationCapability: DomainMutationPhysicalCapability?
     ) async {
         switch await catalogRegularFileEligibility(relativePath: newRelativePath) {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
-            do {
-                try await Self.performBlockingMutationIO {
-                    try FileManager.default.moveItem(atPath: newFullPath, toPath: oldFullPath)
+            if physicalMutationCapability == nil {
+                do {
+                    try await Self.performBlockingMutationIO {
+                        try FileManager.default.moveItem(atPath: newFullPath, toPath: oldFullPath)
+                    }
+                } catch {
+                    forgetTrackedPath(oldRelativePath)
+                    publishFileSystemDeltas(
+                        [.fileRemoved(oldRelativePath), .fileAdded(newRelativePath)],
+                        source: .syntheticMutation
+                    )
                 }
-            } catch {
+            } else {
                 forgetTrackedPath(oldRelativePath)
                 publishFileSystemDeltas(
                     [.fileRemoved(oldRelativePath), .fileAdded(newRelativePath)],
@@ -387,20 +411,44 @@ extension FileSystemService {
         completeMutationWaiter(mutationID)
     }
 
-    func createFile(atRelativePath relativePath: String, content: String) async throws {
+    func createFile(
+        atRelativePath relativePath: String,
+        content: String,
+        overwrite: Bool = false
+    ) async throws {
         try Task.checkCancellation()
         let fm = fm
         let target = try mutationTarget(forRelativePath: relativePath)
         let fullPath = target.url.path
         let fullURL = target.url
 
-        let directoryURL = fullURL.deletingLastPathComponent()
-        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
-        try physicalMutationGuard?.revalidate()
-        try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
-        _ = try mutationTarget(forRelativePath: target.relativePath)
-        guard !fm.fileExists(atPath: fullPath, isDirectory: nil) else {
-            throw FileSystemError.fileAlreadyExists
+        let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
+        if let physicalMutationCapability {
+            do {
+                try physicalMutationCapability.validateWriteTarget(
+                    at: fullPath,
+                    overwrite: overwrite,
+                    expectedContentDigest: nil,
+                    requireExisting: false
+                )
+            } catch DomainMutationPhysicalCapabilityError.destinationExists {
+                throw FileSystemError.fileAlreadyExists
+            }
+        } else {
+            let directoryURL = fullURL.deletingLastPathComponent()
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+            try physicalMutationGuard?.revalidate()
+            try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
+            _ = try mutationTarget(forRelativePath: target.relativePath)
+            var isDirectory = ObjCBool(false)
+            if fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) {
+                if isDirectory.boolValue {
+                    throw FileSystemError.isDirectory
+                }
+                guard overwrite else {
+                    throw FileSystemError.fileAlreadyExists
+                }
+            }
         }
 
         // Materializing a large Swift String as UTF-8 is synchronous and potentially expensive.
@@ -408,8 +456,14 @@ extension FileSystemService {
         // the actor-owned waiter while preparation and the uncancellable disk write continue.
         #if DEBUG
             let dataPreparation = createFileDataPreparationForTesting
+            let exclusiveRename = createFileExclusiveRenameForTesting
+            let posixFailureAfterOpen = createFilePOSIXFailureAfterOpenForTesting
+            let fallbackPOSIXFailureAfterOpen = createFileFallbackPOSIXFailureAfterOpenForTesting
         #else
             let dataPreparation: (@Sendable (String) async throws -> Data)? = nil
+            let exclusiveRename: (@Sendable (String, String) -> Int32)? = nil
+            let posixFailureAfterOpen: Int32? = nil
+            let fallbackPOSIXFailureAfterOpen: (@Sendable (String) -> Int32)? = nil
         #endif
         let mutation = try await startUncancellableMutation(
             .create,
@@ -428,7 +482,29 @@ extension FileSystemService {
                 )
             }
             try await executor {
-                try FileSystemService.writeFileRobust(to: fullURL, data: data)
+                if let capability = executor.physicalMutationCapability {
+                    do {
+                        try capability.writeFile(
+                            at: fullPath,
+                            data: data,
+                            overwrite: overwrite,
+                            expectedContentDigest: nil,
+                            requireExisting: false
+                        )
+                    } catch DomainMutationPhysicalCapabilityError.destinationExists {
+                        throw FileSystemError.fileAlreadyExists
+                    }
+                } else if overwrite {
+                    try FileSystemService.writeFileRobust(to: fullURL, data: data)
+                } else {
+                    try FileSystemService.writeFileNoClobber(
+                        to: fullURL,
+                        data: data,
+                        exclusiveRename: exclusiveRename,
+                        posixFailureAfterOpen: posixFailureAfterOpen,
+                        fallbackPOSIXFailureAfterOpen: fallbackPOSIXFailureAfterOpen
+                    )
+                }
             }
         }
         Task.detached { [weak self] in
@@ -437,7 +513,18 @@ extension FileSystemService {
                 await self?.reconcileCreatedFile(
                     mutationID: mutation.id,
                     relativePath: target.relativePath,
-                    url: fullURL
+                    url: fullURL,
+                    physicalMutationCapability: physicalMutationCapability
+                )
+            } catch FileSystemError.fileAlreadyExists {
+                await self?.completeMutationWaiter(
+                    mutation.id,
+                    error: FileSystemError.fileAlreadyExists
+                )
+            } catch let error as FileSystemError {
+                await self?.completeMutationWaiter(
+                    mutation.id,
+                    error: error
                 )
             } catch {
                 await self?.completeMutationWaiter(
@@ -452,15 +539,18 @@ extension FileSystemService {
     private func reconcileCreatedFile(
         mutationID: UUID,
         relativePath: String,
-        url: URL
+        url: URL,
+        physicalMutationCapability: DomainMutationPhysicalCapability?
     ) async {
         fileSystemDebugLog("File created at \(url.path)")
         switch await catalogRegularFileEligibility(relativePath: relativePath) {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
-            _ = try? await Self.performBlockingMutationIO {
-                try FileManager.default.removeItem(at: url)
+            if physicalMutationCapability == nil {
+                _ = try? await Self.performBlockingMutationIO {
+                    try FileManager.default.removeItem(at: url)
+                }
             }
             forgetTrackedPath(relativePath)
             completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
@@ -709,18 +799,40 @@ extension FileSystemService {
                 )
             )
         }
+        let expectedContentDigest = expectedOriginalContent.flatMap { original in
+            original.data(using: encoding).map(DomainContentDigest.sha256)
+        }
+        let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
+        if let physicalMutationCapability {
+            try physicalMutationCapability.validateWriteTarget(
+                at: fullPath,
+                overwrite: true,
+                expectedContentDigest: expectedContentDigest,
+                requireExisting: true
+            )
+        }
         let mutation = try await startUncancellableMutation(
             .edit,
             relativePaths: [target.relativePath]
         ) { executor in
             try await executor {
-                if let expectedOriginalContent {
-                    let currentData = try Data(contentsOf: fullURL)
-                    guard String(data: currentData, encoding: encoding) == expectedOriginalContent else {
-                        throw FileSystemError.fileContentChanged
+                if let capability = executor.physicalMutationCapability {
+                    try capability.writeFile(
+                        at: fullPath,
+                        data: data,
+                        overwrite: true,
+                        expectedContentDigest: expectedContentDigest,
+                        requireExisting: true
+                    )
+                } else {
+                    if let expectedOriginalContent {
+                        let currentData = try Data(contentsOf: fullURL)
+                        guard String(data: currentData, encoding: encoding) == expectedOriginalContent else {
+                            throw FileSystemError.fileContentChanged
+                        }
                     }
+                    try FileSystemService.writeFileRobust(to: fullURL, data: data)
                 }
-                try FileSystemService.writeFileRobust(to: fullURL, data: data)
             }
         }
         Task.detached { [weak self] in
@@ -730,7 +842,8 @@ extension FileSystemService {
                     mutationID: mutation.id,
                     relativePath: target.relativePath,
                     encoding: encoding,
-                    modificationPublicationPolicy: modificationPublicationPolicy
+                    modificationPublicationPolicy: modificationPublicationPolicy,
+                    physicalMutationCapability: physicalMutationCapability
                 )
             } catch FileSystemError.fileContentChanged {
                 await self?.completeMutationWaiter(
@@ -758,7 +871,8 @@ extension FileSystemService {
         mutationID: UUID,
         relativePath: String,
         encoding: String.Encoding,
-        modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy
+        modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy,
+        physicalMutationCapability: DomainMutationPhysicalCapability?
     ) async {
         switch await catalogRegularFileEligibility(relativePath: relativePath) {
         case .eligible, .ineligible(.ignored):
@@ -773,7 +887,9 @@ extension FileSystemService {
         encodingMap[relativePath] = encoding
         visitedPaths.insert(relativePath)
         visitedItems[relativePath] = false
-        let modificationDate = try? await getFileModificationDate(atRelativePath: relativePath)
+        let modificationDate = physicalMutationCapability == nil
+            ? try? await getFileModificationDate(atRelativePath: relativePath)
+            : nil
         let deferredPublication = FileSystemDeferredEditPublication(
             relativePath: relativePath,
             modificationDate: modificationDate
@@ -839,14 +955,117 @@ extension FileSystemService {
         try data.write(to: url, options: .atomic) // blocking write
     }
 
+    /// Creates a file without replacing a destination that appears after preflight.
+    ///
+    /// The temporary-file publication keeps the normal local-filesystem path atomic. The
+    /// exclusive-open fallback is for filesystems that do not support RENAME_EXCL; neither
+    /// path can replace or truncate an existing destination.
+    private static func writeFileNoClobber(
+        to url: URL,
+        data: Data,
+        exclusiveRename: (@Sendable (String, String) -> Int32)? = nil,
+        posixFailureAfterOpen: Int32? = nil,
+        fallbackPOSIXFailureAfterOpen: (@Sendable (String) -> Int32)? = nil
+    ) throws {
+        let temporaryURL = url.deletingLastPathComponent()
+            .appendingPathComponent(".repoprompt.create.\(UUID().uuidString).tmp")
+        var temporaryExists = false
+        defer {
+            if temporaryExists {
+                _ = unlink(temporaryURL.path)
+            }
+        }
+
+        try writeFilePOSIXNoClobber(
+            to: temporaryURL,
+            data: data,
+            postOpenFailure: posixFailureAfterOpen,
+            didOpen: { temporaryExists = true }
+        )
+
+        let renameError: Int32
+        if let exclusiveRename {
+            let simulatedError = exclusiveRename(temporaryURL.path, url.path)
+            if simulatedError == 0 {
+                temporaryExists = false
+                return
+            }
+            renameError = simulatedError
+        } else {
+            let renameResult = renamex_np(
+                temporaryURL.path,
+                url.path,
+                UInt32(RENAME_EXCL)
+            )
+            if renameResult == 0 {
+                temporaryExists = false
+                return
+            }
+            renameError = errno
+        }
+        if renameError == EEXIST {
+            throw FileSystemError.fileAlreadyExists
+        }
+        guard renameError == EINVAL ||
+            renameError == ENOTSUP ||
+            renameError == EOPNOTSUPP ||
+            renameError == ENOSYS
+        else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(renameError),
+                userInfo: [NSLocalizedDescriptionKey: "renamex_np(RENAME_EXCL) failed for \(url.path) (\(renameError))"]
+            )
+        }
+
+        // Some external filesystems do not implement RENAME_EXCL. Claim the destination
+        // directly with O_EXCL rather than falling back to replacement semantics. Never remove
+        // the destination here: another writer may have claimed it while rename was unsupported.
+        // Once O_EXCL succeeds, a later write/fsync/close failure retains the claimed path and
+        // reports an explicitly incomplete result instead of attempting a racy unlink.
+        try writeFilePOSIXNoClobber(
+            to: url,
+            data: data,
+            postOpenFailureProvider: fallbackPOSIXFailureAfterOpen,
+            preservePartialOutputOnFailure: true
+        )
+    }
+
+    private static func writeFilePOSIXNoClobber(
+        to url: URL,
+        data: Data,
+        postOpenFailure: Int32? = nil,
+        didOpen: (() -> Void)? = nil,
+        postOpenFailureProvider: (@Sendable (String) -> Int32)? = nil,
+        preservePartialOutputOnFailure: Bool = false
+    ) throws {
+        do {
+            try writeFilePOSIX(
+                to: url,
+                data: data,
+                openFlags: O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                postOpenFailure: postOpenFailure,
+                didOpen: didOpen,
+                postOpenFailureProvider: postOpenFailureProvider,
+                preservePartialOutputOnFailure: preservePartialOutputOnFailure
+            )
+        } catch let error as NSError where
+            error.domain == NSPOSIXErrorDomain && error.code == Int(EEXIST)
+        {
+            throw FileSystemError.fileAlreadyExists
+        }
+    }
+
     /// Robust write that works across external/network volumes:
     /// 1) try atomic write
-    /// 2) write to temp in the same directory then move into place (delete destination if needed)
+    /// 2) write to temp in the same directory then replace with POSIX rename
     /// 3) POSIX open(O_CREAT|O_TRUNC)+write+fsync fallback
     private static func writeFileRobust(
         to url: URL,
         data: Data
     ) throws {
+        try rejectDirectory(at: url)
+
         // Fast path: try Foundation's atomic write first.
         do {
             try data.write(to: url, options: [.atomic])
@@ -859,16 +1078,25 @@ extension FileSystemService {
         let dirURL = url.deletingLastPathComponent()
         let tmpURL = dirURL.appendingPathComponent(".repoprompt.tmp.\(UUID().uuidString)")
 
-        // Fallback #1: write to temp in the same directory then move/replace.
+        // Fallback #1: write to temp in the same directory then replace with rename. POSIX rename
+        // cannot remove a destination directory when the source is a regular file.
         do {
             try data.write(to: tmpURL, options: [])
-            if fm.fileExists(atPath: url.path) {
-                // Removing the destination first avoids exchange/rename restrictions on some filesystems
-                // (exFAT/SMB may reject replace semantics).
-                try? fm.removeItem(at: url)
+            guard rename(tmpURL.path, url.path) == 0 else {
+                let code = errno
+                if code == EISDIR || code == ENOTDIR || isDirectory(at: url) {
+                    throw FileSystemError.isDirectory
+                }
+                throw NSError(
+                    domain: NSPOSIXErrorDomain,
+                    code: Int(code),
+                    userInfo: [NSLocalizedDescriptionKey: "rename() failed for \(url.path) (\(code))"]
+                )
             }
-            try fm.moveItem(at: tmpURL, to: url)
             return
+        } catch FileSystemError.isDirectory {
+            try? fm.removeItem(at: tmpURL)
+            throw FileSystemError.isDirectory
         } catch {
             // Clean up temp if it remains
             try? fm.removeItem(at: tmpURL)
@@ -881,12 +1109,20 @@ extension FileSystemService {
     /// Low-level write that avoids Foundation's atomic/replace semantics entirely.
     private static func writeFilePOSIX(
         to url: URL,
-        data: Data
+        data: Data,
+        openFlags: Int32 = O_WRONLY | O_CREAT | O_TRUNC,
+        postOpenFailure: Int32? = nil,
+        didOpen: (() -> Void)? = nil,
+        postOpenFailureProvider: (@Sendable (String) -> Int32)? = nil,
+        preservePartialOutputOnFailure: Bool = false
     ) throws {
         let path = url.path
-        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        let fd = open(path, openFlags, 0o644)
         if fd == -1 {
             let code = errno
+            if code == EISDIR {
+                throw FileSystemError.isDirectory
+            }
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(code),
@@ -894,24 +1130,27 @@ extension FileSystemService {
             )
         }
 
-        var writeError: Int32 = 0
-        data.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) in
-            guard var base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            var remaining = data.count
-            while remaining > 0 {
-                let n = Darwin.write(fd, base, remaining)
-                if n < 0 {
-                    writeError = errno
-                    break
+        didOpen?()
+        var writeError: Int32 = postOpenFailure ?? postOpenFailureProvider?(path) ?? 0
+        if writeError == 0 {
+            data.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) in
+                guard var base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                var remaining = data.count
+                while remaining > 0 {
+                    let n = Darwin.write(fd, base, remaining)
+                    if n < 0 {
+                        writeError = errno
+                        break
+                    }
+                    if n == 0 {
+                        // A zero-byte write makes no progress. Treat it as I/O failure instead of
+                        // spinning forever inside an uncancellable mutation worker.
+                        writeError = EIO
+                        break
+                    }
+                    remaining -= n
+                    base = base.advanced(by: n)
                 }
-                if n == 0 {
-                    // A zero-byte write makes no progress. Treat it as I/O failure instead of
-                    // spinning forever inside an uncancellable mutation worker.
-                    writeError = EIO
-                    break
-                }
-                remaining -= n
-                base = base.advanced(by: n)
             }
         }
 
@@ -924,19 +1163,38 @@ extension FileSystemService {
         // Always attempt to close; prefer first error if any.
         let closeResult = close(fd)
         if writeError != 0 {
-            throw NSError(
+            let error = NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(writeError),
                 userInfo: [NSLocalizedDescriptionKey: "write/fsync failed for \(path) (\(writeError))"]
             )
+            if preservePartialOutputOnFailure {
+                throw FileSystemError.incompleteFileCreation(path: path, underlying: error)
+            }
+            throw error
         }
         if closeResult != 0 {
             let code = errno
-            throw NSError(
+            let error = NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(code),
                 userInfo: [NSLocalizedDescriptionKey: "close() failed for \(path) (\(code))"]
             )
+            if preservePartialOutputOnFailure {
+                throw FileSystemError.incompleteFileCreation(path: path, underlying: error)
+            }
+            throw error
+        }
+    }
+
+    private static func isDirectory(at url: URL) -> Bool {
+        var isDirectory = ObjCBool(false)
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    private static func rejectDirectory(at url: URL) throws {
+        if isDirectory(at: url) {
+            throw FileSystemError.isDirectory
         }
     }
 }

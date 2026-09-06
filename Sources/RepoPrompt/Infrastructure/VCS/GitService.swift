@@ -1591,6 +1591,16 @@ actor GitService {
         else { return nil }
         let includeURL = sourceRepoURL.appendingPathComponent(".worktreeinclude", isDirectory: false)
         guard FileManager.default.fileExists(atPath: includeURL.path) else { return nil }
+        let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
+        if MCPDomainMutationCommitContext.controller != nil, physicalMutationCapability == nil {
+            return GitWorktreeIncludeCopyResult(
+                copiedCount: 0,
+                matchedCount: 0,
+                errorSummaries: [
+                    "protected .worktreeinclude copying is unsupported without a descriptor-backed capability"
+                ]
+            )
+        }
         let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
 
         do {

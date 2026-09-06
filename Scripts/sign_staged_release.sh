@@ -91,7 +91,9 @@ security cms -D -i "$REPOPROMPT_PROVISIONING_PROFILE" -o "$profile_plist"
 profile_app_identifier="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null || true)"
 [[ "$profile_app_identifier" == "$EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER" ]] ||
     fail "Provisioning profile app identifier mismatch: expected $EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER, got ${profile_app_identifier:-<missing>}"
-cp "$REPOPROMPT_PROVISIONING_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
+python3 "$SCRIPT_DIR/embedded_provisioning_profile.py" install \
+    "$REPOPROMPT_PROVISIONING_PROFILE" \
+    "$APP_BUNDLE/Contents/embedded.provisionprofile"
 python3 - "$ENTITLEMENTS_TEMPLATE" "$app_entitlements" "$BUNDLE_ID" "$SIGNING_TEAM_ID" <<'PYTHON'
 import sys
 from pathlib import Path
@@ -193,6 +195,8 @@ sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+python3 "$SCRIPT_DIR/embedded_provisioning_profile.py" validate \
+    "$APP_BUNDLE/Contents/embedded.provisionprofile"
 codesign --verify --strict --verbose=2 -R="$EXPECTED_APP_REQUIREMENT" "$APP_BUNDLE"
 python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --manifest "$CODEX_MANIFEST" verify-bundle \

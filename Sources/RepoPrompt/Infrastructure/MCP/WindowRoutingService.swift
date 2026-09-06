@@ -372,13 +372,45 @@ final class WindowRoutingService: Service {
         case unhide
     }
 
+    nonisolated static func workspaceInventoryModels(
+        _ workspaces: [WorkspaceModel],
+        authorityIncompleteWorkspaceIDs: Set<UUID>,
+        includeHidden: Bool
+    ) -> [WorkspaceModel] {
+        workspaces.compactMap { workspace in
+            var presented = workspace
+            if authorityIncompleteWorkspaceIDs.contains(presented.id) {
+                presented.isHiddenInMenus = true
+            }
+            return includeHidden || !presented.isHiddenInMenus ? presented : nil
+        }
+    }
+
+    private func loadWorkspaceInventorySnapshot(
+        from referenceManager: WorkspaceManagerViewModel,
+        includeHidden: Bool
+    ) async -> [WorkspaceModel] {
+        let workspaces = await referenceManager.loadWorkspaceSnapshotFromDisk()
+        let incompleteIDs = await MainActor.run {
+            referenceManager.pendingConsolidatedRestoreIDs
+        }
+        return Self.workspaceInventoryModels(
+            workspaces,
+            authorityIncompleteWorkspaceIDs: incompleteIDs,
+            includeHidden: includeHidden
+        )
+    }
+
     private func loadWorkspaceDiskSnapshot() async throws -> [WorkspaceModel] {
         guard let referenceManager = await MainActor.run(body: {
             self.windowStates.allWindows.first?.workspaceManager
         }) else {
             throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
         }
-        return await referenceManager.loadWorkspaceSnapshotFromDisk()
+        return await loadWorkspaceInventorySnapshot(
+            from: referenceManager,
+            includeHidden: true
+        )
     }
 
     private nonisolated static func availableWorkspaceSuggestion(_ workspaces: [WorkspaceModel], includeHidden: Bool) -> String {
@@ -1097,7 +1129,10 @@ final class WindowRoutingService: Service {
             throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
         }
         let activeWindowSnapshots = Self.activeWorkspaceSnapshots(from: windows)
-        let diskWorkspaces = await inventoryWindow.workspaceManager.loadWorkspaceSnapshotFromDisk()
+        let diskWorkspaces = await loadWorkspaceInventorySnapshot(
+            from: inventoryWindow.workspaceManager,
+            includeHidden: false
+        )
         return Self.collapsedWorkspaceMatches(
             normalizedWorkingDirs: normalizedWorkingDirs,
             kind: kind,
@@ -1117,7 +1152,10 @@ final class WindowRoutingService: Service {
             throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
         }
         let activeWindowSnapshots = Self.activeWorkspaceSnapshots(from: windows)
-        let diskWorkspaces = await inventoryWindow.workspaceManager.loadWorkspaceSnapshotFromDisk()
+        let diskWorkspaces = await loadWorkspaceInventorySnapshot(
+            from: inventoryWindow.workspaceManager,
+            includeHidden: false
+        )
         return Self.collapsedWorkspaceMatches(
             normalizedWorkingDirs: normalizedWorkingDirs,
             kind: kind,
@@ -1745,7 +1783,10 @@ final class WindowRoutingService: Service {
         }
 
         let approvalWindow = try await resolveWorkspaceApprovalWindow(requestedWindowID: windowID, openInNewWindow: true)
-        let existingWorkspaces = await approvalWindow.workspaceManager.loadWorkspaceSnapshotFromDisk()
+        let existingWorkspaces = await loadWorkspaceInventorySnapshot(
+            from: approvalWindow.workspaceManager,
+            includeHidden: true
+        )
         let workspaceName = derivedWorkspaceName(
             normalizedWorkingDirs: normalizedWorkingDirs,
             creationNameHint: tabName,
@@ -2301,8 +2342,12 @@ final class WindowRoutingService: Service {
                         return ManageWorkspacesResponse(action: "list", workspaces: [], status: "ok")
                     }
 
-                    // Load authoritative workspace data from disk
-                    let diskWorkspaces = await referenceManager.loadWorkspaceSnapshotFromDisk()
+                    // Load authoritative workspace data and overlay incomplete two-phase restores
+                    // as hidden recovery records.
+                    let diskWorkspaces = await routingService.loadWorkspaceInventorySnapshot(
+                        from: referenceManager,
+                        includeHidden: includeHidden
+                    )
 
                     // Build map of which windows are showing each workspace
                     let windowsByWorkspaceID: [UUID: Set<Int>] = await MainActor.run {
@@ -2317,9 +2362,7 @@ final class WindowRoutingService: Service {
 
                     // Build summaries from disk data with window visibility overlay.
                     // Hidden workspaces remain persisted/recoverable, but are excluded unless explicitly requested.
-                    let summaries: [MCPWorkspaceSummary] = diskWorkspaces.filter { model in
-                        includeHidden || !model.isHiddenInMenus
-                    }.map { model in
+                    let summaries: [MCPWorkspaceSummary] = diskWorkspaces.map { model in
                         MCPWorkspaceSummary(
                             id: model.id,
                             name: model.name,
@@ -2608,6 +2651,7 @@ final class WindowRoutingService: Service {
                             manager.applyWorkspaceHiddenStateInMemory(
                                 workspaceID: updatedWorkspace.id,
                                 hidden: updatedWorkspace.isHiddenInMenus,
+                                consolidatedIntoWorkspaceID: updatedWorkspace.consolidatedIntoWorkspaceID,
                                 dateModified: updatedWorkspace.dateModified
                             )
                         }

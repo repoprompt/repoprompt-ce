@@ -896,6 +896,13 @@ class WindowStatesManager: ObservableObject {
             guard !workspace.isEphemeral else {
                 return WindowSessionCaptureCandidate(windowID: window.windowID, entry: nil)
             }
+            // A window whose restore target could not be resolved sits on the system Default
+            // workspace. Persisting that observed state would overwrite the snapshot with a
+            // layout the user never chose, so re-emit the entry we failed to restore. Any
+            // later switch to a real workspace clears the flag and captures normally.
+            if let unresolved = window.unresolvedRestoreEntry, workspace.isSystemWorkspace {
+                return WindowSessionCaptureCandidate(windowID: window.windowID, entry: unresolved)
+            }
 
             let primaryPath = workspace.repoPaths.first.map { repoPath in
                 (repoPath as NSString).expandingTildeInPath

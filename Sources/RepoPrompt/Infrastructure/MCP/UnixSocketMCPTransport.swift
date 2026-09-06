@@ -220,9 +220,12 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
                       let requestID = JSONRPCBridgeID.parseJSONValue(object["id"]),
                       requestID != .null,
                       var params = object["params"] as? [String: Any],
-                      let toolName = params["name"] as? String,
-                      toolName == "prompt" || toolName == "workspace_context"
+                      let requestedToolName = params["name"] as? String
                 else { return object }
+                let canonicalToolName = ServerNetworkManager.canonicalToolName(for: requestedToolName)
+                guard canonicalToolName == "prompt" || canonicalToolName == "workspace_context" else {
+                    return object
+                }
                 var arguments: [String: Any] = [:]
                 if let presentArguments = params["arguments"] {
                     // Only absent arguments may be synthesized. Substituting an empty object for a

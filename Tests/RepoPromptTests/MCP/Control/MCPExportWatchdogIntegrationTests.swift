@@ -1503,150 +1503,193 @@ import XCTest
         }
 
         func testPipelinedSameToolDeadlinesFollowExactRequestIdentityWhenAdmissionReverses() async throws {
+            let testCases = [
+                (requestedName: MCPWindowToolName.prompt, canonicalName: MCPWindowToolName.prompt),
+                (requestedName: "discover_prompt", canonicalName: MCPWindowToolName.prompt),
+                (requestedName: MCPWindowToolName.workspaceContext, canonicalName: MCPWindowToolName.workspaceContext),
+                (requestedName: "discover_workspace_context", canonicalName: MCPWindowToolName.workspaceContext)
+            ]
             try await MCPSharedServerTestLease.shared.withLease { lease in
-                let fixture = try await PersistentMCPTestFixture.make(
-                    lease: lease,
-                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
-                )
-                let endpoint = try fixture.endpointA()
-                let manager = fixture.networkManager
-                let firstAdmissionGate = MCPExecutionIgnoringCancellationGate()
-                let secondFormattingGate = MCPExecutionIgnoringCancellationGate()
-                let firstFormattingGate = MCPExecutionIgnoringCancellationGate()
-                let formattingProbe = MCPPromptExportPhaseProbe()
-                var firstTask: Task<PersistentMCPTestRPCResponse, Error>?
-                var secondTask: Task<PersistentMCPTestRPCResponse, Error>?
+                for testCase in testCases {
+                    let fixture = try await PersistentMCPTestFixture.make(
+                        lease: lease,
+                        domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                    )
+                    let endpoint = try fixture.endpointA()
+                    let manager = fixture.networkManager
+                    let firstAdmissionGate = MCPExecutionIgnoringCancellationGate()
+                    let secondFormattingGate = MCPExecutionIgnoringCancellationGate()
+                    let firstFormattingGate = MCPExecutionIgnoringCancellationGate()
+                    let formattingProbe = MCPPromptExportPhaseProbe()
+                    var firstTask: Task<PersistentMCPTestRPCResponse, Error>?
+                    var secondTask: Task<PersistentMCPTestRPCResponse, Error>?
 
-                do {
-                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
-                    let firstRequestID = endpoint.client.nextRequestIDForTesting()
-                    let secondRequestID = firstRequestID + 1
-                    let wallNowMilliseconds = Int64((Date().timeIntervalSince1970 * 1000).rounded(.down))
-                    await manager.debugSetBeforeToolRequestIdentityClaimForTesting { connectionID, requestID in
-                        guard connectionID == endpoint.connectionID,
-                              requestID == .number(Int64(firstRequestID))
-                        else { return }
-                        await firstAdmissionGate.enterAndWait()
-                    }
-                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.prompt) {
-                        .object(["ok": .bool(true)])
-                    }
-                    await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, toolName in
-                        guard connectionID == endpoint.connectionID,
-                              toolName == MCPWindowToolName.prompt
-                        else { return }
-                        switch await formattingProbe.recordEntryAndReturnCount() {
-                        case 1:
-                            await secondFormattingGate.enterAndWait()
-                        case 2:
-                            await firstFormattingGate.enterAndWait()
-                        default:
-                            XCTFail("Unexpected additional formatting entry")
+                    do {
+                        try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                        let firstRequestID = endpoint.client.nextRequestIDForTesting()
+                        let secondRequestID = firstRequestID + 1
+                        let wallNowMilliseconds = Int64((Date().timeIntervalSince1970 * 1000).rounded(.down))
+                        await manager.debugSetBeforeToolRequestIdentityClaimForTesting { connectionID, requestID in
+                            guard connectionID == endpoint.connectionID,
+                                  requestID == .number(Int64(firstRequestID))
+                            else { return }
+                            await firstAdmissionGate.enterAndWait()
                         }
-                    }
-                    let activeFirstTask = Task {
-                        try await endpoint.callTool(
-                            name: MCPWindowToolName.prompt,
-                            arguments: [
-                                "op": "export",
-                                "_rawJSON": true,
-                                MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey: [
-                                    "kind": MCPToolCallDeadlineEnvelope.Kind.ordinaryPromptExportV1.rawValue,
-                                    "expires_at_unix_milliseconds": wallNowMilliseconds + 300_000
+                        await manager.debugSetResolvedToolOperationOverride(toolName: testCase.canonicalName) {
+                            .object(["ok": .bool(true)])
+                        }
+                        await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, toolName in
+                            guard connectionID == endpoint.connectionID,
+                                  toolName == testCase.canonicalName
+                            else { return }
+                            switch await formattingProbe.recordEntryAndReturnCount() {
+                            case 1:
+                                await secondFormattingGate.enterAndWait()
+                            case 2:
+                                await firstFormattingGate.enterAndWait()
+                            default:
+                                XCTFail("Unexpected additional formatting entry")
+                            }
+                        }
+                        let activeFirstTask = Task {
+                            try await endpoint.callTool(
+                                name: testCase.requestedName,
+                                arguments: [
+                                    "op": "export",
+                                    "_rawJSON": true,
+                                    MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey: [
+                                        "kind": MCPToolCallDeadlineEnvelope.Kind.ordinaryPromptExportV1.rawValue,
+                                        "expires_at_unix_milliseconds": wallNowMilliseconds + 300_000
+                                    ]
                                 ]
-                            ]
-                        )
-                    }
-                    firstTask = activeFirstTask
-                    try await firstAdmissionGate.waitUntilEntered(count: 1)
+                            )
+                        }
+                        firstTask = activeFirstTask
+                        try await firstAdmissionGate.waitUntilEntered(count: 1)
 
-                    let activeSecondTask = Task {
-                        try await endpoint.callTool(
-                            name: MCPWindowToolName.prompt,
-                            arguments: [
-                                "op": "export",
-                                "_rawJSON": true,
-                                MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey: [
-                                    "kind": MCPToolCallDeadlineEnvelope.Kind.ordinaryPromptExportV1.rawValue,
-                                    "expires_at_unix_milliseconds": wallNowMilliseconds + 290_000
+                        let activeSecondTask = Task {
+                            try await endpoint.callTool(
+                                name: testCase.requestedName,
+                                arguments: [
+                                    "op": "export",
+                                    "_rawJSON": true,
+                                    MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey: [
+                                        "kind": MCPToolCallDeadlineEnvelope.Kind.ordinaryPromptExportV1.rawValue,
+                                        "expires_at_unix_milliseconds": wallNowMilliseconds + 290_000
+                                    ]
                                 ]
-                            ]
+                            )
+                        }
+                        secondTask = activeSecondTask
+                        try await secondFormattingGate.waitUntilEntered(count: 1)
+
+                        XCTAssertNil(
+                            MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
+                                connectionID: endpoint.connectionID.uuidString,
+                                connectionGeneration: 1,
+                                requestID: .number(Int64(firstRequestID))
+                            )
                         )
+                        let secondDeadline = try XCTUnwrap(
+                            MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
+                                connectionID: endpoint.connectionID.uuidString,
+                                connectionGeneration: 1,
+                                requestID: .number(Int64(secondRequestID))
+                            )
+                        )
+                        await secondFormattingGate.release()
+                        let secondResponse = try await activeSecondTask.value
+                        XCTAssertEqual(secondResponse.id, secondRequestID, testCase.requestedName)
+                        let secondResponseObject = try Self.responseObject(from: secondResponse)
+                        let secondResponseResult = try XCTUnwrap(secondResponseObject["result"] as? [String: Any])
+                        XCTAssertNotEqual(secondResponseResult["isError"] as? Bool, true, secondResponse.rawJSON)
+                        secondTask = nil
+                        XCTAssertNil(
+                            MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
+                                connectionID: endpoint.connectionID.uuidString,
+                                connectionGeneration: 1,
+                                requestID: .number(Int64(secondRequestID))
+                            ),
+                            testCase.requestedName
+                        )
+
+                        await firstAdmissionGate.release()
+                        try await firstFormattingGate.waitUntilEntered(count: 1)
+                        let firstDeadline = try XCTUnwrap(
+                            MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
+                                connectionID: endpoint.connectionID.uuidString,
+                                connectionGeneration: 1,
+                                requestID: .number(Int64(firstRequestID))
+                            )
+                        )
+                        XCTAssertGreaterThan(firstDeadline.instant, secondDeadline.instant)
+                        XCTAssertNil(
+                            MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
+                                connectionID: endpoint.connectionID.uuidString,
+                                connectionGeneration: 1,
+                                requestID: .number(Int64(secondRequestID))
+                            )
+                        )
+
+                        await firstFormattingGate.release()
+                        let firstResponse = try await activeFirstTask.value
+                        XCTAssertEqual(firstResponse.id, firstRequestID, testCase.requestedName)
+                        let firstResponseObject = try Self.responseObject(from: firstResponse)
+                        let firstResponseResult = try XCTUnwrap(firstResponseObject["result"] as? [String: Any])
+                        XCTAssertNotEqual(firstResponseResult["isError"] as? Bool, true, firstResponse.rawJSON)
+                        firstTask = nil
+                        XCTAssertNil(
+                            MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
+                                connectionID: endpoint.connectionID.uuidString,
+                                connectionGeneration: 1,
+                                requestID: .number(Int64(firstRequestID))
+                            ),
+                            testCase.requestedName
+                        )
+                        await manager.debugSetBeforeToolRequestIdentityClaimForTesting(nil)
+                        await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                        await manager.debugSetResolvedToolOperationOverride(
+                            toolName: testCase.canonicalName,
+                            operation: nil
+                        )
+                        let followupRequestID = endpoint.client.nextRequestIDForTesting()
+                        let followupResponse = try await endpoint.callTool(
+                            name: testCase.requestedName,
+                            arguments: testCase.canonicalName == MCPWindowToolName.prompt
+                                ? ["op": "get"]
+                                : ["op": "snapshot", "include": ["prompt"]]
+                        )
+                        XCTAssertEqual(followupResponse.id, followupRequestID, testCase.requestedName)
+                        let followupResponseObject = try Self.responseObject(from: followupResponse)
+                        let followupResponseResult = try XCTUnwrap(followupResponseObject["result"] as? [String: Any])
+                        XCTAssertNotEqual(followupResponseResult["isError"] as? Bool, true, followupResponse.rawJSON)
+                        await manager.debugSetDomainPeerIdentityForTesting(
+                            connectionID: endpoint.connectionID,
+                            identity: nil
+                        )
+                        await fixture.cleanup()
+                        try await fixture.assertCleanedUp()
+                    } catch {
+                        await firstAdmissionGate.release()
+                        await secondFormattingGate.release()
+                        await firstFormattingGate.release()
+                        firstTask?.cancel()
+                        secondTask?.cancel()
+                        if let firstTask { _ = try? await firstTask.value }
+                        if let secondTask { _ = try? await secondTask.value }
+                        await manager.debugSetBeforeToolRequestIdentityClaimForTesting(nil)
+                        await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                        await manager.debugSetResolvedToolOperationOverride(
+                            toolName: testCase.canonicalName,
+                            operation: nil
+                        )
+                        await manager.debugSetDomainPeerIdentityForTesting(
+                            connectionID: endpoint.connectionID,
+                            identity: nil
+                        )
+                        await fixture.cleanup()
+                        throw error
                     }
-                    secondTask = activeSecondTask
-                    try await secondFormattingGate.waitUntilEntered(count: 1)
-
-                    XCTAssertNil(
-                        MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
-                            connectionID: endpoint.connectionID.uuidString,
-                            connectionGeneration: 1,
-                            requestID: .number(Int64(firstRequestID))
-                        )
-                    )
-                    let secondDeadline = try XCTUnwrap(
-                        MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
-                            connectionID: endpoint.connectionID.uuidString,
-                            connectionGeneration: 1,
-                            requestID: .number(Int64(secondRequestID))
-                        )
-                    )
-                    await secondFormattingGate.release()
-                    _ = try await activeSecondTask.value
-                    secondTask = nil
-
-                    await firstAdmissionGate.release()
-                    try await firstFormattingGate.waitUntilEntered(count: 1)
-                    let firstDeadline = try XCTUnwrap(
-                        MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
-                            connectionID: endpoint.connectionID.uuidString,
-                            connectionGeneration: 1,
-                            requestID: .number(Int64(firstRequestID))
-                        )
-                    )
-                    XCTAssertGreaterThan(firstDeadline.instant, secondDeadline.instant)
-                    XCTAssertNil(
-                        MCPExportResponseDeliveryDeadlineRegistry.shared.deadlineForTesting(
-                            connectionID: endpoint.connectionID.uuidString,
-                            connectionGeneration: 1,
-                            requestID: .number(Int64(secondRequestID))
-                        )
-                    )
-
-                    await firstFormattingGate.release()
-                    _ = try await activeFirstTask.value
-                    firstTask = nil
-                    await manager.debugSetBeforeToolRequestIdentityClaimForTesting(nil)
-                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
-                    await manager.debugSetResolvedToolOperationOverride(
-                        toolName: MCPWindowToolName.prompt,
-                        operation: nil
-                    )
-                    await manager.debugSetDomainPeerIdentityForTesting(
-                        connectionID: endpoint.connectionID,
-                        identity: nil
-                    )
-                    await fixture.cleanup()
-                    try await fixture.assertCleanedUp()
-                } catch {
-                    await firstAdmissionGate.release()
-                    await secondFormattingGate.release()
-                    await firstFormattingGate.release()
-                    firstTask?.cancel()
-                    secondTask?.cancel()
-                    if let firstTask { _ = try? await firstTask.value }
-                    if let secondTask { _ = try? await secondTask.value }
-                    await manager.debugSetBeforeToolRequestIdentityClaimForTesting(nil)
-                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
-                    await manager.debugSetResolvedToolOperationOverride(
-                        toolName: MCPWindowToolName.prompt,
-                        operation: nil
-                    )
-                    await manager.debugSetDomainPeerIdentityForTesting(
-                        connectionID: endpoint.connectionID,
-                        identity: nil
-                    )
-                    await fixture.cleanup()
-                    throw error
                 }
             }
         }

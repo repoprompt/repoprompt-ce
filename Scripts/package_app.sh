@@ -379,7 +379,9 @@ elif (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
         EXPECTED_PROFILE_APP_IDENTIFIER="$EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER"
     fi
     [[ "$PROFILE_APP_IDENTIFIER" == "$EXPECTED_PROFILE_APP_IDENTIFIER" ]] || fail "Provisioning profile app identifier mismatch: expected $EXPECTED_PROFILE_APP_IDENTIFIER, got ${PROFILE_APP_IDENTIFIER:-<missing>}."
-    run cp "$REPOPROMPT_PROVISIONING_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
+    run python3 "$CONTROL_PLANE_SCRIPTS_DIR/embedded_provisioning_profile.py" install \
+        "$REPOPROMPT_PROVISIONING_PROFILE" \
+        "$APP_BUNDLE/Contents/embedded.provisionprofile"
     APP_ENTITLEMENTS="$(mktemp)"
     run python3 - <<PY
 from pathlib import Path
@@ -529,6 +531,10 @@ else
     sign_path "$APP_BUNDLE"
 fi
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )) && (( ! USE_LOCAL_SELF_SIGNED_RELEASE )); then
+    run python3 "$CONTROL_PLANE_SCRIPTS_DIR/embedded_provisioning_profile.py" validate \
+        "$APP_BUNDLE/Contents/embedded.provisionprofile"
+fi
 if [[ -n "${REPOPROMPT_STABLE_RELEASE_CONTEXT:-}" ]] && (( ! USE_ADHOC_SIGNING )); then
     run codesign --verify --strict --verbose=2 -R="$EXPECTED_APP_REQUIREMENT" "$APP_BUNDLE"
 fi

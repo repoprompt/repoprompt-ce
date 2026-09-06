@@ -13,6 +13,7 @@ struct ManageWorkspacesView: View {
     @State private var workspaceBeingRenamed: WorkspaceModel?
     @State private var renameField: String = ""
     @State private var showGlobalStorage: Bool = false
+    @State private var showConsolidatedWorkspaces = false
     @State private var searchText: String = ""
     @State private var showDuplicateCleanupConfirmation = false
     @State private var duplicateCleanupResultMessage: String?
@@ -370,14 +371,11 @@ struct ManageWorkspacesView: View {
                         .font(fontPreset.subheadlineFont)
                         .fontWeight(.medium)
                 }
-                ForEach(group.duplicateWorkspaceIDs.indices, id: \.self) { index in
-                    let workspaceID = group.duplicateWorkspaceIDs[index]
-                    let name = group.duplicateWorkspaceNames[index]
-                    let windowIDs = group.windowIDsByWorkspaceID[workspaceID] ?? []
+                ForEach(group.duplicateWorkspaceRows) { row in
                     HStack(spacing: 0) {
-                        Text("  • \(name)")
+                        Text("  • \(row.name)")
                             .font(fontPreset.captionFont)
-                        Text(" — \(windowStatusText(for: windowIDs))")
+                        Text(" — \(windowStatusText(for: row.windowIDs))")
                             .font(fontPreset.captionFont)
                             .foregroundColor(.secondary)
                     }
@@ -428,13 +426,19 @@ struct ManageWorkspacesView: View {
 
         let backupNote = result.backupURL.map { "\n\nBackup saved at:\n\($0.path)" } ?? ""
 
-        if result.groupsConsolidated == result.groupsDetected && result.skipped.isEmpty {
+        if result.groupsConsolidated == result.groupsDetected, result.skipped.isEmpty {
             return "Successfully consolidated \(result.groupsConsolidated) duplicate workspace \(result.groupsConsolidated == 1 ? "group" : "groups").\(backupNote)"
         }
 
-        let skippedNote = result.skipped.isEmpty
-            ? ""
-            : " \(result.skipped.count) \(result.skipped.count == 1 ? "item was" : "items were") skipped due to active sessions or failed switches \u{2014} try again after those sessions finish."
+        let skippedNote: String
+        if result.skipped.isEmpty {
+            skippedNote = ""
+        } else {
+            let itemDescription = result.skipped.count == 1 ? "item was" : "items were"
+            skippedNote = " \(result.skipped.count) \(itemDescription) not fully consolidated."
+                + " Some steps may have partially completed, but the original recovery copies were preserved."
+                + " Review the remaining entries and retry."
+        }
 
         return "Consolidated \(result.groupsConsolidated) of \(result.groupsDetected) duplicate \(result.groupsDetected == 1 ? "group" : "groups").\(skippedNote)\(backupNote)"
     }
@@ -474,7 +478,17 @@ struct ManageWorkspacesView: View {
 
     private var existingWorkspacesSection: some View {
         let userWorkspaces = workspaceManager.workspaces.filter { !$0.isSystemWorkspace }
-        let ordinaryFilteredWorkspaces = filterWorkspaces(userWorkspaces)
+        let ordinaryWorkspaces = userWorkspaces.filter {
+            $0.consolidatedIntoWorkspaceID == nil
+                && !workspaceManager.pendingConsolidatedRestoreIDs.contains($0.id)
+        }
+        let consolidatedWorkspaces = userWorkspaces.filter {
+            $0.consolidatedIntoWorkspaceID != nil
+                || workspaceManager.pendingConsolidatedRestoreIDs.contains($0.id)
+        }
+        let ordinaryFilteredWorkspaces = filterWorkspaces(ordinaryWorkspaces)
+        let filteredConsolidatedWorkspaces = filterWorkspaces(consolidatedWorkspaces)
+        let filteredWorkspaceCount = ordinaryFilteredWorkspaces.count + filteredConsolidatedWorkspaces.count
         let managementItems = workspaceManagementItems(userWorkspaces: userWorkspaces)
         let filteredManagementItems = filterManagementItems(managementItems)
 
@@ -518,8 +532,8 @@ struct ManageWorkspacesView: View {
 
             if managementSelection.isSelecting {
                 selectionActionBar(filteredItems: filteredManagementItems)
-            } else if !searchText.isEmpty, !ordinaryFilteredWorkspaces.isEmpty {
-                Text("Showing \(ordinaryFilteredWorkspaces.count) of \(userWorkspaces.count) workspaces")
+            } else if !searchText.isEmpty, filteredWorkspaceCount > 0 {
+                Text("Showing \(filteredWorkspaceCount) of \(userWorkspaces.count) workspaces")
                     .font(fontPreset.captionFont)
                     .foregroundColor(.secondary)
             }
@@ -540,7 +554,7 @@ struct ManageWorkspacesView: View {
                 Text("No workspaces found. Create one below.")
                     .foregroundColor(.secondary)
                     .padding(.top, 2)
-            } else if ordinaryFilteredWorkspaces.isEmpty {
+            } else if ordinaryFilteredWorkspaces.isEmpty, filteredConsolidatedWorkspaces.isEmpty {
                 Text("No workspaces match '\(searchText)'")
                     .foregroundColor(.secondary)
                     .padding(.top, 2)
@@ -571,7 +585,56 @@ struct ManageWorkspacesView: View {
                     }
                 }
             }
+
+            if !managementSelection.isSelecting, !filteredConsolidatedWorkspaces.isEmpty {
+                consolidatedWorkspacesSection(filteredConsolidatedWorkspaces)
+            }
         }
+    }
+
+    private func consolidatedWorkspacesSection(_ workspaces: [WorkspaceModel]) -> some View {
+        DisclosureGroup(isExpanded: $showConsolidatedWorkspaces) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Hidden recovery copies retained by workspace consolidation. Use the eye control to restore one.")
+                    .font(fontPreset.captionFont)
+                    .foregroundColor(.secondary)
+
+                ForEach(workspaces) { workspace in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Consolidated into \(canonicalWorkspaceName(for: workspace))")
+                            .font(fontPreset.captionFont)
+                            .foregroundColor(.secondary)
+                        OptimizedWorkspaceRow(
+                            workspace: workspace,
+                            onSwitch: nil,
+                            onRename: {
+                                workspaceBeingRenamed = workspace
+                                renameField = workspace.name
+                            },
+                            onToggleHidden: {
+                                toggleHiddenState(for: workspace)
+                            },
+                            onDelete: {
+                                workspaceManager.deleteWorkspace(workspace)
+                            }
+                        )
+                    }
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            Text("Consolidated workspaces (\(workspaces.count))")
+                .font(fontPreset.subheadlineFont)
+        }
+    }
+
+    private func canonicalWorkspaceName(for workspace: WorkspaceModel) -> String {
+        guard let canonicalID = workspace.consolidatedIntoWorkspaceID,
+              let canonical = workspaceManager.workspaces.first(where: { $0.id == canonicalID })
+        else {
+            return "another workspace"
+        }
+        return canonical.name
     }
 
     private func workspaceManagementItems(
@@ -662,6 +725,9 @@ struct ManageWorkspacesView: View {
 
     private func selectionWorkspaceRow(_ item: WorkspaceManagementItem) -> some View {
         let selected = managementSelection.selectedWorkspaceIDs.contains(item.id)
+        let consolidatedDescription = item.workspace.consolidatedIntoWorkspaceID == nil
+            ? ""
+            : ", consolidated recovery copy"
         return Button {
             handleSelectionMutation(
                 managementSelection.toggle(item.id, isDeletable: item.isDeletable)
@@ -675,6 +741,11 @@ struct ManageWorkspacesView: View {
                     HStack(spacing: 6) {
                         Text(item.workspace.name)
                             .font(fontPreset.subheadlineFont)
+                        if item.workspace.consolidatedIntoWorkspaceID != nil {
+                            Text("CONSOLIDATED")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                                .foregroundColor(.secondary)
+                        }
                         if item.isLeakCleanupCandidate {
                             Text("TEST CLEANUP")
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
@@ -707,7 +778,7 @@ struct ManageWorkspacesView: View {
         }
         .buttonStyle(.plain)
         .disabled(!item.isDeletable)
-        .accessibilityLabel("\(item.workspace.name), \(selected ? "selected" : "not selected")")
+        .accessibilityLabel("\(item.workspace.name)\(consolidatedDescription), \(selected ? "selected" : "not selected")")
         .accessibilityHint(item.deletionBlockReason ?? "Toggle workspace selection")
     }
 
@@ -861,7 +932,12 @@ struct ManageWorkspacesView: View {
     }
 
     private func toggleHiddenState(for ws: WorkspaceModel) {
-        workspaceManager.setWorkspaceHidden(ws, hidden: !ws.isHiddenInMenus)
+        let isRecoveryCopy = ws.consolidatedIntoWorkspaceID != nil
+            || workspaceManager.pendingConsolidatedRestoreIDs.contains(ws.id)
+        workspaceManager.setWorkspaceHidden(
+            ws,
+            hidden: isRecoveryCopy ? false : !ws.isHiddenInMenus
+        )
     }
 
     // MARK: - Create New Workspace

@@ -30,11 +30,18 @@ package enum DomainWorkspaceCommand: Codable, Equatable, Sendable {
     )
 }
 
+/// Opt-in command behavior for mutations that must never replay their captured bytes over a
+/// concurrent durable winner.
+package enum DomainWorkspaceConflictRecoveryPolicy: String, Codable, Equatable, Sendable {
+    case failClosed
+}
+
 package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
     package let operationID: UUID
     package let expectedCatalogRevision: UInt64?
     package let expectedWorkspaceRevision: UInt64?
     package let expectedContextRevision: UInt64?
+    package let conflictRecoveryPolicy: DomainWorkspaceConflictRecoveryPolicy?
     package let origin: DomainCommandOrigin
     package let command: DomainWorkspaceCommand
 
@@ -43,6 +50,7 @@ package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
         expectedCatalogRevision: UInt64? = nil,
         expectedWorkspaceRevision: UInt64? = nil,
         expectedContextRevision: UInt64? = nil,
+        conflictRecoveryPolicy: DomainWorkspaceConflictRecoveryPolicy? = nil,
         origin: DomainCommandOrigin,
         command: DomainWorkspaceCommand
     ) {
@@ -50,6 +58,7 @@ package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
         self.expectedCatalogRevision = expectedCatalogRevision
         self.expectedWorkspaceRevision = expectedWorkspaceRevision
         self.expectedContextRevision = expectedContextRevision
+        self.conflictRecoveryPolicy = conflictRecoveryPolicy
         self.origin = origin
         self.command = command
     }
@@ -62,6 +71,9 @@ package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
             expectedContextRevision.map(String.init) ?? "nil",
             origin.fingerprintComponent
         ]
+        if let conflictRecoveryPolicy {
+            components.append("conflict-recovery:\(conflictRecoveryPolicy.rawValue)")
+        }
         switch command {
         case let .createWorkspace(document):
             components += ["create", document.workspaceID.uuidString, document.fileURL.absoluteString, document.contentDigest]

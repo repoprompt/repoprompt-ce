@@ -5,16 +5,21 @@ import Foundation
 ///
 /// Schema v1 contains copy settings, chat settings, and cross-workspace global
 /// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
-/// workspace-scoped Agent Models profiles. Scalar fields stay optional so missing
-/// JSON fields fall back through the typed GlobalSettingsStore accessors without
-/// losing current default behavior.
+/// workspace-scoped Agent Models profiles. Schema v5 fences the Context Builder
+/// behavior group from pre-Context-Builder typed writers. Scalar fields stay optional
+/// so missing JSON fields fall back through the typed GlobalSettingsStore accessors
+/// without losing current default behavior.
 struct GlobalSettingsDocument: Codable {
     /// Fixed feature-version constants are permanent compatibility boundaries. Add a new
     /// constant for each schema-requiring feature; never infer an existing feature's minimum
     /// version from `currentSchemaVersion`.
     static let baselineSchemaVersion = 2
     static let workspaceAgentModelsSchemaVersion = 4
-    static let currentSchemaVersion = 4
+    /// Context Builder behavior was introduced after the released v1.3 typed codec.
+    /// Keep it above that codec's supported v4 so older writers reject the document
+    /// before their typed save can silently drop the group.
+    static let contextBuilderSchemaVersion = 5
+    static let currentSchemaVersion = contextBuilderSchemaVersion
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -77,6 +82,9 @@ struct GlobalSettingsDocument: Codable {
         var requiredVersion = Self.baselineSchemaVersion
         if let agentModelsSettingsByWorkspaceID, !agentModelsSettingsByWorkspaceID.isEmpty {
             requiredVersion = max(requiredVersion, Self.workspaceAgentModelsSchemaVersion)
+        }
+        if scalarPreferences?.contextBuilder != nil {
+            requiredVersion = max(requiredVersion, Self.contextBuilderSchemaVersion)
         }
         return requiredVersion
     }

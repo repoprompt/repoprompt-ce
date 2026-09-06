@@ -882,7 +882,7 @@ extension OracleViewModel {
         guard changed else { return }
 
         let sessionToSave = sessions[index]
-        Task { [weak self] in
+        scheduleTrackedAutosave(for: sessionToSave) { [weak self] in
             guard let self else { return }
             _ = try? await autosaveSession(sessionToSave)
         }
@@ -1572,6 +1572,39 @@ extension OracleViewModel {
         // Check cancellation at entry
         try Task.checkCancellation()
 
+        let activationLease: WorkspaceActivityCoordinator.ActivationLease?
+        if let workspaceID {
+            guard let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }) else {
+                throw ChatToolError.notFound("The target workspace is unavailable.")
+            }
+            guard workspace.consolidatedIntoWorkspaceID == nil,
+                  !workspaceManager.pendingConsolidatedRestoreIDs.contains(workspaceID)
+            else {
+                throw ChatToolError(
+                    code: .conflict,
+                    message: "The target workspace is being consolidated or restored.",
+                    details: ["workspace_id": workspaceID.uuidString]
+                )
+            }
+            guard let lease = workspaceManager.workspaceActivityCoordinator.beginActivation(
+                workspaceID: workspaceID
+            ) else {
+                throw ChatToolError(
+                    code: .conflict,
+                    message: "The target workspace is being consolidated.",
+                    details: ["workspace_id": workspaceID.uuidString]
+                )
+            }
+            activationLease = lease
+        } else {
+            activationLease = nil
+        }
+        defer {
+            if let activationLease {
+                workspaceManager.workspaceActivityCoordinator.endActivation(activationLease)
+            }
+        }
+
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else {
             throw ChatToolError.invalidParams("Prompt cannot be empty")
@@ -1704,6 +1737,15 @@ extension OracleViewModel {
         }
         guard let workspace else {
             throw ChatSessionError.invalidFilename("The target workspace for this plan chat is unavailable.")
+        }
+        guard workspace.consolidatedIntoWorkspaceID == nil,
+              !workspaceManager.pendingConsolidatedRestoreIDs.contains(workspace.id)
+        else {
+            throw ChatToolError(
+                code: .conflict,
+                message: "The target workspace is being consolidated or restored.",
+                details: ["workspace_id": workspace.id.uuidString]
+            )
         }
 
         // 1) Build StoredMessage entries

@@ -377,6 +377,16 @@ actor DomainWorkspaceContextAuthority {
                 diagnostic: "catalog_revision_mismatch"
             )
         }
+        if envelope.conflictRecoveryPolicy == .failClosed,
+           envelope.expectedWorkspaceRevision == nil
+        {
+            return recordTransientOutcome(
+                envelope: envelope,
+                disposition: .invalid,
+                errorCode: .stateConflict,
+                diagnostic: "fail_closed_requires_workspace_revision"
+            )
+        }
 
         let outcome: DomainCommandOutcome = switch envelope.command {
         case let .createWorkspace(document):
@@ -384,7 +394,13 @@ actor DomainWorkspaceContextAuthority {
         case let .replaceWorkingDocument(document):
             await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
         case let .saveWorkspaceDocument(workspaceID):
-            await saveWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
+            await saveWorkspace(
+                workspaceID,
+                envelope: envelope,
+                fingerprint: fingerprint,
+                allowsCASRecovery: envelope.conflictRecoveryPolicy != .failClosed,
+                allowsExternalRecovery: envelope.conflictRecoveryPolicy != .failClosed
+            )
         case let .resolveExternalConflict(workspaceID, acceptExternal, protectedAgentIdentities):
             await resolveExternalConflict(
                 workspaceID,
@@ -854,6 +870,11 @@ actor DomainWorkspaceContextAuthority {
             guard var record = records[workspaceID], record.health.acceptsMutations else {
                 return .failed
             }
+            guard record.document.metadata.consolidatedIntoWorkspaceID
+                == localDocument.metadata.consolidatedIntoWorkspaceID,
+                externalDocument.metadata.consolidatedIntoWorkspaceID
+                == localDocument.metadata.consolidatedIntoWorkspaceID
+            else { return .recoveryPending }
             let before = record.revisions
             let restoresCapturedDocument = record.document.contentDigest != localDocument.contentDigest
             let revisions: DomainRevisionState
@@ -977,6 +998,9 @@ actor DomainWorkspaceContextAuthority {
               var record = records[workspaceID],
               record.health.acceptsMutations
         else { return .failed }
+        guard record.document.metadata.consolidatedIntoWorkspaceID
+            == localDocument.metadata.consolidatedIntoWorkspaceID
+        else { return .recoveryPending }
         guard record.document.contentDigest != localDocument.contentDigest else {
             return .applied
         }
@@ -1004,6 +1028,7 @@ actor DomainWorkspaceContextAuthority {
                     contextUpdate.tombstones
                 ) { _, new in new },
                 operations: record.operations,
+                requiresMatchingConsolidationLifecycle: true,
                 now: Date()
             )
             catalogRevision = max(catalogRevision, persisted.catalogRevision)
@@ -1444,6 +1469,16 @@ actor DomainWorkspaceContextAuthority {
             guard record.health.acceptsMutations else {
                 return healthRejectionOutcome(envelope, record: record)
             }
+            if isDurableReplay,
+               record.document.metadata.consolidatedIntoWorkspaceID
+               != document.metadata.consolidatedIntoWorkspaceID
+            {
+                return conflictOutcome(
+                    envelope,
+                    record: record,
+                    diagnostic: "workspace_consolidation_lifecycle_changed_after_refresh"
+                )
+            }
             if !isDurableReplay,
                let expected = envelope.expectedWorkspaceRevision,
                expected != record.revisions.workingRevision
@@ -1498,6 +1533,8 @@ actor DomainWorkspaceContextAuthority {
             )
             let recorded = DomainRecordedOperation(fingerprint: fingerprint, recordedAt: Date(), outcome: provisional)
             let operations = record.operations + [recorded]
+            let requiresDirtyLifecycleFence = before.dirtyRevision != nil
+                && envelope.conflictRecoveryPolicy != .failClosed
             let persisted: DomainPersistenceWorkingCommit
             do {
                 persisted = try await persistence.persistWorking(
@@ -1507,6 +1544,8 @@ actor DomainWorkspaceContextAuthority {
                     contextRevisions: contextUpdate.revisions,
                     contextTombstones: record.contextTombstones.merging(contextUpdate.tombstones) { _, new in new },
                     operations: operations,
+                    requiresMatchingConsolidationLifecycle: isDurableReplay || requiresDirtyLifecycleFence,
+                    requiresMatchingSavedDigest: isDurableReplay,
                     now: recorded.recordedAt
                 )
                 catalogRevision = max(catalogRevision, persisted.catalogRevision)
@@ -1527,6 +1566,20 @@ actor DomainWorkspaceContextAuthority {
                             envelope,
                             record: records[document.workspaceID] ?? record,
                             error: DomainPersistenceError.cancelled
+                        )
+                    }
+                    if envelope.conflictRecoveryPolicy == .failClosed {
+                        let refreshed = records[document.workspaceID]
+                        return DomainCommandOutcome(
+                            operationID: envelope.operationID,
+                            disposition: .conflict,
+                            before: before,
+                            after: refreshed?.revisions,
+                            catalogRevision: catalogRevision,
+                            resultingDigest: refreshed?.document.contentDigest,
+                            errorCode: .stateConflict,
+                            diagnostic: "durable_workspace_revision_mismatch",
+                            workspace: refreshed.map(makeSnapshot)
                         )
                     }
                     if !isDurableReplay {
@@ -1660,7 +1713,9 @@ actor DomainWorkspaceContextAuthority {
                     return conflictOutcome(
                         envelope,
                         record: records[workspaceID] ?? record,
-                        diagnostic: "durable_save_revision_mismatch_after_replay"
+                        diagnostic: envelope.conflictRecoveryPolicy == .failClosed
+                            ? "durable_save_revision_mismatch"
+                            : "durable_save_revision_mismatch_after_replay"
                     )
                 }
                 switch await replayCapturedWorkingDocument(
@@ -1696,7 +1751,9 @@ actor DomainWorkspaceContextAuthority {
                 return conflictOutcome(
                     envelope,
                     record: record,
-                    diagnostic: "external_document_changed_during_recovered_save"
+                    diagnostic: envelope.conflictRecoveryPolicy == .failClosed
+                        ? "external_document_changed_during_save"
+                        : "external_document_changed_during_recovered_save"
                 )
             }
 

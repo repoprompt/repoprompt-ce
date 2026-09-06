@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 struct GeneratedOracleExportFileWriter {
     let store: WorkspaceFileContextStore
@@ -30,15 +31,17 @@ struct GeneratedOracleExportFileWriter {
             throw MCPError.invalidParams("Cannot create generated Oracle export at '\(logicalPath)': path already exists.")
         }
 
+        let mutationRootMappings = await destination.lookupContext.domainMutationPhysicalRootMappings(store: store)
         let mutationService = WorkspaceFileMutationService(store: store)
         do {
             let writeResult = try await mutationService.createFileWithPostcondition(
                 userPath: physicalPath,
                 content: content,
+                overwrite: false,
                 rootScope: destination.lookupContext.rootScope,
-                pathResolutionPolicy: .literalPreferredIfStronger
+                pathResolutionPolicy: .literalPreferredIfStronger,
+                mutationRootMappings: mutationRootMappings
             )
-
             if let reason = writeResult.catalogIneligibility {
                 throw MCPError.invalidParams(
                     "Generated Oracle export was written to '\(logicalPath)', but that path is not readable by read_file because \(reason.description). Remove the workspace policy/ignore exclusion for this export path and try again."
@@ -61,31 +64,18 @@ struct GeneratedOracleExportFileWriter {
                 rootScope: destination.lookupContext.rootScope
             )
             return logicalPath
-        } catch let error as MCPError {
-            await cleanupCreatedExportIfPresent(
-                physicalPath: physicalPath,
-                root: scopedRoot,
-                rootScope: destination.lookupContext.rootScope
+        } catch FileSystemError.fileAlreadyExists {
+            throw MCPError.invalidParams(
+                "Cannot create generated Oracle export at '\(logicalPath)': path already exists."
             )
-            throw error
         } catch is FileManagerError {
-            await cleanupCreatedExportIfPresent(
-                physicalPath: physicalPath,
-                root: scopedRoot,
-                rootScope: destination.lookupContext.rootScope
-            )
             throw MCPError.invalidParams(
                 "Cannot create generated Oracle export at '\(logicalPath)': filesystem operation failed."
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
-            await cleanupCreatedExportIfPresent(
-                physicalPath: physicalPath,
-                root: scopedRoot,
-                rootScope: destination.lookupContext.rootScope
-            )
-            throw MCPError.invalidParams(
-                "Cannot create generated Oracle export at '\(logicalPath)': export creation or verification failed."
-            )
+            throw partialCreationError(logicalPath: logicalPath, underlying: error)
         }
     }
 
@@ -106,20 +96,9 @@ struct GeneratedOracleExportFileWriter {
         return resolvedPath
     }
 
-    private func cleanupCreatedExportIfPresent(
-        physicalPath: String,
-        root: WorkspaceRootRef,
-        rootScope: WorkspaceLookupRootScope
-    ) async {
-        guard FileManager.default.fileExists(atPath: physicalPath) else { return }
-        try? FileManager.default.removeItem(atPath: physicalPath)
-        let rootPrefix = root.standardizedFullPath.hasSuffix("/") ? root.standardizedFullPath : root.standardizedFullPath + "/"
-        guard physicalPath.hasPrefix(rootPrefix) else { return }
-        let relativePath = StandardizedPath.relative(String(physicalPath.dropFirst(rootPrefix.count)))
-        await store.replayObservedFileSystemDeltas(rootID: root.id, deltas: [.fileRemoved(relativePath)])
-        _ = await store.awaitAppliedIngressForExplicitRequest(
-            userPath: physicalPath,
-            fallbackScope: rootScope
+    private func partialCreationError(logicalPath: String, underlying: Error) -> MCPError {
+        MCPError.invalidParams(
+            "Cannot create generated Oracle export at '\(logicalPath)': \(String(describing: underlying)). Output may remain at the requested path; inspect it before retrying and do not blindly retry."
         )
     }
 
