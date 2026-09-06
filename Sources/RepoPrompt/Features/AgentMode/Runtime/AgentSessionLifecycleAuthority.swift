@@ -7,6 +7,98 @@ import OSLog
 /// Callers may own presentation, persistence, provider, or MCP mechanics, but none of
 /// those layers may independently retarget a live Agent operation. They consume the
 /// immutable identities and typed decisions produced here.
+struct AgentProvisionalAdmissionIdentity: Equatable, Hashable {
+    let recoveryID: UUID
+    let workspaceID: UUID
+    let tabID: UUID
+    let sessionID: UUID
+    let replacementTabID: UUID
+}
+
+final class AgentProvisionalAdmissionClaim: Equatable {
+    enum State: Equatable {
+        case provisional
+        case recoveringWorkspace
+        case workspaceRecovered
+        case blockedManual(WorkspacePersistenceFailureCategory)
+        case complete
+        case accepted
+    }
+
+    let identity: AgentProvisionalAdmissionIdentity
+    @MainActor
+    private(set) var state: State = .provisional
+
+    init(identity: AgentProvisionalAdmissionIdentity) {
+        self.identity = identity
+    }
+
+    @MainActor
+    @discardableResult
+    func beginWorkspaceRecovery() -> Bool {
+        transition(from: .provisional, to: .recoveringWorkspace)
+    }
+
+    @MainActor
+    @discardableResult
+    func markWorkspaceRecovered() -> Bool {
+        transition(from: .recoveringWorkspace, to: .workspaceRecovered)
+    }
+
+    @MainActor
+    @discardableResult
+    func markComplete() -> Bool {
+        switch state {
+        case .provisional, .recoveringWorkspace, .workspaceRecovered:
+            state = .complete
+            return true
+        case .blockedManual, .complete, .accepted:
+            return false
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    func markBlockedForManualRecovery(_ category: WorkspacePersistenceFailureCategory) -> Bool {
+        switch state {
+        case .recoveringWorkspace:
+            state = .blockedManual(category)
+            return true
+        case let .blockedManual(existing) where existing == category:
+            return true
+        case .blockedManual:
+            return false
+        case .provisional, .workspaceRecovered, .complete, .accepted:
+            return false
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    func resumeBlockedWorkspaceRecovery() -> Bool {
+        guard case .blockedManual = state else { return false }
+        state = .recoveringWorkspace
+        return true
+    }
+
+    @MainActor
+    @discardableResult
+    func markAccepted() -> Bool {
+        transition(from: .provisional, to: .accepted)
+    }
+
+    static func == (lhs: AgentProvisionalAdmissionClaim, rhs: AgentProvisionalAdmissionClaim) -> Bool {
+        lhs.identity == rhs.identity
+    }
+
+    @MainActor
+    private func transition(from expected: State, to replacement: State) -> Bool {
+        guard state == expected else { return false }
+        state = replacement
+        return true
+    }
+}
+
 @MainActor
 final class AgentSessionLifecycleAuthority {
     struct Identity: Equatable, Hashable {
@@ -69,6 +161,7 @@ final class AgentSessionLifecycleAuthority {
     }
 
     enum RejectionReason: String, Error {
+        case cancelled
         case workspacePersistenceRejected = "workspace_persistence_rejected"
         case workspaceChanged = "workspace_changed"
         case tabMissing = "tab_missing"
@@ -81,6 +174,12 @@ final class AgentSessionLifecycleAuthority {
     enum AdmissionDecision: Equatable {
         case commit
         case rollback(RejectionReason)
+    }
+
+    enum DurableAdmissionDecision: Equatable {
+        case commit
+        case localRollback(RejectionReason)
+        case recoverWorkspace(RejectionReason)
     }
 
     struct Event: Equatable {
@@ -154,6 +253,59 @@ final class AgentSessionLifecycleAuthority {
             return .rollback(.sessionIdentityChanged)
         }
         return .commit
+    }
+
+    func decideDurableAdmission(
+        receipt: AgentAdmissionPersistenceReceipt,
+        targetWorkspaceID: UUID,
+        bindingStillCurrent: Bool,
+        isCancelled: Bool
+    ) -> DurableAdmissionDecision {
+        let hasCanonicalCommit = switch receipt.commitEvidence {
+        case .none: false
+        case .canonicalWorking, .saved: true
+        }
+        let durabilityRequiresRecovery = hasCanonicalCommit || {
+            if case .persisted = receipt.outcome { return true }
+            return false
+        }()
+
+        if isCancelled {
+            return durabilityRequiresRecovery
+                ? .recoverWorkspace(.cancelled)
+                : .localRollback(.cancelled)
+        }
+        if let persistedWorkspaceID = receipt.outcome.workspaceID,
+           persistedWorkspaceID != targetWorkspaceID
+        {
+            return durabilityRequiresRecovery
+                ? .recoverWorkspace(.workspaceChanged)
+                : .localRollback(.workspaceChanged)
+        }
+        guard bindingStillCurrent else {
+            return durabilityRequiresRecovery
+                ? .recoverWorkspace(.sessionIdentityChanged)
+                : .localRollback(.sessionIdentityChanged)
+        }
+
+        switch receipt.commitEvidence {
+        case .saved:
+            // Exact canonical/disk evidence wins over a lost or cancelled save response.
+            return .commit
+        case .canonicalWorking:
+            return .recoverWorkspace(.workspacePersistenceRejected)
+        case .none:
+            switch receipt.outcome {
+            case .persisted:
+                return .recoverWorkspace(.workspacePersistenceRejected)
+            case let .notRequired(workspaceID):
+                return workspaceID == targetWorkspaceID
+                    ? .commit
+                    : .localRollback(.workspaceChanged)
+            case .rejected:
+                return .localRollback(.workspacePersistenceRejected)
+            }
+        }
     }
 
     func reconcileProjection(

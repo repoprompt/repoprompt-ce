@@ -30,7 +30,10 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     private let runner: CLIProcessRunner
     private let config: ClaudeCodeAgentConfig
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
-    private let configService = MCPConfigExportService.shared
+    private let configService: MCPConfigExportService
+    private let serverReadiness: @Sendable () async -> Bool
+    private let processStarted: @Sendable (pid_t) async -> Void
+    private let cleanupStarted: @Sendable () async -> Void
     private let toolTracking = AgentToolTrackingController()
     private var streamTask: Task<Void, Never>?
 
@@ -44,11 +47,21 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     init(
         runner: CLIProcessRunner,
         config: ClaudeCodeAgentConfig,
-        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver()
+        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
+        configService: MCPConfigExportService = .shared,
+        serverReadiness: @escaping @Sendable () async -> Bool = {
+            await ServerNetworkManager.shared.isRunning()
+        },
+        processStarted: @escaping @Sendable (pid_t) async -> Void = { _ in },
+        cleanupStarted: @escaping @Sendable () async -> Void = {}
     ) {
         self.runner = runner
         self.config = config
         self.environmentResolver = environmentResolver
+        self.configService = configService
+        self.serverReadiness = serverReadiness
+        self.processStarted = processStarted
+        self.cleanupStarted = cleanupStarted
     }
 
     // MARK: - HeadlessAgentProvider
@@ -62,7 +75,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             if enableDebugLogging {
                 print("[DEBUG] ClaudeCodeAgent: Verifying MCP server is running")
             }
-            let isRunning = await ServerNetworkManager.shared.isRunning()
+            let isRunning = await serverReadiness()
             if enableDebugLogging {
                 print("[DEBUG] ClaudeCodeAgent: MCP server running: \(isRunning)")
             }
@@ -325,6 +338,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     }
 
     func cleanup(context: HeadlessAgentContext) async {
+        await cleanupStarted()
         if enableDebugLogging {
             print("[DEBUG] ClaudeCodeAgent: Cleaning up context \(context.runID)")
         }
@@ -384,12 +398,14 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                 additionalEnvironment: additionalEnvironment,
                                 additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? [],
                                 onProcessStarted: { pid in
-                                    guard let expectedPIDClientName else { return }
-                                    await ServerNetworkManager.shared.registerExpectedAgentPID(
-                                        pid,
-                                        for: expectedPIDClientName,
-                                        runID: expectedPIDRunID
-                                    )
+                                    if let expectedPIDClientName {
+                                        await ServerNetworkManager.shared.registerExpectedAgentPID(
+                                            pid,
+                                            for: expectedPIDClientName,
+                                            runID: expectedPIDRunID
+                                        )
+                                    }
+                                    await self.processStarted(pid)
                                 },
                                 onProcessTerminated: { pid in
                                     guard let expectedPIDClientName else { return }
@@ -551,8 +567,12 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] ClaudeCodeAgent: Disposing provider, cancelling stream task & runners")
         }
-        streamTask?.cancel()
+        // Join the captured task rather than the property: a later run may reassign `streamTask`,
+        // and disposal must settle this run's stream before its launch-config lease is released.
+        let task = streamTask
+        task?.cancel()
         await runner.cancelAll()
+        await task?.value
     }
 
     // MARK: - Helpers

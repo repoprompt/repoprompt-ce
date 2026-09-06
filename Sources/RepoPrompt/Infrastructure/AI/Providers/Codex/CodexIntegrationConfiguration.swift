@@ -175,9 +175,13 @@ enum CodexIntegrationConfiguration {
     /// Invoked from the UI when users opt-in to the integration. Ensures our MCP server exists and is
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
-    static func installPersistentMCPConfig() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+    static func installPersistentMCPConfig(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
         let runtime: CodexRuntimeAuthority.Runtime
-        switch CodexRuntimeAuthority.resolve() {
+        switch CodexRuntimeAuthority.resolveConfigured(
+            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot()
+        ) {
         case let .success(resolved):
             runtime = resolved
         case let .failure(failure):
@@ -223,8 +227,12 @@ enum CodexIntegrationConfiguration {
     /// `enabled = false` so normal Codex usage stays opt-in, while the agent enables it at runtime via
     /// `-c` overrides.
     @discardableResult
-    static func ensureServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
-        switch CodexRuntimeAuthority.resolve() {
+    static func ensureServerForDiscovery(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        switch CodexRuntimeAuthority.resolveConfigured(
+            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot()
+        ) {
         case let .success(resolved):
             ensureServerForDiscovery(runtime: resolved)
         case let .failure(failure):

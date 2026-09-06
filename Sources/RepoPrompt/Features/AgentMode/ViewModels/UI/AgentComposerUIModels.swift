@@ -213,6 +213,28 @@ struct AgentComposerSubmissionLatch {
     }
 }
 
+struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
+    let kind: ACPModelParameterKind
+    let baseModelRaw: String
+    let configID: String
+    let displayName: String
+    let selectedValueRaw: String
+    let selectedDisplayName: String
+    let choices: [ACPModelParameterChoice]
+
+    var id: String {
+        "\(kind.rawValue):\(configID)"
+    }
+
+    var accessibilityLabel: String {
+        displayName
+    }
+
+    var accessibilityValue: String {
+        selectedDisplayName
+    }
+}
+
 struct AgentComposerProps: Equatable {
     let currentTabID: UUID?
     let submitTarget: AgentComposerSubmitTarget?
@@ -234,6 +256,7 @@ struct AgentComposerProps: Equatable {
     let selectedModelDisplayName: String
     let selectedReasoningEffortRaw: String?
     let selectedReasoningEffortDisplayName: String
+    let cursorModelParameterControls: [AgentComposerModelParameterControlProps]
     let availableAgents: [AgentProviderKind]
     let isProviderPickerLockedForCurrentTab: Bool
     let lockedAgentSelectionMessage: String?
@@ -266,6 +289,7 @@ struct AgentComposerProps: Equatable {
         selectedModelDisplayName: AgentModel.defaultModel.displayName,
         selectedReasoningEffortRaw: nil,
         selectedReasoningEffortDisplayName: "",
+        cursorModelParameterControls: [],
         availableAgents: [],
         isProviderPickerLockedForCurrentTab: false,
         lockedAgentSelectionMessage: nil,

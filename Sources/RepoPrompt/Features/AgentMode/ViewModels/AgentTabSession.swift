@@ -495,7 +495,48 @@ final class AgentTabSession: ObservableObject {
     var selectedAgent: AgentProviderKind = .claudeCode
     var selectedModelRaw: String = AgentModel.defaultModel.rawValue
     var selectedReasoningEffortRaw: String?
+    private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
+    private var nextACPModelParameterSelectionRevision: UInt64 = 0
+    var acpModelParameterSelections: [ACPModelParameterSelection] = [] {
+        didSet {
+            let oldByIdentity = Self.acpModelParameterSelectionsByIdentity(oldValue)
+            let newByIdentity = Self.acpModelParameterSelectionsByIdentity(acpModelParameterSelections)
+            for identity in Set(oldByIdentity.keys).union(newByIdentity.keys)
+                where oldByIdentity[identity] != newByIdentity[identity]
+            {
+                advanceACPModelParameterSelectionRevision(for: identity)
+            }
+        }
+    }
+
     var autoEditEnabled: Bool = true
+
+    /// Volatile ownership for an accepted explicit write. This is intentionally
+    /// separate from durable selections so stale asynchronous rollbacks cannot
+    /// overwrite a newer selection, including a normalized no-op write.
+    func recordAcceptedACPModelParameterWrite(_ selections: [ACPModelParameterSelection]) {
+        for selection in ACPModelParameterSelection.normalized(selections) {
+            advanceACPModelParameterSelectionRevision(for: selection.identity)
+        }
+    }
+
+    func acpModelParameterSelectionRevision(for identity: ACPModelParameterIdentity) -> UInt64 {
+        acpModelParameterSelectionRevisionByIdentity[identity] ?? 0
+    }
+
+    private func advanceACPModelParameterSelectionRevision(for identity: ACPModelParameterIdentity) {
+        nextACPModelParameterSelectionRevision &+= 1
+        acpModelParameterSelectionRevisionByIdentity[identity] = nextACPModelParameterSelectionRevision
+    }
+
+    private static func acpModelParameterSelectionsByIdentity(
+        _ selections: [ACPModelParameterSelection]
+    ) -> [ACPModelParameterIdentity: ACPModelParameterSelection] {
+        selections.reduce(into: [ACPModelParameterIdentity: ACPModelParameterSelection]()) { result, selection in
+            result[selection.identity] = selection
+        }
+    }
+
     var selectedModel: AgentModel {
         get { AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel }
         set { selectedModelRaw = newValue.rawValue }

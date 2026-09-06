@@ -87,6 +87,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             "op": .string(description: "Operation.", enum: ["start", "poll", "wait", "cancel", "steer", "respond"]),
             "message": .string(description: messageDescription),
             "model_id": .string(description: "[start] Role label from agent_manage.list_agents task_labels (explore, engineer, pair, design — resolved via global role defaults), or an explicit compound model_id from agents[].models[].model_id to pin an exact target. Defaults to pair when omitted."),
+            "model_parameters": modelParametersSchema(operations: "start"),
             "session_id": .string(description: "[poll, wait, cancel, steer, respond] Session UUID returned by a prior start/steer response. Do not fabricate it. Not accepted by start — use steer to continue an existing session."),
             "session_ids": .array(description: "[wait, poll] Array of session UUIDs. For wait: returns when first session reaches interesting state. For poll: returns all current snapshots. Mutually exclusive with session_id.", items: .string()),
             "session_name": .string(description: "[start] Display name for a new session."),
@@ -133,7 +134,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             **Operations**: start | poll | wait | cancel | steer | respond
 
-            - `start`: Launch an agent run in a **new** session/tab. Do NOT pass `session_id` — use `steer` to continue an existing session. Omit `model_id` to use the `pair` role, or pass `model_id` with a role label (resolved via the global role-default mapping in `agent_manage.list_agents` `task_labels`) or an explicit compound `model_id` from `agents[].models[].model_id`. When started from an Agent Mode run, the new child session inherits the source session's worktree bindings by default; pass `inherit_worktree=false` to keep parent session threading but skip worktree inheritance. Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. Returns a `session_id` — save it for all follow-up calls. Waits up to `timeout` seconds (default \(defaultWaitSeconds)). Pass `detach: true` to return immediately.
+            - `start`: Launch an agent run in a **new** session/tab. Do NOT pass `session_id` — use `steer` to continue an existing session. Omit `model_id` to use the `pair` role, or pass `model_id` with a role label (resolved via the global role-default mapping in `agent_manage.list_agents` `task_labels`) or an explicit compound `model_id` from `agents[].models[].model_id`. Cursor models may also pass `model_parameters` using exact `config_id` and `value` pairs advertised for that model by `agent_manage.list_agents`. These selections are applied before the first prompt and are returned in session snapshots. When started from an Agent Mode run, the new child session inherits the source session's worktree bindings by default; pass `inherit_worktree=false` to keep parent session threading but skip worktree inheritance. Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. Returns a `session_id` — save it for all follow-up calls. Waits up to `timeout` seconds (default \(defaultWaitSeconds)). Pass `detach: true` to return immediately.
             - `poll`: Return current snapshot immediately. Accepts `session_id` (single) or `session_ids` (array — returns all current snapshots).
             - `wait`: Block until the run finishes or needs input. Default \(defaultWaitSeconds)s. `timeout: 0` = poll. Accepts `session_id` (single) or `session_ids` (array — returns when first session reaches interesting state). Returns `interaction_id` when input is pending. A steering interruption may include `wait.steering_message` as caller context; it does not acknowledge provider delivery or instruct the caller to resend.
             - `cancel`: Stop an active agent run. Only valid when the run is `running` or `waiting_for_input`. Requires `session_id`.
@@ -153,7 +154,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                 description: """
                 Provide `op` plus operation-specific fields.
 
-                **start**: message (required), model_id? (defaults to pair), session_name?, workflow_id|workflow_name?, detach?, timeout?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args. Use workflow_name="orchestrate" to plan, decompose, and dispatch sub-agents.
+                **start**: message (required), model_id? (defaults to pair), model_parameters? (Cursor exact config/value selections), session_name?, workflow_id|workflow_name?, detach?, timeout?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args. Use workflow_name="orchestrate" to plan, decompose, and dispatch sub-agents.
                 **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only)
                 **cancel**: session_id (required)
                 **steer**: session_id (required, from a prior `start`/`steer` response), message (required), wait?, timeout_seconds?, workflow_id|workflow_name?
@@ -176,11 +177,11 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             **Operations**: list_agents | list_sessions | get_log | extract_handoff | handoff | create_session | resume_session | stop_session | cleanup_sessions | list_workflows
 
-            - `list_agents`: Returns top-level `task_labels` as the authoritative role-label→model mapping (explore, engineer, pair, design), plus `agents[].models[]` with explicit compound `model_id` targets for callers that want to pin a specific agent/model/effort. Use `task_labels` entries for role-based routing; use `agents[].models[].model_id` for exact selections. Pass `roles_only=true` to return only `task_labels` and omit the explicit per-agent target catalog.
+            - `list_agents`: Returns top-level `task_labels` as the authoritative role-label→model mapping (explore, engineer, pair, design), plus `agents[].models[]` with explicit compound `model_id` targets. Cursor model entries also include release-catalog `model_parameters` and exact choices; `current_value` describes the catalog default, not a live session value. The catalog does not synthesize model variants. Use `task_labels` entries for role-based routing; use `agents[].models[].model_id` for exact selections. Pass `roles_only=true` to return only `task_labels` and omit the explicit per-agent target catalog.
             - `list_sessions`: Browse sessions. Returns `session_id` for each session. Filter by MCP-facing `state` (e.g. `running`, `waiting_for_input`, `completed`, `failed`). When called from agent mode, automatically scopes to sessions spawned by the current agent session.
             - `get_log`: Read faithful transcript XML for a session, preserving visible assistant/tool order without handoff compaction or narration pruning. Use `offset`/`limit` to page by turns.
             - `extract_handoff` (`handoff` alias): Export the full `<forked_session ...>` handoff XML for a live or persisted session. Persisted sessions export transcript-only payloads; `include_file_contents` is accepted only for a live source tab that is currently active so file selection can be snapshotted reliably. Use `output_path` to write to a file; inline XML is returned by default only when no output path is provided.
-            - `create_session` / `resume_session`: Create or resume a session with a specific `model_id`.
+            - `create_session` / `resume_session`: Create or resume a session with a specific `model_id`. Cursor models may also pass exact `model_parameters` advertised by `list_agents`.
             - `stop_session`: Stop a live session.
             - `cleanup_sessions`: Delete up to 256 specific MCP-originated sessions by ID. The entire array must contain unique valid UUID strings; any non-string, invalid UUID, or duplicate rejects the request before lookup or mutation. Only sessions started via MCP are eligible; user-created sessions are never deleted. Skips active sessions. Cancellation before mutation returns the current and remaining IDs as unprocessed/retry IDs. Cancellation after mutation starts but before durable deletion reports the current ID as retryable `mutation_cancelled`, returns only later IDs as unprocessed/retry, and stops the batch. Cancellation after durable deletion keeps the current ID in `deleted_sessions` with `durable=true`, leaves it out of retry IDs, returns only later IDs as unprocessed/retry, and stops the batch. Per-ID lookup and persisted-session load failures are `resolution_failed`. Durable deletion failures preserve live UI/session state and are `delete_failed`; open-tab failures include `durable=false` and `local_cleanup_completed=false`. Missing or previously deleted IDs are `already_absent` and do not make an otherwise successful response partial. Use `list_sessions` first to find session IDs, then pass them here.
             - `list_workflows`: Discover workflows usable with `agent_run` operations, including `orchestrate` for planning, decomposition, and sub-agent dispatch.
@@ -195,8 +196,8 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                 **list_sessions**: agent?, state?, limit?
                 **get_log**: session_id (required), offset?, limit?
                 **extract_handoff / handoff**: session_id (required), up_to_item_id?, include_file_contents?, output_path?, overwrite?, inline?, max_transcript_items?, max_tool_args_characters?
-                **create_session**: model_id?, session_name?
-                **resume_session**: session_id (required), model_id?
+                **create_session**: model_id?, model_parameters?, session_name?
+                **resume_session**: session_id (required), model_id?, model_parameters?
                 **stop_session**: session_id (required)
                 **cleanup_sessions**: session_ids (required, array of 1...256 session UUIDs)
 
@@ -205,6 +206,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                 properties: [
                     "op": .string(description: "Operation.", enum: ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_workflows"]),
                     "model_id": .string(description: "[create_session, resume_session] Role label from list_agents task_labels (explore, engineer, pair, design — resolved via global role defaults), or an explicit compound model_id from list_agents agents[].models[].model_id."),
+                    "model_parameters": modelParametersSchema(operations: "create_session, resume_session"),
                     "session_id": .string(description: "[get_log, extract_handoff, resume_session, stop_session] Session UUID."),
                     "session_name": .string(description: "[create_session] Display name for a new session."),
                     "limit": .integer(description: "[list_sessions, get_log] Max results."),
@@ -225,5 +227,18 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
         ) { [dependencies] _, args in
             try await dependencies.executeAgentManage(args)
         }
+    }
+
+    private func modelParametersSchema(operations: String) -> JSONSchema {
+        .array(
+            description: "[\(operations)] Cursor-only exact provider parameters advertised by agent_manage.list_agents for the selected model. Unknown config IDs or values are rejected before the session starts.",
+            items: .object(
+                properties: [
+                    "config_id": .string(description: "Exact provider config identifier from model_parameters[].config_id."),
+                    "value": .string(description: "Exact advertised choice value from model_parameters[].choices[].value.")
+                ],
+                required: ["config_id", "value"]
+            )
+        )
     }
 }

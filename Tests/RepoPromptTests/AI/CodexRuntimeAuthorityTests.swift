@@ -162,6 +162,9 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
                 minimum: .init(major: 0, minor: 149, patch: 0)
             )
         )
+        XCTAssertTrue(
+            failure(from: old)?.localizedDescription.contains("update the configured executable") == true
+        )
 
         let prerelease = CodexRuntimeAuthority.resolve(
             resourcesURL: nil,
@@ -190,17 +193,148 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         )
 
         let missing = temporaryDirectory.appendingPathComponent("external/missing-codex")
-        XCTAssertEqual(
-            failure(
-                from: CodexRuntimeAuthority.resolve(
-                    resourcesURL: nil,
-                    applicationSupportURL: temporaryDirectory,
-                    explicitExecutableOverride: missing.path,
-                    externalVersionReader: { _ in "codex-cli 0.149.0" }
-                )
-            ),
-            .externalOverrideMissing(missing.path)
+        let missingResult = CodexRuntimeAuthority.resolve(
+            resourcesURL: nil,
+            applicationSupportURL: temporaryDirectory,
+            explicitExecutableOverride: missing.path,
+            externalVersionReader: { _ in "codex-cli 0.149.0" }
         )
+        XCTAssertEqual(failure(from: missingResult), .externalOverrideMissing(missing.path))
+        XCTAssertTrue(
+            failure(from: missingResult)?.localizedDescription.contains("Choose another in Settings") == true
+        )
+    }
+
+    func testInjectedLaunchSnapshotsPreserveBundledLocalBundledChoices() throws {
+        let resources = temporaryDirectory.appendingPathComponent("Resources", isDirectory: true)
+        let environment = temporaryDirectory.appendingPathComponent("environment/codex")
+        let selected = temporaryDirectory.appendingPathComponent("selected/codex")
+        try makeExecutable(at: environment, content: "#!/bin/sh\necho 'codex 0.153.3'\n")
+        try makeExecutable(at: selected, content: "#!/bin/sh\necho 'codex 0.154.0'\n")
+        let bundledExecutable = try makePackage(in: resources, target: "aarch64-apple-darwin")
+        let suiteName = "CodexRuntimeLaunchSnapshotTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        CodexRuntimePreferences.setSelection(.bundled, defaults: defaults)
+        let bundledSnapshot = CodexRuntimeAuthority.makeLaunchSnapshot(defaults: defaults)
+        CodexRuntimePreferences.setSelection(.external(path: selected.path), defaults: defaults)
+        let localSnapshot = CodexRuntimeAuthority.makeLaunchSnapshot(defaults: defaults)
+        CodexRuntimePreferences.setSelection(.bundled, defaults: defaults)
+        let bundledAgainSnapshot = CodexRuntimeAuthority.makeLaunchSnapshot(defaults: defaults)
+
+        let environmentValues = [
+            "PATH": temporaryDirectory.path,
+            CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: environment.path
+        ]
+        let resolve: (CodexRuntimeAuthority.LaunchSnapshot) throws -> CodexRuntimeAuthority.Runtime = { snapshot in
+            try CodexRuntimeAuthority.resolveConfigured(
+                environment: environmentValues,
+                resourcesURL: resources,
+                architectureTarget: "aarch64-apple-darwin",
+                applicationSupportURL: self.temporaryDirectory,
+                defaults: defaults,
+                launchSnapshot: snapshot,
+                externalVersionReader: { url in
+                    url == selected ? "codex 0.154.0" : nil
+                }
+            ).get()
+        }
+
+        XCTAssertEqual(try resolve(bundledSnapshot).executableURL, bundledExecutable)
+        XCTAssertEqual(try resolve(localSnapshot).executableURL, selected)
+        XCTAssertEqual(try resolve(bundledAgainSnapshot).executableURL, bundledExecutable)
+    }
+
+    func testDefaultsMigrationFeedsIsolatedLaunchSnapshotForBundledAndExternalSelections() throws {
+        let externalPath = temporaryDirectory.appendingPathComponent("legacy/codex").path
+        let cases: [(expected: CodexRuntimePreferences.Selection, legacyDomain: [String: Any])] = [
+            (
+                expected: .bundled,
+                legacyDomain: ["codexRuntimeSelectionMode": "bundled"]
+            ),
+            (
+                expected: .external(path: externalPath),
+                legacyDomain: [
+                    "codexRuntimeSelectionMode": "external",
+                    "codexRuntimeExecutablePath": externalPath
+                ]
+            )
+        ]
+
+        for testCase in cases {
+            let successorDomainName = "CodexRuntimeMigrationSnapshotTests-\(UUID().uuidString)"
+            let legacyDomainName = "\(successorDomainName).legacy"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: successorDomainName))
+            defer {
+                defaults.removePersistentDomain(forName: successorDomainName)
+                defaults.removePersistentDomain(forName: legacyDomainName)
+            }
+            defaults.removePersistentDomain(forName: successorDomainName)
+            defaults.removePersistentDomain(forName: legacyDomainName)
+            defaults.setPersistentDomain(testCase.legacyDomain, forName: legacyDomainName)
+
+            let report = BundleIdentityDefaultsMigration.migrateIfNeeded(
+                bundleIdentifier: RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier,
+                defaults: defaults,
+                legacyDomainName: legacyDomainName,
+                successorDomainName: successorDomainName
+            )
+            XCTAssertEqual(report.outcome, .migrated)
+
+            let snapshot = CodexRuntimeAuthority.makeLaunchSnapshot(defaults: defaults)
+            XCTAssertEqual(snapshot.selection, testCase.expected)
+        }
+    }
+
+    func testNewlyPreparedClientsKeepLaunchAuthorityAfterPendingPreferenceWrite() async throws {
+        let environment = temporaryDirectory.appendingPathComponent("environment/codex")
+        let pending = temporaryDirectory.appendingPathComponent("pending/codex")
+        try makeExecutable(at: environment, content: "#!/bin/sh\necho 'codex 0.153.3'\n")
+        try makeExecutable(at: pending, content: "#!/bin/sh\necho 'codex 0.154.0'\n")
+        let suiteName = "CodexRuntimeClientSnapshotTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        CodexRuntimePreferences.setSelection(.inherited, defaults: defaults)
+        let launchSnapshot = CodexRuntimeAuthority.makeLaunchSnapshot(defaults: defaults)
+        CodexRuntimePreferences.setSelection(.external(path: pending.path), defaults: defaults)
+
+        let environmentValues = [
+            "HOME": temporaryDirectory.path,
+            CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: environment.path
+        ]
+        func makeClient() -> CodexAppServerClient {
+            CodexAppServerClient(
+                processEnvironmentBuilder: { _ in
+                    ProcessEnvironmentResult(
+                        environment: environmentValues,
+                        launchContext: .detect(from: environmentValues),
+                        shellEnvironmentSource: .capturedLoginShell
+                    )
+                },
+                runtimeStatePreparer: { _ in },
+                launchSnapshot: launchSnapshot,
+                provisionsRepoPromptMCPOnStart: false
+            )
+        }
+
+        let first = try await makeClient().prepareRuntimeForLaunch()
+        let newlyPrepared = try await makeClient().prepareRuntimeForLaunch()
+        XCTAssertEqual(first, newlyPrepared)
+        XCTAssertEqual(first.executableURL, environment)
+        XCTAssertEqual(first.version, .init(major: 0, minor: 153, patch: 3))
+        XCTAssertNotEqual(first.executableURL, pending)
+
+        let preview = try CodexRuntimeAuthority.resolveConfigured(
+            environment: environmentValues,
+            resourcesURL: nil,
+            applicationSupportURL: temporaryDirectory,
+            defaults: defaults,
+            selection: CodexRuntimePreferences.selection(defaults: defaults),
+            externalVersionReader: { _ in "codex 0.154.0" }
+        ).get()
+        XCTAssertEqual(preview.executableURL, pending)
     }
 
     func testOverrideEnvironmentIsTheOnlyFallbackWhenBundleIsMissing() throws {
@@ -219,6 +353,52 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
 
         XCTAssertEqual(runtime.executableURL, override)
         XCTAssertEqual(runtime.source, .externalOverride)
+    }
+
+    func testConfiguredRuntimePrefersAndClearsPersistedExecutable() throws {
+        let suiteName = "CodexRuntimePreferencesTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let selected = temporaryDirectory.appendingPathComponent("selected/codex")
+        let environment = temporaryDirectory.appendingPathComponent("environment/codex")
+        try makeExecutable(at: selected)
+        try makeExecutable(at: environment)
+
+        CodexRuntimePreferences.setSelection(.external(path: "   "), defaults: defaults)
+        XCTAssertEqual(CodexRuntimePreferences.selection(defaults: defaults), .inherited)
+        CodexRuntimePreferences.setSelection(.external(path: "  \(selected.path)  "), defaults: defaults)
+
+        let configured = try CodexRuntimeAuthority.resolveConfigured(
+            environment: [CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: environment.path],
+            resourcesURL: nil,
+            applicationSupportURL: temporaryDirectory,
+            selection: CodexRuntimePreferences.selection(defaults: defaults),
+            externalVersionReader: { _ in "codex 0.153.3" }
+        ).get()
+        XCTAssertEqual(configured.executableURL, selected)
+
+        CodexRuntimePreferences.setSelection(.bundled, defaults: defaults)
+        let resources = temporaryDirectory.appendingPathComponent("Resources", isDirectory: true)
+        let bundledExecutable = try makePackage(in: resources, target: "aarch64-apple-darwin")
+        let bundled = try CodexRuntimeAuthority.resolveConfigured(
+            environment: [CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: environment.path],
+            resourcesURL: resources,
+            architectureTarget: "aarch64-apple-darwin",
+            applicationSupportURL: temporaryDirectory,
+            selection: CodexRuntimePreferences.selection(defaults: defaults),
+            externalVersionReader: { _ in "codex 0.153.3" }
+        ).get()
+        XCTAssertEqual(bundled.executableURL, bundledExecutable)
+
+        CodexRuntimePreferences.setSelection(.inherited, defaults: defaults)
+        let fallback = try CodexRuntimeAuthority.resolveConfigured(
+            environment: [CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: environment.path],
+            resourcesURL: nil,
+            applicationSupportURL: temporaryDirectory,
+            selection: CodexRuntimePreferences.selection(defaults: defaults),
+            externalVersionReader: { _ in "codex 0.153.3" }
+        ).get()
+        XCTAssertEqual(fallback.executableURL, environment)
     }
 
     func testCodexPreflightUsesCapturedLoginShellOverrideInsteadOfInheritedAppEnvironment() async throws {
@@ -248,7 +428,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertEqual(resolution.resolvedCommand, loginShellOverride.path)
         XCTAssertEqual(resolution.runtime?.source, .externalOverride)
         XCTAssertEqual(resolution.runtime?.version, .init(major: 0, minor: 149, patch: 0))
-        XCTAssertEqual(resolution.displayDescription, "External Codex override 0.149.0 (codex)")
+        XCTAssertEqual(resolution.displayDescription, "Local Codex 0.149.0 (codex)")
         XCTAssertFalse(resolution.displayDescription?.contains(temporaryDirectory.path) == true)
 
         let execProcessConfiguration = CodexExecAgentProvider.processConfiguration(
@@ -263,6 +443,136 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             execProcessConfiguration.environment["CODEX_SQLITE_HOME"],
             resolution.runtime?.statePaths.sqliteHome.path
         )
+    }
+
+    func testCapturedShellEnvironmentIsUsedByVersionProbeForInterpreterScripts() async throws {
+        let bin = temporaryDirectory.appendingPathComponent("shell-bin", isDirectory: true)
+        let node = bin.appendingPathComponent("node")
+        let codex = bin.appendingPathComponent("codex")
+        try makeExecutable(at: node, content: "#!/bin/sh\necho 'codex-cli 0.149.0'\n")
+        try makeExecutable(at: codex, content: "#!/usr/bin/env node\n")
+
+        let temporaryPath = temporaryDirectory.path
+        let resolution = await CodexProviderHelpers.preflightCodexExecutable(
+            inheritedEnvironment: ["HOME": temporaryPath],
+            shellEnvironmentProvider: { _, _ in
+                CLIEnvironmentSnapshot(
+                    environment: [
+                        "HOME": temporaryPath,
+                        "PATH": bin.path,
+                        CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: codex.path
+                    ],
+                    source: .capturedLoginShell
+                )
+            }
+        )
+
+        XCTAssertEqual(resolution.status, .available)
+        XCTAssertEqual(resolution.resolvedCommand, codex.path)
+        XCTAssertEqual(resolution.runtime?.version, .init(major: 0, minor: 149, patch: 0))
+    }
+
+    func testVersionProbeCacheSeparatesCapturedPATHForSameExecutableMetadata() throws {
+        let firstBin = temporaryDirectory.appendingPathComponent("first-shell-bin", isDirectory: true)
+        let secondBin = temporaryDirectory.appendingPathComponent("second-shell-bin", isDirectory: true)
+        let firstInterpreter = firstBin.appendingPathComponent("node")
+        let secondInterpreter = secondBin.appendingPathComponent("node")
+        let codex = temporaryDirectory.appendingPathComponent("codex")
+        try makeExecutable(at: firstInterpreter, content: "#!/bin/sh\necho 'codex-cli 0.149.0'\n")
+        try makeExecutable(at: secondInterpreter, content: "#!/bin/sh\necho 'codex-cli 0.150.0'\n")
+        try makeExecutable(at: codex, content: "#!/usr/bin/env node\n")
+        let metadataBefore = try FileManager.default.attributesOfItem(atPath: codex.path)
+
+        let first = try CodexRuntimeAuthority.resolve(
+            environment: ["PATH": firstBin.path],
+            resourcesURL: nil,
+            applicationSupportURL: temporaryDirectory,
+            explicitExecutableOverride: codex.path
+        ).get()
+        let second = try CodexRuntimeAuthority.resolve(
+            environment: ["PATH": secondBin.path],
+            resourcesURL: nil,
+            applicationSupportURL: temporaryDirectory,
+            explicitExecutableOverride: codex.path
+        ).get()
+        let metadataAfter = try FileManager.default.attributesOfItem(atPath: codex.path)
+
+        XCTAssertEqual(first.executableURL.path, codex.path)
+        XCTAssertEqual(second.executableURL.path, codex.path)
+        XCTAssertEqual(first.version, .init(major: 0, minor: 149, patch: 0))
+        XCTAssertEqual(second.version, .init(major: 0, minor: 150, patch: 0))
+        XCTAssertEqual(
+            (metadataBefore[.size] as? NSNumber)?.uint64Value,
+            (metadataAfter[.size] as? NSNumber)?.uint64Value
+        )
+        XCTAssertEqual(
+            metadataBefore[.modificationDate] as? Date,
+            metadataAfter[.modificationDate] as? Date
+        )
+    }
+
+    func testSettingsPreflightPreservesVersionManagerSymlinkAndRejectsOldSystemCodex() async throws {
+        let bin = temporaryDirectory.appendingPathComponent("bin", isDirectory: true)
+        let shim = bin.appendingPathComponent("volta-shim")
+        let codex = bin.appendingPathComponent("codex")
+        try makeExecutable(
+            at: shim,
+            content: "#!/bin/sh\n[ \"${0##*/}\" = codex ] || exit 126\necho 'codex-cli 0.153.3'\n"
+        )
+        try FileManager.default.createSymbolicLink(at: codex, withDestinationURL: shim)
+
+        let temporaryPath = temporaryDirectory.path
+        let shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider = { _, _ in
+            CLIEnvironmentSnapshot(
+                environment: ["HOME": temporaryPath, "PATH": bin.path],
+                source: .capturedLoginShell
+            )
+        }
+        let accepted = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+            inheritedEnvironment: ["HOME": temporaryPath],
+            shellEnvironmentProvider: shellEnvironmentProvider
+        )
+
+        XCTAssertEqual(accepted.systemCandidate?.resolvedCommand, codex.path)
+        XCTAssertEqual(accepted.systemCandidate?.runtime?.executableURL.path, codex.path)
+        XCTAssertEqual(accepted.systemCandidate?.runtime?.source, .externalOverride)
+        XCTAssertEqual(accepted.systemCandidate?.runtime?.version, .init(major: 0, minor: 153, patch: 3))
+
+        let oldShim = bin.appendingPathComponent("volta-shim-old")
+        try makeExecutable(
+            at: oldShim,
+            content: "#!/bin/sh\n[ \"${0##*/}\" = codex ] || exit 126\necho 'codex-cli 0.142.0 (too old)'\n"
+        )
+        try FileManager.default.removeItem(at: codex)
+        try FileManager.default.createSymbolicLink(at: codex, withDestinationURL: oldShim)
+        let rejected = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+            inheritedEnvironment: ["HOME": temporaryPath],
+            shellEnvironmentProvider: shellEnvironmentProvider
+        )
+
+        XCTAssertNil(rejected.systemCandidate)
+    }
+
+    func testExternalVersionProbeUsesEnvironmentAndSeparatesCachedResults() throws {
+        let bin = temporaryDirectory.appendingPathComponent("interpreter-bin", isDirectory: true)
+        let interpreter = bin.appendingPathComponent("rpce-test-codex-interpreter")
+        let codex = temporaryDirectory.appendingPathComponent("launcher/codex")
+        try makeExecutable(at: interpreter, content: "#!/bin/sh\necho codex-cli 0.153.3\n")
+        try makeExecutable(at: codex, content: "#!/usr/bin/env rpce-test-codex-interpreter\n")
+        let absentEnvironment = ["PATH": "/usr/bin:/bin"]
+        let capturedEnvironment = ["PATH": bin.path + ":/usr/bin:/bin"]
+
+        func resolve(_ environment: [String: String]) -> Result<CodexRuntimeAuthority.Runtime, CodexRuntimeAuthority.Failure> {
+            CodexRuntimeAuthority.resolve(
+                environment: environment,
+                applicationSupportURL: temporaryDirectory,
+                explicitExecutableOverride: codex.path
+            )
+        }
+
+        XCTAssertEqual(failure(from: resolve(absentEnvironment)), .externalOverrideVersionUnreadable(codex.path))
+        XCTAssertEqual(try resolve(capturedEnvironment).get().version, .init(major: 0, minor: 153, patch: 3))
+        XCTAssertEqual(failure(from: resolve(absentEnvironment)), .externalOverrideVersionUnreadable(codex.path))
     }
 
     func testManagedAuthGuidanceUsesRepoPromptOwnedLoginFlow() {

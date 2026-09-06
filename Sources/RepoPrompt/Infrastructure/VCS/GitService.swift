@@ -864,7 +864,7 @@ actor GitService {
                         #endif
                         parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, targetTree)
                         if let stableWatchRootURL = mutationRequest.appManagedContainer {
-                            witnessSession = creationReceiptCoordinator.start(
+                            witnessSession = await creationReceiptCoordinator.start(
                                 destinationURL: mutationRequest.path,
                                 stableWatchRootURL: stableWatchRootURL
                             )
@@ -953,7 +953,10 @@ actor GitService {
                             targetLayout = nil
                         }
                     #endif
-                    var witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    var witnessCoverage: GitWorktreeCreationWitnessCoverage?
+                    if let activeWitnessSession = witnessSession {
+                        witnessCoverage = await creationReceiptCoordinator.finish(activeWitnessSession)
+                    }
                     witnessSession = nil
                     #if DEBUG
                         if consumeReceiptCreationFailureForTesting(
@@ -1170,7 +1173,11 @@ actor GitService {
                         initializationFallbackReason: initializationFallbackReason
                     )
                 } catch is CancellationError {
-                    let witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    let witnessCoverage: GitWorktreeCreationWitnessCoverage? = if let activeWitnessSession = witnessSession {
+                        await creationReceiptCoordinator.finish(activeWitnessSession)
+                    } else {
+                        nil
+                    }
                     if let mutationToken {
                         await workspaceStateAuthority.finishMutation(mutationToken, outcome: .cancelled)
                     }
@@ -1190,7 +1197,11 @@ actor GitService {
                     #endif
                     throw CancellationError()
                 } catch {
-                    let witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    let witnessCoverage: GitWorktreeCreationWitnessCoverage? = if let activeWitnessSession = witnessSession {
+                        await creationReceiptCoordinator.finish(activeWitnessSession)
+                    } else {
+                        nil
+                    }
                     if let mutationToken {
                         await workspaceStateAuthority.finishMutation(mutationToken, outcome: .failed)
                     }

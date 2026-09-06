@@ -260,11 +260,16 @@ struct AgentRunMCPToolService {
     var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
     let startRun: StartRun
+
     var currentSnapshotProvider: (@Sendable (_ sessionID: UUID, _ agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot?)?
     #if DEBUG
         var testAgentModeViewModel: AgentModeViewModel?
+        var testAfterTargetResolution: ((AgentModeViewModel.MCPSessionTarget) async -> Void)?
         var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
+        var testBeforeWorktreeBindingCommit: (() async -> Void)?
         var testBeforeProviderDispatch: (() async -> Void)?
+        var testBeforeSteerDispatch: (() async -> Void)?
+        var testAfterSteerDispatchBeforeBookkeeping: ((AgentModeViewModel.MCPSessionTarget?) async throws -> Void)?
         var testAfterProviderStartBeforeBookkeeping: (() async -> Void)?
         var testDispatchSteerInstruction: ((
             _ sessionID: UUID,
@@ -276,11 +281,20 @@ struct AgentRunMCPToolService {
     var vcsService: VCSService = .shared
     var gitTargetResolver: GitRepoTargetResolver = .init()
 
+    private var preBindingCommitObserver: AgentMCPStartWorktreeCoordinator.PreBindingCommitObserver? {
+        #if DEBUG
+            testBeforeWorktreeBindingCommit
+        #else
+            nil
+        #endif
+    }
+
     private var startWorktreeCoordinator: AgentMCPStartWorktreeCoordinator {
         AgentMCPStartWorktreeCoordinator(
             operationName: "agent_run.start",
             vcsService: vcsService,
-            gitTargetResolver: gitTargetResolver
+            gitTargetResolver: gitTargetResolver,
+            preBindingCommitObserver: preBindingCommitObserver
         )
     }
 
@@ -405,6 +419,11 @@ struct AgentRunMCPToolService {
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
             workspaceID: workspace.id
         )
+        let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
+            value: args["model_parameters"],
+            agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
+            modelRaw: selection.modelRaw
+        )
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -448,7 +467,8 @@ struct AgentRunMCPToolService {
             parentSessionID: spawnParentSessionID,
             inheritWorktreeBindings: usesRoutedParentSource
                 ? false
-                : effectiveParentWorktreeInheritance
+                : effectiveParentWorktreeInheritance,
+            expectedWorkspaceID: workspace.id
         )
         guard let targetSessionID = target.sessionID else {
             await agentModeVM.mcpDiscardSessionTarget(target)
@@ -460,9 +480,7 @@ struct AgentRunMCPToolService {
                     let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
                     try diagnostics.registerRecoverableStartTarget(
                         correlationID: worktreeStartupCorrelationID,
-                        agentSessionID: targetSessionID,
-                        targetTabID: target.tabID,
-                        targetOrigin: target.origin
+                        target: target
                     )
                     try diagnostics.requireRecoverableStartNotAborted(
                         correlationID: worktreeStartupCorrelationID
@@ -473,12 +491,14 @@ struct AgentRunMCPToolService {
                         phase: .discardRequested,
                         errorCategory: "target_registration"
                     )
-                    await agentModeVM.mcpDiscardSessionTarget(target)
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .discardCompleted,
-                        providerRunActive: false
-                    )
+                    let discardResult = await agentModeVM.mcpDiscardSessionTarget(target)
+                    if discardResult == .complete {
+                        try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                            correlationID: worktreeStartupCorrelationID,
+                            phase: .discardCompleted,
+                            providerRunActive: false
+                        )
+                    }
                     throw error
                 }
             }
@@ -497,6 +517,13 @@ struct AgentRunMCPToolService {
             bindings: [AgentSessionWorktreeBinding]
         )?
         do {
+            #if DEBUG
+                await testAfterTargetResolution?(target)
+            #endif
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
             if effectiveParentWorktreeInheritance,
                let parentSourceTabID,
                let spawnParentSessionID
@@ -549,6 +576,7 @@ struct AgentRunMCPToolService {
                             request: worktreeStartRequest,
                             target: target,
                             targetWindow: targetWindow,
+                            expectedWorkspaceID: workspace.id,
                             startupContext: worktreeStartupContext
                         )
                     }
@@ -557,6 +585,7 @@ struct AgentRunMCPToolService {
                         request: worktreeStartRequest,
                         target: target,
                         targetWindow: targetWindow,
+                        expectedWorkspaceID: workspace.id,
                         startupContext: worktreeStartupContext
                     )
                 }
@@ -565,6 +594,7 @@ struct AgentRunMCPToolService {
                     request: worktreeStartRequest,
                     target: target,
                     targetWindow: targetWindow,
+                    expectedWorkspaceID: workspace.id,
                     startupContext: worktreeStartupContext
                 )
             #endif
@@ -615,9 +645,9 @@ struct AgentRunMCPToolService {
                     )
                 }
             #endif
-            await agentModeVM.mcpDiscardSessionTarget(target)
+            let discardResult = await agentModeVM.mcpDiscardSessionTarget(target)
             #if DEBUG
-                if worktreeStartupBenchmarkToken != nil {
+                if worktreeStartupBenchmarkToken != nil, discardResult == .complete {
                     try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
                         correlationID: worktreeStartupCorrelationID,
                         phase: .discardCompleted,
@@ -642,28 +672,42 @@ struct AgentRunMCPToolService {
         let outcome: AgentExternalMCPRunStarter.StartOutcome
         var lifecycleAdmissionAttempted = false
         var providerDispatchAttempted = false
+        var modelParameterStagingRollback: AgentModeViewModel.MCPModelParameterSelectionStagingRollback?
         do {
             try await Self.requireWritableWorkspaceAuthority(
                 targetWindow.workspaceManager.domainAuthorityAdmissionIssue(for: workspace.id)
             )
             lifecycleAdmissionAttempted = true
-            try agentModeVM.requireCurrentAgentSessionLifecycleAdmission(target)
+            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                target,
+                expectedWorkspaceID: workspace.id
+            )
             agentModeVM.recordAgentSessionProviderLifecycle(
                 target: target,
                 phase: .beforeProviderStart,
                 decision: .admitted,
                 reason: "binding_identity_validated"
             )
-            WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
             #if DEBUG
+                await testBeforeProviderDispatch?()
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                    target,
+                    expectedWorkspaceID: workspace.id
+                )
                 if worktreeStartupBenchmarkToken != nil {
-                    await testBeforeProviderDispatch?()
                     try WorktreeStartupBenchmarkDiagnostics.shared.beginRecoverableProviderDispatch(
                         correlationID: worktreeStartupCorrelationID
                     )
                 }
             #endif
+            WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
             providerDispatchAttempted = true
+            modelParameterStagingRollback = try agentModeVM.mcpStageModelParameterSelections(
+                tabID: target.tabID,
+                agentRaw: selection.agentRaw,
+                modelRaw: selection.modelRaw,
+                selections: modelParameterSelections
+            )
             outcome = try await startRun(
                 target,
                 message,
@@ -677,6 +721,7 @@ struct AgentRunMCPToolService {
                 spawnParentSessionID,
                 oracleLaunchSource.source
             )
+            agentModeVM.mcpAcceptSessionTarget(target)
             agentModeVM.recordAgentSessionProviderLifecycle(
                 target: target,
                 phase: .afterProviderStart,
@@ -713,6 +758,14 @@ struct AgentRunMCPToolService {
                 decision: .rejected,
                 reason: providerFailureReason
             )
+            if let modelParameterStagingRollback {
+                switch target.origin {
+                case .existingSession, .existingTab:
+                    agentModeVM.mcpRollbackStagedModelParameterSelections(modelParameterStagingRollback)
+                case .createdForSessionResume, .createdNewTab:
+                    break
+                }
+            }
             let decoratedError = startWorktreeCoordinator.providerStartError(
                 error,
                 targetSessionID: target.sessionID,
@@ -732,9 +785,9 @@ struct AgentRunMCPToolService {
                     )
                 }
             #endif
-            await agentModeVM.mcpDiscardSessionTarget(target)
+            let discardResult = await agentModeVM.mcpDiscardSessionTarget(target)
             #if DEBUG
-                if worktreeStartupBenchmarkToken != nil {
+                if worktreeStartupBenchmarkToken != nil, discardResult == .complete {
                     try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
                         correlationID: worktreeStartupCorrelationID,
                         phase: .discardCompleted,
@@ -939,6 +992,7 @@ struct AgentRunMCPToolService {
     private func executeSteer(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
+        let expectedWorkspaceID = targetWindow.workspaceManager.activeWorkspaceID
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let text = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
@@ -947,11 +1001,23 @@ struct AgentRunMCPToolService {
             sessionID: sessionID,
             targetWindow: targetWindow,
             agentModeVM: agentModeVM,
-            metadata: metadata
+            metadata: metadata,
+            expectedWorkspaceID: expectedWorkspaceID
         )
         let delivery: AgentModeViewModel.MCPInstructionDispatch
         let snapshot: AgentRunMCPSnapshot
         do {
+            if let reactivatedTarget = resolution.reactivatedTarget {
+                guard let expectedWorkspaceID else {
+                    throw MCPError.invalidParams(
+                        "The active workspace changed before the reconstructed Agent session could be steered."
+                    )
+                }
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                    reactivatedTarget,
+                    expectedWorkspaceID: expectedWorkspaceID
+                )
+            }
             if resolution.session.runState.isActive {
                 delivery = try await dispatchSteerInstruction(
                     sessionID: sessionID,
@@ -959,6 +1025,12 @@ struct AgentRunMCPToolService {
                     workflow: workflow,
                     agentModeVM: agentModeVM
                 )
+                if let reactivatedTarget = resolution.reactivatedTarget {
+                    agentModeVM.mcpAcceptSessionTarget(reactivatedTarget)
+                }
+                #if DEBUG
+                    try await testAfterSteerDispatchBeforeBookkeeping?(resolution.reactivatedTarget)
+                #endif
                 await Task.yield()
                 snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
             } else {
@@ -969,12 +1041,33 @@ struct AgentRunMCPToolService {
                         sessionID: sessionID,
                         kind: .steering
                     ) {
-                        try await dispatchSteerInstruction(
+                        #if DEBUG
+                            await testBeforeSteerDispatch?()
+                        #endif
+                        if let reactivatedTarget = resolution.reactivatedTarget {
+                            guard let expectedWorkspaceID else {
+                                throw MCPError.invalidParams(
+                                    "The active workspace changed before the reconstructed Agent session could be steered."
+                                )
+                            }
+                            try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                                reactivatedTarget,
+                                expectedWorkspaceID: expectedWorkspaceID
+                            )
+                        }
+                        let confirmedDelivery = try await dispatchSteerInstruction(
                             sessionID: sessionID,
                             text: text,
                             workflow: workflow,
                             agentModeVM: agentModeVM
                         )
+                        if let reactivatedTarget = resolution.reactivatedTarget {
+                            agentModeVM.mcpAcceptSessionTarget(reactivatedTarget)
+                        }
+                        #if DEBUG
+                            try await testAfterSteerDispatchBeforeBookkeeping?(resolution.reactivatedTarget)
+                        #endif
+                        return confirmedDelivery
                     }
                 } catch {
                     clearFollowUpPendingAfterSteerFailure(
@@ -1072,7 +1165,8 @@ struct AgentRunMCPToolService {
         sessionID: UUID,
         targetWindow: WindowState,
         agentModeVM: AgentModeViewModel,
-        metadata: RequestMetadata
+        metadata: RequestMetadata,
+        expectedWorkspaceID: UUID?
     ) async throws -> SteerControlResolution {
         if let controlledSession = agentModeVM.mcpControlledSession(sessionID: sessionID) {
             return SteerControlResolution(
@@ -1083,6 +1177,11 @@ struct AgentRunMCPToolService {
         }
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available to resolve session_id '\(sessionID.uuidString)'.")
+        }
+        guard workspace.id == expectedWorkspaceID else {
+            throw MCPError.invalidParams(
+                "The active workspace changed before session_id '\(sessionID.uuidString)' could be reconstructed."
+            )
         }
         guard let resolvedSessionID = try await agentModeVM.mcpResolveSessionID(
             reference: sessionID.uuidString,
@@ -1096,7 +1195,8 @@ struct AgentRunMCPToolService {
             sessionID: sessionID,
             createIfNeeded: true,
             sessionName: nil,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            expectedWorkspaceID: workspace.id
         )
         let session = await agentModeVM.ensureSessionReady(tabID: target.tabID)
         guard session.activeAgentSessionID == sessionID else {
@@ -2213,6 +2313,7 @@ struct AgentRunMCPToolService {
         let failureReason = object["failure_reason"]?.stringValue.flatMap(AgentRunMCPSnapshot.FailureReason.init(rawValue:))
         let worktreeBindings = try worktreeBindings(from: object)
         let activeWorktreeMerges = try activeWorktreeMerges(from: object)
+        let modelParameterSelections = try modelParameterSelections(from: agent)
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
             runID: runID,
@@ -2222,6 +2323,7 @@ struct AgentRunMCPToolService {
             agentDisplayName: agent?["name"]?.stringValue,
             modelRaw: agent?["model"]?.stringValue,
             reasoningEffortRaw: agent?["reasoning_effort"]?.stringValue,
+            modelParameterSelections: modelParameterSelections,
             status: status,
             statusText: object["status_text"]?.stringValue,
             latestAssistantPreview: object["assistant_text"]?.stringValue,
@@ -2234,6 +2336,35 @@ struct AgentRunMCPToolService {
             worktreeBindings: worktreeBindings,
             appActiveWorktreeMerges: activeWorktreeMerges
         )
+    }
+
+    private func modelParameterSelections(
+        from agent: [String: Value]?
+    ) throws -> [AgentRunMCPSnapshot.ModelParameterSelection] {
+        guard let raw = agent?["model_parameters"] else { return [] }
+        guard let values = raw.arrayValue else {
+            throw MCPError.internalError("Agent run snapshot model parameters were malformed.")
+        }
+        return try values.enumerated().map { index, value in
+            guard let object = value.objectValue,
+                  let providerID = object["provider_id"]?.stringValue,
+                  let baseModelRaw = object["base_model"]?.stringValue,
+                  let kind = object["kind"]?.stringValue,
+                  let configID = object["config_id"]?.stringValue,
+                  let valueRaw = object["value"]?.stringValue
+            else {
+                throw MCPError.internalError(
+                    "Agent run snapshot model_parameters[\(index)] was malformed."
+                )
+            }
+            return AgentRunMCPSnapshot.ModelParameterSelection(
+                providerID: providerID,
+                baseModelRaw: baseModelRaw,
+                kind: kind,
+                configID: configID,
+                valueRaw: valueRaw
+            )
+        }
     }
 
     private func hookGate(from object: [String: Value]) -> AgentRunMCPSnapshot.HookGate? {

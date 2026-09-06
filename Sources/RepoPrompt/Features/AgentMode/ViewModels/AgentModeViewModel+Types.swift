@@ -504,6 +504,8 @@ extension AgentModeViewModel {
         let sessionID: UUID?
         let origin: Origin
         let lifecycleIdentity: AgentSessionLifecycleAuthority.Identity?
+        let recoveryClaim: AgentProvisionalAdmissionClaim?
+        let discardAuthorityID: UUID?
         let discardRestoreIndexEntry: AgentSessionIndexEntry?
 
         init(
@@ -511,14 +513,35 @@ extension AgentModeViewModel {
             sessionID: UUID?,
             origin: Origin,
             lifecycleIdentity: AgentSessionLifecycleAuthority.Identity? = nil,
+            recoveryClaim: AgentProvisionalAdmissionClaim? = nil,
+            discardAuthorityID: UUID? = nil,
             discardRestoreIndexEntry: AgentSessionIndexEntry? = nil
         ) {
             self.tabID = tabID
             self.sessionID = sessionID
             self.origin = origin
             self.lifecycleIdentity = lifecycleIdentity
+            self.recoveryClaim = recoveryClaim
+            self.discardAuthorityID = discardAuthorityID
             self.discardRestoreIndexEntry = discardRestoreIndexEntry
         }
+
+        func withDiscardAuthorityID(_ discardAuthorityID: UUID) -> MCPSessionTarget {
+            MCPSessionTarget(
+                tabID: tabID,
+                sessionID: sessionID,
+                origin: origin,
+                lifecycleIdentity: lifecycleIdentity,
+                recoveryClaim: recoveryClaim,
+                discardAuthorityID: discardAuthorityID,
+                discardRestoreIndexEntry: discardRestoreIndexEntry
+            )
+        }
+    }
+
+    enum MCPSessionTargetDiscardResult: Equatable {
+        case complete
+        case retainedForRetry
     }
 
     struct AutoEditPermissionGuidance: Equatable {
