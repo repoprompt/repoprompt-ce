@@ -6651,7 +6651,7 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
-    /// Writes prompt export content, allowing absolute paths outside the workspace.
+    /// Writes prompt export content inside an admitted workspace root; external destinations fail closed.
     private func writePromptExportFile(
         path rawPath: String,
         content: String,
@@ -6690,27 +6690,9 @@ final class MCPServerViewModel: ObservableObject {
             return resolvedPath
         }
 
-        let url = URL(fileURLWithPath: resolvedPath)
-        let fm = FileManager.default
-        if fm.fileExists(atPath: url.path) {
-            throw MCPError.invalidParams("path already exists: \(resolvedPath).")
-        }
-        do {
-            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
-                [url.standardizedFileURL.path],
-                rootMappings: mutationRootMappings
-            )
-            try await MCPDomainMutationCommitContext.willCommit()
-            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
-            try physicalMutationGuard?.revalidate()
-            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
-            try physicalMutationGuard?.revalidate()
-            try content.write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            throw MCPError.invalidParams("File creation failed for '\(resolvedPath)': \(error.localizedDescription)")
-        }
-
-        return resolvedPath
+        throw MCPError.invalidParams(
+            "Protected prompt export outside a loaded workspace root is unsupported."
+        )
     }
 
     private func renameFile(

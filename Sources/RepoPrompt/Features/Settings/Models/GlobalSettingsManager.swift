@@ -351,6 +351,12 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         didSet { reconcilePersistenceBlockDismissal() }
     }
 
+    /// True when a failed startup migration must be retried through the raw-preserving
+    /// transaction instead of the ordinary typed save path.
+    var isPendingPreservingMigrationRetry: Bool {
+        fileStore.hasPendingStartupMigration
+    }
+
     @Published private(set) var sessionDismissedPersistenceBlockReason: GlobalSettingsPersistenceBlockReason?
 
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
@@ -2348,6 +2354,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             }
         }
         let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
+        let needsSchemaVersionUpgrade = document.requiredSchemaVersion > document.schemaVersion
         copySettings = document.copySettings
         let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
             chatSettings: document.chatSettings,
@@ -2366,7 +2373,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
         persistenceBlockReason = fileStore.blockReason
         if persistenceBlockReason == nil,
-           migratedContextBuilderState.didChange || seededFileSystemDefaults || disabledInvalidSync
+           migratedContextBuilderState.didChange
+           || seededFileSystemDefaults
+           || disabledInvalidSync
+           || needsSchemaVersionUpgrade
         {
             saveStartupMigration(includeModelSelectionRepair: disabledInvalidSync)
         }
@@ -2423,7 +2433,12 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     /// backing up or resetting the user's settings. Returns true when persistence is unblocked.
     @discardableResult
     func retryBlockedPersistenceSave() -> Bool {
-        save()
+        if fileStore.hasPendingStartupMigration {
+            return persist {
+                try fileStore.retryStartupMigrationPreservingUnknownFields(makeDocument())
+            }
+        }
+        return save()
     }
 
     @discardableResult
@@ -2432,6 +2447,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             let oldGlobalProfile = globalAgentModelsProfile()
             let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
             let document = try fileStore.load()
+            let needsSchemaVersionUpgrade = document.requiredSchemaVersion > document.schemaVersion
             objectWillChange.send()
             copySettings = document.copySettings
             let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
@@ -2449,7 +2465,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
             persistenceBlockReason = fileStore.blockReason
             if persistenceBlockReason == nil,
-               migratedContextBuilderState.didChange || seededFileSystemDefaults || disabledInvalidSync
+               migratedContextBuilderState.didChange
+               || seededFileSystemDefaults
+               || disabledInvalidSync
+               || needsSchemaVersionUpgrade
             {
                 saveStartupMigration(includeModelSelectionRepair: disabledInvalidSync)
             }

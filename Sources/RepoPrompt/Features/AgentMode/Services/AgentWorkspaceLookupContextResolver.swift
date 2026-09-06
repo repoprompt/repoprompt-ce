@@ -66,6 +66,8 @@ struct AgentWorkspaceLookupContextSource: Equatable {
                         StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath),
                         binding.worktreeID,
                         StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath),
+                        binding.commonGitDir.map(StandardizedPath.absolute) ?? "",
+                        binding.isMainWorktree.map { String($0) } ?? "",
                         binding.branch ?? "",
                         binding.head ?? ""
                     ].joined(separator: "\u{1F}")

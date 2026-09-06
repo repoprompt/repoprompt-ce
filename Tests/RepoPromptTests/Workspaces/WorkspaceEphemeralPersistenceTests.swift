@@ -352,9 +352,27 @@ import XCTest
             XCTAssertTrue(activation.didSwitch)
             let sessions = DeletionSessionProvider()
             manager.registerSwitchSessionProvider(sessions)
+            let pendingSaveURL = manager.workspaceFileURL(for: pinnedWorkspace)
+            manager.setWorkspaceDeleteWillExecuteHandlerForTesting { workspaceID in
+                guard workspaceID == pinnedWorkspace.id else { return }
+                var finalSave = pinnedWorkspace
+                finalSave.name = "Final background save"
+                let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -767)
+                do {
+                    let saved = try await client.replaceWorking(
+                        finalSave,
+                        fileURL: pendingSaveURL,
+                        expectedWorkspaceRevision: nil
+                    )
+                    XCTAssertEqual(saved.disposition, .applied)
+                } catch {
+                    XCTFail("Could not publish the pending workspace save: \(error)")
+                }
+            }
             let deletion = await manager.deleteWorkspacesAsync(
                 workspaceIDs: [pinnedWorkspace.id], closeOpenWorkspaces: true
             )
+            manager.setWorkspaceDeleteWillExecuteHandlerForTesting(nil)
             XCTAssertEqual(deletion.deletedWorkspaceIDs, [pinnedWorkspace.id], "\(deletion)")
             XCTAssertTrue(manager.activeWorkspace?.isSystemWorkspace == true)
             XCTAssertTrue(sessions.wasCancelled)

@@ -7838,10 +7838,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             #if DEBUG
                 await workspaceDeleteWillExecuteHandlerForTesting?(workspaceID)
             #endif
+            // Confirmation authorizes deleting these identities, including their latest
+            // saved history. Closing a window can publish a final save or update Default;
+            // those revisions must not invalidate the user's deletion. The authority
+            // captures current revisions under its mutation lock. Automatic cleanup
+            // still requires the exact reviewed catalog and workspace revisions.
             let outcome = await domainWorkspaceAuthorityClient.delete(
                 workspaceID: workspaceID,
-                expectedCatalogRevision: snapshot.catalogRevision,
-                expectedWorkspaceRevision: authoritative.revisions.workingRevision
+                expectedCatalogRevision: closeOpenWorkspaces ? nil : snapshot.catalogRevision,
+                expectedWorkspaceRevision: closeOpenWorkspaces ? nil : authoritative.revisions.workingRevision
             )
             if Self.isSuccessfulDomainOutcome(outcome) {
                 result.deletedWorkspaceIDs.append(workspaceID)

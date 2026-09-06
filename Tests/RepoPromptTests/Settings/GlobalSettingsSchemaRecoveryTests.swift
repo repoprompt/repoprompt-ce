@@ -16,7 +16,7 @@ final class GlobalSettingsSchemaRecoveryTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
     }
 
-    func testRedundantV5HealsAndPreservesUnknownFieldsAcrossSavesAndRestart() throws {
+    func testRedundantV4HealsAndPreservesUnknownFieldsAcrossSavesAndRestart() throws {
         try withSettings { url in
             let original = try fixture()
             try original.write(to: url)
@@ -47,10 +47,32 @@ final class GlobalSettingsSchemaRecoveryTests: XCTestCase {
         }
     }
 
+    func testSupportedV5LoadsWithoutRepairAndPreservesContextBuilderAndUnknownFields() throws {
+        try withSettings { url in
+            var object = try root(fixture(version: 5))
+            object["scalarPreferences"] = ["contextBuilder": ["contextTokenBudget": 4321, "unknownBehavior": "keep"]]
+            let original = try JSONSerialization.data(withJSONObject: object)
+            try original.write(to: url)
+            let store = GlobalSettingsFileStore(fileURL: url)
+            var document = try store.load()
+            XCTAssertNil(store.blockReason)
+            XCTAssertEqual(document.schemaVersion, 5)
+            XCTAssertEqual(try Data(contentsOf: url), original)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.deletingLastPathComponent().appendingPathComponent("Backups").path))
+            document.globalDefaults.discoverAgentRaw = "edited"
+            try store.save(document)
+            let saved = try root(Data(contentsOf: url))
+            XCTAssertEqual(saved["schemaVersion"] as? Int, 5)
+            XCTAssertEqual(saved["scalarPreferences"] as? NSDictionary, object["scalarPreferences"] as? NSDictionary)
+            XCTAssertEqual(saved["unknownRoot"] as? NSDictionary, object["unknownRoot"] as? NSDictionary)
+        }
+    }
+
     func testGenuineFutureForeignAndMalformedDocumentsAreNeverDowngraded() throws {
         for variant in ["secondary", "nullSecondary", "roster", "foreign", "future", "malformed", "invalidProfiles"] {
             try withSettings { url in
                 var object = try root(fixture())
+                if ["secondary", "nullSecondary", "roster"].contains(variant) { object["schemaVersion"] = 6 }
                 switch variant {
                 case "secondary": object["scalarPreferences"] = ["modelSelection": ["secondaryOracleModel": "saved-model"]]
                 case "nullSecondary": object["scalarPreferences"] = ["modelSelection": ["secondaryOracleModel": NSNull()]]
@@ -154,7 +176,7 @@ final class GlobalSettingsSchemaRecoveryTests: XCTestCase {
         XCTAssertNil(try root(saved)["agentModelsSettingsByWorkspaceID"])
     }
 
-    private func fixture(version: Int = 5) throws -> Data {
+    private func fixture(version: Int = 4) throws -> Data {
         try JSONSerialization.data(withJSONObject: [
             "schemaVersion": version,
             "schemaLineage": GlobalSettingsDocument.schemaLineage,
