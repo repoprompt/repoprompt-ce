@@ -1979,7 +1979,7 @@ enum AgentModelCatalog {
     static func discoveryAgents(
         availability: AvailabilityContext = .current
     ) -> [DiscoveryAgent] {
-        AgentProviderKind.allCases.filter { $0 != .devin }.map { agent in
+        AgentProviderKind.allCases.map { agent in
             discoveryAgent(agent, availability: availability)
         }
     }

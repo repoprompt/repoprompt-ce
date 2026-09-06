@@ -219,6 +219,43 @@ final class DevinACPAgentProviderTests: XCTestCase {
         XCTAssertTrue(AgentModelCatalog.isAgentAvailable(.devin, availability: availability))
     }
 
+    func testDiscoveryIncludesDevinCurrentModelAndAdvertisedAlternatives() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(devinAvailable: true)
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: "gpt-5-6-sol-medium",
+                        displayName: "GPT-5.6 Sol Medium Thinking",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: false
+                    ),
+                    AgentModelOption(
+                        rawValue: "claude-opus-5-medium",
+                        displayName: "Claude Opus 5 Medium",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: false
+                    )
+                ],
+                currentModelRaw: "gpt-5-6-sol-medium"
+            ),
+            for: .devin
+        )
+
+        let devin = try XCTUnwrap(
+            AgentModelCatalog.discoveryAgents(availability: availability)
+                .first(where: { $0.agent == .devin })
+        )
+        XCTAssertTrue(devin.available)
+        XCTAssertEqual(devin.defaults.modelRaw, "gpt-5-6-sol-medium")
+        XCTAssertEqual(
+            devin.models.map(\.name),
+            ["Claude Opus 5 Medium", "GPT-5.6 Sol Medium Thinking"]
+        )
+    }
+
     func testTaskLabelsDoNotSelectProviderManagedDevinImplicitly() {
         let onlyDevin = AgentModelCatalog.AvailabilityContext.none.assumingAvailable(.devin)
         for label in AgentModelCatalog.taskLabels {
