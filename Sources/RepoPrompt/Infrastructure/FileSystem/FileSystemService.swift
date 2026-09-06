@@ -196,6 +196,16 @@ actor FileSystemService {
         /// Test-only replacement for UTF-8 materialization inside the detached create worker.
         var createFileDataPreparationForTesting: (@Sendable (String) async throws -> Data)?
 
+        /// Test-only result override for the exclusive create publication primitive.
+        /// Zero reports success; a non-zero value is the simulated errno.
+        var createFileExclusiveRenameForTesting: (@Sendable (String, String) -> Int32)?
+
+        /// Test-only errno injected after a successful POSIX create open and before writing.
+        var createFilePOSIXFailureAfterOpenForTesting: Int32?
+
+        /// Test-only failure/replacement hook invoked after the fallback destination O_EXCL open.
+        var createFileFallbackPOSIXFailureAfterOpenForTesting: (@Sendable (String) -> Int32)?
+
         /// Test-only replacement for the real Finder Trash operation.
         var moveItemToTrashIOForTesting: (@Sendable (URL) throws -> Void)?
 
@@ -474,6 +484,22 @@ actor FileSystemService {
             _ preparation: (@Sendable (String) async throws -> Data)?
         ) {
             createFileDataPreparationForTesting = preparation
+        }
+
+        func setCreateFileExclusiveRenameForTesting(
+            _ operation: (@Sendable (String, String) -> Int32)?
+        ) {
+            createFileExclusiveRenameForTesting = operation
+        }
+
+        func setCreateFilePOSIXFailureAfterOpenForTesting(_ errorNumber: Int32?) {
+            createFilePOSIXFailureAfterOpenForTesting = errorNumber
+        }
+
+        func setCreateFileFallbackPOSIXFailureAfterOpenForTesting(
+            _ handler: (@Sendable (String) -> Int32)?
+        ) {
+            createFileFallbackPOSIXFailureAfterOpenForTesting = handler
         }
 
         func setMoveItemToTrashIOForTesting(_ operation: (@Sendable (URL) throws -> Void)?) {

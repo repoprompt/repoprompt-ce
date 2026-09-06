@@ -1241,6 +1241,7 @@ actor WorkspaceFileContextStore {
         private var publishedGitArtifactIngressDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
         private var watcherSinkWillApplyHandler: (@Sendable (UUID) async -> Void)?
         private var storeEditDeferredPublicationDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
+        private var createFilePostDiskWriteHandlerForTesting: (@Sendable (UUID, String) async throws -> Void)?
         private var publisherIngressWillWaitHandler: (@Sendable (Set<UUID>) async -> Void)?
         private var watcherPublisherIngressDidOpenHandler: (@Sendable (UUID, UUID) async -> Void)?
         private var watcherInfrastructureDidJoinFlightHandler: (@Sendable (UUID, UUID) async -> Void)?
@@ -2516,6 +2517,12 @@ actor WorkspaceFileContextStore {
             _ handler: (@Sendable (UUID, String) async -> Void)?
         ) {
             storeEditDeferredPublicationDidRegisterHandler = handler
+        }
+
+        func setCreateFilePostDiskWriteHandlerForTesting(
+            _ handler: (@Sendable (UUID, String) async throws -> Void)?
+        ) {
+            createFilePostDiskWriteHandlerForTesting = handler
         }
 
         func setSearchContentReadChunkHandlerForTesting(
@@ -16459,6 +16466,7 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         relativePath: String,
         content: String,
+        overwrite: Bool = false,
         validating rootScope: WorkspaceLookupRootScope? = nil
     ) async throws -> WorkspaceFileCatalogMaterializationResult {
         if let rootScope {
@@ -16474,6 +16482,9 @@ actor WorkspaceFileContextStore {
             rootID: rootID,
             commands: [.modified([standardizedRelativePath])]
         )
+        #if DEBUG
+            let postDiskWriteHandler = createFilePostDiskWriteHandlerForTesting
+        #endif
         var didCommitCatalogMutation = false
         var retainedFenceUntilMutationDrain = false
         defer {
@@ -16485,7 +16496,11 @@ actor WorkspaceFileContextStore {
             }
         }
         do {
-            try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
+            try await state.service.createFile(
+                atRelativePath: standardizedRelativePath,
+                content: content,
+                overwrite: overwrite
+            )
         } catch is CancellationError {
             retainedFenceUntilMutationDrain = true
             retainCodemapPathFenceUntilMutationDrain(
@@ -16495,6 +16510,11 @@ actor WorkspaceFileContextStore {
             )
             throw CancellationError()
         }
+        #if DEBUG
+            if let postDiskWriteHandler {
+                try await postDiskWriteHandler(rootID, standardizedRelativePath)
+            }
+        #endif
         let result = try await materializeCatalogFileAfterDiskWrite(
             rootID: rootID,
             relativePath: standardizedRelativePath,
