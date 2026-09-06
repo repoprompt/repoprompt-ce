@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 
 final class DevinACPLaunchResolverTests: XCTestCase {
-    func testProviderProfileMatchesInstalledDevinConvention() {
+    func testProviderProfilePinsDevinCommandAndSearchHints() {
         XCTAssertEqual(CLILaunchProfiles.devin.commandName, "devin")
         XCTAssertTrue(CLILaunchProfiles.devin.supplementalSearchPaths.contains("~/.local/bin"))
         XCTAssertTrue(CLIPathHints.devin.contains("~/.local/bin"))
@@ -54,7 +54,7 @@ final class DevinACPLaunchResolverTests: XCTestCase {
         XCTAssertTrue(reason.contains("did not advertise ACP support"), "unexpected reason: \(reason)")
     }
 
-    func testBunStyleSymlinkShapeIsAcceptedAndLaunchesACP() async throws {
+    func testSymlinkFixturePassesProbeAndResolvesACPArguments() async throws {
         let directory = try makeTemporaryDirectory()
         let targetDirectory = directory.appendingPathComponent("package", isDirectory: true)
         try FileManager.default.createDirectory(at: targetDirectory, withIntermediateDirectories: true)

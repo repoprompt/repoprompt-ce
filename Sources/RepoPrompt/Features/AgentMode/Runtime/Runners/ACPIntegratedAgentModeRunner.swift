@@ -628,7 +628,7 @@ final class ACPIntegratedAgentModeRunner {
                 hooks.persistence.scheduleSave(session)
                 hooks.bindingObservation.updateBindings(session)
 
-                try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                try await Self.applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
                 try Self.validateModelParameterApplicationReport(parameterReport)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
@@ -709,7 +709,7 @@ final class ACPIntegratedAgentModeRunner {
                     return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
                 }
 
-                try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                try await Self.applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
                 try Self.validateModelParameterApplicationReport(parameterReport)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
@@ -902,7 +902,7 @@ final class ACPIntegratedAgentModeRunner {
         }
     }
 
-    private func applyExplicitSelectedModelIfNeeded(
+    static func applyExplicitSelectedModelIfNeeded(
         _ runRequest: ACPRunRequest,
         controller: ACPAgentSessionController,
         runID: UUID
@@ -913,7 +913,9 @@ final class ACPIntegratedAgentModeRunner {
         ) else {
             return
         }
-        log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
+        if AgentRuntimeProviderService.enableDebugLogging {
+            print("[ACP-Runner] run=\(runID) applying \(runRequest.agentKind.displayName) selected model=\(model)")
+        }
         try await controller.setSessionModel(model)
     }
 

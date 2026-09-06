@@ -20,6 +20,7 @@ struct DevinACPResolvedLaunch: Equatable {
     let command: String
     let arguments: [String]
     let additionalPathHints: [String]
+    let environment: [String: String]
     let executableIdentity: ExecutableFileIdentity
 }
 
@@ -258,6 +259,7 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
             command: identity.canonicalPath,
             arguments: DevinACPLaunchCandidate.devinACP.launchArguments,
             additionalPathHints: additionalPathHints,
+            environment: environment,
             executableIdentity: identity
         )
     }

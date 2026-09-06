@@ -16,11 +16,12 @@ final class DevinACPAgentProviderTests: XCTestCase {
     private func makeProvider(
         includeRepoPromptMCPServer: Bool = true
     ) throws -> (DevinACPAgentProvider, URL) {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("DevinACPAgentProviderTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let executable = directory.appendingPathComponent("devin")
-        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        let directory = try makeTestDirectory(name: "DevinACPAgentProviderTests")
+        let bin = directory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let executable = bin.appendingPathComponent("devin")
+        try "#!/bin/sh\ncase \"$*\" in *--help*) echo 'Run as an ACP server over stdio';; *) printf '%s' \"$HOME\";; esac\n"
+            .write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let provider = DevinACPAgentProvider(
             config: DevinAgentConfig(
@@ -31,7 +32,10 @@ final class DevinACPAgentProviderTests: XCTestCase {
             repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(
                 command: "/bin/echo",
                 args: ["--backend", "app"]
-            )
+            ),
+            launchResolver: DevinACPLaunchResolver(environmentProvider: { _ in
+                ["PATH": "/usr/bin:/bin", "XDG_CONFIG_HOME": directory.path, "HOME": directory.path]
+            })
         )
         return (provider, directory)
     }
@@ -51,9 +55,17 @@ final class DevinACPAgentProviderTests: XCTestCase {
         )
     }
 
-    func testLaunchUsesInstalledDevinACPWithIsolatedRepoPromptMCPConfig() async throws {
+    func testFixtureLaunchUsesResolvedDevinACPWithIsolatedRepoPromptMCPConfig() async throws {
         let (provider, directory) = try makeProvider()
-        let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
+        let sourceDevin = directory.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceDevin, withIntermediateDirectories: true)
+        try Data(#"{"mcpServers":{"Fixture":{"transport":"stdio","command":"/bin/echo","args":["fixture"]}}}"#.utf8)
+            .write(to: sourceDevin.appendingPathComponent("mcp_config.json"))
+        let request = makeRequest(workspacePath: directory.path)
+        let support = try await provider.support(for: request)
+        XCTAssertEqual(support, .supported)
+        let launch = try provider.makeLaunchConfiguration(for: request)
+        addTeardownBlock { await provider.cleanupLaunchArtifacts(for: launch) }
         XCTAssertEqual(launch.providerID, .devin)
         XCTAssertEqual(launch.arguments, ["acp"])
         let configRoot = try XCTUnwrap(launch.environment["XDG_CONFIG_HOME"])
@@ -63,9 +75,23 @@ final class DevinACPAgentProviderTests: XCTestCase {
             JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any]
         )
         let servers = try XCTUnwrap(object["mcpServers"] as? [String: Any])
-        XCTAssertNotNil(servers[RepoPromptMCPServerConfiguration.defaultServerName])
+        XCTAssertEqual(Set(servers.keys), ["Fixture", RepoPromptMCPServerConfiguration.defaultServerName])
+        XCTAssertEqual(launch.environment["HOME"], directory.path)
+        let fixture = try XCTUnwrap(servers["Fixture"] as? [String: Any])
+        XCTAssertEqual((fixture["env"] as? [String: String])?["XDG_CONFIG_HOME"], directory.path)
         XCTAssertNotNil(launch.cleanupArtifact)
         XCTAssertNotNil(launch.expectedExecutableIdentity)
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: launch.command)
+        child.arguments = launch.arguments
+        child.environment = launch.environment
+        let output = Pipe()
+        child.standardOutput = output
+        try child.run()
+        let childData = output.fileHandleForReading.readDataToEndOfFile()
+        child.waitUntilExit()
+        XCTAssertEqual(child.terminationStatus, 0)
+        XCTAssertEqual(String(decoding: childData, as: UTF8.self), directory.path)
         await provider.cleanupLaunchArtifacts(for: launch)
         XCTAssertFalse(FileManager.default.fileExists(atPath: configRoot))
     }
@@ -83,20 +109,21 @@ final class DevinACPAgentProviderTests: XCTestCase {
         XCTAssertTrue(session.mcpServers.isEmpty)
     }
 
-    func testModelDiscoveryLaunchDoesNotInjectRepoPromptMCP() throws {
+    func testModelDiscoveryLaunchDoesNotInjectRepoPromptMCP() async throws {
         let (provider, directory) = try makeProvider(includeRepoPromptMCPServer: false)
-        let launch = try provider.makeLaunchConfiguration(for: makeRequest(workspacePath: directory.path))
+        let request = makeRequest(workspacePath: directory.path)
+        let support = try await provider.support(for: request)
+        XCTAssertEqual(support, .supported)
+        let launch = try provider.makeLaunchConfiguration(for: request)
 
-        XCTAssertTrue(launch.environment.isEmpty)
+        XCTAssertEqual(launch.environment["XDG_CONFIG_HOME"], directory.path)
         XCTAssertNil(launch.cleanupArtifact)
     }
 
     func testIsolatedMCPConfigPreservesExistingDevinConfigAndMergesServers() throws {
-        let sourceRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("DevinSourceConfig-\(UUID().uuidString)", isDirectory: true)
+        let sourceRoot = try makeTestDirectory(name: "DevinSourceConfig")
         let sourceDevin = sourceRoot.appendingPathComponent("devin", isDirectory: true)
         try FileManager.default.createDirectory(at: sourceDevin, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: sourceRoot) }
 
         let settingsURL = sourceDevin.appendingPathComponent("config.json")
         try Data("{\"theme\":\"dark\"}".utf8).write(to: settingsURL)
@@ -111,7 +138,7 @@ final class DevinACPAgentProviderTests: XCTestCase {
                 command: "/bin/echo",
                 args: ["repo-prompt"]
             ),
-            sourceConfigurationRoot: sourceRoot
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path]
         )
         defer { DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact) }
 
@@ -134,7 +161,7 @@ final class DevinACPAgentProviderTests: XCTestCase {
         XCTAssertEqual(permissions.intValue & 0o777, 0o600)
     }
 
-    func testPromptUsesStandardACPTextAndImageBlocks() throws {
+    func testPromptPrependsSystemTextOnlyOnInitialTurn() throws {
         let (provider, directory) = try makeProvider()
         let first = try provider.buildPromptBlocks(
             for: AgentMessage(systemPrompt: "SYS", userMessage: "USER"),
@@ -243,7 +270,7 @@ final class DevinACPAgentProviderTests: XCTestCase {
         XCTAssertTrue(ACPPermissionOptionPolicy.isAutoSelectable(optionID: "allow-once", for: .devin))
     }
 
-    func testObservedDevinMCPClientIdentityMatchesRoutingHint() {
+    func testDevinMCPClientRoutingPolicyPinsRmcpHint() {
         XCTAssertEqual(AgentProviderKind.devin.mcpClientNameHint, "rmcp")
         XCTAssertTrue(MCPClientIdentity.matches("rmcp", AgentProviderKind.devin.mcpClientNameHint))
         XCTAssertTrue(AgentProviderKind.devin.requiresPrePromptAgentModeMCPRouting)

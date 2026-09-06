@@ -12,7 +12,7 @@ enum DevinIntegrationConfiguration {
     static func prepare(
         workingDirectory: String,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration,
-        sourceConfigurationRoot: URL? = nil
+        sourceEnvironment: [String: String]
     ) throws -> PreparedConfiguration {
         try repoPromptMCPConfiguration.validateACPLaunchCommand(workingDirectory: workingDirectory)
 
@@ -26,7 +26,7 @@ enum DevinIntegrationConfiguration {
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
-            let sourceRoot = sourceConfigurationRoot ?? defaultSourceConfigurationRoot()
+            let sourceRoot = sourceConfigurationRoot(environment: sourceEnvironment)
             let sourceDevinDirectory = sourceRoot.appendingPathComponent("devin", isDirectory: true)
             try linkExistingConfiguration(
                 from: sourceDevinDirectory,
@@ -45,6 +45,22 @@ enum DevinIntegrationConfiguration {
                 server["env"] = repoPromptMCPConfiguration.environmentDictionary
             }
             servers[repoPromptMCPConfiguration.name] = server
+            // The overlay is for Devin, not for its MCP children. Preserve the native
+            // config root for known stdio entries without overriding explicit server env.
+            for (name, value) in servers {
+                guard var child = value as? [String: Any],
+                      child["transport"] as? String == "stdio",
+                      child["env"] == nil || child["env"] is [String: String]
+                else { continue }
+                var environment = child["env"] as? [String: String] ?? [:]
+                if environment["XDG_CONFIG_HOME"] == nil {
+                    // A child HOME override owns the fallback when native XDG is unset.
+                    let nativeEnvironment = sourceEnvironment.merging(environment) { _, child in child }
+                    environment["XDG_CONFIG_HOME"] = sourceConfigurationRoot(environment: nativeEnvironment).path
+                }
+                child["env"] = environment
+                servers[name] = child
+            }
             rootObject["mcpServers"] = servers
             let data = try JSONSerialization.data(
                 withJSONObject: rootObject,
@@ -87,16 +103,17 @@ enum DevinIntegrationConfiguration {
             .standardizedFileURL
     }
 
-    private static func defaultSourceConfigurationRoot() -> URL {
-        let environment = ProcessInfo.processInfo.environment
+    private static func sourceConfigurationRoot(environment: [String: String]) -> URL {
         if let configured = environment["XDG_CONFIG_HOME"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !configured.isEmpty
         {
-            let expanded = (configured as NSString).expandingTildeInPath
+            let expanded = CommandPathResolver.expandPath(configured, environment: environment)
             return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL
         }
-        return FileManager.default.homeDirectoryForCurrentUser
+        let home = environment["HOME"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        return URL(fileURLWithPath: home, isDirectory: true)
             .appendingPathComponent(".config", isDirectory: true)
             .standardizedFileURL
     }

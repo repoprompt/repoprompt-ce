@@ -135,8 +135,7 @@ struct CLIProvidersSettingsView: View {
                         .font(.title2)
                         .fontWeight(.semibold)
 
-                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Oh My Pi to leverage your existing subscriptions — OpenCode can also proxy any API key.")
-                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Devin to leverage your existing subscriptions — OpenCode can also proxy any API key.")
+                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, Oh My Pi, or Devin to leverage your existing subscriptions — OpenCode can also proxy any API key.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2372,6 +2371,7 @@ struct CLIProvidersSettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                         .buttonStyle(CustomButtonStyle())
+                        .disabled(isLoadingDevin)
                     }
 
                     Text("Models are discovered live from `devin acp`.")

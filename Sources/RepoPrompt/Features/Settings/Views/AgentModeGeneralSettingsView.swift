@@ -530,8 +530,7 @@ struct AgentModeGeneralSettingsView: View {
         let connected = providers.filter(isProviderConnected).count
         let total = providers.count
         if connected == 0 {
-            return "Connect a CLI agent (Claude Code, Codex, OpenCode, Cursor, Oh My Pi) to run anything in Agent Mode."
-            return "Connect a CLI agent (Claude Code, Codex, OpenCode, Cursor, Devin) to run anything in Agent Mode."
+            return "Connect a CLI agent (Claude Code, Codex, OpenCode, Cursor, Oh My Pi, Devin) to run anything in Agent Mode."
         }
         return "\(connected) of \(total) CLI providers connected. Manage auth, installs, and models in CLI Providers."
     }

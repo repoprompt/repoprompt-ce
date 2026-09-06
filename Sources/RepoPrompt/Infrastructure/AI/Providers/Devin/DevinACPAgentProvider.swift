@@ -29,7 +29,8 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         let integration: DevinIntegrationConfiguration.PreparedConfiguration? = if config.includeRepoPromptMCPServer {
             try DevinIntegrationConfiguration.prepare(
                 workingDirectory: workingDirectory,
-                repoPromptMCPConfiguration: repoPromptMCPConfiguration
+                repoPromptMCPConfiguration: repoPromptMCPConfiguration,
+                sourceEnvironment: resolvedLaunch.environment
             )
         } else {
             nil
@@ -38,7 +39,7 @@ struct DevinACPAgentProvider: ACPAgentProvider {
             providerID: providerID,
             command: resolvedLaunch.command,
             arguments: resolvedLaunch.arguments,
-            environment: integration?.environment ?? [:],
+            environment: resolvedLaunch.environment.merging(integration?.environment ?? [:]) { _, overlay in overlay },
             workingDirectory: workingDirectory,
             additionalPathHints: resolvedLaunch.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging,
@@ -61,8 +62,8 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         return try ACPSessionConfiguration(
             mode: mode,
             workingDirectory: standardizedWorkingDirectory(from: request.workspacePath),
-            // Devin 3000.6.11 accepts ACP mcpServers but does not start them. The isolated
-            // XDG config prepared for this launch is the effective RepoPrompt MCP injection.
+            // Use only the isolated XDG configuration for RepoPrompt MCP injection.
+            // Native ACP injection needs new/load/tool proof before replacing this route.
             mcpServers: []
         )
     }
@@ -90,12 +91,35 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         _ payload: [String: Any],
         sessionID _: String
     ) -> [NormalizedAgentRuntimeEvent] {
-        ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .devin)
+        var projected = payload
+        if let update = (payload["sessionUpdate"] as? String)?.lowercased(),
+           update == "tool_call" || update == "tool_call_update",
+           let metadata = payload["_meta"] as? [String: Any],
+           let toolName = ACPRuntimeEventParsing.firstMachineIdentifier(
+               in: metadata,
+               keys: ["cognition.ai/toolName", "cognition.ai/inferenceToolName"]
+           ),
+           toolName != "mcp_call_tool"
+        {
+            // Replay can replace inferenceToolName with a generic dispatcher; prefer
+            // toolName when present, and leave generic-only partial records unresolved.
+            projected["toolName"] = toolName
+        }
+        return ACPDefaultSessionUpdateNormalizer.normalize(projected, providerID: .devin)
     }
 
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async {
         guard let artifact = configuration.cleanupArtifact else { return }
         DevinIntegrationConfiguration.cleanup(artifact: artifact)
+    }
+
+    func shouldEmitStderrLine(_ line: String) -> Bool {
+        // The controller records diagnostics and strips ANSI before this presentation gate.
+        // Only the observed tracing INFO prefix is noise; retain unknown formats and failures.
+        line.range(
+            of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+INFO\s+"#,
+            options: .regularExpression
+        ) == nil
     }
 
     func normalizeError(_ error: Error) -> Error {
