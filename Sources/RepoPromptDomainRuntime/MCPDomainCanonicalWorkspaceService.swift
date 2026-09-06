@@ -20,7 +20,7 @@ package extension DomainPhysicalToolResult {
     }
 }
 
-package struct DomainCanonicalWorkspaceSnapshot: Sendable {
+package struct DomainCanonicalWorkspaceSnapshot {
     package let identity: DomainContextIdentity
     package let roots: [URL]
     package let prompt: String
@@ -39,12 +39,12 @@ package struct DomainCanonicalWorkspaceSnapshot: Sendable {
     }
 }
 
-package enum DomainCanonicalWorkspaceMutation: Sendable {
+package enum DomainCanonicalWorkspaceMutation {
     case setPrompt(String)
     case setSelection([String])
 }
 
-package struct DomainCanonicalWorkspaceAdapter: Sendable {
+package struct DomainCanonicalWorkspaceAdapter {
     package typealias ToolSnapshot = @Sendable (DomainPhysicalToolRequest) async throws -> DomainCanonicalWorkspaceSnapshot
     package typealias ReadSnapshot = @Sendable (DomainPhysicalReadRequest) async throws -> DomainCanonicalWorkspaceSnapshot
     package typealias Mutate = @Sendable (
@@ -79,7 +79,7 @@ package struct DomainCanonicalWorkspaceAdapter: Sendable {
 /// The executable supplies only authoritative snapshot/mutation/path adapters; argument parsing,
 /// selection semantics, file reads, search, tree rendering, codemaps, prompt/context projection,
 /// mutation admission, and response shapes are owned here.
-package struct MCPDomainCanonicalWorkspaceService: Sendable {
+package struct MCPDomainCanonicalWorkspaceService {
     private let adapter: DomainCanonicalWorkspaceAdapter
 
     package init(adapter: DomainCanonicalWorkspaceAdapter) {
@@ -351,9 +351,18 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
                 throw MCPError.invalidParams("export requires path")
             }
             let destination = try adapter.resolvePath(path, snapshot.roots, true)
-            try await admitExport(destination, roots: snapshot.roots)
             let content = "Prompt:\n\(snapshot.prompt)\n\nSelection:\n\(snapshot.selection.joined(separator: "\n"))\n"
-            try content.write(to: destination, atomically: true, encoding: .utf8)
+            let capability = try await admitExport(destination, roots: snapshot.roots)
+            guard let data = content.data(using: .utf8) else {
+                throw MCPError.invalidParams("export content is not UTF-8")
+            }
+            try capability.writeFile(
+                at: destination.path,
+                data: data,
+                overwrite: false,
+                expectedContentDigest: nil,
+                requireExisting: false
+            )
             return try .object(["path": .string(destination.path), "exported": .bool(true)])
         case "list_presets":
             return try .object(["presets": .array([])])
@@ -388,8 +397,17 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
                 throw MCPError.invalidParams("export requires path")
             }
             let destination = try adapter.resolvePath(path, snapshot.roots, true)
-            try await admitExport(destination, roots: snapshot.roots)
-            try snapshot.prompt.write(to: destination, atomically: true, encoding: .utf8)
+            let capability = try await admitExport(destination, roots: snapshot.roots)
+            guard let data = snapshot.prompt.data(using: .utf8) else {
+                throw MCPError.invalidParams("export content is not UTF-8")
+            }
+            try capability.writeFile(
+                at: destination.path,
+                data: data,
+                overwrite: false,
+                expectedContentDigest: nil,
+                requireExisting: false
+            )
             return try .object(["path": .string(destination.path), "exported": .bool(true)])
         case "list_presets":
             return try .object(["presets": .array([])])
@@ -400,7 +418,7 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
         }
     }
 
-    private func admitExport(_ destination: URL, roots: [URL]) async throws {
+    private func admitExport(_ destination: URL, roots: [URL]) async throws -> DomainMutationPhysicalCapability {
         let mappings = roots.map {
             DomainMutationPhysicalRootMapping(canonicalRoot: $0.path, physicalRoot: $0.path)
         }
@@ -408,7 +426,17 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
             [destination.path],
             rootMappings: mappings
         )
+        guard let capability = try await MCPDomainMutationCommitContext.physicalMutationCapability() else {
+            throw DomainMutationPhysicalCapabilityError.scopeUnavailable
+        }
+        try capability.validateWriteTarget(
+            at: destination.path,
+            overwrite: false,
+            expectedContentDigest: nil,
+            requireExisting: false
+        )
         try await MCPDomainMutationCommitContext.willCommit()
+        return capability
     }
 
     private static func codeMapResult(_ url: URL) throws -> Value {

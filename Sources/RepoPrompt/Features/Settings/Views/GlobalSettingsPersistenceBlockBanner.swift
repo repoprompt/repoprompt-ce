@@ -52,7 +52,11 @@ struct GlobalSettingsPersistenceBlockBanner: View {
                 HStack {
                     switch reason {
                     case .saveFailed:
-                        Button("Try again") {
+                        Button(
+                            store.isPendingPreservingMigrationRetry
+                                ? "Retry settings update"
+                                : "Try again"
+                        ) {
                             recoveryActionError = store.retryBlockedPersistenceSave()
                                 ? nil
                                 : "Save still failed. Check file permissions or available disk space, then try again."
@@ -134,7 +138,11 @@ struct GlobalSettingsPersistenceBlockBanner: View {
     private func resetConfirmationMessage(for reason: GlobalSettingsPersistenceBlockReason) -> String {
         switch reason {
         case .saveFailed:
-            "If retrying after fixing permissions or disk space does not work, RepoPrompt can move the current globalSettings.json to the Backups folder and write your current in-memory settings to a fresh current-schema file. This cannot be undone."
+            if store.isPendingPreservingMigrationRetry {
+                "If retrying does not work, RepoPrompt can move the original settings file to the Backups folder and save your current settings in a new file. This cannot be undone."
+            } else {
+                "If retrying after fixing permissions or disk space does not work, RepoPrompt can move the current globalSettings.json to the Backups folder and write your current in-memory settings to a fresh current-schema file. This cannot be undone."
+            }
         case .unsupportedFutureSchema, .incompatibleSchema, .corruptUnrecoverable,
              .automaticSchemaNormalizationFailed:
             "The current globalSettings.json will be moved to the Backups folder and your current in-memory settings will be written to a fresh current-schema file. Your settings will then save normally. This cannot be undone."
@@ -150,7 +158,11 @@ struct GlobalSettingsPersistenceBlockBanner: View {
         case .corruptUnrecoverable:
             "Global settings can't be saved: the settings file is unreadable and couldn't be backed up. Changes won't persist until you recover."
         case .saveFailed:
-            "Global settings can't be saved: RepoPrompt couldn't write globalSettings.json. Check file permissions or available disk space, then try again."
+            if store.isPendingPreservingMigrationRetry {
+                "RepoPrompt could not finish updating your settings. Your original settings file is preserved. Check file permissions or available disk space, then try again."
+            } else {
+                "Global settings can't be saved: RepoPrompt couldn't write globalSettings.json. Check file permissions or available disk space, then try again."
+            }
         case .automaticSchemaNormalizationFailed:
             "Global settings can't be saved: RepoPrompt identified a same-lineage schema v4 file that may only require schema v2, but couldn't safely verify, back up, and atomically normalize it. The original file is preserved. You can show the file or explicitly reset after a backup."
         }

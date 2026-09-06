@@ -1,6 +1,22 @@
 import Foundation
 
 enum AgentWorktreeRuntimeWorkspaceResolver {
+    struct Dependencies {
+        let directoryExists: (String) -> Bool
+        let resolveIdentity: (String) -> GitWorktreeIdentitySnapshot?
+
+        static let live = Dependencies(
+            directoryExists: { path in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            },
+            resolveIdentity: { path in
+                GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: URL(fileURLWithPath: path))
+            }
+        )
+    }
+
     static func primaryExecutionBinding(
         in bindings: [AgentSessionWorktreeBinding],
         fallbackWorkspacePath: String?
@@ -15,7 +31,8 @@ enum AgentWorktreeRuntimeWorkspaceResolver {
 
     static func effectiveWorkspacePath(
         bindings: [AgentSessionWorktreeBinding],
-        fallbackWorkspacePath: String?
+        fallbackWorkspacePath: String?,
+        dependencies: Dependencies = .live
     ) throws -> String? {
         let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
         let binding = primaryExecutionBinding(
@@ -26,7 +43,7 @@ enum AgentWorktreeRuntimeWorkspaceResolver {
         guard let binding else {
             return primaryWorkspacePath
         }
-        return try validatedWorktreeRootPath(for: binding)
+        return try validatedWorktreeRootPath(for: binding, dependencies: dependencies)
     }
 
     /// Codex-specific projection of the same primary-binding selection used by
@@ -36,7 +53,8 @@ enum AgentWorktreeRuntimeWorkspaceResolver {
     /// opaque process-spawn error.
     static func codexRuntimeWorkspacePaths(
         bindings: [AgentSessionWorktreeBinding],
-        fallbackWorkspacePath: String?
+        fallbackWorkspacePath: String?,
+        dependencies: Dependencies = .live
     ) throws -> CodexRuntimeWorkspacePaths {
         let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
         let binding = primaryExecutionBinding(
@@ -47,11 +65,11 @@ enum AgentWorktreeRuntimeWorkspaceResolver {
         guard let binding else {
             return .uniform(primaryWorkspacePath)
         }
-        let executionDirectory = try validatedWorktreeRootPath(for: binding)
+        let executionDirectory = try validatedWorktreeRootPath(for: binding, dependencies: dependencies)
         guard let processLaunchDirectory = standardizedWorkspacePath(binding.logicalRootPath) else {
             throw CodexRuntimeWorkspacePathsError.emptyLogicalRoot
         }
-        guard directoryExists(atPath: processLaunchDirectory) else {
+        guard dependencies.directoryExists(processLaunchDirectory) else {
             throw CodexRuntimeWorkspacePathsError.launchDirectoryUnavailable(path: processLaunchDirectory)
         }
         return .worktreeBound(
@@ -60,27 +78,56 @@ enum AgentWorktreeRuntimeWorkspaceResolver {
         )
     }
 
-    static func validateBindingsAvailable(_ bindings: [AgentSessionWorktreeBinding]) throws {
+    static func validateBindingsAvailable(
+        _ bindings: [AgentSessionWorktreeBinding],
+        dependencies: Dependencies = .live
+    ) throws {
         for binding in bindings {
-            _ = try validatedWorktreeRootPath(for: binding)
+            _ = try validatedWorktreeRootPath(for: binding, dependencies: dependencies)
         }
     }
 
     private static func validatedWorktreeRootPath(
-        for binding: AgentSessionWorktreeBinding
+        for binding: AgentSessionWorktreeBinding,
+        dependencies: Dependencies
     ) throws -> String {
         guard let worktreePath = standardizedWorkspacePath(binding.worktreeRootPath),
-              directoryExists(atPath: worktreePath)
+              dependencies.directoryExists(worktreePath),
+              let identity = dependencies.resolveIdentity(worktreePath),
+              matchesPersistedBinding(binding, identity: identity, worktreePath: worktreePath)
         else {
             throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
         }
         return worktreePath
     }
 
-    private static func directoryExists(atPath path: String) -> Bool {
-        var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
-            && isDirectory.boolValue
+    private static func matchesPersistedBinding(
+        _ binding: AgentSessionWorktreeBinding,
+        identity: GitWorktreeIdentitySnapshot,
+        worktreePath: String
+    ) -> Bool {
+        guard identity.repository.repositoryID == binding.repositoryID,
+              identity.worktreeID == binding.worktreeID,
+              GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                  worktreePath,
+                  roots: [identity.worktreeRootPath]
+              )
+        else {
+            return false
+        }
+
+        if let commonGitDir = binding.commonGitDir,
+           GitRepoRootAuthorization.canonicalPath(commonGitDir)
+           != GitRepoRootAuthorization.canonicalPath(identity.repository.commonGitDir)
+        {
+            return false
+        }
+        if let isMainWorktree = binding.isMainWorktree,
+           isMainWorktree != identity.isMain
+        {
+            return false
+        }
+        return true
     }
 
     static func standardizedWorkspacePath(_ path: String?) -> String? {

@@ -1,12 +1,12 @@
 import Foundation
 import MCP
 
-package struct DomainProtectedMutationOperation: Hashable, Sendable {
+package struct DomainProtectedMutationOperation: Hashable {
     package let toolName: String
     package let action: String
 }
 
-package enum DomainProtectedMutationError: Error, Equatable, LocalizedError, Sendable {
+package enum DomainProtectedMutationError: Error, Equatable, LocalizedError {
     case partialSuccessAfterCommit(operationID: String)
 
     package var errorDescription: String? {
@@ -17,7 +17,7 @@ package enum DomainProtectedMutationError: Error, Equatable, LocalizedError, Sen
     }
 }
 
-package struct MCPDomainProtectedMutationToolProvider: Sendable {
+package struct MCPDomainProtectedMutationToolProvider {
     private let policyStore: DomainMutationPolicyStore
     private let journal: DomainMutationJournal
 
@@ -80,7 +80,7 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
     package static func isProtectedFamily(_ toolName: String) -> Bool {
         [
             "manage_selection", "prompt", "workspace_context", "bind_context", "manage_workspaces",
-            "file_actions", "apply_edits", "manage_worktree",
+            "file_actions", "apply_edits", "manage_worktree"
         ].contains(toolName)
     }
 
@@ -117,13 +117,13 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             let action = arguments["action"]?.stringValue ?? "list"
             return [
                 "switch", "create", "hide", "unhide", "delete", "add_folder", "remove_folder",
-                "select_tab", "create_tab", "close_tab",
+                "select_tab", "create_tab", "close_tab"
             ].contains(action) ? .init(toolName: toolName, action: action) : nil
         case "file_actions":
             let action = arguments["action"]?.stringValue ?? ""
             return action.isEmpty ? nil : .init(toolName: toolName, action: action)
         case "apply_edits":
-            let action: String = if arguments["rewrite"] != nil {
+            let action = if arguments["rewrite"] != nil {
                 "rewrite"
             } else if arguments["edits"] != nil {
                 "batch"
@@ -213,6 +213,9 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                 physicalMutationGuard: {
                     guard await commitState.hasBegunCommit() else { return nil }
                     return try await admissionState.physicalMutationGuard()
+                },
+                physicalMutationCapability: {
+                    try await admissionState.physicalMutationCapability()
                 },
                 willCommit: {
                     try await commitState.beginIfNeeded {
@@ -360,6 +363,7 @@ private actor DomainMutationPhysicalAdmissionState {
     private let ticket: DomainMutationJournalTicket
     private var authorization: DomainMutationAuthorizationSnapshot
     private var pathFence: DomainMutationPathFenceSnapshot?
+    private var physicalCapability: DomainMutationPhysicalCapability?
 
     init(
         operation: DomainProtectedMutationOperation,
@@ -385,6 +389,12 @@ private actor DomainMutationPhysicalAdmissionState {
     ) async throws {
         try Task.checkCancellation()
         guard !paths.isEmpty else { throw DomainMutationPathFenceError.scopeUnavailable }
+        guard Self.supportsPhysicalCapability(operation)
+            || Self.supportsPathFenceOnly(operation)
+            || !requiresPhysicalAdmission
+        else {
+            throw DomainMutationPhysicalCapabilityError.unsupportedOperation("\(operation.toolName).\(operation.action)")
+        }
         var mappings = suppliedMappings
         if securityContext.principal.kind == .appProxy,
            securityContext.principal.assurance == .verifiedProcess
@@ -414,9 +424,16 @@ private actor DomainMutationPhysicalAdmissionState {
             requestedPaths: paths.map(Self.standardized),
             authorizedRoots: physicalRoots
         )
-        try await journal.attachPathFence(fence, to: ticket)
+        let combinedFence = Self.combinedPathFence(pathFence, fence)
+        let capability: DomainMutationPhysicalCapability? = if Self.supportsPhysicalCapability(operation) {
+            try DomainMutationPhysicalCapability.open(snapshot: combinedFence)
+        } else {
+            nil
+        }
+        try await journal.attachPathFence(combinedFence, to: ticket)
         self.authorization = authorization
-        pathFence = fence
+        pathFence = combinedFence
+        physicalCapability = capability
     }
 
     func prepareCommit() async throws {
@@ -438,7 +455,52 @@ private actor DomainMutationPhysicalAdmissionState {
             }
             return nil
         }
-        return DomainMutationPhysicalCommitGuard(snapshot: pathFence)
+        guard physicalCapability != nil
+            || !requiresPhysicalAdmission
+            || Self.supportsPathFenceOnly(operation)
+        else {
+            throw DomainMutationPhysicalCapabilityError.scopeUnavailable
+        }
+        return DomainMutationPhysicalCommitGuard(snapshot: pathFence, capability: physicalCapability)
+    }
+
+    func physicalMutationCapability() throws -> DomainMutationPhysicalCapability? {
+        guard let physicalCapability else {
+            if requiresPhysicalAdmission, !Self.supportsPathFenceOnly(operation) {
+                throw DomainMutationPhysicalCapabilityError.scopeUnavailable
+            }
+            return nil
+        }
+        return physicalCapability
+    }
+
+    private static func supportsPathFenceOnly(_ operation: DomainProtectedMutationOperation) -> Bool {
+        operation.toolName == "manage_worktree"
+    }
+
+    private static func supportsPhysicalCapability(_ operation: DomainProtectedMutationOperation) -> Bool {
+        switch operation.toolName {
+        case "file_actions":
+            ["create", "move", "rename"].contains(operation.action)
+        case "apply_edits":
+            true
+        case "prompt", "workspace_context":
+            operation.action == "export"
+        default:
+            false
+        }
+    }
+
+    private static func combinedPathFence(
+        _ existing: DomainMutationPathFenceSnapshot?,
+        _ incoming: DomainMutationPathFenceSnapshot
+    ) -> DomainMutationPathFenceSnapshot {
+        guard let existing else { return incoming }
+        let roots = Array(Set(existing.authorizedRoots + incoming.authorizedRoots))
+            .sorted { $0.originalPath < $1.originalPath }
+        let entries = Array(Set(existing.entries + incoming.entries))
+            .sorted { $0.requestedPath < $1.requestedPath }
+        return DomainMutationPathFenceSnapshot(authorizedRoots: roots, entries: entries)
     }
 
     private static func nearestExistingAncestor(of path: String) -> String? {

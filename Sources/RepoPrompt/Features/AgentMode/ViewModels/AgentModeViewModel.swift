@@ -6660,6 +6660,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else { return .unavailable }
         let state = worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
         guard case let .hydrated(bindings) = state else { return state }
+        do {
+            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(bindings)
+        } catch {
+            return .unavailable
+        }
         guard let store = promptManager?.workspaceFileContextStore else { return .unavailable }
         let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
         if bindings.isEmpty {
@@ -6819,6 +6824,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
+        }
+        if !desiredBindings.isEmpty {
+            do {
+                try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
+            } catch {
+                throw ExecutionLocationTransitionError.unavailable(error.localizedDescription)
+            }
         }
         guard !session.worktreeBindingTransitionInProgress else {
             throw ExecutionLocationTransitionError.stale
@@ -7038,6 +7050,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 logicalRootName: context.logicalRoot.name,
                 worktreeID: worktree.worktreeID,
                 worktreeRootPath: worktree.path,
+                commonGitDir: worktree.repository.commonGitDir,
+                isMainWorktree: worktree.isMain,
                 worktreeName: worktree.name,
                 branch: worktree.branch,
                 head: worktree.head,
@@ -7808,7 +7822,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     binding.repoKey,
                     StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath),
                     binding.worktreeID,
-                    StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
+                    StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath),
+                    binding.commonGitDir.map(StandardizedPath.absolute) ?? "",
+                    binding.isMainWorktree.map { String($0) } ?? ""
                 ].joined(separator: "\u{1F}")
             }.sorted()
         }
@@ -13699,6 +13715,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 logicalRootName: logicalRoot.name,
                 worktreeID: worktree.worktreeID,
                 worktreeRootPath: worktree.path,
+                commonGitDir: worktree.repository.commonGitDir,
+                isMainWorktree: worktree.isMain,
                 worktreeName: worktree.name,
                 branch: worktree.branch,
                 head: worktree.head,

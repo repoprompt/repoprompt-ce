@@ -87,6 +87,50 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         }
     }
 
+    func testHeadlessResolverRejectsEscapedJSONNULWithoutWritingPrefix() throws {
+        let fileManager = FileManager.default
+        let container = fileManager.temporaryDirectory
+            .appendingPathComponent("rp-headless-nul-\(UUID().uuidString)", isDirectory: true)
+        let root = container.appendingPathComponent("authorized-root", isDirectory: true)
+        let outside = container.appendingPathComponent("outside", isDirectory: true)
+        let prefix = root.appendingPathComponent("prefix")
+        let original = Data("original bytes\n".utf8)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: outside, withIntermediateDirectories: true)
+        try original.write(to: prefix)
+        defer { try? fileManager.removeItem(at: container) }
+
+        let rawPath = "prefix\0/created.txt"
+        let encoded = try JSONEncoder().encode([
+            "action": Value.string("create"),
+            "path": Value.string(rawPath),
+            "content": Value.string("must not be written")
+        ])
+        let decoded = try JSONDecoder().decode([String: Value].self, from: encoded)
+        let decodedPath = try XCTUnwrap(decoded["path"]?.stringValue)
+        XCTAssertTrue(String(data: encoded, encoding: .utf8)?.contains("\\u0000") == true)
+        XCTAssertEqual(
+            try DirectHeadlessDomainContext.resolvePath("prefix", roots: [root]).path,
+            prefix.path
+        )
+
+        do {
+            let resolved = try DirectHeadlessDomainContext.resolvePath(
+                decodedPath,
+                roots: [root],
+                allowMissingLeaf: true
+            )
+            try Data("must not be written".utf8).write(to: resolved)
+            XCTFail("embedded NUL path must be rejected before any write")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("outside the bound workspace roots"), String(describing: error))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: prefix), original)
+        XCTAssertFalse(fileManager.fileExists(atPath: root.appendingPathComponent("created.txt").path))
+        XCTAssertFalse(fileManager.fileExists(atPath: outside.appendingPathComponent("created.txt").path))
+    }
+
     func testHeadlessMergeMutationRejectsPreviewEndpointMovedOutsideViaSymlink() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-headless-merge-fence-\(UUID().uuidString)", isDirectory: true)

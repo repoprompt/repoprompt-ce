@@ -15,6 +15,7 @@ private let fileSystemMutationIOQueue = DispatchQueue(
 private struct FileSystemMutationIOExecutor {
     let operation: FileSystemUncancellableMutation
     let physicalMutationGuard: DomainMutationPhysicalCommitGuard?
+    let physicalMutationCapability: DomainMutationPhysicalCapability?
     let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)?
 
     func callAsFunction(_ io: @escaping @Sendable () throws -> Void) async throws {
@@ -22,7 +23,9 @@ private struct FileSystemMutationIOExecutor {
             fileSystemMutationIOQueue.async {
                 willExecute?(operation)
                 do {
-                    try physicalMutationGuard?.revalidate()
+                    if physicalMutationCapability == nil {
+                        try physicalMutationGuard?.revalidate()
+                    }
                     try io()
                     continuation.resume()
                 } catch {
@@ -119,11 +122,13 @@ extension FileSystemService {
                 let willBegin: (@Sendable (FileSystemUncancellableMutation) async -> Void)? = nil
                 let willExecute: (@Sendable (FileSystemUncancellableMutation) -> Void)? = nil
             #endif
+            let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
             try await MCPDomainMutationCommitContext.willCommit()
             let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
             let executor = FileSystemMutationIOExecutor(
                 operation: operation,
                 physicalMutationGuard: physicalMutationGuard,
+                physicalMutationCapability: physicalMutationCapability,
                 willExecute: willExecute
             )
             let task = Task.detached(priority: .utility) {
@@ -312,18 +317,27 @@ extension FileSystemService {
             throw FileSystemError.fileAlreadyExists
         }
 
-        let destDir = (newFull as NSString).deletingLastPathComponent
-        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
-        try physicalMutationGuard?.revalidate()
-        try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
-        _ = try mutationTarget(forRelativePath: newTarget.relativePath)
+        let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
+        if let physicalMutationCapability {
+            try physicalMutationCapability.validateNoReplaceMove(from: oldFull, to: newFull)
+        } else {
+            let destDir = (newFull as NSString).deletingLastPathComponent
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+            try physicalMutationGuard?.revalidate()
+            try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
+            _ = try mutationTarget(forRelativePath: newTarget.relativePath)
+        }
 
         let mutation = try await startUncancellableMutation(
             .move,
             relativePaths: [oldTarget.relativePath, newTarget.relativePath]
         ) { executor in
             try await executor {
-                try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
+                if let capability = executor.physicalMutationCapability {
+                    try capability.moveFile(from: oldFull, to: newFull)
+                } else {
+                    try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
+                }
             }
         }
         Task.detached { [weak self] in
@@ -334,7 +348,8 @@ extension FileSystemService {
                     oldRelativePath: oldTarget.relativePath,
                     newRelativePath: newTarget.relativePath,
                     oldFullPath: oldFull,
-                    newFullPath: newFull
+                    newFullPath: newFull,
+                    physicalMutationCapability: physicalMutationCapability
                 )
             } catch {
                 await self?.completeMutationWaiter(
@@ -351,17 +366,26 @@ extension FileSystemService {
         oldRelativePath: String,
         newRelativePath: String,
         oldFullPath: String,
-        newFullPath: String
+        newFullPath: String,
+        physicalMutationCapability: DomainMutationPhysicalCapability?
     ) async {
         switch await catalogRegularFileEligibility(relativePath: newRelativePath) {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
-            do {
-                try await Self.performBlockingMutationIO {
-                    try FileManager.default.moveItem(atPath: newFullPath, toPath: oldFullPath)
+            if physicalMutationCapability == nil {
+                do {
+                    try await Self.performBlockingMutationIO {
+                        try FileManager.default.moveItem(atPath: newFullPath, toPath: oldFullPath)
+                    }
+                } catch {
+                    forgetTrackedPath(oldRelativePath)
+                    publishFileSystemDeltas(
+                        [.fileRemoved(oldRelativePath), .fileAdded(newRelativePath)],
+                        source: .syntheticMutation
+                    )
                 }
-            } catch {
+            } else {
                 forgetTrackedPath(oldRelativePath)
                 publishFileSystemDeltas(
                     [.fileRemoved(oldRelativePath), .fileAdded(newRelativePath)],
@@ -398,18 +422,32 @@ extension FileSystemService {
         let fullPath = target.url.path
         let fullURL = target.url
 
-        let directoryURL = fullURL.deletingLastPathComponent()
-        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
-        try physicalMutationGuard?.revalidate()
-        try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
-        _ = try mutationTarget(forRelativePath: target.relativePath)
-        var isDirectory = ObjCBool(false)
-        if fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) {
-            if isDirectory.boolValue {
-                throw FileSystemError.isDirectory
-            }
-            guard overwrite else {
+        let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
+        if let physicalMutationCapability {
+            do {
+                try physicalMutationCapability.validateWriteTarget(
+                    at: fullPath,
+                    overwrite: overwrite,
+                    expectedContentDigest: nil,
+                    requireExisting: false
+                )
+            } catch DomainMutationPhysicalCapabilityError.destinationExists {
                 throw FileSystemError.fileAlreadyExists
+            }
+        } else {
+            let directoryURL = fullURL.deletingLastPathComponent()
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+            try physicalMutationGuard?.revalidate()
+            try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
+            _ = try mutationTarget(forRelativePath: target.relativePath)
+            var isDirectory = ObjCBool(false)
+            if fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) {
+                if isDirectory.boolValue {
+                    throw FileSystemError.isDirectory
+                }
+                guard overwrite else {
+                    throw FileSystemError.fileAlreadyExists
+                }
             }
         }
 
@@ -444,7 +482,19 @@ extension FileSystemService {
                 )
             }
             try await executor {
-                if overwrite {
+                if let capability = executor.physicalMutationCapability {
+                    do {
+                        try capability.writeFile(
+                            at: fullPath,
+                            data: data,
+                            overwrite: overwrite,
+                            expectedContentDigest: nil,
+                            requireExisting: false
+                        )
+                    } catch DomainMutationPhysicalCapabilityError.destinationExists {
+                        throw FileSystemError.fileAlreadyExists
+                    }
+                } else if overwrite {
                     try FileSystemService.writeFileRobust(to: fullURL, data: data)
                 } else {
                     try FileSystemService.writeFileNoClobber(
@@ -463,7 +513,8 @@ extension FileSystemService {
                 await self?.reconcileCreatedFile(
                     mutationID: mutation.id,
                     relativePath: target.relativePath,
-                    url: fullURL
+                    url: fullURL,
+                    physicalMutationCapability: physicalMutationCapability
                 )
             } catch FileSystemError.fileAlreadyExists {
                 await self?.completeMutationWaiter(
@@ -488,15 +539,18 @@ extension FileSystemService {
     private func reconcileCreatedFile(
         mutationID: UUID,
         relativePath: String,
-        url: URL
+        url: URL,
+        physicalMutationCapability: DomainMutationPhysicalCapability?
     ) async {
         fileSystemDebugLog("File created at \(url.path)")
         switch await catalogRegularFileEligibility(relativePath: relativePath) {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
-            _ = try? await Self.performBlockingMutationIO {
-                try FileManager.default.removeItem(at: url)
+            if physicalMutationCapability == nil {
+                _ = try? await Self.performBlockingMutationIO {
+                    try FileManager.default.removeItem(at: url)
+                }
             }
             forgetTrackedPath(relativePath)
             completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
@@ -745,18 +799,40 @@ extension FileSystemService {
                 )
             )
         }
+        let expectedContentDigest = expectedOriginalContent.flatMap { original in
+            original.data(using: encoding).map(DomainContentDigest.sha256)
+        }
+        let physicalMutationCapability = try await MCPDomainMutationCommitContext.physicalMutationCapability()
+        if let physicalMutationCapability {
+            try physicalMutationCapability.validateWriteTarget(
+                at: fullPath,
+                overwrite: true,
+                expectedContentDigest: expectedContentDigest,
+                requireExisting: true
+            )
+        }
         let mutation = try await startUncancellableMutation(
             .edit,
             relativePaths: [target.relativePath]
         ) { executor in
             try await executor {
-                if let expectedOriginalContent {
-                    let currentData = try Data(contentsOf: fullURL)
-                    guard String(data: currentData, encoding: encoding) == expectedOriginalContent else {
-                        throw FileSystemError.fileContentChanged
+                if let capability = executor.physicalMutationCapability {
+                    try capability.writeFile(
+                        at: fullPath,
+                        data: data,
+                        overwrite: true,
+                        expectedContentDigest: expectedContentDigest,
+                        requireExisting: true
+                    )
+                } else {
+                    if let expectedOriginalContent {
+                        let currentData = try Data(contentsOf: fullURL)
+                        guard String(data: currentData, encoding: encoding) == expectedOriginalContent else {
+                            throw FileSystemError.fileContentChanged
+                        }
                     }
+                    try FileSystemService.writeFileRobust(to: fullURL, data: data)
                 }
-                try FileSystemService.writeFileRobust(to: fullURL, data: data)
             }
         }
         Task.detached { [weak self] in
@@ -766,7 +842,8 @@ extension FileSystemService {
                     mutationID: mutation.id,
                     relativePath: target.relativePath,
                     encoding: encoding,
-                    modificationPublicationPolicy: modificationPublicationPolicy
+                    modificationPublicationPolicy: modificationPublicationPolicy,
+                    physicalMutationCapability: physicalMutationCapability
                 )
             } catch FileSystemError.fileContentChanged {
                 await self?.completeMutationWaiter(
@@ -794,7 +871,8 @@ extension FileSystemService {
         mutationID: UUID,
         relativePath: String,
         encoding: String.Encoding,
-        modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy
+        modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy,
+        physicalMutationCapability: DomainMutationPhysicalCapability?
     ) async {
         switch await catalogRegularFileEligibility(relativePath: relativePath) {
         case .eligible, .ineligible(.ignored):
@@ -809,7 +887,9 @@ extension FileSystemService {
         encodingMap[relativePath] = encoding
         visitedPaths.insert(relativePath)
         visitedItems[relativePath] = false
-        let modificationDate = try? await getFileModificationDate(atRelativePath: relativePath)
+        let modificationDate = physicalMutationCapability == nil
+            ? try? await getFileModificationDate(atRelativePath: relativePath)
+            : nil
         let deferredPublication = FileSystemDeferredEditPublication(
             relativePath: relativePath,
             modificationDate: modificationDate

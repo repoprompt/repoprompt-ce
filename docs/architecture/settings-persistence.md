@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-08-11. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-09-05. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -40,14 +40,17 @@ representing its content. Schema-requiring features have fixed introduction cons
 
 - `baselineSchemaVersion = 2`
 - `workspaceAgentModelsSchemaVersion = 4`
+- `contextBuilderSchemaVersion = 5`
 
 `requiredSchemaVersion` returns the maximum fixed feature version required by the
-document. It must never use `currentSchemaVersion` as the version of an existing feature:
-when another feature introduces v5, add a fixed constant for that feature and include it
-in the maximum. Baseline CE content is stamped v2. A document is stamped v4 only when
-`agentModelsSettingsByWorkspaceID` is nonempty. Save, compatible import, recovery, and
-default creation all use this content-derived minimum. Lineage is still stamped on every
-CE write, and future-schema and unlineaged preservation guards remain unchanged.
+document. It must never use `currentSchemaVersion` as the version of an existing feature.
+Baseline CE content is stamped v2; a document is stamped v4 only when
+`agentModelsSettingsByWorkspaceID` is nonempty; and a document containing the
+`scalarPreferences.contextBuilder` group is stamped v5. An existing same-lineage v4 file
+that already contains that group is upgraded through the raw-preserving startup
+transaction before an ordinary typed save can occur. Save, compatible import, recovery,
+and default creation all use this content-derived minimum. Lineage is still stamped on
+every CE write, and future-schema and unlineaged preservation guards remain unchanged.
 
 ## False-v4 normalization
 
@@ -69,12 +72,19 @@ preserved and persistence is latched closed. If verification, backup, or atomic
 replacement fails, the same fail-closed rule applies. Startup default seeding and
 ordinary mutations cannot bypass that latch; explicit backup/reset remains available.
 
-The rollback boundary uses a test-only codec frozen from annotated tag `v1.0.28`
+The rollback boundary uses two test-only codecs. `FrozenV1028GlobalSettingsCompatibility`
+is frozen from annotated tag `v1.0.28`
 (`65d473858d7a140dc82364f4b359482d6dc5ce80`), peeled commit
-`1b185f74e72af3000550796b3d1d7476d244e546`. That source defines the seven-field v2
-root contract. Tests exercise baseline and normalized files across patched → v1.0.28 →
-patched round trips. Genuine same-lineage v4 workspace-profile documents are outside
-that rollback compatibility guarantee.
+`1b185f74e72af3000550796b3d1d7476d244e546`; it covers the seven-field v2 root contract
+and baseline/false-v4 normalization round trips. `FrozenV130GlobalSettingsCompatibility`
+is frozen from released v1.3.0 commit `b8042678fac558842ef4bc37027d0cd26246fdd6`.
+That typed scalar shape supports through v4 and has no Context Builder group, so it
+rejects a v5 file rather than silently dropping that group. Existing same-lineage v4
+files containing Context Builder content are upgraded raw-preservingly before a subsequent
+old write on the non-interleaved, single-writer path. This does not claim cross-process ordering;
+#806 remains unresolved. Do not treat this as a lossless v1.3 round-trip guarantee for
+v4 files; genuine v4 workspace-profile compatibility remains outside the v1.0.28
+rollback guarantee.
 
 ## Frozen legacy ceiling
 
@@ -102,7 +112,12 @@ the preserved file until the user chooses an action:
 - **Incompatible/foreign JSON**: offer compatible import. Import backs up the original
   byte-for-byte, decodes CE-known fields, writes a current-schema CE file, and leaves
   unknown fields only in the backup.
-- **Save failure**: offer retry before reset.
+- **Save failure**: offer retry before reset. If a raw-preserving startup migration
+  failed, retry repeats that same raw-preserving transaction; it records the typed document
+  from the failed attempt and overlays only changed, explicitly owned known fields onto the
+  latest raw JSON, including known optional removals. Unknown root and nested fields remain,
+  and ordinary typed saves remain blocked until the preserving retry succeeds or the user
+  explicitly chooses backup/reset.
 
 Telemetry enablement has a `UserDefaults` mirror so startup can make a safe decision before
 the canonical JSON document is available. A successful settings load synchronizes that
@@ -114,7 +129,11 @@ resynchronizes the mirror from the replacement current-schema document. None of 
 mirror decisions bypass the blocked file's byte-preservation and save latch.
 
 Every save re-checks the on-disk header before writing. This matters because CE dev builds
-can share the live app support folder; a future/foreign file may appear after launch.
+can share the live app support folder; a future/foreign file may appear after launch. This
+is a fail-closed header preflight, not a compare-and-swap transaction: it does not protect
+the read/merge/write interval from a non-cooperating older writer. The supported-writer
+ownership and atomic-CAS design for that interval remains unresolved in #806 and must not
+be represented as closed by this preflight.
 
 Blocked-persistence warnings may be dismissed in workspace windows for the current app
 session. The store owns dismissal across workspace windows and clears it when the reason
@@ -180,7 +199,12 @@ scalarPreferences.contextBuilder.followUpAnalysisEnabled
 
 `GlobalSettingsStore.contextBuilderBehaviorSettings()` resolves a complete non-optional `ContextBuilderBehaviorSettings` value through `ContextBuilderDefaults`; the whole-snapshot setter preserves sibling scalar groups and publishes through the store. Every window reads this same authority. Workspace and tab changes do not change these values, and Context Builder behavior does not use Agent Models workspace inheritance.
 
-The optional scalar group is baseline schema-v2 content. It does not add a feature-version constant or change `requiredSchemaVersion`: documents without workspace Agent Models profiles remain v2, documents with profiles remain v4, and all future/foreign preservation and false-v4 rules continue to apply.
+The optional scalar group is a schema-v5 fenced feature because released v1.3 typed
+writers do not decode or preserve it. A document without workspace Agent Models profiles
+remains v2 when the group is absent; documents with profiles remain v4 when the group is
+absent; and any document containing the group requires v5. Existing v4 documents with
+that group are upgraded through the raw-preserving startup transaction before ordinary
+saves. All future/foreign preservation and false-v4 rules continue to apply.
 
 When the scalar group is absent, load and reload migrate legacy workspace fields deterministically. Workspace entries are sorted by UUID string, then each field independently takes the first applicable value; invalid enhancement modes are skipped and missing values use `ContextBuilderDefaults`. The complete scalar group is materialized and legacy `ChatGlobalSettings` Context Builder fields are stripped. Startup normalization writes these changes, an absent `scalarPreferences.fileSystem.globalIgnoreDefaults` value, and repairs to invalid Oracle ↔ Built-in Chat synchronized-model state through one raw-preserving transaction. The transaction patches only its owned JSON paths, canonicalizes workspace Agent Models UUID keys with the same deterministic winner used during typed decoding, and preserves unknown root, scalar, global-default, workspace, and UUID-backed profile fields, including when false-v4 normalization runs first. Compatible import reconstructs UUID-keyed maps from decoded projections before content-derived schema stamping while retaining the original bytes in the import backup. If persistence is blocked or the save fails, repaired values remain active in memory while the original disk bytes remain under the existing recovery contract. Those optional workspace properties remain decode-compatible legacy migration inputs only. Dormant `GlobalDefaults.discoveryTokenBudget` and `discoveryEnhancementMode` never participate in migration or runtime resolution.
 

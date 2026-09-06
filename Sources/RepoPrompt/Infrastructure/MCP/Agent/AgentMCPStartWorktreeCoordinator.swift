@@ -394,6 +394,7 @@ struct AgentMCPStartWorktreeCoordinator {
         sessionID: UUID,
         targetWindow: WindowState
     ) async throws {
+        try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(bindings)
         let store = targetWindow.promptManager.workspaceFileContextStore
         let physicalRootPaths = Set(bindings.map {
             standardizedPath($0.worktreeRootPath)
@@ -665,6 +666,8 @@ struct AgentMCPStartWorktreeCoordinator {
             logicalRootName: logicalRoot.name,
             worktreeID: worktree.worktreeID,
             worktreeRootPath: physicalRootPath,
+            commonGitDir: worktree.repository.commonGitDir,
+            isMainWorktree: worktree.isMain,
             worktreeName: worktree.name,
             branch: worktree.branch,
             head: worktree.head,

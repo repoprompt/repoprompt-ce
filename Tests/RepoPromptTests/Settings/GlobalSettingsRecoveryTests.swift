@@ -157,6 +157,14 @@ private final class FailingRecoveryGlobalSettingsFileStore: GlobalSettingsFileSt
         includeModelSelectionRepair: Bool
     ) throws {}
 
+    var hasPendingStartupMigration: Bool {
+        false
+    }
+
+    func retryStartupMigrationPreservingUnknownFields(_: GlobalSettingsDocument) throws {
+        throw GlobalSettingsFileStore.GlobalSettingsFileStoreError.startupMigrationRetryUnavailable
+    }
+
     func performUserInitiatedRecovery(replacementDocument: GlobalSettingsDocument) -> Bool {
         recoveryDocuments.append(replacementDocument)
         let backupDirectory = fileURL

@@ -18,14 +18,14 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
         else {
             throw MCPError.invalidParams("file_actions requires action and path")
         }
-        guard ["create", "move", "delete"].contains(action) else {
+        guard ["create", "move", "rename", "delete"].contains(action) else {
             throw MCPError.invalidParams("unknown file_actions action: \(action)")
         }
         let allowMissing = action == "create"
         let source = try context.resolvePath(rawPath, roots: snapshot.roots, allowMissingLeaf: allowMissing)
         var targets = [source.path]
         var destination: URL?
-        if action == "move" {
+        if ["move", "rename"].contains(action) {
             guard let rawDestination = args["new_path"]?.stringValue else {
                 throw MCPError.invalidParams("move requires new_path")
             }
@@ -39,7 +39,7 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
             if manager.fileExists(atPath: source.path), args["if_exists"]?.stringValue != "overwrite" {
                 throw MCPError.invalidParams("path already exists: \(source.path)")
             }
-        case "move":
+        case "move", "rename":
             guard let destination else { throw MCPError.invalidParams("move requires new_path") }
             guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
             guard !manager.fileExists(atPath: destination.path) else { throw MCPError.invalidParams("destination exists") }
@@ -49,25 +49,36 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
             preconditionFailure("file_actions operation was validated above")
         }
         try await admit(targets, roots: snapshot.roots)
-        try await MCPDomainMutationCommitContext.willCommit()
+        guard let capability = try await MCPDomainMutationCommitContext.physicalMutationCapability() else {
+            throw DomainMutationPhysicalCapabilityError.scopeUnavailable
+        }
+        let overwrites = args["if_exists"]?.stringValue == "overwrite"
         switch action {
         case "create":
-            let exists = manager.fileExists(atPath: source.path)
-            if exists, args["if_exists"]?.stringValue != "overwrite" {
-                throw MCPError.invalidParams("path already exists: \(source.path)")
+            guard let data = (args["content"]?.stringValue ?? "").data(using: .utf8) else {
+                throw MCPError.invalidParams("content must be UTF-8")
             }
-            try manager.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try (args["content"]?.stringValue ?? "").write(to: source, atomically: true, encoding: .utf8)
-        case "move":
+            try capability.validateWriteTarget(
+                at: source.path,
+                overwrite: overwrites,
+                expectedContentDigest: nil,
+                requireExisting: false
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
+            try capability.writeFile(
+                at: source.path,
+                data: data,
+                overwrite: overwrites,
+                expectedContentDigest: nil,
+                requireExisting: false
+            )
+        case "move", "rename":
             guard let destination else { throw MCPError.invalidParams("move requires new_path") }
-            guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
-            guard !manager.fileExists(atPath: destination.path) else { throw MCPError.invalidParams("destination exists") }
-            try manager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try manager.moveItem(at: source, to: destination)
+            try capability.validateNoReplaceMove(from: source.path, to: destination.path)
+            try await MCPDomainMutationCommitContext.willCommit()
+            try capability.moveFile(from: source.path, to: destination.path)
         case "delete":
-            guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
-            var resultingURL: NSURL?
-            try manager.trashItem(at: source, resultingItemURL: &resultingURL)
+            throw DomainMutationPhysicalCapabilityError.unsupportedOperation("file_actions.delete")
         default:
             throw MCPError.invalidParams("unknown file_actions action: \(action)")
         }
@@ -189,28 +200,29 @@ private actor DirectHeadlessFileEditHost: FileEditHost {
             [target.path],
             rootMappings: rootMappings
         )
-        let manager = FileManager.default
-        try validateCurrentRevision(manager: manager, overwrite: overwrite)
-        try await MCPDomainMutationCommitContext.willCommit()
-        // Recheck synchronously after the durable boundary and immediately before atomic replacement.
-        try validateCurrentRevision(manager: manager, overwrite: overwrite)
-        try manager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try content.write(to: target, atomically: true, encoding: .utf8)
-    }
-
-    private func validateCurrentRevision(manager: FileManager, overwrite: Bool) throws {
-        if overwrite {
-            guard let expectedDigest,
-                  let current = try? Data(contentsOf: target),
-                  DomainContentDigest.sha256(current) == expectedDigest
-            else {
-                throw MCPError.internalError("apply_edits revision conflict: file changed after preview")
-            }
-        } else {
-            guard expectedMissing, !manager.fileExists(atPath: target.path) else {
-                throw MCPError.internalError("apply_edits revision conflict: file was created concurrently")
-            }
+        guard let capability = try await MCPDomainMutationCommitContext.physicalMutationCapability() else {
+            throw DomainMutationPhysicalCapabilityError.scopeUnavailable
         }
+        if overwrite, expectedDigest == nil {
+            throw MCPError.internalError("apply_edits revision conflict: file was not read before overwrite")
+        }
+        try capability.validateWriteTarget(
+            at: target.path,
+            overwrite: overwrite,
+            expectedContentDigest: expectedDigest,
+            requireExisting: !expectedMissing
+        )
+        guard let data = content.data(using: .utf8) else {
+            throw MCPError.invalidParams("apply_edits requires UTF-8 output")
+        }
+        try await MCPDomainMutationCommitContext.willCommit()
+        try capability.writeFile(
+            at: target.path,
+            data: data,
+            overwrite: overwrite,
+            expectedContentDigest: expectedDigest,
+            requireExisting: !expectedMissing
+        )
     }
 }
 

@@ -1266,12 +1266,16 @@ actor ACPAgentSessionController {
     private func startProcessWaitTask(for process: SpawnedProcess) {
         processWaitTask = Task { [weak self] in
             guard let self else { return }
-            let result = try? await ProcessTermination.waitForTermination(
-                pid: process.pid,
-                processGroupID: process.processGroupID,
-                timeout: nil
-            )
-            await handleProcessExit(result?.exitCode ?? 0, timedOut: result?.timedOut ?? false)
+            do {
+                let result = try await ProcessTermination.waitForTermination(
+                    pid: process.pid,
+                    processGroupID: process.processGroupID,
+                    timeout: nil
+                )
+                await handleProcessExit(result.exitCode, timedOut: result.timedOut)
+            } catch {
+                await handleProcessWaitFailure(error)
+            }
         }
     }
 
@@ -1564,6 +1568,26 @@ actor ACPAgentSessionController {
             let message = timedOut
                 ? "ACP process timed out."
                 : "ACP process exited unexpectedly with code \(exitCode)."
+            emit(.stream(AIStreamResult(type: "error", text: message)))
+            emitTerminal(state: .failed, errorText: message)
+        }
+
+        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
+        failPendingRequests(with: ControllerError.transportClosed)
+        state = .failed
+        await clearExpectedAgentPIDIfNeeded()
+        await cleanupLaunchArtifacts()
+        finishEventsIfNeeded()
+    }
+
+    private func handleProcessWaitFailure(_ error: Error) async {
+        guard state != .closing, state != .closed else {
+            finishEventsIfNeeded()
+            return
+        }
+
+        let message = "ACP process termination observation failed: \(error.localizedDescription)"
+        if state == .promptRunning || !didEmitTerminal {
             emit(.stream(AIStreamResult(type: "error", text: message)))
             emitTerminal(state: .failed, errorText: message)
         }

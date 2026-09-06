@@ -12,6 +12,10 @@ package struct AgentSessionWorktreeBinding: Codable, Equatable, Identifiable, Se
     package let logicalRootName: String?
     package let worktreeID: String
     package let worktreeRootPath: String
+    /// Common Git directory captured when the binding was created.
+    /// Legacy bindings may omit it; fresh repository/worktree IDs are still required at use time.
+    package let commonGitDir: String?
+    package let isMainWorktree: Bool?
     package let worktreeName: String?
     package let branch: String?
     package let head: String?
@@ -28,6 +32,8 @@ package struct AgentSessionWorktreeBinding: Codable, Equatable, Identifiable, Se
         logicalRootName: String? = nil,
         worktreeID: String,
         worktreeRootPath: String,
+        commonGitDir: String? = nil,
+        isMainWorktree: Bool? = nil,
         worktreeName: String? = nil,
         branch: String? = nil,
         head: String? = nil,
@@ -43,6 +49,8 @@ package struct AgentSessionWorktreeBinding: Codable, Equatable, Identifiable, Se
         self.logicalRootName = logicalRootName
         self.worktreeID = worktreeID
         self.worktreeRootPath = worktreeRootPath
+        self.commonGitDir = commonGitDir
+        self.isMainWorktree = isMainWorktree
         self.worktreeName = worktreeName
         self.branch = branch
         self.head = head
@@ -65,6 +73,8 @@ package struct AgentSessionWorktreeBinding: Codable, Equatable, Identifiable, Se
             logicalRootName: logicalRootName,
             worktreeID: worktreeID,
             worktreeRootPath: worktreeRootPath,
+            commonGitDir: commonGitDir,
+            isMainWorktree: isMainWorktree,
             worktreeName: worktreeName,
             branch: branch,
             head: head,
@@ -86,6 +96,8 @@ package struct AgentSessionWorktreeBindingSummary: Codable, Equatable, Identifia
     package let logicalRootName: String?
     package let worktreeID: String
     package let worktreeRootPath: String
+    package let commonGitDir: String?
+    package let isMainWorktree: Bool?
     package let worktreeName: String?
     package let branch: String?
     package let visualLabel: String?
@@ -100,6 +112,8 @@ package struct AgentSessionWorktreeBindingSummary: Codable, Equatable, Identifia
         logicalRootName: String? = nil,
         worktreeID: String,
         worktreeRootPath: String,
+        commonGitDir: String? = nil,
+        isMainWorktree: Bool? = nil,
         worktreeName: String? = nil,
         branch: String? = nil,
         visualLabel: String? = nil,
@@ -113,6 +127,8 @@ package struct AgentSessionWorktreeBindingSummary: Codable, Equatable, Identifia
         self.logicalRootName = logicalRootName
         self.worktreeID = worktreeID
         self.worktreeRootPath = worktreeRootPath
+        self.commonGitDir = commonGitDir
+        self.isMainWorktree = isMainWorktree
         self.worktreeName = worktreeName
         self.branch = branch
         self.visualLabel = visualLabel
@@ -129,6 +145,8 @@ package struct AgentSessionWorktreeBindingSummary: Codable, Equatable, Identifia
             logicalRootName: binding.logicalRootName,
             worktreeID: binding.worktreeID,
             worktreeRootPath: binding.worktreeRootPath,
+            commonGitDir: binding.commonGitDir,
+            isMainWorktree: binding.isMainWorktree,
             worktreeName: binding.worktreeName,
             branch: binding.branch,
             visualLabel: binding.visualLabel,
@@ -151,7 +169,7 @@ package struct AgentWorktreeRuntimeWorkspaceError: LocalizedError, Equatable, Se
             ?? binding.branch
             ?? binding.worktreeID
         let logicalRoot = binding.logicalRootName ?? binding.logicalRootPath
-        return "Agent session is bound to worktree '\(label)' for root '\(logicalRoot)', but the worktree path is unavailable: \(binding.worktreeRootPath). Recreate or repair that Git worktree, bind the session to another worktree, or unbind the session before starting the agent."
+        return "Agent session is bound to worktree '\(label)' for root '\(logicalRoot)', but the worktree path or Git identity is unavailable or changed: \(binding.worktreeRootPath). Recreate or repair that Git worktree, bind the session to another worktree, or unbind the session before starting the agent."
     }
 }
 

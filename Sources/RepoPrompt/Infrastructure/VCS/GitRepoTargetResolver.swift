@@ -79,7 +79,8 @@ struct GitRepoTargetResolver {
                 to: baseRepo,
                 allRepos: allRepos,
                 defaultRepo: defaultRepo,
-                hasExplicitBase: !trimmed.isEmpty
+                hasExplicitBase: !trimmed.isEmpty,
+                authorizedRoots: visibleRoots
             )
         }
 
@@ -92,7 +93,11 @@ struct GitRepoTargetResolver {
             in: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
             selectorKind: .branchNameOrPath
         ) {
-            return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
+            return try await resolveAuthorizedWorktreeRepository(
+                worktree,
+                advertisingRepos: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
+                authorizedRoots: visibleRoots
+            )
         }
 
         let availableNames = visibleRoots.map(\.name).joined(separator: ", ")
@@ -111,38 +116,11 @@ struct GitRepoTargetResolver {
             allRepos: allRepos
         )
         if let authorizedRoots {
-            let rootPaths = authorizedRoots.map(\.standardizedFullPath)
-            let isInsideLoadedRoot = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
-                worktree.path,
-                roots: rootPaths
+            _ = try await resolveAuthorizedWorktreeRepository(
+                worktree,
+                advertisingRepos: [repo],
+                authorizedRoots: authorizedRoots
             )
-            // `worktree` was just obtained from `git worktree list`; authorize its external
-            // checkout path only when another checkout of the same repository is loaded and
-            // the target independently resolves as that exact repository root.
-            let mainRepositoryIsLoaded = worktree.repository.mainWorktreeRoot.map {
-                GitRepoRootAuthorization.isPathWithinAuthorizedRoots($0, roots: rootPaths)
-            } ?? false
-            let loadedRepositoryWorktrees = await mainRepositoryIsLoaded
-                ? []
-                : (try? dependencies.listWorktrees(repo)) ?? []
-            let matchingLinkedRepositoryIsLoaded = loadedRepositoryWorktrees.contains { candidate in
-                GitRepoRootAuthorization.isPathWithinAuthorizedRoots(candidate.path, roots: rootPaths)
-                    && candidate.repository.repositoryID == worktree.repository.repositoryID
-                    && samePath(candidate.repository.commonGitDir, worktree.repository.commonGitDir)
-            }
-            let advertisingRepositoryIsLoaded = mainRepositoryIsLoaded || matchingLinkedRepositoryIsLoaded
-            let resolvedWorktree = !isInsideLoadedRoot && advertisingRepositoryIsLoaded
-                ? await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path))
-                : nil
-            let isVerifiedLinkedWorktree = resolvedWorktree.map {
-                samePath($0.rootPath, worktree.path)
-            } ?? false
-            guard isInsideLoadedRoot || isVerifiedLinkedWorktree else {
-                let rootsList = rootPaths.joined(separator: ", ")
-                throw GitRepoTargetResolverError.invalidParams(
-                    "worktree path must be inside a loaded root or advertised by a loaded repository. Received: \(worktree.path). Loaded roots: \(rootsList)"
-                )
-            }
         }
         // Fail closed on stale/prunable worktrees. Git reports a worktree as prunable when its
         // gitdir points to a non-existent location (the checkout was removed or left incomplete).
@@ -237,7 +215,11 @@ struct GitRepoTargetResolver {
                    selectorKind: .branchNameOrPath
                )
             {
-                return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
+                return try await resolveAuthorizedWorktreeRepository(
+                    worktree,
+                    advertisingRepos: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
+                    authorizedRoots: visibleRoots
+                )
             }
 
             let visibleRootPaths = visibleRoots.map(\.standardizedFullPath)
@@ -254,9 +236,12 @@ struct GitRepoTargetResolver {
                 trimmed,
                 in: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
                 selectorKind: .path
-            ), let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path)),
-            samePath(resolved.rootPath, worktree.path) {
-                return resolved
+            ) {
+                return try await resolveAuthorizedWorktreeRepository(
+                    worktree,
+                    advertisingRepos: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
+                    authorizedRoots: visibleRoots
+                )
             }
 
             let rootsList = visibleRootPaths.joined(separator: ", ")
@@ -332,7 +317,8 @@ struct GitRepoTargetResolver {
         to repo: GitRepoDescriptor,
         allRepos: [GitRepoDescriptor],
         defaultRepo: GitRepoDescriptor,
-        hasExplicitBase: Bool
+        hasExplicitBase: Bool,
+        authorizedRoots: [WorkspaceRootRef]
     ) async throws -> GitRepoDescriptor {
         guard let specifier else {
             return repo
@@ -346,43 +332,101 @@ struct GitRepoTargetResolver {
         case let .main(branch):
             if let branch, !branch.isEmpty {
                 if let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repo.rootURL),
-                   let root = resolveWorktreeRoot(forBranch: branch, layout: layout)
+                   let resolution = resolveWorktreeRoot(forBranch: branch, layout: layout),
+                   let expected = expectedWorktreeDescriptor(for: resolution, basedOn: repo)
                 {
-                    return GitRepoDescriptor(rootURL: root)
+                    return try await resolveAuthorizedWorktreeRepository(
+                        expected,
+                        advertisingRepos: [repo],
+                        authorizedRoots: authorizedRoots
+                    )
                 }
                 if let worktree = try await resolveWorktreeSelector(branch, in: [repo], selectorKind: .branch) {
-                    return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
+                    return try await resolveAuthorizedWorktreeRepository(
+                        worktree,
+                        advertisingRepos: [repo],
+                        authorizedRoots: authorizedRoots
+                    )
                 }
                 throw GitRepoTargetResolverError.invalidParams("No worktree found for branch '\(branch)'. Use repo_root=\"@main\" for the main checkout or pass a full worktree path.")
             }
             if let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repo.rootURL) {
                 if !layout.isLinkedWorktree {
-                    return repo
+                    guard let expected = expectedWorktreeDescriptor(
+                        for: ResolvedWorktreeRoot(root: repo.rootURL, gitDir: nil, isMain: true),
+                        basedOn: repo
+                    ) else {
+                        throw GitRepoTargetResolverError.invalidParams(
+                            "The main checkout identity could not be established for repo: \(repo.rootPath)"
+                        )
+                    }
+                    return try await resolveAuthorizedWorktreeRepository(
+                        expected,
+                        advertisingRepos: [repo],
+                        authorizedRoots: authorizedRoots
+                    )
                 }
-                if let mainRoot = Self.resolveMainWorktreeRoot(for: layout) {
-                    return GitRepoDescriptor(rootURL: mainRoot)
+                if let mainRoot = Self.resolveMainWorktreeRoot(for: layout),
+                   let expected = expectedWorktreeDescriptor(
+                       for: ResolvedWorktreeRoot(root: mainRoot, gitDir: nil, isMain: true),
+                       basedOn: repo
+                   )
+                {
+                    return try await resolveAuthorizedWorktreeRepository(
+                        expected,
+                        advertisingRepos: [repo],
+                        authorizedRoots: authorizedRoots
+                    )
                 }
                 if let main = try await mainWorktree(for: repo) {
-                    return GitRepoDescriptor(rootURL: URL(fileURLWithPath: main.path))
+                    return try await resolveAuthorizedWorktreeRepository(
+                        main,
+                        advertisingRepos: [repo],
+                        authorizedRoots: authorizedRoots
+                    )
                 }
                 throw GitRepoTargetResolverError.invalidParams("The main checkout path could not be resolved for repo: \(repo.rootPath)")
             }
-            if let main = try await mainWorktree(for: repo), !samePath(main.path, repo.rootPath) {
-                return GitRepoDescriptor(rootURL: URL(fileURLWithPath: main.path))
+            if let main = try await mainWorktree(for: repo) {
+                return try await resolveAuthorizedWorktreeRepository(
+                    main,
+                    advertisingRepos: [repo],
+                    authorizedRoots: authorizedRoots
+                )
             }
-            return repo
+            guard let expected = expectedWorktreeDescriptor(
+                for: ResolvedWorktreeRoot(root: repo.rootURL, gitDir: nil, isMain: true),
+                basedOn: repo
+            ) else {
+                throw GitRepoTargetResolverError.invalidParams(
+                    "The main checkout identity could not be established for repo: \(repo.rootPath)"
+                )
+            }
+            return try await resolveAuthorizedWorktreeRepository(
+                expected,
+                advertisingRepos: [repo],
+                authorizedRoots: authorizedRoots
+            )
         case .current:
             return repo
         case let .id(id):
             let candidates = hasExplicitBase ? [repo] : candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo)
             if let worktree = try await resolveWorktreeSelector(id, in: candidates, selectorKind: .id) {
-                return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
+                return try await resolveAuthorizedWorktreeRepository(
+                    worktree,
+                    advertisingRepos: candidates,
+                    authorizedRoots: authorizedRoots
+                )
             }
             throw GitRepoTargetResolverError.invalidParams("No worktree found for id '\(id)'.")
         case let .branch(branch):
             let candidates = hasExplicitBase ? [repo] : candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo)
             if let worktree = try await resolveWorktreeSelector(branch, in: candidates, selectorKind: .branch) {
-                return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
+                return try await resolveAuthorizedWorktreeRepository(
+                    worktree,
+                    advertisingRepos: candidates,
+                    authorizedRoots: authorizedRoots
+                )
             }
             throw GitRepoTargetResolverError.invalidParams("No worktree found for branch '\(branch)'.")
         }
@@ -493,6 +537,108 @@ struct GitRepoTargetResolver {
         return matchesBranch(requested, headRef: branch)
     }
 
+    private struct ResolvedWorktreeRoot {
+        let root: URL
+        let gitDir: URL?
+        let isMain: Bool
+    }
+
+    private func expectedWorktreeDescriptor(
+        for resolution: ResolvedWorktreeRoot,
+        basedOn repo: GitRepoDescriptor
+    ) -> GitWorktreeDescriptor? {
+        guard let repository = repo.worktreeIdentity?.repository,
+              resolution.isMain || resolution.gitDir != nil
+        else {
+            return nil
+        }
+        let root = resolution.root.standardizedFileURL
+        let worktreeID = GitWorktreeIdentity.worktreeID(
+            repositoryID: repository.repositoryID,
+            gitDir: resolution.isMain ? nil : resolution.gitDir,
+            isMain: resolution.isMain,
+            path: root
+        )
+        return GitWorktreeDescriptor(
+            worktreeID: worktreeID,
+            repository: repository,
+            path: root.path,
+            gitDir: resolution.gitDir?.standardizedFileURL.path,
+            name: root.lastPathComponent.isEmpty ? nil : root.lastPathComponent,
+            branch: nil,
+            head: nil,
+            isMain: resolution.isMain,
+            isCurrent: samePath(root.path, repo.rootPath),
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil
+        )
+    }
+
+    private func resolveAuthorizedWorktreeRepository(
+        _ worktree: GitWorktreeDescriptor,
+        advertisingRepos: [GitRepoDescriptor],
+        authorizedRoots: [WorkspaceRootRef]
+    ) async throws -> GitRepoDescriptor {
+        let rootPaths = authorizedRoots.map(\.standardizedFullPath)
+        let isInsideLoadedRoot = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+            worktree.path,
+            roots: rootPaths
+        )
+        if isInsideLoadedRoot {
+            return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
+        }
+
+        // An external checkout must still be advertised by a loaded checkout of the same
+        // repository before its fresh target identity can authorize the path.
+        let mainRepositoryIsLoaded = worktree.repository.mainWorktreeRoot.map {
+            GitRepoRootAuthorization.isPathWithinAuthorizedRoots($0, roots: rootPaths)
+        } ?? false
+        var matchingLinkedRepositoryIsLoaded = false
+        if !mainRepositoryIsLoaded {
+            for advertisingRepo in uniqueRepos(advertisingRepos) {
+                let loadedRepositoryWorktrees = await (try? dependencies.listWorktrees(advertisingRepo)) ?? []
+                if loadedRepositoryWorktrees.contains(where: { candidate in
+                    GitRepoRootAuthorization.isPathWithinAuthorizedRoots(candidate.path, roots: rootPaths)
+                        && candidate.repository.repositoryID == worktree.repository.repositoryID
+                        && samePath(candidate.repository.commonGitDir, worktree.repository.commonGitDir)
+                }) {
+                    matchingLinkedRepositoryIsLoaded = true
+                    break
+                }
+            }
+        }
+        let advertisingRepositoryIsLoaded = mainRepositoryIsLoaded || matchingLinkedRepositoryIsLoaded
+        guard advertisingRepositoryIsLoaded,
+              let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path)),
+              matchesFreshWorktreeIdentity(resolved, worktree: worktree)
+        else {
+            let rootsList = rootPaths.joined(separator: ", ")
+            throw GitRepoTargetResolverError.invalidParams(
+                "worktree path must be inside a loaded root or advertised by a loaded repository. Received: \(worktree.path). Loaded roots: \(rootsList)"
+            )
+        }
+        return resolved
+    }
+
+    private func matchesFreshWorktreeIdentity(
+        _ resolved: GitRepoDescriptor,
+        worktree: GitWorktreeDescriptor
+    ) -> Bool {
+        guard samePath(resolved.rootPath, worktree.path),
+              let identity = resolved.worktreeIdentity
+        else {
+            return false
+        }
+        return samePath(identity.worktreeRootPath, worktree.path)
+            && identity.repository.repositoryID == worktree.repository.repositoryID
+            && samePath(identity.repository.commonGitDir, worktree.repository.commonGitDir)
+            && identity.worktreeID == worktree.worktreeID
+            && identity.isMain == worktree.isMain
+    }
+
     private func samePath(_ lhs: String, _ rhs: String) -> Bool {
         GitRepoRootAuthorization.canonicalPath(lhs) == GitRepoRootAuthorization.canonicalPath(rhs)
     }
@@ -540,7 +686,7 @@ struct GitRepoTargetResolver {
         return resolvedGitdir.deletingLastPathComponent().standardizedFileURL
     }
 
-    private func resolveWorktreeRoot(forBranch branch: String, layout: GitRepositoryLayout) -> URL? {
+    private func resolveWorktreeRoot(forBranch branch: String, layout: GitRepositoryLayout) -> ResolvedWorktreeRoot? {
         let target = branch.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return nil }
         let fileManager = FileManager.default
@@ -556,7 +702,11 @@ struct GitRepoTargetResolver {
                         continue
                     }
                     if let root = resolveWorktreeRootFromEntry(entry) {
-                        return root
+                        return ResolvedWorktreeRoot(
+                            root: root,
+                            gitDir: entry.standardizedFileURL,
+                            isMain: false
+                        )
                     }
                 }
             }
@@ -564,7 +714,7 @@ struct GitRepoTargetResolver {
         if let mainRoot = Self.resolveMainWorktreeRoot(for: layout) {
             let headURL = layout.commonDir.appendingPathComponent("HEAD")
             if let headRef = readHeadRef(from: headURL), matchesBranch(target, headRef: headRef) {
-                return mainRoot
+                return ResolvedWorktreeRoot(root: mainRoot, gitDir: nil, isMain: true)
             }
         }
         return nil
