@@ -223,6 +223,11 @@ best-effort remote cleanup, including registration that settles after cancellati
 If a managed controller has fully ended, explicit idle repair may retire only
 that proven-ended instance and resume the retained exact thread in a new managed
 backend. Live or unknown controller/process state is not silently stopped.
+Ordinary reconnect, changed runtime settings and workspace resolution failures
+therefore refuse reconciliation of an attached managed controller, including
+changes detected after an await. Restore its matching settings or explicitly
+end the backend before requesting exact-history repair; repeated pairing alone
+does not authorize retirement of that live or unknown instance.
 
 The account bar distinguishes **Applied** from **Pending** labels and displays
 the separate application/verification status. A queued destination is never

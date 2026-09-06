@@ -3,6 +3,76 @@ import XCTest
 
 @MainActor
 final class CodexSwitchboardSessionAdmissionTests: XCTestCase {
+    func testManagedRepairNeverRetiresLiveOrUnknownControllerForReconciliation() async {
+        for scenario in ["healthy", "reconnect", "features", "workspace", "profile", "workspaceFailure", "recheckedWorkspace", "recheckedFailure"] {
+            let controller = Controller()
+            var launches = 0
+            var resolutions = 0
+            let coordinator = makeCoordinator(
+                recovery: Recovery(), activeTools: { _ in false }, launched: { launches += 1 },
+                replacement: Controller(), workspace: { _ in
+                    resolutions += 1
+                    if scenario == "workspaceFailure" || (scenario == "recheckedFailure" && resolutions > 1) {
+                        throw CodexAccountAdoptionReason.runtimeUnavailable
+                    }
+                    return .uniform(scenario == "recheckedWorkspace" && resolutions > 1 ? "/synthetic/changed" : "/synthetic/workspace")
+                }
+            )
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.installRunID(UUID())
+            session.codexConversationID = "retained-history"
+            session.requiresSwitchboardPairing = true
+            session.codexController = controller
+            session.switchboardAccountControl = CodexSwitchboardSessionControl()
+            session.codexControllerWorkspacePaths = .uniform("/synthetic/workspace")
+            session.codexControllerPermissionProfile = session.permissionProfile
+            session.codexControllerFeatureState = .init(
+                computerUseEnabled: false, goalSupportEnabled: false,
+                reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled, memoriesEnabled: CodexMemories.isEnabled
+            )
+            switch scenario {
+            case "reconnect": session.codexNeedsReconnect = true
+            case "features": session.codexControllerFeatureState?.goalSupportEnabled = true
+            case "workspace": session.codexControllerWorkspacePaths = .uniform("/synthetic/previous")
+            case "profile": session.codexControllerPermissionProfile = nil
+            default: break
+            }
+            let generation = session.codexControllerGeneration
+            await coordinator.ensureCodexNativeSession(session: session, allowMissingRolloutFallback: false, allowResumeTimeoutFallback: false)
+            XCTAssertTrue(session.codexController === controller, scenario)
+            XCTAssertEqual(session.codexControllerGeneration, generation, scenario)
+            XCTAssertEqual(session.codexConversationID, "retained-history", scenario)
+            XCTAssertEqual(controller.shutdowns, 0, scenario)
+            XCTAssertEqual(controller.starts, 0, scenario)
+            XCTAssertEqual(launches, 0, scenario)
+            XCTAssertEqual(session.switchboardAccountControl?.state, scenario == "healthy" ? .waitingIdle(.runtimeUnavailable) : .failedUnknown(.runtimeUnavailable), scenario)
+            await session.switchboardAccountControl?.revokeAndWait()
+            session.codexEventTask?.cancel()
+        }
+    }
+
+    func testOrdinaryControllerReconciliationStillReplacesItsOwnBackend() async {
+        let controller = Controller()
+        controller.usesManagedHTTPAccountAdoption = false
+        let replacement = Controller()
+        replacement.usesManagedHTTPAccountAdoption = false
+        var launches = 0
+        let coordinator = makeCoordinator(recovery: Recovery(), activeTools: { _ in false }, launched: { launches += 1 }, replacement: replacement)
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.installRunID(UUID())
+        session.codexConversationID = "retained-history"
+        session.codexController = controller
+        // Missing feature metadata uses the ordinary replacement path.
+        await coordinator.ensureCodexNativeSession(session: session)
+        XCTAssertTrue(session.codexController === replacement)
+        XCTAssertEqual(controller.shutdowns, 1)
+        XCTAssertEqual(launches, 1)
+        XCTAssertEqual(session.codexConversationID, "retained-history")
+        session.codexEventTask?.cancel()
+    }
+
     func testCoordinatorRefusesManagedHistoryBeforeAnyBackendOrGlobalLoginWork() async {
         let recovery = Recovery()
         var launches = 0
@@ -88,11 +158,16 @@ final class CodexSwitchboardSessionAdmissionTests: XCTestCase {
         XCTAssertThrowsError(try gate.authorize(method: "review/start"))
     }
 
-    private func makeCoordinator(recovery: Recovery, activeTools: @escaping (UUID) -> Bool, launched: @escaping () -> Void) -> CodexAgentModeCoordinator {
+    private func makeCoordinator(
+        recovery: Recovery, activeTools: @escaping (UUID) -> Bool, launched: @escaping () -> Void,
+        replacement: Controller? = nil,
+        workspace: @escaping (AgentTabSession) throws -> CodexRuntimeWorkspacePaths = { _ in .uniform("/synthetic/workspace") }
+    ) -> CodexAgentModeCoordinator {
         CodexAgentModeCoordinator(
-            windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform("/synthetic/workspace") },
+            windowID: 1, runtimeWorkspacePathsProvider: workspace,
             codexControllerFactory: { _, _, _, _, _, _, _, _, _ in
                 launched()
+                if let replacement { return replacement }
                 fatalError("This refusal test must never create a native backend")
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
@@ -100,6 +175,39 @@ final class CodexSwitchboardSessionAdmissionTests: XCTestCase {
             codexHookApprovalSettings: HookSettings(), activeToolQuery: activeTools,
             preferenceDefaults: UserDefaults(suiteName: "SwitchboardAdmissionTests.\(UUID().uuidString)")!
         )
+    }
+
+    private final class Controller: CodexSessionControlling {
+        var shutdowns = 0
+        var starts = 0
+        var hasActiveThread = true
+        var usesManagedHTTPAccountAdoption = true
+        let currentSessionReference: CodexNativeSessionController.SessionRef? = .init(conversationID: "retained-history")
+        let events = AsyncStream<CodexNativeSessionController.Event> { _ in }
+        func ensureEventsStreamReady() {}
+        func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String) async throws -> CodexNativeSessionController.SessionRef {
+            starts += 1
+            throw CodexAccountAdoptionReason.runtimeUnavailable
+        }
+
+        func startUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexTurnStartReceipt {
+            throw CodexAccountAdoptionReason.runtimeUnavailable
+        }
+
+        func steerUserTurn(text: String, images: [AgentImageAttachment], expectedTurnID: String) async throws -> CodexTurnSteerReceipt {
+            throw CodexAccountAdoptionReason.runtimeUnavailable
+        }
+
+        func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+            throw CodexAccountAdoptionReason.runtimeUnavailable
+        }
+
+        func cancelCurrentTurn() async {}
+        func shutdown() async {
+            shutdowns += 1
+        }
+
+        func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
     }
 
     private struct HookSettings: CodexHookApprovalSettingsProviding {

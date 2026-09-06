@@ -5754,6 +5754,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         await awaitCodexControllerRetirement(for: session.tabID)
     }
 
+    /// Ordinary reconciliation may replace controllers. Managed account adoption
+    /// may not: explicit repair separately proves that the native transport and
+    /// its teardown have ended before retiring it. Keep unknown/live instances
+    /// and their conversation metadata intact, including after suspension.
+    private func refuseImplicitSwitchboardControllerReplacement(_ session: AgentTabSession) -> Bool {
+        guard let controller = session.codexController,
+              session.requiresSwitchboardPairing || controller.usesManagedHTTPAccountAdoption else { return false }
+        session.switchboardAccountControl?.runtimeLost()
+        return true
+    }
+
     func ensureCodexNativeSession(
         session: AgentTabSession,
         policyAlreadyInstalled: Bool = false,
@@ -5789,6 +5800,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 return
             }
+            if refuseImplicitSwitchboardControllerReplacement(session) { return }
             if invalidateCodexControllerForReconnect(
                 session: session,
                 expectedController: activeController,
@@ -5812,6 +5824,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         do {
             runtimeWorkspacePaths = try runtimeWorkspacePathsProvider(session)
         } catch {
+            if refuseImplicitSwitchboardControllerReplacement(session) { return }
             let controllerToShutdown = session.codexController
             await failCodexStartupForWorkspaceResolution(session: session, error: error)
             if let controllerToShutdown {
@@ -5841,6 +5854,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if let existingController = session.codexController,
            session.codexControllerFeatureState != desiredFeatureState
         {
+            if refuseImplicitSwitchboardControllerReplacement(session) { return }
             _ = invalidateCodexControllerForReconnect(
                 session: session,
                 expectedController: existingController,
@@ -5855,6 +5869,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if let existingController = session.codexController,
            session.codexControllerWorkspacePaths ?? .uniform(nil) != runtimeWorkspacePaths
         {
+            if refuseImplicitSwitchboardControllerReplacement(session) { return }
             _ = invalidateCodexControllerForReconnect(
                 session: session,
                 expectedController: existingController,
@@ -5865,6 +5880,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
            let existingProfile = session.codexControllerPermissionProfile,
            existingProfile != controllerPermissionProfile || session.codexControllerTaskLabelKind != currentTaskLabelKind
         {
+            if refuseImplicitSwitchboardControllerReplacement(session) { return }
             let source = existingProfile != controllerPermissionProfile
                 ? "permission-profile-change"
                 : "task-label-kind-change"
@@ -5903,6 +5919,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             do {
                 refreshedWorkspacePaths = try runtimeWorkspacePathsProvider(session)
             } catch {
+                if refuseImplicitSwitchboardControllerReplacement(session) { return nil }
                 let controllerToShutdown = session.codexController
                 await failCodexStartupForWorkspaceResolution(session: session, error: error)
                 if let controllerToShutdown {
@@ -5935,6 +5952,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                || session.codexControllerTaskLabelKind != refreshedTaskLabelKind
                || session.codexControllerFeatureState != refreshedFeatureState
             {
+                if refuseImplicitSwitchboardControllerReplacement(session) { return nil }
                 guard invalidateCodexControllerForReconnect(
                     session: session,
                     expectedController: existingController,
@@ -6096,6 +6114,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             && !requiresTransportStart
             && !hasLiveRunRoute
         if shouldForceReconnectForMissingLiveRoute {
+            if refuseImplicitSwitchboardControllerReplacement(session) { return }
             logCodex("[AgentModeVM][CodexReconnect] forcing reconnect for tab \(session.tabID) because run \(runID) has cached tool policy but no live MCP route")
             let expectedController = session.codexController
             _ = invalidateCodexControllerForReconnect(
@@ -6243,6 +6262,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
         } catch {
+            if refuseImplicitSwitchboardControllerReplacement(session) { return }
             var effectiveError: Error = error
             if !session.requiresSwitchboardPairing, session.codexController?.usesManagedHTTPAccountAdoption != true,
                session.runState.isActive,
