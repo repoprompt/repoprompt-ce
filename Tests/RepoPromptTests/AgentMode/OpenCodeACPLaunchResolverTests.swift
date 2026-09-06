@@ -55,7 +55,8 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let fakeHome = try makeTemporaryDirectory()
         let pathDirectory = try makeTemporaryDirectory()
         let hintDirectory = try makeTemporaryDirectory()
-        let nonExecutable = hintDirectory.appendingPathComponent("opencode")
+        let commandName = "opencode-fixture-\(UUID().uuidString)"
+        let nonExecutable = hintDirectory.appendingPathComponent(commandName)
         try "not executable\n".write(to: nonExecutable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: nonExecutable.path)
         let environment = [
@@ -67,7 +68,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
             ACPLaunchEnvironment(environment: environment, shellEnvironmentSource: .enrichedFallback)
         })
         let config = OpenCodeAgentConfig(
-            commandName: "opencode",
+            commandName: commandName,
             additionalPathHints: [hintDirectory.path],
             includeRepoPromptMCPServer: false,
             includeManagedConfigOverlay: false
@@ -79,9 +80,9 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
             return XCTFail("Expected unsupported result with diagnostic reason")
         }
         XCTAssertTrue(reason.contains("Tried:"), reason)
-        XCTAssertTrue(reason.contains(hintDirectory.appendingPathComponent("opencode").path), reason)
+        XCTAssertTrue(reason.contains(hintDirectory.appendingPathComponent(commandName).path), reason)
         XCTAssertTrue(reason.contains("not executable"), reason)
-        XCTAssertTrue(reason.contains(pathDirectory.appendingPathComponent("opencode").path), reason)
+        XCTAssertTrue(reason.contains(pathDirectory.appendingPathComponent(commandName).path), reason)
         XCTAssertTrue(reason.contains("missing"), reason)
         XCTAssertTrue(reason.contains("fallback PATH"), reason)
         XCTAssertTrue(reason.contains("PATH may not match Terminal"), reason)
@@ -146,6 +147,40 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let marker = directory.appendingPathComponent("probe-ran")
         let executable = try makeExecutable(in: directory, marker: marker)
         try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: directory.path)
+
+        let support = try await OpenCodeACPLaunchResolver().probeSupport(
+            for: OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
+        )
+
+        guard case .unsupported = support else {
+            return XCTFail("Expected unsafe launch path to be unsupported")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testGroupWritableExecutableFileIsRejectedWithoutExecution() async throws {
+        let directory = try makeTemporaryDirectory()
+        let marker = directory.appendingPathComponent("probe-ran")
+        let executable = try makeExecutable(in: directory, marker: marker)
+        try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: executable.path)
+
+        let support = try await OpenCodeACPLaunchResolver().probeSupport(
+            for: OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
+        )
+
+        guard case .unsupported = support else {
+            return XCTFail("Expected unsafe launch path to be unsupported")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testNonHomebrewGroupWritableAncestorIsRejectedWithoutExecution() async throws {
+        let root = try makeTemporaryDirectory()
+        let directory = root.appendingPathComponent("group-writable", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let marker = root.appendingPathComponent("probe-ran")
+        let executable = try makeExecutable(in: directory, marker: marker)
+        try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: directory.path)
 
         let support = try await OpenCodeACPLaunchResolver().probeSupport(
             for: OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
