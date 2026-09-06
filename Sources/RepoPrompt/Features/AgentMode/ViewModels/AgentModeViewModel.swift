@@ -700,6 +700,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
+
+    #if DEBUG
+        var testACPRunner: ACPIntegratedAgentModeRunner {
+            runService.testACPRunner
+        }
+    #endif
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
 
     private var isRestoringState = false
@@ -11094,7 +11100,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func permissionControlsExternallyManagedReason(for session: TabSession) -> String? {
+    func permissionControlsExternallyManagedReason(for session: TabSession) -> String? {
         providerBindingService.externallyManagedPermissionReason(
             isSubagent: usesSubagentPermissionPolicy(session),
             isMCPControlled: session.mcpControlContext != nil,
@@ -11122,7 +11128,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             selectedModelRaw: session.selectedModelRaw,
             permissionProfile: session.permissionProfile,
             isSubagent: usesSubagentPolicy,
-            externallyManagedReason: externallyManagedReason
+            externallyManagedReason: externallyManagedReason,
+            acpModeSnapshot: session.acpSessionModeSnapshot,
+            acpModeIntent: session.acpSessionModeIntent
         )
         if activeProviderControlsBinding != nextControlsBinding {
             activeProviderControlsBinding = nextControlsBinding

@@ -900,7 +900,7 @@ class SystemPromptService {
         \(agentDelegationFinalNote)
         - If something goes wrong, explain what happened and offer to fix it\(askForHelpNote)
         """
-        return AgentModePrompts.Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+        return AgentModePrompts.Fragments.providerQualifiedToolReferences(prompt, agentKind: agentKind)
     }
 
     private static func mcpPairProgramPrompt() -> String {

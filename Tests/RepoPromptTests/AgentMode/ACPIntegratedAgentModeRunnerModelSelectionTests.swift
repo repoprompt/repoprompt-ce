@@ -75,31 +75,38 @@ struct ACPModelSelectionFixtureProvider: ACPAgentProvider {
         import json, sys
         from pathlib import Path
         root = Path(__file__).parent
-        model, mode = 'model-a', 'ask'
+        model, mode = 'model-a', (root/'initial-mode.txt').read_text() if (root/'initial-mode.txt').exists() else 'ask'
         def options():
             return [
                 {'id':'model','name':'Model','category':'model','type':'select','currentValue':model,
                  'options':[{'value':v,'name':v} for v in ['model-a','model-b','model-c','rejected']]},
-                {'id':'mode','name':'Mode','category':'mode','type':'select','currentValue':mode,
-                 'options':[{'value':v,'name':v} for v in ['ask','code']]}]
+                {'id':'permission-profile','name':'Mode','category':'mode','type':'select','currentValue':mode,
+                 'options':[{'value':v,'name':'Mode '+v,'description':'Description '+v} for v in ['ask','code','novel-mode','bypass','unconfirmed']]}]
         def reply(i, result):
             print(json.dumps({'jsonrpc':'2.0','id':i,'result':result}),flush=True)
         for line in sys.stdin:
             m=json.loads(line); method=m.get('method'); params=m.get('params',{}); i=m.get('id')
             record={'method':method,'model':model,'mode':mode}
-            if method=='session/set_config_option': record['selected']=params['value']
+            if method=='session/set_config_option': record.update(selected=params['value'],configId=params['configId'])
             with (root/'requests.jsonl').open('a') as f: f.write(json.dumps(record)+'\n')
             if method=='initialize':
                 reply(i,{'protocolVersion':1,'agentCapabilities':{'loadSession':True},'authMethods':[]})
             elif method in ['session/new','session/load']:
                 reply(i,{'sessionId':'fixture-session','configOptions':options()})
             elif method=='session/set_config_option':
-                if params['value']=='rejected':
+                if params['value']=='unconfirmed':
+                    reply(i,{})
+                elif params['value']=='rejected':
                     print(json.dumps({'jsonrpc':'2.0','id':i,'error':{'code':-32602,'message':'fixture rejection'}}),flush=True)
                 else:
                     if params['configId']=='model': model=params['value']
                     else: mode=params['value']
                     reply(i,{'configOptions':options()})
+                    pushed=root/'push-mode.txt'
+                    if pushed.exists():
+                        mode=pushed.read_text()
+                        print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session',
+                            'update':{'sessionUpdate':'config_option_update','configOptions':options()}}}),flush=True)
             elif method=='session/prompt':
                 stderr=root/'stderr.txt'
                 if stderr.exists(): print(stderr.read_text(),file=sys.stderr,flush=True)
@@ -134,8 +141,8 @@ struct ACPModelSelectionFixtureProvider: ACPAgentProvider {
         )
     }
 
-    func makeSessionConfiguration(for _: ACPRunRequest, mcpServer _: RepoPromptMCPServerConfiguration) throws -> ACPSessionConfiguration {
-        ACPSessionConfiguration(mode: .new, workingDirectory: directory.path, mcpServers: [])
+    func makeSessionConfiguration(for request: ACPRunRequest, mcpServer _: RepoPromptMCPServerConfiguration) throws -> ACPSessionConfiguration {
+        ACPSessionConfiguration(mode: request.resumeSessionID.map { ACPSessionConfiguration.Mode.load(existingSessionID: $0) } ?? .new, workingDirectory: directory.path, mcpServers: [])
     }
 
     func buildPromptBlocks(for message: AgentMessage, request _: ACPRunRequest) throws -> [[String: Any]] {

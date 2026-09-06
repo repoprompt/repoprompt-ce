@@ -21,14 +21,18 @@ final class AgentModeProviderBindingService {
         selectedModelRaw: String? = nil,
         permissionProfile: AgentProviderPermissionProfile,
         isSubagent: Bool,
-        externallyManagedReason: String?
+        externallyManagedReason: String?,
+        acpModeSnapshot: ACPSessionModeSnapshot? = nil,
+        acpModeIntent: String? = nil
     ) -> AgentProviderControlsBinding {
         preferences.controlsBinding(
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
             permissionProfile: permissionProfile,
             isSubagent: isSubagent,
-            externallyManagedReason: externallyManagedReason
+            externallyManagedReason: externallyManagedReason,
+            acpModeSnapshot: acpModeSnapshot,
+            acpModeIntent: acpModeIntent
         )
     }
 

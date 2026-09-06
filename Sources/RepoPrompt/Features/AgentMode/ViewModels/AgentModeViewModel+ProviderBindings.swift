@@ -91,6 +91,16 @@ extension AgentModeViewModel {
     }
 
     func setProviderPermissionLevel(_ id: AgentProviderPermissionLevelID) {
+        if case let .devinMode(raw) = id {
+            guard let session = activeSession, session.selectedAgent == .devin,
+                  session.permissionProfile == .userConfigured,
+                  permissionControlsExternallyManagedReason(for: session) == nil,
+                  session.acpSessionModeSnapshot?.availableValues.contains(raw) == true else { return }
+            // Intent only: never mutate a running turn or persist native observed state as consent.
+            session.acpSessionModeIntent = raw
+            updatePermissionBindingState(from: session)
+            return
+        }
         let providerID = providerBindingService.setPermissionLevel(id)
         providerPreferenceDidChange(providerID, bumpProviderBindingRevision: false)
     }

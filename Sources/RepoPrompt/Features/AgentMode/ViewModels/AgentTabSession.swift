@@ -826,7 +826,32 @@ final class AgentTabSession: ObservableObject {
     }
 
     var claudeController: (any NativeAgentRuntimeControlling)?
-    var acpController: ACPAgentSessionController?
+    var acpSessionModeSnapshot: ACPSessionModeSnapshot?
+    var acpSessionModeIntent: String?
+    var acpModeObservationTask: Task<Void, Never>?
+    func observeACPSessionModes(from controller: ACPAgentSessionController, onChange: @escaping @MainActor () -> Void) {
+        acpModeObservationTask?.cancel()
+        let binding = persistentSessionBindingIdentity
+        acpModeObservationTask = Task { [weak self] in
+            for await snapshot in await controller.sessionModeUpdates() {
+                guard !Task.isCancelled, let self, acpController === controller,
+                      persistentSessionBindingIdentity == binding else { return }
+                acpSessionModeSnapshot = snapshot
+                onChange()
+            }
+        }
+    }
+
+    var acpController: ACPAgentSessionController? {
+        didSet {
+            if oldValue !== acpController {
+                acpModeObservationTask?.cancel()
+                acpModeObservationTask = nil
+                acpSessionModeSnapshot = nil
+            }
+        }
+    }
+
     var codexEventTask: Task<Void, Never>?
     var codexEventTaskRunID: UUID?
     var codexLastEventAt: Date?
@@ -875,8 +900,18 @@ final class AgentTabSession: ObservableObject {
         hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
     }
 
-    // Persistence
-    private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity?
+    /// Persistence
+    private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity? {
+        didSet {
+            if oldValue != persistentSessionBindingIdentity {
+                acpModeObservationTask?.cancel()
+                acpModeObservationTask = nil
+                acpSessionModeSnapshot = nil
+                acpSessionModeIntent = nil
+            }
+        }
+    }
+
     var activeAgentSessionID: UUID? {
         persistentSessionBindingIdentity?.sessionID
     }
@@ -960,6 +995,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     deinit {
+        acpModeObservationTask?.cancel()
         applyEditsApprovalSubscriptionTask?.cancel()
         oversight.snoozeDeadlineTask?.cancel()
         oversight.periodicDeadlineTask?.cancel()
@@ -975,6 +1011,10 @@ final class AgentTabSession: ObservableObject {
     /// instruction, applyEditsReview, MCP control, run cancellation) remain
     /// on the VM and are called separately by each teardown path.
     func cancelEphemeralRuntimeState() {
+        acpModeObservationTask?.cancel()
+        acpModeObservationTask = nil
+        acpSessionModeSnapshot = nil
+        acpSessionModeIntent = nil
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
         pendingDerivedTranscriptRefreshReason = nil

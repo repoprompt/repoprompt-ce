@@ -23,6 +23,22 @@ enum ACPSupportResult: Equatable {
     }
 }
 
+/// Complete, confirmed configuration of one live ACP session, never a provider-wide default.
+struct ACPSessionModeSnapshot: Equatable {
+    struct Option: Equatable {
+        let rawValue: String
+        let displayName: String
+        let description: String?
+    }
+
+    let configID: String
+    let currentValue: String
+    let options: [Option]
+    var availableValues: [String] {
+        options.map(\.rawValue)
+    }
+}
+
 struct ACPDiscoveredSessionModels: Equatable {
     let options: [AgentModelOption]
     let currentModelRaw: String?
@@ -128,6 +144,7 @@ struct ACPRunRequest {
     let sessionModeID: String?
     let autoApproveAllToolPermissions: Bool
     let modelParameterSelections: [ACPModelParameterSelection]
+    let requiresNonBypassSessionMode: Bool
 
     init(
         agentKind: AgentProviderKind,
@@ -138,7 +155,8 @@ struct ACPRunRequest {
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         sessionModeID: String? = nil,
         autoApproveAllToolPermissions: Bool = false,
-        modelParameterSelections: [ACPModelParameterSelection] = []
+        modelParameterSelections: [ACPModelParameterSelection] = [],
+        requiresNonBypassSessionMode: Bool = false
     ) {
         self.agentKind = agentKind
         self.modelString = modelString
@@ -149,6 +167,7 @@ struct ACPRunRequest {
         self.sessionModeID = sessionModeID
         self.autoApproveAllToolPermissions = autoApproveAllToolPermissions
         self.modelParameterSelections = modelParameterSelections
+        self.requiresNonBypassSessionMode = requiresNonBypassSessionMode
     }
 }
 

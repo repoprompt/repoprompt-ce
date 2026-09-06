@@ -257,6 +257,7 @@ struct AgentComposerView: View, Equatable {
 
     @FocusState var isFocused: Bool
 
+    @State private var confirmsDevinBypass = false
     @State private var localInputText: String = ""
     @State private var submissionLatch = AgentComposerSubmissionLatch()
     @State private var lastAppliedDraftRestorationEventIDByTab: [UUID: UUID] = [:]
@@ -1173,6 +1174,13 @@ struct AgentComposerView: View, Equatable {
         .hoverTooltip("Permissions & approval settings")
         .popover(isPresented: $showPermissionPopover, arrowEdge: .bottom) {
             approvalPopoverContent
+                .confirmationDialog("Enable Devin Bypass Permissions?", isPresented: $confirmsDevinBypass, titleVisibility: .visible) {
+                    Button("Request Bypass Permissions", role: .destructive) {
+                        actions.setProviderPermissionLevel(.devinMode("bypass"))
+                    }
+                } message: {
+                    Text("Eligible Devin tools may run without approval on the next turn. Organization restrictions and RepoPrompt MCP policy still apply.")
+                }
         }
     }
 
@@ -1203,7 +1211,7 @@ struct AgentComposerView: View, Equatable {
             managedPermissionInfoBlock
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Sandbox Level")
+                Text(permissionBinding?.providerID == .devin ? "ACP Session Mode" : "Sandbox Level")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                     .foregroundStyle(.secondary)
 
@@ -1215,7 +1223,17 @@ struct AgentComposerView: View, Equatable {
                             isSelected: option.isSelected,
                             disabled: !option.isEnabled
                         ) {
-                            actions.setProviderPermissionLevel(option.id)
+                            if case .devinMode("bypass") = option.id {
+                                confirmsDevinBypass = true
+                            } else {
+                                actions.setProviderPermissionLevel(option.id)
+                            }
+                        }
+                        if permissionBinding.providerID == .devin, let detail = option.detailText, !detail.isEmpty {
+                            Text(detail)
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                                .foregroundStyle(option.isWarning ? .orange : .secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
 
