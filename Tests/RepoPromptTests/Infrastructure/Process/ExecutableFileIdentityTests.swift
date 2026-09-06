@@ -81,4 +81,69 @@ final class ExecutableFileIdentityTests: XCTestCase {
             XCTAssertEqual(path, canonicalEscapedDirectory)
         }
     }
+
+    func testDirectoryHasNoExtendedACLAcceptsCleanDirectory() throws {
+        let directory = try makeTestDirectory(name: "ExecutableFileIdentityCleanACL")
+        try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: directory.path)
+
+        XCTAssertTrue(ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: directory.path))
+        XCTAssertEqual(try posixPermissions(of: directory), 0o775)
+    }
+
+    func testDirectoryHasNoExtendedACLRejectsExtendedEntriesWhilePreservingPOSIXMode() throws {
+        let entries = [
+            "user:nobody allow add_file,delete_child",
+            "user:nobody allow read"
+        ]
+
+        for entry in entries {
+            let directory = try makeTestDirectory(name: "ExecutableFileIdentityExtendedACL")
+            try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: directory.path)
+            try addExtendedACL(entry, to: directory)
+
+            XCTAssertEqual(try posixPermissions(of: directory), 0o775)
+            XCTAssertFalse(
+                ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: directory.path),
+                "Expected extended ACL to be rejected: \(entry)"
+            )
+        }
+    }
+
+    func testDirectoryHasNoExtendedACLFailsClosedForMissingNonDirectoryAndSymlinkPaths() throws {
+        let root = try makeTestDirectory(name: "ExecutableFileIdentityInvalidACLPaths")
+        let regularFile = root.appendingPathComponent("regular-file")
+        try "not a directory\n".write(to: regularFile, atomically: true, encoding: .utf8)
+        let cleanDirectory = root.appendingPathComponent("clean-directory", isDirectory: true)
+        try FileManager.default.createDirectory(at: cleanDirectory, withIntermediateDirectories: true)
+        let symlink = root.appendingPathComponent("directory-link")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: cleanDirectory)
+
+        XCTAssertFalse(ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: root.appendingPathComponent("missing").path))
+        XCTAssertFalse(ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: regularFile.path))
+        XCTAssertFalse(ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: symlink.path))
+    }
+
+    private func addExtendedACL(_ entry: String, to directory: URL) throws {
+        let process = Process()
+        let standardError = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        process.arguments = ["+a", entry, directory.path]
+        process.standardError = standardError
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let error = standardError.fileHandleForReading.readDataToEndOfFile()
+            throw NSError(
+                domain: "ExecutableFileIdentityTests.chmod",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: String(decoding: error, as: UTF8.self)]
+            )
+        }
+    }
+
+    private func posixPermissions(of url: URL) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return try XCTUnwrap(attributes[.posixPermissions] as? NSNumber).intValue & 0o777
+    }
 }
