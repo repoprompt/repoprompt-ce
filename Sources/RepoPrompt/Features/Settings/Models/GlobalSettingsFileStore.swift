@@ -12,6 +12,12 @@ protocol GlobalSettingsFileStoring {
         _ document: GlobalSettingsDocument,
         includeModelSelectionRepair: Bool
     ) throws
+    /// True after a raw-preserving startup migration write failed and must be retried
+    /// through the same preservation transaction.
+    var hasPendingStartupMigration: Bool { get }
+    /// Retries a failed raw-preserving startup migration. Ordinary typed saves must not
+    /// be used to clear this state.
+    func retryStartupMigrationPreservingUnknownFields(_ document: GlobalSettingsDocument) throws
     /// User-initiated recovery: backs up the offending file, writes a current-schema replacement, clears the block.
     @discardableResult
     func performUserInitiatedRecovery(replacementDocument: GlobalSettingsDocument) -> Bool
@@ -54,9 +60,23 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     private let now: () -> Date
     private let normalizationBackupWriter: (Data, URL) throws -> Void
     private let normalizationAtomicWriter: (Data, URL) throws -> Void
+    private let startupMigrationAtomicWriter: (Data, URL) throws -> Void
     private var preservingUnsupportedFutureDocument = false
     private var preservingUnbackedCorruptDocument = false
     private var preservingFailedAutomaticNormalization = false
+
+    private struct PendingStartupMigration {
+        /// The typed document used for the failed attempt. Retry compares against this
+        /// snapshot so only known values changed while persistence was blocked are overlaid.
+        let initialDocument: GlobalSettingsDocument
+        let includeModelSelectionRepair: Bool
+    }
+
+    private var pendingStartupMigration: PendingStartupMigration?
+
+    var hasPendingStartupMigration: Bool {
+        pendingStartupMigration != nil
+    }
 
     /// Non-nil when the on-disk file cannot be safely read or overwritten, so the store falls
     /// back to in-memory defaults and refuses saves. Surfaced to the user (never auto-recovered).
@@ -72,6 +92,9 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         },
         normalizationAtomicWriter: @escaping (Data, URL) throws -> Void = { data, url in
             try data.write(to: url, options: .atomic)
+        },
+        startupMigrationAtomicWriter: @escaping (Data, URL) throws -> Void = { data, url in
+            try data.write(to: url, options: .atomic)
         }
     ) {
         self.fileURL = fileURL
@@ -79,6 +102,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         self.now = now
         self.normalizationBackupWriter = normalizationBackupWriter
         self.normalizationAtomicWriter = normalizationAtomicWriter
+        self.startupMigrationAtomicWriter = startupMigrationAtomicWriter
     }
 
     static func defaultFileURL(fileManager: FileManager = .default) -> URL {
@@ -146,7 +170,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                 preservingFailedAutomaticNormalization = false
                 preservingUnsupportedFutureDocument = false
                 preservingUnbackedCorruptDocument = false
-                blockReason = nil
+                blockReason = pendingStartupMigration == nil ? nil : .saveFailed
                 return normalizedDocument
             } catch {
                 preservingFailedAutomaticNormalization = true
@@ -158,7 +182,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         preservingFailedAutomaticNormalization = false
         preservingUnsupportedFutureDocument = false
         preservingUnbackedCorruptDocument = false
-        blockReason = nil
+        blockReason = pendingStartupMigration == nil ? nil : .saveFailed
         return document
     }
 
@@ -230,6 +254,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         preservingFailedAutomaticNormalization = false
         preservingUnsupportedFutureDocument = false
         preservingUnbackedCorruptDocument = false
+        pendingStartupMigration = nil
         let documentToWrite = GlobalSettingsDocument(
             updatedAt: importedDocument.updatedAt,
             copySettings: importedDocument.copySettings,
@@ -268,6 +293,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         preservingUnsupportedFutureDocument = false
         preservingUnbackedCorruptDocument = false
         preservingFailedAutomaticNormalization = false
+        pendingStartupMigration = nil
         do {
             var documentToWrite = replacementDocument
             documentToWrite.schemaLineage = GlobalSettingsDocument.schemaLineage
@@ -302,8 +328,38 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         _ document: GlobalSettingsDocument,
         includeModelSelectionRepair: Bool
     ) throws {
-        try validateSavePermission()
+        try writeStartupMigrationPreservingUnknownFields(
+            document,
+            retryBaselineDocument: nil,
+            includeModelSelectionRepair: includeModelSelectionRepair,
+            allowRetryOfFailedMigration: false
+        )
+    }
+
+    func retryStartupMigrationPreservingUnknownFields(_ document: GlobalSettingsDocument) throws {
+        guard let pendingStartupMigration else {
+            throw GlobalSettingsFileStoreError.startupMigrationRetryUnavailable
+        }
+        try writeStartupMigrationPreservingUnknownFields(
+            document,
+            retryBaselineDocument: pendingStartupMigration.initialDocument,
+            includeModelSelectionRepair: pendingStartupMigration.includeModelSelectionRepair,
+            allowRetryOfFailedMigration: true
+        )
+    }
+
+    private func writeStartupMigrationPreservingUnknownFields(
+        _ document: GlobalSettingsDocument,
+        retryBaselineDocument: GlobalSettingsDocument?,
+        includeModelSelectionRepair: Bool,
+        allowRetryOfFailedMigration: Bool
+    ) throws {
+        try validateSavePermission(allowRetryOfFailedMigration: allowRetryOfFailedMigration)
         guard fileManager.fileExists(atPath: fileURL.path) else {
+            guard !allowRetryOfFailedMigration else {
+                blockReason = .saveFailed
+                throw GlobalSettingsFileStoreError.startupMigrationRetryRequired
+            }
             try save(document)
             return
         }
@@ -322,6 +378,21 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
               let knownGlobalDefaults = knownRoot["globalDefaults"] as? [String: Any]
         else {
             throw GlobalSettingsFileStoreError.contextBuilderMigrationEncodingFailed
+        }
+
+        let retryBaselineRoot: [String: Any]?
+        if let retryBaselineDocument {
+            var baselineDocumentToEncode = retryBaselineDocument
+            baselineDocumentToEncode.schemaVersion = baselineDocumentToEncode.requiredSchemaVersion
+            baselineDocumentToEncode.schemaLineage = GlobalSettingsDocument.schemaLineage
+            baselineDocumentToEncode.updatedAt = now()
+            let baselineData = try Self.encoder.encode(baselineDocumentToEncode)
+            guard let encodedBaselineRoot = try JSONSerialization.jsonObject(with: baselineData) as? [String: Any] else {
+                throw GlobalSettingsFileStoreError.contextBuilderMigrationEncodingFailed
+            }
+            retryBaselineRoot = encodedBaselineRoot
+        } else {
+            retryBaselineRoot = nil
         }
 
         var rawScalarPreferences = rawRoot["scalarPreferences"] as? [String: Any] ?? [:]
@@ -428,6 +499,14 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             rawRoot["chatSettingsByWorkspaceID"] = rawChatSettings
         }
 
+        if let retryBaselineRoot {
+            Self.overlayKnownRetryChanges(
+                from: retryBaselineRoot,
+                to: knownRoot,
+                onto: &rawRoot
+            )
+        }
+
         rawRoot["schemaVersion"] = knownRoot["schemaVersion"]
         rawRoot["schemaLineage"] = knownRoot["schemaLineage"]
         rawRoot["updatedAt"] = knownRoot["updatedAt"]
@@ -435,17 +514,151 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
             withJSONObject: rawRoot,
             options: [.prettyPrinted, .sortedKeys]
         )
-        try ensureSettingsDirectoryExists()
         do {
-            try migratedData.write(to: fileURL, options: .atomic)
+            try ensureSettingsDirectoryExists()
+            try startupMigrationAtomicWriter(migratedData, fileURL)
+            pendingStartupMigration = nil
             blockReason = nil
         } catch {
+            // Keep the first failed attempt as the retry baseline. A later failed retry
+            // must not make earlier accepted in-memory edits look like the new baseline.
+            if pendingStartupMigration == nil {
+                pendingStartupMigration = PendingStartupMigration(
+                    initialDocument: document,
+                    includeModelSelectionRepair: includeModelSelectionRepair
+                )
+            }
             blockReason = .saveFailed
             throw error
         }
     }
 
-    private func validateSavePermission() throws {
+    /// Overlays only typed values changed after the failed migration attempt. The explicit
+    /// root-key list is the ownership boundary for this retry transaction; recursive merging
+    /// retains unknown raw members and removes changed known optional values without replacing
+    /// their containing raw objects wholesale.
+    private static let retryOwnedRootKeys = [
+        "copySettingsByWorkspaceID",
+        "chatSettingsByWorkspaceID",
+        "agentModelsSettingsByWorkspaceID",
+        "globalDefaults",
+        "scalarPreferences"
+    ]
+
+    private static func overlayKnownRetryChanges(
+        from initialRoot: [String: Any],
+        to currentRoot: [String: Any],
+        onto rawRoot: inout [String: Any]
+    ) {
+        for key in retryOwnedRootKeys {
+            let initialValue = initialRoot[key]
+            let currentValue = currentRoot[key]
+            guard !jsonValuesEqual(initialValue, currentValue) else { continue }
+            if let mergedValue = mergedKnownRetryValue(
+                initialValue: initialValue,
+                currentValue: currentValue,
+                rawValue: rawRoot[key]
+            ) {
+                rawRoot[key] = mergedValue
+            } else {
+                rawRoot.removeValue(forKey: key)
+            }
+        }
+    }
+
+    private static func mergedKnownRetryValue(
+        initialValue: Any?,
+        currentValue: Any?,
+        rawValue: Any?
+    ) -> Any? {
+        if let currentObject = currentValue as? [String: Any] {
+            let initialObject = initialValue as? [String: Any] ?? [:]
+            var mergedObject = rawValue as? [String: Any] ?? [:]
+            let keys = Set(initialObject.keys).union(currentObject.keys).sorted()
+            for key in keys {
+                let initialMember = initialObject[key]
+                let currentMember = currentObject[key]
+                guard !jsonValuesEqual(initialMember, currentMember) else { continue }
+
+                if let currentMember {
+                    if let mergedMember = mergedKnownRetryValue(
+                        initialValue: initialMember,
+                        currentValue: currentMember,
+                        rawValue: mergedObject[key]
+                    ) {
+                        mergedObject[key] = mergedMember
+                    } else {
+                        mergedObject.removeValue(forKey: key)
+                    }
+                } else if let initialObject = initialMember as? [String: Any],
+                          var rawObject = mergedObject[key] as? [String: Any]
+                {
+                    // A removed optional group/member may still contain unknown raw
+                    // members. Remove only the known typed members from that object.
+                    for knownKey in initialObject.keys {
+                        rawObject.removeValue(forKey: knownKey)
+                    }
+                    if rawObject.isEmpty {
+                        mergedObject.removeValue(forKey: key)
+                    } else {
+                        mergedObject[key] = rawObject
+                    }
+                } else {
+                    mergedObject.removeValue(forKey: key)
+                }
+            }
+            return mergedObject
+        }
+
+        guard currentValue != nil else {
+            if let initialObject = initialValue as? [String: Any],
+               var rawObject = rawValue as? [String: Any]
+            {
+                // Preserve unknown nested fields when an entire known optional object
+                // is removed from the typed retry document.
+                for knownKey in initialObject.keys {
+                    rawObject.removeValue(forKey: knownKey)
+                }
+                return rawObject.isEmpty ? nil : rawObject
+            }
+            return nil
+        }
+
+        return currentValue
+    }
+
+    private static func jsonValuesEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (lhs as NSNull, rhs as NSNull):
+            return lhs.isEqual(rhs)
+        case let (lhs as [String: Any], rhs as [String: Any]):
+            guard lhs.keys.count == rhs.keys.count else { return false }
+            return lhs.allSatisfy { element in
+                jsonValuesEqual(element.value, rhs[element.key])
+            }
+        case let (lhs as [Any], rhs as [Any]):
+            guard lhs.count == rhs.count else { return false }
+            return zip(lhs, rhs).allSatisfy { jsonValuesEqual($0.0, $0.1) }
+        case (nil, _), (_, nil):
+            return false
+        default:
+            guard let lhsObject = lhs as? NSObject,
+                  let rhsObject = rhs as? NSObject
+            else {
+                return false
+            }
+            return lhsObject.isEqual(rhsObject)
+        }
+    }
+
+    private func validateSavePermission(allowRetryOfFailedMigration: Bool = false) throws {
+        guard allowRetryOfFailedMigration || pendingStartupMigration == nil else {
+            blockReason = .saveFailed
+            throw GlobalSettingsFileStoreError.startupMigrationRetryRequired
+        }
+
         guard !preservingFailedAutomaticNormalization else {
             blockReason = .automaticSchemaNormalizationFailed
             throw GlobalSettingsFileStoreError.automaticSchemaNormalizationPreserved
@@ -724,6 +937,8 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         case corruptDocumentPreserved
         case automaticSchemaNormalizationFailed
         case automaticSchemaNormalizationPreserved
+        case startupMigrationRetryRequired
+        case startupMigrationRetryUnavailable
         case contextBuilderMigrationEncodingFailed
     }
 

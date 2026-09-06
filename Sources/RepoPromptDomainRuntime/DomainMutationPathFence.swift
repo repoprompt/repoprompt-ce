@@ -1,14 +1,14 @@
 import Darwin
 import Foundation
 
-package struct DomainMutationPathIdentity: Codable, Hashable, Sendable {
+package struct DomainMutationPathIdentity: Codable, Hashable {
     package let originalPath: String
     package let resolvedPath: String
     package let device: UInt64
     package let inode: UInt64
 }
 
-package struct DomainMutationPathFenceEntry: Codable, Hashable, Sendable {
+package struct DomainMutationPathFenceEntry: Codable, Hashable {
     package let requestedPath: String
     package let resolvedPath: String
     /// Identity of the target when it exists, otherwise its nearest existing parent.
@@ -16,7 +16,7 @@ package struct DomainMutationPathFenceEntry: Codable, Hashable, Sendable {
     package let authorizedRoot: DomainMutationPathIdentity
 }
 
-package struct DomainMutationPathFenceSnapshot: Codable, Hashable, Sendable {
+package struct DomainMutationPathFenceSnapshot: Codable, Hashable {
     package let authorizedRoots: [DomainMutationPathIdentity]
     package let entries: [DomainMutationPathFenceEntry]
 
@@ -25,7 +25,7 @@ package struct DomainMutationPathFenceSnapshot: Codable, Hashable, Sendable {
     }
 }
 
-package enum DomainMutationPathFenceError: Error, Equatable, LocalizedError, Sendable {
+package enum DomainMutationPathFenceError: Error, Equatable, LocalizedError {
     case scopeUnavailable
     case relativePath(String)
     case pathOutsideAuthorizedRoots(String)
@@ -51,15 +51,24 @@ package enum DomainMutationPathFenceError: Error, Equatable, LocalizedError, Sen
     }
 }
 
-package struct DomainMutationPhysicalCommitGuard: Sendable {
+package struct DomainMutationPhysicalCommitGuard {
     private let snapshot: DomainMutationPathFenceSnapshot
+    private let capability: DomainMutationPhysicalCapability?
 
-    package init(snapshot: DomainMutationPathFenceSnapshot) {
+    package init(
+        snapshot: DomainMutationPathFenceSnapshot,
+        capability: DomainMutationPhysicalCapability? = nil
+    ) {
         self.snapshot = snapshot
+        self.capability = capability
+    }
+
+    package func physicalMutationCapability() -> DomainMutationPhysicalCapability? {
+        capability
     }
 
     /// Revalidates the admitted path identities synchronously at a path-based mutation boundary.
-    /// This narrows the race window but does not make the later path operation descriptor-bound.
+    /// Protected file I/O uses the retained capability; Git subprocesses retain this path-fence-only guard.
     package func revalidate() throws {
         try DomainMutationPathFence.revalidateBlocking(snapshot)
     }

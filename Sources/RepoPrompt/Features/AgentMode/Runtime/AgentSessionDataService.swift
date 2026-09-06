@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 
 // MARK: - Agent Session Data Error
 
@@ -183,6 +188,8 @@ actor AgentSessionDataService {
     #if DEBUG
         private var deletionTombstoneWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
         private var workspaceRootOverrideForTesting: URL?
+        private var testWorktreeMergeReconciliationHooks: AgentSessionWorktreeMergeReconciliationHooks?
+        private var testBeforeLoadRepairWriteHook: (@Sendable (URL) async -> Void)?
     #endif
     private var metadataIndexReconciliationTasksByFolder: [URL: MetadataIndexReconciliationTaskState] = [:]
     private var metadataIndexReconciledThisProcess: Set<URL> = []
@@ -489,7 +496,67 @@ actor AgentSessionDataService {
     }
 
     private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws {
-        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        try await diskWriter.enqueueAndWait(data: data, url: fileURL.standardizedFileURL)
+    }
+
+    private func reconcileLoadedWorktreeMergeOperations(
+        _ operations: [AgentSessionWorktreeMergeOperation]
+    ) async -> [AgentSessionWorktreeMergeOperation] {
+        #if DEBUG
+            let hooks = testWorktreeMergeReconciliationHooks ?? .live()
+        #else
+            let hooks = AgentSessionWorktreeMergeReconciliationHooks.live()
+        #endif
+        return await AgentSessionWorktreeMergeReconciler.reconcile(operations, hooks: hooks)
+    }
+
+    private func ensureSessionWriteAllowed(_ sessionID: UUID, fileURL: URL) throws {
+        let fileURL = fileURL.standardizedFileURL
+        guard !deletedSessionFileURLs.contains(fileURL) else {
+            throw AgentSessionDataError.sessionDeleted(sessionID)
+        }
+    }
+
+    /// The ordinary save and load/recovery writebacks share this session-file/metadata fence.
+    /// The preflight is repeated after the DEBUG gate because deletion can complete while a
+    /// suspended load is waiting to resume; the post-write checks withdraw any write that crossed
+    /// the deletion boundary and remove its derived metadata.
+    private func persistSessionAndMetadata(
+        _ session: AgentSession,
+        encodedData: Data,
+        fileURL: URL,
+        folder: URL,
+        isLoadRepair: Bool
+    ) async throws {
+        let fileURL = fileURL.standardizedFileURL
+        try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
+        #if DEBUG
+            if isLoadRepair, let testBeforeLoadRepairWriteHook {
+                await testBeforeLoadRepairWriteHook(fileURL)
+            }
+        #endif
+        try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
+        try await writeDataAtomically(encodedData, to: fileURL)
+        try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
+        await upsertMetadataRecord(metadataRecord(from: session, fileURL: fileURL), folder: folder)
+        try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
+    }
+
+    private func persistLoadedMetadataIfIndexPresent(
+        _ session: AgentSession,
+        fileURL: URL
+    ) async throws {
+        let fileURL = fileURL.standardizedFileURL
+        let folder = fileURL.deletingLastPathComponent()
+        try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
+        #if DEBUG
+            if let testBeforeLoadRepairWriteHook {
+                await testBeforeLoadRepairWriteHook(fileURL)
+            }
+        #endif
+        try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
+        await upsertMetadataRecordIfIndexPresent(session, fileURL: fileURL)
+        try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
     }
 
     // MARK: - Metadata Index Helpers
@@ -518,6 +585,46 @@ actor AgentSessionDataService {
         let start = filename.index(filename.startIndex, offsetBy: prefixLength)
         let end = filename.index(filename.endIndex, offsetBy: -suffixLength)
         return UUID(uuidString: String(filename[start ..< end]))
+    }
+
+    /// Returns only a canonical, real session file directly under `folder`.
+    /// The metadata index is not an authority for this path: callers must discover the URL from the
+    /// folder scan, then validate the filename, filesystem object, canonical parent, and decoded ID.
+    private func canonicalAgentSessionFile(
+        _ fileURL: URL,
+        in folder: URL
+    ) -> (fileURL: URL, sessionID: UUID)? {
+        let standardizedFolder = folder.standardizedFileURL
+        let standardizedFile = fileURL.standardizedFileURL
+        guard standardizedFile.deletingLastPathComponent().path == standardizedFolder.path,
+              let sessionID = agentSessionID(fromFilename: standardizedFile.lastPathComponent),
+              standardizedFile.lastPathComponent == agentSessionFilename(for: sessionID),
+              isRealDirectory(at: standardizedFolder),
+              isRegularFileWithoutSymlinks(at: standardizedFile)
+        else {
+            return nil
+        }
+
+        let canonicalFolder = standardizedFolder.resolvingSymlinksInPath().standardizedFileURL
+        let canonicalFile = standardizedFile.resolvingSymlinksInPath().standardizedFileURL
+        guard canonicalFile.deletingLastPathComponent().path == canonicalFolder.path,
+              canonicalFile.lastPathComponent == standardizedFile.lastPathComponent
+        else {
+            return nil
+        }
+        return (standardizedFile, sessionID)
+    }
+
+    private func isRealDirectory(at url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return false }
+        return info.st_mode & S_IFMT == S_IFDIR
+    }
+
+    private func isRegularFileWithoutSymlinks(at url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return false }
+        return info.st_mode & S_IFMT == S_IFREG
     }
 
     private func metadataResourceValues(for fileURL: URL) -> (size: Int64?, modified: Date?) {
@@ -1128,10 +1235,13 @@ actor AgentSessionDataService {
         )
         let freshEncoder = JSONEncoder()
         let data = try freshEncoder.encode(sessionToSave)
-        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
-        try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: agentSessionsFolder)
-        await upsertMetadataRecord(metadataRecord(from: sessionToSave, fileURL: fileURL), folder: agentSessionsFolder)
-        try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: agentSessionsFolder)
+        try await persistSessionAndMetadata(
+            sessionToSave,
+            encodedData: data,
+            fileURL: fileURL,
+            folder: agentSessionsFolder,
+            isLoadRepair: false
+        )
         return fileURL
     }
 
@@ -1161,7 +1271,9 @@ actor AgentSessionDataService {
             let normalized = normalizeLoadedSession(session, fileURL: fileURL)
             var runtimeSession = normalized.runtimeSession
             var persistedSessionToRewrite = normalized.persistedSessionToRewrite
-            let reconciledMergeOperations = await AgentSessionWorktreeMergeReconciler.reconcile(runtimeSession.worktreeMergeOperations)
+            let reconciledMergeOperations = await reconcileLoadedWorktreeMergeOperations(
+                runtimeSession.worktreeMergeOperations
+            )
             if reconciledMergeOperations != runtimeSession.worktreeMergeOperations {
                 runtimeSession.worktreeMergeOperations = reconciledMergeOperations
                 persistedSessionToRewrite = sessionPreparedForStorage(
@@ -1174,13 +1286,15 @@ actor AgentSessionDataService {
             }
             if let persistedSession = persistedSessionToRewrite {
                 let encoded = try encoder.encode(persistedSession)
-                try await writeDataAtomically(encoded, to: fileURL)
-                await upsertMetadataRecord(
-                    metadataRecord(from: persistedSession, fileURL: fileURL),
-                    folder: fileURL.deletingLastPathComponent()
+                try await persistSessionAndMetadata(
+                    persistedSession,
+                    encodedData: encoded,
+                    fileURL: fileURL,
+                    folder: fileURL.deletingLastPathComponent(),
+                    isLoadRepair: true
                 )
             } else {
-                await upsertMetadataRecordIfIndexPresent(runtimeSession, fileURL: fileURL)
+                try await persistLoadedMetadataIfIndexPresent(runtimeSession, fileURL: fileURL)
             }
             return runtimeSession
         } catch {
@@ -1234,10 +1348,12 @@ actor AgentSessionDataService {
                 {
                     do {
                         let encoded = try encoder.encode(persistedSession)
-                        try await writeDataAtomically(encoded, to: fileURL)
-                        await upsertMetadataRecord(
-                            metadataRecord(from: persistedSession, fileURL: fileURL),
-                            folder: fileURL.deletingLastPathComponent()
+                        try await persistSessionAndMetadata(
+                            persistedSession,
+                            encodedData: encoded,
+                            fileURL: fileURL,
+                            folder: fileURL.deletingLastPathComponent(),
+                            isLoadRepair: true
                         )
                     } catch {
                         // Best-effort migration only; continue serving recovered values in-memory.
@@ -1526,14 +1642,6 @@ actor AgentSessionDataService {
         }
 
         var candidateByPath: [String: (fileURL: URL, tabID: UUID)] = [:]
-        if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
-            for record in index.entries {
-                guard let tabID = record.composeTabID, tabIDs.contains(tabID) else { continue }
-                let fileURL = agentSessionsFolder.appendingPathComponent(record.filename)
-                candidateByPath[fileURL.path] = (fileURL, tabID)
-            }
-        }
-
         let files: [URL]
         do {
             files = try await listAgentSessions(for: workspace)
@@ -1542,15 +1650,17 @@ actor AgentSessionDataService {
         }
         for fileURL in files {
             guard
+                let canonicalFile = canonicalAgentSessionFile(fileURL, in: agentSessionsFolder),
                 let stub = try? await loadAgentSessionStub(
-                    from: fileURL,
+                    from: canonicalFile.fileURL,
                     recoverMissingMetadata: false,
                     persistRecoveredMetadata: false
                 ),
+                stub.id == canonicalFile.sessionID,
                 let tabID = stub.composeTabID,
                 tabIDs.contains(tabID)
             else { continue }
-            candidateByPath[fileURL.path] = (fileURL, tabID)
+            candidateByPath[canonicalFile.fileURL.path] = (canonicalFile.fileURL, tabID)
         }
 
         var failures: [UUID: Error] = [:]
@@ -1615,6 +1725,16 @@ actor AgentSessionDataService {
 
         func test_setBeforeSessionWriteHook(_ hook: (@Sendable (URL) async -> Void)?) async {
             await diskWriter.test_setBeforeWriteHook(hook)
+        }
+
+        func test_setWorktreeMergeReconciliationHooks(
+            _ hooks: AgentSessionWorktreeMergeReconciliationHooks?
+        ) {
+            testWorktreeMergeReconciliationHooks = hooks
+        }
+
+        func test_setBeforeLoadRepairWriteHook(_ hook: (@Sendable (URL) async -> Void)?) {
+            testBeforeLoadRepairWriteHook = hook
         }
 
         func test_waitUntilDeletionTombstone(for fileURL: URL) async {

@@ -30,6 +30,77 @@ final class CodexDiscoveredEffortTests: XCTestCase {
         XCTAssertNil(exact.appServerEffortParam)
     }
 
+    func testExactAdvertisedIDWinsMapperDisplayAndParsing() {
+        let records = [
+            record("  GPT-FUTURE  ", efforts: [" MAX ", " ULTRA "]),
+            CodexDynamicModelRecord(
+                id: " gPt-FuTuRe-MaX ",
+                model: "gPt-FuTuRe-MaX",
+                displayName: "Literal Max Model",
+                description: "",
+                isDefault: false
+            ),
+            CodexDynamicModelRecord(
+                id: " gPt-FuTuRe-Ultra ",
+                model: "gPt-FuTuRe-Ultra",
+                displayName: "Literal Ultra Model",
+                description: "",
+                isDefault: false
+            )
+        ]
+
+        let options = CodexDynamicModelMapper.options(from: records)
+        XCTAssertEqual(Set(options.map(\.id)), ["GPT-FUTURE", "gPt-FuTuRe-MaX", "gPt-FuTuRe-Ultra"])
+        XCTAssertEqual(
+            options.first(where: { $0.id == "gPt-FuTuRe-MaX" })?.displayName,
+            "Literal Max Model"
+        )
+        XCTAssertEqual(
+            options.first(where: { $0.id == "gPt-FuTuRe-Ultra" })?.displayName,
+            "Literal Ultra Model"
+        )
+        XCTAssertEqual(
+            CodexDynamicModelMapper.displayName(forModelID: "  GPT-FUTURE-MAX  ", records: records),
+            "Literal Max Model"
+        )
+        XCTAssertEqual(
+            CodexDynamicModelMapper.displayName(forModelID: "  GPT-FUTURE-ULTRA  ", records: records),
+            "Literal Ultra Model"
+        )
+
+        for raw in ["  GPT-FUTURE-MAX  ", "  GPT-FUTURE-ULTRA  "] {
+            let selection = CodexModelSpecifier(raw: raw, discoveredRecords: records)
+            XCTAssertEqual(selection.appServerModelParam, raw.trimmingCharacters(in: .whitespacesAndNewlines))
+            XCTAssertNil(selection.appServerEffortParam)
+        }
+    }
+
+    func testParserUsesNormalizedBaseCapabilityRecordID() {
+        let records = [record("  GPT-FUTURE  ", efforts: [" MAX "])]
+        let selection = CodexModelSpecifier(raw: "gpt-future-max", discoveredRecords: records)
+        XCTAssertEqual(selection.appServerModelParam, "gpt-future")
+        XCTAssertEqual(selection.appServerEffortParam, "max")
+    }
+
+    func testFastCollisionUsesNormalizedAdvertisedID() {
+        let records = [record("  GPT-5.5-FAST-MAX  ", efforts: [])]
+        XCTAssertNil(
+            CodexServiceTierVariantCatalog.fastVariantID(
+                baseModelID: "gpt-5.5",
+                reasoningEffort: .max,
+                discoveredRecords: records
+            )
+        )
+        XCTAssertEqual(
+            CodexServiceTierVariantCatalog.fastVariantID(
+                baseModelID: "gpt-5.5",
+                reasoningEffort: .ultra,
+                discoveredRecords: records
+            ),
+            "gpt-5.5-fast-ultra"
+        )
+    }
+
     func testAdvertisedDefaultEffortAndFastVariantAreDecoded() {
         let records = [record("gpt-5.5", efforts: [], defaultEffort: "ultra")]
         let selection = CodexModelSpecifier(raw: "gpt-5.5-fast-ultra", discoveredRecords: records)

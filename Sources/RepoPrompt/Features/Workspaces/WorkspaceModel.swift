@@ -45,6 +45,13 @@ struct WorkspaceRootSetKey: Hashable {
 }
 
 struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
+    struct DuplicateWorkspaceRow: Identifiable, Equatable {
+        let id: Int
+        let workspaceID: UUID
+        let name: String
+        let windowIDs: [Int]
+    }
+
     let id: String
     let normalizedRepoPaths: [String]
     let canonicalWorkspaceID: UUID
@@ -52,6 +59,19 @@ struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
     let duplicateWorkspaceIDs: [UUID]
     let duplicateWorkspaceNames: [String]
     let windowIDsByWorkspaceID: [UUID: [Int]]
+
+    /// A value snapshot for display. Ordinal IDs keep repeated recovered workspace IDs distinct.
+    var duplicateWorkspaceRows: [DuplicateWorkspaceRow] {
+        zip(duplicateWorkspaceIDs, duplicateWorkspaceNames).enumerated().map { entry in
+            let (workspaceID, name) = entry.element
+            return DuplicateWorkspaceRow(
+                id: entry.offset,
+                workspaceID: workspaceID,
+                name: name,
+                windowIDs: windowIDsByWorkspaceID[workspaceID] ?? []
+            )
+        }
+    }
 }
 
 struct WorkspaceDuplicateCleanupSkippedItem: Equatable {

@@ -9,7 +9,7 @@ struct CodexModelSpecifier: Equatable {
 
     init(baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String? = nil) {
         let normalizedBase = baseModel?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let normalizedBase, !normalizedBase.isEmpty, normalizedBase.lowercased() != "default" {
+        if let normalizedBase, !normalizedBase.isEmpty, CodexModelIdentity.key(normalizedBase) != "default" {
             self.baseModel = normalizedBase
         } else {
             self.baseModel = nil
@@ -30,7 +30,7 @@ struct CodexModelSpecifier: Equatable {
         guard
             let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
             !raw.isEmpty,
-            raw.lowercased() != "default"
+            CodexModelIdentity.key(raw) != "default"
         else {
             return (nil, nil, nil)
         }
@@ -52,7 +52,7 @@ struct CodexModelSpecifier: Equatable {
         ]
         var base = raw
         var effort: ReasoningEffort? = nil
-        let lowered = raw.lowercased()
+        let lowered = CodexModelIdentity.key(raw)
         for (suffix, candidateEffort, requiresKnownFamilySupport) in suffixes where lowered.hasSuffix(suffix) {
             let candidate = String(raw.dropLast(suffix.count))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -72,7 +72,7 @@ struct CodexModelSpecifier: Equatable {
         // Then check for a service tier infix (e.g. "gpt-5.4-fast" → base "gpt-5.4", tier "fast")
         let knownTiers = [CodexServiceTierVariantCatalog.fastServiceTier]
         var tier: String? = nil
-        let baseLowered = base.lowercased()
+        let baseLowered = CodexModelIdentity.key(base)
         for knownTier in knownTiers {
             let tierSuffix = "-\(knownTier)"
             if baseLowered.hasSuffix(tierSuffix) {
@@ -96,11 +96,12 @@ struct CodexModelSpecifier: Equatable {
         records: [CodexDynamicModelRecord]
     ) -> Bool {
         // Exact advertised identities take precedence over synthetic effort suffixes.
-        if records.contains(where: { $0.id.caseInsensitiveCompare(rawModel) == .orderedSame }) {
+        let rawKey = CodexModelIdentity.key(rawModel)
+        if records.contains(where: { CodexModelIdentity.key($0.id) == rawKey }) {
             return false
         }
-        let supportBase = serviceTierStrippedBase(candidate).lowercased()
-        if let record = records.first(where: { $0.id.lowercased() == supportBase }) {
+        let supportBase = CodexModelIdentity.key(serviceTierStrippedBase(candidate))
+        if let record = records.first(where: { CodexModelIdentity.key($0.id) == supportBase }) {
             let advertisedEfforts = record.supportedReasoningEfforts.map(\.reasoningEffort)
                 + [record.defaultReasoningEffort].compactMap(\.self)
             if advertisedEfforts.compactMap(ReasoningEffort.parse).contains(effort) {
@@ -124,7 +125,7 @@ struct CodexModelSpecifier: Equatable {
 
     private static func serviceTierStrippedBase(_ candidate: String) -> String {
         var base = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseLowered = base.lowercased()
+        let baseLowered = CodexModelIdentity.key(base)
         for knownTier in [CodexServiceTierVariantCatalog.fastServiceTier] {
             let tierSuffix = "-\(knownTier)"
             if baseLowered.hasSuffix(tierSuffix) {

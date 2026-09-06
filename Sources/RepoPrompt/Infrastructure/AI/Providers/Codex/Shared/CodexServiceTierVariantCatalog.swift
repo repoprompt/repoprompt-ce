@@ -10,7 +10,7 @@ enum CodexServiceTierVariantCatalog {
     }
 
     private static func gptVersion(from baseModelID: String) -> (major: Int, minor: Int)? {
-        let normalized = baseModelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalized = CodexModelIdentity.key(baseModelID)
         guard normalized.hasPrefix("gpt-") else { return nil }
 
         let versionStart = normalized.index(normalized.startIndex, offsetBy: 4)
@@ -76,7 +76,7 @@ enum CodexServiceTierVariantCatalog {
             let variantID = "\(baseModelID)-\(fastServiceTier)-\(reasoningEffort.rawValue)"
             // Exact discovered model IDs take precedence during extended-effort parsing.
             if [CodexReasoningEffort.max, .ultra].contains(reasoningEffort),
-               discoveredRecords().contains(where: { $0.id.caseInsensitiveCompare(variantID) == .orderedSame })
+               discoveredRecords().contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(variantID) })
             {
                 return nil
             }

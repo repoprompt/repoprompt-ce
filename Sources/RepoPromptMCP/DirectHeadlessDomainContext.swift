@@ -300,6 +300,9 @@ actor DirectHeadlessDomainContext {
     }
 
     nonisolated static func resolvePath(_ rawPath: String, roots: [URL], allowMissingLeaf: Bool = false) throws -> URL {
+        guard !rawPath.contains("\0") else {
+            throw Error.pathOutsideWorkspace(rawPath)
+        }
         guard !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MCPError.invalidParams("path must not be empty")
         }

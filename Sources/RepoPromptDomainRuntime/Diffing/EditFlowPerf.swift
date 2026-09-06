@@ -791,9 +791,15 @@ package enum EditFlowPerf {
             package static let exactCatalogShortcutResolved: StaticString = "ReadFile.ExactCatalogShortcutResolved"
             package static let folderResolutionReturned: StaticString = "ReadFile.FolderResolutionReturned"
             package static let readableServiceResolutionReturned: StaticString = "ReadFile.ReadableServiceResolutionReturned"
+            package static let contentLoadBegan: StaticString = "ReadFile.ContentLoadBegan"
+            package static let contentLoadEnded: StaticString = "ReadFile.ContentLoadEnded"
             package static let storeReadContentEntered: StaticString = "ReadFile.StoreReadContentEntered"
             package static let storeReadContentReturned: StaticString = "ReadFile.StoreReadContentReturned"
             package static let providerResultReady: StaticString = "ReadFile.ProviderResultReady"
+        }
+
+        package enum WorkspaceExactResolution {
+            package static let checkpoint: StaticString = "WorkspaceExactResolution.Checkpoint"
         }
 
         package enum Bootstrap {

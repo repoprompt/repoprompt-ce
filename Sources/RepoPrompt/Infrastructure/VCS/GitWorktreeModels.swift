@@ -3,7 +3,7 @@ import Foundation
 
 // MARK: - Git Worktree Models
 
-public struct GitWorktreeRepositoryIdentity: Sendable, Equatable, Hashable {
+public struct GitWorktreeRepositoryIdentity: Codable, Sendable, Equatable, Hashable {
     public let repositoryID: String
     public let repoKey: String
     public let displayName: String
@@ -22,6 +22,30 @@ public struct GitWorktreeRepositoryIdentity: Sendable, Equatable, Hashable {
         self.displayName = displayName
         self.commonGitDir = commonGitDir
         self.mainWorktreeRoot = mainWorktreeRoot
+    }
+}
+
+/// Fresh identity resolved from the Git metadata at a worktree root.
+///
+/// The repository ID and key are derived from the common Git directory, while the worktree ID
+/// also incorporates the per-worktree Git directory (or the explicit main-worktree marker).
+/// Keeping those values together prevents a path-only resolution from becoming an authority.
+public struct GitWorktreeIdentitySnapshot: Codable, Sendable, Equatable, Hashable {
+    public let repository: GitWorktreeRepositoryIdentity
+    public let worktreeID: String
+    public let worktreeRootPath: String
+    public let isMain: Bool
+
+    public init(
+        repository: GitWorktreeRepositoryIdentity,
+        worktreeID: String,
+        worktreeRootPath: String,
+        isMain: Bool
+    ) {
+        self.repository = repository
+        self.worktreeID = worktreeID
+        self.worktreeRootPath = worktreeRootPath
+        self.isMain = isMain
     }
 }
 
@@ -364,6 +388,42 @@ enum GitWorktreeIdentity {
     private static func sha256Hex(_ text: String) -> String {
         let digest = SHA256.hash(data: Data(text.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// Resolves repository and worktree identity directly from the current Git layout.
+///
+/// This deliberately performs an uncached metadata read so callers can revalidate a persisted
+/// binding after a path has been replaced. Ancestors are considered for bindings to a logical
+/// subdirectory inside a checkout; the returned path is always the actual checkout root.
+enum GitWorktreeIdentityResolver {
+    static func resolve(atWorkTreeRoot root: URL) -> GitWorktreeIdentitySnapshot? {
+        var candidate = root.standardizedFileURL
+        while true {
+            if let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: candidate) {
+                let isMain = !layout.isLinkedWorktree
+                let repository = GitWorktreeIdentity.repositoryIdentity(
+                    commonGitDir: layout.commonDir,
+                    mainWorktreeRoot: isMain ? layout.workTreeRoot : layout.knownMainWorktreeRoot
+                )
+                let worktreeID = GitWorktreeIdentity.worktreeID(
+                    repositoryID: repository.repositoryID,
+                    gitDir: isMain ? nil : layout.gitDir,
+                    isMain: isMain,
+                    path: layout.workTreeRoot
+                )
+                return GitWorktreeIdentitySnapshot(
+                    repository: repository,
+                    worktreeID: worktreeID,
+                    worktreeRootPath: layout.workTreeRoot.standardizedFileURL.path,
+                    isMain: isMain
+                )
+            }
+
+            let parent = candidate.deletingLastPathComponent().standardizedFileURL
+            guard parent.path != candidate.path else { return nil }
+            candidate = parent
+        }
     }
 }
 

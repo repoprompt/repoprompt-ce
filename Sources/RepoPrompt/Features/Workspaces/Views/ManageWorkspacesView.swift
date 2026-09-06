@@ -371,14 +371,11 @@ struct ManageWorkspacesView: View {
                         .font(fontPreset.subheadlineFont)
                         .fontWeight(.medium)
                 }
-                ForEach(group.duplicateWorkspaceIDs.indices, id: \.self) { index in
-                    let workspaceID = group.duplicateWorkspaceIDs[index]
-                    let name = group.duplicateWorkspaceNames[index]
-                    let windowIDs = group.windowIDsByWorkspaceID[workspaceID] ?? []
+                ForEach(group.duplicateWorkspaceRows) { row in
                     HStack(spacing: 0) {
-                        Text("  • \(name)")
+                        Text("  • \(row.name)")
                             .font(fontPreset.captionFont)
-                        Text(" — \(windowStatusText(for: windowIDs))")
+                        Text(" — \(windowStatusText(for: row.windowIDs))")
                             .font(fontPreset.captionFont)
                             .foregroundColor(.secondary)
                     }

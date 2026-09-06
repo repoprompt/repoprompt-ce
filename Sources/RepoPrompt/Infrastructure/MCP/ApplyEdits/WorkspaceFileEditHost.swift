@@ -81,6 +81,7 @@ struct WorkspaceFileEditHost: FileEditHost {
             let writeResult = try await mutationService.createFileWithPostcondition(
                 userPath: path,
                 content: content,
+                overwrite: overwrite,
                 rootScope: lookupRootScope,
                 selectedFileFullPaths: (path as NSString).expandingTildeInPath.hasPrefix("/") ? [] : selectedFileFullPaths(),
                 pathResolutionPolicy: createPathResolutionPolicy,

@@ -1,5 +1,11 @@
 import Foundation
 
+enum CodexModelIdentity {
+    static func key(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
 struct CodexDynamicReasoningRecord: Codable, Hashable {
     let reasoningEffort: String
     let description: String
@@ -90,7 +96,7 @@ enum CodexDynamicModelMapper {
     static func options(from records: [CodexDynamicModelRecord]) -> [CodexDynamicModelOption] {
         var options: [CodexDynamicModelOption] = []
         var seen = Set<String>()
-        let advertisedIDs = Set(records.map { normalizeID($0.id).lowercased() })
+        let advertisedIDs = Set(records.map { CodexModelIdentity.key($0.id) }.filter { !$0.isEmpty })
 
         for record in records {
             let baseID = normalizeID(record.id)
@@ -106,7 +112,7 @@ enum CodexDynamicModelMapper {
             // synthetic option that would resolve to another advertised model instead.
             let effortEntries = normalizedEfforts(for: record, fallbackDescription: baseDescription).filter { entry in
                 ![CodexReasoningEffort.max, .ultra].contains(entry.effort)
-                    || !advertisedIDs.contains("\(baseID)-\(entry.effort.rawValue)".lowercased())
+                    || !advertisedIDs.contains(CodexModelIdentity.key("\(baseID)-\(entry.effort.rawValue)"))
             }
 
             if effortEntries.isEmpty {
@@ -143,35 +149,53 @@ enum CodexDynamicModelMapper {
             }
         }
 
-        return options.sorted { lhs, rhs in
-            let leftBase = lhs.baseID.lowercased()
-            let rightBase = rhs.baseID.lowercased()
-            if leftBase == rightBase {
-                let leftRank = effortRank(lhs.reasoningEffort)
-                let rightRank = effortRank(rhs.reasoningEffort)
-                if leftRank != rightRank {
-                    return leftRank < rightRank
-                }
-                return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        return options.sorted(by: optionPrecedes)
+    }
+
+    static func optionPrecedes(_ lhs: CodexDynamicModelOption, _ rhs: CodexDynamicModelOption) -> Bool {
+        if lhs.isDefault != rhs.isDefault {
+            return lhs.isDefault && !rhs.isDefault
+        }
+
+        let leftBase = CodexModelIdentity.key(lhs.baseID)
+        let rightBase = CodexModelIdentity.key(rhs.baseID)
+        if leftBase == rightBase {
+            let leftRank = effortRank(lhs.reasoningEffort)
+            let rightRank = effortRank(rhs.reasoningEffort)
+            if leftRank != rightRank {
+                return leftRank < rightRank
             }
-            if lhs.isDefault != rhs.isDefault {
-                return lhs.isDefault && !rhs.isDefault
-            }
+        } else {
             if AIModel.codexBaseModelPrecedes(leftBase, rightBase) { return true }
             if AIModel.codexBaseModelPrecedes(rightBase, leftBase) { return false }
-            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
         }
+
+        let displayComparison = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
+        if displayComparison != .orderedSame {
+            return displayComparison == .orderedAscending
+        }
+        return normalizedOptionID(lhs.id) < normalizedOptionID(rhs.id)
     }
 
     static func displayName(forModelID id: String, records: [CodexDynamicModelRecord]) -> String? {
-        let normalizedID = normalizeID(id)
-        let lookupID = normalizedID.lowercased()
+        let lookupID = CodexModelIdentity.key(id)
         guard !lookupID.isEmpty else { return nil }
+
+        // An exact advertised ID is a real model identity, not a synthetic effort variant.
+        if let exactRecord = records.first(where: { CodexModelIdentity.key($0.id) == lookupID }) {
+            let exactID = normalizeID(exactRecord.id)
+            guard !exactID.isEmpty else { return nil }
+            return formatBaseDisplayName(
+                exactRecord.displayName,
+                fallbackModel: exactRecord.model,
+                fallbackID: exactID
+            )
+        }
 
         for record in records {
             let baseID = normalizeID(record.id)
             guard !baseID.isEmpty else { continue }
-            let baseLookupID = baseID.lowercased()
+            let baseLookupID = CodexModelIdentity.key(baseID)
             guard lookupID == baseLookupID || lookupID.hasPrefix("\(baseLookupID)-") else { continue }
 
             let baseDescription = record.description.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -186,7 +210,7 @@ enum CodexDynamicModelMapper {
             }
 
             for effortEntry in effortEntries {
-                let optionID = "\(baseID)-\(effortEntry.effort.rawValue)".lowercased()
+                let optionID = CodexModelIdentity.key("\(baseID)-\(effortEntry.effort.rawValue)")
                 guard lookupID == optionID else { continue }
                 let baseName = formatBaseDisplayName(
                     record.displayName,
@@ -201,9 +225,13 @@ enum CodexDynamicModelMapper {
     }
 
     private static func appendOption(_ option: CodexDynamicModelOption, seen: inout Set<String>, into output: inout [CodexDynamicModelOption]) {
-        let key = option.id.lowercased()
+        let key = CodexModelIdentity.key(option.id)
         guard seen.insert(key).inserted else { return }
         output.append(option)
+    }
+
+    private static func normalizedOptionID(_ id: String) -> String {
+        CodexModelIdentity.key(id)
     }
 
     private static func normalizedEfforts(for record: CodexDynamicModelRecord, fallbackDescription: String) -> [EffortEntry] {
