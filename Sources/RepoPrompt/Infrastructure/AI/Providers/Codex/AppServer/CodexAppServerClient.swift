@@ -119,7 +119,7 @@ actor CodexAppServerClient {
             else {
                 return message
             }
-            return "\(message) The active Codex runtime rejected RepoPrompt's required \(method) request shape. Reinstall or update RepoPrompt CE; if REPOPROMPT_CODEX_EXECUTABLE is set, update or remove that explicit override."
+            return "\(message) The active Codex runtime rejected RepoPrompt's required \(method) request shape. Reinstall or update RepoPrompt CE; if a local Codex executable is configured, update it or switch back to the bundled runtime."
         }
     }
 
@@ -444,6 +444,7 @@ actor CodexAppServerClient {
     private let processSpawnPreparation: @Sendable () async throws -> Void
     private let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
     private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
+    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
     private let provisionsRepoPromptMCPOnStart: Bool
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
@@ -470,6 +471,7 @@ actor CodexAppServerClient {
         runtimeStatePreparer: @escaping @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void = {
             try $0.prepareState()
         },
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         provisionsRepoPromptMCPOnStart: Bool = true,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver(pid: $0)
@@ -482,6 +484,7 @@ actor CodexAppServerClient {
         self.processSpawnPreparation = processSpawnPreparation
         self.processEnvironmentBuilder = processEnvironmentBuilder
         self.runtimeStatePreparer = runtimeStatePreparer
+        self.launchSnapshot = launchSnapshot
         self.provisionsRepoPromptMCPOnStart = provisionsRepoPromptMCPOnStart
         self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
@@ -519,6 +522,7 @@ actor CodexAppServerClient {
             commandName: config.commandName,
             environment: environment,
             additionalPathHints: config.additionalPathHints,
+            launchSnapshot: launchSnapshot,
             logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
         )
         guard resolution.status == .available else {

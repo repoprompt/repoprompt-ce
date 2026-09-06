@@ -80,6 +80,7 @@ final class CodexCLIProvider: AIProvider {
     }
 
     private let workingDirectory: String?
+    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
     private let enableDebugLogging: Bool
     private let defaultRequestTimeout: TimeInterval
     private let testRequestTimeout: TimeInterval
@@ -101,6 +102,7 @@ final class CodexCLIProvider: AIProvider {
 
     init(
         workingDirectory: String? = nil,
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         enableDebugLogging: Bool = false,
         defaultRequestTimeout: TimeInterval? = nil,
         testRequestTimeout: TimeInterval? = nil,
@@ -112,6 +114,7 @@ final class CodexCLIProvider: AIProvider {
         sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil
     ) {
         self.workingDirectory = workingDirectory
+        self.launchSnapshot = launchSnapshot
         self.enableDebugLogging = enableDebugLogging
         self.defaultRequestTimeout = defaultRequestTimeout ?? (45 * 60)
         self.testRequestTimeout = testRequestTimeout ?? 30
@@ -126,7 +129,7 @@ final class CodexCLIProvider: AIProvider {
         _ = logCollector
 
         // Ensure RepoPrompt MCP server entry exists before building overrides.
-        _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
+        _ = MCPIntegrationHelper.ensureCodexServerForDiscovery(launchSnapshot: launchSnapshot)
     }
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
@@ -931,7 +934,7 @@ final class CodexCLIProvider: AIProvider {
 
     private func makeRequestAppServerClient() -> CodexAppServerClient? {
         guard sessionControllerFactory == nil else { return nil }
-        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient()
+        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient(launchSnapshot: launchSnapshot)
     }
 
     private func withActiveRequestAppServerClient<T>(
