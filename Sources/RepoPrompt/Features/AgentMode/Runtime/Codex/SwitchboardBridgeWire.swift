@@ -74,6 +74,7 @@ struct SwitchboardPairingEnvelope: CustomStringConvertible, CustomDebugStringCon
 
 indirect enum SwitchboardJSONValue: Equatable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     case object([String: SwitchboardJSONValue])
+    case array([SwitchboardJSONValue])
     case string(String)
     case integer(Int64)
     case bool(Bool)
@@ -131,21 +132,21 @@ extension [String: SwitchboardJSONValue] {
 enum SwitchboardBridgeWire {
     static let maximumFrameBytes = 65536
 
-    static func validateFrame(_ data: Data) throws {
-        _ = try decodeFrame(data)
+    static func validateFrame(_ data: Data, allowsArrays: Bool = false) throws {
+        _ = try decodeFrame(data, allowsArrays: allowsArrays)
     }
 
-    static func decodeFrame(_ data: Data) throws -> [String: SwitchboardJSONValue] {
+    static func decodeFrame(_ data: Data, allowsArrays: Bool = false) throws -> [String: SwitchboardJSONValue] {
         guard !data.isEmpty, data.count <= maximumFrameBytes, data.last == 0x0A,
               !data.dropLast().contains(0x0A), !data.contains(0x0D)
         else { throw SwitchboardBridgeError.invalidRequest }
-        return try decodeObject(Data(data.dropLast()))
+        return try decodeObject(Data(data.dropLast()), allowsArrays: allowsArrays)
     }
 
-    static func decodeObject(_ data: Data) throws -> [String: SwitchboardJSONValue] {
+    static func decodeObject(_ data: Data, allowsArrays: Bool = false) throws -> [String: SwitchboardJSONValue] {
         guard !data.isEmpty, data.count < maximumFrameBytes, String(data: data, encoding: .utf8) != nil
         else { throw SwitchboardBridgeError.invalidRequest }
-        var parser = Parser(bytes: Array(data))
+        var parser = Parser(bytes: Array(data), allowsArrays: allowsArrays)
         let value = try parser.value(depth: 0)
         parser.whitespace()
         guard parser.index == parser.bytes.count, case let .object(object) = value
@@ -208,6 +209,7 @@ enum SwitchboardBridgeWire {
     /// that JSONDecoder/JSONSerialization erase. Arrays are outside this protocol.
     private struct Parser {
         let bytes: [UInt8]
+        let allowsArrays: Bool
         var index = 0
 
         mutating func whitespace() {
@@ -220,6 +222,19 @@ enum SwitchboardBridgeWire {
             whitespace()
             guard depth <= 8, index < bytes.count else { throw SwitchboardBridgeError.invalidRequest }
             switch bytes[index] {
+            case 0x5B:
+                guard allowsArrays else { throw SwitchboardBridgeError.invalidRequest }
+                index += 1
+                whitespace()
+                var result: [SwitchboardJSONValue] = []
+                if consume(0x5D) { return .array(result) }
+                while true {
+                    guard result.count < 64 else { throw SwitchboardBridgeError.invalidRequest }
+                    try result.append(value(depth: depth + 1))
+                    whitespace()
+                    if consume(0x5D) { return .array(result) }
+                    guard consume(0x2C) else { throw SwitchboardBridgeError.invalidRequest }
+                }
             case 0x7B:
                 index += 1
                 whitespace()

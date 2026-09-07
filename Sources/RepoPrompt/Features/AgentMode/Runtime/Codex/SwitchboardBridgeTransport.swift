@@ -38,7 +38,7 @@ enum SwitchboardBridgeTransport {
         return address
     }
 
-    static func exchange(pairing: SwitchboardPairingEnvelope, request: Data) throws -> Data {
+    static func exchange(pairing: SwitchboardPairingEnvelope, request: Data, allowsArrays: Bool = false) throws -> Data {
         let deadline = DispatchTime.now().uptimeNanoseconds + 3_000_000_000
         guard !request.isEmpty, request.count <= SwitchboardBridgeWire.maximumFrameBytes, request.last == 0x0A
         else { throw SwitchboardBridgeError.invalidRequest }
@@ -73,7 +73,7 @@ enum SwitchboardBridgeTransport {
         try validatePeer(socket, pairing: pairing)
         try write(request, socket: socket, deadline: deadline)
         guard shutdown(socket, SHUT_WR) == 0 else { throw SwitchboardBridgeError.unavailable }
-        let response = try read(socket: socket, deadline: deadline)
+        let response = try read(socket: socket, deadline: deadline, allowsArrays: allowsArrays)
         // Darwin may discard LOCAL_PEERPID after the peer has closed. The
         // connected peer was kernel-authenticated before writing; after EOF,
         // recheck that exact process birth stamp instead of querying a dead link.
@@ -157,7 +157,7 @@ enum SwitchboardBridgeTransport {
         }
     }
 
-    private static func read(socket: Int32, deadline: UInt64) throws -> Data {
+    private static func read(socket: Int32, deadline: UInt64, allowsArrays: Bool) throws -> Data {
         var result = Data()
         var buffer = [UInt8](repeating: 0, count: 4096)
         while true {
@@ -166,7 +166,7 @@ enum SwitchboardBridgeTransport {
             if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
             guard count >= 0 else { throw SwitchboardBridgeError.unavailable }
             if count == 0 {
-                try SwitchboardBridgeWire.validateFrame(result)
+                try SwitchboardBridgeWire.validateFrame(result, allowsArrays: allowsArrays)
                 return result
             }
             guard result.count + count <= SwitchboardBridgeWire.maximumFrameBytes
