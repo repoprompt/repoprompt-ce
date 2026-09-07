@@ -176,6 +176,76 @@ struct SwitchboardAutomaticControl: Equatable, SwitchboardAutomaticPrivateValue 
     }
 }
 
+struct SwitchboardAutomaticIntent: Equatable, SwitchboardAutomaticPrivateValue {
+    let id: UUID
+    let batchID: UUID
+    let enrollmentID: UUID
+    let ruleRevision: Int64
+    let controlEpoch: Int64
+    let source: SwitchboardAutomaticSource
+    let destinationEmail: String
+    let destinationAccountID: String
+    let manualGeneration: Int64
+    let expiresAt: Date
+    init(_ value: SwitchboardJSONValue?) throws {
+        let o = try SwitchboardAutomaticWire.object(value, keys: ["intent_id", "batch_id", "enrollment_id", "rule_revision", "control_epoch", "source_binding", "destination", "manual_generation", "expires_at"])
+        id = try o.uuid("intent_id")
+        batchID = try o.uuid("batch_id")
+        enrollmentID = try o.uuid("enrollment_id")
+        ruleRevision = try o.integer("rule_revision")
+        controlEpoch = try o.integer("control_epoch")
+        source = try .init(o["source_binding"])
+        manualGeneration = try o.integer("manual_generation")
+        let d = try SwitchboardAutomaticWire.object(o["destination"], keys: ["account", "account_id"])
+        destinationEmail = try d.text("account")
+        destinationAccountID = try d.text("account_id")
+        expiresAt = try Date(timeIntervalSince1970: Double(o.integer("expires_at")))
+    }
+}
+
+struct SwitchboardAutomaticPrepared: Equatable, SwitchboardAutomaticPrivateValue {
+    let id: UUID
+    let intent: SwitchboardAutomaticIntent
+    let expiresAt: Date
+    init(_ value: SwitchboardJSONValue?) throws {
+        let o = try SwitchboardAutomaticWire.object(value, keys: ["prepared_id", "intent", "expires_at"])
+        id = try o.uuid("prepared_id")
+        intent = try .init(o["intent"])
+        expiresAt = try Date(timeIntervalSince1970: Double(o.integer("expires_at")))
+    }
+}
+
+struct SwitchboardAutomaticIssued: SwitchboardAutomaticPrivateValue {
+    let permitID: UUID
+    let preparedID: UUID
+    let batchID: UUID
+    let enrollmentID: UUID
+    let enrollmentEpoch: UUID
+    let ruleRevision: Int64
+    let controlEpoch: Int64
+    let source: SwitchboardAutomaticSource
+    let manualGeneration: Int64
+    let nativePeer: SwitchboardAutomaticNativePeer
+    let ttlMilliseconds: Int
+    let grant: CodexAccountAdoptionGrant
+    init(_ result: [String: SwitchboardJSONValue], now: Date) throws {
+        try result.requireKeys(["permit", "selection"])
+        let o = try SwitchboardAutomaticWire.object(result["permit"], keys: ["permit_id", "prepared_id", "batch_id", "enrollment_id", "enrollment_epoch", "rule_revision", "control_epoch", "source_binding", "manual_generation", "native_peer", "ttl_ms"])
+        permitID = try o.uuid("permit_id")
+        preparedID = try o.uuid("prepared_id")
+        batchID = try o.uuid("batch_id")
+        enrollmentID = try o.uuid("enrollment_id")
+        enrollmentEpoch = try o.uuid("enrollment_epoch")
+        ruleRevision = try o.integer("rule_revision")
+        controlEpoch = try o.integer("control_epoch")
+        source = try .init(o["source_binding"])
+        manualGeneration = try o.integer("manual_generation")
+        nativePeer = try .init(o["native_peer"])
+        ttlMilliseconds = try Int(o.integer("ttl_ms", minimum: 1, maximum: 5000))
+        grant = try SwitchboardBridgeWire.selection(result["selection"], now: now)
+    }
+}
+
 enum SwitchboardAutomaticWire {
     static func object(_ value: SwitchboardJSONValue?, keys: Set<String>) throws -> [String: SwitchboardJSONValue] {
         guard case let .object(o) = value else { throw SwitchboardBridgeError.invalidRequest }

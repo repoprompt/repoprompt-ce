@@ -61,6 +61,7 @@
             [
                 "PATH": "/usr/bin:/bin",
                 "LANG": "en_US.UTF-8",
+                "HOME": rootURL.appendingPathComponent("home").path,
                 "CFFIXED_USER_HOME": rootURL.appendingPathComponent("home").path,
                 "TMPDIR": rootURL.appendingPathComponent("tmp").path
             ]
@@ -84,14 +85,20 @@
 
         func spawn(command: String, arguments: [String], environment: [String: String], workingDirectory: String?) throws -> SpawnedProcess {
             try Self.requireHostedXCTest()
-            guard command.hasPrefix(resourcesURL.path + "/BundledRuntimes/Codex/"),
+            let resolution = try resolve()
+            guard let expected = resolution.runtime?.executableURL.path,
                   let workingDirectory, workingDirectory.hasPrefix(rootURL.path + "/") else { throw Failure.invalidFixture }
+            try Self.validateExecutable(command, expected: expected)
             return try ProcessLauncher.spawn(
                 command: "/usr/bin/sandbox-exec",
                 arguments: ["-f", sandboxProfileURL.path, command] + arguments,
                 environment: environment,
                 workingDirectory: workingDirectory
             )
+        }
+
+        static func validateExecutable(_ command: String, expected: String) throws {
+            guard command == expected else { throw Failure.invalidFixture }
         }
     }
 #endif

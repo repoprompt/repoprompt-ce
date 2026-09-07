@@ -149,9 +149,15 @@ extension AgentModeViewModel {
                 inspect: { try await controller.inspectAccountAdoptionRuntime() },
                 reserve: { try await controller.reserveAccountAdoption() },
                 finish: { lease, allow in await controller.finishAccountAdoption(lease, allowTurns: allow) },
-                install: { grant in try await controller.installAccountAdoptionGrant(grant, authorization: authorization) }
+                install: { grant in try await controller.installAccountAdoptionGrant(grant, authorization: authorization) },
+                automatic: .init(
+                    peer: { try await controller.automaticNativePeer() },
+                    hasEnded: { await controller.automaticNativeHasEnded() },
+                    install: { grant, permit in try await controller.installAutomaticAccountGrant(grant, authorization: authorization, permit: permit) }
+                )
             )
             try await control.connect(scope: scope, bridge: bridge, runtime: runtime)
+            control.observeAutomaticOffers(client: SwitchboardAutomaticClient(pairing: pairing, scope: scope))
             control.startPolling()
             session.isDirty = true
             scheduleSave(for: tabID)

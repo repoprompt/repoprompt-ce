@@ -157,8 +157,57 @@ private struct SwitchboardAccountStatus: View {
             VStack(alignment: .leading, spacing: 2) {
                 if let account = control.accountSummary, !account.isEmpty { Text(account).font(.caption).lineLimit(1).hoverTooltip(account) }
                 Text(control.statusText).font(.caption).foregroundStyle(.secondary)
+                if let automatic = control.automatic { SwitchboardAutomaticAccountStatus(control: automatic) }
             }
             Button("Revoke") { control.revoke() }.disabled(control.state == .revoked)
+        }
+    }
+}
+
+private struct SwitchboardAutomaticAccountStatus: View {
+    @ObservedObject var control: CodexSwitchboardAutomaticControl
+    @State private var reviewedOffer: SwitchboardAutomaticOffer?
+    @State private var approves = false
+    @State private var submitting = false
+    @State private var failure = false
+
+    var body: some View {
+        HStack {
+            Text(control.statusText).font(.caption).foregroundStyle(.secondary)
+            if let offer = control.offer, control.enrollment == nil {
+                Button("Review automatic rule…") { reviewedOffer = offer
+                    approves = false
+                    failure = false
+                }
+            }
+            if control.enrollment != nil { Button("Revoke automatic approval") { control.stop() } }
+        }
+        .sheet(isPresented: Binding(get: { reviewedOffer != nil }, set: { if !$0 { reviewedOffer = nil } })) {
+            if let offer = reviewedOffer {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Approve automatic rotation for this root").font(.headline)
+                    Text(offer.name)
+                    Text("Approved accounts: " + offer.accounts.joined(separator: ", "))
+                    Text("Rotate at \(offer.triggerUsedPercent)% used; destination must have at least \(offer.destinationRemainingPercent)% remaining. Cooldown: \(offer.cooldownMinutes) minutes. Quota freshness: \(offer.freshnessSeconds) seconds.")
+                    Text("Switchboard coordinates one destination across explicitly enrolled capable sessions. This root waits for idle; other sessions may still be waiting or unknown. Pause stops new automatic changes and remains Pausing until in-flight installs settle. Manual changes and same-account refresh remain separate.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Toggle("Approve this exact rule for this paired root only", isOn: $approves)
+                    if failure { Text("Approval changed or is unavailable. Review a fresh offer.").font(.caption) }
+                    HStack {
+                        Button("Cancel") { reviewedOffer = nil }.disabled(submitting)
+                        Spacer()
+                        Button("Approve rule") {
+                            submitting = true
+                            Task {
+                                defer { submitting = false }
+                                do { try await control.accept(offerID: offer.id)
+                                    reviewedOffer = nil
+                                } catch { failure = true }
+                            }
+                        }.disabled(!approves || submitting)
+                    }
+                }.padding(20).frame(width: 560).interactiveDismissDisabled(submitting)
+            }
         }
     }
 }

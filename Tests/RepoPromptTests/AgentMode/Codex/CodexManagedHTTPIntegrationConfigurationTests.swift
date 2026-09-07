@@ -2,6 +2,13 @@
 import XCTest
 
 final class CodexManagedHTTPIntegrationConfigurationTests: XCTestCase {
+    func testOnlyExactResolvedExecutableMaySpawnInsideResourceTree() throws {
+        let expected = "/private/tmp/fixture/Resources/BundledRuntimes/Codex/aarch64-apple-darwin/bin/codex"
+        XCTAssertNoThrow(try CodexManagedHTTPIntegrationConfiguration.validateExecutable(expected, expected: expected))
+        XCTAssertThrowsError(try CodexManagedHTTPIntegrationConfiguration.validateExecutable(expected + "-code-mode-host", expected: expected))
+        XCTAssertThrowsError(try CodexManagedHTTPIntegrationConfiguration.validateExecutable("/bin/sh", expected: expected))
+    }
+
     func testExplicitHostedConfigurationKeepsStrictEffectivePolicy() throws {
         XCTAssertNoThrow(try CodexManagedHTTPIntegrationConfiguration.requireHostedXCTest())
         let root = URL(fileURLWithPath: "/private/tmp/sb-integration-policy-\(UUID().uuidString)")
@@ -11,6 +18,7 @@ final class CodexManagedHTTPIntegrationConfigurationTests: XCTestCase {
         try Data("(version 1)".utf8).write(to: profile)
         let endpoint = "http://127.0.0.1:43125/backend-api/codex"
         let configuration = try CodexManagedHTTPIntegrationConfiguration(resourcesURL: root, rootURL: root, responsesURL: endpoint, sandboxProfileURL: profile)
+        XCTAssertEqual(configuration.environment["HOME"], root.appendingPathComponent("home").path)
         var response = try CodexManagedHTTPRuntimeFixture.configuration()
         var config = try XCTUnwrap(response["config"] as? [String: Any])
         var providers = try XCTUnwrap(config["model_providers"] as? [String: Any])
