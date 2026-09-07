@@ -151,6 +151,17 @@ enum CodexIntegrationConfiguration {
         return try MCPServerCatalog(migratingCodexTOML: content)
     }
 
+    static func mcpServerEntries(from catalog: MCPServerCatalog) -> [ServerEntry] {
+        catalog.servers.map { server in
+            let normalized = MCPServerCatalog.normalizedName(server.name)
+            return ServerEntry(
+                rawName: server.name,
+                normalizedName: normalized,
+                cliPathComponent: cliPathComponent(forNormalizedServerName: normalized)
+            )
+        }
+    }
+
     static func mcpServerEntries(from content: String) -> [ServerEntry] {
         mcpServerEntries(fromConfigContent: content)
     }

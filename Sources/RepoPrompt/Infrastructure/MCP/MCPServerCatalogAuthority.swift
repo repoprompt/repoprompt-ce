@@ -11,6 +11,11 @@ final class MCPServerCatalogAuthority: @unchecked Sendable {
         case repoPromptOnly
     }
 
+    struct Projection {
+        let available: MCPServerCatalog
+        let selected: MCPServerCatalog
+    }
+
     typealias CatalogProvider = @Sendable () throws -> MCPServerCatalog
     typealias EnabledNamesProvider = @Sendable (Provider) -> Set<String>
 
@@ -39,6 +44,10 @@ final class MCPServerCatalogAuthority: @unchecked Sendable {
     }
 
     func catalog(for provider: Provider, scope: Scope) throws -> MCPServerCatalog {
+        try projection(for: provider, scope: scope).selected
+    }
+
+    func projection(for provider: Provider, scope: Scope) throws -> Projection {
         let complete = try catalogProvider()
         let enabledNames: Set<String> = switch scope {
         case .directSelected:
@@ -52,6 +61,9 @@ final class MCPServerCatalogAuthority: @unchecked Sendable {
                 RepoPromptMCPServerConfiguration.defaultServerName
             )
         }
-        return try MCPServerCatalog(servers: selected)
+        return try Projection(
+            available: complete,
+            selected: MCPServerCatalog(servers: selected)
+        )
     }
 }

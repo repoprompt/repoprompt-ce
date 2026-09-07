@@ -9245,9 +9245,20 @@ final class CodexNativeSessionController {
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
         memoriesEnabled: Bool = false,
-        computerUseEnabled: Bool = false
+        computerUseEnabled: Bool = false,
+        mcpCatalogAuthority: MCPServerCatalogAuthority = .shared
     ) -> [String: Any] {
-        let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
+        let projection = try? mcpCatalogAuthority.projection(
+            for: .codex,
+            scope: suppressThirdPartyMCPServers ? .repoPromptOnly : .directSelected
+        )
+        let serverEntries = projection.map {
+            CodexIntegrationConfiguration.mcpServerEntries(from: $0.available)
+        } ?? MCPIntegrationHelper.codexMCPServerEntries()
+        let selectedNames = Set(
+            projection?.selected.servers.map { MCPServerCatalog.normalizedName($0.name) }
+                ?? [MCPIntegrationHelper.repoPromptMCPServerName]
+        )
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
         let modelReasoningSummary = reasoningSummariesEnabled.map {
             $0 ? CodexOverrides.ReasoningSummary.auto : .none
@@ -9268,9 +9279,9 @@ final class CodexNativeSessionController {
         )
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
-            enabledMCPServerNames: preferences.enabledMCPServerNames,
-            suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
-            computerUseEnabled: computerUseEnabled
+            enabledMCPServerNames: selectedNames,
+            suppressThirdPartyMCPServers: false,
+            computerUseEnabled: false
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
