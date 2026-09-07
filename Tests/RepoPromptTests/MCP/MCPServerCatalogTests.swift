@@ -105,4 +105,70 @@ final class MCPServerCatalogTests: XCTestCase {
             ["NewServer", "RepoPromptCE"]
         )
     }
+
+    func testMigrationRejectsAmbiguousOrIncompleteTransportDefinitions() {
+        let malformedDefinitions = [
+            """
+            [mcp_servers.Both]
+            command = "/redacted/bin"
+            url = "https://mcp.example.invalid/redacted"
+            """,
+            """
+            [mcp_servers.RemoteWithArgs]
+            url = "https://mcp.example.invalid/redacted"
+            args = ["--not-valid-for-http"]
+            """,
+            """
+            [mcp_servers.MissingTransport]
+            enabled = true
+            """
+        ]
+
+        for source in malformedDefinitions {
+            XCTAssertThrowsError(try MCPServerCatalog(migratingCodexTOML: source))
+        }
+    }
+
+    func testMigrationRejectsDuplicateNormalizedNamesAndFields() {
+        XCTAssertThrowsError(
+            try MCPServerCatalog(
+                migratingCodexTOML: """
+                [mcp_servers.Example]
+                command = "/redacted/one"
+                [mcp_servers." example "]
+                command = "/redacted/two"
+                """
+            )
+        )
+        XCTAssertThrowsError(
+            try MCPServerCatalog(
+                migratingCodexTOML: """
+                [mcp_servers.Example]
+                command = "/redacted/one"
+                command = "/redacted/two"
+                """
+            )
+        )
+    }
+
+    func testMigrationRejectsUnknownOrWronglyTypedPolicyFields() {
+        let malformedPolicies = [
+            "unsupported = true",
+            "enabled = \"true\"",
+            "enabled_tools = [\"read_file\", 42]",
+            "tool_timeout_sec = -1"
+        ]
+
+        for policy in malformedPolicies {
+            XCTAssertThrowsError(
+                try MCPServerCatalog(
+                    migratingCodexTOML: """
+                    [mcp_servers.Example]
+                    command = "/redacted/bin"
+                    \(policy)
+                    """
+                )
+            )
+        }
+    }
 }
