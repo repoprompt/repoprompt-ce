@@ -19,7 +19,7 @@ actor KeyManager {
             return cached
         }
 
-        let account = provider.secureStorageAccount
+        guard let account = provider.secureStorageAccount else { return nil }
         let keyFromDisk = try await secureService.getAPIKey(for: account, accessMode: accessMode)
 
         if let k = keyFromDisk {
@@ -35,8 +35,8 @@ actor KeyManager {
         for provider: AIProviderType,
         accessMode: KeychainAccessMode = .interactive
     ) throws {
+        guard let account = provider.secureStorageAccount else { return }
         cache[provider] = key
-        let account = provider.secureStorageAccount
         try secureService.saveAPIKey(key, for: account, accessMode: accessMode)
     }
 
@@ -46,14 +46,14 @@ actor KeyManager {
         accessMode: KeychainAccessMode = .interactive
     ) throws {
         cache.removeValue(forKey: provider)
-        let account = provider.secureStorageAccount
+        guard let account = provider.secureStorageAccount else { return }
         try secureService.deleteAPIKey(for: account, accessMode: accessMode)
     }
 }
 
 extension AIProviderType {
     /// Maps each provider to its frozen secure-storage account.
-    var secureStorageAccount: SecureStorageAccount {
+    var secureStorageAccount: SecureStorageAccount? {
         switch self {
         case .anthropic: .anthropicAPI
         case .openAI: .openAIAPI
@@ -71,6 +71,7 @@ extension AIProviderType {
         case .openCode: .openCodeCLIAPI
         case .cursor: .cursorCLIAPI
         case .grokBuild: .grokAPI
+        case .omp: nil
         case .zAI: .zAIAPI
         }
     }

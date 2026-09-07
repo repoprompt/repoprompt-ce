@@ -44,4 +44,6 @@ extension Notification.Name {
     /// Posted when Oh My Pi CLI connection status changes
     /// userInfo mirrors `claudeCodeConnectionChanged`
     static let ompConnectionChanged = Notification.Name("ompConnectionChanged")
+    /// Posted when ACP model discovery changes (`userInfo["providerID"]`) or persisted catalogs finish warming.
+    static let acpDiscoveredModelsChanged = Notification.Name("acpDiscoveredModelsChanged")
 }

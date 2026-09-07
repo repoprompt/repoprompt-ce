@@ -1445,6 +1445,7 @@ private enum AppSettingsMCPRegistry {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .omp: "omp"
         }
     }
 

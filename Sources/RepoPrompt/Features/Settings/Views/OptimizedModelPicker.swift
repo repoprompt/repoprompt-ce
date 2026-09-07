@@ -162,6 +162,20 @@ struct OptimizedModelPicker: View {
                     modelButton(option.model, title: option.displayName)
                 }
             }
+        } else if provider == .omp {
+            ForEach(AIModel.ompMenuGroups(for: models)) { group in
+                if let displayName = group.displayName {
+                    Menu(displayName) {
+                        ForEach(group.models, id: \.rawValue) { model in
+                            modelButton(model)
+                        }
+                    }
+                } else {
+                    ForEach(group.models, id: \.rawValue) { model in
+                        modelButton(model)
+                    }
+                }
+            }
         } else if provider == .openCode {
             ForEach(AIModel.openCodeMenu(for: models).providerGroups) { providerGroup in
                 if providerGroup.rendersAsSubmenu {

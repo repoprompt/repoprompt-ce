@@ -6408,6 +6408,8 @@ class PromptViewModel: ObservableObject {
             return api.isCursorConnected
         case .grokBuild:
             return api.isGrokBuildConnected
+        case .omp:
+            return api.isOMPConnected
         }
     }
 
@@ -6429,7 +6431,7 @@ class PromptViewModel: ObservableObject {
             // Custom models are always valid (user explicitly configured them)
             if model.isCustom { return true }
             switch model.providerType {
-            case .claudeCode, .codex, .openCode, .cursor, .grokBuild:
+            case .claudeCode, .codex, .openCode, .cursor, .grokBuild, .omp:
                 return true
             default:
                 // Check if the model's provider has an API key configured

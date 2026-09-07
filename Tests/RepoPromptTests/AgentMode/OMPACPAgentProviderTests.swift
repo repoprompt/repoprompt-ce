@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -118,6 +119,18 @@ final class OMPACPAgentProviderTests: XCTestCase {
         XCTAssertEqual(ompProvider.test_config.modelString, "openai-codex/gpt-5.6-luna")
     }
 
+    func testOracleProviderCarriesSelectedOMPModel() async throws {
+        let model = AIModel.ompCustom(name: "openai-codex/gpt-5.6-luna")
+        XCTAssertEqual(
+            OMPCLIProvider.test_makeHeadlessConfig(modelName: model.modelName).modelString,
+            model.modelName
+        )
+        let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let provider = try await AIProviderFactory.createProvider(for: .omp, keyManager: keyManager)
+        XCTAssertTrue(provider is OMPCLIProvider)
+        await provider.dispose()
+    }
+
     func testCatalogExposesStickyDefaultAndDiscoveredModels() {
         AgentACPModelRegistry.shared.test_reset(providerID: .omp)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .omp) }
@@ -206,6 +219,95 @@ final class OMPACPAgentProviderTests: XCTestCase {
             selectedModelRaw: advertised[0].rawValue, includePlaceholderDefault: false, groupOpenCode: false
         ) { _, _ in }
         XCTAssertEqual(withoutDefault.map(\.title), ["openai-codex", "openrouter"])
+    }
+
+    func testOracleCatalogExposesAndGroupsOnlyAdvertisedOMPModels() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .omp)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .omp) }
+        let advertised = [
+            AgentModelOption(rawValue: "openai-codex/gpt-fixture", displayName: "GPT Fixture", description: nil, isDefault: false),
+            AgentModelOption(rawValue: "openrouter/vendor/model/high", displayName: "Model High", description: nil, isDefault: false),
+            AgentModelOption(rawValue: "openai-codex/another-model", displayName: "Another Model", description: nil, isDefault: false)
+        ]
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(options: advertised, currentModelRaw: advertised[0].rawValue),
+            for: .omp
+        ))
+
+        let models = AIModel.modelsForProvider(.omp)
+        XCTAssertEqual(Set(models.map(\.modelName)), Set(advertised.map(\.rawValue)))
+        XCTAssertEqual(AIModel.fromModelName("omp_custom_openai-codex/gpt-fixture"), .ompCustom(name: advertised[0].rawValue))
+        XCTAssertEqual(models.first { $0.modelName == advertised[0].rawValue }?.displayName, "GPT Fixture")
+
+        let groups = AIModel.ompMenuGroups(for: models)
+        XCTAssertEqual(groups.map(\.displayName), ["openai-codex", "openrouter"])
+        XCTAssertEqual(groups.map(\.models.count), [2, 1])
+        XCTAssertEqual(AIModel.ompMenuGroups(for: [models[0], models[0]]).flatMap(\.models).count, 1)
+    }
+
+    @MainActor
+    func testConnectedOMPModelsAppearInOraclePickerCatalog() async {
+        AgentACPModelRegistry.shared.test_reset(providerID: .omp)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .omp) }
+        let model = AgentModelOption(
+            rawValue: "openai-codex/gpt-fixture",
+            displayName: "GPT Fixture",
+            description: nil,
+            isDefault: true
+        )
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(options: [model], currentModelRaw: model.rawValue),
+            for: .omp
+        ))
+        let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let viewModel = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        defer { viewModel.prepareForWindowClose() }
+        viewModel.isOMPConnected = true
+
+        await viewModel.updateAvailableModels()
+
+        XCTAssertTrue(viewModel.availableModels.contains(.ompCustom(name: model.rawValue)))
+    }
+
+    @MainActor
+    func testOMPDiscoveryRefreshesAnOpenOraclePickerCatalog() async {
+        AgentACPModelRegistry.shared.test_reset(providerID: .omp)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .omp) }
+        let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let viewModel = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        defer { viewModel.prepareForWindowClose() }
+        viewModel.isOMPConnected = true
+        await viewModel.updateAvailableModels()
+
+        let model = AgentModelOption(
+            rawValue: "openai-codex/live-model",
+            displayName: "Live Model",
+            description: nil,
+            isDefault: true
+        )
+        let refreshed = expectation(description: "Oracle picker refresh")
+        let cancellable = viewModel.$availableModels
+            .dropFirst()
+            .sink { models in
+                if models.contains(.ompCustom(name: model.rawValue)) {
+                    refreshed.fulfill()
+                }
+            }
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(options: [model], currentModelRaw: model.rawValue),
+            for: .omp
+        ))
+
+        await fulfillment(of: [refreshed], timeout: 1)
+        cancellable.cancel()
     }
 
     func testTaskLabelsDoNotSelectProviderManagedOMPImplicitly() {

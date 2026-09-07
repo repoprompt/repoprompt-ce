@@ -577,6 +577,16 @@ public class APISettingsViewModel: ObservableObject {
             }
         }
         .store(in: &cliConnectionCancellables)
+
+        NotificationCenter.default.publisher(for: .acpDiscoveredModelsChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let self, !self.hasPreparedForWindowClose else { return }
+                let changedProviderID = notification.userInfo?[AgentACPModelRegistry.providerIDUserInfoKey] as? String
+                guard changedProviderID == nil || changedProviderID == ACPProviderID.omp.rawValue else { return }
+                Task { await self.updateAvailableModels() }
+            }
+            .store(in: &cliConnectionCancellables)
     }
 
     private func applyAuthoritativeCodexDisconnectedState() {
@@ -600,6 +610,7 @@ public class APISettingsViewModel: ObservableObject {
     private func reloadCLIConnectionFlagsFromDefaults() {
         let wasCursorConnected = isCursorConnected
         let wasGrokBuildConnected = isGrokBuildConnected
+        let wasOMPConnected = isOMPConnected
         isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
         if isClaudeCodeConnected {
             claudeCodeCLIStatus = .binaryPresent
@@ -625,6 +636,9 @@ public class APISettingsViewModel: ObservableObject {
             } else {
                 stopCursorModelsSubscription(clearModels: true)
             }
+            Task { await updateAvailableModels() }
+        }
+        if wasOMPConnected != isOMPConnected {
             Task { await updateAvailableModels() }
         }
     }
@@ -1885,6 +1899,10 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
         }
 
+        if isOMPConnected {
+            modelSet.formUnion(AIModel.modelsForProvider(.omp))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -1954,6 +1972,7 @@ public class APISettingsViewModel: ObservableObject {
         case .claudeCode: "claude_code"
         case .codex: "codex"
         case .openCode: "opencode"
+        case .omp: "omp"
         }
     }
 
@@ -2030,6 +2049,8 @@ public class APISettingsViewModel: ObservableObject {
                 break
             case .grokBuild:
                 break
+            case .omp:
+                break
             }
 
             await updateAvailableModels()
@@ -2091,6 +2112,8 @@ public class APISettingsViewModel: ObservableObject {
         case .cursor:
             break
         case .grokBuild:
+            break
+        case .omp:
             break
         }
         await updateAvailableModels()
@@ -3773,6 +3796,7 @@ public class APISettingsViewModel: ObservableObject {
             setContextBuilderProviderVerified(.omp, verified: true)
             ompError = nil
             UserDefaults.standard.set(true, forKey: "OMPCLIConnected")
+            await updateAvailableModels()
             collector.append("Oh My Pi CLI marked as connected")
             ompLogCollector = nil
             NotificationCenter.default.post(
@@ -3788,6 +3812,7 @@ public class APISettingsViewModel: ObservableObject {
             setContextBuilderProviderVerified(.omp, verified: false)
             ompError = message
             UserDefaults.standard.set(false, forKey: "OMPCLIConnected")
+            await updateAvailableModels()
             collector.append("User guidance: \(message)")
             NotificationCenter.default.post(
                 name: .ompConnectionChanged,
@@ -3803,6 +3828,7 @@ public class APISettingsViewModel: ObservableObject {
         setContextBuilderProviderVerified(.omp, verified: false)
         ompError = nil
         UserDefaults.standard.set(false, forKey: "OMPCLIConnected")
+        Task { await updateAvailableModels() }
         NotificationCenter.default.post(
             name: .ompConnectionChanged,
             object: nil,
