@@ -463,7 +463,8 @@ final class ClaudeAgentModeCoordinator {
                 runtimeVariant: runtimeVariant,
                 effectivePermissionMode: effectivePermissionMode,
                 effectiveAllowNativeBashTool: effectiveAllowNativeBashTool,
-                effectiveMCPStrictMode: effectiveMCPStrictMode
+                effectiveMCPStrictMode: effectiveMCPStrictMode,
+                effectiveMCPCatalogScope: effectiveMCPCatalogScope
             )
             guard intentIsCurrent(intent, for: session) else { return .superseded }
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
@@ -650,7 +651,8 @@ final class ClaudeAgentModeCoordinator {
         runtimeVariant: ClaudeCodeRuntimeVariant,
         effectivePermissionMode: String,
         effectiveAllowNativeBashTool: Bool?,
-        effectiveMCPStrictMode: Bool?
+        effectiveMCPStrictMode: Bool?,
+        effectiveMCPCatalogScope: MCPServerCatalogAuthority.Scope
     ) async throws -> NativeAgentRuntimeSessionRef {
         let existingSessionID = session.providerSessionID
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
