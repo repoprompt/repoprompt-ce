@@ -58,15 +58,69 @@ struct ExecutableFileIdentity: Equatable {
         }
     }
 
-    /// Revalidates identity and rejects launch paths that another local user can replace.
-    /// This narrows pathname-spawn TOCTOU exposure to processes running as this same UID.
+    /// Revalidates identity and rejects launch paths that an untrusted local user can replace.
+    /// Root and the current user are trusted globally; admin-group writes are trusted only for ACL-free
+    /// canonical Homebrew Cellar paths.
     func validateForTrustedPathLaunch(atPath path: String) throws {
         try validate(atPath: path)
         try Self.validateTrustedOwnershipAndPermissions(atCanonicalPath: canonicalPath)
     }
 
+    static func permitsHomebrewAdminGroupWritableDirectory(
+        canonicalPath: String,
+        directoryPath: String,
+        mode: mode_t,
+        ownerUID: uid_t,
+        groupGID: gid_t,
+        effectiveUID: uid_t
+    ) -> Bool {
+        guard mode & mode_t(S_IWGRP) != 0,
+              mode & mode_t(S_IWOTH) == 0,
+              ownerUID == 0 || ownerUID == effectiveUID,
+              groupGID == 80
+        else {
+            return false
+        }
+
+        let homebrewLocations = [
+            (prefix: "/opt/homebrew", cellar: "/opt/homebrew/Cellar"),
+            (prefix: "/usr/local", cellar: "/usr/local/Cellar")
+        ]
+
+        return homebrewLocations.contains { location in
+            canonicalPath.hasPrefix(location.cellar + "/")
+                && (
+                    directoryPath == location.prefix
+                        || directoryPath == location.cellar
+                        || directoryPath.hasPrefix(location.cellar + "/")
+                )
+        }
+    }
+
+    static func directoryHasNoExtendedACL(atPath directoryPath: String) -> Bool {
+        let descriptor = open(directoryPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+
+        errno = 0
+        guard let acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
+            let aclErrno = errno
+            return aclErrno == ENOENT
+        }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+
+        guard acl_valid(acl) == 0 else { return false }
+
+        var entry: acl_entry_t?
+        errno = 0
+        let entryResult = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
+        let entryErrno = errno
+        return entryResult == -1 && entryErrno == EINVAL
+    }
+
     private static func validateTrustedOwnershipAndPermissions(atCanonicalPath canonicalPath: String) throws {
-        let trustedUIDs: Set<uid_t> = [0, geteuid()]
+        let effectiveUID = geteuid()
+        let trustedUIDs: Set<uid_t> = [0, effectiveUID]
         var executableInfo = stat()
         guard stat(canonicalPath, &executableInfo) == 0 else {
             throw ExecutableFileIdentityError.unavailable(canonicalPath)
@@ -93,7 +147,17 @@ struct ExecutableFileIdentity: Equatable {
             let isGroupOrWorldWritable = directoryInfo.st_mode & mode_t(S_IWGRP | S_IWOTH) != 0
             let isRootOwnedStickyDirectory = directoryInfo.st_uid == 0
                 && directoryInfo.st_mode & mode_t(S_ISVTX) != 0
-            guard !isGroupOrWorldWritable || isRootOwnedStickyDirectory else {
+            let isPermittedHomebrewDirectory =
+                permitsHomebrewAdminGroupWritableDirectory(
+                    canonicalPath: canonicalPath,
+                    directoryPath: directoryPath,
+                    mode: directoryInfo.st_mode,
+                    ownerUID: directoryInfo.st_uid,
+                    groupGID: directoryInfo.st_gid,
+                    effectiveUID: effectiveUID
+                )
+                && directoryHasNoExtendedACL(atPath: directoryPath)
+            guard !isGroupOrWorldWritable || isRootOwnedStickyDirectory || isPermittedHomebrewDirectory else {
                 throw ExecutableFileIdentityError.untrustedWritableDirectory(directoryPath, directoryInfo.st_mode)
             }
 

@@ -43,11 +43,11 @@ the closed app's version history.
 
 ## Bundled Codex artifact
 
-Debug and release packaging include the complete official OpenAI Codex 0.149.0
+Debug and release packaging include the complete official OpenAI Codex 0.153.4
 standalone package. The authority is the repository-owned
 [`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
-official [`rust-v0.149.0` release](https://github.com/openai/codex/releases/tag/rust-v0.149.0),
-the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.149.0/codex-package_SHA256SUMS),
+official [`rust-v0.153.4` release](https://github.com/openai/codex/releases/tag/rust-v0.153.4),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.153.4/codex-package_SHA256SUMS),
 both macOS package assets, their complete extracted layouts, file hashes,
 architectures, and primary executable signing identities. The upstream release
 publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
@@ -96,16 +96,23 @@ notarization remains enforced by the protected release workflow; if Apple ever
 rejects this policy, stop rather than silently re-signing the upstream payload.
 
 The bundled package is RepoPrompt's default Codex runtime authority; runtime
-selection never falls through to the user's shell `PATH`. Settings shows the
-effective executable and version, and offers a compatible `codex` found in the
-captured login-shell `PATH` as a one-click local selection. Advanced users may also
-select one explicit local executable or set an absolute override with
-`REPOPROMPT_CODEX_EXECUTABLE`; the Settings choice takes precedence. Settings saves
-the next-launch choice while all runtime consumers retain the process-wide active
-selection until relaunch. Version validation uses the captured launch environment,
-including its interpreter search path.
-RepoPrompt rejects overrides older than 0.149.0, matching the bundled runtime and
-the documented app-server contract floor. Bundled and external runtimes both use
+selection never falls through to the user's environment or shell `PATH`. Settings
+presents the included Codex version and status as the ordinary path. Advanced users
+may explicitly select one custom executable with a compatibility warning and can
+restore the included runtime at any time. A legacy `REPOPROMPT_CODEX_EXECUTABLE`
+value is ignored when no runtime preference was ever saved, with a redacted notice
+in Settings rather than implicit execution. Previously saved explicit external path
+selections remain intact. Settings separately reports the immutable active launch
+selection and a saved next-launch selection when they differ, while all runtime consumers
+retain the process-wide active selection until relaunch. Model availability continues to
+come from runtime metadata and existing explicit model selections are not rewritten.
+External version validation uses the captured launch environment, including its interpreter
+search path.
+RepoPrompt rejects custom executables older than 0.149.0, the last proven external
+compatibility floor. This is intentionally distinct from the exact bundled and schema-gate
+pin at 0.153.4: the only consumed schema delta in this rotation is the additive incoming
+`interrupted` status, which RepoPrompt already handles, and no new outgoing request requires
+0.153.4. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.
@@ -130,7 +137,7 @@ To diagnose acquisition independently of a build, run:
 python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
-  --package .build/codex-runtime/0.149.0/aarch64-apple-darwin
+  --package .build/codex-runtime/0.153.4/aarch64-apple-darwin
 python3 Scripts/codex_runtime_artifact.py stage-bundle \
   --arch all \
   --cache-root .build/codex-runtime \
@@ -152,8 +159,8 @@ does not edit or replace `Vendor/Codex/manifest.json`. Select exactly one explic
 stable version/tag, or opt in explicitly to GitHub's latest stable release:
 
 ```bash
-make codex-update-candidate CODEX_CANDIDATE_VERSION=0.150.0
-make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.150.0
+make codex-update-candidate CODEX_CANDIDATE_VERSION=0.154.0
+make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.154.0
 make codex-update-candidate CODEX_CANDIDATE_LATEST=1
 ```
 
@@ -175,13 +182,13 @@ inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
 The official output directory contains a proposed `candidate-manifest.json`,
 `candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
 checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
-0.149.0 pin remains authoritative
+0.153.4 pin remains authoritative
 until a maintainer reviews and deliberately applies a complete rotation change.
 
-The known-good rollback for the 0.149.0 rotation is verified Codex 0.147.0
-(`rust-v0.147.0`; arm64 package archive SHA-256
-`17b2984eb22b607e3d0c25728252fc90f510e476bad39a6d9f45cdb1aa685432`, x86_64
-package archive SHA-256 `d91e59133daf923bc45d76e3da4af8ae9ef62a0231da18488da0cd573b6e9d63`).
+The known-good rollback for the 0.153.4 rotation is verified Codex 0.149.0
+(`rust-v0.149.0`; arm64 package archive SHA-256
+`6c7589a52fe90e3742e35662115a4c55c39715601df0d41345ba8ec8f4221d4e`, x86_64
+package archive SHA-256 `ba332e647cc898e3b4e86a3bc6e8db414a124eb88d8480f4707bbc66b0432f9d`).
 After a reviewed rotation, roll back by reverting the complete rotation change and
 rebuilding from the restored manifest rather than mixing old and new authority files.
 

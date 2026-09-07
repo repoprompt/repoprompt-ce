@@ -9,7 +9,7 @@ final class CodexExecAgentProviderRuntimePreparationTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         let executable = directory.appendingPathComponent("codex")
-        try "#!/bin/sh\necho 'codex 0.149.0'\n".write(to: executable, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\necho 'codex 0.153.4'\n".write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let recorder = PreparedRuntimeRecorder()
         let provider = CodexExecAgentProvider(

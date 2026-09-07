@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "minimumCodexVersion": "0.149.0",
+  "minimumCodexVersion": "0.153.4",
   "experimental": true,
   "methodChecks": [
     {
@@ -463,7 +463,8 @@
           "completed",
           "declined",
           "failed",
-          "inProgress"
+          "inProgress",
+          "interrupted"
         ]
       }
     },

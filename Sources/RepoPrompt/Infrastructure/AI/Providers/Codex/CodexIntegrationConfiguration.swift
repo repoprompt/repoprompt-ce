@@ -894,7 +894,7 @@ enum CodexIntegrationConfiguration {
         supportsDirectOnlyToolNamespaces: Bool
     ) -> String? {
         guard supportsDirectOnlyToolNamespaces else {
-            return "RepoPrompt did not update Codex config because this external Codex version predates RepoPrompt's app-server contract (minimum \(CodexRuntimeAuthority.minimumExternalVersion)). Update the explicit override or use the bundled runtime."
+            return "RepoPrompt did not update Codex config because this external Codex version predates RepoPrompt's external-runtime compatibility floor (minimum \(CodexRuntimeAuthority.minimumExternalVersion)). Update the explicit override or use the bundled runtime."
         }
 
         let codeModePath = ["features", "code_mode"]
