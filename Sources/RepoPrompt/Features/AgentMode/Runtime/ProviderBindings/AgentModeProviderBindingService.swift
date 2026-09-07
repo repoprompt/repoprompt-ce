@@ -79,7 +79,20 @@ final class AgentModeProviderBindingService {
         case .safeManaged:
             return .mcpSafeDefaults
         case .inheritProviderSettings:
-            return .userConfigured
+            switch provider {
+            case .codex:
+                return .providerOverride(.codex(CodexAgentToolPreferences.permissionLevel(
+                    defaults: defaults,
+                    secureStore: preferences.securePermissions
+                )))
+            case .claude:
+                return .providerOverride(.claude(ClaudeAgentToolPreferences.permissionLevel(
+                    defaults: defaults,
+                    secureStore: preferences.securePermissions
+                )))
+            case .none, .openCode, .cursor, .grokBuild:
+                return .mcpSafeDefaults
+            }
         case .custom:
             guard let provider else { return .mcpSafeDefaults }
             let level = AgentModePermissionPreferences.providerSubagentPermissionLevel(

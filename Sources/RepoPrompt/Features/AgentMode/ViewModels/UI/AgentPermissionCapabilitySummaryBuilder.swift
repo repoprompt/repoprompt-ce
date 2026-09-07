@@ -100,27 +100,23 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .claude:
             let permissionMode: String
             let bash: Bool
-            let strict: Bool
             let warnings: [String]
             switch profile {
             case .userConfigured:
                 let level = ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
                 permissionMode = level.displayName
                 bash = ClaudeAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions)
-                strict = ClaudeAgentToolPreferences.mcpStrictModeEnabled(defaults: defaults, secureStore: securePermissions)
                 warnings = level == .fullAccess
                     ? ["Permission mode is Full Access — tools run without approval."]
                     : []
             case .mcpSafeDefaults:
                 permissionMode = ClaudeAgentToolPreferences.PermissionLevel.requireApproval.displayName
                 bash = false
-                strict = true
                 warnings = []
             case .providerOverride:
                 let level = claudePermissionLevel(profile: profile)
                 permissionMode = level.displayName
                 bash = ClaudeAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions)
-                strict = ClaudeAgentToolPreferences.mcpStrictModeEnabled(defaults: defaults, secureStore: securePermissions)
                 warnings = level == .fullAccess
                     ? ["Permission mode is Full Access — tools run without approval."]
                     : []
@@ -131,9 +127,9 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 isAvailable: isAvailable,
                 fileMutation: "Permission mode: \(permissionMode)",
                 shell: bash ? "Bash enabled" : "Bash disabled",
-                externalMCP: strict
-                    ? "Third-party MCP: RepoPrompt only"
-                    : "Third-party MCP: all servers",
+                externalMCP: profile == .userConfigured
+                    ? "Third-party MCP: selected from RepoPrompt catalog"
+                    : "Third-party MCP: suppressed",
                 search: ClaudeAgentToolPreferences.toolSearchEnabled(defaults: defaults)
                     ? "Tool search allowed"
                     : "Tool search disabled",
