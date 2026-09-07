@@ -326,6 +326,54 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertEqual(store.diagnostic(for: .codex)?.kind, .keychainWriteFailed)
     }
 
+    func testProviderMCPSelectionsNormalizePersistAndSurviveRestart() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        secureStrings.plainValues[AgentPermissionSecureDomain.codex.storageKey] = try encode(
+            SecureCodexPermissionDocument(
+                schemaVersion: 1,
+                mcpServerTogglesByNormalizedName: [
+                    " NewServer ": true,
+                    "RepoPromptCE": false,
+                    "": true
+                ]
+            )
+        )
+        secureStrings.plainValues[AgentPermissionSecureDomain.claude.storageKey] = try encode(
+            SecureClaudePermissionDocument(
+                schemaVersion: 1,
+                mcpServerTogglesByNormalizedName: [
+                    " NEWSERVER ": true,
+                    "repopromptce": false
+                ]
+            )
+        )
+
+        let store = makeStore(secureStrings: secureStrings)
+        XCTAssertTrue(store.codexPermissions().mcpServerEnabled(normalizedName: "newserver"))
+        XCTAssertTrue(store.claudePermissions().mcpServerEnabled(normalizedName: "NewServer"))
+        XCTAssertTrue(store.codexPermissions().mcpServerEnabled(normalizedName: "RepoPromptCE"))
+        XCTAssertTrue(store.claudePermissions().mcpServerEnabled(normalizedName: "repopromptce"))
+        XCTAssertFalse(store.codexPermissions().mcpServerEnabled(normalizedName: "discovered-later"))
+        XCTAssertFalse(store.claudePermissions().mcpServerEnabled(normalizedName: "discovered-later"))
+
+        let savedCodex = try decode(
+            SecureCodexPermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.codex.storageKey]
+        )
+        let savedClaude = try decode(
+            SecureClaudePermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.claude.storageKey]
+        )
+        XCTAssertEqual(savedCodex.schemaVersion, SecureCodexPermissionDocument.currentSchemaVersion)
+        XCTAssertEqual(savedClaude.schemaVersion, SecureClaudePermissionDocument.currentSchemaVersion)
+        XCTAssertEqual(savedCodex.mcpServerTogglesByNormalizedName, ["newserver": true])
+        XCTAssertEqual(savedClaude.mcpServerTogglesByNormalizedName, ["newserver": true])
+
+        let restarted = makeStore(secureStrings: secureStrings)
+        XCTAssertTrue(restarted.codexPermissions().mcpServerEnabled(normalizedName: "NEWSERVER"))
+        XCTAssertTrue(restarted.claudePermissions().mcpServerEnabled(normalizedName: " newserver "))
+    }
+
     private func makeStore(
         secureStrings: FakeSecurePlainStringStore,
         notificationCenter: NotificationCenter = NotificationCenter()
