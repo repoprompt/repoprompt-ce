@@ -43,7 +43,7 @@ final class SwitchboardControllerRuntimeFixture {
         let configURL = repository.appendingPathComponent(".build/validation-artifacts/\(configurationName)/config.json")
         guard FileManager.default.fileExists(atPath: configURL.path) else { throw XCTSkip("Configure the pinned real-runtime integration fixture explicitly.") }
         let fields: Set<String> = mode == .manual ? ["resources", "source"] : [
-            "resources", "source", "native_sha256", "metadata_sha256", "python", "python_sha256",
+            "resources", "source", "native_sha256", "metadata_sha256", "python", "python_sha256"
         ]
         guard let config = try JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: String],
               Set(config.keys) == fields, let resourcePath = config["resources"], let source = config["source"] else { throw Failure.unavailable }
@@ -308,7 +308,7 @@ final class SwitchboardControllerRuntimeFixture {
                         "helper_integrity", "interpreter", "arguments", "source_integrity", "source_load",
                         "source_load_config", "source_load_rotation_rules", "source_load_repoprompt_bridge",
                         "source_load_global_rotation_wire", "source_load_global_rotation", "private_state",
-                        "loopback_server", "bridge_server", "pairing", "ready", "commands",
+                        "loopback_server", "bridge_server", "pairing", "ready", "commands"
                     ])
                     guard let stage = value["stage"] as? String, allowed.contains(stage) else { throw Failure.unavailable }
                     throw Failure.stage(stage)
