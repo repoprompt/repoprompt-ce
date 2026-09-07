@@ -101,6 +101,60 @@ struct SwitchboardAutomaticEnrollment: Equatable, SwitchboardAutomaticPrivateVal
     }
 }
 
+struct SwitchboardAutomaticOffer: Equatable, SwitchboardAutomaticPrivateValue {
+    let id: UUID
+    let enrollment: SwitchboardAutomaticEnrollment
+    let name: String
+    let accounts: [String]
+    let triggerUsedPercent: Int64
+    let destinationRemainingPercent: Int64
+    let cooldownMinutes: Int64
+    let freshnessSeconds: Int64
+    let expiresAt: Date
+
+    init(_ value: SwitchboardJSONValue?) throws {
+        let o = try SwitchboardAutomaticWire.object(value, keys: ["offer_id", "enrollment", "policy", "expires_at"])
+        id = try o.uuid("offer_id")
+        enrollment = try .init(o["enrollment"])
+        expiresAt = try Date(timeIntervalSince1970: Double(o.integer("expires_at")))
+        let p = try SwitchboardAutomaticWire.object(o["policy"], keys: ["name", "accounts", "trigger_used_percent", "destination_remaining_percent", "cooldown_minutes", "freshness_seconds"])
+        name = try p.text("name", maxBytes: 192)
+        guard name.count <= 48 else { throw SwitchboardBridgeError.invalidRequest }
+        accounts = try p.array("accounts", maximum: 32).map { try ["email": $0].text("email", maxBytes: 257) }
+        guard accounts.count >= 2, Set(accounts).count == accounts.count,
+              accounts.allSatisfy({ $0.range(of: "^[^\\s@]{1,128}@[^\\s@]{1,128}$", options: .regularExpression) != nil })
+        else { throw SwitchboardBridgeError.invalidRequest }
+        triggerUsedPercent = try p.integer("trigger_used_percent", minimum: 50, maximum: 99)
+        destinationRemainingPercent = try p.integer("destination_remaining_percent", minimum: 5, maximum: 80)
+        cooldownMinutes = try p.integer("cooldown_minutes", minimum: 1, maximum: 1440)
+        freshnessSeconds = try p.integer("freshness_seconds", minimum: 30, maximum: 900)
+        guard 100 - destinationRemainingPercent < triggerUsedPercent else { throw SwitchboardBridgeError.invalidRequest }
+        let digest = try Self.policyDigest(
+            ruleID: enrollment.ruleID,
+            accounts: accounts,
+            trigger: triggerUsedPercent,
+            remaining: destinationRemainingPercent,
+            cooldown: cooldownMinutes,
+            freshness: freshnessSeconds
+        )
+        guard digest == enrollment.ruleDigest else { throw SwitchboardBridgeError.identityMismatch }
+    }
+
+    static func policyDigest(ruleID: String, accounts: [String], trigger: Int64, remaining: Int64, cooldown: Int64, freshness: Int64) throws -> String {
+        let fields: [String: Any] = [
+            "id": ruleID,
+            "provider": "codex",
+            "accounts": accounts.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) },
+            "trigger_used_percent": trigger,
+            "destination_remaining_percent": remaining,
+            "cooldown_minutes": cooldown,
+            "freshness_seconds": freshness
+        ]
+        let data = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys, .withoutEscapingSlashes])
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 struct SwitchboardAutomaticControl: Equatable, SwitchboardAutomaticPrivateValue {
     enum State: String { case enabled, pausing, paused, pausingUnknown = "pausing_unknown" }
     let epoch: Int64
