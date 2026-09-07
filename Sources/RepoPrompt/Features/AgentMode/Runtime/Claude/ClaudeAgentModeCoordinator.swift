@@ -110,6 +110,7 @@ final class ClaudeAgentModeCoordinator {
         let permissionMode: String?
         let allowNativeBashTool: Bool?
         let mcpStrictMode: Bool?
+        let mcpCatalogScope: MCPServerCatalogAuthority.Scope
     }
 
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeSteering")
@@ -172,7 +173,8 @@ final class ClaudeAgentModeCoordinator {
             runtimeVariant: launchSettings.runtimeVariant,
             permissionMode: launchSettings.permissionMode,
             allowNativeBashTool: launchSettings.allowNativeBashTool,
-            mcpStrictMode: launchSettings.mcpStrictMode
+            mcpStrictMode: launchSettings.mcpStrictMode,
+            mcpCatalogScope: launchSettings.mcpCatalogScope
         )
         let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: coreConfig, mode: .agentMode)
         return ClaudeCompatibleNativeSessionAdapter(runtimeConfig: runtimeConfig) {
@@ -360,6 +362,7 @@ final class ClaudeAgentModeCoordinator {
         ).effectiveMode
         let effectiveAllowNativeBashTool = runtimePermission.allowNativeBashTool
         let effectiveMCPStrictMode = runtimePermission.mcpStrictMode
+        let effectiveMCPCatalogScope = runtimePermission.mcpCatalogScope
 
         // If the session's Claude runtime variant or effective permission mode no
         // longer matches the controller, recycle it so the next process launches
@@ -371,8 +374,9 @@ final class ClaudeAgentModeCoordinator {
         let permissionModeChanged = currentLaunchSettings?.permissionMode != effectivePermissionMode
         let bashToolChanged = currentLaunchSettings?.allowNativeBashTool != effectiveAllowNativeBashTool
         let mcpStrictModeChanged = currentLaunchSettings?.mcpStrictMode != effectiveMCPStrictMode
+        let mcpCatalogScopeChanged = currentLaunchSettings?.mcpCatalogScope != effectiveMCPCatalogScope
         if let existingController = session.claudeController,
-           runtimeVariantChanged || permissionModeChanged || bashToolChanged || mcpStrictModeChanged
+           runtimeVariantChanged || permissionModeChanged || bashToolChanged || mcpStrictModeChanged || mcpCatalogScopeChanged
         {
             let hasTurnInFlight = await existingController.hasTurnInFlight
             guard intentIsCurrent(intent, for: session),
@@ -425,7 +429,8 @@ final class ClaudeAgentModeCoordinator {
                 workspacePath: runtimeWorkspacePath,
                 permissionMode: effectivePermissionMode,
                 allowNativeBashTool: effectiveAllowNativeBashTool,
-                mcpStrictMode: effectiveMCPStrictMode
+                mcpStrictMode: effectiveMCPStrictMode,
+                mcpCatalogScope: effectiveMCPCatalogScope
             )
             let createdController = claudeControllerFactory(
                 runID,
@@ -493,7 +498,8 @@ final class ClaudeAgentModeCoordinator {
             workspacePath: runtimeWorkspacePath,
             permissionMode: effectivePermissionMode,
             allowNativeBashTool: runtimePermission.allowNativeBashTool,
-            mcpStrictMode: runtimePermission.mcpStrictMode
+            mcpStrictMode: runtimePermission.mcpStrictMode,
+            mcpCatalogScope: runtimePermission.mcpCatalogScope
         )
         return controllerLaunchSettingsByTabID[session.tabID] != expected
     }
@@ -707,7 +713,8 @@ final class ClaudeAgentModeCoordinator {
                 workspacePath: retryWorkspacePath,
                 permissionMode: effectivePermissionMode,
                 allowNativeBashTool: effectiveAllowNativeBashTool,
-                mcpStrictMode: effectiveMCPStrictMode
+                mcpStrictMode: effectiveMCPStrictMode,
+                mcpCatalogScope: effectiveMCPCatalogScope
             )
             let freshController = claudeControllerFactory(
                 intent.runID,
@@ -1476,7 +1483,8 @@ final class ClaudeAgentModeCoordinator {
             return ClaudeControllerLaunchPolicy(
                 permissionMode: session.permissionProfile.claudePermissionMode,
                 allowNativeBashTool: session.permissionProfile == .mcpSafeDefaults ? false : nil,
-                mcpStrictMode: session.permissionProfile == .mcpSafeDefaults ? true : nil
+                mcpStrictMode: true,
+                mcpCatalogScope: session.permissionProfile == .userConfigured ? .directSelected : .repoPromptOnly
             )
         }
         let permissionMode = providerBindingService.runtimePermission(

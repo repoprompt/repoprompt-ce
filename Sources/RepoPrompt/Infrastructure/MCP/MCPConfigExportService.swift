@@ -142,6 +142,10 @@ actor MCPConfigExportService {
         try makeLease(prefix: "discovery", contents: renderServerConfig())
     }
 
+    func prepareLaunchConfig(contents: String) throws -> MCPConfigLease {
+        try makeLease(prefix: "agent", contents: contents)
+    }
+
     /// Creates a unique empty config so a process cannot load the user's default MCP config.
     func prepareEmptyLaunchConfig() throws -> MCPConfigLease {
         try makeLease(

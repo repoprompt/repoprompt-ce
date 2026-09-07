@@ -4,6 +4,7 @@ struct ClaudeControllerLaunchPolicy: Equatable {
     let permissionMode: String?
     let allowNativeBashTool: Bool?
     let mcpStrictMode: Bool?
+    let mcpCatalogScope: MCPServerCatalogAuthority.Scope
 
     @MainActor
     static func resolve(
@@ -17,19 +18,28 @@ struct ClaudeControllerLaunchPolicy: Equatable {
             ClaudeControllerLaunchPolicy(
                 permissionMode: permissionMode,
                 allowNativeBashTool: false,
-                mcpStrictMode: true
+                mcpStrictMode: true,
+                mcpCatalogScope: .repoPromptOnly
             )
-        case .userConfigured, .providerOverride:
+        case .userConfigured:
             ClaudeControllerLaunchPolicy(
                 permissionMode: permissionMode,
                 allowNativeBashTool: ClaudeAgentToolPreferences.bashToolEnabled(
                     defaults: defaults,
                     secureStore: securePermissions
                 ),
-                mcpStrictMode: ClaudeAgentToolPreferences.mcpStrictModeEnabled(
+                mcpStrictMode: true,
+                mcpCatalogScope: .directSelected
+            )
+        case .providerOverride:
+            ClaudeControllerLaunchPolicy(
+                permissionMode: permissionMode,
+                allowNativeBashTool: ClaudeAgentToolPreferences.bashToolEnabled(
                     defaults: defaults,
                     secureStore: securePermissions
-                )
+                ),
+                mcpStrictMode: true,
+                mcpCatalogScope: .repoPromptOnly
             )
         }
     }

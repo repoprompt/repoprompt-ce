@@ -6,7 +6,7 @@ final class MCPServerCatalogAuthority: @unchecked Sendable {
         case claude
     }
 
-    enum Scope {
+    enum Scope: Equatable {
         case directSelected
         case repoPromptOnly
     }

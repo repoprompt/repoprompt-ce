@@ -75,4 +75,26 @@ final class MCPServerCatalogAuthorityTests: XCTestCase {
         XCTAssertEqual(overrides["mcp_servers.disabledserver.enabled"] as? Bool, false)
         XCTAssertEqual(overrides["mcp_servers.repopromptce.enabled"] as? Bool, true)
     }
+
+    func testDirectClaudeLaunchAlwaysUsesStrictRepoPromptConfig() async {
+        let config = ClaudeCodeAgentConfig.agentMode(mcpStrictMode: false)
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: config
+        )
+        let url = URL(fileURLWithPath: "/redacted/generated-mcp.json")
+
+        let arguments = await controller.test_buildArguments(
+            existingSessionID: nil,
+            model: nil,
+            configURL: url
+        )
+
+        XCTAssertEqual(config.mcpCatalogScope, .directSelected)
+        XCTAssertTrue(arguments.contains("--strict-mcp-config"))
+        XCTAssertEqual(arguments.suffix(3), ["--mcp-config", url.path, "--strict-mcp-config"])
+    }
 }

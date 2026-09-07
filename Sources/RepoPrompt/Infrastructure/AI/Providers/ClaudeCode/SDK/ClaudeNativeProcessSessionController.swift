@@ -561,7 +561,13 @@ final actor ClaudeNativeProcessSessionController {
         guard isRunning else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
         }
-        configLease = try await configService.prepareLaunchConfig()
+        let selectedCatalog = try MCPServerCatalogAuthority.shared.catalog(
+            for: .claude,
+            scope: config.mcpCatalogScope
+        )
+        configLease = try await configService.prepareLaunchConfig(
+            contents: selectedCatalog.renderClaudeJSON()
+        )
     }
 
     private func startProcessIfNeeded(
@@ -592,7 +598,8 @@ final actor ClaudeNativeProcessSessionController {
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
         let arguments = buildArguments(
             existingSessionID: existingSessionID,
-            model: nil
+            model: nil,
+            configURL: configURL
         )
 
         let workingDirectory = resolvedWorkingDirectory()
@@ -1711,7 +1718,15 @@ final actor ClaudeNativeProcessSessionController {
             existingSessionID: String?,
             model: String?
         ) -> [String] {
-            buildArguments(existingSessionID: existingSessionID, model: model)
+            buildArguments(existingSessionID: existingSessionID, model: model, configURL: configURL)
+        }
+
+        func test_buildArguments(
+            existingSessionID: String?,
+            model: String?,
+            configURL: URL
+        ) -> [String] {
+            buildArguments(existingSessionID: existingSessionID, model: model, configURL: configURL)
         }
 
         @discardableResult
@@ -1970,7 +1985,8 @@ final actor ClaudeNativeProcessSessionController {
 
     private func buildArguments(
         existingSessionID: String?,
-        model: String?
+        model: String?,
+        configURL: URL? = nil
     ) -> [String] {
         var args: [String] = [
             "-p",
@@ -1998,9 +2014,7 @@ final actor ClaudeNativeProcessSessionController {
         }
         if let configURL {
             args.append(contentsOf: ["--mcp-config", configURL.path])
-            if config.mcpStrictMode {
-                args.append("--strict-mcp-config")
-            }
+            args.append("--strict-mcp-config")
         }
         if !config.disallowedBuiltInTools.isEmpty {
             args.append(contentsOf: ["--disallowedTools", config.disallowedBuiltInTools.joined(separator: ",")])
