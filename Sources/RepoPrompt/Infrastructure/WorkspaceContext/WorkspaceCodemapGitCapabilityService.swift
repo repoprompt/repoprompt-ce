@@ -884,9 +884,11 @@ actor WorkspaceCodemapGitCapabilityService {
                 expectedLayout: capability.repositoryLayout,
                 prefix: capability.repositoryRelativeLoadedRootPrefix
             )
-            // Earlier root-wide churn does not invalidate the current request, but this request
-            // must observe one unchanged root authority across its two captures.
-            guard preRepository == postRepository else {
+            // Candidate-local fingerprints and attributes establish source stability. Unrelated
+            // index or metadata churn must not reject the entire batch.
+            guard preRepository.sourceClassificationEvidence == postRepository.sourceClassificationEvidence,
+                  preRepository.matchesSourceAuthorityStability(of: postRepository)
+            else {
                 hooks.sourceAuthorityRejected(.repositoryAuthorityChangedDuringIssuance)
                 return unavailable
             }

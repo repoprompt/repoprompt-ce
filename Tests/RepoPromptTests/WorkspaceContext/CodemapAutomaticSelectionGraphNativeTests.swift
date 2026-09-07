@@ -3,6 +3,55 @@ import Foundation
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
+    func testUnrelatedGitIndexChurnDoesNotRestartGraphPage() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root",
+            files: [
+                "Sources/First.swift": "struct First {}\n",
+                "Sources/Second.swift": "struct Second {}\n"
+            ]
+        )
+        let indexURL = rootURL.appendingPathComponent(".git/index")
+        let authorityCaptures = CodemapLockedValues<Int>()
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterFirstAuthorityCapture: {
+                    let shouldChurn = !authorityCaptures.values.isEmpty
+                    authorityCaptures.append(1)
+                    if shouldChurn {
+                        try? FileManager.default.setAttributes(
+                            [.modificationDate: Date()],
+                            ofItemAtPath: indexURL.path
+                        )
+                    }
+                }
+            )
+        )
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+
+        let engine = try fixture.runtime().bindingEngine()
+        let rootAccounting = try await waitForGraphCompletion(
+            engine: engine,
+            rootID: loaded.id
+        )
+
+        XCTAssertEqual(rootAccounting.phase, .complete)
+        XCTAssertEqual(rootAccounting.retryAttempt, 0)
+        XCTAssertNil(rootAccounting.retry)
+        XCTAssertEqual(rootAccounting.progress.counts.processedCandidateCount, 2)
+        XCTAssertGreaterThan(authorityCaptures.values.count, 1)
+        let accounting = await engine.accounting()
+        XCTAssertEqual(accounting.counters.graphIndexRetries, 0)
+    }
+
     func testNestedRepositoryGraphUsesValidatedWorktreeBytesAndCompletesWithoutRetry() async throws {
         let repository = try ReviewGitRepositoryFixture(name: #function)
         let relativePath = "Nested/Sources/Feature.swift"

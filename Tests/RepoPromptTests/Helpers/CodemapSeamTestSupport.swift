@@ -37,7 +37,10 @@ final class CodemapStoreFixture: @unchecked Sendable {
     private let runtimeTracker: CodemapRuntimeTracker
     private let runtimeProvider: CodeMapArtifactRuntimeProvider
 
-    init(name: String) throws {
+    init(
+        name: String,
+        capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks = .none
+    ) throws {
         let registry = WorkspaceCodemapBindingIntegrationRegistry()
         let builtSourceTexts = CodemapLockedValues<String>()
         let runtimeTracker = CodemapRuntimeTracker()
@@ -79,7 +82,8 @@ final class CodemapStoreFixture: @unchecked Sendable {
                             namespaceSalt: Data(
                                 repeating: 0x6C,
                                 count: GitBlobRepositoryNamespace.saltByteCount
-                            )
+                            ),
+                            hooks: capabilityHooks
                         ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),
                         catalogClient: registry.makeBindingCatalogClient()
