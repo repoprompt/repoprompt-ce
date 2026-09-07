@@ -41,13 +41,14 @@ enum AgentMCPSelectionResolver {
         defaultTaskLabel: AgentModelCatalog.TaskLabelKind? = nil,
         availability: AgentModelCatalog.AvailabilityContext = .current,
         workspaceID: UUID? = nil,
-        roleSelectionProvider: RoleSelectionProvider? = nil
+        roleSelectionProvider: RoleSelectionProvider? = nil,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general
     ) throws -> ResolvedSelection {
         let trimmed = modelID?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmed, !trimmed.isEmpty else {
             // No explicit model_id — use default global role if provided
             if let defaultKind = defaultTaskLabel,
-               let resolved = resolveRoleSelection(defaultKind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider)
+               let resolved = try resolveRoleSelection(defaultKind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider, surface: surface)
             {
                 return ResolvedSelection(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw, taskLabelKind: defaultKind)
             }
@@ -58,7 +59,7 @@ enum AgentMCPSelectionResolver {
         if !trimmed.contains(":") {
             let lowered = trimmed.lowercased()
             if let entry = AgentModelCatalog.taskLabels.first(where: { $0.label == lowered }) {
-                guard let resolved = resolveRoleSelection(entry.kind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider) else {
+                guard let resolved = try resolveRoleSelection(entry.kind, availability: availability, workspaceID: workspaceID, roleSelectionProvider: roleSelectionProvider, surface: surface) else {
                     throw MCPError.invalidParams("No available agent/model for task label '\(trimmed)'.")
                 }
                 return ResolvedSelection(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw, taskLabelKind: entry.kind)
@@ -79,6 +80,12 @@ enum AgentMCPSelectionResolver {
         guard let agent = AgentProviderKind(rawValue: parsed.agentRaw) else {
             throw MCPError.invalidParams(
                 "Unknown agent '\(parsed.agentRaw)' in model_id. Use agent_manage op=list_agents."
+            )
+        }
+
+        guard surface.allows(agent) else {
+            throw MCPError.invalidParams(
+                "Agent '\(parsed.agentRaw)' is available only in interactive Agent Mode and cannot run headlessly."
             )
         }
 
@@ -105,14 +112,17 @@ enum AgentMCPSelectionResolver {
         _ role: AgentModelCatalog.TaskLabelKind,
         availability: AgentModelCatalog.AvailabilityContext,
         workspaceID: UUID?,
-        roleSelectionProvider: RoleSelectionProvider?
-    ) -> AgentModelCatalog.NormalizedAgentSelection? {
-        if let provided = roleSelectionProvider?(role, availability) {
-            return provided
+        roleSelectionProvider: RoleSelectionProvider?,
+        surface: AgentModelCatalog.AgentSelectionSurface
+    ) throws -> AgentModelCatalog.NormalizedAgentSelection? {
+        let resolved = roleSelectionProvider?(role, availability)
+            ?? MCPAgentRoleDefaultsService.effectiveNormalizedSelection(for: role, availability: availability, workspaceID: workspaceID)
+            ?? AgentModelCatalog.resolveTaskLabelKind(role, availability: availability)
+        if let resolved, !surface.allows(resolved.agent) {
+            throw MCPError.invalidParams(
+                "Agent '\(resolved.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
+            )
         }
-        if let effective = MCPAgentRoleDefaultsService.effectiveNormalizedSelection(for: role, availability: availability, workspaceID: workspaceID) {
-            return effective
-        }
-        return AgentModelCatalog.resolveTaskLabelKind(role, availability: availability)
+        return resolved
     }
 }

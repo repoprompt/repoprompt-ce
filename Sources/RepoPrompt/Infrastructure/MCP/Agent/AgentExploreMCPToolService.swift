@@ -224,7 +224,8 @@ struct AgentExploreMCPToolService {
             modelID: nil,
             defaultTaskLabel: .explore,
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
+            workspaceID: workspace.id,
+            surface: .headless
         )
         return ExploreStartContext(
             metadata: metadata,

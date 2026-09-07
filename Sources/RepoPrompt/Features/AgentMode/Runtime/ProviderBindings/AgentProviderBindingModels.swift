@@ -17,6 +17,7 @@ enum AgentProviderPermissionLevelID: Hashable {
     case codex(CodexAgentToolPreferences.PermissionLevel)
     case claude(ClaudeAgentToolPreferences.PermissionLevel)
     case openCode(OpenCodeAgentToolPreferences.PermissionLevel)
+    case antigravity(AntigravityAgentToolPreferences.PermissionLevel)
     case cursor(CursorAgentToolPreferences.PermissionLevel)
     case grokBuild(GrokBuildAgentToolPreferences.PermissionLevel)
 
@@ -28,6 +29,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .claude
         case .openCode:
             .openCode
+        case .antigravity:
+            .antigravity
         case .cursor:
             .cursor
         case .grokBuild:
@@ -43,6 +46,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .claude(.requireApproval)
         case .openCode:
             .openCode(.managedDefault)
+        case .antigravity:
+            .antigravity(.autoEdit)
         case .cursor:
             .cursor(.managedDefault)
         case .grokBuild:
@@ -58,6 +63,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             ClaudeAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.claude)
         case .openCode:
             OpenCodeAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.openCode)
+        case .antigravity:
+            AntigravityAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.antigravity)
         case .cursor:
             CursorAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.cursor)
         case .grokBuild:
@@ -77,6 +84,9 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .openCode:
             guard let level = OpenCodeAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .openCode(level)
+        case .antigravity:
+            guard let level = AntigravityAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            self = .antigravity(level)
         case .cursor:
             guard let level = CursorAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .cursor(level)
@@ -94,6 +104,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.rawValue
         case let .openCode(level):
             level.rawValue
+        case let .antigravity(level):
+            level.rawValue
         case let .cursor(level):
             level.rawValue
         case let .grokBuild(level):
@@ -108,6 +120,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .claude(level):
             level.displayName
         case let .openCode(level):
+            level.displayName
+        case let .antigravity(level):
             level.displayName
         case let .cursor(level):
             level.displayName
@@ -124,6 +138,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.iconName
         case let .openCode(level):
             level.iconName
+        case let .antigravity(level):
+            level.iconName
         case let .cursor(level):
             level.iconName
         case let .grokBuild(level):
@@ -139,6 +155,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .openCode(level):
             level.detailText
+        case let .antigravity(level):
+            level.detailText
         case let .cursor(level):
             level.detailText
         case let .grokBuild(level):
@@ -153,6 +171,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .claude(level):
             level.isWarning
         case let .openCode(level):
+            level.isWarning
+        case let .antigravity(level):
             level.isWarning
         case let .cursor(level):
             level.isWarning

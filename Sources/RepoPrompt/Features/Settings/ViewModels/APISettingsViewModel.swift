@@ -389,6 +389,7 @@ public class APISettingsViewModel: ObservableObject {
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
             grokBuildAvailable: isGrokBuildConnected,
+            antigravityAvailable: AntigravityRuntimeManager.installedRuntimeSync() != nil,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -496,6 +497,8 @@ public class APISettingsViewModel: ObservableObject {
             isCursorConnected
         case .grokBuild:
             isGrokBuildConnected
+        case .antigravity:
+            AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }

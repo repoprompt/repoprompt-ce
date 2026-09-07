@@ -345,13 +345,15 @@ final class AutoRecommendationEngine {
            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
            !modelRaw.isEmpty,
+           AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
            AgentModelCatalog.isAgentAvailable(agent, availability: availability),
            isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
         {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: agent.rawValue,
                 modelRaw: modelRaw,
-                availability: availability
+                availability: availability,
+                surface: .headless
             )
         }
 
@@ -366,11 +368,15 @@ final class AutoRecommendationEngine {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: recommendation.recommendedAgent.rawValue,
                 modelRaw: recommendation.recommendedModel.rawValue,
-                availability: availability
+                availability: availability,
+                surface: .headless
             )
         }
 
-        guard let availableAgent = AgentModelCatalog.selectableAgents(availability: availability).first(where: {
+        guard let availableAgent = AgentModelCatalog.selectableAgents(
+            availability: availability,
+            surface: .headless
+        ).first(where: {
             switch $0 {
             case .claudeCode:
                 enabledRecommendationProviders.contains(.claudeCode)
@@ -382,6 +388,8 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.grokBuild)
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
+            case .antigravity:
+                false
             }
         }) else {
             return nil

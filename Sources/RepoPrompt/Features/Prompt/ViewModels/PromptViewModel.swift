@@ -544,7 +544,7 @@ class PromptViewModel: ObservableObject {
     private var apiSettingsObserver: AnyCancellable?
     private var apiSettingsCancellables = Set<AnyCancellable>()
 
-    @Published private(set) var availableAgentKinds: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
+    @Published private(set) var availableAgentKinds: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none, surface: .headless)
 
     /// Preferred context-builder agent from the effective Agent Models profile.
     @Published var contextBuilderAgent: AgentProviderKind = .claudeCode {
@@ -606,7 +606,7 @@ class PromptViewModel: ObservableObject {
     }
 
     private func refreshAvailableAgentKinds() {
-        availableAgentKinds = AgentModelCatalog.selectableAgents(availability: agentAvailabilityContext)
+        availableAgentKinds = AgentModelCatalog.selectableAgents(availability: agentAvailabilityContext, surface: .headless)
     }
 
     private func resolvedPersistedContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection? {

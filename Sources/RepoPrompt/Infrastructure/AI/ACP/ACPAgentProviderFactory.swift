@@ -46,6 +46,8 @@ enum ACPAgentProviderFactory {
                     apiKey: grokAPIKeyProvider()
                 )
             )
+        case .antigravity:
+            AntigravityACPAgentProvider()
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil
         }

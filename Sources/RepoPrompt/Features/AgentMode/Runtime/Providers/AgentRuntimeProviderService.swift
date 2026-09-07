@@ -41,6 +41,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case openCode
     case cursor
     case grokBuild
+    case antigravity
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
@@ -68,6 +69,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "cursor-agent"
         case .grokBuild:
             "grok"
+        case .antigravity:
+            "agy_acp_server.par"
         }
     }
 
@@ -83,6 +86,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "Cursor CLI"
         case .grokBuild:
             "Grok Build"
+        case .antigravity:
+            "Google Antigravity"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -104,6 +109,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.cursorMCPClientID
         case .grokBuild:
             Self.grokBuildMCPClientID
+        case .antigravity:
+            "antigravity"
         }
     }
 
@@ -115,6 +122,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .cursor
         case .grokBuild:
             .grokBuild
+        case .antigravity:
+            .antigravity
         case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             nil
         }
@@ -124,7 +133,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor, .grokBuild:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
             false
         }
     }
@@ -135,14 +144,14 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
         }
     }
 
     var requiresPrePromptAgentModeMCPRouting: Bool {
         switch self {
-        case .cursor, .grokBuild:
+        case .cursor, .grokBuild, .antigravity:
             false
         case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
@@ -156,6 +165,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "Anthropic's Claude Code agent. Strong at general-purpose development, code understanding, architecture, and open-ended reasoning tasks."
         case .codexExec:
             return "OpenAI's Codex CLI agent. Optimized for tool-driven engineering workflows. Supports configurable reasoning effort levels per model."
+        case .antigravity:
+            return "Google Antigravity ACP agent. Available for interactive Agent Mode; headless Context Builder and delegated runs are not supported."
         case .openCode:
             return "OpenCode ACP agent. Interactive Agent Mode uses RepoPrompt MCP tools; headless discovery/delegate runs use RepoPrompt's managed no-native-tools mode."
         case .cursor:
@@ -190,6 +201,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "claude_native"
         case .codexExec:
             "codex_native"
+        case .antigravity:
+            "antigravity_acp"
         case .openCode:
             "opencode_acp"
         case .cursor:
@@ -209,7 +222,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor, .grokBuild:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
             nil
         }
     }
@@ -310,6 +323,10 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created GrokBuildACPHeadlessAgentProvider")
             }
             return GrokBuildACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+        case .antigravity:
+            return UnsupportedHeadlessAgentProvider(
+                reason: "Google Antigravity is currently supported only in interactive Agent Mode. Choose another provider for Context Builder or delegated headless runs."
+            )
         }
     }
 }

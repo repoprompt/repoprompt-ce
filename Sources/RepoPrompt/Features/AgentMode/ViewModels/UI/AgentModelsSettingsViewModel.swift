@@ -476,7 +476,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     func contextBuilderAgentModelMenuItems(windowID: Int) -> [StableMenuItem] {
         let selection = selectedContextBuilderSelection
-        var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
+        var items = AgentModelCatalog.selectableAgents(availability: availability, surface: .headless).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
@@ -489,7 +489,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         AgentProviderSettingsMenuAction.appendStableMenuItem(
             to: &items,
             windowID: windowID,
-            availableAgents: AgentModelCatalog.selectableAgents(availability: availability)
+            availableAgents: AgentModelCatalog.selectableAgents(availability: availability, surface: .headless)
         )
         return items
     }

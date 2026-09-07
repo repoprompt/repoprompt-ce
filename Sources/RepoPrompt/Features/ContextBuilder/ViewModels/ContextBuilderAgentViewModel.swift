@@ -589,7 +589,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @Published private(set) var runModelRaw: String?
     @Published private(set) var codexDynamicModels: [CodexAppServerClient.RemoteModel] = []
     @Published private(set) var acpDynamicModelRevision: Int = 0
-    @Published private(set) var availableAgents: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
+    @Published private(set) var availableAgents: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none, surface: .headless)
     @Published var selectedAgent: AgentProviderKind = .claudeCode {
         didSet {
             guard selectedAgent != oldValue else { return }
@@ -1113,7 +1113,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             agentRaw: agentRaw,
             modelRaw: modelRaw,
             availability: agentAvailabilityContext,
-            codexDynamicModels: codexDynamicModels
+            codexDynamicModels: codexDynamicModels,
+            surface: .headless
         )
     }
 
@@ -1146,7 +1147,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func refreshAvailableAgents() {
-        availableAgents = AgentModelCatalog.selectableAgents(availability: agentAvailabilityContext)
+        availableAgents = AgentModelCatalog.selectableAgents(availability: agentAvailabilityContext, surface: .headless)
     }
 
     private func isModelRawValidForSelectedAgent(_ rawModel: String) -> Bool {

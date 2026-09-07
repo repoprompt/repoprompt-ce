@@ -774,7 +774,9 @@ private enum AppSettingsMCPRegistry {
             key: "context_builder.agent",
             group: "context_builder",
             description: "CLI agent used by the Context Builder MCP tool.",
-            allowedValues: AgentProviderKind.allCases.map(\.rawValue),
+            allowedValues: AgentProviderKind.allCases
+                .filter { AgentModelCatalog.AgentSelectionSurface.headless.allows($0) }
+                .map(\.rawValue),
             read: { .string($0.globalContextBuilderAgentSelection().agentRaw ?? AgentProviderKind.claudeCode.rawValue) },
             write: { store, value in
                 let agentRaw = try requiredString(from: value)
@@ -1358,6 +1360,8 @@ private enum AppSettingsMCPRegistry {
             .codex
         case .openCode:
             .openCode
+        case .antigravity:
+            nil
         case .cursor:
             .cursor
         case .grokBuild:
@@ -1496,7 +1500,7 @@ private enum AppSettingsMCPRegistry {
     static func agentModelRawCandidates(
         request: AppSettingCandidateRequest
     ) throws -> AppSettingCandidatesResult {
-        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: request.availability)
+        let discoveryAgents = AgentModelCatalog.discoveryAgents(availability: request.availability, surface: .headless)
         let filteredAgents: [AgentModelCatalog.DiscoveryAgent] = if let agentFilter = request.agentFilter {
             discoveryAgents.filter { $0.agent == agentFilter && $0.available }
         } else {

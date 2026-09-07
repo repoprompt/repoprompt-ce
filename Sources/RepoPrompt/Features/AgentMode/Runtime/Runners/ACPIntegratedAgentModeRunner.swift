@@ -847,7 +847,7 @@ final class ACPIntegratedAgentModeRunner {
         agentKind: AgentProviderKind,
         modelString: String?
     ) throws -> String? {
-        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild else { return nil }
+        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity else { return nil }
         guard let model = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
@@ -862,13 +862,14 @@ final class ACPIntegratedAgentModeRunner {
                 detail: "Cursor model `\(model)` is not in this release's supported model catalog. Update RepoPrompt CE or choose Cursor Auto."
             )
         }
-        if agentKind == .grokBuild,
-           AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.contains(rawModel: model) != true
+        if agentKind == .grokBuild || agentKind == .antigravity,
+           let providerID = agentKind.acpProviderID,
+           AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)?.contains(rawModel: model) != true
         {
-            // Grok has no provider-side alias surface: an unknown concrete model fails the
-            // run instead of silently running Grok's current default.
+            // These ACP providers have no provider-side alias surface: an unknown
+            // concrete model fails instead of silently running the provider's default.
             throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build model `\(model)` is not in the discovered model set. Refresh Grok Build models and retry."
+                detail: "\(agentKind.displayName) model `\(model)` is not in the discovered model set. Refresh its models and retry."
             )
         }
         return model
