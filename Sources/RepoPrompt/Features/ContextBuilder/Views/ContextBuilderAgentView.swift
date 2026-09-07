@@ -889,7 +889,7 @@ struct ContextBuilderAgentView: View {
                     set: { viewModel.questionTimeoutSeconds = $0 }
                 ),
                 analysisTokenBudget: Binding(
-                    get: { viewModel.analysisTokenBudget },
+                    get: { min(max(viewModel.analysisTokenBudget, 40000), 200_000) },
                     set: { viewModel.analysisTokenBudget = $0 }
                 ),
                 followUpAnalysisEnabled: Binding(
@@ -1670,7 +1670,7 @@ private struct SettingsBudgetSliderRow: View {
 
             Slider(
                 value: Binding(
-                    get: { Double(value) },
+                    get: { min(max(Double(value), range.lowerBound), range.upperBound) },
                     set: { value = Int($0) }
                 ),
                 in: range,
