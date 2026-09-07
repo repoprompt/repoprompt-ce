@@ -267,6 +267,7 @@ final class AgentRuntimeProviderService {
             }
             return ClaudeCompatibleHeadlessProviderAdapter(
                 runtimeConfig: runtimeConfig,
+                mcpCatalogScope: config.mcpCatalogScope,
                 wrappedProvider: wrappedProvider
             )
         case .codexExec:

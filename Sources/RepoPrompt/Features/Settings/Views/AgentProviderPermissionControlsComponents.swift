@@ -165,6 +165,7 @@ struct AgentProviderToolsRuntimeControls: View {
                 if let claudeTools = binding.claudeTools {
                     ClaudeProviderToolsRuntimeSection(
                         tools: claudeTools,
+                        mcpServers: binding.mcpServers,
                         onApplyMutation: onApplyClaudeToolSettingMutation
                     )
                 }
@@ -376,6 +377,7 @@ private struct ProviderRuntimeToggleRow: View {
 
 struct ClaudeProviderToolsRuntimeSection: View {
     let tools: ClaudeToolSettingsBinding
+    let mcpServers: [MCPServerControlBinding]
     let onApplyMutation: (ClaudeToolSettingMutation) -> Void
 
     var body: some View {
@@ -390,20 +392,23 @@ struct ClaudeProviderToolsRuntimeSection: View {
             ))
             .toggleStyle(.switch)
 
-            Toggle("RepoPrompt Only (Strict MCP)", isOn: Binding(
-                get: { tools.mcpStrictModeEnabled },
-                set: { onApplyMutation(.mcpStrictMode(enabled: $0)) }
-            ))
-            .toggleStyle(.switch)
-
-            Text(
-                tools.mcpStrictModeEnabled
-                    ? "Only RepoPrompt MCP is active. Other MCP servers are ignored."
-                    : "Other MCP servers from your Claude config will also be loaded."
-            )
-            .font(.footnote)
-            .foregroundColor(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
+            ProviderRuntimeSubsection(
+                title: "MCP servers",
+                subtitle: "Choose from RepoPrompt's configured catalog. RepoPromptCE is required."
+            ) {
+                ForEach(mcpServers) { server in
+                    ProviderRuntimeToggleRow(
+                        title: server.name,
+                        description: nil,
+                        badge: server.isRequired ? "Required" : nil,
+                        isOn: server.isSelected,
+                        isDisabled: server.isRequired,
+                        onChange: {
+                            onApplyMutation(.mcpServer(normalizedName: server.normalizedName, enabled: $0))
+                        }
+                    )
+                }
+            }
 
             Toggle("Lazy Tool Loading", isOn: Binding(
                 get: { tools.toolSearchEnabled },

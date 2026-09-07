@@ -146,6 +146,22 @@ enum CodexIntegrationConfiguration {
         return mcpServerEntries(fromConfigContent: content)
     }
 
+    static func mcpServerCatalog() throws -> MCPServerCatalog {
+        let content = try String(contentsOf: configURL(), encoding: .utf8)
+        return try MCPServerCatalog(migratingCodexTOML: content)
+    }
+
+    static func mcpServerEntries(from catalog: MCPServerCatalog) -> [ServerEntry] {
+        catalog.servers.map { server in
+            let normalized = MCPServerCatalog.normalizedName(server.name)
+            return ServerEntry(
+                rawName: server.name,
+                normalizedName: normalized,
+                cliPathComponent: cliPathComponent(forNormalizedServerName: normalized)
+            )
+        }
+    }
+
     static func mcpServerEntries(from content: String) -> [ServerEntry] {
         mcpServerEntries(fromConfigContent: content)
     }

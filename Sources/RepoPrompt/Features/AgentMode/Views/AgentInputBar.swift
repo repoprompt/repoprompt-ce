@@ -1353,22 +1353,34 @@ struct AgentComposerView: View, Equatable {
                 }
 
                 Section {
-                    Toggle("RepoPrompt Only", isOn: Binding(
-                        get: { claudeTools.mcpStrictModeEnabled },
-                        set: { newValue in
-                            actions.applyClaudeToolSettingMutation(.mcpStrictMode(enabled: newValue))
+                    ForEach(props.providerControls?.mcpServers ?? []) { server in
+                        Toggle(
+                            isOn: Binding(
+                                get: { server.isSelected },
+                                set: { newValue in
+                                    actions.applyClaudeToolSettingMutation(
+                                        .mcpServer(normalizedName: server.normalizedName, enabled: newValue)
+                                    )
+                                }
+                            )
+                        ) {
+                            HStack(spacing: 4) {
+                                Text(server.name)
+                                if server.isRequired {
+                                    Text("(required)")
+                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
                         }
-                    ))
+                        .disabled(server.isRequired)
+                    }
                 } header: {
                     Text("MCP Servers")
                 } footer: {
-                    Text(
-                        claudeTools.mcpStrictModeEnabled
-                            ? "Only RepoPrompt MCP is active. Other MCP servers are ignored."
-                            : "Other MCP servers from your Claude config will also be loaded."
-                    )
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                    .foregroundStyle(.secondary)
+                    Text("Direct Claude sessions use only the selected RepoPrompt catalog under strict MCP configuration.")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                        .foregroundStyle(.secondary)
                 }
 
                 Section {

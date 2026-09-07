@@ -24,6 +24,7 @@ struct ClaudeCodeAgentConfig {
     let toolContext: MCPIntegrationHelper.CLIToolContext
     let disallowedBuiltInTools: [String]
     let mcpStrictMode: Bool
+    let mcpCatalogScope: MCPServerCatalogAuthority.Scope
     let toolSearchEnabled: Bool
     let effortLevel: ClaudeCodeEffortLevel?
 
@@ -56,6 +57,7 @@ struct ClaudeCodeAgentConfig {
         allowNativeBashTool: Bool? = nil,
         disallowedBuiltInTools: [String]? = nil,
         mcpStrictMode: Bool? = nil,
+        mcpCatalogScope: MCPServerCatalogAuthority.Scope = .directSelected,
         toolSearchEnabled: Bool? = nil,
         effortLevel: ClaudeCodeEffortLevel? = nil
     ) -> ClaudeCodeAgentConfig {
@@ -65,8 +67,7 @@ struct ClaudeCodeAgentConfig {
         )
         let resolvedBash = allowNativeBashTool
             ?? ClaudeAgentToolPreferences.bashToolEnabled(defaults: defaults)
-        let resolvedStrictMode = mcpStrictMode
-            ?? ClaudeAgentToolPreferences.mcpStrictModeEnabled(defaults: defaults)
+        let resolvedStrictMode = true
         let resolvedToolSearch = toolSearchEnabled
             ?? ClaudeAgentToolPreferences.toolSearchEnabled(defaults: defaults)
         let resolvedEffortLevel = effortLevel
@@ -87,6 +88,7 @@ struct ClaudeCodeAgentConfig {
             toolContext: .agentRun,
             disallowedBuiltInTools: disallowedBuiltInTools,
             mcpStrictMode: resolvedStrictMode,
+            mcpCatalogScope: mcpCatalogScope,
             toolSearchEnabled: resolvedToolSearch,
             effortLevel: resolvedEffortLevel
         )
@@ -128,6 +130,7 @@ struct ClaudeCodeAgentConfig {
             toolContext: .discoverRun,
             disallowedBuiltInTools: nil,
             mcpStrictMode: true,
+            mcpCatalogScope: .repoPromptOnly,
             toolSearchEnabled: false,
             effortLevel: nil
         )
@@ -148,6 +151,7 @@ struct ClaudeCodeAgentConfig {
         toolContext: MCPIntegrationHelper.CLIToolContext,
         disallowedBuiltInTools: [String]?,
         mcpStrictMode: Bool,
+        mcpCatalogScope: MCPServerCatalogAuthority.Scope,
         toolSearchEnabled: Bool,
         effortLevel: ClaudeCodeEffortLevel?
     ) {
@@ -165,6 +169,7 @@ struct ClaudeCodeAgentConfig {
         self.allowNativeBashTool = allowNativeBashTool
         self.toolContext = toolContext
         self.mcpStrictMode = mcpStrictMode
+        self.mcpCatalogScope = mcpCatalogScope
         self.toolSearchEnabled = toolSearchEnabled
         self.effortLevel = Self.isNoModelCompatibleBackend(runtimeVariant)
             ? nil

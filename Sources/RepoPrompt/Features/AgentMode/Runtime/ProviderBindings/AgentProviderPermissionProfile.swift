@@ -67,9 +67,9 @@ extension AgentProviderPermissionProfile {
 
     var codexSuppressesThirdPartyMCPServers: Bool {
         switch self {
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .providerOverride:
             true
-        case .userConfigured, .providerOverride:
+        case .userConfigured:
             false
         }
     }

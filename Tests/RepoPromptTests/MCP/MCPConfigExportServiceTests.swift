@@ -44,6 +44,36 @@ final class MCPConfigExportServiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: second.url.path))
     }
 
+    func testSelectedCatalogContentsUseOwnerOnlyLeaseAndCleanup() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let catalog = try MCPServerCatalog(servers: [
+            .init(name: "ArbitraryAdditional", transport: .http(url: "https://extra.example.invalid/mcp")),
+            .init(
+                name: "RepoPromptCE",
+                transport: .stdio(command: "/redacted/rp", args: ["--backend", "app"], environment: [:])
+            )
+        ])
+        let contents = try catalog.renderClaudeJSON()
+        let service = MCPConfigExportService(
+            identity: .repoPromptCE(.debug),
+            configDirectoryURL: root.appendingPathComponent("MCP", isDirectory: true)
+        )
+
+        let lease = try await service.prepareLaunchConfig(contents: contents)
+
+        XCTAssertEqual(try String(contentsOf: lease.url), contents)
+        XCTAssertEqual(
+            contents,
+            #"{"mcpServers":{"ArbitraryAdditional":{"type":"http","url":"https://extra.example.invalid/mcp"},"RepoPromptCE":{"args":["--backend","app"],"command":"/redacted/rp"}}}"#
+        )
+        let attributes = try FileManager.default.attributesOfItem(atPath: lease.url.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o400)
+
+        lease.release()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: lease.url.path))
+    }
+
     func testLeaseNeverRemovesAReplacementAtItsPath() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

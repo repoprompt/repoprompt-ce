@@ -107,7 +107,7 @@ struct SecureSubagentPermissionDocument: Codable, Equatable {
 }
 
 struct SecureCodexPermissionDocument: Codable, Equatable {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
 
     var schemaVersion: Int
     var updatedAt: Date
@@ -164,6 +164,7 @@ struct SecureCodexPermissionDocument: Codable, Equatable {
     }
 
     func mcpServerEnabled(normalizedName: String) -> Bool {
+        if MCPServerCatalog.isRepoPrompt(normalizedName) { return true }
         let key = Self.normalizedMCPServerKey(normalizedName)
         return mcpServerTogglesByNormalizedName?[key] ?? false
     }
@@ -174,26 +175,29 @@ struct SecureCodexPermissionDocument: Codable, Equatable {
 }
 
 struct SecureClaudePermissionDocument: Codable, Equatable {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
 
     var schemaVersion: Int
     var updatedAt: Date
     var permissionModeRaw: String?
     var bashToolEnabled: Bool?
     var mcpStrictModeEnabled: Bool?
+    var mcpServerTogglesByNormalizedName: [String: Bool]?
 
     init(
         schemaVersion: Int = currentSchemaVersion,
         updatedAt: Date = Date(),
         permissionModeRaw: String? = ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode,
         bashToolEnabled: Bool? = true,
-        mcpStrictModeEnabled: Bool? = true
+        mcpStrictModeEnabled: Bool? = true,
+        mcpServerTogglesByNormalizedName: [String: Bool]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.updatedAt = updatedAt
         self.permissionModeRaw = permissionModeRaw
         self.bashToolEnabled = bashToolEnabled
         self.mcpStrictModeEnabled = mcpStrictModeEnabled
+        self.mcpServerTogglesByNormalizedName = mcpServerTogglesByNormalizedName
     }
 
     static func failClosedDocument(now: Date = Date()) -> SecureClaudePermissionDocument {
@@ -206,6 +210,12 @@ struct SecureClaudePermissionDocument: Codable, Equatable {
 
     func permissionLevel() -> ClaudeAgentToolPreferences.PermissionLevel {
         ClaudeAgentToolPreferences.PermissionLevel.from(permissionMode: permissionMode())
+    }
+
+    func mcpServerEnabled(normalizedName: String) -> Bool {
+        if MCPServerCatalog.isRepoPrompt(normalizedName) { return true }
+        let key = MCPServerCatalog.normalizedName(normalizedName)
+        return mcpServerTogglesByNormalizedName?[key] ?? false
     }
 
     static func normalizedPermissionMode(_ raw: String?, preserveUnknown: Bool) -> String {
@@ -890,12 +900,7 @@ final class AgentPermissionSecureStore {
             changed = true
         }
         let originalToggles = document.mcpServerTogglesByNormalizedName ?? [:]
-        var normalized: [String: Bool] = [:]
-        for (key, value) in originalToggles {
-            let normalizedKey = SecureCodexPermissionDocument.normalizedMCPServerKey(key)
-            guard !normalizedKey.isEmpty else { continue }
-            normalized[normalizedKey] = value
-        }
+        let normalized = normalizedMCPServerToggles(originalToggles)
         if normalized != originalToggles {
             document.mcpServerTogglesByNormalizedName = normalized.isEmpty ? nil : normalized
             changed = true
@@ -923,7 +928,23 @@ final class AgentPermissionSecureStore {
             document.mcpStrictModeEnabled = true
             changed = true
         }
+        let originalToggles = document.mcpServerTogglesByNormalizedName ?? [:]
+        let normalized = normalizedMCPServerToggles(originalToggles)
+        if normalized != originalToggles {
+            document.mcpServerTogglesByNormalizedName = normalized.isEmpty ? nil : normalized
+            changed = true
+        }
         return changed
+    }
+
+    private func normalizedMCPServerToggles(_ toggles: [String: Bool]) -> [String: Bool] {
+        var normalized: [String: Bool] = [:]
+        for (key, value) in toggles {
+            let normalizedKey = MCPServerCatalog.normalizedName(key)
+            guard !normalizedKey.isEmpty, !MCPServerCatalog.isRepoPrompt(normalizedKey) else { continue }
+            normalized[normalizedKey] = (normalized[normalizedKey] ?? true) && value
+        }
+        return normalized
     }
 
     @discardableResult

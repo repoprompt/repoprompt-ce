@@ -2,22 +2,22 @@ import Foundation
 
 @MainActor
 final class AgentProviderPreferenceSnapshotStore {
-    typealias CodexMCPServerEntriesProvider = () -> [MCPIntegrationHelper.CodexServerEntry]
+    typealias MCPServerCatalogProvider = () -> MCPServerCatalog?
 
     let defaults: UserDefaults
     let securePermissions: AgentPermissionSecureStore?
 
-    private let codexMCPServerEntriesProvider: CodexMCPServerEntriesProvider
+    private let mcpServerCatalogProvider: MCPServerCatalogProvider
     private var revisionByProviderID: [AgentProviderBindingID: Int]
 
     init(
         defaults: UserDefaults = .standard,
         securePermissions: AgentPermissionSecureStore? = nil,
-        codexMCPServerEntries: @escaping CodexMCPServerEntriesProvider = { MCPIntegrationHelper.codexMCPServerEntries() }
+        mcpServerCatalog: @escaping MCPServerCatalogProvider = { try? CodexIntegrationConfiguration.mcpServerCatalog() }
     ) {
         self.defaults = defaults
         self.securePermissions = securePermissions ?? (defaults === UserDefaults.standard ? AgentPermissionSecureStore.shared : nil)
-        codexMCPServerEntriesProvider = codexMCPServerEntries
+        mcpServerCatalogProvider = mcpServerCatalog
         revisionByProviderID = Dictionary(uniqueKeysWithValues: AgentProviderBindingID.allCases.map { ($0, 0) })
     }
 
@@ -62,6 +62,7 @@ final class AgentProviderPreferenceSnapshotStore {
             providerID: providerID,
             permission: permission,
             runtimePermission: runtimePermission(for: selectedAgent, profile: permissionProfile),
+            mcpServers: mcpServerControls(providerID: providerID, profile: permissionProfile),
             codexTools: providerID == .codex
                 ? codexToolSettingsBinding(profile: permissionProfile)
                 : nil,
@@ -246,6 +247,13 @@ final class AgentProviderPreferenceSnapshotStore {
             ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
         case let .mcpStrictMode(enabled):
             ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+        case let .mcpServer(normalizedName, enabled):
+            ClaudeAgentToolPreferences.setMCPServerEnabled(
+                normalizedName: normalizedName,
+                isEnabled: enabled,
+                defaults: defaults,
+                secureStore: securePermissions
+            )
         case let .toolSearch(enabled):
             ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
         case let .agentModePromptDelivery(delivery):
@@ -414,7 +422,9 @@ final class AgentProviderPreferenceSnapshotStore {
     private func codexToolSettingsBinding(
         profile: AgentProviderPermissionProfile
     ) -> CodexToolSettingsBinding {
-        let entries = codexMCPServerEntriesProvider()
+        let entries = mcpServerCatalogProvider().map {
+            CodexIntegrationConfiguration.mcpServerEntries(from: $0)
+        } ?? []
         switch profile {
         case .userConfigured, .providerOverride:
             var states: [String: Bool] = [:]
@@ -458,6 +468,33 @@ final class AgentProviderPreferenceSnapshotStore {
                 toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
+            )
+        }
+    }
+
+    private func mcpServerControls(
+        providerID: AgentProviderBindingID,
+        profile: AgentProviderPermissionProfile
+    ) -> [MCPServerControlBinding] {
+        guard let catalog = mcpServerCatalogProvider() else { return [] }
+        return catalog.servers.map { server in
+            let normalized = MCPServerCatalog.normalizedName(server.name)
+            let selected: Bool = if profile != .userConfigured {
+                MCPServerCatalog.isRepoPrompt(server.name)
+            } else if providerID == .claude {
+                securePermissions?.claudePermissions().mcpServerEnabled(normalizedName: normalized) ?? false
+            } else {
+                CodexAgentToolPreferences.mcpServerEnabled(
+                    normalizedName: normalized,
+                    defaults: defaults,
+                    secureStore: securePermissions
+                )
+            }
+            return MCPServerControlBinding(
+                name: server.name,
+                normalizedName: normalized,
+                isRequired: MCPServerCatalog.isRepoPrompt(server.name),
+                isSelected: selected || MCPServerCatalog.isRepoPrompt(server.name)
             )
         }
     }
