@@ -565,6 +565,22 @@ enum AgentModelCatalog {
         }
     }
 
+    struct DevinModelFamilyGroup: Identifiable {
+        let family: AgentModelFamily?
+        let options: [AgentModelOption]
+        var id: String {
+            family?.id ?? ""
+        }
+    }
+
+    static func devinModelGroups(for options: [AgentModelOption]) -> [DevinModelFamilyGroup] {
+        let grouped = Dictionary(grouping: options, by: { $0.isPlaceholderDefault ? "" : ($0.modelFamily?.id ?? "") })
+        return grouped.keys.sorted().map { id in
+            let options = grouped[id] ?? []
+            return DevinModelFamilyGroup(family: id.isEmpty ? nil : options.first?.modelFamily, options: options)
+        }
+    }
+
     static func openCodeMenu(for options: [AgentModelOption]) -> OpenCodeMenu {
         struct Entry {
             let option: AgentModelOption
@@ -1966,7 +1982,7 @@ enum AgentModelCatalog {
         surface: AgentSelectionSurface = .general
     ) -> [DiscoveryAgent] {
         AgentProviderKind.allCases
-            .filter { $0 != .devin && surface.allows($0) }
+            .filter { surface.allows($0) }
             .map { agent in
                 discoveryAgent(agent, availability: availability)
             }

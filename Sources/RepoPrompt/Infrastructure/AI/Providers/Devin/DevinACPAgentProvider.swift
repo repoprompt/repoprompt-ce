@@ -1,6 +1,7 @@
 import Foundation
 
 struct DevinACPAgentProvider: ACPAgentProvider {
+    private let modelFamilies = DevinModelFamilyCatalog()
     private let config: DevinAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: DevinACPLaunchResolver
@@ -20,7 +21,15 @@ struct DevinACPAgentProvider: ACPAgentProvider {
     }
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
-        try await launchResolver.probeSupport(for: config)
+        let result = try await launchResolver.probeSupport(for: config)
+        if result == .supported {
+            try await modelFamilies.refresh(launch: launchResolver.resolvedLaunch(for: config))
+        }
+        return result
+    }
+
+    func modelFamily(for rawModel: String) -> AgentModelFamily? {
+        modelFamilies.family(for: rawModel)
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {

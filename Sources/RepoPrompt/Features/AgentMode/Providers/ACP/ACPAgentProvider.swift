@@ -321,6 +321,7 @@ protocol ACPAgentProvider: Sendable {
     ) -> [NormalizedAgentRuntimeEvent]
     func preferredAuthMethodID(context: ACPAuthenticationContext) -> String?
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async
+    func modelFamily(for rawModel: String) -> AgentModelFamily?
     func normalizeError(_ error: Error) -> Error
 
     /// Opts a provider into ACP's parameterized model picker capability and classifies
@@ -340,6 +341,10 @@ extension ACPAgentProvider {
     }
 
     func modelParameterKind(for _: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        nil
+    }
+
+    func modelFamily(for _: String) -> AgentModelFamily? {
         nil
     }
 

@@ -2964,7 +2964,8 @@ actor ACPAgentSessionController {
             displayName: displayName,
             description: normalizedACPModelString(rawOption["description"] as? String),
             isPlaceholderDefault: false,
-            isProviderDefault: rawOption["isDefault"] as? Bool ?? false
+            isProviderDefault: rawOption["isDefault"] as? Bool ?? false,
+            modelFamily: provider.modelFamily(for: rawValue)
         )
     }
 

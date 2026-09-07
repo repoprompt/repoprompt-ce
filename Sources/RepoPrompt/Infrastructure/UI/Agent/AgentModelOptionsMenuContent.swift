@@ -90,6 +90,16 @@ struct AgentModelOptionsMenuContent: View {
                     modelOptionButton(option)
                 }
             }
+        } else if agentKind == .devin {
+            ForEach(AgentModelCatalog.devinModelGroups(for: options)) { group in
+                if let family = group.family {
+                    Menu(family.displayName) {
+                        ForEach(group.options, id: \.rawValue) { option in modelOptionButton(option) }
+                    }
+                } else {
+                    ForEach(group.options, id: \.rawValue) { option in modelOptionButton(option) }
+                }
+            }
         } else if agentKind == .omp {
             ForEach(AgentModelCatalog.ompModelGroups(for: options)) { group in
                 if let provider = group.providerID {
@@ -238,6 +248,21 @@ enum AgentModelStableMenuItems {
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
             )
+        }
+        if agentKind == .devin {
+            return AgentModelCatalog.devinModelGroups(for: visibleOptions).flatMap { group -> [StableMenuItem] in
+                let items = group.options.map { option in
+                    modelItem(
+                        option,
+                        agentKind: agentKind,
+                        selectedAgent: selectedAgent,
+                        selectedModelRaw: selectedModelRaw,
+                        onSelect: onSelect
+                    )
+                }
+                guard let family = group.family else { return items }
+                return [.submenu(family.displayName, items: items)]
+            }
         }
         if agentKind == .omp {
             return AgentModelCatalog.ompModelGroups(for: visibleOptions).flatMap { group -> [StableMenuItem] in

@@ -246,6 +246,95 @@ final class DevinACPAgentProviderTests: XCTestCase {
         XCTAssertTrue(AgentModelCatalog.isAgentAvailable(.devin, availability: availability))
     }
 
+    func testDiscoveryIncludesDevinCurrentModelAndAdvertisedAlternatives() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(devinAvailable: true)
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: "gpt-5-6-sol-medium",
+                        displayName: "GPT-5.6 Sol Medium Thinking",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: false
+                    ),
+                    AgentModelOption(
+                        rawValue: "claude-opus-5-medium",
+                        displayName: "Claude Opus 5 Medium",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: false
+                    )
+                ],
+                currentModelRaw: "gpt-5-6-sol-medium"
+            ),
+            for: .devin
+        )
+
+        let devin = try XCTUnwrap(
+            AgentModelCatalog.discoveryAgents(availability: availability)
+                .first(where: { $0.agent == .devin })
+        )
+        XCTAssertTrue(devin.available)
+        XCTAssertEqual(devin.defaults.modelRaw, "gpt-5-6-sol-medium")
+        XCTAssertEqual(
+            devin.models.map(\.name),
+            ["Claude Opus 5 Medium", "GPT-5.6 Sol Medium Thinking"]
+        )
+    }
+
+    @MainActor
+    func testNativeFamilyMetadataAnnotatesOnlyACPModelsAndSurvivesStorage() async throws {
+        let directory = try makeTestDirectory(name: "DevinModelFamilies")
+        _ = try ACPModelSelectionFixtureProvider(directory: directory, providerID: .devin)
+        let catalog = #"{"families":[{"family_uid":"fixture","family_label":"Fixture Family","variants":[{"model_uid":"model-a"},{"model_uid":"model-b"},{"model_uid":"not-advertised-by-acp"}]}]}"#
+        try catalog.write(to: directory.appendingPathComponent("catalog.json"), atomically: true, encoding: .utf8)
+        let executable = directory.appendingPathComponent("devin")
+        let script = """
+        #!/bin/sh
+        if [ "$1" = "models" ]; then cat '\(directory.path)/catalog.json'; exit 0; fi
+        if [ "$2" = "--help" ]; then echo 'Run as an ACP server over stdio'; exit 0; fi
+        exec '\(directory.path)/acp-fixture'
+        """
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let provider = DevinACPAgentProvider(config: DevinAgentConfig(commandName: executable.path, additionalPathHints: [], includeRepoPromptMCPServer: false))
+        let request = makeRequest(workspacePath: directory.path)
+        let support = try await provider.support(for: request)
+        XCTAssertEqual(support, .supported)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        do {
+            _ = try await controller.bootstrap()
+            let snapshot = try XCTUnwrap(AgentACPModelRegistry.shared.currentSnapshot(for: .devin))
+            XCTAssertFalse(snapshot.options.contains { $0.rawValue == "not-advertised-by-acp" })
+            let family = try XCTUnwrap(snapshot.options.first { $0.rawValue == "model-a" }?.modelFamily)
+            XCTAssertEqual(family.displayName, "Fixture Family")
+            let groups = AgentModelCatalog.devinModelGroups(for: snapshot.options)
+            XCTAssertEqual(groups.map(\.id), ["", "fixture"])
+            XCTAssertEqual(Set(groups[1].options.map(\.rawValue)), ["model-a", "model-b"])
+            let items = AgentModelStableMenuItems.modelItems(
+                agentKind: .devin,
+                options: snapshot.options,
+                selectedAgent: .devin,
+                selectedModelRaw: "model-a"
+            ) { _, _ in }
+            XCTAssertEqual(items.last?.title, "Fixture Family")
+            let record = try XCTUnwrap(ACPDynamicModelStore.canonicalProviderRecord(from: snapshot, providerID: .devin))
+            let decoded = try JSONDecoder().decode(ACPDynamicProviderRecord.self, from: JSONEncoder().encode(record))
+            XCTAssertEqual(ACPDynamicModelStore.snapshot(from: decoded)?.options.first { $0.rawValue == "model-a" }?.modelFamily, family)
+            await controller.shutdown()
+        } catch {
+            await controller.shutdown()
+            throw error
+        }
+    }
+
+    func testFamilyCatalogRejectsConflictingModelAssignments() throws {
+        let invalid = #"{"families":[{"family_uid":"one","family_label":"One","variants":[{"model_uid":"same"}]},{"family_uid":"two","family_label":"Two","variants":[{"model_uid":"same"}]}]}"#
+        XCTAssertThrowsError(try DevinModelFamilyCatalog.parse(Data(invalid.utf8)))
+        XCTAssertThrowsError(try DevinModelFamilyCatalog.parse(Data(#"{"families":[{"family_uid":"","family_label":"Missing ID","variants":[]}]}"#.utf8)))
+    }
+
     func testTaskLabelsDoNotSelectProviderManagedDevinImplicitly() {
         let onlyDevin = AgentModelCatalog.AvailabilityContext.none.assumingAvailable(.devin)
         for label in AgentModelCatalog.taskLabels {

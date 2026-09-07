@@ -11,6 +11,7 @@ struct ACPDynamicModelRecord: Codable, Hashable {
     /// Variant provenance for synthesized effort options. Optional so records persisted
     /// before effort support decode unchanged.
     var effortVariant: AgentModelEffortVariant? = nil
+    var modelFamily: AgentModelFamily? = nil
 }
 
 struct ACPDynamicProviderRecord: Codable, Hashable {
@@ -206,7 +207,8 @@ enum ACPDynamicModelStore {
             isProviderDefault: option.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
             defaultReasoningEffort: option.defaultReasoningEffort?.rawValue,
-            effortVariant: option.effortVariant
+            effortVariant: option.effortVariant,
+            modelFamily: option.modelFamily
         )
     }
 
@@ -224,7 +226,8 @@ enum ACPDynamicModelStore {
             isProviderDefault: record.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
             defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort),
-            effortVariant: record.effortVariant
+            effortVariant: record.effortVariant,
+            modelFamily: record.modelFamily
         )
     }
 
@@ -278,7 +281,8 @@ enum ACPDynamicModelStore {
             defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort,
             // Variant provenance is semantic identity, not metadata: keep it only when both
             // records agree, so a real base (nil) never inherits stale variant provenance.
-            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil
+            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil,
+            modelFamily: metadataRecord.modelFamily ?? fallbackRecord.modelFamily
         )
     }
 
