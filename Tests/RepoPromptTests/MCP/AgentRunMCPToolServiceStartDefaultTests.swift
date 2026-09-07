@@ -116,14 +116,14 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
             preferences: AgentProviderPreferenceSnapshotStore(
                 defaults: defaults,
                 securePermissions: secureStore,
-                codexMCPServerEntries: {
-                    [
-                        MCPIntegrationHelper.CodexServerEntry(
-                            rawName: "external-tools",
-                            normalizedName: "external-tools",
-                            cliPathComponent: "external-tools"
-                        )
-                    ]
+                mcpServerCatalog: {
+                    try? MCPServerCatalog(servers: [
+                        .init(
+                            name: "RepoPromptCE",
+                            transport: .stdio(command: "/redacted/rp", args: [], environment: [:])
+                        ),
+                        .init(name: "external-tools", transport: .http(url: "https://tools.example.invalid/mcp"))
+                    ])
                 }
             )
         )

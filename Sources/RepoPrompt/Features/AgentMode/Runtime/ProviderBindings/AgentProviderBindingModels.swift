@@ -225,8 +225,20 @@ enum CodexToolSettingMutation: Equatable {
 enum ClaudeToolSettingMutation: Equatable {
     case bashTool(enabled: Bool)
     case mcpStrictMode(enabled: Bool)
+    case mcpServer(normalizedName: String, enabled: Bool)
     case toolSearch(enabled: Bool)
     case agentModePromptDelivery(delivery: ClaudeAgentToolPreferences.AgentModePromptDelivery)
+}
+
+struct MCPServerControlBinding: Equatable, Identifiable {
+    var id: String {
+        normalizedName
+    }
+
+    let name: String
+    let normalizedName: String
+    let isRequired: Bool
+    let isSelected: Bool
 }
 
 /// Persisted Codex tool preference snapshot for editing/display.
@@ -279,6 +291,7 @@ struct AgentProviderControlsBinding: Equatable {
     let providerID: AgentProviderBindingID
     let permission: AgentPermissionChromeBinding
     let runtimePermission: AgentProviderRuntimePermissionBinding
+    let mcpServers: [MCPServerControlBinding]
     let codexTools: CodexToolSettingsBinding?
     let claudeTools: ClaudeToolSettingsBinding?
 }

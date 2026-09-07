@@ -273,9 +273,8 @@ struct ClaudeAgentToolPreferences {
 
     // MARK: - MCP Strict Mode
 
-    /// When enabled (default), Claude Code launches with `--strict-mcp-config` so only the
-    /// RepoPrompt MCP server is active.
-    /// When disabled, other MCP servers from the user's config are allowed.
+    /// Legacy preference retained only for stored-schema compatibility.
+    /// Agent Mode launch strictness is unconditional.
     static func mcpStrictModeEnabled(
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
@@ -301,6 +300,23 @@ struct ClaudeAgentToolPreferences {
             return
         }
         defaults.set(isEnabled, forKey: mcpStrictModeEnabledKey)
+    }
+
+    static func setMCPServerEnabled(
+        normalizedName: String,
+        isEnabled: Bool,
+        defaults: UserDefaults = .standard,
+        secureStore: AgentPermissionSecureStore? = nil
+    ) {
+        guard !MCPServerCatalog.isRepoPrompt(normalizedName) else { return }
+        let key = MCPServerCatalog.normalizedName(normalizedName)
+        if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
+            secureStore.updateClaudePermissions { document in
+                var toggles = document.mcpServerTogglesByNormalizedName ?? [:]
+                toggles[key] = isEnabled
+                document.mcpServerTogglesByNormalizedName = toggles
+            }
+        }
     }
 
     // MARK: - Tool Search

@@ -123,17 +123,28 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
 
         let secureStrings = FakeSecurePlainStringStore()
         let secureStore = makeStore(secureStrings: secureStrings)
+        let catalog = try MCPServerCatalog(servers: [
+            .init(name: "ArbitraryAdditional", transport: .http(url: "https://extra.example.invalid/mcp")),
+            .init(
+                name: "RepoPromptCE",
+                transport: .stdio(command: "/redacted/rp", args: [], environment: [:])
+            )
+        ])
         let snapshots = AgentProviderPreferenceSnapshotStore(
             defaults: defaults,
             securePermissions: secureStore,
-            codexMCPServerEntries: { [] }
+            mcpServerCatalog: { catalog }
         )
 
         let binding = snapshots.topLevelSettingsControlsBinding(providerID: .codex)
+        let claude = snapshots.topLevelSettingsControlsBinding(providerID: .claude)
 
         XCTAssertEqual(binding.permission.displayName, CodexAgentToolPreferences.PermissionLevel.autoReview.displayName)
         XCTAssertEqual(binding.runtimePermission.codexApprovalReviewer, .autoReview)
         XCTAssertEqual(binding.codexTools?.bashToolEnabled, true)
+        XCTAssertEqual(binding.mcpServers.map(\.name), ["ArbitraryAdditional", "RepoPromptCE"])
+        XCTAssertEqual(claude.mcpServers, binding.mcpServers)
+        XCTAssertEqual(claude.mcpServers.map(\.isRequired), [false, true])
     }
 
     func testSuccessfulResetPersistsProductDefaultsAcrossRelaunch() throws {
