@@ -172,6 +172,42 @@ final class OMPACPAgentProviderTests: XCTestCase {
         )
     }
 
+    func testModelPickerGroupsOnlyAdvertisedProvidersAndKeepsDefaultAtRoot() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .omp)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .omp) }
+        let availability = AgentModelCatalog.AvailabilityContext(ompAvailable: true)
+        let stale = AgentModelOption(rawValue: "unavailable/old-model", displayName: "Old Model", description: nil, isDefault: false)
+        AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(options: [stale], currentModelRaw: stale.rawValue), for: .omp
+        )
+        let advertised = [
+            AgentModelOption(rawValue: "openai-codex/gpt-fixture", displayName: "GPT Fixture", description: nil, isDefault: false),
+            AgentModelOption(rawValue: "openrouter/vendor/model/high", displayName: "Model High", description: nil, isDefault: false),
+            AgentModelOption(rawValue: "openai-codex/another-model", displayName: "Another Model", description: nil, isDefault: false)
+        ]
+        AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(options: advertised, currentModelRaw: stale.rawValue), for: .omp
+        )
+        let options = AgentModelCatalog.options(for: .omp, availability: availability)
+        let items = AgentModelStableMenuItems.modelItems(
+            agentKind: .omp, options: options, selectedAgent: .omp,
+            selectedModelRaw: advertised[0].rawValue
+        ) { _, _ in }
+        XCTAssertEqual(items.map(\.title), ["Default", "openai-codex", "openrouter"])
+        let groups = AgentModelCatalog.ompModelGroups(for: options)
+        XCTAssertEqual(groups.map(\.providerID), [nil, "openai-codex", "openrouter"])
+        XCTAssertEqual(groups[1].options.map(\.rawValue), ["openai-codex/another-model", "openai-codex/gpt-fixture"])
+        XCTAssertEqual(groups[2].options.map(\.rawValue), ["openrouter/vendor/model/high"])
+        XCTAssertEqual(groups[2].options.first?.displayName, "Model High")
+        XCTAssertEqual(Set(options.filter { !$0.isPlaceholderDefault }.map(\.rawValue)), Set(advertised.map(\.rawValue)))
+        XCTAssertFalse(AgentModelCatalog.isValid(rawModel: stale.rawValue, for: .omp, availability: availability))
+        let withoutDefault = AgentModelStableMenuItems.modelItems(
+            agentKind: .omp, options: options, selectedAgent: .omp,
+            selectedModelRaw: advertised[0].rawValue, includePlaceholderDefault: false, groupOpenCode: false
+        ) { _, _ in }
+        XCTAssertEqual(withoutDefault.map(\.title), ["openai-codex", "openrouter"])
+    }
+
     func testTaskLabelsDoNotSelectProviderManagedOMPImplicitly() {
         let onlyOMP = AgentModelCatalog.AvailabilityContext.none.assumingAvailable(.omp)
         for label in AgentModelCatalog.taskLabels {

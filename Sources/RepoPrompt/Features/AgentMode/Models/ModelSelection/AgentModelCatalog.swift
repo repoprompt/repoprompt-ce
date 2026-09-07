@@ -530,6 +530,31 @@ enum AgentModelCatalog {
         return baseDisplayName(for: effectiveRaw)
     }
 
+    struct OMPProviderModelGroup: Identifiable {
+        let providerID: String?
+        let options: [AgentModelOption]
+
+        var id: String {
+            providerID ?? ""
+        }
+    }
+
+    /// OMP's ACP advertisement already applies its authentication and enabled-model
+    /// filters. Group that exact set; don't synthesize models or interpret opaque
+    /// model suffixes as OpenCode reasoning variants.
+    static func ompModelGroups(for options: [AgentModelOption]) -> [OMPProviderModelGroup] {
+        let grouped = Dictionary(grouping: options) { option -> String in
+            guard !option.isPlaceholderDefault,
+                  let slash = option.rawValue.firstIndex(of: "/"),
+                  slash != option.rawValue.startIndex,
+                  option.rawValue.index(after: slash) != option.rawValue.endIndex else { return "" }
+            return String(option.rawValue[..<slash])
+        }
+        return grouped.keys.sorted().map { provider in
+            OMPProviderModelGroup(providerID: provider.isEmpty ? nil : provider, options: grouped[provider] ?? [])
+        }
+    }
+
     static func openCodeMenu(for options: [AgentModelOption]) -> OpenCodeMenu {
         struct Entry {
             let option: AgentModelOption
