@@ -904,6 +904,51 @@ actor WorkspaceCodemapGitCapabilityService {
             }
             try Task.checkCancellation()
 
+            // Recheck candidate-local evidence after the repository capture.
+            for index in candidates.indices {
+                guard let path = candidatePaths[index],
+                      let expectedFingerprint = postPathFingerprints[index],
+                      let expectedAttributes = postAttributeGenerations[index]
+                else { continue }
+                do {
+                    let attributes = try digestEvidence(
+                        urls: Self.candidateAttributeURLs(
+                            layout: capability.repositoryLayout,
+                            candidateRepositoryRelativePath: path
+                        ),
+                        includeBoundedContents: true
+                    )
+                    guard attributes == expectedAttributes else {
+                        hooks.sourceAuthorityRejected(.candidateAttributesChanged(index: index))
+                        postAttributeGenerations[index] = nil
+                        continue
+                    }
+                } catch {
+                    hooks.sourceAuthorityRejected(.candidateAttributesChanged(index: index))
+                    postAttributeGenerations[index] = nil
+                    continue
+                }
+                do {
+                    let fingerprint = try pathFingerprintClient.fingerprint(
+                        capability.repositoryLayout.workTreeRoot,
+                        path
+                    )
+                    #if DEBUG
+                        await hooks.afterSourcePathFingerprintCapture()
+                    #endif
+                    guard fingerprint == expectedFingerprint, fingerprint.isRegularFile else {
+                        hooks.sourceAuthorityRejected(.candidatePathChanged(index: index))
+                        postPathFingerprints[index] = nil
+                        continue
+                    }
+                    postPathFingerprints[index] = fingerprint
+                } catch {
+                    hooks.sourceAuthorityRejected(.candidateFingerprintUnavailable(index: index))
+                    postPathFingerprints[index] = nil
+                }
+                try Task.checkCancellation()
+            }
+
             var authorities = unavailable
             for index in candidates.indices {
                 guard let path = candidatePaths[index],
