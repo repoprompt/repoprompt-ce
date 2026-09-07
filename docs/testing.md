@@ -870,6 +870,81 @@ python3 Scripts/worktree_startup_live_benchmark.py aggregate --help
 python3 Scripts/worktree_startup_live_benchmark.py cleanup --help
 ```
 
+## Real Codex controller account-adoption integration
+
+`CodexSwitchboardControllerRuntimeTests` uses the actual Swift app-server client,
+native controller and account control with the production Python private bridge
+and a real packaged Codex 0.149.0 executable. Only grants and the loopback
+Responses service are synthetic. It does not use `requestExecutor` or rewrite
+native protocol responses.
+
+The scenarios require actual native completion events followed by full native
+history reads: A-to-B routing with retained input/context and thread ID; A's
+401 renewal while B waits behind a genuinely active turn; persistent A-only
+401 failure without falling through to B; fresh destination-capacity refusal
+after idle waiting; and new consent on the same live controller/thread. They
+also require an initially null account, unchanged synthetic auth-file bytes,
+post-revocation dispatch refusal and owned-process teardown. Public status stays
+`applied_unverified`; fixture HTTP receipts are test evidence, not a production
+runtime-verification flag.
+
+The publication-race case invalidates the exact bound consent after actor
+admission but immediately before native frame publication. It requires a
+`revoked` error, unchanged idle native metadata and zero HTTP requests. Its
+unfixed regression actually completed a native turn and recorded one request;
+an immediate request-count check alone would not establish this boundary.
+All five provider-work RPC methods must carry the same revocable authorization
+through the nonblocking pipe writer; interrupt and read-only operations remain
+available without it.
+
+The large-context case sends more than 256 KiB of synthetic input with the marker
+at its end and verifies retained input after account switching. A second actual
+native case revokes after a published frame prefix and requires owned-transport
+retirement, no completed native turn, no HTTP request and no implicit restart.
+Real-pipe tests cover bounded capacity waits outside the consent lock, deadline
+expiry, interrupted writes, broken pipes and preservation of descriptor flags.
+
+Create the ignored `.build/validation-artifacts/switchboard-controller/config.json`
+with exactly these keys, pointing to independently verified resources outside
+the real user home and the frozen companion source from the bridge lane above:
+
+```json
+{"resources":"/private/tmp/verified-app/RepoPrompt.app/Contents/Resources","source":"/absolute/path/to/pinned/repoprompt_bridge.py"}
+```
+
+Then use the coordinated test lane and the task's Xcode/public-dependency wrapper:
+
+```bash
+./conductor test --filter 'CodexManagedHTTPIntegrationConfigurationTests|CodexSwitchboardControllerRuntimeTests'
+```
+
+An absent explicit configuration skips this opt-in lane; a skip is not acceptance.
+The DEBUG-only factory also requires the actual XCTest runtime and test bundle
+to be loaded. Production construction still uses the ordinary resolver, exact
+HTTPS provider URL and normal process launcher; no environment, CLI or settings
+switch enables the integration constructor.
+
+The fixture retains strict effective-policy validation but selects one canonical
+numeric loopback URL for both launch and inspection. A Seatbelt wrapper restricts
+the native executable and descendants to that exact local port, private Unix
+sockets and private writes, while denying real-user-home/Keychain reads. Seatbelt
+requires `localhost:PORT` syntax; the application URL remains `127.0.0.1` with a
+fixed path and no hostname aliases, credentials, query or fragment. Runtime
+metadata/layout/version checks remain active; artifact signature and provenance
+must be verified before supplying its resources path.
+
+The test options intentionally supply a private no-tools configuration closure
+and empty extra skill roots instead of consulting global MCP entries/preferences
+or forwarding the user's shared skills directory. The fixture constructor
+also bypasses ambient domain-carrier propagation and rejects any attempted
+shared MCP PID registration. These exceptions belong only to this explicit
+hosted-test kernel; ordinary application construction is unchanged.
+
+This is controller-kernel evidence, not production HTTPS, real Vault, UI/composer,
+coordinator tool routing or child-agent integration evidence. Keep those remaining
+layers explicit in any completion claim. Never supply real account credentials
+or run this fixture against a production provider endpoint.
+
 ## Handoff checklist
 
 - Protected contract, plausible defect, chosen layer, and observable oracle.

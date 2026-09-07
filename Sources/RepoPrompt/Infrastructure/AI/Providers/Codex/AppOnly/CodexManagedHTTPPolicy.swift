@@ -14,8 +14,8 @@ enum CodexManagedHTTPPolicy {
         guard version == supportedRuntimeVersion, version == bundledVersion else { throw Failure.unsupportedConfiguration }
     }
 
-    /// Privileged native frames must never hold the consent lock while waiting
-    /// for pipe capacity. EAGAIN/partial-write failure fences the owned backend.
+    /// Restore descriptor flags before callers handle failures/close transport.
+    /// Capacity waits belong outside each chunk's revocable-consent lock.
     static func withNonblockingPipeWrite<T>(descriptor: Int32, _ body: () throws -> T) throws -> T {
         let flags = fcntl(descriptor, F_GETFL)
         guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
@@ -25,6 +25,63 @@ enum CodexManagedHTTPPolicy {
         return try body()
     }
 
+    /// Retain actor serialization for the whole frame, but never hold consent
+    /// while waiting for pipe capacity. A revoked partial frame is terminal: its
+    /// missing newline must never be completed by a later unrelated request.
+    static func writeAuthorizedFrame(
+        _ frame: Data, descriptor: Int32, authorization: CodexAccountAdoptionAuthorization,
+        timeout: TimeInterval = 3,
+        writeChunk: (Int32, Data) throws -> Void = { try writeAtomicChunk($1, descriptor: $0) },
+        didPublishChunk: (Int) -> Void = { _ in }
+    ) throws {
+        let pipeLimit = fpathconf(descriptor, _PC_PIPE_BUF)
+        guard pipeLimit > 0, timeout > 0, timeout <= 30 else { throw Failure.unsupportedConfiguration }
+        let chunkLimit = min(Int(pipeLimit), 4096)
+        let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(timeout * 1_000_000_000)
+        var offset = 0
+        try withNonblockingPipeWrite(descriptor: descriptor) {
+            do {
+                while offset < frame.count {
+                    guard DispatchTime.now().uptimeNanoseconds < deadline else { throw FDWriteError.system(errno: ETIMEDOUT) }
+                    let end = min(offset + chunkLimit, frame.count)
+                    let chunk = frame.subdata(in: offset ..< end)
+                    do {
+                        try authorization.withAuthorization { try writeChunk(descriptor, chunk) }
+                    } catch let failure as FDWriteError where failure.errnoValue == EINTR {
+                        continue
+                    } catch let failure as FDWriteError where failure.errnoValue == EAGAIN || failure.errnoValue == EWOULDBLOCK {
+                        // PIPE_BUF-sized nonblocking pipe writes are atomic:
+                        // EAGAIN publishes none of this chunk. Poll outside the
+                        // consent lock, then recheck authority before retrying.
+                        var event = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+                        let result = Darwin.poll(&event, 1, 10)
+                        if result < 0, errno != EINTR { throw FDWriteError.system(errno: errno) }
+                        continue
+                    }
+                    offset = end
+                    didPublishChunk(offset)
+                }
+            } catch CodexAccountAdoptionReason.revoked {
+                guard offset == 0 else { throw FDWriteError.system(errno: ECANCELED) }
+                throw CodexAccountAdoptionReason.revoked
+            }
+        }
+    }
+
+    /// Exactly one syscall under consent; EINTR must return to the outer loop
+    /// so its deadline and revocation checks are never hidden by writeAll.
+    static func writeAtomicChunk(_ chunk: Data, descriptor: Int32) throws {
+        let written = chunk.withUnsafeBytes { Darwin.write(descriptor, $0.baseAddress, $0.count) }
+        guard written == chunk.count else {
+            let failure = written < 0 ? errno : (written == 0 ? EPIPE : EIO)
+            switch failure {
+            case EPIPE: throw FDWriteError.brokenPipe(errno: failure)
+            case EBADF: throw FDWriteError.badDescriptor(errno: failure)
+            default: throw FDWriteError.system(errno: failure)
+            }
+        }
+    }
+
     enum Failure: Error, LocalizedError {
         case unsupportedConfiguration
         var errorDescription: String? {
@@ -32,9 +89,10 @@ enum CodexManagedHTTPPolicy {
         }
     }
 
-    /// Lives inside the app-server actor so admission and writing a request frame
-    /// have no intervening await. Main-actor UI reservations alone are insufficient.
+    /// Actor-owned admission returns the exact consent that must also protect
+    /// frame publication: synchronous code can still race main-actor revocation.
     struct RequestGate {
+        private static let providerWorkMethods: Set<String> = ["turn/start", "turn/steer", "review/start", "thread/compact/start", "thread/shellCommand"]
         private(set) var threadID: String?
         private var hasStarted = false
         private var lease: UUID?
@@ -82,11 +140,12 @@ enum CodexManagedHTTPPolicy {
             self.authorization = authorization
         }
 
-        mutating func authorize(method: String, permitsAccountLogin: Bool = false, requestedThreadID: String? = nil) throws {
-            if method == "turn/interrupt" { return }
+        @discardableResult
+        mutating func authorize(method: String, permitsAccountLogin: Bool = false, requestedThreadID: String? = nil) throws -> CodexAccountAdoptionAuthorization? {
+            if method == "turn/interrupt" { return nil }
             if method == "account/login/start" {
                 guard permitsAccountLogin, lease != nil else { throw Failure.unsupportedConfiguration }
-                return
+                return nil
             }
             if ["account/logout", "thread/fork", "thread/goal/set", "thread/goal/clear"].contains(method) {
                 throw Failure.unsupportedConfiguration
@@ -99,12 +158,12 @@ enum CodexManagedHTTPPolicy {
                     guard expectedResumeThreadID == nil else { throw Failure.unsupportedConfiguration }
                 }
                 hasRequestedThread = true
-                return
+                return nil
             }
-            if ["turn/start", "turn/steer", "review/start", "thread/compact/start", "thread/shellCommand"].contains(method) {
+            if Self.providerWorkMethods.contains(method) {
                 guard permitsTurns, lease == nil, let authorization else { throw Failure.unsupportedConfiguration }
                 try authorization.withAuthorization {}
-                hasDispatchedProviderWork = true
+                return authorization
             }
             if lease != nil, method.hasPrefix("config/"), method != "config/read" {
                 throw Failure.unsupportedConfiguration
@@ -112,6 +171,11 @@ enum CodexManagedHTTPPolicy {
             if lease != nil, !["/read", "/list", "/get"].contains(where: method.hasSuffix) {
                 throw Failure.unsupportedConfiguration
             }
+            return nil
+        }
+
+        mutating func recordFramePublication(method: String) {
+            if Self.providerWorkMethods.contains(method) { hasDispatchedProviderWork = true }
         }
     }
 
@@ -153,6 +217,20 @@ enum CodexManagedHTTPPolicy {
     }
 
     static var launchArguments: [String] {
+        launchArguments(baseURL: baseURL)
+    }
+
+    #if DEBUG
+        static func integrationLaunchArguments(_ configuration: CodexManagedHTTPIntegrationConfiguration) -> [String] {
+            launchArguments(baseURL: configuration.responsesURL)
+        }
+
+        static func verifyIntegrationConfiguration(_ response: [String: Any], configuration: CodexManagedHTTPIntegrationConfiguration) throws {
+            try verifyEffectiveConfiguration(response, expectedBaseURL: configuration.responsesURL)
+        }
+    #endif
+
+    private static func launchArguments(baseURL: String) -> [String] {
         let assignments = [
             "model_provider=\"\(providerID)\"",
             "model_providers.\(providerID).name=\"Switchboard managed HTTP\"",
@@ -181,6 +259,10 @@ enum CodexManagedHTTPPolicy {
     }
 
     static func verifyEffectiveConfiguration(_ response: [String: Any]) throws {
+        try verifyEffectiveConfiguration(response, expectedBaseURL: baseURL)
+    }
+
+    private static func verifyEffectiveConfiguration(_ response: [String: Any], expectedBaseURL: String) throws {
         guard let config = response["config"] as? [String: Any],
               config["model_provider"] as? String == providerID,
               config["cli_auth_credentials_store"] as? String == "ephemeral",
@@ -189,7 +271,7 @@ enum CodexManagedHTTPPolicy {
               let providers = config["model_providers"] as? [String: Any],
               let provider = providers[providerID] as? [String: Any],
               provider["name"] as? String == "Switchboard managed HTTP",
-              provider["base_url"] as? String == baseURL,
+              provider["base_url"] as? String == expectedBaseURL,
               provider["wire_api"] as? String == "responses",
               strictBoolean(provider["requires_openai_auth"], equals: true),
               strictBoolean(provider["supports_websockets"], equals: false)

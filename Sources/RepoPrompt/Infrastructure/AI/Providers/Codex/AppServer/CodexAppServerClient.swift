@@ -457,6 +457,41 @@ actor CodexAppServerClient {
     private let faultInjection: FaultInjection
     #if DEBUG
         private var terminalObserverJoinCount = 0
+        private var integrationConfiguration: CodexManagedHTTPIntegrationConfiguration?
+        private var integrationBeforeFramePublication: (@Sendable (String) -> Void)?
+        private var integrationAfterFrameChunk: (@Sendable (String?, Int) -> Void)?
+
+        /// Test-only construction; the shipped/default initializer never selects
+        /// alternate resources, routing or a process wrapper from ambient state.
+        static func makeForHostedIntegrationTest(
+            _ configuration: CodexManagedHTTPIntegrationConfiguration,
+            beforeFramePublication: (@Sendable (String) -> Void)? = nil,
+            afterFrameChunk: (@Sendable (String?, Int) -> Void)? = nil
+        ) async throws -> CodexAppServerClient {
+            try CodexManagedHTTPIntegrationConfiguration.requireHostedXCTest()
+            let client = CodexAppServerClient(
+                processEnvironmentBuilder: { _ in
+                    .init(environment: configuration.environment, launchContext: .detect(from: configuration.environment), shellEnvironmentSource: .inheritedRichEnvironment)
+                },
+                runtimeStatePreparer: { runtime in
+                    try runtime.prepareState(ordinaryCodexHomeURL: configuration.rootURL.appendingPathComponent("empty-ordinary-home"))
+                },
+                provisionsRepoPromptMCPOnStart: false,
+                expectedAgentPIDRegistrar: .init(
+                    register: { _, _, _ in preconditionFailure("Hosted integration fixture must not register shared MCP authority") },
+                    clear: { _, _, _ in preconditionFailure("Hosted integration fixture must not clear shared MCP authority") }
+                ),
+                managedHTTPAccountAdoption: true
+            )
+            await client.installHostedIntegrationConfiguration(configuration, beforeFramePublication: beforeFramePublication, afterFrameChunk: afterFrameChunk)
+            return client
+        }
+
+        private func installHostedIntegrationConfiguration(_ configuration: CodexManagedHTTPIntegrationConfiguration, beforeFramePublication: (@Sendable (String) -> Void)?, afterFrameChunk: (@Sendable (String?, Int) -> Void)?) {
+            integrationConfiguration = configuration
+            integrationBeforeFramePublication = beforeFramePublication
+            integrationAfterFrameChunk = afterFrameChunk
+        }
     #endif
 
     deinit {
@@ -527,12 +562,16 @@ actor CodexAppServerClient {
             )
         )
         var environment = environmentResult.environment
-        let resolution = CodexProviderHelpers.resolveCodexExecutable(
-            commandName: config.commandName,
-            environment: environment,
-            additionalPathHints: config.additionalPathHints,
-            logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
-        )
+        let resolution: CodexProviderHelpers.CodexExecutableResolution
+        #if DEBUG
+            if let integrationConfiguration {
+                resolution = try integrationConfiguration.resolve()
+            } else {
+                resolution = resolveDefaultRuntime(environment: environment)
+            }
+        #else
+            resolution = resolveDefaultRuntime(environment: environment)
+        #endif
         guard resolution.status == .available else {
             throw ClientError.executableUnavailable(resolution.userMessage)
         }
@@ -552,6 +591,41 @@ actor CodexAppServerClient {
             resolution: resolution
         )
         return runtime
+    }
+
+    private func resolveDefaultRuntime(environment: [String: String]) -> CodexProviderHelpers.CodexExecutableResolution {
+        CodexProviderHelpers.resolveCodexExecutable(
+            commandName: config.commandName,
+            environment: environment,
+            additionalPathHints: config.additionalPathHints,
+            logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
+        )
+    }
+
+    func verifyManagedEffectiveConfiguration(_ response: [String: Any]) throws {
+        #if DEBUG
+            if let integrationConfiguration {
+                try CodexManagedHTTPPolicy.verifyIntegrationConfiguration(response, configuration: integrationConfiguration)
+                return
+            }
+        #endif
+        try CodexManagedHTTPPolicy.verifyEffectiveConfiguration(response)
+    }
+
+    private var managedLaunchArguments: [String] {
+        #if DEBUG
+            if let integrationConfiguration { return CodexManagedHTTPPolicy.integrationLaunchArguments(integrationConfiguration) }
+        #endif
+        return CodexManagedHTTPPolicy.launchArguments
+    }
+
+    private func spawnRuntime(command: String, arguments: [String], environment: [String: String], workingDirectory: String?) throws -> SpawnedProcess {
+        #if DEBUG
+            if let integrationConfiguration {
+                return try integrationConfiguration.spawn(command: command, arguments: arguments, environment: environment, workingDirectory: workingDirectory)
+            }
+        #endif
+        return try ProcessLauncher.spawn(command: command, arguments: arguments, environment: environment, workingDirectory: workingDirectory)
     }
 
     private func prepareState(for runtime: CodexRuntimeAuthority.Runtime) throws {
@@ -1384,10 +1458,13 @@ actor CodexAppServerClient {
             throw lastTransportFailure ?? ClientError.processNotRunning
         }
         var guardedParams = params
+        var frameAuthorization = managedAuthorization
         if usesManagedHTTPAccountAdoption {
             if permitsManagedAccountLogin, managedAuthorization == nil { throw CodexAccountAdoptionReason.revoked }
-            // Actor-confined check and frame publication below contain no await.
-            try managedRequestGate.authorize(method: method, permitsAccountLogin: permitsManagedAccountLogin, requestedThreadID: params?["threadId"] as? String)
+            // Capture the gate's exact consent, then recheck it under the same
+            // lock as the final write; another actor can revoke without await.
+            let providerAuthorization = try managedRequestGate.authorize(method: method, permitsAccountLogin: permitsManagedAccountLogin, requestedThreadID: params?["threadId"] as? String)
+            frameAuthorization = providerAuthorization ?? managedAuthorization
             guardedParams = try CodexManagedHTTPPolicy.requestParameters(
                 method: method, params: params, permitsAccountLogin: permitsManagedAccountLogin
             )
@@ -1421,11 +1498,15 @@ actor CodexAppServerClient {
                     return
                 }
                 do {
-                    if let managedAuthorization {
-                        try sendAuthorizedJSONLine(payload, method: method, authorization: managedAuthorization)
+                    #if DEBUG
+                        integrationBeforeFramePublication?(method)
+                    #endif
+                    if let frameAuthorization {
+                        try sendAuthorizedJSONLine(payload, method: method, authorization: frameAuthorization)
                     } else {
                         try sendJSONLine(payload, method: method)
                     }
+                    if usesManagedHTTPAccountAdoption { managedRequestGate.recordFramePublication(method: method) }
                 } catch {
                     failPendingRequestIfPresent(id: requestID, error: error)
                 }
@@ -1614,7 +1695,7 @@ actor CodexAppServerClient {
             if usesManagedHTTPAccountAdoption, managedVerifiedTransportGeneration == nil {
                 do {
                     let effective = try await request(method: "config/read", params: [:], timeout: 5)
-                    try CodexManagedHTTPPolicy.verifyEffectiveConfiguration(effective)
+                    try verifyManagedEffectiveConfiguration(effective)
                     let account = try await request(method: "account/read", params: ["refreshToken": false], timeout: 5)
                     guard account["account"] is NSNull else { throw CodexManagedHTTPPolicy.Failure.unsupportedConfiguration }
                     try ensureStartupAuthority(startupAuthority)
@@ -1659,7 +1740,12 @@ actor CodexAppServerClient {
         guard let launchContext = preparedRuntimeLaunchContext else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
         }
-        var environment = Self.processEnvironmentForCurrentLaunch(launchContext.environment)
+        var environment = launchContext.environment
+        #if DEBUG
+            if integrationConfiguration == nil { environment = Self.processEnvironmentForCurrentLaunch(environment) }
+        #else
+            environment = Self.processEnvironmentForCurrentLaunch(environment)
+        #endif
         if usesManagedHTTPAccountAdoption {
             try managedRequestGate.claimStartup()
             environment = CodexManagedHTTPPolicy.environment(environment)
@@ -1680,7 +1766,7 @@ actor CodexAppServerClient {
             ),
             featurePolicy: config.processFeaturePolicy
         )
-        let args = processOverrides + (usesManagedHTTPAccountAdoption ? CodexManagedHTTPPolicy.launchArguments : []) + ["app-server"]
+        let args = processOverrides + (usesManagedHTTPAccountAdoption ? managedLaunchArguments : []) + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
             config.processLaunchDirectory
         )
@@ -1689,7 +1775,7 @@ actor CodexAppServerClient {
             try await processSpawnPreparation()
             try Task.checkCancellation()
             try ensureStartupAuthority(startupAuthority)
-            spawned = try ProcessLauncher.spawn(
+            spawned = try spawnRuntime(
                 command: resolution.resolvedCommand,
                 arguments: args,
                 environment: environment,
@@ -2208,13 +2294,10 @@ actor CodexAppServerClient {
     /// Related:
     /// - ClaudeNativeProcessSessionController.sendLine (reference atomic write pattern)
     private func sendAuthorizedJSONLine(_ payload: [String: Any], method: String?, authorization: CodexAccountAdoptionAuthorization) throws {
-        guard let descriptor = activeTransport?.process.stdinDescriptor else { throw ClientError.processNotRunning }
-        try CodexManagedHTTPPolicy.withNonblockingPipeWrite(descriptor: descriptor) {
-            try authorization.withAuthorization { try sendJSONLine(payload, method: method) }
-        }
+        try sendJSONLine(payload, method: method, authorization: authorization)
     }
 
-    private func sendJSONLine(_ payload: [String: Any], method: String?) throws {
+    private func sendJSONLine(_ payload: [String: Any], method: String?, authorization: CodexAccountAdoptionAuthorization? = nil) throws {
         guard let activeTransport, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
         }
@@ -2232,7 +2315,22 @@ actor CodexAppServerClient {
         frame.append(0x0A)
         let generation = activeTransport.generation
         do {
-            try writeFrameHandler(stdinDescriptor, frame)
+            if let authorization {
+                try CodexManagedHTTPPolicy.writeAuthorizedFrame(
+                    frame, descriptor: stdinDescriptor, authorization: authorization,
+                    didPublishChunk: { offset in
+                        #if DEBUG
+                            self.integrationAfterFrameChunk?(method, offset)
+                        #endif
+                    }
+                )
+            } else {
+                try writeFrameHandler(stdinDescriptor, frame)
+            }
+        } catch CodexAccountAdoptionReason.revoked {
+            // No prefix was published. Partial-frame revocation is instead a
+            // terminal ECANCELED write failure, handled below after flags restore.
+            throw CodexAccountAdoptionReason.revoked
         } catch let error as FDWriteError {
             let failure = ClientError.transportWriteFailed(
                 message: transportWriteFailureMessage(method: method, errno: error.errnoValue),

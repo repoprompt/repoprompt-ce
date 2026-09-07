@@ -3,6 +3,26 @@ import Darwin
 import XCTest
 
 final class CodexManagedHTTPPolicyTests: XCTestCase {
+    func testEveryProviderWorkMethodCarriesExactRevocableFrameAuthority() throws {
+        for method in ["turn/start", "turn/steer", "review/start", "thread/compact/start", "thread/shellCommand"] {
+            var gate = CodexManagedHTTPPolicy.RequestGate()
+            try gate.claimStartup()
+            try gate.bindThread("owned")
+            let lease = try gate.reserve()
+            let authorization = CodexAccountAdoptionAuthorization()
+            try gate.bindAuthorization(authorization)
+            gate.finish(lease, allowTurns: true)
+            let frameAuthority = try XCTUnwrap(gate.authorize(method: method))
+            XCTAssertTrue(frameAuthority === authorization, method)
+            authorization.invalidate()
+            var wrote = false
+            XCTAssertThrowsError(try frameAuthority.withAuthorization { wrote = true })
+            XCTAssertFalse(wrote, method)
+            XCTAssertNil(try gate.authorize(method: "turn/interrupt"))
+            XCTAssertNil(try gate.authorize(method: "thread/read"))
+        }
+    }
+
     func testPrivilegedWriteIsNonblockingAndRestoresFlagsOnFailure() throws {
         let pipe = Pipe()
         let descriptor = pipe.fileHandleForWriting.fileDescriptor

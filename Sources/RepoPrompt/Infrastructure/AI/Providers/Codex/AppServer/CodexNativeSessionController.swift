@@ -2110,7 +2110,7 @@ final class CodexNativeSessionController {
             throw CodexAccountAdoptionReason.transportUnverified
         }
         let configuration = try await performRequest(method: "config/read", params: [:], timeout: 5)
-        try CodexManagedHTTPPolicy.verifyEffectiveConfiguration(configuration)
+        try await client.verifyManagedEffectiveConfiguration(configuration)
         let loaded = try await performRequest(method: "thread/loaded/list", params: [:], timeout: 5)
         // A brand-new unmaterialized thread cannot service includeTurns on 0.149.
         // Only actor-owned no-dispatch provenance permits metadata-only evidence.

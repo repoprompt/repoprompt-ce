@@ -197,9 +197,15 @@ Consent revocation is checked again at the final child-process write using a
 synchronous revocable authorization. Main-actor checks alone are insufficient:
 a revoke must also fence a login or refreshed-token response queued for native
 actor execution. Pairing and grant data remain memory-only.
-Privileged native writes use nonblocking pipe mode while holding this authority
-lock. A partial write or unavailable pipe capacity fails closed and retires the
-owned transport; revocation must not wait for a stalled child's pipe to drain.
+Managed provider-work and privileged native frames use nonblocking, atomic
+`PIPE_BUF`-bounded chunks. The exact consent lock protects each chunk; the actor
+serializes the whole frame, while capacity polling occurs outside the consent
+lock under a three-second monotonic deadline. Revocation before any bytes leaves
+the original idle thread intact. Revocation after a prefix, deadline expiry or
+another write failure retires the owned transport before another frame can be
+appended to that prefix. Descriptor flags are restored before teardown. A frame
+counts as provider work only after its complete newline has been published, so
+zero-byte revocation does not strand a fresh unmaterialized thread during repair.
 Routine bridge polling does not reserve the native runtime or block existing
 work. Only an admissible pending adoption takes the native lease, and Stop
 remains available during adoption/refresh. Turn admission separately checks the

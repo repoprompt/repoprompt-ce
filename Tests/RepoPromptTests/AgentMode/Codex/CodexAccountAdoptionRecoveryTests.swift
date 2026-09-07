@@ -70,6 +70,8 @@ final class CodexAccountAdoptionRecoveryTests: XCTestCase {
         try fresh.bindAuthorization(CodexAccountAdoptionAuthorization())
         fresh.finish(lease, allowTurns: true)
         try fresh.authorize(method: "turn/start")
+        XCTAssertTrue(fresh.permitsUnmaterializedThreadProof, "Admission alone must not strand an unmaterialized thread after zero-byte revocation")
+        fresh.recordFramePublication(method: "turn/start")
         XCTAssertFalse(fresh.permitsUnmaterializedThreadProof)
         var resumed = CodexManagedHTTPPolicy.RequestGate(expectedResumeThreadID: "existing")
         try resumed.claimStartup()
