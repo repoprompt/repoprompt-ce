@@ -9,11 +9,17 @@ struct MCPServerCatalog: Equatable {
         init(name: String, transport: Transport, policy: Policy? = nil) {
             self.name = name
             self.transport = transport
-            self.policy = policy ?? (
-                MCPServerCatalog.isRepoPrompt(name)
-                    ? Policy(enabled: true, required: true)
-                    : Policy()
-            )
+            let supplied = policy ?? Policy()
+            self.policy = MCPServerCatalog.isRepoPrompt(name)
+                ? Policy(
+                    enabled: true,
+                    required: true,
+                    enabledTools: supplied.enabledTools,
+                    tools: supplied.tools,
+                    supportsParallelToolCalls: supplied.supportsParallelToolCalls,
+                    toolTimeoutSeconds: supplied.toolTimeoutSeconds
+                )
+                : supplied
         }
     }
 
@@ -75,7 +81,6 @@ struct MCPServerCatalog: Equatable {
         let selected = Set(enabledNames.map(Self.normalizedName))
         return servers.filter { server in
             Self.isRepoPrompt(server.name)
-                || server.policy.required == true
                 || selected.contains(Self.normalizedName(server.name))
         }
     }
