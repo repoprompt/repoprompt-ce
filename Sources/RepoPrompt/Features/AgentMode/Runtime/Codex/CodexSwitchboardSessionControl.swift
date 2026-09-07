@@ -30,6 +30,13 @@ final class CodexSwitchboardSessionControl: ObservableObject {
         let reserve: @MainActor () async throws -> UUID
         let finish: @MainActor (UUID, Bool) async -> Void
         let install: @MainActor (CodexAccountAdoptionGrant) async throws -> CodexAccountAdoptionLoginReceipt
+        var automatic: AutomaticRuntime?
+    }
+
+    struct AutomaticRuntime {
+        let peer: @MainActor () async throws -> SwitchboardAutomaticNativePeer
+        let hasEnded: @MainActor () async -> Bool
+        let install: @MainActor (CodexAccountAdoptionGrant, CodexAutomaticAdoptionPermit) async throws -> CodexAccountAdoptionLoginReceipt
     }
 
     @Published private(set) var state: CodexAccountAdoptionState = .waitingIdle(.runtimeUnavailable)
@@ -47,6 +54,7 @@ final class CodexSwitchboardSessionControl: ObservableObject {
     private var selectedGrant: CodexAccountAdoptionGrant?
     private let mutex = AsyncMutex()
     let authorization = CodexAccountAdoptionAuthorization()
+    @Published private(set) var automatic: CodexSwitchboardAutomaticControl?
     /// Called after local admission state settles, not from Published's willSet.
     var availabilityDidChange: (() -> Void)?
 
@@ -158,6 +166,170 @@ final class CodexSwitchboardSessionControl: ObservableObject {
         }
     }
 
+    func observeAutomaticOffers(client: SwitchboardAutomaticClient, startPolling: Bool = true) {
+        guard automatic == nil, runtime?.automatic != nil else { return }
+        let automatic = CodexSwitchboardAutomaticControl(client: client, source: { [weak self] in self?.core?.automaticSource }, perform: { [weak self] prepared, enrollment in
+            await self?.performAutomatic(prepared, enrollment: enrollment)
+        })
+        self.automatic = automatic
+        if startPolling { automatic.start() }
+    }
+
+    private func performAutomatic(_ prepared: SwitchboardAutomaticPrepared, enrollment: SwitchboardAutomaticEnrollment) async {
+        try? await mutex.withLock { [weak self] in
+            await self?.performAutomaticLocked(prepared, enrollment: enrollment)
+        }
+    }
+
+    private func performAutomaticLocked(_ prepared: SwitchboardAutomaticPrepared, enrollment: SwitchboardAutomaticEnrollment) async {
+        guard let automatic, let core, let runtime, let native = runtime.automatic,
+              !blocksPermanently, !isPreparing else { return }
+        let source = prepared.intent.source
+        let expectedEpoch = epoch
+        guard (try? core.validateAutomaticAdmission(source: source)) != nil else { return }
+        isTransactionInFlight = true
+        availabilityDidChange?()
+        defer { isTransactionInFlight = false
+            availabilityDidChange?()
+        }
+        guard let lease = try? await runtime.reserve() else { return }
+        await executeAutomatic(
+            prepared,
+            enrollment: enrollment,
+            automatic: automatic,
+            core: core,
+            runtime: runtime,
+            native: native,
+            lease: lease,
+            expectedEpoch: expectedEpoch
+        )
+        await runtime.finish(lease, !core.blocksDispatch)
+    }
+
+    private func executeAutomatic(
+        _ prepared: SwitchboardAutomaticPrepared,
+        enrollment: SwitchboardAutomaticEnrollment,
+        automatic: CodexSwitchboardAutomaticControl,
+        core: CodexAccountAdoption,
+        runtime: Runtime,
+        native: AutomaticRuntime,
+        lease _: UUID,
+        expectedEpoch: UUID
+    ) async {
+        let source = prepared.intent.source
+        var permit: CodexAutomaticAdoptionPermit?
+        var issued: SwitchboardAutomaticIssued?
+        var confirmedReceipt: SwitchboardAutomaticReceipt?
+        defer { if let permit { automatic.fence.finish(permit) } }
+        do {
+            try checkIdentity(expectedEpoch)
+            try core.validateAutomaticAdmission(source: source)
+            let before = try await runtime.inspect()
+            try checkIdentity(expectedEpoch)
+            try core.validateAutomaticAdmission(source: source)
+            try core.validateAutomaticProof(before)
+            let peer = try await native.peer()
+            try checkIdentity(expectedEpoch)
+            try core.validateAutomaticAdmission(source: source)
+            guard prepared.expiresAt > Date(), prepared.intent.expiresAt > Date(),
+                  automatic.enrollment == enrollment else { throw CodexAccountAdoptionReason.revoked }
+            let began = DispatchTime.now().uptimeNanoseconds
+            let response = try await automatic.client.begin(prepared, nativePeer: peer)
+            // Validate every captured binding before a receipt or authority can
+            // be created. Unparseable/lost/mismatched responses remain unknown.
+            try Self.validateIssued(response, prepared: prepared, enrollment: enrollment, peer: peer)
+            issued = response
+            let authority = try automatic.fence.arm(
+                id: response.permitID,
+                epoch: response.controlEpoch,
+                manualGeneration: response.manualGeneration,
+                beginStartedAt: began,
+                ttlMilliseconds: response.ttlMilliseconds,
+                nativePeer: peer,
+                destination: .init(grant: response.grant)
+            )
+            permit = authority
+            try checkIdentity(expectedEpoch)
+            try core.validateAutomaticAdmission(source: source)
+            let receipt = try await native.install(response.grant, authority)
+            authority.fence()
+            try checkIdentity(expectedEpoch)
+            guard receipt.externalTokenLogin, receipt.isChatGPTAccount,
+                  receipt.email == nil || receipt.email == response.grant.email else { throw CodexAccountAdoptionReason.identityChanged }
+            let after = try await runtime.inspect()
+            try checkIdentity(expectedEpoch)
+            try core.validateAutomaticProof(after)
+            try core.validateAutomaticAdmission(source: source)
+            guard authority.snapshot.publication == .complete else { throw CodexAccountAdoptionReason.mutationUnconfirmed }
+            let proof = SwitchboardAutomaticReceipt(
+                outcome: .applied,
+                publication: .complete,
+                nativeEnded: false,
+                permitFenced: true,
+                appliedBinding: .init(grant: response.grant),
+                reason: "none"
+            )
+            confirmedReceipt = proof
+            try await automatic.record(proof, permitID: response.permitID)
+            try checkIdentity(expectedEpoch)
+            try core.commitAutomatic(response.grant, source: source)
+            lastSeenRevision = max(lastSeenRevision, response.grant.revision)
+            selectedGrant = nil
+        } catch {
+            guard let permit, let issued else { return }
+            if let confirmedReceipt {
+                // A lost finish acknowledgment must retry the same terminal
+                // proof, never replace an already-applied receipt with unknown.
+                core.suspend(.mutationUnconfirmed)
+                try? await automatic.record(confirmedReceipt, permitID: issued.permitID)
+                return
+            }
+            let snapshot = permit.fence()
+            let ended = await native.hasEnded()
+            let sameLivePeer = await (try? native.peer()) == issued.nativePeer
+            let receipt: SwitchboardAutomaticReceipt
+            if snapshot.publication == .none, !ended, sameLivePeer {
+                receipt = .init(
+                    outcome: .fencedUnpublished,
+                    publication: .none,
+                    nativeEnded: false,
+                    permitFenced: true,
+                    appliedBinding: source,
+                    reason: "publication_fenced"
+                )
+            } else {
+                core.suspend(.mutationUnconfirmed)
+                let outcome: SwitchboardAutomaticReceipt.Outcome = ended && snapshot.publication != .none
+                    ? (snapshot.publication == .prefix ? .fencedPrefixNativeEnded : .publishedUnknownNativeEnded) : .unknown
+                receipt = .init(
+                    outcome: outcome,
+                    publication: snapshot.publication,
+                    nativeEnded: ended,
+                    permitFenced: true,
+                    appliedBinding: nil,
+                    reason: "mutation_unconfirmed"
+                )
+            }
+            try? await automatic.record(receipt, permitID: issued.permitID)
+        }
+    }
+
+    static func validateIssued(
+        _ issued: SwitchboardAutomaticIssued,
+        prepared: SwitchboardAutomaticPrepared,
+        enrollment: SwitchboardAutomaticEnrollment,
+        peer: SwitchboardAutomaticNativePeer
+    ) throws {
+        let intent = prepared.intent
+        guard issued.preparedID == prepared.id, issued.batchID == intent.batchID,
+              issued.enrollmentID == enrollment.id, issued.enrollmentEpoch == enrollment.epoch,
+              issued.ruleRevision == intent.ruleRevision, issued.controlEpoch == intent.controlEpoch,
+              issued.source == intent.source, issued.manualGeneration == intent.manualGeneration,
+              issued.nativePeer == peer, issued.grant.accountID == intent.destinationAccountID,
+              issued.grant.email == intent.destinationEmail, issued.grant.accountID != intent.source.accountID,
+              issued.grant.revision > intent.source.revision else { throw SwitchboardBridgeError.identityMismatch }
+    }
+
     func pollOnce() async {
         do {
             try await mutex.withLock { [weak self] in await self?.pollLocked() }
@@ -175,6 +347,7 @@ final class CodexSwitchboardSessionControl: ObservableObject {
             let grant = try await bridge.poll(lastSeenRevision: lastSeenRevision)
             try checkIdentity(expectedEpoch)
             if let grant {
+                automatic?.manualChanged()
                 lastSeenRevision = grant.revision
                 selectedGrant = grant
                 core.queue(grant)
@@ -263,6 +436,7 @@ final class CodexSwitchboardSessionControl: ObservableObject {
     }
 
     func runtimeLost() {
+        automatic?.stop()
         authorization.invalidate()
         epoch = UUID()
         core?.suspend(.runtimeUnavailable)
@@ -274,6 +448,7 @@ final class CodexSwitchboardSessionControl: ObservableObject {
     }
 
     func revoke() {
+        automatic?.stop()
         authorization.invalidate()
         epoch = UUID()
         core?.revoke()
