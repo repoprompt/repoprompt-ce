@@ -19,7 +19,7 @@ extension MCPServerCatalog {
             guard !line.isEmpty else { continue }
             if line.first == "[" {
                 if let current { drafts.append(current) }
-                current = try Self.migrationServerName(from: line).map(Draft.init(name:))
+                current = try Self.migrationServerName(from: line).map { Draft(name: $0) }
                 continue
             }
             guard var draft = current else { continue }
