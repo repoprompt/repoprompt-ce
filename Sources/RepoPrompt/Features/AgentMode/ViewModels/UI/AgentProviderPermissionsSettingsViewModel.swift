@@ -141,6 +141,13 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
                 ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
             case let .mcpStrictMode(enabled):
                 ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            case let .mcpServer(normalizedName, enabled):
+                ClaudeAgentToolPreferences.setMCPServerEnabled(
+                    normalizedName: normalizedName,
+                    isEnabled: enabled,
+                    defaults: defaults,
+                    secureStore: securePermissions
+                )
             case let .toolSearch(enabled):
                 ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
             case let .agentModePromptDelivery(delivery):
