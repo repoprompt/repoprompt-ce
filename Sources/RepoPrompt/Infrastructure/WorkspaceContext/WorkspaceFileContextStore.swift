@@ -19410,6 +19410,7 @@ actor WorkspaceFileContextStore {
         return true
     }
 
+    /// Returns whether missing classification remains current; only catalog removal requires a deletion fence.
     @discardableResult
     private func fenceAndPruneCatalogFileMissingOnDisk(
         rootID: UUID,
@@ -19427,19 +19428,27 @@ actor WorkspaceFileContextStore {
         if let expectedFileID, capturedFile?.id != expectedFileID { return false }
         if requireCatalogFileAbsent, capturedFile != nil { return false }
 
-        guard let token = await fenceCodemapPaths(
-            rootID: rootID,
-            commands: [.deleted([path])]
-        ) else { return false }
+        let token: CodemapPathFenceToken?
+        if capturedFile != nil {
+            guard let acquired = await fenceCodemapPaths(
+                rootID: rootID,
+                commands: [.deleted([path])]
+            ) else { return false }
+            token = acquired
+        } else {
+            token = nil
+        }
         var didCommitMutation = false
         defer {
             releaseCodemapPathFence(token, didCommitMutation: didCommitMutation)
         }
         #if DEBUG
-            await awaitExactFileSuspensionGateForTesting(
-                point: .missingFilePruneFence,
-                rootID: rootID
-            )
+            if token != nil {
+                await awaitExactFileSuspensionGateForTesting(
+                    point: .missingFilePruneFence,
+                    rootID: rootID
+                )
+            }
         #endif
 
         func catalogIdentityIsCurrent() -> Bool {
@@ -19451,8 +19460,8 @@ actor WorkspaceFileContextStore {
                 currentFile?.standardizedFullPath == capturedFile?.standardizedFullPath
         }
 
+        if let token, token.rootEpoch.rootLifetimeID != capturedLifetimeID { return false }
         guard !Task.isCancelled,
-              token.rootEpoch.rootLifetimeID == capturedLifetimeID,
               let currentState = rootStatesByID[rootID],
               currentState.lifetimeID == capturedLifetimeID,
               currentState.service === initialState.service,
@@ -19468,6 +19477,7 @@ actor WorkspaceFileContextStore {
               catalogIdentityIsCurrent()
         else { return false }
 
+        guard capturedFile != nil else { return true }
         let didPrune = withCodemapPathLocalCatalogMutation(rootID: rootID) {
             pruneCatalogFileMissingOnDisk(
                 rootID: rootID,

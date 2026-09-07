@@ -222,6 +222,351 @@ final class MCPReadMutationPathContractTests: XCTestCase {
     }
 
     #if DEBUG
+        @MainActor
+        func testMissingUncataloguedReadBypassesDeletionConvergence() async throws {
+            let rootURL = try makeTemporaryDirectory(name: "MissingReadDeletionFence")
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let roots = await store.rootRefs(scope: .visibleWorkspace)
+            let alias = try XCTUnwrap(ClientPathFormatter.exactRootAliases(visibleRoots: roots)[root.id])
+            let namespace = WorkspaceExactFileNamespace.identity(roots: roots)
+            let readableService = WorkspaceReadableFileService(store: store)
+            let relativePath = "Missing.swift"
+            let target = rootURL.appendingPathComponent(relativePath)
+
+            for path in [target.path, "\(alias)//\(relativePath)", relativePath] {
+                let before = await store.file(rootID: root.id, relativePath: relativePath)
+                XCTAssertNil(before, path)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: target.path), path)
+                let deletion = MCPPathContractReleaseGate(name: "missing read deletion")
+                let progress = MCPPathContractReleaseGate(name: "missing read progress")
+                progress.release()
+                let entries = ExactResolutionPeerProbe()
+                let completed = ExactResolutionPeerProbe()
+                await store.setExactFileSuspensionGateForTesting(
+                    point: .missingFilePruneFence,
+                    rootID: root.id
+                ) {
+                    await entries.record()
+                    await progress.enterAndWait()
+                    await deletion.enterAndWait()
+                }
+                let task = Task {
+                    do {
+                        let result = try await MCPServerViewModel.resolveReadFileRequestAfterFreshness(
+                            WorkspaceExactFileInput.parse(path),
+                            readableService: readableService,
+                            rootScope: .visibleWorkspace,
+                            rootRefs: roots,
+                            namespace: namespace
+                        )
+                        await completed.record()
+                        await progress.enterAndWait()
+                        return result
+                    } catch {
+                        await completed.record()
+                        await progress.enterAndWait()
+                        throw error
+                    }
+                }
+                addTeardownBlock {
+                    deletion.release()
+                    _ = await task.result
+                    await store.clearExactFileCandidateProbeGateForTesting()
+                }
+                let progressed = await progress.waitUntilEntered()
+                let entryCount = await entries.count
+                let completionCount = await completed.count
+                let heldFences = await store.codemapPathFenceCountForTesting(rootID: root.id, relativePath: relativePath)
+                XCTAssertTrue(progressed, path)
+                XCTAssertEqual(entryCount, 0, path)
+                XCTAssertEqual(completionCount, 1, path)
+                XCTAssertEqual(heldFences, 0, path)
+                deletion.release()
+                let result = try await task.value
+                guard case .noCandidate = result else {
+                    XCTFail("Expected normal missing result for \(path), got \(result)")
+                    continue
+                }
+                await store.clearExactFileCandidateProbeGateForTesting()
+                let after = await store.file(rootID: root.id, relativePath: relativePath)
+                XCTAssertNil(after, path)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: target.path), path)
+            }
+        }
+
+        @MainActor
+        func testPublicMCPCreateBypassesMissingCandidateDeletionConvergence() async throws {
+            let rootURL = try makeTemporaryDirectory(name: "PublicCreateDeletionFence")
+            let relativePath = "New.swift"
+            let destination = rootURL.appendingPathComponent(relativePath)
+            let content = "created through public MCP\n"
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: root.id)
+            let service = try XCTUnwrap(loadedService)
+            let (server, _) = try makeInProcessMCPFileActionsServer(store: store, root: rootURL)
+            let tool = try await inProcessFileActionsTool(from: server)
+            let deletion = MCPPathContractReleaseGate(name: "public create deletion")
+            let progress = MCPPathContractReleaseGate(name: "public create progress")
+            progress.release()
+            let entries = ExactResolutionPeerProbe()
+            let completed = ExactResolutionPeerProbe()
+            let prepared = ExactResolutionPeerProbe()
+            await store.setExactFileSuspensionGateForTesting(
+                point: .missingFilePruneFence,
+                rootID: root.id
+            ) {
+                await entries.record()
+                await progress.enterAndWait()
+                await deletion.enterAndWait()
+            }
+            await service.setCreateFileDataPreparationForTesting { value in
+                let fences = await store.codemapPathFenceCountForTesting(rootID: root.id, relativePath: relativePath)
+                XCTAssertGreaterThan(fences, 0, "Creation must retain its legitimate mutation fence")
+                await prepared.record()
+                return Data(value.utf8)
+            }
+            let task = Task {
+                do {
+                    let result = try await tool(fileActionArguments(path: destination.path, content: content, ifExists: "error"))
+                    await completed.record()
+                    await progress.enterAndWait()
+                    return result
+                } catch {
+                    await completed.record()
+                    await progress.enterAndWait()
+                    throw error
+                }
+            }
+            addTeardownBlock {
+                deletion.release()
+                _ = await task.result
+                await store.clearExactFileCandidateProbeGateForTesting()
+                await service.setCreateFileDataPreparationForTesting(nil)
+            }
+            let progressed = await progress.waitUntilEntered()
+            let entryCount = await entries.count
+            let completionCount = await completed.count
+            let preparationCount = await prepared.count
+            let heldFences = await store.codemapPathFenceCountForTesting(rootID: root.id, relativePath: relativePath)
+            XCTAssertTrue(progressed)
+            XCTAssertEqual(entryCount, 0)
+            XCTAssertEqual(completionCount, 1)
+            XCTAssertEqual(preparationCount, 1, "Public create must reach physical admission and data preparation")
+            XCTAssertEqual(heldFences, 0)
+            deletion.release()
+            let result = try await task.value
+            await store.clearExactFileCandidateProbeGateForTesting()
+            await service.setCreateFileDataPreparationForTesting(nil)
+            let reply = try XCTUnwrap(result.decode(ToolResultDTOs.FileActionReply.self))
+            XCTAssertEqual(reply.status, "ok")
+            XCTAssertEqual(reply.mutationState, "applied")
+            XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), content)
+            let record = await store.file(rootID: root.id, relativePath: relativePath)
+            XCTAssertEqual(record?.standardizedFullPath, StandardizedPath.absolute(destination.path))
+            let remaining = await store.codemapPathFenceCountForTesting(rootID: root.id, relativePath: relativePath)
+            XCTAssertEqual(remaining, 0)
+        }
+
+        func testStaleCatalogFileWaitsForDeletionConvergenceBeforePruning() async throws {
+            let rootURL = try makeTemporaryDirectory(name: "StaleRecordDeletionFence")
+            let target = rootURL.appendingPathComponent("Target.swift")
+            try write("stale\n", to: target)
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let original = await store.file(rootID: root.id, relativePath: "Target.swift")
+            let record = try XCTUnwrap(original)
+            let namespace = await WorkspaceExactFileNamespace.identity(roots: store.rootRefs(scope: .visibleWorkspace))
+            let watcher = MCPPathContractReleaseGate(name: "stale record watcher")
+            let deletion = MCPPathContractReleaseGate(name: "stale record deletion")
+            let completion = MCPPathContractReleaseGate(name: "stale record completion")
+            completion.release()
+            let completed = ExactResolutionPeerProbe()
+            await store.setWatcherSinkWillApplyHandler { rootID in
+                if rootID == root.id { await watcher.enterAndWait() }
+            }
+            await store.setExactFileSuspensionGateForTesting(point: .missingFilePruneFence, rootID: root.id) {
+                await deletion.enterAndWait()
+            }
+            addTeardownBlock {
+                deletion.release()
+                watcher.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.clearExactFileCandidateProbeGateForTesting()
+            }
+            try FileManager.default.removeItem(at: target)
+            let before = await store.file(rootID: root.id, relativePath: "Target.swift")
+            XCTAssertEqual(before?.id, record.id)
+            let task = Task {
+                do {
+                    let result = try await store.resolveExactExistingWorkspaceFile(.absolute(target.path), namespace: namespace)
+                    await completed.record()
+                    await completion.enterAndWait()
+                    return result
+                } catch {
+                    await completed.record()
+                    await completion.enterAndWait()
+                    throw error
+                }
+            }
+            addTeardownBlock {
+                deletion.release()
+                watcher.release()
+                _ = await task.result
+            }
+            let entered = await deletion.waitUntilEntered()
+            let held = await store.file(rootID: root.id, relativePath: "Target.swift")
+            let fenceCount = await store.codemapPathFenceCountForTesting(rootID: root.id, relativePath: "Target.swift")
+            let completionCount = await completed.count
+            XCTAssertTrue(entered)
+            XCTAssertEqual(held?.id, record.id)
+            XCTAssertEqual(fenceCount, 1)
+            XCTAssertEqual(completionCount, 0)
+            deletion.release()
+            let finished = await completion.waitUntilEntered()
+            if !finished { watcher.release() }
+            let result = await task.result
+            let after = await store.file(rootID: root.id, relativePath: "Target.swift")
+            let remaining = await store.codemapPathFenceCountForTesting(rootID: root.id, relativePath: "Target.swift")
+            await store.setWatcherSinkWillApplyHandler(nil)
+            watcher.release()
+            await store.clearExactFileCandidateProbeGateForTesting()
+            guard case .claimedMissing = try result.get() else {
+                return XCTFail("Expected stale record to resolve as missing")
+            }
+            XCTAssertNil(after)
+            XCTAssertEqual(remaining, 0)
+        }
+
+        func testUncataloguedMissingCandidateRechecksDisk() async throws {
+            let rootURL = try makeTemporaryDirectory(name: "MissingCandidateDiskRecheck")
+            let target = rootURL.appendingPathComponent("Target.swift")
+            let content = "appeared after eligibility\n"
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let namespace = await WorkspaceExactFileNamespace.identity(roots: store.rootRefs(scope: .visibleWorkspace))
+            let watcher = MCPPathContractReleaseGate(name: "disk recheck watcher")
+            let eligibility = MCPPathContractReleaseGate(name: "disk recheck eligibility")
+            let completion = MCPPathContractReleaseGate(name: "disk recheck completion")
+            completion.release()
+            await store.setWatcherSinkWillApplyHandler { rootID in
+                if rootID == root.id { await watcher.enterAndWait() }
+            }
+            await store.setExactFileSuspensionGateForTesting(point: .candidateEligibility, rootID: root.id) {
+                await eligibility.enterAndWait()
+            }
+            let task = Task {
+                do {
+                    let result = try await store.resolveExactExistingWorkspaceFile(.absolute(target.path), namespace: namespace)
+                    await completion.enterAndWait()
+                    return result
+                } catch {
+                    await completion.enterAndWait()
+                    throw error
+                }
+            }
+            addTeardownBlock {
+                eligibility.release()
+                watcher.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                _ = await task.result
+                await store.clearExactFileCandidateProbeGateForTesting()
+            }
+            guard await eligibility.waitUntilEntered() else {
+                eligibility.release()
+                watcher.release()
+                _ = await task.result
+                return
+            }
+            do {
+                try write(content, to: target)
+            } catch {
+                eligibility.release()
+                watcher.release()
+                _ = await task.result
+                throw error
+            }
+            let before = await store.file(rootID: root.id, relativePath: "Target.swift")
+            XCTAssertNil(before)
+            eligibility.release()
+            let finished = await completion.waitUntilEntered()
+            if !finished { watcher.release() }
+            let result = await task.result
+            await store.setWatcherSinkWillApplyHandler(nil)
+            watcher.release()
+            await store.clearExactFileCandidateProbeGateForTesting()
+            guard case let .issue(.unresolved(input)) = try result.get() else {
+                return XCTFail("Reappearing bytes must invalidate the missing observation")
+            }
+            XCTAssertEqual(input, target.path)
+            XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), content)
+        }
+
+        func testCancelledStaleFilePruneReleasesFenceWithoutPruning() async throws {
+            let rootURL = try makeTemporaryDirectory(name: "CancelledStaleDeletion")
+            let target = rootURL.appendingPathComponent("Target.swift")
+            try write("stale\n", to: target)
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let original = await store.file(rootID: root.id, relativePath: "Target.swift")
+            let record = try XCTUnwrap(original)
+            let namespace = await WorkspaceExactFileNamespace.identity(roots: store.rootRefs(scope: .visibleWorkspace))
+            let watcher = MCPPathContractReleaseGate(name: "cancelled prune watcher")
+            let deletion = MCPPathContractReleaseGate(name: "cancelled prune deletion")
+            let completion = MCPPathContractReleaseGate(name: "cancelled prune completion")
+            completion.release()
+            await store.setWatcherSinkWillApplyHandler { rootID in
+                if rootID == root.id { await watcher.enterAndWait() }
+            }
+            await store.setExactFileSuspensionGateForTesting(point: .missingFilePruneFence, rootID: root.id) {
+                await deletion.enterAndWaitIgnoringCancellationUntilRelease()
+            }
+            addTeardownBlock {
+                deletion.release()
+                watcher.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.clearExactFileCandidateProbeGateForTesting()
+            }
+            try FileManager.default.removeItem(at: target)
+            let before = await store.file(rootID: root.id, relativePath: "Target.swift")
+            XCTAssertEqual(before?.id, record.id)
+            let task = Task {
+                do {
+                    let result = try await store.resolveExactExistingWorkspaceFile(.absolute(target.path), namespace: namespace)
+                    await completion.enterAndWait()
+                    return result
+                } catch {
+                    await completion.enterAndWait()
+                    throw error
+                }
+            }
+            addTeardownBlock {
+                deletion.release()
+                watcher.release()
+                _ = await task.result
+            }
+            let entered = await deletion.waitUntilEntered()
+            XCTAssertTrue(entered)
+            let heldFences = await store.codemapPathFenceCountForTesting(rootID: root.id, relativePath: "Target.swift")
+            XCTAssertEqual(heldFences, 1)
+            task.cancel()
+            deletion.release()
+            let finished = await completion.waitUntilEntered()
+            if !finished { watcher.release() }
+            let result = await task.result
+            let after = await store.file(rootID: root.id, relativePath: "Target.swift")
+            let remaining = await store.codemapPathFenceCountForTesting(rootID: root.id, relativePath: "Target.swift")
+            await store.setWatcherSinkWillApplyHandler(nil)
+            watcher.release()
+            await store.clearExactFileCandidateProbeGateForTesting()
+            guard case let .failure(error) = result, error is CancellationError else {
+                return XCTFail("Expected cancellation instead of stale-record pruning")
+            }
+            XCTAssertEqual(after?.id, record.id)
+            XCTAssertEqual(remaining, 0)
+        }
+
         func testQualifiedResolutionSkipsPeerProbeWhileBareRelativeClassifiesNamespace() async throws {
             let parent = try makeTemporaryDirectory(name: "QualifiedPeerIsolation")
             let addressedRootURL = parent.appendingPathComponent("Addressed", isDirectory: true)
@@ -1441,7 +1786,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             }
 
             await store.setExactFileSuspensionGateForTesting(
-                point: .missingFilePruneFence,
+                point: .candidateMissingFilePrune,
                 rootID: root.id
             ) {
                 await creationGate.enterAndWait()
@@ -1458,14 +1803,14 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             creationGate.release()
             let creationResolution = try await creationResolutionTask.value
             guard case let .directory(match) = creationResolution else {
-                return XCTFail("Expected the post-fence directory, got \(creationResolution)")
+                return XCTFail("Expected the post-classification directory, got \(creationResolution)")
             }
             XCTAssertEqual(match.relativePath, "CreatedDirectory")
 
             await store.clearExactFileCandidateProbeGateForTesting()
             try FileManager.default.createDirectory(at: removedDirectoryURL, withIntermediateDirectories: true)
             await store.setExactFileSuspensionGateForTesting(
-                point: .missingFilePruneFence,
+                point: .candidateMissingFilePrune,
                 rootID: root.id
             ) {
                 await removalGate.enterAndWait()
@@ -1482,7 +1827,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             removalGate.release()
             let removalResolution = try await removalResolutionTask.value
             guard case .claimedMissing = removalResolution else {
-                return XCTFail("Expected the removed post-fence directory to be missing, got \(removalResolution)")
+                return XCTFail("Expected the removed post-classification directory to be missing, got \(removalResolution)")
             }
         }
 
