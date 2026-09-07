@@ -71,8 +71,8 @@ final class MCPServerCatalogAuthorityTests: XCTestCase {
             mcpCatalogAuthority: authority
         )
 
-        XCTAssertEqual(overrides["mcp_servers.ArbitraryAdditional.enabled"] as? Bool, true)
-        XCTAssertEqual(overrides["mcp_servers.DisabledServer.enabled"] as? Bool, false)
-        XCTAssertEqual(overrides["mcp_servers.RepoPromptCE.enabled"] as? Bool, true)
+        XCTAssertEqual(overrides["mcp_servers.arbitraryadditional.enabled"] as? Bool, true)
+        XCTAssertEqual(overrides["mcp_servers.disabledserver.enabled"] as? Bool, false)
+        XCTAssertEqual(overrides["mcp_servers.repopromptce.enabled"] as? Bool, true)
     }
 }
