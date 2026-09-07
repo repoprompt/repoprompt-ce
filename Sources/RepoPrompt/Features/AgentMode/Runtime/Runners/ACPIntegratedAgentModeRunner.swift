@@ -925,7 +925,7 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        guard let model = try Self.explicitSelectedModel(
+        guard let model = try explicitSelectedModel(
             agentKind: runRequest.agentKind,
             modelString: runRequest.modelString
         ) else {
