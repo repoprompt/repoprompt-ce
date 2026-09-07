@@ -30,10 +30,14 @@ enum CodexManagedHTTPPolicy {
     /// missing newline must never be completed by a later unrelated request.
     static func writeAuthorizedFrame(
         _ frame: Data, descriptor: Int32, authorization: CodexAccountAdoptionAuthorization,
+        automaticPermit: CodexAutomaticAdoptionPermit? = nil,
         timeout: TimeInterval = 3,
         writeChunk: (Int32, Data) throws -> Void = { try writeAtomicChunk($1, descriptor: $0) },
         didPublishChunk: (Int) -> Void = { _ in }
     ) throws {
+        if automaticPermit != nil {
+            guard frame.last == 0x0A, !frame.dropLast().contains(0x0A) else { throw Failure.unsupportedConfiguration }
+        }
         let pipeLimit = fpathconf(descriptor, _PC_PIPE_BUF)
         guard pipeLimit > 0, timeout > 0, timeout <= 30 else { throw Failure.unsupportedConfiguration }
         let chunkLimit = min(Int(pipeLimit), 4096)
@@ -46,7 +50,15 @@ enum CodexManagedHTTPPolicy {
                     let end = min(offset + chunkLimit, frame.count)
                     let chunk = frame.subdata(in: offset ..< end)
                     do {
-                        try authorization.withAuthorization { try writeChunk(descriptor, chunk) }
+                        try authorization.withAuthorization {
+                            if let automaticPermit {
+                                try automaticPermit.publishChunk(offset: offset, count: chunk.count, isFinal: end == frame.count) {
+                                    try writeChunk(descriptor, chunk)
+                                }
+                            } else {
+                                try writeChunk(descriptor, chunk)
+                            }
+                        }
                     } catch let failure as FDWriteError where failure.errnoValue == EINTR {
                         continue
                     } catch let failure as FDWriteError where failure.errnoValue == EAGAIN || failure.errnoValue == EWOULDBLOCK {
