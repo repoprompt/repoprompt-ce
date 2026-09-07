@@ -7,13 +7,16 @@ import Foundation
 /// headless implementation.
 final class ClaudeCompatibleHeadlessProviderAdapter: HeadlessAgentProvider {
     let runtimeConfig: ClaudeCompatiblePluginRuntimeConfig
+    let mcpCatalogScope: MCPServerCatalogAuthority.Scope
     private let wrappedProvider: any HeadlessAgentProvider
 
     init(
         runtimeConfig: ClaudeCompatiblePluginRuntimeConfig,
+        mcpCatalogScope: MCPServerCatalogAuthority.Scope,
         wrappedProvider: any HeadlessAgentProvider
     ) {
         self.runtimeConfig = runtimeConfig
+        self.mcpCatalogScope = mcpCatalogScope
         self.wrappedProvider = wrappedProvider
     }
 

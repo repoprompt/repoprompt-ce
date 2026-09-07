@@ -24,6 +24,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
             XCTAssertEqual(adapter.runtimeConfig.mode.rawValue, "discovery")
             XCTAssertEqual(adapter.runtimeConfig.commandName, "claude")
             XCTAssertEqual(adapter.runtimeConfig.modelString, "sonnet")
+            XCTAssertEqual(adapter.mcpCatalogScope, .repoPromptOnly)
         }
         XCTAssertNil(ClaudeCompatiblePluginBridge.pluginID(for: .codexExec))
 
