@@ -65,7 +65,10 @@ extension MCPServerCatalog {
             throw MigrationError.malformedHeader(header)
         }
         let inner = header.dropFirst().dropLast().trimmingCharacters(in: .whitespaces)
-        guard inner.hasPrefix("mcp_servers") else { return nil }
+        guard inner.hasPrefix("mcp_servers.") else {
+            if inner == "mcp_servers" { throw MigrationError.malformedHeader(header) }
+            return nil
+        }
         let suffix = inner.dropFirst("mcp_servers".count)
         guard suffix.first == "." else { throw MigrationError.malformedHeader(header) }
         let name = try decodeKey(suffix.dropFirst().trimmingCharacters(in: .whitespaces))

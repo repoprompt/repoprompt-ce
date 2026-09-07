@@ -94,11 +94,21 @@ final class MCPServerCatalogTests: XCTestCase {
     func testSelectionsDefaultNewServersOffAndCannotDisableRepoPromptCE() throws {
         let catalog = try MCPServerCatalog(
             servers: [
-                .init(name: "NewServer", transport: .http(url: "https://mcp.example.invalid/redacted")),
-                .init(name: "RepoPromptCE", transport: .stdio(command: "/redacted/rp", args: [], environment: [:]))
+                .init(
+                    name: "NewServer",
+                    transport: .http(url: "https://mcp.example.invalid/redacted"),
+                    policy: .init(enabled: true, required: true)
+                ),
+                .init(
+                    name: "RepoPromptCE",
+                    transport: .stdio(command: "/redacted/rp", args: [], environment: [:]),
+                    policy: .init(enabled: false, required: false)
+                )
             ]
         )
 
+        XCTAssertEqual(catalog.servers.last?.policy.enabled, true)
+        XCTAssertEqual(catalog.servers.last?.policy.required, true)
         XCTAssertEqual(catalog.selectedServers(enabledNames: []).map(\.name), ["RepoPromptCE"])
         XCTAssertEqual(
             catalog.selectedServers(enabledNames: ["NEWSERVER"]).map(\.name),
