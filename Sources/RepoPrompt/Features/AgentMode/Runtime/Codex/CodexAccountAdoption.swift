@@ -141,6 +141,29 @@ final class CodexAccountAdoption: ObservableObject {
         applied?.revision
     }
 
+    var automaticSource: SwitchboardAutomaticSource? {
+        applied.map(SwitchboardAutomaticSource.init(grant:))
+    }
+
+    func validateAutomaticAdmission(source: SwitchboardAutomaticSource) throws {
+        try validateAdmission()
+        guard pending == nil, !refreshInFlight, !reservesController, automaticSource == source,
+              !blocksDispatch else { throw CodexAccountAdoptionReason.busy }
+    }
+
+    func validateAutomaticProof(_ proof: CodexAccountAdoptionRuntimeProof) throws {
+        try validateRuntime(proof)
+    }
+
+    func commitAutomatic(_ grant: CodexAccountAdoptionGrant, source: SwitchboardAutomaticSource) throws {
+        try validateAutomaticAdmission(source: source)
+        try validateGrant(grant)
+        guard grant.revision > highestRevision else { throw CodexAccountAdoptionReason.identityChanged }
+        highestRevision = grant.revision
+        applied = grant
+        state = .appliedUnverified(revision: grant.revision)
+    }
+
     init(scope: CodexAccountAdoptionScope, dependencies: Dependencies) {
         self.scope = scope
         self.dependencies = dependencies

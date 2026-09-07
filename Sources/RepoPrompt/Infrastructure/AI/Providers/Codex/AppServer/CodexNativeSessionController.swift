@@ -130,6 +130,9 @@ protocol CodexSessionControlling: AnyObject {
     func reserveAccountAdoption() async throws -> UUID
     func finishAccountAdoption(_ lease: UUID, allowTurns: Bool) async
     func installAccountAdoptionGrant(_ grant: CodexAccountAdoptionGrant, authorization: CodexAccountAdoptionAuthorization) async throws -> CodexAccountAdoptionLoginReceipt
+    func installAutomaticAccountGrant(_ grant: CodexAccountAdoptionGrant, authorization: CodexAccountAdoptionAuthorization, permit: CodexAutomaticAdoptionPermit) async throws -> CodexAccountAdoptionLoginReceipt
+    func automaticNativePeer() async throws -> SwitchboardAutomaticNativePeer
+    func automaticNativeHasEnded() async -> Bool
 
     func ensureEventsStreamReady()
     func startOrResume(
@@ -211,6 +214,18 @@ extension CodexSessionControlling {
 
     func installAccountAdoptionGrant(_: CodexAccountAdoptionGrant, authorization _: CodexAccountAdoptionAuthorization) async throws -> CodexAccountAdoptionLoginReceipt {
         throw CodexAccountAdoptionReason.runtimeUnavailable
+    }
+
+    func installAutomaticAccountGrant(_: CodexAccountAdoptionGrant, authorization _: CodexAccountAdoptionAuthorization, permit _: CodexAutomaticAdoptionPermit) async throws -> CodexAccountAdoptionLoginReceipt {
+        throw CodexAccountAdoptionReason.runtimeUnavailable
+    }
+
+    func automaticNativePeer() async throws -> SwitchboardAutomaticNativePeer {
+        throw CodexAccountAdoptionReason.runtimeUnavailable
+    }
+
+    func automaticNativeHasEnded() async -> Bool {
+        false
     }
 
     var currentSessionReference: CodexNativeSessionController.SessionRef? {
@@ -2140,6 +2155,22 @@ final class CodexNativeSessionController {
     }
 
     func installAccountAdoptionGrant(_ grant: CodexAccountAdoptionGrant, authorization: CodexAccountAdoptionAuthorization) async throws -> CodexAccountAdoptionLoginReceipt {
+        try await installAccountGrant(grant, authorization: authorization, permit: nil)
+    }
+
+    func automaticNativePeer() async throws -> SwitchboardAutomaticNativePeer {
+        try await client.automaticNativePeer()
+    }
+
+    func automaticNativeHasEnded() async -> Bool {
+        await client.managedTransportHasFullyEnded()
+    }
+
+    func installAutomaticAccountGrant(_ grant: CodexAccountAdoptionGrant, authorization: CodexAccountAdoptionAuthorization, permit: CodexAutomaticAdoptionPermit) async throws -> CodexAccountAdoptionLoginReceipt {
+        try await installAccountGrant(grant, authorization: authorization, permit: permit)
+    }
+
+    private func installAccountGrant(_ grant: CodexAccountAdoptionGrant, authorization: CodexAccountAdoptionAuthorization, permit: CodexAutomaticAdoptionPermit?) async throws -> CodexAccountAdoptionLoginReceipt {
         guard usesManagedHTTPAccountAdoption else { throw CodexAccountAdoptionReason.transportUnverified }
         var params: [String: Any] = [
             "type": "chatgptAuthTokens", "accessToken": grant.accessToken, "chatgptAccountId": grant.accountID
@@ -2148,7 +2179,7 @@ final class CodexNativeSessionController {
         do {
             let installed = try await client.requestWithSettlementDeadline(
                 method: "account/login/start", params: params, deadline: 5, permitsManagedAccountLogin: true,
-                managedAuthorization: authorization
+                managedAuthorization: authorization, automaticPermit: permit
             )
             let response = try await client.request(method: "account/read", params: ["refreshToken": false], timeout: 5)
             guard let account = response["account"] as? [String: Any],
@@ -2162,6 +2193,9 @@ final class CodexNativeSessionController {
                 email: account["email"] as? String
             )
         } catch {
+            if error as? CodexAccountAdoptionReason == .revoked, let permit, permit.snapshot.publication == .none {
+                throw CodexAccountAdoptionReason.revoked
+            }
             // Remote errors may echo request data; never interpolate them.
             throw CodexAccountAdoptionReason.mutationUnconfirmed
         }

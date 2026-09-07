@@ -771,6 +771,12 @@ actor CodexAppServerClient {
         usesManagedHTTPAccountAdoption && activeTransport == nil && startupTask == nil && transportTerminationTask == nil
     }
 
+    func automaticNativePeer() throws -> SwitchboardAutomaticNativePeer {
+        guard managedHTTPPolicyIsVerified(), let activeTransport else { throw CodexAccountAdoptionReason.runtimeUnavailable }
+        let pid = activeTransport.process.pid
+        return try .init(pid: pid, start: SwitchboardBridgeTransport.processStart(pid: pid))
+    }
+
     func bindManagedAccountThread(_ threadID: String) throws {
         guard managedHTTPPolicyIsVerified() else { throw CodexManagedHTTPPolicy.Failure.unsupportedConfiguration }
         try managedRequestGate.bindThread(threadID)
@@ -1375,7 +1381,8 @@ actor CodexAppServerClient {
         deadline: TimeInterval,
         onUnsettled: @escaping @Sendable (_ generation: UInt64) -> Void = { _ in },
         permitsManagedAccountLogin: Bool = false,
-        managedAuthorization: CodexAccountAdoptionAuthorization? = nil
+        managedAuthorization: CodexAccountAdoptionAuthorization? = nil,
+        automaticPermit: CodexAutomaticAdoptionPermit? = nil
     ) async throws -> [String: Any] {
         guard let activeTransport, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
@@ -1389,9 +1396,17 @@ actor CodexAppServerClient {
                 useDefaultTimeout: false,
                 onMutationUnsettled: onUnsettled,
                 permitsManagedAccountLogin: permitsManagedAccountLogin,
-                managedAuthorization: managedAuthorization
+                managedAuthorization: managedAuthorization,
+                automaticPermit: automaticPermit
             )
         } catch {
+            if error as? CodexAccountAdoptionReason == .revoked,
+               let automaticPermit, automaticPermit.fence().publication == .none
+            {
+                // Exact automatic-login evidence: no bytes were published and
+                // the permit is now fenced. Preserve this same live controller.
+                throw CodexAccountAdoptionReason.revoked
+            }
             let cause: MutationFailureCause
             if Self.isTimeoutError(error) {
                 cause = .timeout(error)
@@ -1451,7 +1466,8 @@ actor CodexAppServerClient {
         useDefaultTimeout: Bool,
         onMutationUnsettled: (@Sendable (_ generation: UInt64) -> Void)? = nil,
         permitsManagedAccountLogin: Bool = false,
-        managedAuthorization: CodexAccountAdoptionAuthorization? = nil
+        managedAuthorization: CodexAccountAdoptionAuthorization? = nil,
+        automaticPermit: CodexAutomaticAdoptionPermit? = nil
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard let activeTransport, !didTerminateTransport else {
@@ -1459,6 +1475,13 @@ actor CodexAppServerClient {
         }
         var guardedParams = params
         var frameAuthorization = managedAuthorization
+        if let automaticPermit {
+            guard usesManagedHTTPAccountAdoption, method == "account/login/start", permitsManagedAccountLogin,
+                  managedAuthorization != nil,
+                  let expectedPeer = automaticPermit.nativePeer,
+                  expectedPeer == (try? automaticNativePeer()),
+                  automaticPermit.authorizesLogin(params) else { throw CodexAccountAdoptionReason.revoked }
+        }
         if usesManagedHTTPAccountAdoption {
             if permitsManagedAccountLogin, managedAuthorization == nil { throw CodexAccountAdoptionReason.revoked }
             // Capture the gate's exact consent, then recheck it under the same
@@ -1502,7 +1525,7 @@ actor CodexAppServerClient {
                         integrationBeforeFramePublication?(method)
                     #endif
                     if let frameAuthorization {
-                        try sendAuthorizedJSONLine(payload, method: method, authorization: frameAuthorization)
+                        try sendAuthorizedJSONLine(payload, method: method, authorization: frameAuthorization, automaticPermit: automaticPermit)
                     } else {
                         try sendJSONLine(payload, method: method)
                     }
@@ -2293,11 +2316,11 @@ actor CodexAppServerClient {
     ///
     /// Related:
     /// - ClaudeNativeProcessSessionController.sendLine (reference atomic write pattern)
-    private func sendAuthorizedJSONLine(_ payload: [String: Any], method: String?, authorization: CodexAccountAdoptionAuthorization) throws {
-        try sendJSONLine(payload, method: method, authorization: authorization)
+    private func sendAuthorizedJSONLine(_ payload: [String: Any], method: String?, authorization: CodexAccountAdoptionAuthorization, automaticPermit: CodexAutomaticAdoptionPermit? = nil) throws {
+        try sendJSONLine(payload, method: method, authorization: authorization, automaticPermit: automaticPermit)
     }
 
-    private func sendJSONLine(_ payload: [String: Any], method: String?, authorization: CodexAccountAdoptionAuthorization? = nil) throws {
+    private func sendJSONLine(_ payload: [String: Any], method: String?, authorization: CodexAccountAdoptionAuthorization? = nil, automaticPermit: CodexAutomaticAdoptionPermit? = nil) throws {
         guard let activeTransport, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
         }
@@ -2318,6 +2341,7 @@ actor CodexAppServerClient {
             if let authorization {
                 try CodexManagedHTTPPolicy.writeAuthorizedFrame(
                     frame, descriptor: stdinDescriptor, authorization: authorization,
+                    automaticPermit: automaticPermit,
                     didPublishChunk: { offset in
                         #if DEBUG
                             self.integrationAfterFrameChunk?(method, offset)
