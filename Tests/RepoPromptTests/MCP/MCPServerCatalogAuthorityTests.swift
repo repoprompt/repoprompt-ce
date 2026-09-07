@@ -74,6 +74,48 @@ final class MCPServerCatalogAuthorityTests: XCTestCase {
         XCTAssertEqual(overrides["mcp_servers.arbitraryadditional.enabled"] as? Bool, true)
         XCTAssertEqual(overrides["mcp_servers.disabledserver.enabled"] as? Bool, false)
         XCTAssertEqual(overrides["mcp_servers.repopromptce.enabled"] as? Bool, true)
+
+        let restrictedOverrides = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            suppressThirdPartyMCPServers: true,
+            mcpCatalogAuthority: authority
+        )
+        XCTAssertEqual(restrictedOverrides["mcp_servers.arbitraryadditional.enabled"] as? Bool, false)
+        XCTAssertEqual(restrictedOverrides["mcp_servers.disabledserver.enabled"] as? Bool, false)
+        XCTAssertEqual(restrictedOverrides["mcp_servers.repopromptce.enabled"] as? Bool, true)
+    }
+
+    @MainActor
+    func testClaudeLaunchPolicyMatrixSeparatesDirectAndRestrictedFlows() throws {
+        let suiteName = "MCPServerCatalogAuthorityTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let direct = ClaudeControllerLaunchPolicy.resolve(
+            permissionMode: nil,
+            profile: .userConfigured,
+            defaults: defaults,
+            securePermissions: nil
+        )
+        let safeManaged = ClaudeControllerLaunchPolicy.resolve(
+            permissionMode: nil,
+            profile: .mcpSafeDefaults,
+            defaults: defaults,
+            securePermissions: nil
+        )
+        let mcpOverride = ClaudeControllerLaunchPolicy.resolve(
+            permissionMode: nil,
+            profile: .providerOverride(.claude(.fullAccess)),
+            defaults: defaults,
+            securePermissions: nil
+        )
+
+        XCTAssertEqual(direct.mcpCatalogScope, .directSelected)
+        XCTAssertEqual(safeManaged.mcpCatalogScope, .repoPromptOnly)
+        XCTAssertEqual(mcpOverride.mcpCatalogScope, .repoPromptOnly)
+        XCTAssertTrue(direct.mcpStrictMode == true)
+        XCTAssertTrue(safeManaged.mcpStrictMode == true)
+        XCTAssertTrue(mcpOverride.mcpStrictMode == true)
+        XCTAssertEqual(ClaudeCodeAgentConfig.discovery().mcpCatalogScope, .repoPromptOnly)
     }
 
     func testDirectClaudeLaunchAlwaysUsesStrictRepoPromptConfig() async throws {

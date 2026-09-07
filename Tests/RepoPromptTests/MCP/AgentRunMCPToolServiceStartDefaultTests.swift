@@ -22,13 +22,54 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
             externallyManagedReason: nil
         )
 
-        XCTAssertEqual(profile, .userConfigured)
+        XCTAssertEqual(profile, .providerOverride(.codex(.readOnly)))
         XCTAssertEqual(snapshot.permission.displayName, CodexAgentToolPreferences.PermissionLevel.readOnly.displayName)
         XCTAssertEqual(snapshot.runtimePermission.codexSandboxMode, .readOnly)
         XCTAssertEqual(snapshot.runtimePermission.codexApprovalReviewer, .user)
         XCTAssertEqual(snapshot.codexTools?.bashToolEnabled, false)
         XCTAssertFalse(profile.codexBashToolEnabled(userConfigured: false))
-        XCTAssertFalse(profile.codexSuppressesThirdPartyMCPServers)
+        XCTAssertTrue(profile.codexSuppressesThirdPartyMCPServers)
+    }
+
+    func testInheritedClaudeSettingsRetainPermissionButSuppressThirdPartyMCP() throws {
+        let suiteName = "AgentRunMCPToolServiceStartDefaultTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.removePersistentDomain(forName: suiteName)
+        AgentModePermissionPreferences.setSubagentPermissionPolicy(.inheritProviderSettings, defaults: defaults)
+        ClaudeAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults)
+        let service = makeBindingService(defaults: defaults)
+
+        let profile = service.permissionProfileForMCPActivation(isSubagent: true, provider: .claude)
+        let launchPolicy = ClaudeControllerLaunchPolicy.resolve(
+            permissionMode: profile.claudePermissionMode,
+            profile: profile,
+            defaults: defaults,
+            securePermissions: nil
+        )
+
+        XCTAssertEqual(profile, .providerOverride(.claude(.fullAccess)))
+        XCTAssertEqual(launchPolicy.permissionMode, ClaudeAgentToolPreferences.PermissionLevel.fullAccess.permissionMode)
+        XCTAssertEqual(launchPolicy.mcpCatalogScope, .repoPromptOnly)
+    }
+
+    func testCapabilitySummaryDescribesCatalogSelectionAndRestrictedSuppression() throws {
+        let suiteName = "AgentRunMCPToolServiceStartDefaultTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.removePersistentDomain(forName: suiteName)
+        ClaudeAgentToolPreferences.setMCPStrictModeEnabled(false, defaults: defaults)
+        let builder = AgentPermissionCapabilitySummaryBuilder(defaults: defaults)
+
+        let direct = builder.summary(for: .claude, profile: .userConfigured, availability: .none)
+        let restricted = builder.summary(
+            for: .claude,
+            profile: .providerOverride(.claude(.requireApproval)),
+            availability: .none
+        )
+
+        XCTAssertEqual(direct.externalMCP, "Third-party MCP: selected from RepoPrompt catalog")
+        XCTAssertEqual(restricted.externalMCP, "Third-party MCP: suppressed")
     }
 
     func testCustomRestrictiveCodexOverrideWinsOverSafeManagedDefaults() throws {
@@ -59,7 +100,7 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
         XCTAssertEqual(snapshot.runtimePermission.codexApprovalReviewer, .user)
         XCTAssertEqual(snapshot.codexTools?.bashToolEnabled, false)
         XCTAssertFalse(profile.codexBashToolEnabled(userConfigured: false))
-        XCTAssertFalse(profile.codexSuppressesThirdPartyMCPServers)
+        XCTAssertTrue(profile.codexSuppressesThirdPartyMCPServers)
     }
 
     func testSubagentPolicyStorageFailureUsesCodexSafeManagedSnapshot() throws {
