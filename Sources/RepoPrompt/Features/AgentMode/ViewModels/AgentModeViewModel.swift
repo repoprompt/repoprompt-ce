@@ -700,6 +700,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var isAgentModeActive = false
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
+        private var test_agentAvailabilityContext: AgentModelCatalog.AvailabilityContext?
+        private var test_managedSessionFence: CodexManagedSessionFence?
+
+        func test_setAgentAvailabilityContext(_ context: AgentModelCatalog.AvailabilityContext) {
+            test_agentAvailabilityContext = context
+            handleAgentProviderAvailabilityChanged()
+        }
+
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
         private var test_persistentBindingResolutionSnapshotBuildCount = 0
@@ -860,6 +868,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_installLiveSession(_ session: TabSession) {
             sessions[session.tabID] = session
+            observeSwitchboardAvailability(for: session)
         }
 
         func test_installPersistentSessionBinding(
@@ -1161,10 +1170,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for agentKind: AgentProviderKind,
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption] {
-        guard AgentModelCatalog.isAgentAvailable(agentKind, availability: agentAvailabilityContext) else { return [] }
+        let availability = modelAvailabilityContext(for: agentKind)
+        guard AgentModelCatalog.isAgentAvailable(agentKind, availability: availability) else { return [] }
         return codexCoordinator.modelOptions(
             for: agentKind,
-            availability: agentAvailabilityContext,
+            availability: availability,
             codexDynamicModels: codexDynamicModels,
             includeClaudeEffortVariants: includeClaudeEffortVariants
         )
@@ -1172,6 +1182,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func selectModel(rawModel: String) {
         selectedModelRaw = rawModel
+    }
+
+    private func modelAvailabilityContext(for agent: AgentProviderKind) -> AgentModelCatalog.AvailabilityContext {
+        if agent == .codexExec, activeSession?.isSwitchboardManagedSession == true {
+            // Model presentation only; this value never publishes global login
+            // state and cannot grant dispatch or bootstrap authority.
+            return .init(claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false)
+        }
+        return agentAvailabilityContext
     }
 
     /// Persist the last-used model for a given agent to UserDefaults.
@@ -1315,7 +1334,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private var agentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
-        promptManager?.apiSettingsViewModel?.agentModeAvailabilityContext ?? .current
+        #if DEBUG
+            if let test_agentAvailabilityContext { return test_agentAvailabilityContext }
+        #endif
+        return promptManager?.apiSettingsViewModel?.agentModeAvailabilityContext ?? .current
+    }
+
+    var managedSessionFence: CodexManagedSessionFence {
+        #if DEBUG
+            if let test_managedSessionFence { return test_managedSessionFence }
+        #endif
+        return .shared
     }
 
     var hasAvailableAgentProviders: Bool {
@@ -1323,15 +1352,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var isSelectedAgentAvailable: Bool {
-        AgentModelCatalog.isAgentAvailable(selectedAgent, availability: agentAvailabilityContext)
+        if let activeSession, activeSession.isSwitchboardManagedSession {
+            return activeSession.hasLiveSwitchboardAuthority && activeSession.switchboardDispatchBlockReason == nil
+        }
+        return AgentModelCatalog.isAgentAvailable(selectedAgent, availability: agentAvailabilityContext)
     }
 
     var canSendWithCurrentProvider: Bool {
-        isSelectedAgentAvailable
-            && !(selectedAgent == .codexExec && CodexManagedSessionFence.shared.isFenced)
+        canSendWithProvider(selectedAgent, session: activeSession)
+    }
+
+    func canSendWithProvider(_ agent: AgentProviderKind, session: TabSession?) -> Bool {
+        if let session, session.isSwitchboardManagedSession {
+            return agent == .codexExec && session.hasLiveSwitchboardAuthority
+                && session.switchboardDispatchBlockReason == nil && !managedSessionFence.isLogoutInProgress
+        }
+        return AgentModelCatalog.isAgentAvailable(agent, availability: agentAvailabilityContext)
+            && !(agent == .codexExec && managedSessionFence.isFenced)
     }
 
     var unavailableSelectedAgentMessage: String? {
+        if let activeSession, activeSession.isSwitchboardManagedSession {
+            return managedSessionFence.isLogoutInProgress ? CodexManagedSessionFence.blockedMessage : activeSession.switchboardDispatchBlockReason
+        }
         guard !isSelectedAgentAvailable else { return nil }
         return unavailableAgentMessage(for: selectedAgent)
     }
@@ -1350,7 +1393,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         AgentModelCatalog.isValid(
             rawModel: rawModel,
             for: agent,
-            availability: agentAvailabilityContext,
+            availability: modelAvailabilityContext(for: agent),
             codexDynamicModels: codexDynamicModels
         )
     }
@@ -1381,7 +1424,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func handleAgentProviderAvailabilityChanged() {
         refreshAvailableAgents()
         if let activeSession,
-           activeSession.runState.isActive || activeSession.isProviderSelectionLocked
+           activeSession.runState.isActive || activeSession.isProviderSelectionLocked || activeSession.isSwitchboardManagedSession
         {
             return
         }
@@ -1837,6 +1880,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #if DEBUG
         init(
             testWindowID: Int = 1,
+            testAgentAvailability: AgentModelCatalog.AvailabilityContext? = nil,
+            testManagedSessionFence: CodexManagedSessionFence? = nil,
             testWorkspacePath: String? = nil,
             testWorkspaceDirectory: URL? = nil,
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
@@ -1900,6 +1945,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testUsesProductionAgentDefaultsAndModelPolling: Bool = false
         ) {
             windowID = testWindowID
+            test_agentAvailabilityContext = testAgentAvailability
+            test_managedSessionFence = testManagedSessionFence
             promptManager = nil
             workspaceFileContextStore = testWorkspaceFileContextStore
             workspaceManager = nil
@@ -1976,6 +2023,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 stallWatchdogProbeThreshold: testWatchdogProbeThreshold,
                 stallWatchdogRecoveryThreshold: testWatchdogRecoveryThreshold,
                 transportClosedRecoveryGraceInterval: testCodexTransportClosedRecoveryGraceInterval ?? 1.5,
+                managedSessionFence: testManagedSessionFence ?? .shared,
                 initialLastUsedReasoningEffort: CodexAgentToolPreferences.lastUsedReasoningEffort(),
                 initialLastUsedReasoningEffortsByModelSlug: CodexAgentToolPreferences.lastUsedReasoningEffortsByModelSlug()
             )
@@ -3406,6 +3454,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    func invalidateSwitchboardAuthoritiesForManagedLogout() {
+        // Only explicit Switchboard authority is synchronously revoked. Ordinary
+        // Codex teardown and all non-Codex providers retain their existing path.
+        for session in sessions.values {
+            session.switchboardAccountControl?.revoke()
+        }
+    }
+
     func stopCodexSessionsForManagedLogout() async {
         codexCoordinator.stopRuntimeTasksForManagedLogout()
         let codexSessions = sessions.values.filter(Self.sessionOwnsCodexRuntimeState)
@@ -3919,6 +3975,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         newSession.hasLoadedPersistedState = newSession.activeAgentSessionID == nil
         seedSortMetadataForUnhydratedSession(newSession, tabID: tabID)
         sessions[tabID] = newSession
+        observeSwitchboardAvailability(for: newSession)
         ensureApplyEditsApprovalSessionSync(for: newSession)
         return newSession
     }
@@ -3995,6 +4052,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let fallback = makeSession(for: tabID)
         sessions[tabID] = fallback
+        observeSwitchboardAvailability(for: fallback)
         ensureApplyEditsApprovalSessionSync(for: fallback)
         return fallback
     }
@@ -13572,8 +13630,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty else {
             return .blocked(message: "")
         }
-        guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
-            return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
+        guard canSendWithProvider(session.selectedAgent, session: session) else {
+            return .blocked(message: session.switchboardDispatchBlockReason ?? unavailableAgentMessage(for: session.selectedAgent))
         }
         let workflow = session.selectedWorkflow
         if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session),
@@ -13798,11 +13856,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
             return .blocked(message: "")
         }
-        guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
+        guard canSendWithProvider(session.selectedAgent, session: session) else {
+            if let message = session.switchboardDispatchBlockReason { return .blocked(message: message) }
+            if session.selectedAgent == .codexExec, managedSessionFence.isFenced { return .blocked(message: CodexManagedSessionFence.blockedMessage) }
             return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
-        }
-        if session.selectedAgent == .codexExec, CodexManagedSessionFence.shared.isFenced {
-            return .blocked(message: CodexManagedSessionFence.blockedMessage)
         }
 
         scheduleSkillCatalogRefresh()
@@ -13937,7 +13994,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) async {
         guard let session = sessions[tabID] else { return }
-        if session.selectedAgent == .codexExec, CodexManagedSessionFence.shared.isFenced {
+        if session.selectedAgent == .codexExec, !canSendWithProvider(session.selectedAgent, session: session) {
             restoreRejectedManualSubmissionComposerState(
                 tabID: tabID,
                 session: session,
@@ -13946,7 +14003,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 taggedFiles: taggedFilesToSend,
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                message: CodexManagedSessionFence.blockedMessage
+                message: session.switchboardDispatchBlockReason ?? CodexManagedSessionFence.blockedMessage
             )
             return
         }
@@ -15620,12 +15677,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         let session = session(for: tabID)
-        guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
+        guard canSendWithProvider(session.selectedAgent, session: session) else {
             if session.mcpFollowUpRunPending {
                 session.mcpFollowUpRunPending = false
                 handleObservedMCPStateChange(for: session)
             }
-            return .failed(message: unavailableAgentMessage(for: session.selectedAgent))
+            return .failed(message: session.switchboardDispatchBlockReason ?? unavailableAgentMessage(for: session.selectedAgent))
         }
         defer {
             if session.mcpFollowUpRunPending {

@@ -368,6 +368,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private static let repeatedResumeTimeoutFallbackThreshold = 2
     private let preferenceDefaults: UserDefaults
+    private let managedSessionFence: CodexManagedSessionFence
 
     init(
         windowID: Int,
@@ -389,10 +390,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         transportClosedRecoveryGraceInterval: TimeInterval = 1.5,
         recoveryProbeTimeout: TimeInterval = 2.0,
         preferenceDefaults: UserDefaults = .standard,
+        managedSessionFence: CodexManagedSessionFence = .shared,
         initialLastUsedReasoningEffort: CodexReasoningEffort? = nil,
         initialLastUsedReasoningEffortsByModelSlug: [String: CodexReasoningEffort] = [:]
     ) {
         self.windowID = windowID
+        self.managedSessionFence = managedSessionFence
         self.runtimeWorkspacePathsProvider = runtimeWorkspacePathsProvider
         self.codexControllerFactory = codexControllerFactory
         self.codexCapabilitiesForLaunch = codexCapabilitiesForLaunch
@@ -5775,15 +5778,32 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         skipResumeWhenNoPriorCodexHistory: Bool = false,
         semanticRunState: AgentSessionRunState? = nil
     ) async {
-        let managedSessionFence = CodexManagedSessionFence.shared
+        let managedSessionFence = managedSessionFence
         // Managed histories are never implicitly restarted or returned to shared
         // login. Only explicit, root-scoped preparation may create a backend.
         guard !session.requiresSwitchboardPairing || session.codexController != nil || session.allowsSwitchboardBootstrap else { return }
         let allowMissingRolloutFallback = allowMissingRolloutFallback && !session.requiresSwitchboardPairing
         let allowResumeTimeoutFallback = allowResumeTimeoutFallback && !session.requiresSwitchboardPairing
         let sessionInstallationToken = managedSessionFence.capturePublicationToken()
+        let capturedControl = session.switchboardAccountControl
+        let capturedSessionID = session.activeAgentSessionID
+        let capturedBindingGeneration = session.bindingTransitionGeneration
+        func allowsInstallation() -> Bool {
+            guard managedSessionFence.isCurrent(sessionInstallationToken), !managedSessionFence.isLogoutInProgress else { return false }
+            if session.isSwitchboardManagedSession {
+                guard let capturedControl, session.switchboardAccountControl === capturedControl,
+                      session.activeAgentSessionID == capturedSessionID,
+                      session.bindingTransitionGeneration == capturedBindingGeneration,
+                      session.parentSessionID == nil,
+                      (try? capturedControl.authorization.withAuthorization { true }) == true else { return false }
+                return session.allowsSwitchboardBootstrap || session.hasLiveSwitchboardAuthority
+            }
+            // A removed/replaced managed control cannot fall back to ordinary auth.
+            guard capturedControl == nil else { return false }
+            return managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+        }
         guard session.selectedAgent == .codexExec,
-              managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+              allowsInstallation()
         else { return }
         let runAttemptIDAtEntry = session.activeRunAttemptID
         let effectiveRunState = semanticRunState ?? session.runState
@@ -5909,7 +5929,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard session.selectedAgent == .codexExec,
                   session.runID == runID,
                   session.activeRunAttemptID == runAttemptIDAtEntry,
-                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                  allowsInstallation()
             else {
                 logCodex("[AgentModeVM][CodexRetirement] replacement abandoned after state changed tab=\(session.tabID) run=\(runID)")
                 return nil
@@ -5994,7 +6014,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     desiredFeatureState.capabilities,
                     switchboardLaunch
                 )
-                guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else {
+                guard allowsInstallation() else {
                     logCodex("[AgentModeVM][CodexLogout] retiring controller created after managed sign-out invalidated its session token tab=\(session.tabID)")
                     await controller.shutdown()
                     return nil
@@ -6006,7 +6026,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.codexControllerFeatureState = desiredFeatureState
             }
             guard let controller = session.codexController,
-                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                  allowsInstallation()
             else { return nil }
             controller.ensureEventsStreamReady()
             if session.codexEventTask == nil || session.codexEventTaskRunID != runID {
@@ -6450,10 +6470,32 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         policyAlreadyInstalled: Bool = false,
         terminalizeRejectedSend: Bool = true
     ) async -> NativeSendOutcome {
-        if let message = session.switchboardDispatchBlockReason {
+        let logoutGeneration = managedSessionFence.capturePublicationToken()
+        let dispatchOwnership = session.activeRunOwnership
+        let dispatchRunID = session.runID
+        var didActivateSendState = false
+        func dispatchRejection() -> String? {
+            guard managedSessionFence.isCurrent(logoutGeneration), !managedSessionFence.isLogoutInProgress else {
+                return CodexManagedSessionFence.blockedMessage
+            }
+            if session.isSwitchboardManagedSession { return session.switchboardDispatchBlockReason }
+            return managedSessionFence.isFenced ? CodexManagedSessionFence.blockedMessage : nil
+        }
+        func rejectDispatch(_ message: String) async -> NativeSendOutcome {
             viewModel?.finalizeAttachmentsForTurn(for: session, reservationID: attachmentReservationID, disposition: .restoreToPending)
+            if let dispatchOwnership,
+               session.isCurrentRunAttemptForCurrentBinding(dispatchOwnership, expectedRunID: dispatchRunID)
+            {
+                clearCodexPendingAuthRetryTurn(session)
+                if didActivateSendState, terminalizeRejectedSend {
+                    await finalizeCodexRun(
+                        session, turnStatus: .failed, reason: "send-admission-revoked", notifyOnCompleted: false
+                    )
+                }
+            }
             return .preDispatchRejected(message: message)
         }
+        if let message = dispatchRejection() { return await rejectDispatch(message) }
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
         let wasRunAlreadyActive = session.runState.isActive
         let activeSendRunID = wasRunAlreadyActive ? session.runID : nil
@@ -6503,6 +6545,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
         let hadResumeEligibleCodexHistoryBeforeSend = Self.hasResumeEligibleCodexHistory(session.items)
+        if let message = dispatchRejection() { return await rejectDispatch(message) }
         session.waitingPrompt = nil
         clearCodexNativeToolLiveness(session)
         setRunningStatus("Initializing…", source: .transport, session: session, urgent: true)
@@ -6511,6 +6554,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexLastEventAt = sendStartedAt
         recordCodexWatchdogProgress(for: session, at: sendStartedAt)
         viewModel?.setAgentRunActive(session.tabID, isActive: true)
+        didActivateSendState = true
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         cancelCodexIdleShutdown(for: session.tabID)
 
@@ -6546,6 +6590,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return .cancelled
         }
+        if let message = dispatchRejection() { return await rejectDispatch(message) }
         guard let controller = session.codexController,
               controller.hasActiveThread
         else {
@@ -6646,6 +6691,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             )
                         }
                     }
+                    if let message = dispatchRejection() { return await rejectDispatch(message) }
                     beginTrackedCodexUserTurn(session)
                     updateCodexStallWatchdogState(for: session)
                     logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.startUserTurn")
@@ -6665,6 +6711,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     dispatched = true
                 }
             case let .steer(identity):
+                if let message = dispatchRejection() { return await rejectDispatch(message) }
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 do {
                     let receipt = try await controller.steerUserTurn(
@@ -6697,6 +6744,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         priorIdentity: identity,
                         acceptedDispatchTurnID: actualTurnID
                     )
+                    if let message = dispatchRejection() { return await rejectDispatch(message) }
                     session.codexPendingSteerLifecycleReconciliation = reconciliation
                     do {
                         let receipt = try await controller.steerUserTurn(

@@ -1,15 +1,57 @@
 import SwiftUI
 
+/// Presentation only. These labels never grant pairing or dispatch authority.
+struct SwitchboardSessionPairingCopy {
+    let status: String
+    let action: String
+
+    @MainActor init(session: AgentTabSession) {
+        let hasRetainedManagedHistory = session.requiresSwitchboardPairing
+            && (
+                session.codexConversationID != nil || session.codexRolloutPath != nil
+                    || !session.items.isEmpty || !session.transcript.turns.isEmpty
+            )
+        if hasRetainedManagedHistory {
+            status = "Retained conversation requires Switchboard re-pairing."
+        } else if session.requiresSwitchboardPairing {
+            status = "New Codex session requires Switchboard pairing."
+        } else {
+            status = "Switchboard account switching is off for this session."
+        }
+        action = hasRetainedManagedHistory ? "Re-pair Switchboard…" : "Pair Switchboard…"
+    }
+}
+
 struct SwitchboardSessionAccountBar: View {
     let viewModel: AgentModeViewModel
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
     let tabID: UUID?
+    @State private var creatingSession = false
+    @State private var creationFailed = false
 
     var body: some View {
-        if statusPillsUI.snapshot.selectedAgent == .codexExec,
-           let tabID, let session = viewModel.sessions[tabID]
-        {
-            SwitchboardSessionAccountControls(viewModel: viewModel, session: session)
+        VStack(spacing: 0) {
+            HStack {
+                Button("New Switchboard Codex session…") {
+                    creatingSession = true
+                    creationFailed = false
+                    Task { @MainActor in
+                        defer { creatingSession = false }
+                        creationFailed = await viewModel.createAndActivateSwitchboardSessionTab() == nil
+                    }
+                }
+                .disabled(creatingSession)
+                .accessibilityIdentifier("new-switchboard-codex-session")
+                .keyboardShortcut("n", modifiers: [.command, .option, .shift])
+                if creationFailed { Text("A new session could not be created. Try again after the workspace is ready.").font(.caption) }
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            if statusPillsUI.snapshot.selectedAgent == .codexExec,
+               let tabID, let session = viewModel.sessions[tabID]
+            {
+                SwitchboardSessionAccountControls(viewModel: viewModel, session: session)
+            }
         }
     }
 }
@@ -30,11 +72,11 @@ private struct SwitchboardSessionAccountControls: View {
             if let control = session.switchboardAccountControl {
                 SwitchboardAccountStatus(control: control)
             } else {
-                Text(session.requiresSwitchboardPairing ? "Retained conversation requires Switchboard re-pairing." : "Switchboard account switching is off for this session.")
+                Text(SwitchboardSessionPairingCopy(session: session).status)
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
-            Button(session.requiresSwitchboardPairing ? "Re-pair Switchboard…" : "Pair Switchboard…") {
+            Button(SwitchboardSessionPairingCopy(session: session).action) {
                 envelope = ""
                 consent = false
                 errorText = nil

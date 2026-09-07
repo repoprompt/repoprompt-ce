@@ -533,17 +533,52 @@ final class AgentTabSession: ObservableObject {
     var pendingNonCodexUserInputTokenQueue: [Int] = []
     var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
 
-    // Codex native session identifiers and metadata
-    var codexConversationID: String?
+    /// Codex native session identifiers and metadata
+    var codexConversationID: String? {
+        didSet {
+            if oldValue != codexConversationID, switchboardAccountControl?.scope != nil { switchboardAccountControl?.runtimeLost() }
+        }
+    }
+
     var codexRolloutPath: String?
     @Published var requiresSwitchboardPairing = false
-    @Published var switchboardAccountControl: CodexSwitchboardSessionControl?
+    @Published var switchboardAccountControl: CodexSwitchboardSessionControl? {
+        didSet {
+            guard oldValue !== switchboardAccountControl else { return }
+            oldValue?.availabilityDidChange = nil
+            oldValue?.revoke()
+            composerSubmissionToken = UUID()
+            switchboardAccountControl?.availabilityDidChange = { [weak self] in
+                self?.switchboardAvailabilityDidChange?()
+            }
+            switchboardAvailabilityDidChange?()
+        }
+    }
+
+    var switchboardAvailabilityDidChange: (() -> Void)?
+
+    var isSwitchboardManagedSession: Bool {
+        selectedAgent == .codexExec && (requiresSwitchboardPairing || switchboardAccountControl != nil || codexController?.usesManagedHTTPAccountAdoption == true)
+    }
+
+    /// No global provider status substitutes for this exact live root binding.
+    var hasLiveSwitchboardAuthority: Bool {
+        guard isSwitchboardManagedSession, requiresSwitchboardPairing, parentSessionID == nil,
+              let control = switchboardAccountControl, control.hasLiveAuthority,
+              let scope = control.scope, scope.sessionID == activeAgentSessionID,
+              scope.controllerGeneration == codexControllerGeneration,
+              scope.threadID == codexConversationID,
+              let controller = codexController, controller.usesManagedHTTPAccountAdoption,
+              controller.hasActiveThread, controller.currentSessionReference?.conversationID == scope.threadID else { return false }
+        return true
+    }
 
     var switchboardDispatchBlockReason: String? {
-        guard selectedAgent == .codexExec, requiresSwitchboardPairing || switchboardAccountControl != nil else { return nil }
+        guard isSwitchboardManagedSession else { return nil }
         guard parentSessionID == nil else { return "Switchboard pairing is available only for root Codex sessions." }
         guard let control = switchboardAccountControl else { return "Re-pair this retained conversation with Switchboard before continuing." }
-        return control.blocksDispatch ? control.statusText : nil
+        if control.blocksDispatch { return control.statusText }
+        return hasLiveSwitchboardAuthority ? nil : "The managed session binding changed. Re-pair this conversation before continuing."
     }
 
     var allowsSwitchboardBootstrap: Bool {
@@ -651,7 +686,7 @@ final class AgentTabSession: ObservableObject {
     var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init()
 
     var isProviderSelectionLocked: Bool {
-        hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
+        isSwitchboardManagedSession || (hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend)
     }
 
     // Persistence

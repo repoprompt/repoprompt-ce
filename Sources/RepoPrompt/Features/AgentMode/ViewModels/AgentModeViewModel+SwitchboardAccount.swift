@@ -1,6 +1,49 @@
 import Foundation
 
 extension AgentModeViewModel {
+    func observeSwitchboardAvailability(for session: TabSession) {
+        session.switchboardAvailabilityDidChange = { [weak self, weak session] in
+            guard let self, let session, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
+            syncComposerUIState(tabID: session.tabID)
+        }
+    }
+
+    /// UI-only entry: always request a distinct blank tab, never repurpose the
+    /// current ordinary/Claude conversation or copy its provider history.
+    @discardableResult
+    func createAndActivateSwitchboardSessionTab() async -> UUID? {
+        await createAndActivateSwitchboardSessionTab(createFreshTab: { [weak self] in
+            await self?.createAndActivateSessionTab()
+        })
+    }
+
+    @discardableResult
+    func createAndActivateSwitchboardSessionTab(createFreshTab: () async -> UUID?) async -> UUID? {
+        guard !managedSessionFence.isLogoutInProgress else { return nil }
+        let publication = managedSessionFence.capturePublicationToken()
+        let workspaceID = activeWorkspaceIDForSessionIndexOwnership
+        let previousTabIDs = Set(sessions.keys)
+        let previousTabID = currentTabID
+        guard let tabID = await createFreshTab(), !previousTabIDs.contains(tabID), tabID != previousTabID,
+              activeWorkspaceIDForSessionIndexOwnership == workspaceID,
+              managedSessionFence.isCurrent(publication), !managedSessionFence.isLogoutInProgress,
+              let session = sessions[tabID], session.items.isEmpty, session.transcript.turns.isEmpty,
+              !session.hasSentFirstMessage, session.parentSessionID == nil,
+              !session.runState.isActive, session.codexController == nil, session.claudeController == nil,
+              session.provider == nil, session.providerSessionID == nil,
+              session.codexConversationID == nil, session.codexRolloutPath == nil,
+              session.switchboardAccountControl == nil, session.mcpControlContext == nil else { return nil }
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = defaultModelRaw(for: .codexExec)
+        session.requiresSwitchboardPairing = true
+        observeSwitchboardAvailability(for: session)
+        session.isDirty = true
+        scheduleSave(for: tabID)
+        if currentTabID == tabID { updateBindingsFromSession(session) }
+        requestUIRefresh(tabID: tabID, urgent: true)
+        return tabID
+    }
+
     enum SwitchboardPairingFailure: Error, LocalizedError {
         case rootRequired, idleRequired, legacySession, identityChanged, runtimeUnavailable
 
@@ -23,6 +66,7 @@ extension AgentModeViewModel {
         let session = await ensureSessionReady(tabID: tabID)
         try Task.checkCancellation()
         guard sessions[tabID] === session, activeWorkspaceIDForSessionIndexOwnership == workspaceID else { throw SwitchboardPairingFailure.identityChanged }
+        observeSwitchboardAvailability(for: session)
         guard session.selectedAgent == .codexExec, session.parentSessionID == nil else { throw SwitchboardPairingFailure.rootRequired }
         guard codexCoordinator.switchboardSetupRejection(for: session) == nil,
               !switchboardHasActiveOrUnknownDescendants(of: session),
@@ -30,7 +74,8 @@ extension AgentModeViewModel {
               session.switchboardAccountControl?.isPreparing != true else { throw SwitchboardPairingFailure.idleRequired }
         if let controller = session.codexController, !controller.usesManagedHTTPAccountAdoption { throw SwitchboardPairingFailure.legacySession }
         if !session.requiresSwitchboardPairing,
-           session.codexConversationID != nil || session.codexRolloutPath != nil || !session.items.isEmpty { throw SwitchboardPairingFailure.legacySession }
+           session.codexConversationID != nil || session.codexRolloutPath != nil
+           || !session.items.isEmpty || !session.transcript.turns.isEmpty { throw SwitchboardPairingFailure.legacySession }
         let retainedThreadID = session.codexConversationID
         if session.codexRolloutPath != nil, retainedThreadID == nil { throw SwitchboardPairingFailure.runtimeUnavailable }
 

@@ -3,6 +3,64 @@ import XCTest
 
 @MainActor
 final class CodexSwitchboardSessionAdmissionTests: XCTestCase {
+    func testManagedBootstrapRechecksLogoutRevocationAndControlReplacementAtFactoryBoundary() async {
+        for change in ["logout", "revoke", "replace", "child"] {
+            let fence = CodexManagedSessionFence()
+            let token = fence.beginLogout()
+            fence.finishLogout(token: token, succeeded: true)
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.requiresSwitchboardPairing = true
+            session.switchboardAccountControl = CodexSwitchboardSessionControl()
+            let controller = Controller()
+            var launches = 0
+            let coordinator = makeCoordinator(recovery: Recovery(), activeTools: { _ in false }, launched: {
+                launches += 1
+                switch change {
+                case "logout": _ = fence.beginLogout()
+                case "revoke": session.switchboardAccountControl?.revoke()
+                case "replace": session.switchboardAccountControl = CodexSwitchboardSessionControl()
+                default: session.parentSessionID = UUID()
+                }
+            }, replacement: controller, fence: fence)
+            await coordinator.ensureCodexNativeSession(session: session)
+            XCTAssertEqual(launches, 1, change)
+            XCTAssertNil(session.codexController, change)
+            XCTAssertEqual(controller.shutdowns, 1, change)
+            await session.switchboardAccountControl?.revokeAndWait()
+            session.codexEventTask?.cancel()
+        }
+    }
+
+    func testExplicitManagedBootstrapAfterCompletedLogoutDoesNotNeedGlobalLogin() async {
+        for managed in [false, true] {
+            let fence = CodexManagedSessionFence()
+            let token = fence.beginLogout()
+            fence.finishLogout(token: token, succeeded: true)
+            var launches = 0
+            let controller = Controller()
+            let recovery = Recovery()
+            let coordinator = makeCoordinator(
+                recovery: recovery,
+                activeTools: { _ in false },
+                launched: { launches += 1 },
+                replacement: controller,
+                fence: fence
+            )
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.requiresSwitchboardPairing = managed
+            if managed { session.switchboardAccountControl = CodexSwitchboardSessionControl() }
+            await coordinator.ensureCodexNativeSession(session: session, allowMissingRolloutFallback: false, allowResumeTimeoutFallback: false)
+            XCTAssertEqual(launches, managed ? 1 : 0)
+            XCTAssertTrue(fence.isFenced)
+            let calls = await recovery.calls
+            XCTAssertEqual(calls, 0)
+            await session.switchboardAccountControl?.revokeAndWait()
+            session.codexEventTask?.cancel()
+        }
+    }
+
     func testManagedRepairNeverRetiresLiveOrUnknownControllerForReconciliation() async {
         for scenario in ["healthy", "reconnect", "features", "workspace", "profile", "workspaceFailure", "recheckedWorkspace", "recheckedFailure"] {
             let controller = Controller()
@@ -161,6 +219,7 @@ final class CodexSwitchboardSessionAdmissionTests: XCTestCase {
     private func makeCoordinator(
         recovery: Recovery, activeTools: @escaping (UUID) -> Bool, launched: @escaping () -> Void,
         replacement: Controller? = nil,
+        fence: CodexManagedSessionFence = .shared,
         workspace: @escaping (AgentTabSession) throws -> CodexRuntimeWorkspacePaths = { _ in .uniform("/synthetic/workspace") }
     ) -> CodexAgentModeCoordinator {
         CodexAgentModeCoordinator(
@@ -173,7 +232,8 @@ final class CodexSwitchboardSessionAdmissionTests: XCTestCase {
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, authRecovery: recovery,
             codexHookApprovalSettings: HookSettings(), activeToolQuery: activeTools,
-            preferenceDefaults: UserDefaults(suiteName: "SwitchboardAdmissionTests.\(UUID().uuidString)")!
+            preferenceDefaults: UserDefaults(suiteName: "SwitchboardAdmissionTests.\(UUID().uuidString)")!,
+            managedSessionFence: fence
         )
     }
 

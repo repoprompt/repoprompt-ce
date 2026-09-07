@@ -47,6 +47,15 @@ final class CodexSwitchboardSessionControl: ObservableObject {
     private var selectedGrant: CodexAccountAdoptionGrant?
     private let mutex = AsyncMutex()
     let authorization = CodexAccountAdoptionAuthorization()
+    /// Called after local admission state settles, not from Published's willSet.
+    var availabilityDidChange: (() -> Void)?
+
+    var hasLiveAuthority: Bool {
+        guard !isPreparing, !blocksPermanently, core != nil, let scope,
+              let admission = runtime?.admission(), admission.scope == scope,
+              admission.isExplicitRootCodexSession, admission.isManagedHTTPBackend else { return false }
+        return (try? authorization.withAuthorization { true }) == true
+    }
 
     var blocksDispatch: Bool {
         isPreparing || isTransactionInFlight || core?.blocksDispatch != false
@@ -109,8 +118,10 @@ final class CodexSwitchboardSessionControl: ObservableObject {
             }
         }
         isTransactionInFlight = true
+        availabilityDidChange?()
         defer { isTransactionInFlight = false
             isPreparing = false
+            availabilityDidChange?()
         }
         do {
             let lease = try await runtime.reserve()
@@ -155,6 +166,7 @@ final class CodexSwitchboardSessionControl: ObservableObject {
 
     private func pollLocked() async {
         guard !isPreparing, !blocksPermanently, let bridge, let runtime, let core else { return }
+        defer { availabilityDidChange?() }
         let expectedEpoch = epoch
         do {
             try checkIdentity(expectedEpoch)
@@ -169,7 +181,10 @@ final class CodexSwitchboardSessionControl: ObservableObject {
             }
             if core.isReadyForApplication() {
                 isTransactionInFlight = true
-                defer { isTransactionInFlight = false }
+                availabilityDidChange?()
+                defer { isTransactionInFlight = false
+                    availabilityDidChange?()
+                }
                 let lease = try await runtime.reserve()
                 do {
                     try checkIdentity(expectedEpoch)
@@ -207,7 +222,10 @@ final class CodexSwitchboardSessionControl: ObservableObject {
         guard !blocksPermanently, let runtime, let core else { throw CodexAccountAdoptionReason.revoked }
         let expectedEpoch = epoch
         isTransactionInFlight = true
-        defer { isTransactionInFlight = false }
+        availabilityDidChange?()
+        defer { isTransactionInFlight = false
+            availabilityDidChange?()
+        }
         let lease: UUID
         do { lease = try await runtime.reserve() } catch {
             core.suspend(.runtimeUnavailable)
@@ -251,6 +269,7 @@ final class CodexSwitchboardSessionControl: ObservableObject {
         state = .failedUnknown(.runtimeUnavailable)
         isPreparing = false
         selectedGrant = nil
+        availabilityDidChange?()
         scheduleCleanup()
     }
 
@@ -261,6 +280,7 @@ final class CodexSwitchboardSessionControl: ObservableObject {
         selectedGrant = nil
         state = .revoked
         isPreparing = false
+        availabilityDidChange?()
         scheduleCleanup()
     }
 

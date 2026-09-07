@@ -3,6 +3,7 @@ import Foundation
 
 @MainActor
 protocol CodexManagedSessionShutdownParticipant: AnyObject {
+    func invalidateSwitchboardAuthoritiesForManagedLogout()
     func stopCodexSessionsForManagedLogout() async
 }
 
@@ -120,6 +121,12 @@ final class CodexManagedLogoutCoordinator {
         }
 
         let id = UUID()
+        // No await between invalidating every managed authority and publishing
+        // the global fence. Native writers on other actors share these permits:
+        // once sign-out is observable, none may publish another managed frame.
+        for participant in participants {
+            participant.invalidateSwitchboardAuthoritiesForManagedLogout()
+        }
         let fenceGeneration = fence.beginLogout()
         let logoutOperation = logoutOperation
         let task = Task { @MainActor in

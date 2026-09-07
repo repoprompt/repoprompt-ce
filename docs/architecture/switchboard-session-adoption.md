@@ -213,6 +213,12 @@ live revocable consent so a stale asynchronous lease release cannot reopen it.
 
 ## Session UI and onboarding
 
+Choose **New Switchboard Codex session…** (Command–Option–Shift–N) from Agent
+Mode to create a separate empty root tab, including when no ordinary provider
+is connected. This entry never converts or copies the current ordinary/Claude
+history. The new tab cannot send until private pairing and account application
+complete; creating it does not grant consent or start a provider turn.
+
 Use the Codex session's **Pair Switchboard…** control, paste a fresh private
 pairing envelope from Switchboard, and explicitly allow idle account changes.
 The envelope input is a native masked secure field and clears on submission,
@@ -220,6 +226,25 @@ cancellation or dismissal; pairing material is never a transcript input.
 This is a separate authority from the ordinary Codex login in Settings: a paired
 managed session does not require Settings to report Connected. The UI does not
 alter or fabricate that global status.
+
+Composer availability and final dispatch use the exact managed root's live
+session/controller/native-thread binding and revocable authorization. Preparing,
+unpaired, revoked, failed, child, or replaced bindings remain blocked even when
+the ordinary login is connected. Availability changes publish after adoption
+transactions release their dispatch block. Global provider-status refresh never
+reassigns a managed conversation to another provider. The model menu is local to
+that Codex conversation, not a claim that global Codex login is Connected.
+
+An explicitly prepared or live managed binding may bypass a completed ordinary
+sign-out fence. Active **Stop Sessions & Sign Out** still stops Codex sessions;
+startup rechecks the captured logout generation and managed control after awaits.
+Consent lost during that operation must be explicitly paired again.
+Every window synchronously revokes its Switchboard authorities before the global
+logout fence is published, with no await between that pass and publication.
+The existing asynchronous ordinary-Codex teardown follows. Suspended native-send
+admission also rechecks its captured logout generation after startup, hook review,
+and steering retry boundaries; the final native writer still enforces the same
+revocable authority at frame publication.
 
 Pairing is default-off and root-only. An existing ordinary backend or ordinary
 native history cannot be converted; begin with a new empty Codex session.
