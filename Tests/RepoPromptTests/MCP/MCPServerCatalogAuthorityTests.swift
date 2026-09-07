@@ -52,4 +52,27 @@ final class MCPServerCatalogAuthorityTests: XCTestCase {
             ["RepoPromptCE"]
         )
     }
+
+    func testDirectCodexLaunchOverridesUseCompleteAndSelectedProjection() throws {
+        let catalog = try MCPServerCatalog(servers: [
+            .init(name: "ArbitraryAdditional", transport: .http(url: "https://extra.example.invalid/mcp")),
+            .init(name: "DisabledServer", transport: .http(url: "https://off.example.invalid/mcp")),
+            .init(
+                name: "RepoPromptCE",
+                transport: .stdio(command: "/redacted/rp", args: [], environment: [:])
+            )
+        ])
+        let authority = MCPServerCatalogAuthority(
+            catalogProvider: { catalog },
+            enabledNamesProvider: { _ in ["ArbitraryAdditional"] }
+        )
+
+        let overrides = CodexNativeSessionController.defaultAppServerConfigOverrides(
+            mcpCatalogAuthority: authority
+        )
+
+        XCTAssertEqual(overrides["mcp_servers.ArbitraryAdditional.enabled"] as? Bool, true)
+        XCTAssertEqual(overrides["mcp_servers.DisabledServer.enabled"] as? Bool, false)
+        XCTAssertEqual(overrides["mcp_servers.RepoPromptCE.enabled"] as? Bool, true)
+    }
 }
