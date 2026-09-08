@@ -710,7 +710,14 @@ actor ServerNetworkManager {
 
     private let bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming
     private let bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)?
-    private let domainHost: MCPDomainHost
+    private let defaultDomainHost: MCPDomainHost
+    private var domainHost: MCPDomainHost {
+        #if DEBUG
+            if let runtime = AppDomainRuntimeComposition.shared.runtimeForTesting { return runtime.domainHost }
+        #endif
+        return defaultDomainHost
+    }
+
     private var isRunningState: Bool = false
     private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
@@ -722,7 +729,7 @@ actor ServerNetworkManager {
     ) {
         self.bootstrapLifecycleTiming = bootstrapLifecycleTiming
         self.bootstrapPeerPIDResolver = bootstrapPeerPIDResolver
-        self.domainHost = domainHost
+        defaultDomainHost = domainHost
     }
 
     // Bootstrap socket server. Startup candidates remain separate until bind/listen and
@@ -6133,39 +6140,14 @@ actor ServerNetworkManager {
                                 )
                             }
                         #endif
-                        let readiness = await self.awaitAgentPolicyAdmissionIfNeeded(
+                        guard await self.completeApprovedAgentInitialization(
                             clientName: clientInfo.name,
                             bootstrapClientName: bootstrapClientName,
                             connectionID: connectionID,
-                            sessionKey: sessionToken,
-                            clientPid: clientPid
-                        )
-                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
-                        if readiness == .timedOut {
-                            self.pendingConnections.removeValue(forKey: connectionID)
-                            return false
-                        }
-
-                        let policyOutcome = await self.applyPendingPolicyIfAvailable(
-                            clientName: clientInfo.name,
-                            connectionID: connectionID,
+                            sessionToken: sessionToken,
                             clientPid: clientPid,
-                            bootstrapClientName: bootstrapClientName,
                             expectedLifecycleGeneration: expectedLifecycleGeneration
-                        )
-                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
-                        if case let .rejected(runID, reason) = policyOutcome {
-                            mcpPolicyLog(
-                                "rejected MCP initialize after pid-gated policy wait client=\(clientInfo.name) connection=\(connectionID) runID=\(runID?.uuidString ?? "nil") reason=\(reason)"
-                            )
-                            self.pendingConnections.removeValue(forKey: connectionID)
-                            return false
-                        }
-                        self.notifyConnectionWaiters(
-                            connectionID: connectionID,
-                            clientName: clientInfo.name,
-                            lifecycleGeneration: expectedLifecycleGeneration
-                        )
+                        ) else { return false }
 
                         // Do not block MCP initialize on window binding/readiness/cache warming.
                         // Policy admission and waiter notification are complete; finish catalog prep opportunistically.
@@ -7653,6 +7635,83 @@ actor ServerNetworkManager {
         mutableArgs["window_id"] = .int(windowID)
         return mutableArgs
     }
+
+    /// Shared post-approval initialize sequence. Routing is still PID/run-admitted and lifecycle fenced.
+    private func completeApprovedAgentInitialization(
+        clientName: String,
+        bootstrapClientName: String?,
+        connectionID: UUID,
+        sessionToken: String,
+        clientPid: Int,
+        expectedLifecycleGeneration: UInt64
+    ) async -> Bool {
+        let readiness = await awaitAgentPolicyAdmissionIfNeeded(
+            clientName: clientName,
+            bootstrapClientName: bootstrapClientName,
+            connectionID: connectionID,
+            sessionKey: sessionToken,
+            clientPid: clientPid
+        )
+        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+        if readiness == .timedOut {
+            pendingConnections.removeValue(forKey: connectionID)
+            return false
+        }
+
+        let policyOutcome = await applyPendingPolicyIfAvailable(
+            clientName: clientName,
+            connectionID: connectionID,
+            clientPid: clientPid,
+            bootstrapClientName: bootstrapClientName,
+            expectedLifecycleGeneration: expectedLifecycleGeneration
+        )
+        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+        if case let .rejected(runID, reason) = policyOutcome {
+            mcpPolicyLog(
+                "rejected MCP initialize after pid-gated policy wait client=\(clientName) connection=\(connectionID) runID=\(runID?.uuidString ?? "nil") reason=\(reason)"
+            )
+            pendingConnections.removeValue(forKey: connectionID)
+            return false
+        }
+        notifyConnectionWaiters(
+            connectionID: connectionID,
+            clientName: clientName,
+            lifecycleGeneration: expectedLifecycleGeneration
+        )
+        return true
+    }
+
+    #if DEBUG
+        /// Socket fixtures substitute user approval only, never run routing or pending-policy admission.
+        func debugCompleteApprovedAgentInitialization(
+            clientName: String,
+            connectionID: UUID,
+            sessionToken: String,
+            clientPid: Int
+        ) async -> Bool {
+            guard let generation = connectionLifecycleGenerationByID[connectionID],
+                  isCurrentConnection(connectionID, lifecycleGeneration: generation)
+            else { return false }
+            // Direct socket fixtures do not pass through registerAndStartBootstrapConnection.
+            // Carry the registered transport's real peer identity; never synthesize verification.
+            guard let bootstrap = connections[connectionID] as? BootstrapSocketConnectionManager else { return false }
+            let observedPID = await bootstrap.peerPID()
+            let claimedPID = await bootstrap.claimedPID()
+            guard isCurrentConnection(connectionID, lifecycleGeneration: generation) else { return false }
+            bootstrapClaimedPIDByConnectionID[connectionID] = claimedPID
+            bootstrapObservedPeerPIDByConnectionID[connectionID] = observedPID
+            identityContextByConnection[connectionID] = ConnectionIdentityContext(
+                clientName: clientName, capabilityToken: sessionToken, source: .handshake,
+                hasHandshake: true, lastUpdated: Date()
+            )
+            bindSessionToken(sessionToken, to: connectionID)
+            return await completeApprovedAgentInitialization(
+                clientName: clientName, bootstrapClientName: clientName,
+                connectionID: connectionID, sessionToken: sessionToken, clientPid: clientPid,
+                expectedLifecycleGeneration: generation
+            )
+        }
+    #endif
 
     func registerExpectedAgentPID(_ pid: pid_t, for clientName: String, runID: UUID? = nil) {
         let storageKey = Self.clientStorageKey(clientName)

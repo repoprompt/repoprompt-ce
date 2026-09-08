@@ -17,6 +17,64 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import ci_app_test_runner as runner  # noqa: E402
 
 
+class LocalExecutionTests(unittest.TestCase):
+    def test_conductor_routes_root_tests_through_sandbox_runner(self) -> None:
+        import conductor
+
+        root = SCRIPT_DIR.parent
+        argv, lanes, cwd, _, _ = conductor.OperationRegistry(root).prepare({
+            "operation": "test",
+            "args": {"filter": "WorkspaceRootRemovalTests/testCaseOnlyMissIsANoOp", "testProduct": "RepoPromptPackageTests"},
+        })
+        self.assertEqual(argv, [
+            sys.executable, str(SCRIPT_DIR / "ci_app_test_runner.py"), "--local",
+            "--test-product", "RepoPromptPackageTests",
+            "--filter", "WorkspaceRootRemovalTests/testCaseOnlyMissIsANoOp",
+        ])
+        self.assertEqual(lanes, ["build"])
+        self.assertEqual(cwd, root)
+
+    def test_local_build_then_sandboxed_execution_preserves_selection_and_exit(self) -> None:
+        calls = []
+        sandbox = None
+
+        def execute(command, cwd, environment):
+            nonlocal sandbox
+            calls.append(tuple(command))
+            self.assertEqual(cwd, SCRIPT_DIR.parent)
+            if len(calls) == 1:
+                self.assertEqual(dict(environment), {"PATH": "/usr/bin"})
+                return 0
+            sandbox = Path(environment["REPOPROMPT_TEST_SANDBOX_ROOT"])
+            self.assertTrue((sandbox / runner.SANDBOX_MARKER_NAME).is_file())
+            self.assertEqual(Path(environment["HOME"]), sandbox / "home")
+            self.assertEqual(environment["CFFIXED_USER_HOME"], environment["HOME"])
+            self.assertEqual(Path(environment["TMPDIR"]), sandbox / "tmp")
+            self.assertEqual(environment["PATH"], "/usr/bin")
+            return 17
+
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin"}, clear=True):
+            result = runner.run_local_tests(
+                swift_binary="swift", cwd=SCRIPT_DIR.parent,
+                test_filter="Suite/testMethod", test_product="RepoPromptPackageTests",
+                executor=execute,
+            )
+        self.assertEqual(result, 17)
+        self.assertEqual(calls, [
+            ("swift", "build", "--build-tests"),
+            ("swift", "test", "--skip-build", "--test-product", "RepoPromptPackageTests", "--filter", "Suite/testMethod"),
+        ])
+        self.assertIsNotNone(sandbox)
+        self.assertFalse(sandbox.exists())
+
+    def test_local_build_failure_does_not_launch_tests(self) -> None:
+        executor = mock.Mock(return_value=9)
+        self.assertEqual(runner.run_local_tests(
+            swift_binary="swift", cwd=None, executor=executor,
+        ), 9)
+        executor.assert_called_once()
+
+
 class TestDiscoveryTests(unittest.TestCase):
     def test_parse_suite_methods_deduplicates_and_sorts(self) -> None:
         output = "\n".join(
@@ -232,6 +290,12 @@ class TestExecutionTests(unittest.TestCase):
             self.assertEqual(first["TMPDIR"], first["TEMP"])
             self.assertEqual(first["PATH"], "/usr/bin")
             self.assertEqual(first["CUSTOM_TOKEN"], "preserved")
+            sandbox = Path(first["REPOPROMPT_TEST_SANDBOX_ROOT"])
+            self.assertTrue((sandbox / runner.SANDBOX_MARKER_NAME).is_file())
+            self.assertEqual(Path(first["HOME"]), sandbox / "home")
+            self.assertEqual(Path(first["TMPDIR"]), sandbox / "tmp")
+            self.assertEqual(Path(first["TMP"]), sandbox / "tmp")
+            self.assertEqual(Path(first["TEMP"]), sandbox / "tmp")
             for key in (
                 "HOME",
                 "TMPDIR",

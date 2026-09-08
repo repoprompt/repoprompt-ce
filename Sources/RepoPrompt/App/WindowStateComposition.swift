@@ -34,6 +34,7 @@ enum WindowStateCompositionFactory {
         settingsStore: GlobalSettingsStore = .shared,
         domainRuntime: MCPDomainRuntime? = nil,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
+        keyManager injectedKeyManager: KeyManager? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
@@ -53,7 +54,7 @@ enum WindowStateCompositionFactory {
         let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
 
         // 2) AI queries
-        let keyManager = KeyManager()
+        let keyManager = injectedKeyManager ?? KeyManager()
         let aiQueriesService = aiQueriesServiceFactory?(keyManager)
             ?? AIQueriesService(keyManager: keyManager)
 

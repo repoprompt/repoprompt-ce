@@ -783,3 +783,58 @@ struct WorkspacePathLookupResult: Equatable {
     let file: WorkspaceFileRecord?
     let folder: WorkspaceFolderRecord?
 }
+
+/// Transient accepted root intent. Invalid entries are counted, never silently authorized away.
+struct WorkspacePrimaryRootManifest: Equatable {
+    let orderedPaths: [String]
+    let invalidEntryCount: Int
+
+    init(normalizedPaths: [String?]) {
+        var seen = Set<String>()
+        orderedPaths = normalizedPaths.compactMap(\.self).filter { seen.insert($0).inserted }
+        invalidEntryCount = normalizedPaths.count(where: { $0 == nil })
+    }
+}
+
+struct WorkspaceRootReconciliationTicket: Hashable {
+    let workspaceID: UUID
+    let activationGeneration: UInt64
+    let rootIntentGeneration: UInt64
+}
+
+struct WorkspacePrimaryRootSnapshot: Equatable {
+    let ticket: WorkspaceRootReconciliationTicket
+    let roots: [WorkspaceRootRef]
+}
+
+struct WorkspaceRootReadinessFailure: Error, Equatable {
+    enum Availability: String {
+        case missingDirectory, notDirectory, accessDenied, loadFailed
+    }
+
+    enum Reason: Equatable {
+        case emptyConfiguration, invalidConfiguration, workspaceUnavailable, workspaceInactive
+        case rootsChanging, rootsUnavailable(Availability), wrongRootKind, incompleteProjection, staleInvocation
+    }
+
+    let reason: Reason
+    let expectedCount: Int
+    let loadedCount: Int
+    let missingCount: Int
+
+    var retryable: Bool {
+        switch reason {
+        case .emptyConfiguration, .invalidConfiguration, .workspaceUnavailable, .wrongRootKind: false
+        default: true
+        }
+    }
+}
+
+/// In-memory authority only; filesystem availability is deliberately observed off this actor.
+struct WorkspacePrimaryRootReadinessObservation: Equatable {
+    let primaryRoots: [WorkspaceRootRef]
+    let requestedRoots: [WorkspaceRootRef]
+    let missingPaths: [String]
+    let wrongKindPaths: [String]
+    let nonqueryablePaths: [String]
+}
