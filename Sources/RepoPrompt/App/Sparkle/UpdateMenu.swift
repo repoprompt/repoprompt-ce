@@ -30,11 +30,17 @@ struct UpdateMenu: Commands {
                     .keyboardShortcut("u", modifiers: [.command, .option])
                 }
             } else {
-                Button("Check for Updates…") {
+                Button(sparkleManager.updateCheckMenuTitle) {
                     sparkleManager.checkForUpdates()
                 }
-                .disabled(!sparkleManager.canDiscoverUpdates)
+                .disabled(!sparkleManager.canInitiateUpdateCheck)
                 .keyboardShortcut("u", modifiers: [.command, .option])
+            }
+
+            if sparkleManager.migrationRecoveryDownloadsURL != nil {
+                Button("Stable releases / recovery downloads…") {
+                    sparkleManager.openMigrationRecoveryDownloads()
+                }
             }
 
             Divider()

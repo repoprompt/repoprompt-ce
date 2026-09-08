@@ -221,6 +221,74 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertNil(SparkleBuildVersion("28.7.95.1"))
     }
 
+    func testMigrationRecoveryDownloadsRemainAvailableWithoutDetectedUpdate() throws {
+        let blockedMessage = "migration blocked"
+        let recoveryURL = try XCTUnwrap(SparkleUpdaterManager.recoveryDownloadsURL(
+            identityMigrationBlockedMessage: blockedMessage
+        ))
+
+        XCTAssertEqual(
+            recoveryURL.absoluteString,
+            "https://github.com/repoprompt/repoprompt-ce-updates/releases"
+        )
+        XCTAssertNil(SparkleUpdaterManager.updateChannel(forAppcastItemURL: recoveryURL))
+        XCTAssertNil(SparkleUpdaterManager.manualDownloadURL(
+            for: nil,
+            identityMigrationBlockedMessage: blockedMessage
+        ))
+        XCTAssertEqual(
+            SparkleUpdaterManager.userInitiatedUpdateAction(
+                discoveryEnabled: true,
+                sparkleConfigurationValid: true,
+                identityMigrationBlockedMessage: blockedMessage
+            ),
+            .appcastDiscovery
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.updateStatusText(
+                availableUpdate: nil,
+                checkState: .failed
+            ),
+            "Unable to check for updates"
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.updateCheckMenuTitle(checkState: .failed),
+            "Check for Updates… (Last Check Failed)"
+        )
+        XCTAssertTrue(SparkleUpdaterManager.recoveryDownloadsCaveat.contains("does not verify"))
+        XCTAssertNil(SparkleUpdaterManager.recoveryDownloadsURL(
+            identityMigrationBlockedMessage: nil
+        ))
+    }
+
+    func testCancelledManualDiscoveryDoesNotClaimCurrentResult() {
+        XCTAssertEqual(
+            SparkleUpdaterManager.checkStateAfterCancellation(
+                currentState: .checking,
+                hadActiveRequest: true
+            ),
+            .notChecked
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.updateStatusText(
+                availableUpdate: nil,
+                checkState: .notChecked
+            ),
+            "Updates have not been checked yet"
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.checkStateAfterCancellation(
+                currentState: .failed,
+                hadActiveRequest: false
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.updateCheckMenuTitle(checkState: .checking),
+            "Checking for Updates…"
+        )
+    }
+
     func testBlockedMigrationDiscoversNewerUpdateButRejectsSparkleInstallation() throws {
         let downloadURL = try XCTUnwrap(URL(
             string: "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/download/tip-repair/RepoPrompt.zip"

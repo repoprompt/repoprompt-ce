@@ -106,18 +106,28 @@ struct GeneralSettingsView: View {
                             Spacer()
 
                             // Check for updates button
-                            Button("Check for Updates") {
+                            Button(sparkleManager.appcastCheckState == .checking ? "Checking…" : "Check for Updates") {
                                 sparkleManager.checkForUpdates()
-                                closeAction?()
+                                if !sparkleManager.isDiscoveryOnly {
+                                    closeAction?()
+                                }
                             }
                             .buttonStyle(.bordered)
-                            .disabled(!sparkleManager.canDiscoverUpdates)
+                            .disabled(!sparkleManager.canInitiateUpdateCheck)
                         }
 
                         if let message = sparkleManager.updateWarningMessage {
                             Label(message, systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
+                        }
+
+                        if let recoveryURL = sparkleManager.migrationRecoveryDownloadsURL {
+                            Link("Stable releases / recovery downloads", destination: recoveryURL)
+                                .font(.caption)
+                            Text(SparkleUpdaterManager.recoveryDownloadsCaveat)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
 
                         if let availableUpdate = sparkleManager.availableUpdate {

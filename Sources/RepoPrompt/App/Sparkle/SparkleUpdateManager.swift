@@ -46,6 +46,11 @@ final class SparkleUpdaterManager: ObservableObject {
     private static let stableFeedURL = SecurityObfuscation.decode(SecurityObfuscation.stableFeedURLEncoded)
     private static let tipFeedURL = SecurityObfuscation.decode(SecurityObfuscation.tipFeedURLEncoded)
     private static let expectedPublicEdKey = SecurityObfuscation.decode(SecurityObfuscation.expectedPublicEdKeyEncoded)
+    static let stableRecoveryDownloadsURL = URL(
+        string: "https://github.com/repoprompt/repoprompt-ce-updates/releases"
+    )
+    static let recoveryDownloadsCaveat =
+        "Opening this page only provides recovery downloads; it does not verify that manually installing or downgrading a build is safe for this Mac."
 
     private struct CanonicalURL: Hashable {
         let scheme: String
@@ -170,6 +175,24 @@ final class SparkleUpdaterManager: ObservableObject {
         updaterStarted && sparkleConfigurationValid && updateInstallationBlockedMessage == nil
     }
 
+    var migrationRecoveryDownloadsURL: URL? {
+        Self.recoveryDownloadsURL(
+            identityMigrationBlockedMessage: updateInstallationBlockedMessage
+        )
+    }
+
+    var isDiscoveryOnly: Bool {
+        discoveryEnabled && !updaterStarted && updateInstallationBlockedMessage != nil
+    }
+
+    var canInitiateUpdateCheck: Bool {
+        canDiscoverUpdates && appcastCheckState != .checking
+    }
+
+    var updateCheckMenuTitle: String {
+        Self.updateCheckMenuTitle(checkState: appcastCheckState)
+    }
+
     var manualUpdateDownloadURL: URL? {
         Self.manualDownloadURL(
             for: availableUpdate,
@@ -182,6 +205,35 @@ final class SparkleUpdaterManager: ObservableObject {
             availableUpdate: availableUpdate,
             checkState: appcastCheckState
         )
+    }
+
+    static func recoveryDownloadsURL(
+        identityMigrationBlockedMessage: String?
+    ) -> URL? {
+        guard identityMigrationBlockedMessage != nil else { return nil }
+        return stableRecoveryDownloadsURL
+    }
+
+    static func updateCheckMenuTitle(
+        checkState: SparkleAppcastCheckState
+    ) -> String {
+        switch checkState {
+        case .notChecked:
+            "Check for Updates…"
+        case .checking:
+            "Checking for Updates…"
+        case .succeeded:
+            "Check for Updates… (Up to Date)"
+        case .failed:
+            "Check for Updates… (Last Check Failed)"
+        }
+    }
+
+    static func checkStateAfterCancellation(
+        currentState: SparkleAppcastCheckState,
+        hadActiveRequest: Bool
+    ) -> SparkleAppcastCheckState {
+        hadActiveRequest ? .notChecked : currentState
     }
 
     static func manualDownloadURL(
@@ -718,10 +770,14 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     private func invalidateActiveAppcastCheck() {
+        let hadActiveRequest = appcastCheckTask != nil || activeAppcastCheckRequest != nil
         appcastCheckTask?.cancel()
         appcastCheckTask = nil
         activeAppcastCheckRequest = nil
-        appcastCheckState = .notChecked
+        appcastCheckState = Self.checkStateAfterCancellation(
+            currentState: appcastCheckState,
+            hadActiveRequest: hadActiveRequest
+        )
     }
 
     func setUpdateChannel(_ channel: UpdateChannel) {
@@ -782,6 +838,20 @@ final class SparkleUpdaterManager: ObservableObject {
         } else if let manualUpdateDownloadURL {
             NSWorkspace.shared.open(manualUpdateDownloadURL)
         }
+    }
+
+    func openMigrationRecoveryDownloads() {
+        guard let migrationRecoveryDownloadsURL else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Open Stable recovery downloads?"
+        alert.informativeText = Self.recoveryDownloadsCaveat
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open Releases")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        NSWorkspace.shared.open(migrationRecoveryDownloadsURL)
     }
 
     private func beginUserInitiatedSparkleCheck() {
