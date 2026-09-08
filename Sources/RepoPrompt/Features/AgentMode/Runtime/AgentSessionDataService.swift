@@ -186,6 +186,8 @@ actor AgentSessionDataService {
 
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
     private var deletedSessionFileURLs: Set<URL> = []
+    /// Overlapping reversible deletions share the local save fence; one failure cannot clear another.
+    private var deletionAttemptCountByFileURL: [URL: Int] = [:]
     #if DEBUG
         private var deletionTombstoneWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
         private var workspaceRootOverrideForTesting: URL?
@@ -231,6 +233,10 @@ actor AgentSessionDataService {
         let providerSessionID: String?
         let providerCleanupHandle: ProviderConversationCleanupHandle?
         let autoEditEnabled: Bool
+        /// Optional because synthesized `Decodable` ignores property defaults: a pre-version-8 file
+        /// carries no key at all, and a non-optional would fail the whole header decode.
+        let autoWakeOnOversightUpdates: Bool?
+        let agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>?
         let codexConversationID: String?
         let codexRolloutPath: String?
         let codexModel: String?
@@ -1383,6 +1389,8 @@ actor AgentSessionDataService {
                 providerSessionID: header.providerSessionID,
                 providerCleanupHandle: header.providerCleanupHandle,
                 autoEditEnabled: header.autoEditEnabled,
+                autoWakeOnOversightUpdates: header.autoWakeOnOversightUpdates ?? false,
+                agentSessionLinkAutoWakeTargetSessionIDs: header.agentSessionLinkAutoWakeTargetSessionIDs ?? [],
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
                 codexModel: header.codexModel,
@@ -1603,15 +1611,21 @@ actor AgentSessionDataService {
     }
 
     /// Delete a particular agent session file.
+    ///
+    /// The file must be attributable to a session UUID before anything irreversible happens: the
+    /// deletion fence is keyed by session, and deleting a transcript we cannot name would leave
+    /// oversight unable to revoke grants or clear saved intent for it.
     func deleteAgentSessionFile(_ fileURL: URL) async throws {
         let fileURL = fileURL.standardizedFileURL
         let folder = fileURL.deletingLastPathComponent()
         let filename = fileURL.lastPathComponent
-        let parsedID = agentSessionID(fromFilename: filename)
-        try await deleteSessionFileDurably(fileURL)
+        guard let parsedID = agentSessionID(fromFilename: filename) else {
+            throw AgentSessionDataError.invalidFilename(filename)
+        }
+        try await deleteSessionFileDurably(sessionID: parsedID, fileURL: fileURL)
         await removeMetadataRecords(
             matching: { record in
-                record.filename == filename || parsedID.map { record.id == $0 } == true
+                record.filename == filename || record.id == parsedID
             },
             folder: folder
         )
@@ -1623,7 +1637,7 @@ actor AgentSessionDataService {
         let filename = agentSessionFilename(for: id)
         let fileURL = agentSessionsFolder.appendingPathComponent(filename).standardizedFileURL
 
-        try await deleteSessionFileDurably(fileURL)
+        try await deleteSessionFileDurably(sessionID: id, fileURL: fileURL)
         await removeMetadataRecords(matching: { $0.id == id || $0.filename == filename }, folder: agentSessionsFolder)
     }
 
@@ -1646,7 +1660,30 @@ actor AgentSessionDataService {
             return Dictionary(uniqueKeysWithValues: tabIDs.map { ($0, error) })
         }
 
-        var candidateByPath: [String: (fileURL: URL, tabID: UUID)] = [:]
+        // Standardized path → exact session identity and owning compose tab. Every candidate is
+        // identity-checked before any file for that tab is deleted, so a malformed record cannot
+        // leave oversight unable to fence the session that actually owned the transcript.
+        var candidateByPath: [String: (sessionID: UUID, fileURL: URL, tabID: UUID)] = [:]
+        var validationFailures: [UUID: Error] = [:]
+        func note(sessionID: UUID, fileURL: URL, tabID: UUID) {
+            let standardized = fileURL.standardizedFileURL
+            let invalidFilename = AgentSessionDataError.invalidFilename(standardized.lastPathComponent)
+            guard let filenameSessionID = agentSessionID(fromFilename: standardized.lastPathComponent),
+                  filenameSessionID == sessionID
+            else {
+                validationFailures[tabID] = invalidFilename
+                return
+            }
+            if let existing = candidateByPath[standardized.path],
+               existing.sessionID != sessionID || existing.tabID != tabID
+            {
+                validationFailures[existing.tabID] = invalidFilename
+                validationFailures[tabID] = invalidFilename
+                return
+            }
+            candidateByPath[standardized.path] = (sessionID, standardized, tabID)
+        }
+
         let files: [URL]
         do {
             files = try await listAgentSessions(for: workspace)
@@ -1665,13 +1702,19 @@ actor AgentSessionDataService {
                 let tabID = stub.composeTabID,
                 tabIDs.contains(tabID)
             else { continue }
-            candidateByPath[canonicalFile.fileURL.path] = (canonicalFile.fileURL, tabID)
+            note(sessionID: stub.id, fileURL: canonicalFile.fileURL, tabID: tabID)
         }
 
-        var failures: [UUID: Error] = [:]
+        var failures = validationFailures
         for candidate in candidateByPath.values.sorted(by: { $0.fileURL.path < $1.fileURL.path }) {
+            // A tab with any identity ambiguity is left wholly untouched. Other tabs in the same
+            // upstream batch remain independently deletable and independently report failures.
+            guard validationFailures[candidate.tabID] == nil else { continue }
             do {
-                try await deleteSessionFileDurably(candidate.fileURL.standardizedFileURL)
+                try await deleteSessionFileDurably(
+                    sessionID: candidate.sessionID,
+                    fileURL: candidate.fileURL
+                )
             } catch {
                 failures[candidate.tabID] = error
             }
@@ -1686,8 +1729,22 @@ actor AgentSessionDataService {
         return failures
     }
 
-    private func deleteSessionFileDurably(_ fileURL: URL) async throws {
+    /// Irreversible removal of one session file, bracketed by the durable-deletion reporter.
+    ///
+    /// Phase order is the contract:
+    ///
+    /// 1. **Begin** marks the session in-progress *before* waiting for pending writes or touching the
+    ///    file, so oversight already refuses it while the removal is in flight.
+    /// 2. **Failure** clears only this attempt and preserves durable intent — nothing was deleted.
+    /// 3. **Commit** happens on successful removal *or* an already-absent file, and before any later
+    ///    await, so no metadata cleanup, next batch file, or view-model teardown can run while the
+    ///    session still looks alive to oversight.
+    private func deleteSessionFileDurably(sessionID: UUID, fileURL: URL) async throws {
+        // The local tombstone is inserted synchronously on actor entry, exactly as before, so the
+        // reporter's actor hop cannot open a window in which a concurrent save is still accepted.
         deletedSessionFileURLs.insert(fileURL)
+        deletionAttemptCountByFileURL[fileURL, default: 0] += 1
+        let attempt = await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID)
         #if DEBUG
             let tombstoneWaiters = deletionTombstoneWaitersByURL.removeValue(forKey: fileURL) ?? []
             for waiter in tombstoneWaiters {
@@ -1700,9 +1757,18 @@ actor AgentSessionDataService {
                 try FileManager.default.removeItem(at: fileURL)
             }
         } catch {
-            deletedSessionFileURLs.remove(fileURL)
+            let remainingAttempts = max(0, (deletionAttemptCountByFileURL[fileURL] ?? 1) - 1)
+            if remainingAttempts == 0 {
+                deletionAttemptCountByFileURL.removeValue(forKey: fileURL)
+                deletedSessionFileURLs.remove(fileURL)
+            } else {
+                deletionAttemptCountByFileURL[fileURL] = remainingAttempts
+            }
+            await AgentSessionDurableDeletionReporter.didFailDurableDeletion(attempt)
             throw error
         }
+        await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt)
+        // Keep one permanent count with the tombstone. A later overlapping failure must not reopen saves.
     }
 
     private func discardSaveIfSessionWasDeleted(

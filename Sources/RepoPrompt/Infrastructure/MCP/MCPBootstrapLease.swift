@@ -425,7 +425,8 @@ actor MCPBootstrapLease {
 
     private func releaseRouting(
         selection: RoutingWaitSelection,
-        progressReporter: MCPBootstrapRoutingProgressReporter?
+        progressReporter: MCPBootstrapRoutingProgressReporter?,
+        beforeRoutingCleanup: (@MainActor () async -> Bool)? = nil
     ) async -> MCPRoutingWaitOutcome {
         guard !hasReleased else {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) routing release ignored because lease already released")
@@ -496,6 +497,19 @@ actor MCPBootstrapLease {
             break
         }
 
+        if outcome == .routed,
+           let beforeRoutingCleanup,
+           await !beforeRoutingCleanup()
+        {
+            if Task.isCancelled {
+                outcome = .cancelled
+                await cancelAndCleanup()
+            } else {
+                outcome = .failed(.signalled)
+                await failAndCleanup()
+            }
+        }
+
         // Publish the finalized result to this run's lease before any awaited diagnostics or
         // cleanup can erase MCPRoutingWaiter's process-global terminal state.
         routingTerminalOutcome = outcome
@@ -542,10 +556,14 @@ actor MCPBootstrapLease {
     }
 
     /// Fail-closed routing readiness that consumes the typed absolute-deadline core.
-    func requireRouting(timeoutMs: Int = 10000) async throws {
+    func requireRouting(
+        timeoutMs: Int = 10000,
+        beforeRoutingCleanup: (@MainActor () async -> Bool)? = nil
+    ) async throws {
         let outcome = await releaseRouting(
             selection: .absolute(timeoutMs: timeoutMs),
-            progressReporter: nil
+            progressReporter: nil,
+            beforeRoutingCleanup: beforeRoutingCleanup
         )
         switch outcome {
         case .routed:

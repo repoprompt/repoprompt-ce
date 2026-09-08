@@ -46,6 +46,7 @@ package enum MCPClientToolPolicyCatalog {
         .worktreeManage,
         .agentExternalControl,
         .agentExploreControl,
+        .agentSessionLinkControl,
         .agentReasoningControl,
         .statusPublication,
     ]
@@ -75,12 +76,21 @@ package enum MCPClientToolPolicyCatalog {
         .conversationLog,
     ]
 
+    /// Capabilities that are advertised and callable only when the connection's effective policy
+    /// carries an explicit additional grant for the tool.
+    ///
+    /// `agentSessionLinkControl` is intentionally absent from every `grantedCapabilities` set above:
+    /// its grant is not a property of the run's profile, it is computed live from the exact caller's
+    /// active links in either direction. Catalog reachability grants no outbound oversight authority;
+    /// each operation still authorizes its direction independently, and the tool disappears after the
+    /// exact endpoint's final inbound or outbound link is revoked.
     package static let policyGatedCapabilities: Set<MCPToolCapability> = [
         .userInteraction,
         .agentReasoningControl,
         .statusPublication,
         .agentConversationSend,
         .conversationLog,
+        .agentSessionLinkControl,
     ]
 
     package static let classifications: [MCPClientToolPolicyProfile: MCPClientToolPolicyClassification] = [

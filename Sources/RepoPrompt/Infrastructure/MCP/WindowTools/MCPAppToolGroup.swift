@@ -54,7 +54,8 @@ enum MCPAppToolGroup: CaseIterable, Hashable {
             [
                 MCPWindowToolName.agentExplore,
                 MCPWindowToolName.agentRun,
-                MCPWindowToolName.agentManage
+                MCPWindowToolName.agentManage,
+                MCPWindowToolName.agentSessionLink
             ]
         case .agentSessionControl:
             [

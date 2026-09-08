@@ -95,6 +95,13 @@ package protocol DomainAgentCapabilityBackend: Sendable {
     func explore(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func run(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func manage(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
+    /// Cross-window oversight-link operations.
+    ///
+    /// Standalone/headless compositions have no windows and therefore no live top-level Agent
+    /// sessions to grant or observe, so a conforming backend is expected to fail closed. The binding
+    /// still exists because the canonical catalog must stay complete: a tool that is absent from one
+    /// composition would be an ungated hole rather than a denial.
+    func monitorSessionLink(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func shareThoughts(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func publishStatus(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
     func waitForInstruction(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult
@@ -312,6 +319,7 @@ package enum MCPDomainStandaloneToolInstaller {
             binding(MCPWindowToolName.agentExplore, backends.agent.explore),
             binding(MCPWindowToolName.agentRun, backends.agent.run),
             binding(MCPWindowToolName.agentManage, backends.agent.manage),
+            binding(MCPWindowToolName.agentSessionLink, backends.agent.monitorSessionLink),
             binding(MCPWindowToolName.shareThoughts, backends.agent.shareThoughts),
             binding(MCPWindowToolName.setStatus, backends.agent.publishStatus),
             binding(MCPWindowToolName.waitForNextInstruction, backends.agent.waitForInstruction),

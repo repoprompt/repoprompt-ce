@@ -128,7 +128,10 @@ final class ClaudeIntegratedAgentModeRunner {
                         session: session,
                         text: initialMessageForRun,
                         attachments: attachments,
-                        intent: .runAttempt(ownership: ownership, runID: runID)
+                        intent: .runAttempt(ownership: ownership, runID: runID),
+                        // No event stream is owned until this send succeeds and the runner subscribes
+                        // below, so replacing a route-stale controller is safe at this boundary.
+                        allowsCatalogRouteControllerRecovery: true
                     )
                     let providerInitializationOutcome = switch sendOutcome {
                     case .sent:

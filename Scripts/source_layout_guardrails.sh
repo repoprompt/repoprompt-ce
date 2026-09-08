@@ -481,7 +481,7 @@ PY
     fi
   done
   if ! grep -q 'MCPDomainCanonicalToolDefinitions.definition(named:' "$domain_runtime_source_dir/MCPDomainReadToolDefinitions.swift"; then
-    fail "M3 shared read definitions must delegate to the canonical 27-tool schema authority"
+    fail "M3 shared read definitions must delegate to the canonical 28-tool schema authority"
   fi
   print_matches \
     "RepoPromptDomainRuntime contains app/UI/provider implementation" \
@@ -769,6 +769,7 @@ print_matches \
 # 8. Agent-authored reports and working notes stay local unless explicitly
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
+  "docs/architecture/agent-session-oversight-auto-wake.md"
   "docs/architecture/apple-identity-migration.md"
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/context-composer.md"

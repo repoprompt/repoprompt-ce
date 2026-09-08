@@ -1,7 +1,8 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 6
+    /// 7 adds the granular observer-session Auto-wake target UUID set.
+    static let currentSchemaVersion = 7
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -58,6 +59,10 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var acpModelParameterSelections: [ACPModelParameterSelection]
     var lastRunStateRaw: String?
     var autoEditEnabled: Bool
+    /// Deliberately **not** listed in `lacksTranscriptDerivedFields`: this is session configuration,
+    /// not a transcript-derived completeness signal, so a record missing it is not stale.
+    var autoWakeOnOversightUpdates: Bool
+    var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
     var parentSessionID: UUID?
     var isMCPOriginated: Bool
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
@@ -126,6 +131,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         acpModelParameterSelections: [ACPModelParameterSelection] = [],
         lastRunStateRaw: String?,
         autoEditEnabled: Bool,
+        autoWakeOnOversightUpdates: Bool = false,
+        agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
         parentSessionID: UUID?,
         isMCPOriginated: Bool,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
@@ -157,6 +164,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunStateRaw = lastRunStateRaw
         self.autoEditEnabled = autoEditEnabled
+        self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
+        self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
         self.parentSessionID = parentSessionID
         self.isMCPOriginated = isMCPOriginated
         self.worktreeBindingSummaries = worktreeBindingSummaries
@@ -190,6 +199,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case acpModelParameterSelections
         case lastRunStateRaw
         case autoEditEnabled
+        case autoWakeOnOversightUpdates
+        case agentSessionLinkAutoWakeTargetSessionIDs
         case parentSessionID
         case isMCPOriginated
         case worktreeBindingSummaries
@@ -229,6 +240,14 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         )
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
+        autoWakeOnOversightUpdates = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .autoWakeOnOversightUpdates
+        ) ?? false
+        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
+            Set<UUID>.self,
+            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
+        ) ?? []
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
         worktreeBindingSummaries = try container.decodeIfPresent([AgentSessionWorktreeBindingSummary].self, forKey: .worktreeBindingSummaries) ?? []
@@ -260,6 +279,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentReasoningEffortRaw: agentReasoningEffortRaw,
             acpModelParameterSelections: acpModelParameterSelections,
             autoEditEnabled: autoEditEnabled,
+            autoWakeOnOversightUpdates: autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: agentSessionLinkAutoWakeTargetSessionIDs,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
@@ -303,6 +324,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && acpModelParameterSelections == other.acpModelParameterSelections
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
+            && autoWakeOnOversightUpdates == other.autoWakeOnOversightUpdates
+            && agentSessionLinkAutoWakeTargetSessionIDs == other.agentSessionLinkAutoWakeTargetSessionIDs
             && parentSessionID == other.parentSessionID
             && isMCPOriginated == other.isMCPOriginated
             && worktreeBindingSummaries == other.worktreeBindingSummaries
@@ -348,6 +371,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             acpModelParameterSelections: session.acpModelParameterSelections,
             lastRunStateRaw: session.lastRunState,
             autoEditEnabled: session.autoEditEnabled,
+            autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
             parentSessionID: session.parentSessionID,
             isMCPOriginated: session.isMCPOriginated,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,

@@ -12,7 +12,7 @@ repoprompt-mcp --backend auto
 
 ## Ownership
 
-`RepoPromptDomainRuntime` owns the protocol-neutral MCP host and canonical 27-tool catalog. It owns connection generations, invocation admission, policy/resource lanes, progress, watchdogs, settlement, terminal fencing, response-delivery accounting, and bounded drain. The app's `ServerNetworkManager`, `ServerController`, and `MCPService` are transport, presentation, proxy, reconnect, replay, listener, and approval adapters.
+`RepoPromptDomainRuntime` owns the protocol-neutral MCP host and canonical 28-tool catalog. It owns connection generations, invocation admission, policy/resource lanes, progress, watchdogs, settlement, terminal fencing, response-delivery accounting, and bounded drain. The app's `ServerNetworkManager`, `ServerController`, and `MCPService` are transport, presentation, proxy, reconnect, replay, listener, and approval adapters.
 
 App transport lifetime is process-owned from launch through termination. Opening or closing the last window does not start or stop MCP. Window identity is accepted only as an admission selector: public `window_id` binding captures that window's current logical tab as an explicit authoritative context, while hidden `_windowID` captures the same context for one call. Later active-tab changes do not redirect either admitted call or persistent binding. There is no active-tab execution fallback.
 
@@ -40,7 +40,7 @@ When every `REPOPROMPT_MCP_WORKING_DIRS` entry is an existing Git worktree of ex
 
 - Backend-selection tests own the app default, explicit selection, one-shot auto probing, unavailable-app fallback, parser rejection, and no-protocol-bytes probe contract.
 - Domain host tests own admission/drain/generation/watchdog/delivery invariants.
-- Canonical catalog tests own all 27 fingerprints, single execution envelopes, fail-closed materialization, and headless `bind_context` semantics.
+- Canonical catalog tests own all 28 fingerprints, single execution envelopes, fail-closed materialization, and headless `bind_context` semantics.
 - Routing tests own exact presentation-to-context capture and rejection when no authoritative context exists.
 - Standalone composition tests construct the real runtime without app composition and resolve every canonical tool.
 - Direct process tests launch the built executable with no app, exercise canonical state roots and the advertised policy surface, verify denied mutations do not execute, and validate EOF drain.

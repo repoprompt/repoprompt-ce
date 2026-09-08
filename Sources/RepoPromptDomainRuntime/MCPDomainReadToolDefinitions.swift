@@ -1,7 +1,7 @@
 import Foundation
 
 /// Canonical subset executed by the shared domain read provider.
-/// Schema ownership remains in `MCPDomainCanonicalToolDefinitions` for all 27 tools.
+/// Schema ownership remains in `MCPDomainCanonicalToolDefinitions` for all 28 tools.
 package enum MCPDomainReadToolDefinitions {
     package static let toolNames: [String] = [
         MCPWindowToolName.getCodeStructure,

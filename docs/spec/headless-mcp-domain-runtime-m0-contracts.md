@@ -9,7 +9,7 @@ Machine-readable authority: `Scripts/Fixtures/headless_mcp_domain_runtime_m0_con
 
 This is Milestone 0 of the eight-PR headless runtime plan. It records current authorities, closes bounded evidence questions, and establishes drift guards. It deliberately does **not** add a runtime target, move providers, define a production `DomainRunLaunchToken`, change persistence, or launch a child process.
 
-The normalized catalog fixture contains all 27 public tools. Fifteen tools expose 86 schema-discriminated actions; the other 12 tools are actionless and instead freeze their top-level required properties. M0 does **not** claim that every action was invoked or that a universal success/error envelope exists.
+The normalized catalog fixture contains all 28 public tools. Sixteen tools expose 94 schema-discriminated actions; the other 12 tools are actionless and instead freeze their top-level required properties. M0 does **not** claim that every action was invoked or that a universal success/error envelope exists.
 
 Missing-discriminator behavior is frozen per action-bearing tool from implementation source:
 
@@ -19,7 +19,7 @@ Missing-discriminator behavior is frozen per action-bearing tool from implementa
 
 Each row carries a source path, behavior marker, and typed-error marker checked by XCTest; default markers must contain the frozen default value. M0 does not infer mutation ordering beyond what these source branches state. Exact per-action result and JSON-RPC envelope parity is explicitly unmeasured in M0 and must be covered by executable migration fixtures when a tool family moves.
 
-`ToolCatalogSnapshotTests` remains the detailed description/schema-hash golden for the 24 window tools. The M0 manifest adds the three global tools, action coverage, policy normalization, and dependency accounting rather than creating a second schema-hash authority.
+`ToolCatalogSnapshotTests` remains the detailed description/schema-hash golden for the 25 window tools. The M0 manifest adds the three global tools, action coverage, policy normalization, and dependency accounting rather than creating a second schema-hash authority.
 
 ## Canonical inventories
 
@@ -52,6 +52,7 @@ Capability names below are from the domain-runtime `MCPDomainToolCatalog`; every
 | `agent_explore` | agent_explore_control | control / lifecycle managed | `MCPAgentControlToolProvider` | manifest + catalog golden | policy/provider errors; session lifecycle | app authoritative / exact later parity |
 | `agent_run` | agent_external_control | control / lifecycle managed | `MCPAgentControlToolProvider` | manifest + catalog golden | policy/provider errors; session lifecycle | app authoritative / exact later parity |
 | `agent_manage` | agent_external_control | control / bounded | `MCPAgentControlToolProvider` | manifest + catalog golden | ownership/invalid session; bounded cleanup | app authoritative / exact later parity |
+| `agent_session_link` | agent_session_link_control | control / lifecycle managed | `MCPAgentControlToolProvider` → `AgentSessionLinkMCPToolService` | manifest + catalog golden | uniform link-denial/invalid params; oversight-link lifecycle | app authoritative / headless fails closed as unavailable |
 | `share_thoughts` | agent_reasoning_control | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | policy/identity errors; request cancellation | app authoritative / exact later parity |
 | `set_status` | status_publication (`agent_session_control` serialized compatibility name) | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden + `list_agents` capability fixture | policy/identity errors; request cancellation | app authoritative / exact later parity |
 | `wait_for_next_user_instruction` | agent_reasoning_control | control / interactive | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | terminal/cancel; interactive lifecycle | app authoritative / exact later parity |

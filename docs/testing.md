@@ -40,6 +40,8 @@ make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTes
 make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTests/testBehavior
 ```
 
+`FILTER` matches suite and method names, never file names. A test file commonly holds several suites named after the contracts they pin, none of them named after the file, so filtering by a filename selects nothing — and a zero-test run exits `0`, reporting `Executed 0 tests, with 0 failures`, which reads as a pass. Check the printed executed count before treating a focused run as evidence; if it is zero, take a real suite name from the file (or `swift test list`) and filter on that.
+
 Use the narrowest relevant filter while iterating. Broaden to the affected target or full suite when the change crosses shared infrastructure, package boundaries, generated surfaces, test harness behavior, or many unrelated suites:
 
 ```bash

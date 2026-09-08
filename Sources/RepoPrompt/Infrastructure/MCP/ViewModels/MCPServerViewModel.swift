@@ -914,6 +914,31 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
+    private var agentSessionLinkToolService: AgentSessionLinkMCPToolService {
+        AgentSessionLinkMCPToolService(
+            toolName: MCPWindowToolName.agentSessionLink,
+            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            requireTargetWindow: { [self] in try requireTargetWindow() },
+            // Exact run-installed/handover/pending-run routing only: the observing endpoint can never
+            // be supplied, hinted, or explicitly bound by the caller.
+            resolveObserverEndpoint: { [self] metadata, targetWindow in
+                await resolveAgentSessionLinkObserverEndpoint(
+                    metadata: metadata,
+                    targetWindow: targetWindow
+                )
+            },
+            withHeartbeat: { [self] connectionID, tool, stage, message, operation in
+                try await withHeartbeat(
+                    connectionID: connectionID,
+                    tool: tool,
+                    stage: stage,
+                    message: message,
+                    operation: operation
+                )
+            }
+        )
+    }
+
     @Published private(set) var isRunning = false // overall status
     @Published private(set) var pendingClientID: String? // approval state
     @Published private(set) var diagnostics: MCPDiagnostics = .init(
@@ -1108,6 +1133,12 @@ final class MCPServerViewModel: ObservableObject {
         executeAgentManage: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing agent_manage") }
             return try await agentManageToolService.execute(args: args)
+        },
+        executeAgentSessionLink: { [weak self] args in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while executing agent_session_link")
+            }
+            return try await agentSessionLinkToolService.execute(args: args)
         },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }

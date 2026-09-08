@@ -60,7 +60,20 @@ final class AgentRunAttemptLifecycle {
     /// Provider process run identity for the active or most recent run.
     private(set) var currentRunID: UUID?
     private(set) var providerTerminalDrainGeneration: UInt64 = 0
-    private(set) var terminalCommitInProgress = false
+    private(set) var terminalCommitInProgress = false {
+        didSet {
+            guard oldValue != terminalCommitInProgress else { return }
+            onTerminalCommitPhaseChange?()
+        }
+    }
+
+    /// Change channel for observers that gate on the terminal-commit phase but cannot see it
+    /// otherwise: this state is owned here and is not `@Published`, so a settling run would look
+    /// idle to a cross-window observer without an explicit notification.
+    ///
+    /// Installed by the owning `TabSession`. It fires only on real transitions, so the phase reset
+    /// inside `beginAttempt` is silent when no commit was in progress.
+    var onTerminalCommitPhaseChange: (() -> Void)?
     private(set) var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
     private(set) var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
     private(set) var terminalResources: AgentRunAttemptTerminalResources?

@@ -5,17 +5,24 @@ package struct MCPDomainClientPolicySnapshot: Equatable, Sendable {
     package let additionalToolNames: Set<String>
     package let role: MCPClientTaskRole
     package let allowsAgentExternalControlTools: Bool
+    /// Whether server-owned routing resolved this connection to an exact endpoint that currently has
+    /// an Agent-session link in either direction. This is intentionally narrower than an additional
+    /// tool grant: only this live authority fact may override profile/role hiding for
+    /// `agent_session_link`, so a policy-supplied grant cannot manufacture the override.
+    package let hasExactAgentSessionLinkGrant: Bool
 
     package init(
         restrictedToolNames: Set<String>,
         additionalToolNames: Set<String>,
         role: MCPClientTaskRole,
-        allowsAgentExternalControlTools: Bool
+        allowsAgentExternalControlTools: Bool,
+        hasExactAgentSessionLinkGrant: Bool = false
     ) {
         self.restrictedToolNames = restrictedToolNames
         self.additionalToolNames = additionalToolNames
         self.role = role
         self.allowsAgentExternalControlTools = allowsAgentExternalControlTools
+        self.hasExactAgentSessionLinkGrant = hasExactAgentSessionLinkGrant
     }
 }
 
@@ -72,6 +79,27 @@ package struct MCPDomainPreAdmissionDecision: Equatable, Sendable {
 }
 
 extension MCPDomainHost {
+    /// The one profile-policy exception backed by live, exact domain authority.
+    ///
+    /// Being the target of an oversight link grants no outbound observer authority, but it does make
+    /// `agent_session_link` reachable for self-scoped and inverse operations. The operation service
+    /// still authorizes those directions independently. No other tool, static additional grant, or
+    /// profile restriction inherits this exception.
+    private static func exactLinkGrantOverridesProfilePolicy(
+        toolName: String,
+        policy: MCPDomainClientPolicySnapshot
+    ) -> Bool {
+        toolName == MCPWindowToolName.agentSessionLink
+            && policy.hasExactAgentSessionLinkGrant
+    }
+
+    /// Capabilities whose role advertisement policy is also enforced at `tools/call` admission.
+    package static let executionRoleGatedCapabilities: Set<MCPToolCapability> = [
+        .agentExploreControl,
+        .agentExternalControl,
+        .agentSessionLinkControl,
+    ]
+
     package func advertisedCatalog(
         _ request: MCPDomainCatalogAdvertisementRequest
     ) async -> MCPDomainCatalogAdvertisementResult {
@@ -93,21 +121,28 @@ extension MCPDomainHost {
                 hidden[toolName] = .disabled
                 continue
             }
-            if request.policy.restrictedToolNames.contains(toolName) {
+            let exactLinkOverride = Self.exactLinkGrantOverridesProfilePolicy(
+                toolName: toolName,
+                policy: request.policy
+            )
+            if request.policy.restrictedToolNames.contains(toolName), !exactLinkOverride {
                 hidden[toolName] = .restricted
                 continue
             }
             if MCPClientToolPolicyCatalog.policyGatedToolNames.contains(toolName),
-               !request.policy.additionalToolNames.contains(toolName)
+               !request.policy.additionalToolNames.contains(toolName),
+               !exactLinkOverride
             {
                 hidden[toolName] = .missingAdditionalToolGrant
                 continue
             }
-            if !MCPClientToolPolicyCatalog.shouldAdvertise(
-                toolName: toolName,
-                role: request.policy.role,
-                allowsAgentExternalControlTools: request.policy.allowsAgentExternalControlTools
-            ) {
+            if !exactLinkOverride,
+               !MCPClientToolPolicyCatalog.shouldAdvertise(
+                   toolName: toolName,
+                   role: request.policy.role,
+                   allowsAgentExternalControlTools: request.policy.allowsAgentExternalControlTools
+               )
+            {
                 hidden[toolName] = .roleAdvertisementPolicy
                 continue
             }
@@ -125,7 +160,8 @@ extension MCPDomainHost {
         policy: MCPDomainClientPolicySnapshot
     ) throws {
         if MCPClientToolPolicyCatalog.policyGatedToolNames.contains(toolName),
-           !policy.additionalToolNames.contains(toolName)
+           !policy.additionalToolNames.contains(toolName),
+           !Self.exactLinkGrantOverridesProfilePolicy(toolName: toolName, policy: policy)
         {
             throw MCPDomainCallPolicyDenial.missingAdditionalGrant(toolName: toolName)
         }
@@ -138,10 +174,21 @@ extension MCPDomainHost {
         guard MCPDomainToolCatalog.entry(named: toolName) != nil else {
             throw MCPDomainCallPolicyDenial.unknownTool(toolName: toolName)
         }
-        if policy.restrictedToolNames.contains(toolName) {
+        let exactLinkOverride = Self.exactLinkGrantOverridesProfilePolicy(
+            toolName: toolName,
+            policy: policy
+        )
+        if policy.restrictedToolNames.contains(toolName), !exactLinkOverride {
             throw MCPDomainCallPolicyDenial.restricted(toolName: toolName)
         }
-        if MCPDomainToolCatalog.capabilities(for: toolName).contains(.agentExploreControl),
+        // Advertisement is never authority: a hidden tool stays callable by name unless execution
+        // mirrors the role filter. Both agent-control capability families are gated here so a
+        // non-orchestrator agent cannot reach `agent_run` / `agent_manage` simply by naming them.
+        // The exact-link exception above affects only agent_session_link reachability; its service
+        // continues to enforce outbound versus inverse operation authority on every call.
+        let capabilities = MCPDomainToolCatalog.capabilities(for: toolName)
+        if !exactLinkOverride,
+           !capabilities.isDisjoint(with: Self.executionRoleGatedCapabilities),
            !MCPClientToolPolicyCatalog.shouldAdvertise(
                toolName: toolName,
                role: policy.role,

@@ -903,9 +903,15 @@ struct AgentRunMCPToolService {
 
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
-        let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
-        let timeoutSeconds = try forcePoll ? 0 : Self.resolvedWaitTimeoutSeconds(args["timeout"])
         let metadata = await captureRequestMetadata()
+        let sessionID = try await resolveControlSessionID(
+            args,
+            operation: forcePoll ? .runPoll : .runWait,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            metadata: metadata
+        )
+        let timeoutSeconds = try forcePoll ? 0 : Self.resolvedWaitTimeoutSeconds(args["timeout"])
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         if initialSnapshot.isActionableForMCPWait || timeoutSeconds <= 0 {
             return decoratedRunValue(snapshot: initialSnapshot)
@@ -926,6 +932,16 @@ struct AgentRunMCPToolService {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        let metadata = await captureRequestMetadata()
+        // All-or-nothing: authorize every requested target before returning any snapshot.
+        try await authorizeControlTargets(
+            operation: .runWait,
+            sessionIDs: sessionIDs,
+            reference: nil,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            metadata: metadata
+        )
 
         // Single-element waits should preserve the existing single-session response shape.
         if sessionIDs.count == 1 {
@@ -936,7 +952,6 @@ struct AgentRunMCPToolService {
         }
 
         let timeoutSeconds = try Self.resolvedWaitTimeoutSeconds(args["timeout"])
-        let metadata = await captureRequestMetadata()
         let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
 
         if let ready = initialSnapshots.first(where: { isInterestingSnapshot($0) }) {
@@ -1019,6 +1034,16 @@ struct AgentRunMCPToolService {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        let metadata = await captureRequestMetadata()
+        // All-or-nothing: authorize every requested target before returning any snapshot.
+        try await authorizeControlTargets(
+            operation: .runPoll,
+            sessionIDs: sessionIDs,
+            reference: nil,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            metadata: metadata
+        )
         let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
         return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots)
     }
@@ -1026,7 +1051,14 @@ struct AgentRunMCPToolService {
     private func executeCancel(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
-        let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        let metadata = await captureRequestMetadata()
+        let sessionID = try await resolveControlSessionID(
+            args,
+            operation: .runCancel,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            metadata: metadata
+        )
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         if initialSnapshot.status == .expired {
             throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
@@ -1039,7 +1071,6 @@ struct AgentRunMCPToolService {
         else {
             throw MCPError.invalidParams("The run is not currently active and cannot be cancelled.")
         }
-        let metadata = await captureRequestMetadata()
         let cancelsStartupPendingRun = !session.runState.isActive && session.mcpFollowUpRunPending
         let tabID = session.tabID
         let cancelResult = try await withHeartbeat(
@@ -1065,10 +1096,16 @@ struct AgentRunMCPToolService {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let expectedWorkspaceID = targetWindow.workspaceManager.activeWorkspaceID
-        let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        let metadata = await captureRequestMetadata()
+        let sessionID = try await resolveControlSessionID(
+            args,
+            operation: .runSteer,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            metadata: metadata
+        )
         let text = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
-        let metadata = await captureRequestMetadata()
         let resolution = try await ensureSteerControlContext(
             sessionID: sessionID,
             targetWindow: targetWindow,
@@ -1337,7 +1374,17 @@ struct AgentRunMCPToolService {
     private func executeRespond(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
-        let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        // `respond` answers a pending interaction, so it must prove caller authority like every other
+        // target-bearing operation. Without this an agent could answer its own `ask_user` prompt by
+        // issuing a parallel tool call against its own session ID.
+        let metadata = await captureRequestMetadata()
+        let sessionID = try await resolveControlSessionID(
+            args,
+            operation: .runRespond,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            metadata: metadata
+        )
         let interactionID = try requireUUID(args["interaction_id"], name: "interaction_id")
         let workflow = try resolveWorkflow(args: args)
         let payload = try parseResponsePayload(args: args)
@@ -2732,17 +2779,12 @@ struct AgentRunMCPToolService {
         return sessionID
     }
 
+    /// Parses and resolves in one step, which is all `agent_run` ever needs: it has no ledger to
+    /// consult between the two halves, so nothing here may observe them apart.
     private func resolveWorkflow(args: [String: Value]) throws -> AgentWorkflowDefinition? {
-        let workflowID = normalizedString(args["workflow_id"])
-        let workflowName = normalizedString(args["workflow_name"])
-        if workflowID != nil, workflowName != nil {
-            throw MCPError.invalidParams("Specify either workflow_id or workflow_name, not both.")
-        }
-        guard let reference = workflowID ?? workflowName else {
-            return nil
-        }
-        guard let workflow = AgentWorkflowStore.shared.resolveWorkflowReference(reference) else {
-            throw MCPError.invalidParams("Workflow '\(reference)' was not found.")
+        guard let reference = try AgentWorkflowReference.parse(args: args) else { return nil }
+        guard let workflow = reference.resolved() else {
+            throw MCPError.invalidParams(reference.notFoundMessage)
         }
         return workflow
     }
@@ -2975,6 +3017,9 @@ struct AgentRunMCPToolService {
 
     /// Resolves session_id for control operations (poll/wait/cancel/steer/respond).
     /// Accepts both full UUIDs and short IDs for a uniform caller experience.
+    ///
+    /// Resolution is deliberately not authorization: `authorizeControlTargets` runs on every resolved
+    /// target so a disclosed full UUID cannot reach an unrelated session.
     private func resolveControlSessionID(
         reference raw: String,
         targetWindow: WindowState,
@@ -2994,13 +3039,59 @@ struct AgentRunMCPToolService {
 
     private func resolveControlSessionID(
         _ args: [String: Value],
+        operation: DomainAgentSessionTargetOperation,
         targetWindow: WindowState,
-        agentModeVM: AgentModeViewModel
+        agentModeVM: AgentModeViewModel,
+        metadata: RequestMetadata
     ) async throws -> UUID {
         guard let raw = normalizedString(args["session_id"]) else {
             throw MCPError.invalidParams("session_id is required for agent_run control operations.")
         }
-        return try await resolveControlSessionID(reference: raw, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        let sessionID = try await resolveControlSessionID(
+            reference: raw,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM
+        )
+        try await authorizeControlTargets(
+            operation: operation,
+            sessionIDs: [sessionID],
+            reference: raw,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            metadata: metadata
+        )
+        return sessionID
+    }
+
+    /// Common execution-time gate for every target-bearing `agent_run` operation.
+    ///
+    /// An oversight grant is never a valid basis here, so a linked observer cannot bypass sanitized read
+    /// and idle-only send by calling poll/wait/cancel/steer/respond on its overseen target.
+    private func authorizeControlTargets(
+        operation: DomainAgentSessionTargetOperation,
+        sessionIDs: [UUID],
+        reference: String?,
+        targetWindow: WindowState,
+        agentModeVM: AgentModeViewModel,
+        metadata: RequestMetadata
+    ) async throws {
+        let caller = await AgentSessionTargetOperationGuard.resolveCaller(
+            metadata: metadata,
+            targetWindow: targetWindow,
+            resolveSpawnParentSessionID: resolveSpawnParentSessionID
+        )
+        guard caller != .administrativePrincipal else { return }
+        let workspace = targetWindow.workspaceManager.activeWorkspace
+        for sessionID in sessionIDs {
+            try await AgentSessionTargetOperationGuard.require(
+                operation: operation,
+                caller: caller,
+                sessionID: sessionID,
+                reference: sessionIDs.count == 1 ? reference : nil,
+                agentModeVM: agentModeVM,
+                workspace: workspace
+            )
+        }
     }
 
     private func parseSessionIDArray(_ args: [String: Value]) throws -> [String] {

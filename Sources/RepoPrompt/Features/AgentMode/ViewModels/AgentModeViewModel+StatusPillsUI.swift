@@ -13,7 +13,8 @@ extension AgentModeViewModel {
             interviewFirst: interviewFirst,
             executionLocation: executionLocationProps(tabID: currentTabID),
             activeAgentSessionID: activeSession?.activeAgentSessionID,
-            activeRunID: activeSession?.runID
+            activeRunID: activeSession?.runID,
+            monitor: currentMonitorPillProps()
         )
     }
 

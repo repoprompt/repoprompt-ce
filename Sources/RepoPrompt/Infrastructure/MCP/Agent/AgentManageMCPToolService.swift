@@ -90,6 +90,7 @@ struct AgentManageMCPToolService {
 
     private struct HandoffSessionInfo {
         let sessionID: UUID
+        let parentSessionID: UUID?
         let name: String
         let transcript: AgentTranscript
         let sourceTabID: UUID?
@@ -107,6 +108,75 @@ struct AgentManageMCPToolService {
         let isMCPOriginated: Bool
         let runStateRaw: String?
         let isEffectivelyActive: Bool
+    }
+
+    /// Common execution-time gate for every target-bearing `agent_manage` operation.
+    ///
+    /// Non-Agent administrative callers retain their existing explicitly routed authority; an
+    /// Agent-origin caller may only reach a session it directly spawned. An oversight grant is never a
+    /// valid basis here.
+    private func operationCaller(
+        metadata: RequestMetadata,
+        targetWindow: WindowState
+    ) async -> DomainAgentSessionCallerIdentity {
+        await AgentSessionTargetOperationGuard.resolveCaller(
+            metadata: metadata,
+            targetWindow: targetWindow,
+            resolveSpawnParentSessionID: resolveSpawnParentSessionID
+        )
+    }
+
+    /// Authorizes one caller-supplied session reference **before** any target-side work happens.
+    ///
+    /// Resolution here is deliberately minimal. `agent_manage` references are canonical UUIDs, so the
+    /// canonical session ID is simply the parsed reference, and provenance comes from already-loaded
+    /// live state, the workspace session index, or the persisted *metadata* record. None of those
+    /// hydrates a session or reads a transcript, so a caller that is about to be denied never causes
+    /// the target to load and never sees a target-specific error.
+    ///
+    /// A non-UUID reference is denied with the identical wording, keeping malformed, nonexistent, and
+    /// unauthorized references indistinguishable.
+    private func authorizeSessionReference(
+        operation: DomainAgentSessionTargetOperation,
+        reference: String,
+        metadata: RequestMetadata,
+        targetWindow: WindowState,
+        agentModeVM: AgentModeViewModel,
+        workspace: WorkspaceModel
+    ) async throws {
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let sessionID = UUID(uuidString: trimmed) else {
+            throw AgentSessionTargetOperationGuard.denialError(reference: reference)
+        }
+        try await AgentSessionTargetOperationGuard.require(
+            operation: operation,
+            caller: operationCaller(metadata: metadata, targetWindow: targetWindow),
+            sessionID: sessionID,
+            reference: reference,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
+    }
+
+    /// Cleanup resolves target provenance through the same injected persistence seam the mutation
+    /// path uses, so authorization and deletion agree on what each requested UUID is.
+    private func cleanupProvenance(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        workspace: WorkspaceModel
+    ) async -> DomainAgentSessionTargetProvenance {
+        if let liveSession = try? agentModeVM.authoritativeLiveSession(for: sessionID),
+           liveSession.hasLoadedPersistedState
+        {
+            return .known(targetSessionID: sessionID, parentSessionID: liveSession.parentSessionID)
+        }
+        if let entry = agentModeVM.sessionIndex[sessionID] {
+            return .known(targetSessionID: sessionID, parentSessionID: entry.parentSessionID)
+        }
+        if let meta = try? await cleanupDependencies.loadPersistedMetadata(sessionID, workspace) {
+            return .known(targetSessionID: sessionID, parentSessionID: meta.parentSessionID)
+        }
+        return .unknown(targetSessionID: sessionID)
     }
 
     func execute(args: [String: Value]) async throws -> Value {
@@ -236,7 +306,9 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("No active workspace available for agent_manage.list_sessions.")
         }
         let agentModeVM = targetWindow.agentModeViewModel
-        let scopedParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
+        let discoveryScope = await DomainAgentSessionOperationAuthorizer.discoveryScope(
+            for: operationCaller(metadata: metadata, targetWindow: targetWindow)
+        )
         let agentFilter = normalizedString(args["agent"])?.lowercased()
         let stateFilter = normalizedString(args["state"])
         let limit = max(1, args["limit"]?.intValue ?? 100)
@@ -293,13 +365,19 @@ struct AgentManageMCPToolService {
             )
         }
 
-        // Scope to direct children when called from agent mode
-        let scoped: [[String: Value]] = {
-            guard let parentID = scopedParentSessionID else { return Array(entriesByID.values) }
-            return entriesByID.values.filter { object in
+        // Agent-origin discovery is filtered to the caller's direct children so an unrelated sibling
+        // cannot be enumerated before a target operation is attempted. An Agent Mode run whose
+        // routing did not resolve exactly sees nothing rather than everything.
+        let scoped: [[String: Value]] = switch discoveryScope {
+        case .unrestricted:
+            Array(entriesByID.values)
+        case let .directChildren(parentID):
+            entriesByID.values.filter { object in
                 object["parent_session_id"]?.stringValue == parentID.uuidString
             }
-        }()
+        case .none:
+            []
+        }
 
         let filtered = scoped.filter { object in
             let agentObject = object["agent"]?.objectValue
@@ -326,6 +404,7 @@ struct AgentManageMCPToolService {
 
     private func executeGetLog(args: [String: Value]) async throws -> Value {
         let sessionReference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.get_log.")
@@ -334,6 +413,17 @@ struct AgentManageMCPToolService {
         let limit = max(1, args["limit"]?.intValue ?? 20)
 
         let agentModeVM = targetWindow.agentModeViewModel
+        // Authorize *before* touching the target. `resolveTranscript` hydrates a live session or
+        // loads its full persisted transcript, so running it first performs target-side work — and
+        // surfaces target-specific errors — on behalf of a caller that may be about to be denied.
+        try await authorizeSessionReference(
+            operation: .manageGetLog,
+            reference: sessionReference,
+            metadata: metadata,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
         let transcriptInfo = try await resolveTranscript(
             reference: sessionReference,
             workspace: workspace,
@@ -366,6 +456,7 @@ struct AgentManageMCPToolService {
 
     private func executeExtractHandoff(args: [String: Value]) async throws -> Value {
         let sessionReference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.extract_handoff.")
@@ -387,14 +478,14 @@ struct AgentManageMCPToolService {
             name: "overwrite",
             defaultValue: true
         )
-        let maxTranscriptItems = try clampedInt(
+        let maxTranscriptItems = try Self.clampedInt(
             args["max_transcript_items"],
             name: "max_transcript_items",
             defaultValue: 200,
             minValue: 1,
             maxValue: 1000
         )
-        let maxToolArgsCharacters = try clampedInt(
+        let maxToolArgsCharacters = try Self.clampedInt(
             args["max_tool_args_characters"],
             name: "max_tool_args_characters",
             defaultValue: 2000,
@@ -412,6 +503,16 @@ struct AgentManageMCPToolService {
         }
 
         let agentModeVM = targetWindow.agentModeViewModel
+        // Authorize *before* touching the target, for the same reason as `get_log`:
+        // `resolveHandoffSession` hydrates a live session or loads its full persisted transcript.
+        try await authorizeSessionReference(
+            operation: .manageExtractHandoff,
+            reference: sessionReference,
+            metadata: metadata,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
         let sessionInfo = try await resolveHandoffSession(
             reference: sessionReference,
             workspace: workspace,
@@ -607,6 +708,14 @@ struct AgentManageMCPToolService {
         guard let sessionID = try await agentModeVM.mcpResolveSessionID(reference: sessionReference, workspace: workspace) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
         }
+        try await AgentSessionTargetOperationGuard.require(
+            operation: .manageResume,
+            caller: operationCaller(metadata: metadata, targetWindow: targetWindow),
+            sessionID: sessionID,
+            reference: sessionReference,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
@@ -752,6 +861,7 @@ struct AgentManageMCPToolService {
     }
 
     private func executeStopSession(args: [String: Value]) async throws -> Value {
+        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.stop_session.")
@@ -761,6 +871,14 @@ struct AgentManageMCPToolService {
         guard let sessionID = try await agentModeVM.mcpResolveSessionID(reference: sessionReference, workspace: workspace) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
         }
+        try await AgentSessionTargetOperationGuard.require(
+            operation: .manageStop,
+            caller: operationCaller(metadata: metadata, targetWindow: targetWindow),
+            sessionID: sessionID,
+            reference: sessionReference,
+            agentModeVM: agentModeVM,
+            workspace: workspace
+        )
 
         guard let session = try agentModeVM.mcpSettledLiveSessionForStop(sessionID: sessionID) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' is not currently live and cannot be stopped.")
@@ -788,6 +906,7 @@ struct AgentManageMCPToolService {
     }
 
     private func executeCleanupSessions(args: [String: Value]) async throws -> Value {
+        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.cleanup_sessions.")
@@ -825,6 +944,24 @@ struct AgentManageMCPToolService {
             }
             firstIndexBySessionID[sessionID] = index
             requestedIDs.append(sessionID)
+        }
+
+        // Collection operations authorize every target before any mutation or data return, so a
+        // partially applied cleanup can never leak that one of the requested UUIDs exists.
+        let cleanupCaller = await operationCaller(metadata: metadata, targetWindow: targetWindow)
+        if cleanupCaller != .administrativePrincipal {
+            for sessionID in requestedIDs {
+                try await AgentSessionTargetOperationGuard.require(
+                    operation: .manageCleanup,
+                    caller: cleanupCaller,
+                    provenance: cleanupProvenance(
+                        sessionID: sessionID,
+                        agentModeVM: agentModeVM,
+                        workspace: workspace
+                    ),
+                    reference: sessionID.uuidString
+                )
+            }
         }
 
         #if DEBUG
@@ -972,6 +1109,11 @@ struct AgentManageMCPToolService {
             var mutationStarted = false
             var durableDeletionCommitted = false
             var providerCleanupOutcome: ProviderConversationCleanupOutcome?
+            // The production deletion paths already report through `AgentSessionDataService`, but
+            // this service's dependencies are injectable, so it brackets its own boundary too. Both
+            // phases are idempotent, and a duplicate commit cannot downgrade an existing tombstone.
+            let deletionAttempt = await AgentSessionDurableDeletionReporter
+                .beginDurableDeletion(sessionID: sessionID)
             do {
                 let openTabID = candidate.tabID.flatMap { tabID -> UUID? in
                     guard targetWindow.workspaceManager.activeWorkspace?.id == workspace.id,
@@ -998,6 +1140,7 @@ struct AgentManageMCPToolService {
                         workspace
                     )
                     durableDeletionCommitted = true
+                    await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(deletionAttempt)
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.deleteOpen",
@@ -1021,6 +1164,7 @@ struct AgentManageMCPToolService {
                     mutationStarted = true
                     try await cleanupDependencies.deletePersistedSession(sessionID, workspace)
                     durableDeletionCommitted = true
+                    await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(deletionAttempt)
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.deletePersisted",
@@ -1089,6 +1233,9 @@ struct AgentManageMCPToolService {
                 }
             } catch is CancellationError {
                 wasCancelled = true
+                if !durableDeletionCommitted {
+                    await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
+                }
                 let remainingIDs = requestedIDs.dropFirst(index + 1)
                 if durableDeletionCommitted {
                     var deletedSession: [String: Value] = [
@@ -1140,6 +1287,9 @@ struct AgentManageMCPToolService {
                 retrySessionIDs.append(contentsOf: remainingIDs)
                 break
             } catch {
+                if !durableDeletionCommitted {
+                    await AgentSessionDurableDeletionReporter.didFailDurableDeletion(deletionAttempt)
+                }
                 if usedOpenTabAuthority {
                     skippedSessions.append([
                         "session_id": .string(sessionID.uuidString),
@@ -1225,7 +1375,7 @@ struct AgentManageMCPToolService {
         reference: String,
         workspace: WorkspaceModel,
         agentModeVM: AgentModeViewModel
-    ) async throws -> (sessionID: UUID, name: String?, transcript: AgentTranscript) {
+    ) async throws -> (sessionID: UUID, parentSessionID: UUID?, name: String?, transcript: AgentTranscript) {
         let normalizedReference = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         let referenceUUID = UUID(uuidString: normalizedReference)
         if let referenceUUID,
@@ -1234,12 +1384,12 @@ struct AgentManageMCPToolService {
         {
             let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
             let liveName = agentModeVM.sessionIndex[sessionID]?.name
-            return (sessionID, liveName, hydrated.transcript)
+            return (sessionID, hydrated.parentSessionID, liveName, hydrated.transcript)
         }
         guard let persisted = try await AgentSessionDataService.shared.loadAgentSession(reference: reference, for: workspace) else {
             throw MCPError.invalidParams("Session '\(reference)' was not found in the active workspace.")
         }
-        return (persisted.id, persisted.name, persisted.transcript ?? .empty)
+        return (persisted.id, persisted.parentSessionID, persisted.name, persisted.transcript ?? .empty)
     }
 
     private func resolveHandoffSession(
@@ -1260,6 +1410,7 @@ struct AgentManageMCPToolService {
                 ?? "Agent Session"
             return HandoffSessionInfo(
                 sessionID: sessionID,
+                parentSessionID: hydrated.parentSessionID,
                 name: liveName,
                 transcript: hydrated.transcript,
                 sourceTabID: hydrated.tabID,
@@ -1295,6 +1446,7 @@ struct AgentManageMCPToolService {
             ?? persisted.name
         return HandoffSessionInfo(
             sessionID: persisted.id,
+            parentSessionID: persisted.parentSessionID,
             name: persisted.name,
             transcript: transcript,
             sourceTabID: nil,
@@ -1427,7 +1579,7 @@ struct AgentManageMCPToolService {
         return parsed
     }
 
-    private func clampedInt(
+    static func clampedInt(
         _ value: Value?,
         name: String,
         defaultValue: Int,
@@ -1435,19 +1587,17 @@ struct AgentManageMCPToolService {
         maxValue: Int
     ) throws -> Int {
         guard let value else { return defaultValue }
-        let parsed: Int?
-        switch value {
+        let parsed: Int? = switch value {
         case let .int(intValue):
-            parsed = intValue
+            intValue
         case let .double(doubleValue):
-            guard doubleValue.isFinite else { parsed = nil
-                break
-            }
-            parsed = Int(doubleValue)
+            // Reached before target authorization, so a bad literal from any caller must clamp
+            // rather than trap: out-of-`Int`-range JSON numerals decode as `.double`.
+            AgentMCPToolHelpers.saturatingInt(fromDouble: doubleValue)
         case let .string(stringValue):
-            parsed = Int(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+            Int(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
         default:
-            parsed = nil
+            nil
         }
         guard let parsed else {
             throw MCPError.invalidParams("\(name) must be an integer.")
