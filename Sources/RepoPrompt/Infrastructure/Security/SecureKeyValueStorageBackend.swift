@@ -43,6 +43,51 @@ extension SecureKeyValueStorageBackend {
     }
 }
 
+enum UnavailableSecureKeyValueStorageError: Error, Equatable {
+    case unavailable
+}
+
+/// Fail-closed storage used when an official runtime cannot authenticate its
+/// already-committed credential destination. Unlike the ephemeral debug store,
+/// it rejects writes so a temporary authority failure cannot create a shadow copy.
+final class UnavailableSecureKeyValueStore: SecureKeyValueStorageBackend, @unchecked Sendable {
+    static let shared = UnavailableSecureKeyValueStore()
+
+    let persistsValuesAcrossLaunches = false
+
+    private init() {}
+
+    func save(
+        _ value: String,
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws {
+        throw UnavailableSecureKeyValueStorageError.unavailable
+    }
+
+    func create(
+        _ value: String,
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws {
+        throw UnavailableSecureKeyValueStorageError.unavailable
+    }
+
+    func get(
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws -> String {
+        throw UnavailableSecureKeyValueStorageError.unavailable
+    }
+
+    func delete(
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws {
+        throw UnavailableSecureKeyValueStorageError.unavailable
+    }
+}
+
 struct SecureKeyValueStorageSelection {
     let decision: RuntimeSecureStorageDecision
     let backend: SecureKeyValueStorageBackend

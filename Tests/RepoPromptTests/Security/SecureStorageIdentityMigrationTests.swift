@@ -223,7 +223,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertTrue(source.calls.isEmpty)
     }
 
-    func testResolverRejectsCommittedBridgeWithUnreadableAccountProjection() throws {
+    func testResolverAuthenticatesCommittedDestinationWithoutReadingHistoricalAccounts() throws {
         let manifest = makeManifest(status: .committed)
         let encoded = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest))
         let bridge = MigrationTestBackend(values: [
@@ -237,11 +237,13 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
             bridgeStoreFactory: { _ in bridge }
         )
 
-        XCTAssertThrowsError(try resolver.resolve()) { error in
-            guard case KeychainService.KeychainError.authenticationFailed = error else {
-                return XCTFail("Expected authenticationFailed, got \(error)")
-            }
-        }
+        let resolution = try XCTUnwrap(resolver.resolve())
+
+        XCTAssertTrue(resolution.store === bridge)
+        XCTAssertEqual(
+            bridge.calls.map(\.key),
+            [SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount]
+        )
     }
 
     func testCommittedProjectionReportsVerifiedRecordsForPresentValues() throws {
@@ -420,6 +422,103 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         }
     }
 
+    func testCommittedStartupPrecedesDivergentLiveCatalogAndPreparerInputs() {
+        let migrationAccounts = SecureStorageAccountCatalog.identityMigrationV2Accounts
+        let runtimeAccounts = SecureStorageAccountCatalog.allAccounts
+        XCTAssertEqual(migrationAccounts.count, 24)
+        XCTAssertEqual(runtimeAccounts.count, 25)
+        XCTAssertFalse(migrationAccounts.contains(.agentPermissionAntigravityDocument))
+        XCTAssertTrue(runtimeAccounts.contains(.agentPermissionAntigravityDocument))
+        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog())
+
+        let manifest = SecureStorageIdentityMigrationManifest(
+            version: SecureStorageIdentityMigrationManifest.currentVersion,
+            status: .committed,
+            attemptIdentifier: firstAttemptIdentifier,
+            catalogIdentifiers: migrationAccounts.map(\.identifier).sorted()
+        )
+        var committedActivationCalls = 0
+        var preparerAnchorCalls = 0
+        var legacySourceCalls = 0
+
+        let outcome = SecureStorageIdentityMigrationBootstrap.committedStartupOutcome(
+            loadManifest: { manifest },
+            activate: { loadedManifest in
+                committedActivationCalls += 1
+                XCTAssertEqual(loadedManifest, manifest)
+            }
+        )
+        switch outcome {
+        case .absent, .preparing:
+            preparerAnchorCalls += 1
+            legacySourceCalls += 1
+        case .activated:
+            break
+        case let .blocked(error):
+            XCTFail("Expected committed activation, got \(error)")
+        }
+
+        XCTAssertEqual(committedActivationCalls, 1)
+        XCTAssertEqual(preparerAnchorCalls, 0)
+        XCTAssertEqual(legacySourceCalls, 0)
+    }
+
+    func testCommittedStartupFailureDoesNotEnterPreparation() {
+        let manifest = makeManifest(status: .committed)
+        var preparationCalls = 0
+
+        let outcome = SecureStorageIdentityMigrationBootstrap.committedStartupOutcome(
+            loadManifest: { manifest },
+            activate: { _ in throw TestStateError.failed }
+        )
+        switch outcome {
+        case .absent, .preparing:
+            preparationCalls += 1
+        case .blocked:
+            break
+        case .activated:
+            XCTFail("Expected committed activation to fail closed")
+        }
+
+        XCTAssertEqual(preparationCalls, 0)
+    }
+
+    func testFreshAndPreparingUsersStillEnterPreparationPath() {
+        for manifest in [nil, makeManifest(status: .preparing)] {
+            var preparationCalls = 0
+            let outcome = SecureStorageIdentityMigrationBootstrap.committedStartupOutcome(
+                loadManifest: { manifest },
+                activate: { _ in XCTFail("Non-committed state must not activate") }
+            )
+            switch outcome {
+            case .absent, .preparing:
+                preparationCalls += 1
+            case .activated, .blocked:
+                XCTFail("Expected preparation eligibility")
+            }
+            XCTAssertEqual(preparationCalls, 1)
+        }
+    }
+
+    func testUnavailableBackendRejectsReadsAndWrites() {
+        let backend = UnavailableSecureKeyValueStore.shared
+        let accessMode = KeychainAccessMode.nonInteractive(reason: .test)
+
+        XCTAssertFalse(backend.persistsValuesAcrossLaunches)
+        XCTAssertThrowsError(try backend.get(for: "key", accessMode: accessMode)) {
+            XCTAssertEqual($0 as? UnavailableSecureKeyValueStorageError, .unavailable)
+        }
+        XCTAssertThrowsError(try backend.save("value", for: "key", accessMode: accessMode)) {
+            XCTAssertEqual($0 as? UnavailableSecureKeyValueStorageError, .unavailable)
+        }
+        XCTAssertThrowsError(try backend.create("value", for: "key", accessMode: accessMode)) {
+            XCTAssertEqual($0 as? UnavailableSecureKeyValueStorageError, .unavailable)
+        }
+        XCTAssertThrowsError(try backend.delete(for: "key", accessMode: accessMode)) {
+            XCTAssertEqual($0 as? UnavailableSecureKeyValueStorageError, .unavailable)
+        }
+    }
+
     func testCommittedBridgeRemainsAuthorityWhenRuntimeCatalogAddsAccount() throws {
         let frozenMigrationAccounts: [SecureStorageAccount] = [.openAIAPI]
         let futureRuntimeAccount = SecureStorageAccount.anthropicAPI
@@ -447,6 +546,26 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
 
         XCTAssertEqual(bridge.value(for: futureRuntimeAccount.identifier), "future-value")
         XCTAssertEqual(resolution.manifest.catalogIdentifiers, [SecureStorageAccount.openAIAPI.identifier])
+    }
+
+    func testPostWriteJournalCommitFailureRequiresUnavailableOfficialStorage() throws {
+        let source = MigrationTestBackend(values: [SecureStorageAccount.openAIAPI.identifier: "secret"])
+        let bridge = MigrationTestBackend()
+        let state = TestIdentityMigrationStateStore(saveErrorAfterMutation: TestStateError.failed)
+
+        let report = makeCoordinator(source: source, bridge: bridge, state: state).prepareBridge()
+
+        XCTAssertFalse(report.bridgeReady)
+        XCTAssertEqual(report.stage, .journalCommit)
+        XCTAssertEqual(state.manifest?.status, .committed)
+        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.requiresUnavailableOfficialStorage(after: report))
+        XCTAssertThrowsError(try UnavailableSecureKeyValueStore.shared.save(
+            "new-secret",
+            for: SecureStorageAccount.openAIAPI.identifier,
+            accessMode: .nonInteractive(reason: .test)
+        )) {
+            XCTAssertEqual($0 as? UnavailableSecureKeyValueStorageError, .unavailable)
+        }
     }
 
     func testPreparingJournalPersistenceFailureLeavesBridgeUntouched() {
@@ -659,17 +778,20 @@ private final class TestIdentityMigrationStateStore: SecureStorageIdentityMigrat
     var loadError: Error?
     var createError: Error?
     var saveFailuresRemaining: Int
+    var saveErrorAfterMutation: Error?
 
     init(
         manifest: SecureStorageIdentityMigrationManifest? = nil,
         loadError: Error? = nil,
         createError: Error? = nil,
-        saveFailuresRemaining: Int = 0
+        saveFailuresRemaining: Int = 0,
+        saveErrorAfterMutation: Error? = nil
     ) {
         self.manifest = manifest
         self.loadError = loadError
         self.createError = createError
         self.saveFailuresRemaining = saveFailuresRemaining
+        self.saveErrorAfterMutation = saveErrorAfterMutation
     }
 
     func load() throws -> SecureStorageIdentityMigrationManifest? {
@@ -698,6 +820,9 @@ private final class TestIdentityMigrationStateStore: SecureStorageIdentityMigrat
         }
         savedManifests.append(manifest)
         self.manifest = manifest
+        if let saveErrorAfterMutation {
+            throw saveErrorAfterMutation
+        }
     }
 
     /// Test-only stand-in for out-of-band journal deletion. Production code has

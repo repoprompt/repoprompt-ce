@@ -54,10 +54,20 @@ struct SystemSettingsView: View {
                         // Status row
                         HStack(spacing: 8) {
                             // Status icon and text
-                            Image(systemName: sparkleManager.updateAvailable ? "arrow.down.circle.fill" : "checkmark.circle.fill")
-                                .foregroundColor(sparkleManager.updateAvailable ? .blue : .green)
+                            Image(
+                                systemName: sparkleManager.updateAvailable
+                                    ? "arrow.down.circle.fill"
+                                    : sparkleManager.appcastCheckState == .succeeded
+                                    ? "checkmark.circle.fill"
+                                    : "arrow.triangle.2.circlepath.circle"
+                            )
+                            .foregroundColor(
+                                sparkleManager.updateAvailable
+                                    ? .blue
+                                    : sparkleManager.appcastCheckState == .succeeded ? .green : .secondary
+                            )
 
-                            Text(sparkleManager.availableUpdate?.availabilityStatus ?? "You have the latest version")
+                            Text(sparkleManager.updateStatusText)
                                 .foregroundColor(sparkleManager.updateAvailable ? .blue : .secondary)
 
                             Spacer()
@@ -68,22 +78,29 @@ struct SystemSettingsView: View {
                                 closeAction?()
                             }
                             .buttonStyle(.bordered)
-                            .disabled(!sparkleManager.canCheckForUpdates)
+                            .disabled(!sparkleManager.canDiscoverUpdates)
                         }
 
-                        if let message = sparkleManager.updatesDisabledMessage {
+                        if let message = sparkleManager.updateWarningMessage {
                             Label(message, systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                         }
 
-                        // Install button (only when update is available)
                         if let availableUpdate = sparkleManager.availableUpdate {
-                            Button(availableUpdate.installButtonTitle) {
-                                sparkleManager.installUpdate()
+                            if sparkleManager.canInstallAvailableUpdate {
+                                Button(availableUpdate.installButtonTitle) {
+                                    sparkleManager.installUpdate()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .padding(.top, 2)
+                            } else if sparkleManager.manualUpdateDownloadURL != nil {
+                                Button(availableUpdate.manualDownloadButtonTitle) {
+                                    sparkleManager.performAvailableUpdateAction()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .padding(.top, 2)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .padding(.top, 2)
                         }
 
                         // Auto-update toggle (separate row for clarity)

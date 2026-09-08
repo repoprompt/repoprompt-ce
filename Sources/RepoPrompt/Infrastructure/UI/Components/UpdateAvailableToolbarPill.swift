@@ -3,7 +3,7 @@ import SwiftUI
 
 private enum UpdateAvailableToolbarSnapshot: Equatable {
     case hidden
-    case available(notice: AvailableUpdateNotice, canCheckForUpdates: Bool)
+    case available(notice: AvailableUpdateNotice, canPerformAction: Bool, manualDownload: Bool)
 }
 
 @MainActor
@@ -15,14 +15,16 @@ private final class UpdateAvailableToolbarStateObserver: ObservableObject {
     init(sparkleManager: SparkleUpdaterManager) {
         snapshot = Self.makeSnapshot(
             availableUpdate: sparkleManager.availableUpdate,
-            canCheckForUpdates: sparkleManager.canCheckForUpdates
+            canCheckForUpdates: sparkleManager.canCheckForUpdates,
+            installationBlockedMessage: sparkleManager.updateInstallationBlockedMessage
         )
 
-        Publishers.CombineLatest(
+        Publishers.CombineLatest3(
             sparkleManager.$availableUpdate.removeDuplicates(),
-            sparkleManager.$canCheckForUpdates.removeDuplicates()
+            sparkleManager.$canCheckForUpdates.removeDuplicates(),
+            sparkleManager.$updateInstallationBlockedMessage.removeDuplicates()
         )
-        .map(Self.makeSnapshot(availableUpdate:canCheckForUpdates:))
+        .map(Self.makeSnapshot(availableUpdate:canCheckForUpdates:installationBlockedMessage:))
         .removeDuplicates()
         .receive(on: RunLoop.main)
         .sink { [weak self] snapshot in
@@ -34,10 +36,19 @@ private final class UpdateAvailableToolbarStateObserver: ObservableObject {
 
     private nonisolated static func makeSnapshot(
         availableUpdate: AvailableUpdateNotice?,
-        canCheckForUpdates: Bool
+        canCheckForUpdates: Bool,
+        installationBlockedMessage: String?
     ) -> UpdateAvailableToolbarSnapshot {
         guard let availableUpdate else { return .hidden }
-        return .available(notice: availableUpdate, canCheckForUpdates: canCheckForUpdates)
+        let manualDownload = installationBlockedMessage != nil
+        let canPerformAction = manualDownload
+            ? SparkleUpdaterManager.updateChannel(forAppcastItemURL: availableUpdate.downloadURL) == availableUpdate.channel
+            : canCheckForUpdates
+        return .available(
+            notice: availableUpdate,
+            canPerformAction: canPerformAction,
+            manualDownload: manualDownload
+        )
     }
 }
 
@@ -56,9 +67,9 @@ struct UpdateAvailableToolbarPill: View {
         switch observer.snapshot {
         case .hidden:
             EmptyView()
-        case let .available(notice, canCheckForUpdates):
+        case let .available(notice, canPerformAction, manualDownload):
             Button {
-                sparkleManager.installUpdate()
+                sparkleManager.performAvailableUpdateAction()
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.down.circle.fill")
@@ -78,13 +89,18 @@ struct UpdateAvailableToolbarPill: View {
             }
             .buttonStyle(.plain)
             .padding(.trailing, 8)
-            .disabled(!canCheckForUpdates)
-            .hoverTooltip(canCheckForUpdates ? notice.availableTooltip : notice.notReadyTooltip, .bottom)
+            .disabled(!canPerformAction)
+            .hoverTooltip(
+                canPerformAction
+                    ? manualDownload ? "Open the trusted-channel update download in your browser" : notice.availableTooltip
+                    : notice.notReadyTooltip,
+                .bottom
+            )
             .accessibilityLabel(notice.accessibilityLabel)
             .accessibilityHint(
-                canCheckForUpdates ?
-                    notice.accessibilityHint :
-                    "Sparkle is not ready to check for updates yet."
+                canPerformAction
+                    ? manualDownload ? "Opens the trusted-channel update download in your browser." : notice.accessibilityHint
+                    : "The update action is not available yet."
             )
         }
     }

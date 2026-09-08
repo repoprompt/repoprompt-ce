@@ -68,15 +68,15 @@ struct SecureStorageIdentityMigrationReport: Equatable {
         guard !bridgeReady else { return nil }
         let states = records.map(\.state) + [blockingState].compactMap(\.self)
         if states.contains(.userInteractionCancelled) {
-            return "Updates are paused because Keychain access was cancelled. Quit and reopen RepoPrompt CE to retry, then approve Keychain access if prompted. Your existing credentials were not deleted."
+            return "Update installation is paused because Keychain access was cancelled. Quit and reopen RepoPrompt CE to retry, then approve Keychain access if prompted. Your existing credentials were not deleted."
         }
         if states.contains(.authenticationFailed) {
-            return "Updates are paused because Keychain authentication failed. Unlock your login Keychain, then quit and reopen RepoPrompt CE to retry. Your existing credentials were not deleted."
+            return "Update installation is paused because Keychain authentication failed. Unlock your login Keychain, then quit and reopen RepoPrompt CE to retry. Your existing credentials were not deleted."
         }
         if states.contains(.interactionRequired) {
-            return "Updates are paused because the login Keychain is locked or unavailable. Unlock it, then quit and reopen RepoPrompt CE to retry. Your existing credentials were not deleted."
+            return "Update installation is paused because the login Keychain is locked or unavailable. Unlock it, then quit and reopen RepoPrompt CE to retry. Your existing credentials were not deleted."
         }
-        return "Updates are paused because secure credential migration could not be verified. Quit and reopen RepoPrompt CE to retry. Your existing credentials were not deleted."
+        return "Update installation is paused because secure credential migration could not be verified. Quit and reopen RepoPrompt CE to retry. Your existing credentials were not deleted."
     }
 }
 
@@ -566,25 +566,16 @@ enum SecureStorageIdentityMigrationActivationError: Error {
     case invalidBridgeManifest
 }
 
-/// Shared verification of a committed bridge's full projection under the frozen
-/// version-2 manifest contract, expressed in the existing record states:
-/// - the journal manifest must be committed and must cover exactly the expected
-///   account catalog;
-/// - the bridge-manifest item must equal the committed journal encoding
-///   byte-for-byte -- any other present value (a mismatched attempt or a planted
-///   preparing manifest) is rejected as an invalid bridge manifest;
-/// - every cataloged account resolves to an explicit record state: a readable
-///   value is `.verified` (readability is the strongest value contract the frozen
-///   digest-free schema allows), a missing item is `.absent`, and any other read
-///   failure propagates so callers surface its specific blocked reason instead of
-///   silently accepting an unreadable projection.
-enum SecureStorageIdentityMigrationCommittedProjection {
+/// Authenticates the durable destination proof for a completed migration.
+/// The journal and bridge manifest are the authority for the frozen migration
+/// epoch; ordinary startup does not re-read every historical credential.
+enum SecureStorageIdentityMigrationCommittedDestination {
     static func verify(
         manifest: SecureStorageIdentityMigrationManifest,
         accounts: [SecureStorageAccount],
         bridgeStore: SecureKeyValueStorageBackend,
         accessMode: KeychainAccessMode
-    ) throws -> [SecureStorageIdentityMigrationRecord] {
+    ) throws {
         guard manifest.status == .committed,
               manifest.catalogIdentifiers == accounts.map(\.identifier).sorted(),
               let encoded = SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest)
@@ -597,6 +588,25 @@ enum SecureStorageIdentityMigrationCommittedProjection {
         ) == encoded else {
             throw SecureStorageIdentityMigrationActivationError.invalidBridgeManifest
         }
+    }
+}
+
+/// Full projection verification remains part of preparation/commit validation.
+/// Normal committed opening uses only `SecureStorageIdentityMigrationCommittedDestination`;
+/// individual bridge operations continue to validate each existing item's ACL.
+enum SecureStorageIdentityMigrationCommittedProjection {
+    static func verify(
+        manifest: SecureStorageIdentityMigrationManifest,
+        accounts: [SecureStorageAccount],
+        bridgeStore: SecureKeyValueStorageBackend,
+        accessMode: KeychainAccessMode
+    ) throws -> [SecureStorageIdentityMigrationRecord] {
+        try SecureStorageIdentityMigrationCommittedDestination.verify(
+            manifest: manifest,
+            accounts: accounts,
+            bridgeStore: bridgeStore,
+            accessMode: accessMode
+        )
         return try accounts.map { account in
             do {
                 _ = try bridgeStore.get(for: account.identifier, accessMode: accessMode)
@@ -624,6 +634,12 @@ struct SecureStorageIdentityMigrationCommittedBridgeResolver {
 
     func resolve() throws -> SecureStorageIdentityMigrationCommittedBridge? {
         guard let manifest = try stateStore.load() else { return nil }
+        return try resolve(manifest: manifest)
+    }
+
+    func resolve(
+        manifest: SecureStorageIdentityMigrationManifest
+    ) throws -> SecureStorageIdentityMigrationCommittedBridge {
         guard manifest.status == .committed,
               SecureStorageIdentityMigrationCoordinator.isStructurallyValid(
                   manifest,
@@ -634,7 +650,7 @@ struct SecureStorageIdentityMigrationCommittedBridgeResolver {
         }
 
         let bridgeStore = try bridgeStoreFactory(manifest.attemptIdentifier)
-        _ = try SecureStorageIdentityMigrationCommittedProjection.verify(
+        try SecureStorageIdentityMigrationCommittedDestination.verify(
             manifest: manifest,
             accounts: accounts,
             bridgeStore: bridgeStore,
@@ -666,6 +682,13 @@ final class IdentityMigrationRuntimeState: @unchecked Sendable {
     }
 }
 
+enum SecureStorageIdentityMigrationCommittedStartupOutcome {
+    case absent
+    case preparing
+    case activated
+    case blocked(Error)
+}
+
 enum SecureStorageIdentityMigrationBootstrap {
     static let phaseInfoKey = "RepoPromptIdentityMigrationPhase"
     static let anchorRelativePathInfoKey = "RepoPromptIdentityMigrationAnchorRelativePath"
@@ -676,11 +699,11 @@ enum SecureStorageIdentityMigrationBootstrap {
     }
 
     static let unrecognizedConfigurationMessage =
-        "Updates are paused because this build has an unrecognized secure credential migration configuration."
+        "Update installation is paused because this build has an unrecognized secure credential migration configuration."
     static let successorUnsupportedPhaseMessage =
-        "Updates are paused because this build has an unsupported secure credential migration configuration."
+        "Update installation is paused because this build has an unsupported secure credential migration configuration."
     static let successorMissingBridgeMessage =
-        "Updates are paused because this Mac's credentials have not finished migrating from the previous RepoPrompt CE version. Open the previous RepoPrompt CE version to complete credential migration, then relaunch this app. Your existing credentials were not deleted."
+        "Update installation is paused because this Mac's credentials have not finished migrating from the previous RepoPrompt CE version. Open the previous RepoPrompt CE version to complete credential migration, then relaunch this app. Your existing credentials were not deleted."
 
     /// Pure phase gate for a successor-identity launch. Returns nil when bridge
     /// activation may proceed, or the stable blocked guidance otherwise.
@@ -710,15 +733,31 @@ enum SecureStorageIdentityMigrationBootstrap {
     static func prepareIfConfigured(bundle: Bundle = .main) {
         IdentityMigrationRuntimeState.shared.setBlockedMessage(nil)
         let domain = SecureKeyValueStorageFactory.currentDecision().domain
+        guard domain == .officialDeveloperID || domain == .successorOfficialDeveloperID else {
+            return
+        }
+
+        recordDiagnostic(
+            stage: "bootstrap",
+            outcome: .started,
+            bundle: bundle,
+            domain: domain
+        )
+
+        // A committed migration is a per-user terminal state. Resolve its
+        // authenticated destination before consulting package phase, catalog,
+        // embedded-anchor, or legacy-source preparation inputs.
+        let committedOutcome = activateCommittedBridgeIfPresent(bundle: bundle, domain: domain)
+        switch committedOutcome {
+        case .activated, .blocked:
+            return
+        case .absent, .preparing:
+            break
+        }
+
         let phase = configuredPhase(from: bundle.object(forInfoDictionaryKey: phaseInfoKey))
         switch domain {
         case .officialDeveloperID:
-            recordDiagnostic(
-                stage: "bootstrap",
-                outcome: .started,
-                bundle: bundle,
-                domain: domain
-            )
             guard let phase else {
                 recordDiagnostic(
                     stage: "configuration",
@@ -731,32 +770,45 @@ enum SecureStorageIdentityMigrationBootstrap {
             }
             switch phase {
             case .disabled:
-                activateCommittedBridgeIfPresent(bridgeRequired: false, bundle: bundle)
+                if case .preparing = committedOutcome {
+                    blockUpdates("Update installation is paused because the secure credential migration journal is incomplete.")
+                }
             case .legacyPreparer:
                 prepareLegacyBridge(bundle: bundle)
             }
         case .successorOfficialDeveloperID:
+            let blockedMessage = successorBlockedMessage(forPhase: phase) ?? successorMissingBridgeMessage
             recordDiagnostic(
-                stage: "bootstrap",
-                outcome: .started,
+                stage: "configuration",
+                outcome: .blocked,
                 bundle: bundle,
                 domain: domain
             )
-            if let blockedMessage = successorBlockedMessage(forPhase: phase) {
-                recordDiagnostic(
-                    stage: "configuration",
-                    outcome: .blocked,
-                    bundle: bundle,
-                    domain: domain
-                )
-                blockUpdates(blockedMessage)
-                return
-            }
-            // The successor identity has no legacy storage fallback: without an
-            // authenticated committed bridge it must stay ephemeral and say so.
-            activateCommittedBridgeIfPresent(bridgeRequired: true, bundle: bundle)
+            blockOfficialStorageAndUpdates(blockedMessage)
         case .localSelfSigned, .appleDevelopmentDebug, .ephemeral:
             return
+        }
+    }
+
+    static func requiresUnavailableOfficialStorage(
+        after report: SecureStorageIdentityMigrationReport
+    ) -> Bool {
+        // Journal commit persists before post-write verification. Any error at
+        // this stage is ambiguous: the terminal state may already be durable.
+        report.stage == .journalCommit
+    }
+
+    static func committedStartupOutcome(
+        loadManifest: () throws -> SecureStorageIdentityMigrationManifest?,
+        activate: (SecureStorageIdentityMigrationManifest) throws -> Void
+    ) -> SecureStorageIdentityMigrationCommittedStartupOutcome {
+        do {
+            guard let manifest = try loadManifest() else { return .absent }
+            guard manifest.status == .committed else { return .preparing }
+            try activate(manifest)
+            return .activated
+        } catch {
+            return .blocked(error)
         }
     }
 
@@ -783,7 +835,7 @@ enum SecureStorageIdentityMigrationBootstrap {
                 bundle: bundle,
                 domain: .officialDeveloperID
             )
-            blockUpdates("Updates are paused because the secure credential migration package is incomplete, its account catalog changed, or it has an invalid identity anchor.")
+            blockUpdates("Update installation is paused because the secure credential migration package is incomplete, its account catalog changed, or it has an invalid identity anchor.")
             return
         }
 
@@ -843,7 +895,11 @@ enum SecureStorageIdentityMigrationBootstrap {
             recordStateCounts: report.diagnosticStateCounts
         )
         guard report.bridgeReady else {
-            blockUpdates(report.blockedUpdateMessage)
+            if requiresUnavailableOfficialStorage(after: report) {
+                blockOfficialStorageAndUpdates(report.blockedUpdateMessage)
+            } else {
+                blockUpdates(report.blockedUpdateMessage)
+            }
             return
         }
         let manifest: SecureStorageIdentityMigrationManifest
@@ -857,7 +913,7 @@ enum SecureStorageIdentityMigrationBootstrap {
                     bundle: bundle,
                     domain: .officialDeveloperID
                 )
-                blockUpdates("Updates are paused because the secure credential migration journal is incomplete.")
+                blockOfficialStorageAndUpdates("Update installation is paused because the secure credential migration journal is incomplete.")
                 return
             }
             manifest = loadedManifest
@@ -869,7 +925,7 @@ enum SecureStorageIdentityMigrationBootstrap {
                 domain: .officialDeveloperID,
                 error: error
             )
-            blockUpdates(for: error)
+            blockOfficialStorageAndUpdates(for: error)
             return
         }
 
@@ -894,17 +950,15 @@ enum SecureStorageIdentityMigrationBootstrap {
                 domain: .officialDeveloperID,
                 error: error
             )
-            blockUpdates(for: error)
+            blockOfficialStorageAndUpdates(for: error)
         }
     }
 
+    @discardableResult
     private static func activateCommittedBridgeIfPresent(
-        bridgeRequired: Bool,
-        bundle: Bundle
-    ) {
-        let domain: RuntimeSecureStorageDomain = bridgeRequired
-            ? .successorOfficialDeveloperID
-            : .officialDeveloperID
+        bundle: Bundle,
+        domain: RuntimeSecureStorageDomain
+    ) -> SecureStorageIdentityMigrationCommittedStartupOutcome {
         let accessValidator: ClassicKeychainACLValidator
         do {
             accessValidator = try ClassicKeychainACLValidator(
@@ -921,8 +975,8 @@ enum SecureStorageIdentityMigrationBootstrap {
                 domain: domain,
                 error: error
             )
-            blockUpdates(for: error)
-            return
+            blockOfficialStorageAndUpdates(for: error)
+            return .blocked(error)
         }
         let stateStore = KeychainSecureStorageIdentityMigrationStateStore(
             store: KeychainService(
@@ -930,89 +984,85 @@ enum SecureStorageIdentityMigrationBootstrap {
                 itemAccessValidator: accessValidator
             )
         )
-        let resolution: SecureStorageIdentityMigrationCommittedBridge?
-        do {
-            resolution = try SecureStorageIdentityMigrationCommittedBridgeResolver(
-                accounts: SecureStorageAccountCatalog.identityMigrationV2Accounts,
-                stateStore: stateStore,
-                bridgeStoreFactory: { attemptIdentifier in
-                    guard let serviceName = KeychainService.identityMigrationBridgeServiceName(
-                        for: attemptIdentifier
-                    ) else {
-                        throw SecureStorageIdentityMigrationActivationError.invalidJournal
-                    }
-                    return KeychainService(
-                        serviceName: serviceName,
-                        itemAccessValidator: accessValidator
-                    )
-                }
-            ).resolve()
-        } catch {
-            recordDiagnostic(
-                stage: "committed-bridge-resolve",
-                outcome: .blocked,
-                bundle: bundle,
-                domain: domain,
-                error: error
-            )
-            blockUpdates(for: error)
-            return
-        }
-        guard let resolution else {
-            recordDiagnostic(
-                stage: "committed-bridge-resolve",
-                outcome: bridgeRequired ? .blocked : .skipped,
-                bundle: bundle,
-                domain: domain
-            )
-            if bridgeRequired {
-                blockUpdates(successorMissingBridgeMessage)
+        let outcome = committedStartupOutcome(
+            loadManifest: { try stateStore.load() },
+            activate: { manifest in
+                try activateCommittedBridge(
+                    manifest: manifest,
+                    accessValidator: accessValidator
+                )
             }
-            return
-        }
-        let manifest = resolution.manifest
+        )
 
-        guard let bridgeServiceName = KeychainService.identityMigrationBridgeServiceName(
-            for: manifest.attemptIdentifier
-        ) else {
+        switch outcome {
+        case .absent, .preparing:
             recordDiagnostic(
-                stage: "committed-bridge-service",
-                outcome: .blocked,
+                stage: "committed-bridge-resolve",
+                outcome: .skipped,
                 bundle: bundle,
                 domain: domain
             )
-            blockUpdates("Updates are paused because the secure credential migration journal is incomplete.")
-            return
-        }
-
-        let accessProvider = ExistingKeychainItemAccessAttributeProvider(
-            serviceName: bridgeServiceName,
-            account: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
-            accessValidator: accessValidator
-        )
-        do {
-            let bridge = try bridgeStore(
-                attemptIdentifier: manifest.attemptIdentifier,
-                itemCreationAttributeProvider: accessProvider,
-                itemAccessValidator: accessValidator
-            )
-            SecureKeyValueStorageFactory.installOfficialBackendOverride(bridge)
+        case .activated:
             recordDiagnostic(
                 stage: "committed-bridge-activation",
                 outcome: .succeeded,
                 bundle: bundle,
                 domain: domain
             )
-        } catch {
+        case let .blocked(error):
             recordDiagnostic(
-                stage: "committed-bridge-activation",
+                stage: "committed-bridge-resolve",
                 outcome: .blocked,
                 bundle: bundle,
                 domain: domain,
                 error: error
             )
-            blockUpdates(for: error)
+            blockOfficialStorageAndUpdates(for: error)
         }
+        return outcome
+    }
+
+    private static func activateCommittedBridge(
+        manifest: SecureStorageIdentityMigrationManifest,
+        accessValidator: ClassicKeychainACLValidator
+    ) throws {
+        let resolution = try SecureStorageIdentityMigrationCommittedBridgeResolver(
+            accounts: SecureStorageAccountCatalog.identityMigrationV2Accounts,
+            stateStore: KeychainSecureStorageIdentityMigrationStateStore(
+                store: KeychainService(
+                    serviceName: KeychainService.identityMigrationLegacyStateServiceName,
+                    itemAccessValidator: accessValidator
+                )
+            ),
+            bridgeStoreFactory: { attemptIdentifier in
+                guard let serviceName = KeychainService.identityMigrationBridgeServiceName(
+                    for: attemptIdentifier
+                ) else {
+                    throw SecureStorageIdentityMigrationActivationError.invalidJournal
+                }
+                return KeychainService(
+                    serviceName: serviceName,
+                    itemAccessValidator: accessValidator
+                )
+            }
+        ).resolve(manifest: manifest)
+
+        guard let bridgeServiceName = KeychainService.identityMigrationBridgeServiceName(
+            for: resolution.manifest.attemptIdentifier
+        ) else {
+            throw SecureStorageIdentityMigrationActivationError.invalidJournal
+        }
+        let accessProvider = ExistingKeychainItemAccessAttributeProvider(
+            serviceName: bridgeServiceName,
+            account: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
+            accessValidator: accessValidator
+        )
+        let bridge = try bridgeStore(
+            attemptIdentifier: resolution.manifest.attemptIdentifier,
+            itemCreationAttributeProvider: accessProvider,
+            itemAccessValidator: accessValidator
+        )
+        SecureKeyValueStorageFactory.installOfficialBackendOverride(bridge)
     }
 
     private static func bridgeStore(
@@ -1052,9 +1102,19 @@ enum SecureStorageIdentityMigrationBootstrap {
         return unresolvedCandidate
     }
 
+    private static func blockOfficialStorageAndUpdates(_ message: String?) {
+        SecureKeyValueStorageFactory.installOfficialBackendOverride(UnavailableSecureKeyValueStore.shared)
+        blockUpdates(message)
+    }
+
+    private static func blockOfficialStorageAndUpdates(for error: Error) {
+        SecureKeyValueStorageFactory.installOfficialBackendOverride(UnavailableSecureKeyValueStore.shared)
+        blockUpdates(for: error)
+    }
+
     private static func blockUpdates(_ message: String?) {
         IdentityMigrationRuntimeState.shared.setBlockedMessage(
-            message ?? "Updates are paused because secure credential migration could not be verified."
+            message ?? "Update installation is paused because secure credential migration could not be verified."
         )
     }
 
