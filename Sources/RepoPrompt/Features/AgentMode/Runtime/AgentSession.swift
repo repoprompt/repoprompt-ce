@@ -186,6 +186,10 @@ struct AgentSession: Codable, Identifiable {
     var autoWakeOnOversightUpdates: Bool
     /// Granular target selections preserved even while the master setting is on.
     var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
+    var routineWakeIntervalEnabled: Bool
+    var routineWakeIntervalSeconds: Int
+    var periodicIdleWakeEnabled: Bool
+    var periodicIdleWakeIntervalSeconds: Int
 
     /// Persisted per-turn token usage for non-Codex providers.
     /// Used to rebuild context usage after reopen/resume when tool payloads are pruned.
@@ -248,6 +252,10 @@ struct AgentSession: Codable, Identifiable {
         autoEditEnabled: Bool = true,
         autoWakeOnOversightUpdates: Bool = false,
         agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
+        routineWakeIntervalEnabled: Bool = false,
+        routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds,
+        periodicIdleWakeEnabled: Bool = false,
+        periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
@@ -288,6 +296,10 @@ struct AgentSession: Codable, Identifiable {
         self.autoEditEnabled = autoEditEnabled
         self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
         self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
+        self.routineWakeIntervalEnabled = routineWakeIntervalEnabled
+        self.routineWakeIntervalSeconds = AgentSessionLinkRoutineWakeInterval.normalized(routineWakeIntervalSeconds)
+        self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
+        self.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds)
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
@@ -330,6 +342,10 @@ struct AgentSession: Codable, Identifiable {
         case autoEditEnabled
         case autoWakeOnOversightUpdates
         case agentSessionLinkAutoWakeTargetSessionIDs
+        case routineWakeIntervalEnabled
+        case routineWakeIntervalSeconds
+        case periodicIdleWakeEnabled
+        case periodicIdleWakeIntervalSeconds
         case providerTokenUsageByTurn
         case codexConversationID
         case codexRolloutPath
@@ -385,6 +401,16 @@ struct AgentSession: Codable, Identifiable {
             Set<UUID>.self,
             forKey: .agentSessionLinkAutoWakeTargetSessionIDs
         ) ?? []
+        routineWakeIntervalEnabled = try container.decodeIfPresent(Bool.self, forKey: .routineWakeIntervalEnabled) ?? false
+        routineWakeIntervalSeconds = try AgentSessionLinkRoutineWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .routineWakeIntervalSeconds)
+                ?? AgentSessionLinkRoutineWakeInterval.defaultSeconds
+        )
+        periodicIdleWakeEnabled = try container.decodeIfPresent(Bool.self, forKey: .periodicIdleWakeEnabled) ?? false
+        periodicIdleWakeIntervalSeconds = try AgentSessionLinkPeriodicWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .periodicIdleWakeIntervalSeconds)
+                ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
+        )
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)

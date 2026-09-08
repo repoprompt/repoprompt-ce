@@ -47,6 +47,7 @@ final class CodexIntegratedAgentModeRunner {
             #if DEBUG || EDIT_FLOW_PERF
                 EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable, codexTurnMCPServerEnableState)
             #endif
+            let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
             let execution = await CodexIntegratedRunExecutionAdapter.execute {
                 guard mcpServerReady else {
                     return .failed(message: "MCP catalog registration failed before Agent launch.")
@@ -68,7 +69,7 @@ final class CodexIntegratedAgentModeRunner {
                 return outcome
             }
             let outcome = execution.nativeOutcome
-            hooks.providerInput.recordPendingHandoffSendOutcome(session, outcome.didSend)
+            if !isPeriodic { hooks.providerInput.recordPendingHandoffSendOutcome(session, outcome.didSend) }
             if execution.didStartProviderRun {
                 session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
             } else if createdOwnership, execution.shouldReleaseCreatedOwnership {

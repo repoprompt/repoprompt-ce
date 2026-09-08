@@ -154,7 +154,10 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             notifications.append(notification)
             let stored = fixture.viewModel.monitorPillPropsByEndpoint[fixture.endpoint]
             XCTAssertEqual(stored?.endpoint, fixture.endpoint)
-            XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor, stored)
+            // Queue presentation is derived live; this fixture has no pending updates.
+            var expectedDisplay = stored
+            expectedDisplay?.pendingUpdates = .empty
+            XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor, expectedDisplay)
         }
 
         fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
@@ -167,6 +170,91 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         XCTAssertTrue((notifications.first?.object as? AgentModeViewModel) === fixture.viewModel)
         XCTAssertNil(notifications.first?.userInfo)
         withExtendedLifetime(cancellable) {}
+    }
+
+    func testRoutineIntervalWritesSynchronizeStatusPillsWithoutProjectionRefresh() throws {
+        let fixture = try makeFixture()
+        // Match the cached and live master values; this test changes only the interval.
+        fixture.session.oversight.autoWakeOnUpdates = false
+        fixture.viewModel.agentSessionLinkPublishProjection(
+            props(endpoint: fixture.endpoint, outboundCount: 0),
+            to: fixture.endpoint
+        )
+        XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabID)
+        XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.monitor.routineWakeIntervalEnabled)
+        for (enabled, seconds) in [(true, 3600), (false, 10800)] {
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetRoutineWakeInterval(
+                enabled: enabled,
+                seconds: seconds,
+                for: fixture.endpoint
+            ))
+            let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(displayed.routineWakeIntervalEnabled, enabled)
+            XCTAssertEqual(displayed.routineWakeIntervalSeconds, seconds)
+            XCTAssertFalse(displayed.autoWakeOnUpdatesEnabled)
+        }
+    }
+
+    func testPeriodicIdleWritesSynchronizeStatusPillsWithoutProjectionRefresh() throws {
+        let fixture = try makeFixture()
+        let published = props(endpoint: fixture.endpoint)
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        for (enabled, seconds) in [(true, 7200), (false, 21600)] {
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetPeriodicIdleWake(
+                enabled: enabled,
+                seconds: seconds,
+                for: fixture.endpoint
+            ))
+            fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+            let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(displayed.periodicIdleWakeEnabled, enabled)
+            XCTAssertEqual(displayed.periodicIdleWakeIntervalSeconds, seconds)
+            XCTAssertFalse(displayed.routineWakeIntervalEnabled)
+            XCTAssertEqual(displayed.routineWakeIntervalSeconds, 300)
+        }
+    }
+
+    func testMasterWritesSynchronizeLivePolicyWithoutProjectionRefresh() throws {
+        let fixture = try makeFixture()
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+        XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.monitor.autoWakeOnUpdatesEnabled)
+
+        for enabled in [true, false] {
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
+                enabled,
+                for: fixture.endpoint
+            ))
+            let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(displayed.autoWakeOnUpdatesEnabled, enabled)
+            XCTAssertEqual(try XCTUnwrap(displayed.outbound.first).isAutoWakeEffectivelySelected, enabled)
+            // A late projection cannot overwrite a newer saved preference.
+            fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+            XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor.autoWakeOnUpdatesEnabled, enabled)
+        }
+    }
+
+    func testGranularWritesSynchronizeLivePolicyWithoutProjectionRefresh() throws {
+        let fixture = try makeFixture()
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let published = props(endpoint: fixture.endpoint)
+        let targetSessionID = try XCTUnwrap(published.outbound.first).targetSessionID
+        fixture.viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
+
+        for selection: Set<UUID> in [[targetSessionID], []] {
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeTargetSessionIDs(
+                selection,
+                for: fixture.endpoint
+            ))
+            let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(displayed.autoWakeTargetSessionIDs, selection)
+            XCTAssertFalse(displayed.autoWakeOnUpdatesEnabled)
+            XCTAssertEqual(
+                try XCTUnwrap(displayed.outbound.first).isAutoWakeEffectivelySelected,
+                selection.contains(targetSessionID)
+            )
+        }
     }
 
     func testEqualProjectionReplacementPublishesNothing() throws {

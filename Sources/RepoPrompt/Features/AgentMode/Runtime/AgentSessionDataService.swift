@@ -237,6 +237,10 @@ actor AgentSessionDataService {
         /// carries no key at all, and a non-optional would fail the whole header decode.
         let autoWakeOnOversightUpdates: Bool?
         let agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>?
+        let routineWakeIntervalEnabled: Bool?
+        let routineWakeIntervalSeconds: Int?
+        let periodicIdleWakeEnabled: Bool?
+        let periodicIdleWakeIntervalSeconds: Int?
         let codexConversationID: String?
         let codexRolloutPath: String?
         let codexModel: String?
@@ -1391,6 +1395,10 @@ actor AgentSessionDataService {
                 autoEditEnabled: header.autoEditEnabled,
                 autoWakeOnOversightUpdates: header.autoWakeOnOversightUpdates ?? false,
                 agentSessionLinkAutoWakeTargetSessionIDs: header.agentSessionLinkAutoWakeTargetSessionIDs ?? [],
+                routineWakeIntervalEnabled: header.routineWakeIntervalEnabled ?? false,
+                routineWakeIntervalSeconds: header.routineWakeIntervalSeconds ?? AgentSessionLinkRoutineWakeInterval.defaultSeconds,
+                periodicIdleWakeEnabled: header.periodicIdleWakeEnabled ?? false,
+                periodicIdleWakeIntervalSeconds: header.periodicIdleWakeIntervalSeconds ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
                 codexModel: header.codexModel,

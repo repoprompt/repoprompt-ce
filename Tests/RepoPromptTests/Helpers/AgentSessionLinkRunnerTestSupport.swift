@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -45,6 +46,7 @@ final class AgentSessionLinkRunnerHarness {
     var stubSystemPrompt: String
 
     private(set) var acceptedClaims: [AgentSessionLinkOutboundPromptClaim] = []
+    private(set) var acceptedDispatchCount = 0
     let observerSessionID = UUID()
 
     /// The observer incarnation these runs dispatch as.
@@ -75,7 +77,8 @@ final class AgentSessionLinkRunnerHarness {
         stubSystemPrompt: String = "BASE INSTRUCTIONS",
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
-        workspacePath: String = FileManager.default.currentDirectoryPath
+        workspacePath: String = FileManager.default.currentDirectoryPath,
+        sessionLinkHost: AgentModeViewModel? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -182,10 +185,15 @@ final class AgentSessionLinkRunnerHarness {
                 },
                 augmentUserMessageForProviderSend: { text, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in },
-                prependPendingHandoffIfNeeded: { text, _ in text },
+                prependPendingHandoffIfNeeded: { text, session in
+                    sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
+                },
                 recordPendingHandoffSendOutcome: { _, _ in },
-                claimAgentSessionLinkPrompt: { _, dispatchID in
+                claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
+                        if let sessionLinkHost {
+                            return sessionLinkHost.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
+                        }
                         guard let harnessBox else {
                             // Family-first, exactly like the production fence: a reserved-family
                             // value that does not parse must never degrade to "nothing owed".
@@ -206,11 +214,20 @@ final class AgentSessionLinkRunnerHarness {
                         }
                     }
                 },
-                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
-                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
-                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
-                acceptAgentSessionLinkPrompt: { claim in
+                acquireAgentSessionLinkPhysicalDispatch: { session, dispatchID in
+                    sessionLinkHost?.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID) ?? true
+                },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { session, dispatchID in
+                    sessionLinkHost?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                },
+                recordAgentSessionLinkPhysicalDispatchFailure: { session, dispatchID in
+                    sessionLinkHost?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
+                },
+                acceptAgentSessionLinkPrompt: { session, context, claim in
                     MainActor.assumeIsolated {
+                        harnessBox?.acceptedDispatchCount += 1
+                        sessionLinkHost?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                        guard let claim else { return }
                         harnessBox?.claimStore.accept(claim)
                         harnessBox?.acceptedClaims.append(claim)
                     }
@@ -381,7 +398,8 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
         ACPSessionConfiguration(
-            mode: .new,
+            mode: environment["ACP_FAIL_LOAD"] == "1"
+                ? request.resumeSessionID.map { .load(existingSessionID: $0) } ?? .new : .new,
             workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path,
             mcpServers: []
         )
@@ -410,6 +428,39 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
 }
 
 // MARK: - Fake ACP server
+
+/// A pipe gate holds an actual JSON-RPC response without timing sleeps or blocking the test actor.
+final class AgentSessionLinkACPResponseGate {
+    let path: String
+    private let handle: FileHandle
+    private var released = false
+
+    init(directory: URL) throws {
+        path = directory.appendingPathComponent("response-gate").path
+        guard mkfifo(path, 0o600) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        handle = try FileHandle(forUpdating: URL(fileURLWithPath: path))
+    }
+
+    func waitUntilEntered() async throws {
+        let marker = path + ".entered"
+        try await AsyncTestWait.waitUntil("scripted ACP response to reach its gate") {
+            FileManager.default.fileExists(atPath: marker)
+        }
+    }
+
+    func release() {
+        guard !released else { return }
+        released = true
+        try? handle.write(contentsOf: Data([1]))
+    }
+
+    deinit {
+        if !released { try? handle.write(contentsOf: Data([1])) }
+        try? handle.close()
+    }
+}
 
 enum AgentSessionLinkACPServerScript {
     /// Minimal ACP server. `ACP_FAIL_PROMPTS_CONTAINING` makes `session/prompt` return an error when
@@ -469,8 +520,16 @@ enum AgentSessionLinkACPServerScript {
                 continue
             method = request.get("method")
             params = request.get("params") or {}
+            if method == os.environ.get("ACP_HOLD_METHOD"):
+                gate_path = os.environ["ACP_RESPONSE_GATE"]
+                with open(gate_path + ".entered", "w"):
+                    pass
+                with open(gate_path, "rb", buffering=0) as gate:
+                    gate.read(1)
             if method == "initialize":
                 respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
+            elif method == "session/load" and os.environ.get("ACP_FAIL_LOAD"):
+                respond_error(request.get("id"), "session not found: invalid params")
             elif method == "session/new":
                 respond(request.get("id"), {
                     "sessionId": "monitor-acp-session",

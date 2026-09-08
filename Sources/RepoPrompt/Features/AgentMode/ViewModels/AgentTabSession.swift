@@ -56,6 +56,7 @@ final class AgentTabSession: ObservableObject {
     @Published var runState: AgentSessionRunState = .idle {
         didSet {
             guard runState != oldValue else { return }
+            noteMonitorObservationInputsChanged()
             onRunStateChanged?(self)
         }
     }
@@ -144,25 +145,54 @@ final class AgentTabSession: ObservableObject {
 
     var worktreeBindingTransitionInProgress: Bool = false
 
-    // Wait/question state
-    @Published var waitingPrompt: String? = nil
-    @Published var pendingAskUser: AgentAskUserPendingState? = nil
-    @Published var pendingUserInputRequest: AgentRequestUserInputRequest? = nil
-    @Published var pendingApproval: AgentApprovalRequest? = nil
-    @Published var pendingCodexHookReview: AgentCodexHookReviewRequest? = nil
+    /// Wait/question state
+    @Published var waitingPrompt: String? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingAskUser: AgentAskUserPendingState? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingUserInputRequest: AgentRequestUserInputRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingApproval: AgentApprovalRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingCodexHookReview: AgentCodexHookReviewRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
     var codexHookReviewContinuation: CheckedContinuation<Void, Error>?
     var codexHookGateCoalescedContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
     var codexHookGateGeneration: UInt64 = 0
-    var codexHookGateAttemptToken: UUID?
+    var codexHookGateAttemptToken: UUID? {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
     var codexHookGateDispatchOwnerToken: UUID?
     var codexHookGateInventoryFingerprint: String?
     @Published var codexHookGateAudit: AgentCodexHookGateAudit?
     var codexHookGateBindingMemo: CodexHookGateBindingIdentity?
     var codexHookGateActiveBinding: CodexHookGateBindingIdentity?
-    @Published var pendingPermissionsRequest: AgentPermissionsRequest? = nil
-    @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil
-    @Published var pendingApplyEditsReview: PendingApplyEditsReview? = nil
-    @Published var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil
+    @Published var pendingPermissionsRequest: AgentPermissionsRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingApplyEditsReview: PendingApplyEditsReview? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    @Published var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
 
     /// Explicit change channel for oversight inputs that are not `@Published`.
     /// A non-replaying subject avoids perturbing unrelated session observers.
@@ -216,7 +246,14 @@ final class AgentTabSession: ObservableObject {
     }
 
     func noteMonitorObservationInputsChanged() {
+        invalidatePeriodicIdleSpanIfLocallyBlocked()
         monitorObservationSignal.send(())
+    }
+
+    func invalidatePeriodicIdleSpanIfLocallyBlocked() {
+        guard oversight.periodicIdleSince != nil,
+              !AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(self) else { return }
+        oversight.invalidatePeriodicIdleSpan()
     }
 
     var queuedUserInputRequests: [AgentRequestUserInputRequest] = []
@@ -380,6 +417,7 @@ final class AgentTabSession: ObservableObject {
         var retryAttempted: Bool = false
         /// Final monitoring identity composed for the original physical dispatch, if any.
         var monitoringDispatchID: AgentSessionLinkPromptDispatchID?
+        var monitoringDispatchContext: AgentSessionLinkDispatchContext?
         /// Accepted oversight claim from the original dispatch, retained so managed-auth replay can
         /// attach the byte-equivalent supplement without acknowledging it twice.
         var monitoringClaim: AgentSessionLinkOutboundPromptClaim?
@@ -548,7 +586,7 @@ final class AgentTabSession: ObservableObject {
         let originRunAttemptID: UUID
         var blockingTurn: CodexFallbackBlockingTurn?
         var state: CodexFallbackQueueState
-        var monitoringWakeID: UUID?
+        var monitoringDispatchContext: AgentSessionLinkDispatchContext?
     }
 
     var codexPendingTurnKind: CodexTurnKind?
@@ -557,20 +595,32 @@ final class AgentTabSession: ObservableObject {
     var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness?
     var codexRoutingObservedTurnID: String?
     var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
-    var codexFallbackQueue: [CodexFallbackQueueEntry] = []
-    var codexFallbackDispatchInFlight: CodexFallbackQueueEntry?
+    var codexFallbackQueue: [CodexFallbackQueueEntry] = [] {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
+    var codexFallbackDispatchInFlight: CodexFallbackQueueEntry? {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
     /// Bridges queued follow-ups to a hook-gate owner's turn for as long as that turn has no
     /// settled identity of its own. Whichever of the accepted `turn/start` receipt or the
     /// lifecycle start arrives first supplies the value — they race, and the queue has to be
     /// bound by then either way. It is transient by design: the turn's terminal event either
     /// upgrades it to the identity-derived blocker or resolves the queue outright.
     var codexFallbackHookGateOwnerBlocker: CodexFallbackBlockingTurn?
-    var codexFallbackPumpTask: Task<Void, Never>?
+    var codexFallbackPumpTask: Task<Void, Never>? {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
     var codexFallbackSuccessorRetryTask: Task<Void, Never>?
     let codexDispatchSerialGate = CodexDispatchSerialGate()
 
-    // Instruction steering coordination state
-    var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>?
+    /// Instruction steering coordination state
+    var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>? {
+        didSet { noteMonitorObservationInputsChanged() }
+    }
+
     var instructionTimeoutTask: Task<Void, Never>?
     var instructionWaitID: UUID?
 
@@ -611,7 +661,21 @@ final class AgentTabSession: ObservableObject {
     }
 
     var provider: HeadlessAgentProvider?
-    var agentTask: Task<Void, Never>?
+    var agentTask: Task<Void, Never>? {
+        didSet {
+            // Latch the actual producer synchronously, while its exact composer admission is held.
+            // ACP may install this after cancellation during awaited startup: the tombstone still
+            // owns that exact composer claim. Sampling after start could capture a rebound user's task.
+            guard let agentTask, var attempt = oversight.pendingAutoWake,
+                  attempt.isPeriodic,
+                  attempt.phase == .preparingDispatch || attempt.phase == .cancelledBeforeDispatch,
+                  attempt.periodicProducerTask == nil,
+                  let submissionID = attempt.periodicComposerAttemptID,
+                  activeComposerSubmitAttempt?.id == submissionID else { return }
+            attempt.periodicProducerTask = agentTask
+            oversight.pendingAutoWake = attempt
+        }
+    }
 
     // Settings (per-tab)
     var selectedAgent: AgentProviderKind = .claudeCode
@@ -898,6 +962,7 @@ final class AgentTabSession: ObservableObject {
     deinit {
         applyEditsApprovalSubscriptionTask?.cancel()
         oversight.snoozeDeadlineTask?.cancel()
+        oversight.periodicDeadlineTask?.cancel()
     }
 
     /// Cancels all ephemeral runtime tasks and clears transient state on this
@@ -936,6 +1001,7 @@ final class AgentTabSession: ObservableObject {
         applyEditsApprovalSubscriptionTask = nil
         applyEditsApprovalSubscriptionID = nil
         oversight.retireSnoozeState()
+        oversight.retirePeriodicScheduling()
     }
 
     var hasPendingCodexHookReviewRequest: Bool {

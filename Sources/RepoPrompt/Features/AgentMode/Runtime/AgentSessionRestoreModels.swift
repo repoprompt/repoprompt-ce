@@ -15,6 +15,10 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var autoEditEnabled: Bool
     var autoWakeOnOversightUpdates: Bool = false
     var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = []
+    var routineWakeIntervalEnabled: Bool = false
+    var routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds
+    var periodicIdleWakeEnabled: Bool = false
+    var periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds
     var parentSessionID: UUID?
     var hasUnknownConversationContent: Bool
     var isMCPOriginated: Bool

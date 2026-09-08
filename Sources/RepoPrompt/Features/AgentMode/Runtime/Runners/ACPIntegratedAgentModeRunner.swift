@@ -459,7 +459,7 @@ final class ACPIntegratedAgentModeRunner {
         do {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
             try await controller.prompt(monitoring.message, request: runRequest)
-            if let claim = monitoring.claim { hooks.providerInput.acceptAgentSessionLinkPrompt(claim) }
+            hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, monitoring.claim)
             log("active steering session/prompt completed attempt=\(runAttemptID)", runID: runID)
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
@@ -573,6 +573,7 @@ final class ACPIntegratedAgentModeRunner {
         lease: MCPBootstrapLease,
         attachmentReservationID: UUID?
     ) async {
+        let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let modelDescription = runRequest.modelString ?? "default"
         let resumeDescription = runRequest.resumeSessionID ?? "nil"
         let workspaceDescription = runRequest.workspacePath ?? "nil"
@@ -610,6 +611,10 @@ final class ACPIntegratedAgentModeRunner {
                 }
                 var initialMessageForPromptTurn = initialMessageForRun
                 if bootstrap.didFallbackToNewSessionAfterLoadFailure {
+                    // Periodic turns preserve handoffs, so they cannot adopt a contextless replacement.
+                    // Existing cancellation cleanup retires this unprompted controller.
+                    guard !isPeriodic else { throw CancellationError() }
+
                     await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session)
                     initialMessageForPromptTurn = hooks.providerInput.prependPendingHandoffIfNeeded(initialMessageForRun, session)
                 }
@@ -830,7 +835,7 @@ final class ACPIntegratedAgentModeRunner {
             log("controller.prompt begin", runID: runID)
             try await controller.prompt(monitoring.message, request: runRequest)
             // A non-throwing `controller.prompt` return is ACP's acceptance signal.
-            if let claim = monitoring.claim { hooks.providerInput.acceptAgentSessionLinkPrompt(claim) }
+            hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, monitoring.claim)
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)

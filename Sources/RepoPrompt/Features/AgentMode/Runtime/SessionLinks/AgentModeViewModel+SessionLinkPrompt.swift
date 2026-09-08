@@ -293,6 +293,7 @@ extension AgentModeViewModel {
             inventory: inventory
         )
         if existing == published { return }
+        defer { agentSessionLinkReconcilePeriodicWake(for: endpoint) }
         agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID] = published
         // An accepted publication names the incarnation this session UUID currently *is*, so a passive
         // queue filed under that UUID for any other incarnation belongs to a retired one. Collected
@@ -353,6 +354,7 @@ extension AgentModeViewModel {
         }
 
         record(.accepted)
+        defer { agentSessionLinkReconcilePeriodicWake(for: endpoint) }
         let becameReady = projection.isReady && !(existing?.runID == projection.runID && existing?.isReady == true)
         agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = projection
         if projection.isReady {
@@ -465,6 +467,9 @@ extension AgentModeViewModel {
         // rather than a second channel: whatever publishes deliverable content is exactly what a wake
         // would be scheduled against, and whatever clears it is exactly what cancels one.
         agentSessionLinkNoteAutoWakeOpportunity(snapshot, endpoint: endpoint)
+        // The dashboard's pending-updates section is derived from this queue, and a receipt changes
+        // it without changing any link row, so no projection publication is guaranteed.
+        requestUIRefresh(tabID: endpoint.tabID)
     }
 
     /// Fences one exact incarnation's prompt inventory and retracts its published value.
@@ -489,6 +494,7 @@ extension AgentModeViewModel {
     func agentSessionLinkWithholdPromptInventory(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UInt64 {
+        defer { agentSessionLinkReconcilePeriodicWake(for: endpoint) }
         agentSessionLinkNextPromptInventoryHoldToken &+= 1
         let token = agentSessionLinkNextPromptInventoryHoldToken
         // An overlapping write *joins* the existing fence rather than replacing it: the baseline to
@@ -630,6 +636,13 @@ extension AgentModeViewModel {
         // invalidate its deadline token rather than let a successor inherit suppression it never
         // asked for. Accepted-provenance-before-receipt ordering is untouched by this.
         agentSessionLinkPruneAutoWakeSnoozeState()
+        for session in sessions.values {
+            if let endpoint = session.oversight.periodicEndpoint,
+               agentSessionLinkObserverEndpoint(tabID: session.tabID) != endpoint
+            {
+                session.oversight.retirePeriodicScheduling()
+            }
+        }
         agentSessionLinkPromptClaimStore.retainOnly(observerSessionIDs: liveSessionIDs)
     }
 
@@ -758,6 +771,14 @@ extension AgentModeViewModel {
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkPromptClaimOutcome {
         let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
+        let periodicAttempt = session.oversight.pendingAutoWake.flatMap { attempt in
+            attempt.isPeriodic && attempt.wakeID == effectiveID.autoWakeID ? attempt : nil
+        }
+        if let periodicAttempt {
+            guard periodicAttempt.phase != .cancelledBeforeDispatch,
+                  agentSessionLinkPeriodicWakeIsEligible(session, endpoint: periodicAttempt.observerEndpoint)
+            else { return .requiredLaneBatchUnavailable }
+        }
         guard let context = agentSessionLinkPromptContext(for: session) else {
             // No prompt context at all still refuses a wake: the batch it exists to deliver cannot be
             // rendered, so the turn has nothing to say. Classified by reserved family, exactly as the
@@ -792,6 +813,7 @@ extension AgentModeViewModel {
             inventory: context.inventory,
             passiveNotices: context.passiveNotices,
             locationLabelsByReference: locationLabelsByReference,
+            allowsClaimlessAutoWake: periodicAttempt != nil,
             render: AgentSessionLinkPrompts.rendered
         )
     }
@@ -878,15 +900,18 @@ extension AgentModeViewModel {
         session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkDecoratedProviderText {
+        let captured = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatchID)
         let outcome = agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
         guard let claim = outcome.claim else {
             return AgentSessionLinkDecoratedProviderText(
+                dispatchContext: captured,
                 text: providerText,
                 claim: nil,
                 mustAbortDispatch: outcome.mustAbortDispatch
             )
         }
         return AgentSessionLinkDecoratedProviderText(
+            dispatchContext: captured,
             text: AgentSessionLinkPromptComposer.decorated(providerText, with: claim),
             claim: claim,
             mustAbortDispatch: false
@@ -905,6 +930,38 @@ extension AgentModeViewModel {
     /// Ordering is load-bearing for an accepted auto-wake: the wake's visible provenance row is
     /// recorded *before* the receipt is applied, so the queue republication the receipt triggers
     /// already sees the settled attempt rather than a still-pending one.
+    func acceptAgentSessionLinkDispatch(
+        session: TabSession,
+        context: AgentSessionLinkDispatchContext?,
+        claim: AgentSessionLinkOutboundPromptClaim?
+    ) {
+        guard context?.isPeriodic == true else {
+            acceptAgentSessionLinkPromptClaim(claim)
+            return
+        }
+        if let attempt = session.oversight.pendingAutoWake,
+           attempt.isPeriodic, attempt.wakeID == context?.dispatchID.autoWakeID
+        {
+            attempt.task?.cancel()
+            session.oversight.pendingAutoWake = nil
+            if sessions[session.tabID] === session,
+               agentSessionLinkObserverEndpoint(tabID: session.tabID) == attempt.observerEndpoint
+            {
+                agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
+            }
+            session.noteMonitorObservationInputsChanged()
+        }
+        if let claim {
+            agentSessionLinkPromptClaimStore.accept(claim)
+            if let passive = claim.passive {
+                AgentSessionLinkRuntimeBridge.shared.applyPassiveMonitorNoticeReceipt(
+                    passive.receipt, observerEndpoint: passive.observerEndpoint
+                )
+            }
+        }
+        agentSessionLinkDrainAutoWakeReevaluationIfOwed(session: session)
+    }
+
     func acceptAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
         guard let claim else { return }
         agentSessionLinkPromptClaimStore.accept(claim)

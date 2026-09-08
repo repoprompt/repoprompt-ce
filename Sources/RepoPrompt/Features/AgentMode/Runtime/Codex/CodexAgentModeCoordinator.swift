@@ -3033,6 +3033,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         {
             return .queuedFallback(queueID: submission.queueID, reason: reason)
         }
+        if var attempt = session.oversight.pendingAutoWake, attempt.isPeriodic,
+           attempt.phase == .dispatching
+        {
+            attempt.phase = .preparingDispatch
+            attempt.physicalOutcome = .notAttempted
+            attempt.periodicProducerDispatchID = .codexFallback(queueID: submission.queueID)
+            session.oversight.pendingAutoWake = attempt
+        }
         let entry = AgentTabSession.CodexFallbackQueueEntry(
             id: submission.queueID,
             providerText: submission.providerText,
@@ -3053,9 +3061,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             originRunAttemptID: runAttemptID,
             blockingTurn: recoverableCodexFallbackBlockingTurn(session: session),
             state: .queued,
-            monitoringWakeID: viewModel?.agentSessionLinkEffectiveDispatchID(
-                for: session, dispatchID: .codexFallback(queueID: submission.queueID)
-            ).autoWakeID
+            monitoringDispatchContext: AgentSessionLinkDispatchContext(session: session, dispatchID: .codexFallback(queueID: submission.queueID))
         )
         detachCodexFallbackAttachmentReservation(attachmentReservationID, session: session)
         session.codexFallbackQueue.append(entry)
@@ -3285,6 +3291,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // fallback dispatch, so an entry that sat in the queue while the user added or removed an oversight link
         // ships the current membership revision rather than the one that was live at enqueue time.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.codexFallback(queueID: head.id)
+        if let captured = head.monitoringDispatchContext, captured.isPeriodic,
+           session.oversight.pendingAutoWake?.wakeID != captured.dispatchID.autoWakeID
+        {
+            await failCodexFallbackDispatch(session: session, entry: head, message: nil)
+            return false
+        }
         let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
             head.providerText,
             session: session,
@@ -3323,7 +3335,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             // Acceptance is the non-throwing `startUserTurn` return that produces the enclosing `.sent`
             // path; the in-flight bookkeeping below is local state, not provider acceptance.
-            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
                   session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID
@@ -3422,10 +3434,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.mcpFollowUpRunPending = false
         session.codexFallbackHookGateOwnerBlocker = nil
         // Capture the original producer before teardown; settlement may admit a successor.
-        let abandonedWakeID = session.oversight.pendingAutoWake.flatMap { attempt in
-            session.codexFallbackQueue.contains(where: { $0.monitoringWakeID == attempt.wakeID })
-                || session.codexFallbackDispatchInFlight?.monitoringWakeID == attempt.wakeID
-                ? attempt.wakeID : nil
+        let abandonedWake = session.oversight.pendingAutoWake.flatMap { attempt -> (UUID, AgentSessionLinkPromptDispatchID)? in
+            let entry = session.codexFallbackQueue.first(where: { $0.monitoringDispatchContext?.dispatchID.autoWakeID == attempt.wakeID })
+                ?? session.codexFallbackDispatchInFlight.flatMap { $0.monitoringDispatchContext?.dispatchID.autoWakeID == attempt.wakeID ? $0 : nil }
+            guard let entry else { return nil }
+            return (attempt.wakeID, attempt.isPeriodic ? .codexFallback(queueID: entry.id) : .autoWake(wakeID: attempt.wakeID))
         }
         let queued = session.codexFallbackQueue
         session.codexFallbackQueue.removeAll()
@@ -3472,10 +3485,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.appendItem(.error(reason, sequenceIndex: session.nextSequenceIndex))
             }
         }
-        if let abandonedWakeID {
+        if let (wakeID, dispatchID) = abandonedWake, session.oversight.pendingAutoWake?.wakeID == wakeID {
             viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
-                dispatchID: .autoWake(wakeID: abandonedWakeID)
+                dispatchID: dispatchID
             )
         }
         viewModel?.publishMCPStateChange(for: session)
@@ -5454,8 +5467,30 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ?? replayTurn.monitoringClaim?.dispatchID
             let monitoring: AgentSessionLinkDecoratedProviderText?
             let replayText: String
-            if let originalMonitoringDispatchID,
-               originalMonitoringDispatchID.isAutoWakeFamily
+            if replayTurn.monitoringDispatchContext?.isPeriodic == true {
+                guard let endpoint = viewModel?.agentSessionLinkObserverEndpoint(tabID: session.tabID),
+                      viewModel?.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint) == true else { return false }
+                if var attempt = session.oversight.pendingAutoWake {
+                    guard attempt.isPeriodic,
+                          attempt.wakeID == replayTurn.monitoringDispatchContext?.dispatchID.autoWakeID,
+                          attempt.phase == .dispatching else { return false }
+                    attempt.periodicProducerDispatchID = replayDispatchID
+                    session.oversight.pendingAutoWake = attempt
+                }
+                monitoring = AgentSessionLinkDecoratedProviderText(
+                    dispatchContext: replayTurn.monitoringDispatchContext,
+                    text: replayTurn.text, claim: nil, mustAbortDispatch: false
+                )
+                if let claim = replayTurn.monitoringClaim {
+                    guard viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                        claim, for: session, dispatchID: claim.dispatchID
+                    ) == true else { return false }
+                    replayText = AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: claim)
+                } else {
+                    replayText = replayTurn.text
+                }
+            } else if let originalMonitoringDispatchID,
+                      originalMonitoringDispatchID.isAutoWakeFamily
             {
                 guard let acknowledged = replayTurn.monitoringClaim,
                       viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
@@ -5530,7 +5565,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -7068,10 +7103,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 return .cancelled
             }
-            if let monitoringDispatchID = candidate?.claim?.dispatchID,
+            if let monitoringDispatchID = candidate?.dispatchContext?.dispatchID,
                var pendingAuthTurn = session.codexPendingAuthRetryTurn
             {
                 pendingAuthTurn.monitoringDispatchID = monitoringDispatchID
+                pendingAuthTurn.monitoringDispatchContext = candidate?.dispatchContext
                 session.codexPendingAuthRetryTurn = pendingAuthTurn
             }
             let acquired = self.viewModel?.agentSessionLinkAcquirePhysicalDispatch(
@@ -7228,7 +7264,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // `startUserTurn`, or a `steerUserTurn` receipt carrying an accepted turn ID. Acknowledge
             // before the staleness guard below, because a dispatch the provider accepted after the
             // local run changed still delivered the supplement exactly once.
-            viewModel?.acceptAgentSessionLinkPromptClaim(monitoring?.claim)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: monitoring?.claim)
             // Managed-auth recovery can still replay this exact turn after acceptance. Hand it the
             // acknowledged claim so the replay can re-attach the identical fragment instead of
             // shipping the bare stored text and silently dropping the revision forever.

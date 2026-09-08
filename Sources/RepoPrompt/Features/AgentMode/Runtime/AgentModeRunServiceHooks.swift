@@ -135,7 +135,7 @@ extension AgentModeRunService {
         ) -> Void
         /// Acknowledges whichever opaque membership/passive components the provider accepted; their
         /// respective owners settle them behind this one runner-neutral call.
-        let acceptAgentSessionLinkPrompt: (AgentSessionLinkOutboundPromptClaim) -> Void
+        let acceptAgentSessionLinkPrompt: (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
 
         /// Attaches the cross-window oversight supplement to an already-built provider message.
         ///
@@ -143,13 +143,16 @@ extension AgentModeRunService {
         /// supplement remains the final RepoPrompt envelope. Every runner must also consult
         /// `mustAbortDispatch` before transport; this shared seam prevents one provider family from
         /// accidentally sending an auto-wake whose required lane batch was unavailable.
+        @MainActor
         func decoratedAgentMessage(
             _ message: AgentMessage,
             session: AgentTabSession,
             dispatchID: AgentSessionLinkPromptDispatchID
         ) -> AgentSessionLinkDecoratedAgentMessage {
+            let captured = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatchID)
             let outcome = claimAgentSessionLinkPrompt(session, dispatchID)
             return AgentSessionLinkDecoratedAgentMessage(
+                dispatchContext: captured,
                 message: AgentSessionLinkPromptComposer.decorated(message, with: outcome.claim),
                 claim: outcome.claim,
                 mustAbortDispatch: outcome.mustAbortDispatch
@@ -162,6 +165,7 @@ extension AgentModeRunService {
     /// Named for the same reason its text-shaped sibling is: a tuple would let a call site keep
     /// compiling while silently ignoring the abort.
     struct AgentSessionLinkDecoratedAgentMessage {
+        var dispatchContext: AgentSessionLinkDispatchContext?
         let message: AgentMessage
         let claim: AgentSessionLinkOutboundPromptClaim?
         /// The dispatch required a lane batch it could not be given. Make no physical provider call.

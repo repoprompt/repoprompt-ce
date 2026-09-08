@@ -48,6 +48,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     private var retained: [AgentModeViewModel] = []
 
     override func tearDown() {
+        for viewModel in retained {
+            for session in viewModel.sessions.values {
+                session.oversight.retirePeriodicScheduling()
+                session.oversight.pendingAutoWake?.task?.cancel()
+            }
+        }
         retained.removeAll()
         super.tearDown()
     }
@@ -371,7 +377,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         let absorbed = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
         XCTAssertEqual(absorbed.wakeID, reserved.wakeID)
-        XCTAssertEqual(absorbed.wakeFingerprint.attentionOccurrences, [attention.occurrence])
+        XCTAssertEqual(absorbed.wakeFingerprint?.attentionOccurrences, [attention.occurrence])
         XCTAssertTrue(fixture.session.oversight.autoWakeReevaluationOwed)
         XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session,
@@ -398,7 +404,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             "ambiguous settlement must drain the one owed reevaluation"
         )
         XCTAssertNotEqual(replayed.wakeID, reserved.wakeID)
-        XCTAssertEqual(replayed.wakeFingerprint.attentionOccurrences, [attention.occurrence])
+        XCTAssertEqual(replayed.wakeFingerprint?.attentionOccurrences, [attention.occurrence])
         XCTAssertFalse(fixture.session.oversight.autoWakeReevaluationOwed)
     }
 
@@ -1271,7 +1277,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         XCTAssertNotEqual(replayed.wakeID, reserved.wakeID)
         XCTAssertEqual(replayed.requiredAttentionOccurrence, successor.occurrence)
-        XCTAssertEqual(replayed.wakeFingerprint.attentionOccurrences, [successor.occurrence])
+        XCTAssertEqual(replayed.wakeFingerprint?.attentionOccurrences, [successor.occurrence])
         XCTAssertFalse(fixture.session.oversight.autoWakeReevaluationOwed)
         XCTAssertNil(fixture.session.oversight.suppressedWakeFingerprint)
     }
@@ -1456,7 +1462,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             queueEpoch: reserved.queueEpoch,
             queueRevision: reserved.queueRevision,
             wakeFingerprint: reserved.wakeFingerprint,
-            requiredAttentionOccurrence: reserved.requiredAttentionOccurrence,
+            admissionBasis: reserved.admissionBasis,
             attemptedFingerprint: reserved.wakeFingerprint,
             physicalOutcome: .ambiguous,
             phase: .dispatching,
@@ -2263,7 +2269,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             queueEpoch: reserved.queueEpoch,
             queueRevision: reserved.queueRevision,
             wakeFingerprint: reserved.wakeFingerprint,
-            requiredAttentionOccurrence: reserved.requiredAttentionOccurrence,
+            admissionBasis: reserved.admissionBasis,
             attemptedFingerprint: reserved.wakeFingerprint,
             physicalOutcome: .ambiguous,
             phase: .dispatching,
@@ -2574,7 +2580,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         let attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
         XCTAssertEqual(
-            Set(attempt.wakeFingerprint.edges.map(\.reference)),
+            Set(attempt.wakeFingerprint?.edges.map(\.reference) ?? []),
             Set([0, 1].map { Self.laneReference($0, generation: 1) }),
             "the wake expiry re-drove must account for every lane that changed while snoozed"
         )
@@ -3420,6 +3426,489 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
+    // MARK: - Routine wake interval and Wake now
+
+    /// Deferred routine content is not consumed, and its own deadline releases it without another
+    /// target edge — which is the whole difference between an interval and a dropped update.
+    func testRoutineIntervalDefersRoutineWakesAndExpiresWithoutAnotherPublication() async throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try enableRoutineInterval(fixture, clock: clock, seconds: 300)
+
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertNil(
+            fixture.session.oversight.pendingAutoWake,
+            "routine content inside the interval reserves nothing"
+        )
+        await settleSnoozeTasks()
+        XCTAssertEqual(clock.pendingSleepCount, 1, "the shared deadline carries the interval")
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]?.entries.count,
+            1,
+            "deferral is admission-only: the queue still holds the update"
+        )
+
+        clock.advance(seconds: 300)
+        try await AsyncTestWait.waitUntil("the interval deadline to re-drive the retained snapshot") {
+            await MainActor.run { fixture.session.oversight.pendingAutoWake != nil }
+        }
+        let admitted = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertEqual(admitted.admissionBasis, .routineStatusOrOverflow)
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]?.queueRevision,
+            1,
+            "no second publication was required"
+        )
+    }
+
+    /// The interval measures from the transport boundary: stamped once per attempt, stamped even
+    /// while limiting is off, and never stamped by a dispatch that provably did not happen.
+    func testOversightWakesStampOnlyTheirFirstPhysicalAcquisition() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        XCTAssertFalse(fixture.session.oversight.routineWakeIntervalEnabled)
+
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertNil(fixture.session.oversight.lastOversightWakeDispatch, "reservation stamps nothing")
+
+        XCTAssertTrue(try driveToPhysicalDispatch(fixture, wakeID: reserved.wakeID))
+        let stamped = try XCTUnwrap(fixture.session.oversight.lastOversightWakeDispatch)
+        XCTAssertEqual(stamped.instant, clock.instant)
+        XCTAssertEqual(stamped.observerEndpoint, reserved.observerEndpoint)
+
+        clock.advanceWithoutFiring(seconds: 120)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        XCTAssertEqual(
+            fixture.session.oversight.lastOversightWakeDispatch,
+            stamped,
+            "a re-entrant acquire for the same dispatch must not restamp"
+        )
+
+        let notAttempted = try makeFixture()
+        installSnoozeClock(notAttempted)
+        try publishInventory(notAttempted, revision: 1)
+        notAttempted.session.oversight.autoWakeOnUpdates = true
+        try publishLane(notAttempted, linkSetRevision: 1, queueRevision: 1)
+        let pending = try XCTUnwrap(notAttempted.session.oversight.pendingAutoWake)
+        notAttempted.viewModel.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            for: notAttempted.session,
+            dispatchID: .autoWake(wakeID: pending.wakeID)
+        )
+        XCTAssertNil(
+            notAttempted.session.oversight.lastOversightWakeDispatch,
+            "a definite no-call leaves the interval untouched"
+        )
+    }
+
+    /// Purposeful attention admits inside the window without changing the preference, and its own
+    /// dispatch restarts the interval like any other oversight wake.
+    func testPurposefulAttentionBypassesTheRoutineIntervalAndRestartsIt() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try enableRoutineInterval(fixture, clock: clock, seconds: 300)
+        let attention = Self.attentionRequest(0)
+
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            attentionRequests: [attention]
+        )
+        let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertEqual(reserved.admissionBasis, .purposefulAttention(attention.occurrence))
+        XCTAssertTrue(
+            fixture.session.oversight.routineWakeIntervalEnabled,
+            "the bypass changes no preference"
+        )
+        XCTAssertEqual(fixture.session.oversight.routineWakeIntervalSeconds, 300)
+
+        clock.advanceWithoutFiring(seconds: 120)
+        XCTAssertTrue(try driveToPhysicalDispatch(fixture, wakeID: reserved.wakeID))
+        XCTAssertEqual(
+            fixture.session.oversight.lastOversightWakeDispatch?.instant,
+            clock.instant,
+            "an attention wake restarts the routine interval from its own dispatch"
+        )
+    }
+
+    /// Enabling the limit is a policy change like selection or snooze: it retracts a merely scheduled
+    /// routine attempt, and it must never clear a tombstone that still fences a provider path.
+    func testEnablingTheIntervalRetractsAScheduledRoutineWakeButNeverATombstone() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertNotNil(fixture.session.oversight.pendingAutoWake)
+
+        fixture.session.oversight.lastOversightWakeDispatch = AgentSessionLinkOversightWakeDispatch(
+            observerEndpoint: endpoint,
+            instant: clock.instant
+        )
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetRoutineWakeInterval(
+            enabled: true,
+            seconds: 300,
+            for: endpoint
+        ))
+        XCTAssertNil(
+            fixture.session.oversight.pendingAutoWake,
+            "a scheduled routine attempt loses its basis to the new limit"
+        )
+
+        let fenced = try makeFixture()
+        let fencedClock = installSnoozeClock(fenced)
+        try publishInventory(fenced, revision: 1)
+        fenced.session.oversight.autoWakeOnUpdates = true
+        let fencedEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fenced.viewModel,
+            tabID: fenced.tabID
+        )
+        try publishLane(fenced, linkSetRevision: 1, queueRevision: 1)
+        var preparing = try XCTUnwrap(fenced.session.oversight.pendingAutoWake)
+        preparing.task?.cancel()
+        preparing.task = nil
+        preparing.phase = .preparingDispatch
+        fenced.session.oversight.pendingAutoWake = preparing
+        fenced.viewModel.cancelAgentSessionLinkAutoWake(
+            for: fencedEndpoint,
+            reason: .eligibilityLost
+        )
+        XCTAssertEqual(
+            fenced.session.oversight.pendingAutoWake?.phase,
+            .cancelledBeforeDispatch
+        )
+
+        fenced.session.oversight.lastOversightWakeDispatch = AgentSessionLinkOversightWakeDispatch(
+            observerEndpoint: fencedEndpoint,
+            instant: fencedClock.instant
+        )
+        for seconds in [300, 900] {
+            XCTAssertTrue(fenced.viewModel.agentSessionLinkSetRoutineWakeInterval(
+                enabled: true,
+                seconds: seconds,
+                for: fencedEndpoint
+            ))
+            XCTAssertEqual(
+                fenced.session.oversight.pendingAutoWake?.phase,
+                .cancelledBeforeDispatch,
+                "repeated interval changes must not clear the transport fence"
+            )
+        }
+    }
+
+    /// The user's own one-shot processes what routine policy is refusing, and changes none of it.
+    func testWakeNowProcessesDeselectedAndSnoozedLanesWithoutChangingPolicy() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        _ = try requireSnoozeSuccess(
+            mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 600))
+        )
+        fixture.session.oversight.autoWakeOnUpdates = false
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 2,
+            edgeSequenceOffset: 10,
+            selectedTargetIndices: []
+        )
+        try enableRoutineInterval(fixture, clock: clock, seconds: 300)
+        XCTAssertNil(
+            fixture.session.oversight.pendingAutoWake,
+            "precondition: selection, snooze, and the interval all refuse this content"
+        )
+
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint),
+            .scheduled
+        )
+        let manual = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertTrue(manual.isManual)
+        XCTAssertNil(manual.requiredAttentionOccurrence)
+        XCTAssertFalse(fixture.session.oversight.autoWakeOnUpdates)
+        XCTAssertTrue(fixture.session.oversight.autoWakeTargetSessionIDs.isEmpty)
+        XCTAssertEqual(fixture.session.oversight.autoWakeSnoozes.count, 1, "the snooze is untouched")
+        XCTAssertTrue(fixture.session.oversight.routineWakeIntervalEnabled)
+        XCTAssertEqual(fixture.session.oversight.routineWakeIntervalSeconds, 300)
+        XCTAssertNil(fixture.session.oversight.suppressedWakeFingerprint)
+    }
+
+    /// Wake now answers for the instant it was clicked: it never queues itself behind a busy turn and
+    /// never adds a second reservation.
+    func testWakeNowRefusesBusyObserversAndRepeatedClicks() throws {
+        let empty = try makeFixture()
+        try publishInventory(empty, revision: 1)
+        let emptyEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            empty.viewModel,
+            tabID: empty.tabID
+        )
+        XCTAssertEqual(
+            empty.viewModel.agentSessionLinkRequestManualWakeNow(for: emptyEndpoint),
+            .refused(.noPendingUpdates)
+        )
+        XCTAssertNil(empty.session.oversight.pendingAutoWake)
+
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, selectedTargetIndices: [])
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+
+        fixture.session.runState = .running
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint),
+            .refused(.sessionBusy)
+        )
+        XCTAssertNil(
+            fixture.session.oversight.pendingAutoWake,
+            "a busy refusal stores nothing to run later"
+        )
+
+        fixture.session.runState = .idle
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint),
+            .scheduled
+        )
+        let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint),
+            .refused(.alreadyWaking)
+        )
+        XCTAssertEqual(
+            fixture.session.oversight.pendingAutoWake?.wakeID,
+            reserved.wakeID,
+            "a second click cannot replace the reservation the first one made"
+        )
+    }
+
+    /// Manual permission is scoped to its own attempt: it processes a shape that already failed, and
+    /// leaves that failure suppressed for every later automatic publication.
+    func testManualWakeIgnoresFailureSuppressionWithoutClearingIt() throws {
+        let fixture = try makeFixture()
+        installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let failedShape = reserved.wakeFingerprint
+        fixture.viewModel.cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+        fixture.session.oversight.suppressedWakeFingerprint = failedShape
+
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2)
+        XCTAssertNil(
+            fixture.session.oversight.pendingAutoWake,
+            "precondition: the automatic path is suppressed for this exact shape"
+        )
+
+        XCTAssertEqual(
+            fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint),
+            .scheduled
+        )
+        XCTAssertTrue(try XCTUnwrap(fixture.session.oversight.pendingAutoWake).isManual)
+        XCTAssertEqual(
+            fixture.session.oversight.suppressedWakeFingerprint,
+            failedShape,
+            "the manual attempt ignores suppression without clearing it"
+        )
+
+        fixture.viewModel.cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 3)
+        XCTAssertNil(
+            fixture.session.oversight.pendingAutoWake,
+            "manual permission dies with its attempt rather than re-arming automatic retries"
+        )
+    }
+
+    func testManualWakeRetriesSuppressedAttentionThroughPhysicalAcquisition() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        let attention = Self.attentionRequest(0)
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0],
+            attentionRequests: [attention]
+        )
+        let failedShape = try XCTUnwrap(fixture.session.oversight.pendingAutoWake).wakeFingerprint
+        fixture.viewModel.cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+        fixture.session.oversight.suppressedWakeFingerprint = failedShape
+
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+        let manual = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertTrue(try driveToPhysicalDispatch(fixture, wakeID: manual.wakeID))
+        XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failedShape)
+    }
+
+    func testManualWakePhysicalFailurePreservesAutomaticSuppression() throws {
+        for hasPriorSuppression in [false, true] {
+            let fixture = try makeFixture()
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = false
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, selectedTargetIndices: [])
+            let original = hasPriorSuppression ? try XCTUnwrap(
+                fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]
+            ).wakeEligibilityFingerprint : nil
+            fixture.session.oversight.suppressedWakeFingerprint = original
+            try publishLane(
+                fixture, linkSetRevision: 1, queueRevision: 2,
+                edgeSequenceOffset: 1, selectedTargetIndices: []
+            )
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+            let manual = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+            XCTAssertNotEqual(manual.wakeFingerprint, original)
+            XCTAssertTrue(try driveToPhysicalDispatch(fixture, wakeID: manual.wakeID))
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(
+                for: fixture.session, dispatchID: .autoWake(wakeID: manual.wakeID)
+            )
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            XCTAssertEqual(
+                fixture.session.oversight.suppressedWakeFingerprint, original,
+                "manual failure must preserve automatic suppression, including nil"
+            )
+        }
+    }
+
+    func testManualWakeBecomingBusyRedrivesAbsorbedAttention() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = false
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, selectedTargetIndices: [])
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+        let manual = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let task = try XCTUnwrap(manual.task)
+        try publishLane(
+            fixture, linkSetRevision: 1, queueRevision: 2,
+            selectedTargetIndices: [], attentionRequests: [Self.attentionRequest(0)]
+        )
+        fixture.session.runState = .running
+        await task.value
+        let successor = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertNotEqual(successor.wakeID, manual.wakeID)
+        XCTAssertFalse(successor.isManual)
+        XCTAssertNotNil(successor.requiredAttentionOccurrence)
+        XCTAssertFalse(fixture.session.oversight.autoWakeReevaluationOwed)
+        XCTAssertEqual(fixture.session.runState, .running, "attention must wait for readiness, not interrupt")
+    }
+
+    func testManualWakeCannotAdmitAReplacementQueueEpoch() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, selectedTargetIndices: [])
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.admissionBasis, .manual)
+
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            selectedTargetIndices: [],
+            queueEpoch: UUID()
+        )
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake, "the new epoch requires ordinary admission")
+    }
+
+    func testRoutineCountdownOnlyAppearsForOtherwiseEligiblePendingContent() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try enableRoutineInterval(fixture, clock: clock, seconds: 300)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        func projection() -> AgentMonitorPendingUpdates {
+            fixture.viewModel.agentSessionLinkPendingUpdatesProjection(for: endpoint, outbound: [])
+        }
+        XCTAssertNil(projection().routineWakeDeferredUntil, "an empty queue schedules no wake")
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertEqual(projection().routineWakeDeferredUntil, clock.wallNow.addingTimeInterval(300))
+
+        fixture.session.runState = .running
+        XCTAssertNil(projection().routineWakeDeferredUntil, "busy is another gate")
+        fixture.session.runState = .idle
+        fixture.session.oversight.autoWakeOnUpdates = false
+        XCTAssertNil(projection().routineWakeDeferredUntil, "deselected content cannot promise a wake")
+        fixture.session.oversight.autoWakeOnUpdates = true
+        fixture.session.oversight.suppressedWakeFingerprint = try XCTUnwrap(
+            fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]
+        ).wakeEligibilityFingerprint
+        XCTAssertNil(projection().routineWakeDeferredUntil, "failure suppression has no timed retry")
+        fixture.session.oversight.suppressedWakeFingerprint = nil
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+        XCTAssertNil(projection().routineWakeDeferredUntil, "an existing attempt is not a countdown")
+    }
+
+    // MARK: - Routine wake interval helpers
+
+    /// Turns the limit on with a stamp that makes it currently deferring.
+    private func enableRoutineInterval(
+        _ fixture: Fixture,
+        clock: AgentSessionLinkAutoWakeSnoozeTestClock,
+        seconds: Int
+    ) throws {
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
+            fixture.viewModel,
+            tabID: fixture.tabID
+        )
+        fixture.session.oversight.lastOversightWakeDispatch = AgentSessionLinkOversightWakeDispatch(
+            observerEndpoint: endpoint,
+            instant: clock.instant
+        )
+        fixture.session.oversight.routineWakeIntervalEnabled = true
+        fixture.session.oversight.routineWakeIntervalSeconds = seconds
+    }
+
+    /// Drives a reserved attempt through the real claim and physical-acquisition seam.
+    @discardableResult
+    private func driveToPhysicalDispatch(_ fixture: Fixture, wakeID: UUID) throws -> Bool {
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session,
+            dispatchID: .autoWake(wakeID: wakeID)
+        ))
+        var preparing = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        preparing.task?.cancel()
+        preparing.task = nil
+        preparing.phase = .preparingDispatch
+        fixture.session.oversight.pendingAutoWake = preparing
+        return fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            for: fixture.session,
+            dispatchID: claim.dispatchID
+        )
+    }
+
     // MARK: - Snooze helpers
 
     @discardableResult
@@ -3470,6 +3959,544 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         for _ in 0 ..< 20 {
             await Task.yield()
         }
+    }
+
+    func testBusyPeriodicObserverSkipsEligibilityButMaintainsPreparingAttempt() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        fixture.session.runState = .running
+        var probes = 0
+        fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { _ in
+            probes += 1
+            return true
+        }
+        for _ in 0 ..< 20 {
+            fixture.session.noteMonitorObservationInputsChanged()
+            fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        }
+        await settleSnoozeTasks()
+        XCTAssertEqual(probes, 0)
+        XCTAssertNil(fixture.session.oversight.periodicDeadline)
+        fixture.session.runState = .completed
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        fixture.session.runState = .running
+        fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { _ in false }
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+    }
+
+    func testPeriodicCommittedDeletionFencesPreparedProducerBeforeCleanup() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let host = LiveWindowEndpointHost()
+        host.register(fixture.viewModel, windowID: endpoint.windowID)
+        let bridge = AgentSessionLinkRuntimeBridge(authority: DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+            runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date(timeIntervalSince1970: 0)
+        )), host: host)
+        let registry = AgentSessionDeletionRegistry.shared
+        let oldCommit = registry.commitObserver
+        let oldChange = registry.changeObserver
+        let oldInvalidation = AgentSessionLinkInvalidationSink.invalidateBinding
+        let oldReadiness = AgentSessionLinkCandidateReadinessSignal.onChange
+        let oldExact = AgentSessionLinkLocationInvalidationSink.refreshExactTargets
+        let oldObserved = AgentSessionLinkLocationInvalidationSink.refreshObservedTargets
+        bridge.attach(host: host)
+        defer {
+            registry.commitObserver = oldCommit
+            registry.changeObserver = oldChange
+            AgentSessionLinkInvalidationSink.invalidateBinding = oldInvalidation
+            AgentSessionLinkCandidateReadinessSignal.onChange = oldReadiness
+            AgentSessionLinkLocationInvalidationSink.refreshExactTargets = oldExact
+            AgentSessionLinkLocationInvalidationSink.refreshObservedTargets = oldObserved
+            fixture.session.oversight.retirePeriodicScheduling()
+        }
+        fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { bridge.isPeriodicWakeObserverLive(for: $0) }
+        let failed = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        registry.didFailDurableDeletion(failed)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint))
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        let rawID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        _ = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            "periodic", session: fixture.session, dispatchID: rawID
+        )
+        let gate = AutoWakeCatalogAuthorityGate()
+        let cleanup = registry.commitObserver
+        registry.commitObserver = { sessionID in
+            _ = await gate.requirement()
+            await cleanup?(sessionID)
+        }
+        let token = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
+        await gate.waitUntilEntered()
+        // Assert the contested state, so an unrelated inventory withdrawal cannot make this pass.
+        XCTAssertTrue(registry.isPermanentlyDeleted(sessionID: fixture.sessionID))
+        XCTAssertEqual(host.agentSessionLinkCandidates().first { $0.domainEndpoint == endpoint }?.isClosing, true)
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkPromptInventoryBySessionID[fixture.sessionID]?.inventory.isEmpty ?? true)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .preparingDispatch)
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: rawID))
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: fixture.session, dispatchID: rawID)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertNil(fixture.session.oversight.periodicDeadline)
+        await gate.open()
+        await deletion.value
+    }
+
+    // MARK: - Periodic idle scheduling and shared dispatch ownership
+
+    private func periodicFixture() throws -> (Fixture, AgentSessionLinkAutoWakeSnoozeTestClock, DomainAgentSessionLinkEndpointIdentity) {
+        let fixture = try makeFixture()
+        fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { _ in true }
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        fixture.session.oversight.periodicIdleWakeEnabled = true
+        fixture.session.oversight.periodicIdleWakeIntervalSeconds = 600
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        return (fixture, clock, endpoint)
+    }
+
+    @discardableResult
+    private func reservePeriodic(
+        _ fixture: Fixture,
+        clock: AgentSessionLinkAutoWakeSnoozeTestClock,
+        endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) throws -> UUID {
+        let token = try XCTUnwrap(fixture.session.oversight.periodicDeadlineToken)
+        let deadline = try XCTUnwrap(fixture.session.oversight.periodicDeadline)
+        clock.advanceWithoutFiring(seconds: 600)
+        fixture.viewModel.agentSessionLinkPeriodicWakeDeadline(endpoint: endpoint, token: token, deadline: deadline)
+        let attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        attempt.task?.cancel() // This suite drives the real physical seam without launching a provider.
+        fixture.session.oversight.pendingAutoWake?.task = nil
+        return attempt.wakeID
+    }
+
+    func testPeriodicScheduledCancellationRedrivesPendingAttention() throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        let attention = Self.attentionRequest(0)
+        try publishLane(
+            fixture, linkSetRevision: 1, queueRevision: 1,
+            targetIndices: [], laneIndices: [0], attentionRequests: [attention]
+        )
+        XCTAssertTrue(fixture.session.oversight.autoWakeReevaluationOwed)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkSetPeriodicIdleWake(enabled: false, seconds: 600, for: endpoint))
+        let successor = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertFalse(successor.isPeriodic)
+        XCTAssertNotNil(successor.requiredAttentionOccurrence)
+        XCTAssertFalse(fixture.session.oversight.autoWakeReevaluationOwed)
+    }
+
+    func testPeriodicEarlyAdmissionRefusalRedrivesPendingAttention() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        let periodic = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let attention = Self.attentionRequest(0)
+        try publishLane(
+            fixture, linkSetRevision: 1, queueRevision: 1,
+            targetIndices: [], laneIndices: [0], attentionRequests: [attention]
+        )
+        fixture.session.runState = .running
+        await fixture.viewModel.agentSessionLinkRunPeriodicAttempt(periodic, session: fixture.session)
+        let successor = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertFalse(successor.isPeriodic)
+        XCTAssertNotNil(successor.requiredAttentionOccurrence)
+        XCTAssertFalse(fixture.session.oversight.autoWakeReevaluationOwed)
+        XCTAssertEqual(fixture.session.runState, .running, "attention admission must not interrupt the active turn")
+    }
+
+    func testPeriodicEmptyQueueAcquiresAndAcceptsWithoutAClaimOrRoutineStamp() throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let natural = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session, dispatchID: .headlessRun(runID: UUID())
+        ))
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(natural)
+        let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake?.queue)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        let rawID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        let monitoring = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            AgentModeViewModel.periodicWakeMessage, session: fixture.session, dispatchID: rawID
+        )
+        XCTAssertNil(monitoring.claim)
+        XCTAssertFalse(monitoring.mustAbortDispatch)
+        XCTAssertEqual(monitoring.dispatchContext?.dispatchID.autoWakeID, wakeID)
+        XCTAssertEqual(monitoring.text, AgentModeViewModel.periodicWakeMessage)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: rawID))
+        XCTAssertNil(fixture.session.oversight.lastOversightWakeDispatch)
+        fixture.viewModel.acceptAgentSessionLinkDispatch(session: fixture.session, context: monitoring.dispatchContext, claim: nil)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertEqual(fixture.session.oversight.periodicDeadline, clock.instant.advanced(by: .seconds(600)))
+    }
+
+    func testPeriodicIdleBaselineDoesNotSlideAndBusyExpiryHasNoBacklog() throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let original = try XCTUnwrap(fixture.session.oversight.periodicDeadline)
+        let token = try XCTUnwrap(fixture.session.oversight.periodicDeadlineToken)
+        clock.advanceWithoutFiring(seconds: 300)
+        fixture.session.noteMonitorObservationInputsChanged()
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertEqual(fixture.session.oversight.periodicDeadline, original)
+        fixture.session.runState = .running
+        fixture.session.runState = .completed // Both edges occur before deferred Combine delivery.
+        XCTAssertNil(fixture.session.oversight.periodicDeadlineToken)
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertEqual(fixture.session.oversight.periodicDeadline, clock.instant.advanced(by: .seconds(600)))
+        clock.advanceWithoutFiring(seconds: 300)
+        fixture.viewModel.agentSessionLinkPeriodicWakeDeadline(endpoint: endpoint, token: token, deadline: original)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+    }
+
+    func testPeriodicTombstoneRejectsLateProducerAndForeignRefusalCannotRetireIt() throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        let producer = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        _ = fixture.viewModel.agentSessionLinkDecoratedProviderText("periodic", session: fixture.session, dispatchID: producer)
+        fixture.session.oversight.periodicIdleWakeEnabled = false
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        let foreign = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: fixture.session, dispatchID: foreign)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID)
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: producer))
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: fixture.session, dispatchID: producer)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+    }
+
+    func testPeriodicAcceptanceReleasesWaitingContinuationBeforeNotificationReevaluation() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let natural = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session, dispatchID: .headlessRun(runID: UUID())
+        ))
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(natural)
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        let raw = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+        let monitoring = fixture.viewModel.agentSessionLinkDecoratedProviderText("periodic", session: fixture.session, dispatchID: raw)
+        XCTAssertNil(monitoring.claim)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: raw))
+        let waiting = Task { @MainActor in
+            try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID, prompt: "What next?", timeoutSeconds: 5)
+        }
+        for _ in 0 ..< 20 where fixture.session.instructionContinuation == nil {
+            await Task.yield()
+        }
+        XCTAssertNotNil(fixture.session.instructionContinuation)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.admissionBasis, .periodic)
+        fixture.viewModel.acceptAgentSessionLinkDispatch(session: fixture.session, context: monitoring.dispatchContext, claim: nil)
+        let notification = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertFalse(notification.isPeriodic)
+        let response = try await waiting.value
+        guard case .laneUpdateAutoWake = response.origin else { return XCTFail("notification must resume the waiting continuation") }
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertNil(fixture.session.oversight.periodicDeadlineToken)
+        XCTAssertFalse(fixture.session.items.contains { $0.kind == .user })
+    }
+
+    func testPeriodicFinalizerWaitsForDelayedProducerBeforeRetiringTombstone() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        let raw = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        _ = fixture.viewModel.agentSessionLinkDecoratedProviderText("periodic", session: fixture.session, dispatchID: raw)
+        let gate = AutoWakeCatalogAuthorityGate()
+        let producer = Task { @MainActor in
+            _ = await gate.requirement()
+            XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: raw))
+        }
+        fixture.session.oversight.pendingAutoWake?.periodicProducerTask = producer
+        fixture.session.oversight.pendingAutoWake?.periodicStartReturned = true
+        fixture.session.oversight.periodicIdleWakeEnabled = false
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        let finalizer = Task { @MainActor in
+            await fixture.viewModel.agentSessionLinkAwaitPhysicalDispatchSettlement(wakeID: wakeID, endpoint: endpoint)
+        }
+        await gate.waitUntilEntered()
+        for _ in 0 ..< 5 {
+            await Task.yield()
+        }
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        XCTAssertTrue(AgentModeViewModel.dispatchRequiresLaneBatch(fixture.session, raw), "lost VM must still fail closed")
+        await gate.open()
+        await finalizer.value
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertNil(fixture.session.oversight.periodicDeadline)
+    }
+
+    func testPeriodicACPResumeFailurePreservesIdentityAndHandoffWithoutPrompting() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let (harness, provider, responseGate, directory) = try makePeriodicACPHarness(
+            fixture, holdMethod: "unused", failLoad: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = responseGate
+        fixture.session.selectedAgent = .openCode
+        fixture.session.providerSessionID = "missing-original-session"
+        fixture.session.pendingHandoff.payload = "Preserve user handoff"
+        let handoff = fixture.session.pendingHandoff
+        let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        let startup = try startPeriodicACP(fixture, harness: harness, wakeID: wakeID, endpoint: endpoint)
+        await startup.value
+        XCTAssertEqual(fixture.session.providerSessionID, "missing-original-session")
+        XCTAssertEqual(fixture.session.pendingHandoff, handoff)
+        XCTAssertTrue(provider.promptedMessages.isEmpty)
+        XCTAssertEqual(harness.acceptedDispatchCount, 0)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        XCTAssertNil(fixture.session.acpController)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+    }
+
+    func testPeriodicClaudeResumeFailureDoesNotStartFreshButUserRecoveryStillWorks() async throws {
+        for periodic in [true, false] {
+            let (fixture, clock, endpoint) = try periodicFixture()
+            if periodic { _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint) }
+            else { fixture.session.oversight.retirePeriodicScheduling() }
+            let session = AgentTabSession(tabID: fixture.tabID)
+            session.hasLoadedPersistedState = true
+            session.testInstallPersistentSessionBinding(sessionID: UUID())
+            session.oversight.pendingAutoWake = fixture.session.oversight.pendingAutoWake
+            session.selectedAgent = .claudeCode
+            session.providerSessionID = "missing-original-session"
+            let controller = MonitorFakeNativeController()
+            await controller.setRejectResume(true)
+            var creations = 0
+            let coordinator = ClaudeAgentModeCoordinator(
+                windowID: 1, workspacePathProvider: { _ in nil },
+                claudeControllerFactory: { _, _, _, _ in
+                    creations += 1
+                    return controller
+                }
+            )
+            let runID = UUID()
+            session.installRunID(runID)
+            let ownership = session.beginRunAttempt(source: "test.periodic.resume")
+            let result = await coordinator.ensureClaudeNativeSession(
+                session: session, intent: .runAttempt(ownership: ownership, runID: runID)
+            )
+            let attempts = await controller.startOrResumeExistingSessionIDs
+            if periodic {
+                guard case .failed = result else { return XCTFail("periodic resume must fail closed: \(result)") }
+                XCTAssertEqual(attempts, ["missing-original-session"])
+                XCTAssertEqual(creations, 1)
+                XCTAssertEqual(session.providerSessionID, "missing-original-session")
+            } else {
+                XCTAssertEqual(result, .ready)
+                XCTAssertEqual(attempts, ["missing-original-session", nil])
+                XCTAssertEqual(creations, 2)
+            }
+            await controller.shutdown()
+        }
+    }
+
+    func testPeriodicACPCancelledStartupLatchesLateProducerAndPreservesHandoff() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let factoryGate = AutoWakeCatalogAuthorityGate()
+        let (harness, provider, responseGate, directory) = try makePeriodicACPHarness(
+            fixture, holdMethod: "session/new", factoryGate: factoryGate
+        )
+        defer {
+            responseGate.release()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        fixture.session.pendingHandoff.payload = "User handoff must remain untouched"
+        let handoff = fixture.session.pendingHandoff
+        let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        let startup = try startPeriodicACP(fixture, harness: harness, wakeID: wakeID, endpoint: endpoint)
+        await factoryGate.waitUntilEntered()
+        XCTAssertNil(fixture.session.agentTask, "ACP startup is suspended before producer installation")
+        fixture.session.oversight.periodicIdleWakeEnabled = false
+        fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        await factoryGate.open()
+        try await responseGate.waitUntilEntered()
+        try await AsyncTestWait.waitUntil("ACP startup to return while its producer remains gated") {
+            await MainActor.run { fixture.session.oversight.pendingAutoWake?.periodicStartReturned == true }
+        }
+        XCTAssertNotNil(
+            fixture.session.oversight.pendingAutoWake?.periodicProducerTask,
+            "the exact composer owner must latch a producer installed after cancellation"
+        )
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        XCTAssertEqual(fixture.session.pendingHandoff, handoff)
+        XCTAssertTrue(provider.promptedMessages.isEmpty)
+        responseGate.release()
+        await startup.value
+        await fixture.session.agentTask?.value
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertTrue(provider.promptedMessages.isEmpty, "disabled periodic text must never reach controller.prompt")
+        XCTAssertEqual(harness.acceptedDispatchCount, 0)
+        XCTAssertEqual(fixture.session.pendingHandoff, handoff)
+        await fixture.session.acpController?.shutdown()
+    }
+
+    func testPeriodicACPInstructionWaitDeliversAttentionBeforePromptResponse() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let (harness, provider, responseGate, directory) = try makePeriodicACPHarness(fixture, holdMethod: "session/prompt")
+        defer {
+            responseGate.release()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        // Consume membership first: this periodic physical call has genuinely no optional claim.
+        let membership = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session, dispatchID: .headlessRun(runID: UUID())
+        ))
+        fixture.viewModel.acceptAgentSessionLinkPromptClaim(membership)
+        let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        let startup = try startPeriodicACP(fixture, harness: harness, wakeID: wakeID, endpoint: endpoint)
+        try await responseGate.waitUntilEntered()
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .dispatching)
+        XCTAssertEqual(
+            fixture.session.oversight.pendingAutoWake?.periodicProducerDispatchID,
+            try .acpPromptTurn(runAttemptID: XCTUnwrap(fixture.session.activeRunAttemptID))
+        )
+        XCTAssertEqual(harness.acceptedDispatchCount, 0, "ACP callback cannot run until the held prompt response returns")
+        // Attention arrives before the wait is installed, exercising the existing reevaluation debt.
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0],
+            attentionRequests: [Self.attentionRequest(0)]
+        )
+        XCTAssertTrue(fixture.session.oversight.autoWakeReevaluationOwed)
+        XCTAssertFalse(fixture.session.oversight.autoWakeOnUpdates, "attention must not depend on routine wake selection")
+        let waiting = Task { @MainActor in
+            try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID, prompt: "What next?", timeoutSeconds: 5)
+        }
+        let response = try await waiting.value
+        XCTAssertFalse(response.timedOut)
+        guard case .laneUpdateAutoWake = response.origin else {
+            responseGate.release()
+            await fixture.session.agentTask?.value
+            await fixture.session.acpController?.shutdown()
+            return XCTFail("exact attention must resume the ordinary wait before ACP completes")
+        }
+        XCTAssertEqual(harness.acceptedDispatchCount, 0, "yielding the execution slot must not manufacture an acceptance receipt")
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertFalse(fixture.session.items.contains { $0.kind == .user })
+        XCTAssertEqual(provider.promptedMessages.count, 1, "attention resumes the existing run, not another ACP prompt")
+        try MonitorSupplementAssertions.assertCarriesNoSupplement(XCTUnwrap(provider.promptedMessages.first).userMessage)
+        responseGate.release()
+        await fixture.session.agentTask?.value
+        await startup.value
+        XCTAssertEqual(harness.acceptedDispatchCount, 1, "the original transport callback still settles after its response")
+        XCTAssertTrue(harness.acceptedClaims.isEmpty, "the original periodic turn was claimless")
+        await fixture.session.acpController?.shutdown()
+    }
+
+    func testPeriodicACPContinuationReleaseRejectsUnacquiredCancelledAndForeignRuns() async throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        let runAttemptID = fixture.session.beginRunAttempt(source: "test.periodic.acp.wait-fences").attemptID
+        let raw = AgentSessionLinkPromptDispatchID.acpPromptTurn(runAttemptID: runAttemptID)
+        var acquired = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        acquired.phase = .dispatching
+        acquired.physicalOutcome = .ambiguous
+        acquired.periodicProducerDispatchID = raw
+        fixture.session.runState = .waitingForUser
+        fixture.session.instructionWaitID = UUID()
+        let _: UserInstructionResponse = try await withCheckedThrowingContinuation { continuation in
+            fixture.session.instructionContinuation = continuation
+            for phase: AgentSessionLinkAutoWakeAttempt.Phase in [.preparingDispatch, .cancelledBeforeDispatch, .dispatching] {
+                var attempt = acquired
+                attempt.phase = phase
+                if phase == .dispatching { attempt.physicalOutcome = .notAttempted }
+                fixture.session.oversight.pendingAutoWake = attempt
+                fixture.viewModel.agentSessionLinkReleasePeriodicACPContinuationSlot(for: fixture.session)
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID)
+            }
+            for foreign: AgentSessionLinkPromptDispatchID in [.acpPromptTurn(runAttemptID: UUID()), .acpActiveSteering(runAttemptID: runAttemptID)] {
+                var attempt = acquired
+                attempt.periodicProducerDispatchID = foreign
+                fixture.session.oversight.pendingAutoWake = attempt
+                fixture.viewModel.agentSessionLinkReleasePeriodicACPContinuationSlot(for: fixture.session)
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID)
+            }
+            fixture.session.oversight.pendingAutoWake = acquired
+            fixture.session.codexHookGateAttemptToken = UUID()
+            fixture.viewModel.agentSessionLinkReleasePeriodicACPContinuationSlot(for: fixture.session)
+            XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID, "a hook approval is not an ordinary wait")
+            fixture.session.instructionContinuation = nil
+            fixture.session.instructionWaitID = nil
+            fixture.session.codexHookGateAttemptToken = nil
+            continuation.resume(returning: UserInstructionResponse(text: nil, timedOut: false, elapsedSeconds: 0))
+        }
+        fixture.session.oversight.pendingAutoWake = nil
+    }
+
+    private func makePeriodicACPHarness(
+        _ fixture: Fixture, holdMethod: String, factoryGate: AutoWakeCatalogAuthorityGate? = nil, failLoad: Bool = false
+    ) throws -> (AgentSessionLinkRunnerHarness, AgentSessionLinkCapturingACPProvider, AgentSessionLinkACPResponseGate, URL) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PeriodicACP-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let gate = try AgentSessionLinkACPResponseGate(directory: directory)
+        let script = try AgentSessionLinkACPServerScript.write(to: directory)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path, environment: [
+            "ACP_HOLD_METHOD": holdMethod, "ACP_RESPONSE_GATE": gate.path, "ACP_FAIL_LOAD": failLoad ? "1" : ""
+        ])
+        let harness = AgentSessionLinkRunnerHarness(
+            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            acpProviderFactory: { _, _ in
+                _ = await factoryGate?.requirement()
+                return provider
+            },
+            workspacePath: directory.path, sessionLinkHost: fixture.viewModel
+        )
+        harness.onHeadlessMessageBuilt = { [weak self] in
+            // Fresh ACP startup owns a new process run; publish its exact ready catalog as the host would.
+            _ = try? self?.publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true)
+        }
+        return (harness, provider, gate, directory)
+    }
+
+    /// Hold the real composer claim across real run-service/ACP startup, then use the production
+    /// periodic finalizer. Only the app-host preparation is bypassed; no producer handle is injected.
+    private func startPeriodicACP(
+        _ fixture: Fixture, harness: AgentSessionLinkRunnerHarness, wakeID: UUID,
+        endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) throws -> Task<Void, Never> {
+        let target = try XCTUnwrap(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
+        let submission = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+        guard case let .claimed(claim) = fixture.viewModel.claimComposerSubmitAttempt(submission, requireActiveTabOwnership: false) else {
+            throw NSError(domain: "PeriodicACP", code: 1)
+        }
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        fixture.session.oversight.pendingAutoWake?.periodicComposerAttemptID = submission.id
+        return Task { @MainActor in
+            _ = await harness.service.startRun(
+                tabID: fixture.tabID, session: fixture.session,
+                initialUserMessage: AgentModeViewModel.periodicWakeMessage,
+                initialMessageForRun: AgentModeViewModel.periodicWakeMessage, attachments: []
+            )
+            if fixture.session.oversight.pendingAutoWake?.wakeID == wakeID {
+                fixture.session.oversight.pendingAutoWake?.periodicStartReturned = true
+            }
+            fixture.viewModel.releaseComposerSubmitClaim(claim)
+            await fixture.viewModel.agentSessionLinkAwaitPhysicalDispatchSettlement(wakeID: wakeID, endpoint: endpoint)
+        }
+    }
+
+    func testPeriodicWithheldInventoryAndHostRetirementFailClosed() throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        let raw = AgentSessionLinkPromptDispatchID.codexFallback(queueID: UUID())
+        _ = fixture.viewModel.agentSessionLinkDecoratedProviderText("periodic", session: fixture.session, dispatchID: raw)
+        _ = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: raw))
+        fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { _ in false }
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint))
     }
 
     // MARK: - Fixture

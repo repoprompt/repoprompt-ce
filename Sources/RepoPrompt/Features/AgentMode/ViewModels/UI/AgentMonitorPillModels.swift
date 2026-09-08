@@ -271,11 +271,290 @@ enum AgentMonitorAutoWakeCopy {
     way. Unlink revokes attention, and all other safety and admission gates still apply
     """
     static let unavailableMessage = "That Agent session is no longer active."
-    /// Shown with zero links, where the setting is saved but has nothing to act on yet.
-    static let noLinksNote = "Saved with this session. It takes effect once you oversee something."
     static let loadingReason = "This Agent session is still loading."
     static let closingReason = "This Agent session is closing."
     static let missingReason = "That Agent session is no longer active."
+}
+
+/// Why the observer's own `Wake now` cannot run, or `nil` when it can.
+///
+/// Shared by the action result and button availability.
+enum AgentMonitorWakeNowRefusal: Equatable {
+    /// The exact incarnation is gone, closing, or not hydrated.
+    case observerUnavailable
+    /// The queue holds nothing deliverable for this observer.
+    case noPendingUpdates
+    /// A wake is already reserved — including one whose transport fence is still standing.
+    case alreadyWaking
+    /// The observer is running, waiting on an interaction, or otherwise not dispatchable.
+    case sessionBusy
+    /// The provider context cannot carry a lane supplement right now.
+    case notReady
+
+    /// Shown in the dashboard's existing observer-control message area, and as the button tooltip.
+    var message: String {
+        switch self {
+        case .observerUnavailable:
+            "That Agent session is no longer active."
+        case .noPendingUpdates:
+            "No pending updates to process."
+        case .alreadyWaking:
+            "A wake for these updates is already pending."
+        case .sessionBusy:
+            "This session is busy. Try again when its current turn finishes."
+        case .notReady:
+            "This session can’t carry an update right now."
+        }
+    }
+}
+
+/// What one `Wake now` request did.
+///
+/// `.scheduled` deliberately does not say "started": the coordinator reserved the turn, and claim
+/// construction, budget, and physical acquisition may still refuse it.
+enum AgentMonitorWakeNowOutcome: Equatable {
+    case scheduled
+    case refused(AgentMonitorWakeNowRefusal)
+
+    var refusal: AgentMonitorWakeNowRefusal? {
+        guard case let .refused(refusal) = self else { return nil }
+        return refusal
+    }
+}
+
+/// The dashboard's read-only projection of one observer's pending oversight queue.
+///
+/// Counts are *coalesced* updates rather than raw events, because that is what the canonical queue
+/// stores: one status interval per lane plus separate attention occurrences. Unattributed overflow is
+/// deliberately outside both counts — it records that edges were dropped, never which session
+/// produced them — but it still makes the queue non-empty, so an overflow-only queue must never read
+/// as "No pending updates".
+struct AgentMonitorPendingUpdates: Equatable {
+    enum Item: Equatable {
+        case status(
+            from: AgentSessionLinkPassiveStatusNotices.Status,
+            to: AgentSessionLinkPassiveStatusNotices.Status
+        )
+        case attention
+    }
+
+    struct Group: Equatable, Identifiable {
+        let targetSessionID: UUID
+        let displayName: String
+        let locationLabel: String?
+        let items: [Item]
+
+        var id: UUID {
+            targetSessionID
+        }
+
+        /// `location: task` when both are known, matching the lane rows above it.
+        var title: String {
+            guard let locationLabel, !locationLabel.isEmpty else { return displayName }
+            return "\(locationLabel): \(displayName)"
+        }
+    }
+
+    let groups: [Group]
+    let updateCount: Int
+    let sessionCount: Int
+    let hasUnattributedOverflow: Bool
+    let wakeNowRefusal: AgentMonitorWakeNowRefusal?
+    /// When routine content deferred by the minimum interval becomes eligible again, or `nil`.
+    let routineWakeDeferredUntil: Date?
+
+    static let empty = AgentMonitorPendingUpdates(
+        groups: [],
+        updateCount: 0,
+        sessionCount: 0,
+        hasUnattributedOverflow: false,
+        wakeNowRefusal: .noPendingUpdates,
+        routineWakeDeferredUntil: nil
+    )
+
+    static let unavailable = AgentMonitorPendingUpdates(
+        groups: [],
+        updateCount: 0,
+        sessionCount: 0,
+        hasUnattributedOverflow: false,
+        wakeNowRefusal: .observerUnavailable,
+        routineWakeDeferredUntil: nil
+    )
+
+    var isEmpty: Bool {
+        updateCount == 0 && !hasUnattributedOverflow
+    }
+
+    /// Joins the canonical queue to the dashboard's own rows.
+    ///
+    /// Labels come from the outbound rows, matched by generation-qualified reference, so the section
+    /// says exactly what the lane list above it says and can never resurrect a retired incarnation's
+    /// name. Queue content whose row is missing (a projection-ordering gap) keeps its place under a
+    /// short-ID fallback rather than borrowing a different generation's label.
+    static func make(
+        snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot?,
+        outbound: [AgentMonitorPillProps.Outbound],
+        wakeNowRefusal: AgentMonitorWakeNowRefusal?,
+        routineWakeDeferredUntil: Date?
+    ) -> AgentMonitorPendingUpdates {
+        guard let snapshot, snapshot.isDeliverable else {
+            return AgentMonitorPendingUpdates(
+                groups: [],
+                updateCount: 0,
+                sessionCount: 0,
+                hasUnattributedOverflow: false,
+                wakeNowRefusal: wakeNowRefusal ?? .noPendingUpdates,
+                routineWakeDeferredUntil: nil
+            )
+        }
+        var itemsByTarget: [UUID: [Item]] = [:]
+        var referenceByTarget: [UUID: DomainAgentSessionLinkReference] = [:]
+        for entry in snapshot.entries {
+            itemsByTarget[entry.targetSessionID, default: []]
+                .append(.status(from: entry.fromStatus, to: entry.toStatus))
+            referenceByTarget[entry.targetSessionID] = entry.reference
+        }
+        for request in snapshot.attentionRequests {
+            itemsByTarget[request.targetSessionID, default: []].append(.attention)
+            referenceByTarget[request.targetSessionID] = request.reference
+        }
+        let sortedRows = AgentMonitorDashboardSortPolicy.sorted(outbound)
+        var groups: [Group] = []
+        for row in sortedRows {
+            guard let items = itemsByTarget[row.targetSessionID],
+                  referenceByTarget[row.targetSessionID] == DomainAgentSessionLinkReference(
+                      linkID: row.linkID,
+                      generation: row.generation
+                  )
+            else {
+                continue
+            }
+            groups.append(Group(
+                targetSessionID: row.targetSessionID,
+                displayName: row.displayName,
+                locationLabel: row.locationLabel,
+                items: items
+            ))
+        }
+        let matched = Set(groups.map(\.targetSessionID))
+        for (targetSessionID, items) in itemsByTarget
+            .filter({ !matched.contains($0.key) })
+            .sorted(by: { $0.key.uuidString < $1.key.uuidString })
+        {
+            groups.append(Group(
+                targetSessionID: targetSessionID,
+                displayName: AgentMonitorSessionIDFormatter.short(targetSessionID),
+                locationLabel: nil,
+                items: items
+            ))
+        }
+        let updateCount = snapshot.entries.count + snapshot.attentionRequests.count
+        return AgentMonitorPendingUpdates(
+            groups: groups,
+            updateCount: updateCount,
+            sessionCount: Set(itemsByTarget.keys).count,
+            hasUnattributedOverflow: snapshot.unacknowledgedOverflowCount > 0,
+            wakeNowRefusal: wakeNowRefusal,
+            routineWakeDeferredUntil: routineWakeDeferredUntil
+        )
+    }
+}
+
+enum AgentMonitorPeriodicWakeCopy {
+    static let label = "Wake when idle for"
+    static let intervalLabel = "Periodic wake interval"
+    static let tooltip = """
+    While overseeing another session, wake after this much idle time, even without updates. \
+    Each wake uses a model turn and only follows prior user instructions.
+    """
+
+    static func optionLabel(seconds: Int) -> String {
+        "\(seconds / 60) min"
+    }
+}
+
+/// Pure routine-interval formatting; the coordinator decides whether a countdown is truthful.
+enum AgentMonitorRoutineWakeCopy {
+    static let limitLabel = "Routine wake-ups no more often than"
+    static let intervalLabel = "Minimum interval"
+    static let tooltip = """
+    Applies across every session this observer oversees, and counts from the last oversight wake \
+    rather than from a fixed schedule. Explicit attention requests and Wake now bypass it without \
+    changing it. Nothing is dropped or acknowledged: deferred updates stay queued and still ride \
+    along on this agent’s own next turn.
+    """
+    static let accessibilityLabel = "Limit routine wake-ups"
+    static let intervalAccessibilityLabel = "Minimum interval between routine wake-ups"
+
+    static func optionLabel(seconds: Int) -> String {
+        seconds < 60 ? "\(seconds) sec" : "\(seconds / 60) min"
+    }
+
+    /// The muted inline countdown, or `nil` when there is nothing truthful to say.
+    ///
+    /// Rounded **up** and never zero: an elapsed remainder omits the line rather than claiming a wake
+    /// happened or is imminent.
+    static func countdown(deferredUntil: Date?, now: Date) -> String? {
+        guard let deferredUntil else { return nil }
+        let remaining = deferredUntil.timeIntervalSince(now)
+        guard remaining > 0 else { return nil }
+        if remaining < 60 { return "Next wake in less than a minute" }
+        return "Next wake in \(Int(ceil(remaining / 60))) min"
+    }
+
+    static let countdownTooltip = """
+    The earliest a routine update may start a follow-up turn, not a promised call. It still depends \
+    on the update still being pending and on every other admission gate.
+    """
+}
+
+/// Copy for the compact pending-updates section and its one-shot Wake now action.
+enum AgentMonitorPendingUpdatesCopy {
+    static let header = "Pending updates"
+    static let wakeNowLabel = "Wake now"
+    static let detailsLabel = "Details"
+    static let empty = "No pending updates"
+    static let overflowOnly = "Additional changes pending"
+    static let overflowNote = "Additional changes not itemized"
+    static let wakeNowTooltip = """
+    Processes the pending updates in one turn now. It bypasses the routine interval and this \
+    session’s selection and snooze choices for this one turn without changing any of them.
+    """
+    static let attentionItem = "Attention requested"
+
+    /// Sessions are counted only when more than one is involved: a single-session queue reads better
+    /// without a redundant clause.
+    static func summary(updateCount: Int, sessionCount: Int, hasOverflow: Bool) -> String {
+        guard updateCount > 0 else {
+            return hasOverflow ? overflowOnly : empty
+        }
+        let updates = updateCount == 1 ? "1 update" : "\(updateCount) updates"
+        let base = sessionCount > 1 ? "\(updates) across \(sessionCount) sessions" : updates
+        return hasOverflow ? "\(base) · \(overflowNote)" : base
+    }
+
+    static func statusItem(
+        from: AgentSessionLinkPassiveStatusNotices.Status,
+        to: AgentSessionLinkPassiveStatusNotices.Status
+    ) -> String {
+        "\(label(from)) → \(label(to))"
+    }
+
+    static func item(_ item: AgentMonitorPendingUpdates.Item) -> String {
+        switch item {
+        case let .status(from, to): statusItem(from: from, to: to)
+        case .attention: attentionItem
+        }
+    }
+
+    private static func label(_ status: AgentSessionLinkPassiveStatusNotices.Status) -> String {
+        switch status {
+        case .idle: "Idle"
+        case .running: "Running"
+        case .waiting: "Waiting"
+        case .unavailable: "Unavailable"
+        }
+    }
 }
 
 /// Copy for the inline row controls and the unread affordance.
@@ -1069,6 +1348,22 @@ struct AgentMonitorPillProps: Equatable {
     /// unlinked or temporarily prompt-ineligible: the setting is saved with the session and stays
     /// editable there, it is simply inert until it has something to act on.
     var autoWakeUnavailableReason: String?
+    /// This observer session's persisted minimum routine wake interval, and the duration it retains
+    /// while that limit is off.
+    ///
+    /// Saved with the session exactly like the Auto-wake selection, and inert in the same way: it
+    /// governs routine status and overflow admission only, and never delivery.
+    var routineWakeIntervalEnabled: Bool
+    var routineWakeIntervalSeconds: Int
+    var periodicIdleWakeEnabled: Bool
+    var periodicIdleWakeIntervalSeconds: Int
+    /// The live pending-queue projection, overlaid for the tab on screen rather than published with
+    /// the authoritative link rows.
+    ///
+    /// Deliberately absent from the stored projection: queue depth changes on receipts and busy/idle
+    /// transitions that move no link, so baking it into stored props would repaint the sidebar and
+    /// window title for presentation-only churn.
+    var pendingUpdates: AgentMonitorPendingUpdates?
     /// Process-wide durable-oversight state, overlaid by the owning window rather than published by
     /// the bridge's per-endpoint projection.
     ///
@@ -1088,6 +1383,11 @@ struct AgentMonitorPillProps: Equatable {
         autoWakeOnUpdatesEnabled: Bool = false,
         autoWakeTargetSessionIDs: Set<UUID> = [],
         autoWakeUnavailableReason: String? = nil,
+        routineWakeIntervalEnabled: Bool = false,
+        routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds,
+        periodicIdleWakeEnabled: Bool = false,
+        periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
+        pendingUpdates: AgentMonitorPendingUpdates? = nil,
         persistence: AgentSessionOversightPersistencePresentation = AgentSessionOversightPersistencePresentation.noDurableLayer
     ) {
         self.sessionID = sessionID
@@ -1100,6 +1400,11 @@ struct AgentMonitorPillProps: Equatable {
         self.autoWakeOnUpdatesEnabled = autoWakeOnUpdatesEnabled
         self.autoWakeTargetSessionIDs = autoWakeTargetSessionIDs
         self.autoWakeUnavailableReason = autoWakeUnavailableReason
+        self.routineWakeIntervalEnabled = routineWakeIntervalEnabled
+        self.routineWakeIntervalSeconds = routineWakeIntervalSeconds
+        self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
+        self.periodicIdleWakeIntervalSeconds = periodicIdleWakeIntervalSeconds
+        self.pendingUpdates = pendingUpdates
         self.persistence = persistence
     }
 
@@ -1130,6 +1435,11 @@ struct AgentMonitorPillProps: Equatable {
             autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled,
             autoWakeTargetSessionIDs: autoWakeTargetSessionIDs,
             autoWakeUnavailableReason: autoWakeUnavailableReason,
+            routineWakeIntervalEnabled: routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
+            pendingUpdates: pendingUpdates,
             persistence: persistence
         )
     }
@@ -1156,6 +1466,11 @@ struct AgentMonitorPillProps: Equatable {
             autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled,
             autoWakeTargetSessionIDs: autoWakeTargetSessionIDs,
             autoWakeUnavailableReason: autoWakeUnavailableReason,
+            routineWakeIntervalEnabled: routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
+            pendingUpdates: pendingUpdates,
             persistence: presentation
         )
     }

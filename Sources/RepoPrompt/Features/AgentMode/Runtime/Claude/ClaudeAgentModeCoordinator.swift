@@ -96,7 +96,7 @@ final class ClaudeAgentModeCoordinator {
             _ session: AgentTabSession,
             _ dispatchID: AgentSessionLinkPromptDispatchID
         ) -> Void
-        let acceptAgentSessionLinkPromptClaim: @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
+        let acceptAgentSessionLinkPromptClaim: @MainActor (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
 
         init(
             isSessionCurrent: @escaping @MainActor (_ session: AgentTabSession) -> Bool,
@@ -127,7 +127,7 @@ final class ClaudeAgentModeCoordinator {
                 _ session: AgentTabSession,
                 _ dispatchID: AgentSessionLinkPromptDispatchID
             ) -> Void,
-            acceptAgentSessionLinkPromptClaim: @escaping @MainActor (AgentSessionLinkOutboundPromptClaim?) -> Void
+            acceptAgentSessionLinkPromptClaim: @escaping @MainActor (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
         ) {
             self.isSessionCurrent = isSessionCurrent
             self.requestUIRefresh = requestUIRefresh
@@ -158,7 +158,7 @@ final class ClaudeAgentModeCoordinator {
                 acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
                 recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
-                acceptAgentSessionLinkPromptClaim: { _ in }
+                acceptAgentSessionLinkPromptClaim: { _, _, _ in }
             )
         }
     }
@@ -724,6 +724,7 @@ final class ClaudeAgentModeCoordinator {
         effectiveAllowNativeBashTool: Bool?,
         effectiveMCPStrictMode: Bool?
     ) async throws -> NativeAgentRuntimeSessionRef {
+        let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let existingSessionID = session.providerSessionID
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
         let effortLevel = currentClaudeEffortLevel(for: session)
@@ -754,7 +755,8 @@ final class ClaudeAgentModeCoordinator {
                 }
                 throw ControllerLifecycleError.superseded
             }
-            guard intent.allowsFreshStartRecovery,
+            // A periodic turn cannot recover into a fresh conversation without its handoff.
+            guard !isPeriodic, intent.allowsFreshStartRecovery,
                   shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID)
             else {
                 throw error
@@ -1206,7 +1208,7 @@ final class ClaudeAgentModeCoordinator {
                 let turnID = try await controller.sendUserMessage(providerBoundText)
                 // The returned provider turn ID is the acceptance signal. Acknowledge before the
                 // currency guard: even a locally superseded turn delivered this supplement.
-                hostCapabilities.acceptAgentSessionLinkPromptClaim(monitoring.claim)
+                hostCapabilities.acceptAgentSessionLinkPromptClaim(session, monitoring.dispatchContext, monitoring.claim)
                 guard intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {

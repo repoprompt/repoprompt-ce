@@ -35,27 +35,32 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
     }
 
     func testFallbackResetSettlesOnlyItsUnattemptedWake() throws {
-        for ownsWake in [false, true] {
-            for acquired in [false, true] {
-                let fixture = try makeFixture()
-                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
-                let wakeID = UUID()
-                fixture.session.oversight.pendingAutoWake = AgentSessionLinkAutoWakeAttempt(
-                    wakeID: wakeID, observerEndpoint: endpoint, queueEpoch: Self.queueEpoch,
-                    queueRevision: 1,
-                    wakeFingerprint: Self.laneSnapshot(observerEndpoint: endpoint).wakeEligibilityFingerprint,
-                    requiredAttentionOccurrence: nil, attemptedFingerprint: nil,
-                    physicalOutcome: acquired ? .ambiguous : .notAttempted,
-                    phase: acquired ? .dispatching : .preparingDispatch, task: nil
-                )
-                var entry = Self.fallbackQueueEntry(controller: fixture.controller, session: fixture.session)
-                entry.monitoringWakeID = ownsWake ? wakeID : UUID()
-                fixture.session.codexFallbackQueue = [entry]
-                fixture.viewModel.test_codexCoordinator.handleMCPControlReset(for: fixture.session, reason: "test reset")
-                XCTAssertTrue(fixture.session.codexFallbackQueue.isEmpty)
-                XCTAssertEqual(fixture.session.oversight.pendingAutoWake == nil, ownsWake && !acquired)
-                fixture.viewModel.test_codexCoordinator.handleMCPControlReset(for: fixture.session, reason: "repeat reset")
-                XCTAssertEqual(fixture.session.oversight.pendingAutoWake == nil, ownsWake && !acquired)
+        for periodic in [false, true] {
+            for ownsWake in [false, true] {
+                for acquired in [false, true] {
+                    let fixture = try makeFixture()
+                    let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                    let wakeID = UUID()
+                    fixture.session.oversight.pendingAutoWake = AgentSessionLinkAutoWakeAttempt(
+                        wakeID: wakeID, observerEndpoint: endpoint, queueEpoch: Self.queueEpoch,
+                        queueRevision: 1,
+                        wakeFingerprint: Self.laneSnapshot(observerEndpoint: endpoint).wakeEligibilityFingerprint,
+                        admissionBasis: periodic ? .periodic : .routineStatusOrOverflow, attemptedFingerprint: nil,
+                        physicalOutcome: acquired ? .ambiguous : .notAttempted,
+                        phase: acquired ? .dispatching : .preparingDispatch, task: nil
+                    )
+                    var entry = Self.fallbackQueueEntry(controller: fixture.controller, session: fixture.session)
+                    if periodic { fixture.session.oversight.pendingAutoWake?.periodicProducerDispatchID = .codexFallback(queueID: entry.id) }
+                    entry.monitoringDispatchContext = AgentSessionLinkDispatchContext(
+                        session: fixture.session, dispatchID: .autoWake(wakeID: ownsWake ? wakeID : UUID())
+                    )
+                    fixture.session.codexFallbackQueue = [entry]
+                    fixture.viewModel.test_codexCoordinator.handleMCPControlReset(for: fixture.session, reason: "test reset")
+                    XCTAssertTrue(fixture.session.codexFallbackQueue.isEmpty)
+                    XCTAssertEqual(fixture.session.oversight.pendingAutoWake == nil, ownsWake && !acquired)
+                    fixture.viewModel.test_codexCoordinator.handleMCPControlReset(for: fixture.session, reason: "repeat reset")
+                    XCTAssertEqual(fixture.session.oversight.pendingAutoWake == nil, ownsWake && !acquired)
+                }
             }
         }
     }
@@ -449,7 +454,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             queueEpoch: Self.queueEpoch,
             queueRevision: 1,
             wakeFingerprint: Self.laneSnapshot(observerEndpoint: endpoint).wakeEligibilityFingerprint,
-            requiredAttentionOccurrence: nil,
+            admissionBasis: .routineStatusOrOverflow,
             attemptedFingerprint: nil,
             physicalOutcome: .notAttempted,
             phase: .dispatching,

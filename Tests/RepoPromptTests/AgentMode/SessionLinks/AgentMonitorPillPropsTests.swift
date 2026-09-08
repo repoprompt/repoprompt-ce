@@ -590,8 +590,6 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertTrue(accessibilityHint.contains("their exact lane’s snooze without changing them"))
         XCTAssertTrue(accessibilityHint.contains("Unlink revokes attention"))
         XCTAssertTrue(accessibilityHint.contains("all other safety and admission gates still apply"))
-        // Zero links is a real, saved state, and the note has to say so rather than read as an error.
-        XCTAssertTrue(AgentMonitorAutoWakeCopy.noLinksNote.contains("Saved with this session"))
     }
 
     func testOverlayStillDisablesAddWhenLiveStateSaysSo() {
@@ -1289,5 +1287,298 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         )
         XCTAssertNotEqual(first.rowKey, relinked.rowKey)
         XCTAssertEqual(first.id, relinked.id, "the identifier itself is deliberately unchanged")
+    }
+
+    // MARK: - Pending updates and the routine wake interval
+
+    private func pendingRow(
+        linkID: UUID,
+        generation: UInt64 = 1,
+        targetSessionID: UUID,
+        displayName: String,
+        locationLabel: String? = nil
+    ) -> AgentMonitorPillProps.Outbound {
+        AgentMonitorPillProps.Outbound(
+            linkID: linkID,
+            generation: generation,
+            targetSessionID: targetSessionID,
+            targetEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: targetSessionID),
+            displayName: displayName,
+            providerDisplayName: nil,
+            locationLabel: locationLabel,
+            status: .idle
+        )
+    }
+
+    private func pendingSnapshot(
+        entries: [(reference: DomainAgentSessionLinkReference, targetSessionID: UUID)],
+        attention: [(reference: DomainAgentSessionLinkReference, targetSessionID: UUID)] = [],
+        overflow: UInt64 = 0,
+        isDeliverable: Bool = true
+    ) -> AgentSessionLinkPassiveStatusNotices.Snapshot {
+        let queueEpoch = UUID()
+        return AgentSessionLinkPassiveStatusNotices.Snapshot(
+            observerEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: observerID),
+            queueEpoch: queueEpoch,
+            queueRevision: 1,
+            linkSetRevision: 1,
+            isEnabled: true,
+            isDeliverable: isDeliverable,
+            entries: entries.enumerated().map { index, entry in
+                AgentSessionLinkPassiveStatusNotices.PendingEntry(
+                    reference: entry.reference,
+                    targetEndpoint: AgentSessionLinkIdentityTestSupport
+                        .endpoint(sessionID: entry.targetSessionID),
+                    targetSessionID: entry.targetSessionID,
+                    displayName: "reducer name",
+                    fromStatus: .running,
+                    toStatus: .idle,
+                    observedAt: Date(timeIntervalSince1970: 0),
+                    idleForSend: true,
+                    changeSequence: UInt64(index + 1),
+                    edgeSequence: UInt64(index + 1)
+                )
+            },
+            attentionRequests: attention.enumerated().map { index, request in
+                AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest(
+                    occurrence: .init(
+                        queueEpoch: queueEpoch,
+                        reference: request.reference,
+                        attentionSequence: UInt64(index + 1)
+                    ),
+                    targetEndpoint: AgentSessionLinkIdentityTestSupport
+                        .endpoint(sessionID: request.targetSessionID),
+                    targetSessionID: request.targetSessionID,
+                    requestedAt: Date(timeIntervalSince1970: 0),
+                    status: .idle
+                )
+            },
+            unacknowledgedOverflowCount: overflow,
+            overflowProduced: overflow,
+            autoWakeLanes: []
+        )
+    }
+
+    /// Counts are coalesced updates and distinct sessions, and overflow is disclosed beside them
+    /// rather than counted as one.
+    func testPendingUpdatesCountsGroupsAndDisclosesOverflowSeparately() throws {
+        let firstTarget = try XCTUnwrap(UUID(uuidString: "0000A001-0000-0000-0000-000000000001"))
+        let secondTarget = try XCTUnwrap(UUID(uuidString: "0000A002-0000-0000-0000-000000000002"))
+        let firstReference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
+        let secondReference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 4)
+
+        let pending = AgentMonitorPendingUpdates.make(
+            snapshot: pendingSnapshot(
+                entries: [
+                    (firstReference, firstTarget),
+                    (secondReference, secondTarget)
+                ],
+                attention: [(firstReference, firstTarget)],
+                overflow: 3
+            ),
+            outbound: [
+                pendingRow(
+                    linkID: secondReference.linkID,
+                    generation: secondReference.generation,
+                    targetSessionID: secondTarget,
+                    displayName: "Review API"
+                ),
+                pendingRow(
+                    linkID: firstReference.linkID,
+                    targetSessionID: firstTarget,
+                    displayName: "Build API",
+                    locationLabel: "worktree/feature"
+                )
+            ],
+            wakeNowRefusal: nil,
+            routineWakeDeferredUntil: nil
+        )
+
+        XCTAssertEqual(pending.updateCount, 3, "one status per lane plus the attention occurrence")
+        XCTAssertEqual(pending.sessionCount, 2)
+        XCTAssertTrue(pending.hasUnattributedOverflow)
+        XCTAssertFalse(pending.isEmpty)
+        XCTAssertEqual(pending.groups.map(\.targetSessionID), [firstTarget, secondTarget])
+        XCTAssertEqual(
+            pending.groups.first?.title,
+            "worktree/feature: Build API",
+            "labels come from the dashboard rows, never from reducer-supplied target prose"
+        )
+        XCTAssertEqual(
+            pending.groups.first?.items,
+            [.status(from: .running, to: .idle), .attention]
+        )
+        XCTAssertEqual(
+            AgentMonitorPendingUpdatesCopy.summary(
+                updateCount: pending.updateCount,
+                sessionCount: pending.sessionCount,
+                hasOverflow: pending.hasUnattributedOverflow
+            ),
+            "3 updates across 2 sessions · Additional changes not itemized"
+        )
+    }
+
+    /// A row whose generation no longer matches the queued content cannot lend it a label, and an
+    /// overflow-only queue is never described as empty.
+    func testPendingUpdatesRefusesRetiredLabelsAndNeverCallsOverflowEmpty() throws {
+        let target = try XCTUnwrap(UUID(uuidString: "0000A003-0000-0000-0000-000000000003"))
+        let linkID = UUID()
+        let queued = DomainAgentSessionLinkReference(linkID: linkID, generation: 2)
+
+        let pending = AgentMonitorPendingUpdates.make(
+            snapshot: pendingSnapshot(entries: [(queued, target)]),
+            outbound: [
+                pendingRow(
+                    linkID: linkID,
+                    generation: 1,
+                    targetSessionID: target,
+                    displayName: "Retired incarnation",
+                    locationLabel: "worktree/old"
+                )
+            ],
+            wakeNowRefusal: nil,
+            routineWakeDeferredUntil: nil
+        )
+        let group = pending.groups.first
+        XCTAssertEqual(pending.groups.count, 1)
+        XCTAssertEqual(group?.targetSessionID, target)
+        XCTAssertEqual(
+            group?.displayName,
+            AgentMonitorSessionIDFormatter.short(target),
+            "a generation mismatch degrades to the short ID instead of borrowing the retired label"
+        )
+        XCTAssertNil(group?.locationLabel)
+
+        let overflowOnly = AgentMonitorPendingUpdates.make(
+            snapshot: pendingSnapshot(entries: [], overflow: 2),
+            outbound: [],
+            wakeNowRefusal: nil,
+            routineWakeDeferredUntil: nil
+        )
+        XCTAssertEqual(overflowOnly.updateCount, 0)
+        XCTAssertTrue(overflowOnly.hasUnattributedOverflow)
+        XCTAssertFalse(overflowOnly.isEmpty)
+        XCTAssertEqual(
+            AgentMonitorPendingUpdatesCopy.summary(
+                updateCount: 0,
+                sessionCount: 0,
+                hasOverflow: true
+            ),
+            AgentMonitorPendingUpdatesCopy.overflowOnly
+        )
+        XCTAssertEqual(
+            AgentMonitorPendingUpdatesCopy.summary(
+                updateCount: 0,
+                sessionCount: 0,
+                hasOverflow: false
+            ),
+            AgentMonitorPendingUpdatesCopy.empty
+        )
+
+        // A queue that cannot be delivered at all reports nothing to process rather than a count.
+        let undeliverable = AgentMonitorPendingUpdates.make(
+            snapshot: pendingSnapshot(entries: [(queued, target)], isDeliverable: false),
+            outbound: [],
+            wakeNowRefusal: nil,
+            routineWakeDeferredUntil: nil
+        )
+        XCTAssertTrue(undeliverable.isEmpty)
+        XCTAssertEqual(undeliverable.wakeNowRefusal, .noPendingUpdates)
+    }
+
+    /// The countdown rounds up, never renders zero, and disappears once the deadline has passed.
+    func testRoutineWakeCountdownRoundsUpAndOmitsElapsedDeadlines() {
+        let now = moment(hour: 9)
+        XCTAssertNil(AgentMonitorRoutineWakeCopy.countdown(deferredUntil: nil, now: now))
+        XCTAssertEqual(
+            AgentMonitorRoutineWakeCopy.countdown(
+                deferredUntil: now.addingTimeInterval(30),
+                now: now
+            ),
+            "Next wake in less than a minute"
+        )
+        XCTAssertEqual(
+            AgentMonitorRoutineWakeCopy.countdown(
+                deferredUntil: now.addingTimeInterval(61),
+                now: now
+            ),
+            "Next wake in 2 min"
+        )
+        XCTAssertEqual(
+            AgentMonitorRoutineWakeCopy.countdown(
+                deferredUntil: now.addingTimeInterval(300),
+                now: now
+            ),
+            "Next wake in 5 min"
+        )
+        XCTAssertNil(
+            AgentMonitorRoutineWakeCopy.countdown(deferredUntil: now, now: now),
+            "an elapsed deadline omits the line rather than claiming a wake happened"
+        )
+        XCTAssertNil(
+            AgentMonitorRoutineWakeCopy.countdown(
+                deferredUntil: now.addingTimeInterval(-120),
+                now: now
+            )
+        )
+    }
+
+    /// The approved durations are the only ones any writer can install, and they read as minutes.
+    func testRoutineWakeIntervalNormalizesToApprovedOptions() {
+        XCTAssertEqual(
+            AgentSessionLinkRoutineWakeInterval.optionsSeconds,
+            [60, 300, 600, 900, 1800, 3600, 10800]
+        )
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.defaultSeconds, 300)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(0), 60)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(-90), 60)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(61), 300)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(300), 300)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(700), 900)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(1801), 3600)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(3600), 3600)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(4000), 10800)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(10800), 10800)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.normalized(Int.max), 10800)
+        XCTAssertEqual(AgentMonitorRoutineWakeCopy.optionLabel(seconds: 60), "1 min")
+        XCTAssertEqual(AgentMonitorRoutineWakeCopy.optionLabel(seconds: 1800), "30 min")
+        XCTAssertEqual(AgentMonitorRoutineWakeCopy.optionLabel(seconds: 3600), "60 min")
+        XCTAssertEqual(AgentMonitorRoutineWakeCopy.optionLabel(seconds: 10800), "180 min")
+    }
+
+    /// Both props rebuilders forward the observer-level values; a zero-link session keeps its saved
+    /// choice rather than rendering the default.
+    func testObserverPreferencesSurvivePropsCopies() {
+        let props = AgentMonitorPillProps(
+            sessionID: observerID,
+            sidebarOversightMenu: nil,
+            outbound: [],
+            inbound: [],
+            recentNotices: [],
+            canAddReason: nil,
+            autoWakeOnUpdatesEnabled: true,
+            routineWakeIntervalEnabled: true,
+            routineWakeIntervalSeconds: 900,
+            periodicIdleWakeEnabled: true,
+            periodicIdleWakeIntervalSeconds: 7200,
+            pendingUpdates: .empty
+        )
+
+        let withReason = props.withCanAddReason("Load this thread first.")
+        XCTAssertTrue(withReason.routineWakeIntervalEnabled)
+        XCTAssertEqual(withReason.routineWakeIntervalSeconds, 900)
+        XCTAssertTrue(withReason.periodicIdleWakeEnabled)
+        XCTAssertEqual(withReason.periodicIdleWakeIntervalSeconds, 7200)
+        XCTAssertEqual(withReason.pendingUpdates, AgentMonitorPendingUpdates.empty)
+
+        let withPersistence = props.withPersistence(
+            AgentSessionOversightPersistencePresentation.noDurableLayer,
+            eligibilityReason: nil
+        )
+        XCTAssertTrue(withPersistence.routineWakeIntervalEnabled)
+        XCTAssertEqual(withPersistence.routineWakeIntervalSeconds, 900)
+        XCTAssertTrue(withPersistence.periodicIdleWakeEnabled)
+        XCTAssertEqual(withPersistence.periodicIdleWakeIntervalSeconds, 7200)
+        XCTAssertEqual(withPersistence.pendingUpdates, AgentMonitorPendingUpdates.empty)
     }
 }

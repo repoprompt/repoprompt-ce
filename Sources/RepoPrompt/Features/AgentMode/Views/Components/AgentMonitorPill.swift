@@ -120,6 +120,9 @@ struct AgentMonitorPopoverView: View {
     /// outbound link at once, so gating it on a row would disable an unrelated row's actions.
     @State private var isChangingAutoWake = false
     @State private var autoWakeFailureMessage: String?
+    /// Local disclosure state for the pending-updates detail list. Presentation only: collapsing it
+    /// acknowledges nothing, and reopening the popover starts collapsed again.
+    @State private var showPendingUpdateDetails = false
     /// The most recent successful Unlink, recoverable for a bounded window. One slot per open
     /// popover: a second Unlink replaces it, and closing the popover drops it.
     @State private var undoSlot: UndoSlot?
@@ -175,10 +178,17 @@ struct AgentMonitorPopoverView: View {
                         Divider()
                     }
                     addSection
-                    // Unconditional and available with zero links: the setting is saved with this
-                    // observer session rather than with any individual oversight relationship.
-                    Divider()
-                    observerControlsSection
+                    if props.isOverseer {
+                        Divider()
+                        // Scoped to the controls so the Add field is not re-rendered every minute.
+                        TimelineView(.periodic(from: freshnessTickAnchor, by: 60)) { timeline in
+                            observerControlsSection(now: timeline.date)
+                        }
+                        if let pending = props.pendingUpdates, !pending.isEmpty {
+                            Divider()
+                            pendingUpdatesSection
+                        }
+                    }
                     if hasPersistenceContent {
                         Divider()
                         persistenceSection
@@ -243,7 +253,9 @@ struct AgentMonitorPopoverView: View {
             }
 
             if let reason = props.canAddReason {
-                messageText(reason)
+                if reason != AgentSessionLinkEndpointEligibility.roleDeniedReason {
+                    messageText(reason)
+                }
             } else if let validationMessage {
                 messageText(validationMessage)
             }
@@ -508,14 +520,12 @@ struct AgentMonitorPopoverView: View {
         .accessibilityLabel(accessibilityLabel)
     }
 
-    /// The observer-level passive status-update switch.
-    ///
-    /// Observer-session controls, rendered whether or not anything is overseen.
-    private var observerControlsSection: some View {
+    /// Session-level wake controls, visible only while this session oversees another.
+    private func observerControlsSection(now: Date) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 autoWakeToggle
-                if !props.autoWakeOnUpdatesEnabled, !props.outbound.isEmpty {
+                if !props.autoWakeOnUpdatesEnabled {
                     Button(
                         currentOutboundTargetsAreAllSelected
                             ? AgentMonitorAutoWakeCopy.deselectAll
@@ -529,10 +539,10 @@ struct AgentMonitorPopoverView: View {
                     .disabled(isChangingAutoWake || props.autoWakeUnavailableReason != nil)
                 }
             }
+            routineWakeIntervalRow(now: now)
+            periodicIdleWakeRow
             if let reason = props.autoWakeUnavailableReason {
                 messageText(reason)
-            } else if props.outbound.isEmpty {
-                messageText(AgentMonitorAutoWakeCopy.noLinksNote)
             }
             if let autoWakeFailureMessage {
                 messageText(autoWakeFailureMessage)
@@ -560,6 +570,166 @@ struct AgentMonitorPopoverView: View {
         .fixedSize()
         .disabled(isBusy || isChangingAutoWake || props.autoWakeUnavailableReason != nil)
         .accessibilityLabel("Auto-wake for \(row.displayName)")
+    }
+
+    /// The routine-limit checkbox, its interval picker, and the countdown.
+    ///
+    /// The picker stays visible while limiting is off so the retained choice is not hidden, and the
+    /// countdown renders only when the runtime says the interval is the one thing delaying a wake.
+    private func routineWakeIntervalRow(now: Date) -> some View {
+        let controlsDisabled = isChangingAutoWake || props.autoWakeUnavailableReason != nil
+        return HStack(spacing: 8) {
+            Toggle(AgentMonitorRoutineWakeCopy.limitLabel, isOn: Binding(
+                get: { props.routineWakeIntervalEnabled },
+                set: {
+                    setRoutineWakeInterval(
+                        enabled: $0,
+                        seconds: props.routineWakeIntervalSeconds
+                    )
+                }
+            ))
+            .toggleStyle(.checkbox)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            .fixedSize()
+            .disabled(controlsDisabled)
+            .hoverTooltip(AgentMonitorRoutineWakeCopy.tooltip, .top)
+            .accessibilityLabel(AgentMonitorRoutineWakeCopy.accessibilityLabel)
+            .accessibilityValue(props.routineWakeIntervalEnabled ? "On" : "Off")
+
+            Picker(AgentMonitorRoutineWakeCopy.intervalLabel, selection: Binding(
+                get: { props.routineWakeIntervalSeconds },
+                set: {
+                    setRoutineWakeInterval(
+                        enabled: props.routineWakeIntervalEnabled,
+                        seconds: $0
+                    )
+                }
+            )) {
+                ForEach(AgentSessionLinkRoutineWakeInterval.optionsSeconds, id: \.self) { seconds in
+                    Text(AgentMonitorRoutineWakeCopy.optionLabel(seconds: seconds)).tag(seconds)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            .fixedSize()
+            .disabled(controlsDisabled || !props.routineWakeIntervalEnabled)
+            .accessibilityLabel(AgentMonitorRoutineWakeCopy.intervalAccessibilityLabel)
+
+            if let countdown = AgentMonitorRoutineWakeCopy.countdown(
+                deferredUntil: props.pendingUpdates?.routineWakeDeferredUntil,
+                now: now
+            ) {
+                Text(countdown)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .hoverTooltip(AgentMonitorRoutineWakeCopy.countdownTooltip, .top)
+                    .accessibilityLabel(countdown)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var periodicIdleWakeRow: some View {
+        let controlsDisabled = isChangingAutoWake || props.autoWakeUnavailableReason != nil
+        return HStack(spacing: 8) {
+            Toggle(AgentMonitorPeriodicWakeCopy.label, isOn: Binding(
+                get: { props.periodicIdleWakeEnabled },
+                set: {
+                    setPeriodicIdleWake(enabled: $0, seconds: props.periodicIdleWakeIntervalSeconds)
+                }
+            ))
+            .toggleStyle(.checkbox)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            .fixedSize()
+            .disabled(controlsDisabled)
+            .hoverTooltip(AgentMonitorPeriodicWakeCopy.tooltip, .top)
+
+            Picker(AgentMonitorPeriodicWakeCopy.intervalLabel, selection: Binding(
+                get: { props.periodicIdleWakeIntervalSeconds },
+                set: { setPeriodicIdleWake(enabled: props.periodicIdleWakeEnabled, seconds: $0) }
+            )) {
+                ForEach(AgentSessionLinkPeriodicWakeInterval.optionsSeconds, id: \.self) { seconds in
+                    Text(AgentMonitorPeriodicWakeCopy.optionLabel(seconds: seconds)).tag(seconds)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            .fixedSize()
+            .disabled(controlsDisabled || !props.periodicIdleWakeEnabled)
+            .accessibilityLabel(AgentMonitorPeriodicWakeCopy.intervalLabel)
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// The compact pending-updates block: what is queued, and the one-shot that processes it.
+    ///
+    /// Counts come from the runtime projection rather than these rows, so the section says exactly
+    /// what the canonical queue holds.
+    @ViewBuilder
+    private var pendingUpdatesSection: some View {
+        let pending = props.pendingUpdates ?? AgentMonitorPendingUpdates.empty
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                sectionHeader(AgentMonitorPendingUpdatesCopy.header)
+                Spacer(minLength: 6)
+                wakeNowButton(pending)
+            }
+            Text(AgentMonitorPendingUpdatesCopy.summary(
+                updateCount: pending.updateCount,
+                sessionCount: pending.sessionCount,
+                hasOverflow: pending.hasUnattributedOverflow
+            ))
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
+            if !pending.groups.isEmpty {
+                DisclosureGroup(
+                    AgentMonitorPendingUpdatesCopy.detailsLabel,
+                    isExpanded: $showPendingUpdateDetails
+                ) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(pending.groups) { group in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(group.title)
+                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                ForEach(Array(group.items.enumerated()), id: \.offset) { _, item in
+                                    Text(AgentMonitorPendingUpdatesCopy.item(item))
+                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityElement(children: .combine)
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            }
+        }
+    }
+
+    private func wakeNowButton(_ pending: AgentMonitorPendingUpdates) -> some View {
+        let refusal = pending.wakeNowRefusal
+        let isDisabled = refusal != nil
+            || isChangingAutoWake
+            || props.autoWakeUnavailableReason != nil
+        return Button(AgentMonitorPendingUpdatesCopy.wakeNowLabel) {
+            wakeNowForPendingUpdates()
+        }
+        .buttonStyle(.plain)
+        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        .foregroundStyle(isDisabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
+        .disabled(isDisabled)
+        .hoverTooltip(refusal?.message ?? AgentMonitorPendingUpdatesCopy.wakeNowTooltip, .top)
+        .accessibilityLabel(AgentMonitorPendingUpdatesCopy.wakeNowLabel)
+        .accessibilityHint(refusal?.message ?? AgentMonitorPendingUpdatesCopy.wakeNowTooltip)
     }
 
     private var autoWakeToggle: some View {
@@ -1116,6 +1286,51 @@ struct AgentMonitorPopoverView: View {
             isChangingAutoWake = false
             autoWakeFailureMessage = outcome.failureMessage
         }
+    }
+
+    /// Writes the routine-interval preference and renders whatever the session settles on.
+    ///
+    /// Synchronous, and the bindings read `props`, so nothing is rendered optimistically.
+    private func setRoutineWakeInterval(enabled: Bool, seconds: Int) {
+        guard !isChangingAutoWake else { return }
+        guard let observerEndpoint = props.endpoint else {
+            autoWakeFailureMessage = AgentMonitorAutoWakeCopy.unavailableMessage
+            return
+        }
+        let applied = AgentSessionLinkRuntimeBridge.shared.setRoutineWakeInterval(
+            enabled: enabled,
+            seconds: seconds,
+            observerEndpoint: observerEndpoint
+        )
+        autoWakeFailureMessage = applied ? nil : AgentMonitorAutoWakeCopy.unavailableMessage
+    }
+
+    private func setPeriodicIdleWake(enabled: Bool, seconds: Int) {
+        guard !isChangingAutoWake else { return }
+        guard let observerEndpoint = props.endpoint else {
+            autoWakeFailureMessage = AgentMonitorAutoWakeCopy.unavailableMessage
+            return
+        }
+        let applied = AgentSessionLinkRuntimeBridge.shared.setPeriodicIdleWake(
+            enabled: enabled,
+            seconds: seconds,
+            observerEndpoint: observerEndpoint
+        )
+        autoWakeFailureMessage = applied ? nil : AgentMonitorAutoWakeCopy.unavailableMessage
+    }
+
+    /// Requests one manual wake and reports only what the coordinator decided.
+    ///
+    /// A refusal reuses the observer-level message surface; a successful reservation says nothing,
+    /// because the pending section is about to show it.
+    private func wakeNowForPendingUpdates() {
+        guard let observerEndpoint = props.endpoint else {
+            autoWakeFailureMessage = AgentMonitorAutoWakeCopy.unavailableMessage
+            return
+        }
+        let outcome = AgentSessionLinkRuntimeBridge.shared
+            .wakeNowForPendingOversightUpdates(observerEndpoint: observerEndpoint)
+        autoWakeFailureMessage = outcome.refusal?.message
     }
 
     private func setLaneAutoWake(_ row: AgentMonitorPillProps.Outbound, enabled: Bool) {

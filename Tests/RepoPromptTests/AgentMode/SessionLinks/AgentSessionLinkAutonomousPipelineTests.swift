@@ -528,7 +528,7 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
 /// reduction, liveness, and send paths. Nothing here answers *for* a target: `performSend` reaches
 /// the target view model's own transaction, and readiness is whatever that session really is.
 @MainActor
-private final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
+final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
     private var viewModelsByWindowID: [Int: AgentModeViewModel] = [:]
 
     func register(_ viewModel: AgentModeViewModel, windowID: Int) {

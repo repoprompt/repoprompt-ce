@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -12,12 +13,14 @@ import RepoPromptDomainRuntime
 /// `hasPendingAutoWake`). Everything here is `@MainActor`-bound through its owning session; no new
 /// isolation domain is introduced.
 ///
-/// Two invariants are worth naming. Only the durable selection pair is ever persisted; every other
-/// field is process-local and dies with the incarnation, which is what lets a rebind, relink, or
-/// relaunch start unsnoozed and unsuppressed. And the reserved wake attempt is a single slot rather
-/// than a queue: the `.cancelledBeforeDispatch` tombstone that fences an in-flight provider call
-/// lives in that same slot (see `pendingAutoWakeOwnsTransportBoundary`), so nothing may clear it
-/// except a path that can prove no transport call happened.
+/// Two invariants are worth naming. Only the durable preferences — selection, routine limiting, and
+/// periodic idle waking — are ever persisted; every other field is process-local and dies with
+/// the incarnation, which is what lets a rebind or relaunch start unsnoozed, unsuppressed, and
+/// untimed. (Within one incarnation the wake stamp is observer-scoped, so unlinking and relinking a
+/// target does not reset it.) And the reserved wake attempt is a single slot rather than a queue: the
+/// `.cancelledBeforeDispatch` tombstone that fences an in-flight provider call lives in that same
+/// slot (see `pendingAutoWakeOwnsTransportBoundary`), so nothing may clear it except a path that can
+/// prove no transport call happened.
 struct AgentSessionOversightState {
     // MARK: Durable Auto-wake selection
 
@@ -27,6 +30,41 @@ struct AgentSessionOversightState {
     var autoWakeOnUpdates: Bool = true
     /// Granular target UUIDs; preserved while the master setting is enabled.
     var autoWakeTargetSessionIDs: Set<UUID> = []
+
+    // MARK: Durable routine wake interval
+
+    /// Minimum spacing between *routine* automatic wakes. Off by default; exact purposeful attention
+    /// and the user's own `Wake now` bypass it without changing it.
+    var routineWakeIntervalEnabled: Bool = false
+    /// The chosen interval, retained while limiting is off. Read through
+    /// `normalizedRoutineWakeIntervalSeconds`: a decoded value is never trusted raw.
+    var routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds
+
+    /// Durable periodic-idle policy only; storing or restoring it does not arm a wake.
+    var periodicIdleWakeEnabled: Bool = false
+    var periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds
+
+    /// Scheduling only: execution is owned by the existing pendingAutoWake slot.
+    var periodicEndpoint: DomainAgentSessionLinkEndpointIdentity?
+    var periodicObservation: AnyCancellable?
+    var periodicIdleSince: ContinuousClock.Instant?
+    var periodicDeadline: ContinuousClock.Instant?
+    var periodicDeadlineToken: UUID?
+    var periodicDeadlineTask: Task<Void, Never>?
+
+    mutating func invalidatePeriodicIdleSpan() {
+        periodicDeadlineTask?.cancel()
+        periodicDeadlineTask = nil
+        periodicDeadlineToken = nil
+        periodicDeadline = nil
+        periodicIdleSince = nil
+    }
+
+    mutating func retirePeriodicScheduling() {
+        invalidatePeriodicIdleSpan()
+        periodicObservation = nil
+        periodicEndpoint = nil
+    }
 
     // MARK: Reserved wake attempt
 
@@ -78,10 +116,20 @@ struct AgentSessionOversightState {
     /// One task rather than one per record: a replacement always cancels its predecessor, and the
     /// token is what makes a cancelled-but-already-resumed callback fail closed instead of expiring a
     /// record the newer arming is responsible for.
+    ///
+    /// Shared with the routine wake interval, which arms the same slot; `nextAutoWakeDeadline` picks
+    /// whichever comes first.
     var snoozeDeadlineTask: Task<Void, Never>?
     var snoozeTaskToken: UUID?
     /// Injected monotonic seam. Production is `ContinuousClock`; tests advance it explicitly.
     var snoozeClock: AgentSessionLinkAutoWakeSnoozeClock = .continuous
+
+    // MARK: Ephemeral wake timing
+
+    /// The last physical oversight dispatch this incarnation acquired — routine, attention, or
+    /// manual alike, and recorded even while limiting is off so enabling it measures from the wake
+    /// that actually happened. Monotonic, so a clock change moves the display and never admission.
+    var lastOversightWakeDispatch: AgentSessionLinkOversightWakeDispatch?
 
     // MARK: Target-declared context
 
@@ -131,6 +179,58 @@ struct AgentSessionOversightState {
             .min()
     }
 
+    /// The chosen interval, clamped to the approved options.
+    var normalizedRoutineWakeIntervalSeconds: Int {
+        AgentSessionLinkRoutineWakeInterval.normalized(routineWakeIntervalSeconds)
+    }
+
+    /// When routine status and overflow may next admit a wake, or `nil` when nothing delays them.
+    ///
+    /// Endpoint-qualified, so a retired incarnation's stamp fails open exactly like a missing one.
+    func routineWakeIntervalDeadline(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> ContinuousClock.Instant? {
+        guard routineWakeIntervalEnabled,
+              let stamp = lastOversightWakeDispatch,
+              stamp.observerEndpoint == observerEndpoint
+        else {
+            return nil
+        }
+        return stamp.instant.advanced(by: .seconds(normalizedRoutineWakeIntervalSeconds))
+    }
+
+    /// The strictly-future deadline currently deferring routine admission, or `nil`.
+    ///
+    /// An elapsed interval is inactive whether or not the deadline task has fired, exactly like an
+    /// elapsed snooze record.
+    func routineWakeIntervalDeferral(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        now: ContinuousClock.Instant
+    ) -> ContinuousClock.Instant? {
+        guard let deadline = routineWakeIntervalDeadline(observerEndpoint: observerEndpoint),
+              deadline > now
+        else {
+            return nil
+        }
+        return deadline
+    }
+
+    /// The earliest observer-policy deadline that owes one reevaluation, snooze or interval.
+    func nextAutoWakeDeadline(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        now: ContinuousClock.Instant,
+        includeRoutineInterval: Bool
+    ) -> ContinuousClock.Instant? {
+        let snooze = nextActiveSnoozeDeadline(observerEndpoint: observerEndpoint, now: now)
+        guard includeRoutineInterval,
+              let interval = routineWakeIntervalDeferral(observerEndpoint: observerEndpoint, now: now)
+        else {
+            return snooze
+        }
+        guard let snooze else { return interval }
+        return min(snooze, interval)
+    }
+
     /// Whether this incarnation has reserved its one automatic follow-up.
     ///
     /// The nil/non-nil transition is the only part of the attempt an outside observer can act on;
@@ -152,7 +252,8 @@ struct AgentSessionOversightState {
 
     // MARK: Mutation
 
-    /// Cancels the deadline task and drops every snooze record.
+    /// Cancels the shared deadline task and drops every observer-local policy record, including the
+    /// wake stamp.
     ///
     /// Retirement, never transfer: an endpoint that is going away must not leave a task that could
     /// resume against the incarnation replacing it.
@@ -161,6 +262,46 @@ struct AgentSessionOversightState {
         snoozeDeadlineTask = nil
         snoozeTaskToken = nil
         autoWakeSnoozes.removeAll()
+        lastOversightWakeDispatch = nil
+    }
+}
+
+/// One physical oversight dispatch, qualified by the exact incarnation that acquired it, so a rebind
+/// cannot inherit its predecessor's timing.
+struct AgentSessionLinkOversightWakeDispatch: Equatable {
+    let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    let instant: ContinuousClock.Instant
+}
+
+/// The approved routine-wake interval durations and the one normalization every writer shares —
+/// decode paths, the durable setter, restoration, and the picker.
+///
+/// Ceiling to an approved option: a stored 61 becomes 5 minutes rather than 1, and anything past the
+/// largest option is capped rather than rejected.
+enum AgentSessionLinkRoutineWakeInterval {
+    static let optionsSeconds = [60, 300, 600, 900, 1800, 3600, 10800]
+    static let defaultSeconds = 300
+    static let maximumSeconds = 10800
+
+    static func normalized(_ seconds: Int) -> Int {
+        for option in optionsSeconds where option >= seconds {
+            return option
+        }
+        return maximumSeconds
+    }
+}
+
+/// Approved periodic-idle durations. Unsupported values round up to the next option, capped at six hours.
+enum AgentSessionLinkPeriodicWakeInterval {
+    static let optionsSeconds = [600, 1800, 3600, 7200, 21600]
+    static let defaultSeconds = 1800
+    static let maximumSeconds = 21600
+
+    static func normalized(_ seconds: Int) -> Int {
+        for option in optionsSeconds where option >= seconds {
+            return option
+        }
+        return maximumSeconds
     }
 }
 

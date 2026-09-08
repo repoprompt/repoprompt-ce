@@ -739,7 +739,34 @@ enum AgentSessionLinkPromptClaimOutcome: Equatable {
 /// A named type rather than a tuple so `mustAbortDispatch` cannot be dropped by a call site that only
 /// destructures the two fields it already knew about: adding a third tuple element would compile
 /// everywhere it was ignored, which is exactly the failure this exists to prevent.
+/// Captured before transport; a late callback must never infer origin from a successor slot.
+struct AgentSessionLinkDispatchContext: Equatable {
+    let dispatchID: AgentSessionLinkPromptDispatchID
+    let isPeriodic: Bool
+
+    @MainActor
+    init(session: AgentTabSession, dispatchID: AgentSessionLinkPromptDispatchID) {
+        if var attempt = session.oversight.pendingAutoWake,
+           attempt.phase.ownsTransportBoundary,
+           !dispatchID.isAutoWakeFamily || dispatchID.autoWakeID == attempt.wakeID
+        {
+            self.dispatchID = .autoWake(wakeID: attempt.wakeID)
+            isPeriodic = attempt.isPeriodic
+            if attempt.isPeriodic, attempt.phase == .preparingDispatch,
+               attempt.periodicProducerDispatchID == nil, !dispatchID.isAutoWakeFamily
+            {
+                attempt.periodicProducerDispatchID = dispatchID
+                session.oversight.pendingAutoWake = attempt
+            }
+        } else {
+            self.dispatchID = dispatchID
+            isPeriodic = false
+        }
+    }
+}
+
 struct AgentSessionLinkDecoratedProviderText {
+    var dispatchContext: AgentSessionLinkDispatchContext?
     let text: String
     /// Acknowledge at this dispatch's own physical-acceptance signal, and only then.
     let claim: AgentSessionLinkOutboundPromptClaim?
@@ -1029,9 +1056,10 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         inventory: AgentSessionLinkPromptInventory,
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
         locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
+        allowsClaimlessAutoWake: Bool = false,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkPromptClaimOutcome {
-        let requiresLaneBatch = dispatchID.isAutoWakeFamily
+        let requiresLaneBatch = dispatchID.isAutoWakeFamily && !(allowsClaimlessAutoWake && dispatchID.autoWakeID != nil)
         // Every refusal below means "send undecorated" for an ordinary dispatch and "do not dispatch"
         // for a wake, so the mapping is decided once here instead of being restated — and possibly
         // forgotten — at each exit.

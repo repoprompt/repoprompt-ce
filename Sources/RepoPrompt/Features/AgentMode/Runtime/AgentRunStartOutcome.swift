@@ -25,9 +25,18 @@ struct AgentDirectRunStartOptions: Equatable {
     /// does not move `lastUserMessageAt`, and never consumes a staged handoff — the rendered lane
     /// claim the ordinary supplement path attaches is its whole new provider input.
     var laneUpdateWakeID: UUID?
+    var periodicWakeID: UUID?
+
+    var skipsUserAugmentation: Bool {
+        isLaneUpdate || periodicWakeID != nil
+    }
 
     var isLaneUpdate: Bool {
         laneUpdateWakeID != nil
+    }
+
+    static func periodicWake(wakeID: UUID) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(ignoresPendingHandoff: true, periodicWakeID: wakeID)
     }
 
     static let `default` = AgentDirectRunStartOptions()

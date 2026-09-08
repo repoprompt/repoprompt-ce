@@ -131,6 +131,33 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool
 
+    /// Writes this observer's minimum routine wake interval to one exact incarnation.
+    ///
+    /// Observer configuration, like the Auto-wake selection: it polls no target, mints no capability,
+    /// moves no authority, and starts no turn.
+    @discardableResult
+    func agentSessionLinkSetRoutineWakeInterval(
+        enabled: Bool,
+        seconds: Int,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool
+
+    @discardableResult
+    func agentSessionLinkSetPeriodicIdleWake(
+        enabled: Bool,
+        seconds: Int,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool
+
+    /// Reserves one manual wake for pending updates on one exact incarnation, or explains why not.
+    ///
+    /// A conforming host must not change any preference from it: selection, snoozes, the routine
+    /// interval, and failure suppression are read-only for this operation.
+    @discardableResult
+    func agentSessionLinkRequestManualWakeNow(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentMonitorWakeNowOutcome
+
     @discardableResult
     func agentSessionLinkSetWaitingOn(
         _ waitingOn: DomainAgentSessionWaitingOn?,
@@ -372,6 +399,35 @@ extension AgentSessionLinkEndpointHost {
         for _: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
         false
+    }
+
+    /// Fail-closed defaults for the routine wake interval and `Wake now`.
+    ///
+    /// A host that models no live view model owns no observer policy and can start no turn, so it
+    /// refuses both rather than reporting a success nothing performed.
+    @discardableResult
+    func agentSessionLinkSetRoutineWakeInterval(
+        enabled _: Bool,
+        seconds _: Int,
+        for _: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        false
+    }
+
+    @discardableResult
+    func agentSessionLinkSetPeriodicIdleWake(
+        enabled _: Bool,
+        seconds _: Int,
+        for _: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        false
+    }
+
+    @discardableResult
+    func agentSessionLinkRequestManualWakeNow(
+        for _: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentMonitorWakeNowOutcome {
+        .refused(.observerUnavailable)
     }
 
     /// Fail-closed defaults for snooze routing.
@@ -4176,6 +4232,71 @@ final class AgentSessionLinkRuntimeBridge {
                 .union([targetSessionID]),
             observerSessionID: observerSessionID
         )
+    }
+
+    // MARK: Routine wake interval and Wake now routing
+
+    /// Writes one observer's routine wake interval, addressed to the exact live incarnation.
+    ///
+    /// Synchronous and authority-free, unlike the Auto-wake calls above: it changes no grant and
+    /// reports no link count, so an authority hop would add only a suspension point the endpoint
+    /// could be replaced across.
+    @discardableResult
+    func setRoutineWakeInterval(
+        enabled: Bool,
+        seconds: Int,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard !isFrozenForTermination,
+              let host,
+              host.agentSessionLinkCandidates()
+              .contains(where: { $0.domainEndpoint == observerEndpoint })
+        else {
+            return false
+        }
+        return host.agentSessionLinkSetRoutineWakeInterval(
+            enabled: enabled,
+            seconds: seconds,
+            for: observerEndpoint
+        )
+    }
+
+    /// The setting is local policy; the timer separately checks effective outbound membership.
+    @discardableResult
+    func setPeriodicIdleWake(
+        enabled: Bool,
+        seconds: Int,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard isPeriodicWakeObserverLive(for: observerEndpoint), let host else { return false }
+        return host.agentSessionLinkSetPeriodicIdleWake(
+            enabled: enabled,
+            seconds: seconds,
+            for: observerEndpoint
+        )
+    }
+
+    func isPeriodicWakeObserverLive(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination, let host else { return false }
+        return host.agentSessionLinkCandidates().contains { $0.domainEndpoint == endpoint && !$0.isClosing }
+    }
+
+    /// Requests one manual wake for pending updates on the exact live incarnation.
+    ///
+    /// Synchronous because its refusal is only true of the instant it was computed: a suspension
+    /// before the reservation would make `.sessionBusy` and `.alreadyWaking` stale by construction.
+    @discardableResult
+    func wakeNowForPendingOversightUpdates(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentMonitorWakeNowOutcome {
+        guard !isFrozenForTermination,
+              let host,
+              host.agentSessionLinkCandidates()
+              .contains(where: { $0.domainEndpoint == observerEndpoint })
+        else {
+            return .refused(.observerUnavailable)
+        }
+        return host.agentSessionLinkRequestManualWakeNow(for: observerEndpoint)
     }
 
     // MARK: Auto-wake snooze routing

@@ -77,6 +77,48 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     }
 
     @discardableResult
+    func agentSessionLinkSetRoutineWakeInterval(
+        enabled: Bool,
+        seconds: Int,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
+        return viewModel.agentSessionLinkSetRoutineWakeInterval(
+            enabled: enabled,
+            seconds: seconds,
+            for: endpoint
+        )
+    }
+
+    @discardableResult
+    func agentSessionLinkSetPeriodicIdleWake(
+        enabled: Bool,
+        seconds: Int,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
+        return viewModel.agentSessionLinkSetPeriodicIdleWake(
+            enabled: enabled,
+            seconds: seconds,
+            for: endpoint
+        )
+    }
+
+    /// Routes one `Wake now` request to the view model that *is* this exact incarnation.
+    ///
+    /// Same addressing rule as the policy writes above: a superseded incarnation must not have a turn
+    /// reserved on the live one that replaced it.
+    @discardableResult
+    func agentSessionLinkRequestManualWakeNow(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentMonitorWakeNowOutcome {
+        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
+            return .refused(.observerUnavailable)
+        }
+        return viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint)
+    }
+
+    @discardableResult
     func agentSessionLinkSetWaitingOn(
         _ waitingOn: DomainAgentSessionWaitingOn?,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
