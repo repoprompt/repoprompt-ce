@@ -254,6 +254,11 @@ struct ContextBuilderAgentView: View {
             // Line 3: Plan actions (only when plan is ready)
             if case let .ready(route, previewText) = status {
                 planReadyActions(route: route, previewText: previewText)
+            } else if let route = viewModel.failedAnswerRoute(for: subjectTabID) {
+                Button("View in Chat", systemImage: "bubble.left.and.bubble.right") {
+                    viewGeneratedPlan(route: route)
+                }
+                .hoverTooltip(ContextBuilderGeneratedAnswerActionText.viewInChatTooltip)
             }
         }
         .padding(10)
