@@ -2,6 +2,7 @@ import Foundation
 
 final class AgentACPModelRegistry {
     static let shared = AgentACPModelRegistry()
+    static let providerIDUserInfoKey = "providerID"
 
     private let lock = NSLock()
     private var liveSnapshotsByProvider: [ACPProviderID: ACPDiscoveredSessionModels] = [:]
@@ -38,6 +39,11 @@ final class AgentACPModelRegistry {
 
         guard didChange else { return false }
         ACPDynamicModelStore.save(normalizedSnapshot, for: providerID)
+        NotificationCenter.default.post(
+            name: .acpDiscoveredModelsChanged,
+            object: nil,
+            userInfo: [Self.providerIDUserInfoKey: providerID.rawValue]
+        )
         return true
     }
 
@@ -74,12 +80,18 @@ final class AgentACPModelRegistry {
         guard let plan else { return }
         let loadedSnapshots = await plan.task.value
 
-        lock.withLock {
-            guard plan.generation == standardStoreWarmGeneration else { return }
+        let didApply: Bool = lock.withLock {
+            guard plan.generation == standardStoreWarmGeneration, !didWarmStandardStore else {
+                return false
+            }
             persistedSnapshotsByProvider = loadedSnapshots
             didWarmStandardStore = true
             standardStoreWarmTask = nil
+            return true
         }
+        // No provider ID: warming can publish catalogs for every persisted provider at once.
+        guard didApply else { return }
+        NotificationCenter.default.post(name: .acpDiscoveredModelsChanged, object: nil)
     }
 
     private struct StandardStoreWarmPlan {

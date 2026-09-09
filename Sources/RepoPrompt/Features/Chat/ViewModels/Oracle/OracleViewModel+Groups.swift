@@ -80,6 +80,7 @@ enum AppOracleGroupRouting {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .omp: "omp"
         }
     }
 }
@@ -677,7 +678,8 @@ extension OracleViewModel {
             agentModeSessionID: context.agentModeSessionID,
             agentModeRunID: context.agentModeRunID,
             activationPolicy: .background,
-            packaging: context.packaging
+            packaging: context.packaging,
+            transientImages: context.transientImages
         )
     }
 

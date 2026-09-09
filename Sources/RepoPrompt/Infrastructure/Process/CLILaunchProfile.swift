@@ -16,6 +16,12 @@ enum CLILaunchProfiles {
     ]
     static let cursorProviderSpecificPaths: [String] = []
 
+    /// Bun global-install location used by OMP's published CLI.
+    static let ompProviderSpecificPaths: [String] = ["~/.bun/bin"]
+
+    /// Devin's installer links its versioned CLI shim here.
+    static let devinProviderSpecificPaths: [String] = ["~/.local/bin"]
+
     /// Official Grok Build installer location (`GROK_BIN_DIR` overrides it, but a custom
     /// value is honored through PATH or an explicitly configured absolute command only).
     static let grokBuildProviderSpecificPaths: [String] = [
@@ -64,6 +70,18 @@ enum CLILaunchProfiles {
         commandName: "cursor-agent",
         preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
+    )
+
+    static let omp = CLILaunchProfile(
+        commandName: "omp",
+        preferredBasenames: ["omp"],
+        supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(ompProviderSpecificPaths)
+    )
+
+    static let devin = CLILaunchProfile(
+        commandName: "devin",
+        preferredBasenames: ["devin"],
+        supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(devinProviderSpecificPaths)
     )
 
     static let grokBuild = CLILaunchProfile(

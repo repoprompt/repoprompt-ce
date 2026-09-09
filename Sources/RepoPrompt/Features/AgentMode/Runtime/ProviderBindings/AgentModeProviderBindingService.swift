@@ -206,7 +206,7 @@ final class AgentModeProviderBindingService {
                 // Claude launch settings are revalidated immediately before dispatch.
                 // Avoid an eager untracked shutdown that could race a newly started run.
                 break
-            case .openCode, .antigravity:
+            case .openCode, .antigravity, .omp:
                 let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
                 guard let sessionModeID = runtime.acpSessionModeID,
                       session.runState.isActive,
@@ -239,6 +239,10 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .devin:
+                // Devin owns its internal tool permissions; RepoPrompt exposes no mutable
+                // provider preference to push into a live session.
+                break
             case .grokBuild:
                 // Grok full access is a launch-time `--always-approve` flag; it applies to
                 // newly launched processes and never mutates a running controller. The next

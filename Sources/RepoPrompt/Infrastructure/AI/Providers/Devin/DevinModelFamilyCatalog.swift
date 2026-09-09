@@ -1,0 +1,87 @@
+import Foundation
+
+/// Advisory presentation metadata read from `devin models list --format json`. It never adds
+/// a selectable model: the ACP controller annotates only the model IDs its session advertises.
+final class DevinModelFamilyCatalog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var familiesByModel: [String: AgentModelFamily] = [:]
+
+    func family(for rawModel: String) -> AgentModelFamily? {
+        lock.withLock { familiesByModel[rawModel] }
+    }
+
+    func refresh(launch: ACPCLIResolvedLaunch) async throws {
+        lock.withLock { familiesByModel = [:] }
+        do {
+            try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
+            let runner = CLIProcessRunner(config: CLIProcessConfiguration(
+                command: launch.command,
+                environment: launch.environment,
+                additionalPaths: [],
+                enableDebugLogging: false,
+                shellLookupMode: .fallbackOnly
+            ))
+            let result = try await runner.run(
+                args: ["models", "list", "--format", "json"],
+                stdin: nil,
+                outputMode: .none,
+                timeout: 10,
+                cancelChildOnTaskCancellation: true
+            )
+            try Task.checkCancellation()
+            guard result.status == 0 else { return }
+            let parsed = try Self.parse(result.stdout)
+            lock.withLock { familiesByModel = parsed }
+        } catch {
+            // An older CLI or an unreachable account catalog leaves an ordinary flat picker.
+            // Never block a valid ACP session, and never infer a family from a model ID.
+            try Task.checkCancellation()
+        }
+    }
+
+    /// Rejects the whole catalog on duplicate or blank identity rather than grouping models
+    /// under an ambiguous label.
+    static func parse(_ data: Data) throws -> [String: AgentModelFamily] {
+        struct Catalog: Decodable {
+            struct Family: Decodable {
+                struct Variant: Decodable {
+                    let modelID: String
+                    enum CodingKeys: String, CodingKey { case modelID = "model_uid" }
+                }
+
+                let familyID: String
+                let familyLabel: String
+                let variants: [Variant]
+                enum CodingKeys: String, CodingKey {
+                    case familyID = "family_uid"
+                    case familyLabel = "family_label"
+                    case variants
+                }
+            }
+
+            let families: [Family]
+        }
+        enum InvalidCatalog: Error { case invalidOrDuplicateIdentity }
+
+        let catalog = try JSONDecoder().decode(Catalog.self, from: data)
+        var result: [String: AgentModelFamily] = [:]
+        var familyIDs = Set<String>()
+        for family in catalog.families {
+            guard !family.familyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !family.familyLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  familyIDs.insert(family.familyID).inserted
+            else {
+                throw InvalidCatalog.invalidOrDuplicateIdentity
+            }
+            for variant in family.variants {
+                guard !variant.modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      result[variant.modelID] == nil
+                else {
+                    throw InvalidCatalog.invalidOrDuplicateIdentity
+                }
+                result[variant.modelID] = AgentModelFamily(id: family.familyID, displayName: family.familyLabel)
+            }
+        }
+        return result
+    }
+}

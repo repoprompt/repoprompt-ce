@@ -5,6 +5,8 @@ enum ACPProviderID: String, Codable, Hashable {
     case cursor
     case grokBuild
     case antigravity
+    case omp
+    case devin
 }
 
 enum ACPSupportResult: Equatable {
@@ -300,6 +302,9 @@ protocol ACPAgentProvider: Sendable {
     ) -> [NormalizedAgentRuntimeEvent]
     func preferredAuthMethodID(context: ACPAuthenticationContext) -> String?
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async
+    /// Advisory native grouping for a model the session advertised. Never a source of
+    /// selectable models: the controller annotates only IDs the runtime already listed.
+    func modelFamily(for rawModel: String) -> AgentModelFamily?
     func normalizeError(_ error: Error) -> Error
 
     /// Opts a provider into ACP's parameterized model picker capability and classifies
@@ -319,6 +324,10 @@ extension ACPAgentProvider {
     }
 
     func modelParameterKind(for _: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        nil
+    }
+
+    func modelFamily(for _: String) -> AgentModelFamily? {
         nil
     }
 

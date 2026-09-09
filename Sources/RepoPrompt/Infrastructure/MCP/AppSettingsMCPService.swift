@@ -117,6 +117,12 @@ final class AppSettingsMCPService: Service {
         func handleForTesting(_ args: [String: Value]) async throws -> Value {
             try await handle(args)
         }
+
+        /// The agent-filter → chat-provider mapping lives in a file-private registry;
+        /// this is the only seam tests can reach it through.
+        static func test_aiProviderType(for agent: AgentProviderKind) -> AIProviderType? {
+            AppSettingsMCPRegistry.aiProviderType(for: agent)
+        }
     #endif
 
     private func list(_ args: [String: Value]) async throws -> Value {
@@ -1407,7 +1413,7 @@ private enum AppSettingsMCPRegistry {
 
     // MARK: - Candidate Providers
 
-    private static func aiProviderType(for agent: AgentProviderKind) -> AIProviderType? {
+    static func aiProviderType(for agent: AgentProviderKind) -> AIProviderType? {
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             .claudeCode
@@ -1415,7 +1421,10 @@ private enum AppSettingsMCPRegistry {
             .codex
         case .openCode:
             .openCode
-        case .antigravity:
+        case .omp:
+            .omp
+        // Devin is interactive-only: it exposes no non-agent (chat/Oracle) provider.
+        case .antigravity, .devin:
             nil
         case .cursor:
             .cursor
@@ -1443,6 +1452,7 @@ private enum AppSettingsMCPRegistry {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .omp: "omp"
         }
     }
 
