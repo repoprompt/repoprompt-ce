@@ -1,6 +1,35 @@
 import Foundation
 import SwiftOpenAI
 
+enum AIImageMediaType: String, Equatable {
+    case png = "image/png"
+    case jpeg = "image/jpeg"
+    case gif = "image/gif"
+    case webp = "image/webp"
+}
+
+/// Request-scoped image data for a single Oracle request. Deliberately non-Codable
+/// and path-free so it never lands in persisted chat history.
+struct AITransientImage: Equatable {
+    let bytes: Data
+    let mediaType: AIImageMediaType
+    let title: String?
+
+    var base64Payload: String {
+        bytes.base64EncodedString()
+    }
+
+    var openAIDataURL: String {
+        "data:\(mediaType.rawValue);base64,\(base64Payload)"
+    }
+
+    var normalizedTitle: String? {
+        guard let title else { return nil }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 /// A single conversation entry
 struct ConversationEntry {
     enum Role {
@@ -31,6 +60,9 @@ struct AIMessage {
 
     /// NEW: Full conversation array, user + AI in order
     let conversationMessages: [ConversationEntry]
+
+    /// Request-scoped provider payload. Never copied into persisted chat messages.
+    var transientImages: [AITransientImage]
 
     let temperature: Double?
 
@@ -118,6 +150,7 @@ struct AIMessage {
         fileBlocks: [String] = [],
         gitDiff: String? = nil,
         conversationMessages: [ConversationEntry] = [],
+        transientImages: [AITransientImage] = [],
         temperature: Double?,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
@@ -129,6 +162,7 @@ struct AIMessage {
         self.fileBlocks = fileBlocks
         self.gitDiff = gitDiff
         self.conversationMessages = conversationMessages
+        self.transientImages = transientImages
         self.temperature = temperature
         self.promptSectionsOrder = promptSectionsOrder
         self.disabledPromptSections = disabledPromptSections
@@ -148,6 +182,7 @@ struct AIMessage {
         conversationMessages = [
             ConversationEntry(role: .user, content: userMessage)
         ]
+        transientImages = []
         // Use library defaults for prompt ordering
         promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder
         disabledPromptSections = []
@@ -227,10 +262,48 @@ struct AIMessage {
             let role: ChatCompletionParameters.Message.Role = (entry.role == .user)
                 ? .user
                 : .assistant
-            msgs.append(.init(role: role, content: .text(text)))
+            if entry.role == .user, idx == lastUserIndex, !transientImages.isEmpty {
+                msgs.append(.init(role: role, content: openAIChatContent(text: text)))
+            } else {
+                msgs.append(.init(role: role, content: .text(text)))
+            }
+        }
+
+        // Edge case: images with no user turn to attach them to.
+        if lastUserIndex == nil, !transientImages.isEmpty {
+            msgs.append(.init(role: .user, content: openAIChatContent(text: tail)))
         }
 
         return msgs
+    }
+
+    private func openAIChatContent(text: String) -> ChatCompletionParameters.Message.ContentType {
+        var parts: [ChatCompletionParameters.Message.ContentType.MessageContent] = []
+        if !text.isEmpty {
+            parts.append(.text(text))
+        }
+        for image in transientImages {
+            if let title = image.normalizedTitle {
+                parts.append(.text("Image title: \(title)"))
+            }
+            guard let url = URL(string: image.openAIDataURL) else { continue }
+            parts.append(.imageUrl(.init(url: url, detail: nil)))
+        }
+        return .contentArray(parts)
+    }
+
+    private func openAIResponsesContent(text: String) -> SwiftOpenAI.MessageContent {
+        var parts: [SwiftOpenAI.ContentItem] = []
+        if !text.isEmpty {
+            parts.append(.text(SwiftOpenAI.TextContent(text: text)))
+        }
+        for image in transientImages {
+            if let title = image.normalizedTitle {
+                parts.append(.text(SwiftOpenAI.TextContent(text: "Image title: \(title)")))
+            }
+            parts.append(.image(SwiftOpenAI.ImageContent(detail: "auto", imageUrl: image.openAIDataURL)))
+        }
+        return .array(parts)
     }
 
     /// Generates the full array of `InputItem`s for the Responses-API,
@@ -248,9 +321,10 @@ struct AIMessage {
 
         var items: [SwiftOpenAI.InputItem] = []
         var firstUser = true
+        let lastUserIndex = conversationMessages.lastIndex { $0.role == .user }
 
         // 2. Walk through the stored conversation.
-        for entry in conversationMessages {
+        for (index, entry) in conversationMessages.enumerated() {
             switch entry.role {
             case .user:
                 var text = entry.content
@@ -259,9 +333,12 @@ struct AIMessage {
                     firstUser = false
                 }
 
+                let content: SwiftOpenAI.MessageContent = (index == lastUserIndex && !transientImages.isEmpty)
+                    ? openAIResponsesContent(text: text)
+                    : .text(text)
                 let msg = SwiftOpenAI.InputMessage(
                     role: "user",
-                    content: .text(text)
+                    content: content
                 )
                 items.append(.message(msg))
 
@@ -275,12 +352,12 @@ struct AIMessage {
             }
         }
 
-        // 3. Edge-case: no user message yet but there *is* a tail.
-        if items.isEmpty, !additions.isEmpty {
-            let msg = SwiftOpenAI.InputMessage(
-                role: "user",
-                content: .text(additions)
-            )
+        // 3. Edge-case: no user message yet, but there *is* a tail or an image to send.
+        if lastUserIndex == nil, !transientImages.isEmpty || (items.isEmpty && !additions.isEmpty) {
+            let content: SwiftOpenAI.MessageContent = transientImages.isEmpty
+                ? .text(additions)
+                : openAIResponsesContent(text: additions)
+            let msg = SwiftOpenAI.InputMessage(role: "user", content: content)
             items.append(.message(msg))
         }
 

@@ -6408,6 +6408,8 @@ class PromptViewModel: ObservableObject {
             return api.isCursorConnected
         case .grokBuild:
             return api.isGrokBuildConnected
+        case .omp:
+            return api.isOMPConnected
         }
     }
 

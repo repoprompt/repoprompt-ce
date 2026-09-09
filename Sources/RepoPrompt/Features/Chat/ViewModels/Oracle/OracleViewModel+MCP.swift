@@ -129,6 +129,8 @@ extension OracleViewModel {
         let agentModeRunID: UUID?
         let activationPolicy: OracleSendActivationPolicy
         let packaging: OracleSendPackagingContext
+        /// Request-scoped images loaded from the MCP surface; never persisted.
+        let transientImages: [AITransientImage]
 
         init(
             tabID: UUID,
@@ -137,7 +139,8 @@ extension OracleViewModel {
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil,
             activationPolicy: OracleSendActivationPolicy = .foregroundWhenActive,
-            packaging: OracleSendPackagingContext
+            packaging: OracleSendPackagingContext,
+            transientImages: [AITransientImage] = []
         ) {
             self.tabID = tabID
             self.workspaceID = workspaceID
@@ -146,6 +149,7 @@ extension OracleViewModel {
             self.agentModeRunID = agentModeRunID
             self.activationPolicy = activationPolicy
             self.packaging = packaging
+            self.transientImages = transientImages
         }
     }
 
@@ -1182,6 +1186,12 @@ extension OracleViewModel {
         }
 
         let selectedModel = modelSelection.model
+        let transientImages = tabContext?.transientImages ?? []
+        if !transientImages.isEmpty, !OracleImageRouteAdmission.supports(selectedModel) {
+            throw ChatToolError.invalidParams(
+                "Image attachments are not supported by the selected Oracle model '\(selectedModel.displayName)' on provider '\(selectedModel.providerType.displayName)'."
+            )
+        }
         let mcpControlledModel = modelSelection.mcpControlInfo
         let overrideModelName = selectedModel.displayName
         let overrideChatPresetName: String? = {
@@ -1245,6 +1255,7 @@ extension OracleViewModel {
                 lookupContextOverride: lookupContextOverride,
                 reviewGitContextOverride: reviewGitContextOverride,
                 overrideAIMessage: tabContext?.packaging.prebuiltAIMessage,
+                oracleTransientImages: transientImages,
                 onProgress: onProgress
             )
         }

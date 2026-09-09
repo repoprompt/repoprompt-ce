@@ -154,6 +154,14 @@ final class AgentProviderPreferenceSnapshotStore {
                 autoApproveAllACPToolPermissions: level.launchesWithAlwaysApprove,
                 acceptsPendingACPApprovalWhenActivated: level.launchesWithAlwaysApprove
             )
+        case .omp:
+            return AgentProviderRuntimePermissionBinding(
+                acpSessionModeID: effectiveOMPPermissionLevel(profile: profile).sessionModeID
+            )
+        case .devin:
+            // Devin owns its internal tool permissions; RepoPrompt requests no session mode
+            // and never auto-approves its ACP permission options.
+            return AgentProviderRuntimePermissionBinding()
         }
     }
 
@@ -172,6 +180,11 @@ final class AgentProviderPreferenceSnapshotStore {
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .grokBuild(level):
             GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .omp(level):
+            OMPAgentToolPreferences.setPermissionLevel(level, defaults: defaults)
+        case .devin:
+            // Devin exposes no mutable RepoPrompt-side permission preference.
+            break
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -437,6 +450,46 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .omp:
+            let effective = effectiveOMPPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: effective.isWarning,
+                externallyManagedReason: externallyManagedReason,
+                options: OMPAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .omp(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
+        case .devin:
+            let level = AgentProviderPermissionLevelID.devin
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: level.displayName,
+                iconName: level.iconName,
+                isWarning: false,
+                externallyManagedReason: externallyManagedReason,
+                options: [
+                    AgentPermissionOptionBinding(
+                        id: level,
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: false,
+                        isSelected: true,
+                        isEnabled: false
+                    )
+                ]
+            )
         }
     }
 
@@ -645,6 +698,12 @@ final class AgentProviderPreferenceSnapshotStore {
         }
     }
 
+    private func effectiveOMPPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> OMPAgentToolPreferences.PermissionLevel {
+        profile.ompPermissionLevel(userConfigured: OMPAgentToolPreferences.permissionLevel(defaults: defaults))
+    }
+
     private func effectiveGrokBuildPermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> GrokBuildAgentToolPreferences.PermissionLevel {
@@ -668,6 +727,8 @@ final class AgentProviderPreferenceSnapshotStore {
         case .cursor: .cursor
         case .grokBuild: .grokBuild
         case .antigravity: .antigravity
+        case .omp: .omp
+        case .devin: .devin
         }
     }
 

@@ -158,7 +158,9 @@ enum AgentSessionLinkPrompts {
         switch agentKind {
         case .codexExec, .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__\(canonical)"
-        case .openCode, .cursor, .grokBuild, .antigravity:
+        // Devin exposes MCP only through its `mcp_*` gateway meta-tools, so no qualified
+        // per-tool name exists to promise the model.
+        case .openCode, .cursor, .grokBuild, .antigravity, .omp, .devin:
             return canonical
         }
     }

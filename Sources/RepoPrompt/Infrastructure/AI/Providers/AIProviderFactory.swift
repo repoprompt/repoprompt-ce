@@ -89,6 +89,8 @@ class AIProviderFactory {
             return CursorCLIProvider()
         case .grokBuild:
             return GrokBuildCLIProvider()
+        case .omp:
+            return OMPCLIProvider()
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 
@@ -181,6 +183,7 @@ enum AIProviderType: Codable, Equatable {
     case openCode // OpenCode CLI provider case
     case cursor // Cursor CLI provider case
     case grokBuild // Grok Build CLI provider case
+    case omp // Oh My Pi CLI provider case
 }
 
 extension AIProviderType {
@@ -203,6 +206,7 @@ extension AIProviderType {
         case .openCode: "OpenCode"
         case .cursor: "Cursor CLI"
         case .grokBuild: "Grok Build"
+        case .omp: "Oh My Pi"
         }
     }
 

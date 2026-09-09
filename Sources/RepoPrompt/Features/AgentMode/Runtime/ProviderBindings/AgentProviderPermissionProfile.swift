@@ -155,11 +155,25 @@ extension AgentProviderPermissionProfile {
         }
     }
 
+    func ompPermissionLevel(
+        userConfigured: OMPAgentToolPreferences.PermissionLevel = OMPAgentToolPreferences.permissionLevel()
+    ) -> OMPAgentToolPreferences.PermissionLevel {
+        switch self {
+        case .userConfigured: userConfigured
+        case .mcpSafeDefaults: .providerManaged
+        case let .providerOverride(.omp(level)): level
+        case .providerOverride: .providerManaged
+        }
+    }
+
     func acpSessionModeID(for agent: AgentProviderKind) -> String? {
         switch agent {
         case .openCode:
             openCodeSessionModeID
-        case .cursor, .grokBuild, .antigravity:
+        case .omp:
+            ompPermissionLevel().sessionModeID
+        // Devin advertises session modes live per session; RepoPrompt never requests one.
+        case .cursor, .grokBuild, .antigravity, .devin:
             nil
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil

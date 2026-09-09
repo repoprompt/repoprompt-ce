@@ -583,6 +583,8 @@ struct AgentModeGeneralSettingsView: View {
         case .antigravity: AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .cursor: apiSettingsVM.isCursorConnected
         case .grokBuild: apiSettingsVM.isGrokBuildConnected
+        case .omp: apiSettingsVM.isOMPConnected
+        case .devin: apiSettingsVM.isDevinConnected
         }
     }
 
