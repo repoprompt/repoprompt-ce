@@ -40,16 +40,17 @@ enum SparkleUpdaterStartDecision: Equatable {
 #endif
 
 /// Class to monitor updates and provide UI notifications
+@MainActor
 final class SparkleUpdaterManager: ObservableObject {
     /// Singleton instance - set by AppDelegate on launch
     static var shared: SparkleUpdaterManager!
-    private static let stableFeedURL = SecurityObfuscation.decode(SecurityObfuscation.stableFeedURLEncoded)
-    private static let tipFeedURL = SecurityObfuscation.decode(SecurityObfuscation.tipFeedURLEncoded)
-    private static let expectedPublicEdKey = SecurityObfuscation.decode(SecurityObfuscation.expectedPublicEdKeyEncoded)
-    static let stableRecoveryDownloadsURL = URL(
+    private nonisolated static let stableFeedURL = SecurityObfuscation.decode(SecurityObfuscation.stableFeedURLEncoded)
+    private nonisolated static let tipFeedURL = SecurityObfuscation.decode(SecurityObfuscation.tipFeedURLEncoded)
+    private nonisolated static let expectedPublicEdKey = SecurityObfuscation.decode(SecurityObfuscation.expectedPublicEdKeyEncoded)
+    nonisolated static let stableRecoveryDownloadsURL = URL(
         string: "https://github.com/repoprompt/repoprompt-ce-updates/releases"
     )
-    static let recoveryDownloadsCaveat =
+    nonisolated static let recoveryDownloadsCaveat =
         "Opening this page only provides recovery downloads; it does not verify that manually installing or downgrading a build is safe for this Mac."
 
     private struct CanonicalURL: Hashable {
@@ -73,7 +74,7 @@ final class SparkleUpdaterManager: ObservableObject {
         let downloadURL: URL?
     }
 
-    private static func canonicalizeFeedURL(_ raw: String) -> CanonicalURL? {
+    private nonisolated static func canonicalizeFeedURL(_ raw: String) -> CanonicalURL? {
         guard let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
         guard let scheme = url.scheme?.lowercased(),
               let host = url.host?.lowercased() else { return nil }
@@ -88,7 +89,7 @@ final class SparkleUpdaterManager: ObservableObject {
         return CanonicalURL(scheme: scheme, host: host, port: port, path: path)
     }
 
-    private static var acceptedConfigurations: [AcceptedSparkleConfiguration] {
+    private nonisolated static var acceptedConfigurations: [AcceptedSparkleConfiguration] {
         [stableFeedURL, tipFeedURL].compactMap { rawFeed in
             guard let canonical = canonicalizeFeedURL(rawFeed) else { return nil }
             return AcceptedSparkleConfiguration(feed: canonical, publicEdKey: expectedPublicEdKey)
@@ -119,13 +120,13 @@ final class SparkleUpdaterManager: ObservableObject {
     private let httpClient: HTTPClient = DefaultHTTPClient.uiCriticalClient
 
     /// How often to check for updates (12 hours in seconds)
-    private static let updateCheckInterval: TimeInterval = 12 * 60 * 60
+    private nonisolated static let updateCheckInterval: TimeInterval = 12 * 60 * 60
 
     /// UserDefaults key for last passive appcast check timestamp
-    private static let lastCheckKey = "SparkleLastUpdateCheck"
+    private nonisolated static let lastCheckKey = "SparkleLastUpdateCheck"
 
     /// UserDefaults key for RepoPrompt's passive appcast-check preference.
-    private static let passiveAppcastChecksKey = "RepoPromptPassiveAppcastChecksEnabled"
+    private nonisolated static let passiveAppcastChecksKey = "RepoPromptPassiveAppcastChecksEnabled"
 
     /// Expose updater for settings UI
     var updater: SPUUpdater {
@@ -207,14 +208,14 @@ final class SparkleUpdaterManager: ObservableObject {
         )
     }
 
-    static func recoveryDownloadsURL(
+    nonisolated static func recoveryDownloadsURL(
         identityMigrationBlockedMessage: String?
     ) -> URL? {
         guard identityMigrationBlockedMessage != nil else { return nil }
         return stableRecoveryDownloadsURL
     }
 
-    static func updateCheckMenuTitle(
+    nonisolated static func updateCheckMenuTitle(
         checkState: SparkleAppcastCheckState
     ) -> String {
         switch checkState {
@@ -229,14 +230,14 @@ final class SparkleUpdaterManager: ObservableObject {
         }
     }
 
-    static func checkStateAfterCancellation(
+    nonisolated static func checkStateAfterCancellation(
         currentState: SparkleAppcastCheckState,
         hadActiveRequest: Bool
     ) -> SparkleAppcastCheckState {
         hadActiveRequest ? .notChecked : currentState
     }
 
-    static func manualDownloadURL(
+    nonisolated static func manualDownloadURL(
         for notice: AvailableUpdateNotice?,
         identityMigrationBlockedMessage: String?
     ) -> URL? {
@@ -247,7 +248,7 @@ final class SparkleUpdaterManager: ObservableObject {
         return notice.downloadURL
     }
 
-    static func updateStatusText(
+    nonisolated static func updateStatusText(
         availableUpdate: AvailableUpdateNotice?,
         checkState: SparkleAppcastCheckState
     ) -> String {
@@ -332,7 +333,7 @@ final class SparkleUpdaterManager: ObservableObject {
         setupPeriodicUpdateCheck()
     }
 
-    static func startDecision(
+    nonisolated static func startDecision(
         sparkleConfigurationValid: Bool,
         discoveryEnabled: Bool,
         identityMigrationBlockedMessage: String?
@@ -341,7 +342,7 @@ final class SparkleUpdaterManager: ObservableObject {
         return identityMigrationBlockedMessage == nil ? .start : .discoveryOnly
     }
 
-    static func userInitiatedUpdateAction(
+    nonisolated static func userInitiatedUpdateAction(
         discoveryEnabled: Bool,
         sparkleConfigurationValid: Bool,
         identityMigrationBlockedMessage: String?
@@ -405,7 +406,7 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     @discardableResult
-    static func performPassiveAppcastCheck(
+    nonisolated static func performPassiveAppcastCheck(
         check: () async -> Bool,
         now: Date = Date(),
         defaults: UserDefaults = .standard
@@ -426,9 +427,7 @@ final class SparkleUpdaterManager: ObservableObject {
         }
 
         invalidateActiveAppcastCheck()
-        await MainActor.run {
-            appcastCheckState = .checking
-        }
+        appcastCheckState = .checking
 
         let checkedChannel = updateChannel
         let requestIdentity = AppcastCheckRequestIdentity(channel: checkedChannel)
@@ -451,34 +450,32 @@ final class SparkleUpdaterManager: ObservableObject {
         appcastCheckTask = task
         let appcastInfo = await task.value
 
-        return await MainActor.run {
-            guard Self.appcastResultIsCurrent(
-                request: requestIdentity,
-                activeRequest: self.activeAppcastCheckRequest,
-                selectedChannel: self.updateChannel
-            ), self.userInitiatedObserverState.activeRequest == nil else {
-                sparkleUpdaterManagerDebugLog("Discarding stale appcast result for channel \(checkedChannel.rawValue)")
-                return false
-            }
-
-            defer {
-                self.activeAppcastCheckRequest = nil
-                self.appcastCheckTask = nil
-            }
-
-            guard !task.isCancelled else { return false }
-            self.apply(
-                appcastInfo: appcastInfo,
-                currentVersion: currentVersion,
-                currentBuildNumber: currentBuildNumber,
-                checkedChannel: checkedChannel
-            )
-            self.appcastCheckState = appcastInfo == nil ? .failed : .succeeded
-            return appcastInfo != nil
+        guard Self.appcastResultIsCurrent(
+            request: requestIdentity,
+            activeRequest: activeAppcastCheckRequest,
+            selectedChannel: updateChannel
+        ), userInitiatedObserverState.activeRequest == nil else {
+            sparkleUpdaterManagerDebugLog("Discarding stale appcast result for channel \(checkedChannel.rawValue)")
+            return false
         }
+
+        defer {
+            activeAppcastCheckRequest = nil
+            appcastCheckTask = nil
+        }
+
+        guard !task.isCancelled else { return false }
+        apply(
+            appcastInfo: appcastInfo,
+            currentVersion: currentVersion,
+            currentBuildNumber: currentBuildNumber,
+            checkedChannel: checkedChannel
+        )
+        appcastCheckState = appcastInfo == nil ? .failed : .succeeded
+        return appcastInfo != nil
     }
 
-    static func appcastResultIsCurrent(
+    nonisolated static func appcastResultIsCurrent(
         request: AppcastCheckRequestIdentity,
         activeRequest: AppcastCheckRequestIdentity?,
         selectedChannel: UpdateChannel
@@ -486,7 +483,7 @@ final class SparkleUpdaterManager: ObservableObject {
         request == activeRequest && request.channel == selectedChannel
     }
 
-    static func updateChannel(forAppcastItemURL url: URL?) -> UpdateChannel? {
+    nonisolated static func updateChannel(forAppcastItemURL url: URL?) -> UpdateChannel? {
         guard let url,
               url.scheme?.lowercased() == "https",
               url.host?.lowercased() == "github.com",
@@ -514,7 +511,7 @@ final class SparkleUpdaterManager: ObservableObject {
         }
     }
 
-    static func makePassiveAppcastRequest(feedURL: URL) -> URLRequest {
+    nonisolated static func makePassiveAppcastRequest(feedURL: URL) -> URLRequest {
         var request = URLRequest(url: feedURL)
         request.timeoutInterval = 15
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -523,7 +520,7 @@ final class SparkleUpdaterManager: ObservableObject {
         return request
     }
 
-    static func testFetchAndParseAppcastVersion(feedURL: URL, httpClient: HTTPClient) async -> String? {
+    nonisolated static func testFetchAndParseAppcastVersion(feedURL: URL, httpClient: HTTPClient) async -> String? {
         let currentBuildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
         return await fetchAndParseAppcast(
             feedURL: feedURL,
@@ -532,7 +529,7 @@ final class SparkleUpdaterManager: ObservableObject {
         )?.latestVersion
     }
 
-    static func currentEligibilityContext(
+    nonisolated static func currentEligibilityContext(
         currentBuildNumber: String
     ) -> AppcastEligibilityContext {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
@@ -546,7 +543,7 @@ final class SparkleUpdaterManager: ObservableObject {
         )
     }
 
-    private static func fetchAndParseAppcast(
+    private nonisolated static func fetchAndParseAppcast(
         feedURL: URL,
         httpClient: HTTPClient,
         context: AppcastEligibilityContext
@@ -706,7 +703,7 @@ final class SparkleUpdaterManager: ObservableObject {
             .store(in: &cancellables)
     }
 
-    static func sparkleResultIsNotOlderThanKnownUpdate(
+    nonisolated static func sparkleResultIsNotOlderThanKnownUpdate(
         candidateBuildNumber: String,
         knownBuildNumber: String?
     ) -> Bool {
@@ -717,7 +714,7 @@ final class SparkleUpdaterManager: ObservableObject {
         return candidateBuild >= knownBuild
     }
 
-    static func presentationVersion(
+    nonisolated static func presentationVersion(
         channel: UpdateChannel,
         displayVersion: String,
         title: String?
@@ -727,7 +724,7 @@ final class SparkleUpdaterManager: ObservableObject {
         return AvailableUpdateNotice.marketingVersion(fromTipTitle: title) ?? fallbackVersion
     }
 
-    static func sanitizeVersionString(_ version: String) -> String {
+    nonisolated static func sanitizeVersionString(_ version: String) -> String {
         var version = version.trimmingCharacters(in: .whitespacesAndNewlines)
         if version.lowercased().hasPrefix("tip build") {
             version.removeFirst("tip build".count)
@@ -944,28 +941,32 @@ final class SparkleUpdaterManager: ObservableObject {
 
 #if DEBUG
     extension SparkleUpdaterManager {
-        static var debugLastCheckKey: String {
+        static func debugMainActorIsolationProbe() -> Bool {
+            Thread.isMainThread
+        }
+
+        nonisolated static var debugLastCheckKey: String {
             lastCheckKey
         }
 
-        static var debugPassiveAppcastChecksKey: String {
+        nonisolated static var debugPassiveAppcastChecksKey: String {
             passiveAppcastChecksKey
         }
 
-        static var debugExpectedFeedURL: String {
+        nonisolated static var debugExpectedFeedURL: String {
             stableFeedURL
         }
 
-        static var debugTipFeedURL: String {
+        nonisolated static var debugTipFeedURL: String {
             tipFeedURL
         }
 
-        static func debugFeedURLMatchesExpected(_ raw: String) -> Bool {
+        nonisolated static func debugFeedURLMatchesExpected(_ raw: String) -> Bool {
             guard let canonical = canonicalizeFeedURL(raw) else { return false }
             return acceptedConfigurations.contains { $0.feed == canonical }
         }
 
-        static func debugIsVersion(_ lhs: String, newerThan rhs: String) -> Bool {
+        nonisolated static func debugIsVersion(_ lhs: String, newerThan rhs: String) -> Bool {
             SparkleVersionComparison.isVersion(lhs, newerThan: rhs)
         }
 

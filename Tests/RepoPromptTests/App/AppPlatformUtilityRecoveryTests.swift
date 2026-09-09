@@ -2,6 +2,17 @@
 import XCTest
 
 final class AppPlatformUtilityRecoveryTests: XCTestCase {
+    func testSparkleUpdaterManagerRunsOnMainActorFromDetachedCaller() async {
+        let (detachedCallerWasOnMainThread, managerRanOnMainThread) = await Task.detached {
+            let detachedCallerWasOnMainThread = Thread.isMainThread
+            let managerRanOnMainThread = await SparkleUpdaterManager.debugMainActorIsolationProbe()
+            return (detachedCallerWasOnMainThread, managerRanOnMainThread)
+        }.value
+
+        XCTAssertFalse(detachedCallerWasOnMainThread)
+        XCTAssertTrue(managerRanOnMainThread)
+    }
+
     func testSparkleUpdaterStartDecisionKeepsDiscoveryAvailableDuringIdentityMigrationBlock() {
         XCTAssertEqual(
             SparkleUpdaterManager.startDecision(
