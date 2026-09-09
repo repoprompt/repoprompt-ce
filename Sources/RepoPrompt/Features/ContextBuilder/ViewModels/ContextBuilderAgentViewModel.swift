@@ -4496,17 +4496,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     @MainActor
     func planStatus(for tabID: UUID?) -> ContextBuilderPlanStatus {
         guard let id = tabID, let session = sessions[id] else { return .idle }
-        if session.isBackgroundPlanGenerating {
-            return .generating
-        }
-        if let error = session.backgroundPlanError {
-            return .error(error)
-        }
-        if let route = session.generatedAnswerRoute {
-            let preview = session.backgroundPlanResponsePreviewText ?? session.backgroundPlanResponseText
-            return .ready(route: route, previewText: preview)
-        }
-        return .idle
+        return session.planStatus
+    }
+
+    @MainActor
+    func failedAnswerRoute(for tabID: UUID?) -> ContextBuilderGeneratedAnswerRoute? {
+        guard let tabID else { return nil }
+        return sessions[tabID]?.failedAnswerRoute
     }
 
     /// Returns the current context-builder follow-up Oracle chat ID for a tab, when known.
@@ -4782,10 +4778,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     "Context Builder Oracle group result did not match its prepared members"
                 )
             }
-            guard let primary = session.followUpOracleGroupState.members.first else {
-                throw ChatToolError.internalError("Context Builder Oracle group completed without Primary state")
-            }
-            let primaryResult = groupReply.result.primary
             try await oracleStore.releaseArtifactReservation(
                 frozenPack.reservation,
                 removeIfUnreferenced: false
@@ -4795,36 +4787,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 await runTestHooks?.afterOracleArtifactReservationReleased?(generation)
             #endif
             try requireCurrentOracleRun(session: session, generation: generation)
-            if primaryResult.status != .completed,
-               let partialResponse = primaryResult.error?.partialResponse,
-               !partialResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            {
-                session.backgroundPlanResponseText = partialResponse
-            }
-            let primaryResponse = try groupReply.requiredCompletedPrimaryResponse()
-            let errors = groupReply.orderedResults.compactMap { result in
-                result.error.map {
-                    "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) failed: \($0.message)"
-                }
-            }
-            let reply = ChatSendReply(
-                chatId: primary.sessionID,
-                shortId: primary.chatID,
-                mode: mode.mcpModeName,
-                response: primaryResponse,
-                errors: errors.isEmpty ? nil : errors,
-                oracleGroup: groupReply
+            let reply = try session.completeOracleGroupReply(
+                groupReply,
+                generation: generation,
+                originWorkspaceID: originWorkspaceID,
+                mode: mode
             )
-            session.isBackgroundPlanGenerating = false
-            session.backgroundPlanResponseText = reply.response
-            session.backgroundPlanReasoningText = nil
-            session.generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
-                workspaceID: originWorkspaceID,
-                tabID: tabID,
-                chatID: primary.chatID
-            )
-            session.followUpOracleGroupState.finish(generation: generation)
-            session.followUpOracleGroupTask = nil
             clearPendingBackgroundPlanUIRefresh(for: tabID)
             applyPlanPreview(to: session)
             updateRuntimeBindings(from: session)
@@ -5847,6 +5815,73 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 message: message
             )
         )
+    }
+}
+
+extension ContextBuilderAgentViewModel.TabSession {
+    /// Called only after the runtime settled and artifact reservation release succeeded.
+    /// A failed primary is a group outcome, not a failure to deliver the group.
+    @MainActor
+    func completeOracleGroupReply(
+        _ groupReply: ContextBuilderOracleGroupReply,
+        generation: UInt64,
+        originWorkspaceID: UUID,
+        mode: HeadlessMode
+    ) throws -> ChatSendReply {
+        try Task.checkCancellation()
+        guard followUpOracleGroupState.generation == generation else { throw CancellationError() }
+        guard followUpOracleGroupState.matchesFinalResult(groupReply.result, generation: generation),
+              let primary = followUpOracleGroupState.members.first
+        else {
+            throw ChatToolError.internalError("Context Builder Oracle group result did not match its prepared members")
+        }
+        let primaryResult = groupReply.result.primary
+        let errors = groupReply.orderedResults.compactMap { result in
+            result.error.map {
+                "\(OracleViewModel.oracleLabel(laneIndex: result.laneIndex)) \(result.status.rawValue): \($0.message)"
+            }
+        }
+        let reply = ChatSendReply(
+            chatId: primary.sessionID,
+            shortId: primary.chatID,
+            mode: mode.mcpModeName,
+            response: primaryResult.status == .completed ? primaryResult.response : nil,
+            errors: errors.isEmpty ? nil : errors,
+            oracleGroup: groupReply
+        )
+        isBackgroundPlanGenerating = false
+        backgroundPlanResponseText = reply.response ?? primaryResult.error?.partialResponse
+        backgroundPlanReasoningText = nil
+        backgroundPlanError = primaryResult.status == .completed ? nil :
+            ContextBuilderOraclePrimaryCompletionError.notCompleted(
+                status: primaryResult.status,
+                code: primaryResult.error?.code ?? "oracle_primary_not_completed",
+                message: primaryResult.error?.message ?? "Primary Oracle did not complete successfully."
+            ).localizedDescription
+        generatedAnswerRoute = ContextBuilderGeneratedAnswerRoute(
+            workspaceID: originWorkspaceID,
+            tabID: tabID,
+            chatID: primary.chatID
+        )
+        followUpOracleGroupState.finish(generation: generation)
+        followUpOracleGroupTask = nil
+        return reply
+    }
+
+    @MainActor
+    var planStatus: ContextBuilderPlanStatus {
+        if isBackgroundPlanGenerating { return .generating }
+        if let error = backgroundPlanError { return .error(error) }
+        if let route = generatedAnswerRoute {
+            return .ready(route: route, previewText: backgroundPlanResponsePreviewText ?? backgroundPlanResponseText)
+        }
+        return .idle
+    }
+
+    @MainActor
+    var failedAnswerRoute: ContextBuilderGeneratedAnswerRoute? {
+        guard !isBackgroundPlanGenerating, backgroundPlanError != nil else { return nil }
+        return generatedAnswerRoute
     }
 }
 

@@ -400,94 +400,83 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertNil(wrongWorkspace)
     }
 
-    func testAggregateOraclePillCountAndLabelsUseConfiguredOrLatestProjectedGroup() {
-        let historical = ChatSession(
-            oracleGroupID: UUID(),
-            oracleLaneIndex: 0,
-            oracleGroupSize: 5,
-            name: "Historical",
-            savedAt: Date(timeIntervalSince1970: 100)
-        )
-        let latestSingle = ChatSession(
-            name: "Latest Single",
-            savedAt: Date(timeIntervalSince1970: 200)
-        )
-        let latestGroupID = UUID()
-        let latestProjected = ChatSession(
-            oracleGroupID: latestGroupID,
-            oracleLaneIndex: 0,
-            oracleGroupSize: 4,
-            name: "Latest Group",
-            savedAt: Date(timeIntervalSince1970: 300)
-        )
-        let staleSiblingProjection = ChatSession(
-            oracleGroupID: latestGroupID,
-            oracleLaneIndex: 1,
-            oracleGroupSize: 5,
-            name: "Stale Group Sibling",
-            savedAt: Date(timeIntervalSince1970: 200)
-        )
-        let invalidProjected = ChatSession(
-            oracleGroupID: UUID(),
-            oracleLaneIndex: 0,
-            oracleGroupSize: 99,
-            name: "Invalid Projection",
-            savedAt: Date(timeIntervalSince1970: 400)
-        )
+    func testBadgeUsesSelectedStoredRosterAndDoesNotCreateMissingMembers() {
+        let single = ChatSession(name: "Legacy single")
+        let group = ChatSession(oracleGroupID: UUID(), oracleLaneIndex: 0, oracleGroupSize: 2)
+        // Configuration is deliberately absent from the presentation API: changing it cannot
+        // promote a historical single chat or change an existing group's stored roster.
+        XCTAssertEqual(AgentOraclePillLogic.aggregateOracleCount(session: single), 1)
+        XCTAssertEqual(AgentOraclePillLogic.aggregateOracleCount(session: group), 2)
+        XCTAssertEqual(AgentOraclePillLogic.aggregateOracleCount(session: nil), 1)
+        XCTAssertTrue(AgentOraclePillLogic.groupMemberSessions(for: single, in: [single, group]).isEmpty)
+        XCTAssertEqual(AgentOraclePillLogic.groupMemberSessions(for: group, in: [single, group]).map(\.id), [group.id])
+        XCTAssertFalse(AgentOraclePillLogic.canCopyAll(single))
+        XCTAssertTrue(AgentOraclePillLogic.canCopyAll(group))
+    }
 
-        XCTAssertEqual(
-            AgentOraclePillLogic.aggregateOracleCount(
-                configuredAdditionalCount: 0,
-                sessions: [historical, latestSingle]
-            ),
-            1
+    func testBadgeFollowsOwnerFilteringStreamingSelectionAndExplicitHistory() throws {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let owner = UUID()
+        let runID = UUID()
+        func session(size: Int, savedAt: TimeInterval, agent: UUID) -> ChatSession {
+            ChatSession(
+                workspaceID: workspaceID, composeTabID: tabID,
+                agentModeSessionID: agent, agentModeRunID: runID,
+                oracleGroupID: UUID(), oracleLaneIndex: 0, oracleGroupSize: size,
+                savedAt: Date(timeIntervalSince1970: savedAt),
+                messages: [StoredMessage(isUser: false, rawText: "answer", sequenceIndex: 0)]
+            )
+        }
+        let streaming = session(size: 2, savedAt: 100, agent: owner)
+        let newer = session(size: 3, savedAt: 200, agent: owner)
+        let foreign = session(size: 5, savedAt: 300, agent: UUID())
+        let sessions = [foreign, newer, streaming]
+        let eligible = AgentOraclePillLogic.eligibleSessions(
+            sessions: sessions, streamingSessionIDs: [streaming.id], liveMessageCount: { _ in nil },
+            activeAgentSessionID: owner, activeRunID: runID
         )
-        XCTAssertEqual(
-            AgentOraclePillLogic.aggregateOracleCount(
-                configuredAdditionalCount: 0,
-                sessions: [historical, staleSiblingProjection, latestProjected]
-            ),
-            4
+        XCTAssertFalse(eligible.contains { $0.id == foreign.id })
+        let selected = try XCTUnwrap(AgentOraclePillLogic.latestSession(
+            in: eligible, streamingSessionIDs: [streaming.id]
+        ))
+        XCTAssertEqual(selected.id, streaming.id)
+        XCTAssertEqual(AgentOraclePillLogic.aggregateOracleCount(session: selected), 2)
+        let historicalID = AgentOraclePillLogic.reconciledPresentedSessionID(
+            currentSessionID: newer.id, isExplicit: true, currentWorkspaceID: workspaceID,
+            sameTabSessions: sessions, eligibleSessions: eligible, streamingSessionIDs: [streaming.id]
         )
-        XCTAssertEqual(
-            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 2, sessions: []),
-            3
+        XCTAssertEqual(historicalID, newer.id)
+        XCTAssertEqual(AgentOraclePillLogic.aggregateOracleCount(
+            session: sessions.first { $0.id == historicalID }
+        ), 3)
+    }
+
+    func testLaneStatusUsesCanonicalOutcomeInsteadOfAssistantText() {
+        let groupID = UUID()
+        let primary = ChatSession(oracleGroupID: groupID, oracleLaneIndex: 0, oracleGroupSize: 3)
+        let secondary = ChatSession(
+            oracleGroupID: groupID, oracleLaneIndex: 1, oracleGroupSize: 3,
+            messages: [StoredMessage(isUser: false, rawText: "Error: valid answer", sequenceIndex: 0)]
         )
-        XCTAssertEqual(
-            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 0, sessions: [invalidProjected]),
-            5
-        )
-        XCTAssertFalse(AgentOraclePillLogic.canCopyAll(latestSingle))
-        XCTAssertTrue(AgentOraclePillLogic.canCopyAll(latestProjected))
-        XCTAssertEqual(
-            (0 ... 4).map(OracleViewModel.oracleLabel(laneIndex:)),
-            ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
-        )
-        XCTAssertEqual(
-            AgentOraclePillLogic.laneDotState(isStreaming: true, lastAssistantContent: "Error: stale"),
-            .streaming
-        )
-        XCTAssertEqual(
-            AgentOraclePillLogic.laneDotState(
-                isStreaming: false,
-                lastAssistantContent: "partial answer\n\n--\nError:\nstatus code 502"
-            ),
-            .failed
-        )
-        XCTAssertEqual(
-            AgentOraclePillLogic.laneDotState(
-                isStreaming: false,
-                lastAssistantContent: "Error: status code 502 Gemini response stalled"
-            ),
-            .failed
-        )
-        XCTAssertEqual(
-            AgentOraclePillLogic.laneDotState(
-                isStreaming: false,
-                lastAssistantContent: "Review looks correct. Mention error handling."
-            ),
-            .completed
-        )
+        let cancelled = ChatSession(oracleGroupID: groupID, oracleLaneIndex: 2, oracleGroupSize: 3)
+        let sessions = [primary, secondary, cancelled]
+        let statuses: [OracleLaneMarkdownPayload.Status] = [.failed, .completed, .cancelled]
+        let payload = OracleLaneMarkdownPayload(lanes: zip(sessions, statuses).enumerated().map { index, pair in
+            OracleLaneMarkdownPayload.Lane(
+                laneIndex: index, chatID: pair.0.shortID, providerID: nil, modelID: "same-model",
+                effectiveReasoningEffort: nil, status: pair.1,
+                response: index == 1 ? "Error: valid answer" : nil, partialResponse: nil,
+                errorCode: index == 0 ? "invalid_model" : nil,
+                errorMessage: index == 0 ? "failed before sending" : nil
+            )
+        })
+        XCTAssertEqual(sessions.map {
+            AgentOraclePillLogic.laneStatus(session: $0, isStreaming: false, payload: payload)
+        }, statuses)
+        XCTAssertEqual(AgentOraclePillLogic.laneStatus(session: primary, isStreaming: false, payload: nil), .unavailable)
+        XCTAssertEqual(AgentOraclePillLogic.laneStatus(session: primary, isStreaming: true, payload: payload), .running)
+        XCTAssertEqual(AgentOraclePillLogic.groupMemberSessions(for: primary, in: Array(sessions.reversed())).map(\.id), sessions.map(\.id))
     }
 
     func testGroupedDeleteFallsBackToProjectionCleanupWhenCanonicalDocumentIsMissing() async throws {
