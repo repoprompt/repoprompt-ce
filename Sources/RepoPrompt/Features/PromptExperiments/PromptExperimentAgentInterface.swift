@@ -48,9 +48,9 @@
     }
 
     enum PromptExperimentAgentResponse {
-        case capabilities(operations: [String], limitations: [String])
+        case capabilities(operations: [String], targets: [PromptExperimentResolvedTarget], limitations: [String])
         case records([PromptExperimentRecord])
-        case record(PromptExperimentRecord)
+        case record(PromptExperimentRecord, artifactTextBySHA256: [String: String])
         case draft(experimentID: UUID, draft: PromptExperimentDraft)
         case sealed(experimentID: UUID, plan: PromptExperimentPlan)
     }
@@ -68,6 +68,7 @@
             case .capabilities:
                 return .capabilities(
                     operations: PromptExperimentAgentOperation.allCases.map(\.rawValue),
+                    targets: service.availableTargets(),
                     limitations: [
                         "DEBUG pilot; synthetic-fixture, fixed-comparison, serial trials only.",
                         "No agent operation can approve, start, cancel, score, or promote a plan.",
@@ -120,20 +121,28 @@
                 )
                 return .sealed(experimentID: experimentID, plan: plan)
             case let .read(experimentID):
-                return try await .record(service.ownedRecord(
+                let record = try await service.ownedRecord(
                     id: experimentID,
                     controllerSessionID: owner.controllerSessionID
-                ))
+                )
+                return try await .record(
+                    record,
+                    artifactTextBySHA256: service.readableArtifactText(for: record)
+                )
             case let .proposeNextRevision(experimentID, digest):
                 try await service.startNextRevision(
                     experimentID: experimentID,
                     expectedPlanDigest: digest,
                     expectedControllerSessionID: owner.controllerSessionID
                 )
-                return try await .record(service.ownedRecord(
+                let record = try await service.ownedRecord(
                     id: experimentID,
                     controllerSessionID: owner.controllerSessionID
-                ))
+                )
+                return try await .record(
+                    record,
+                    artifactTextBySHA256: service.readableArtifactText(for: record)
+                )
             }
         }
 

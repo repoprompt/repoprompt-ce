@@ -180,27 +180,12 @@
                                 await progress("Context Builder \(phase.stage): \(message)")
                             }
                         )
-                        let afterDigest = try? verifyEnvironment(plan.environment)
-                        let disposition: PromptExperimentRuntimeDisposition = switch completion.terminalDisposition {
-                        case .completed:
-                            .completed
-                        case .cancelled:
-                            .cancelled
-                        case let .failed(message):
-                            .failed(message)
-                        }
-                        result = PromptExperimentRuntimeResult(
-                            disposition: disposition,
-                            runtimeLink: PromptExperimentRuntimeLink(
-                                adapter: PromptExperimentPlan.executionAdapter,
-                                tabID: completion.tabID,
-                                runID: completion.runID,
-                                provider: completion.agentKind?.rawValue ?? plan.resolvedTarget.agentRaw,
-                                model: completion.modelRaw ?? plan.resolvedTarget.modelRaw
-                            ),
-                            output: completion.agentOutput,
+                        result = Self.runtimeResult(
+                            completion: completion,
+                            fallbackProvider: plan.resolvedTarget.agentRaw,
+                            fallbackModel: plan.resolvedTarget.modelRaw,
                             fixtureDigestBefore: beforeDigest,
-                            fixtureDigestAfter: afterDigest
+                            fixtureDigestAfter: try? verifyEnvironment(plan.environment)
                         )
                     } catch is CancellationError {
                         result = PromptExperimentRuntimeResult(
@@ -212,7 +197,9 @@
                                 provider: plan.resolvedTarget.agentRaw,
                                 model: plan.resolvedTarget.modelRaw
                             ),
-                            output: nil,
+                            committedHandoff: nil,
+                            assistantOutput: nil,
+                            handoffUnavailableReason: "Context Builder was cancelled before an immutable handoff was committed.",
                             fixtureDigestBefore: beforeDigest,
                             fixtureDigestAfter: try? verifyEnvironment(plan.environment)
                         )
@@ -226,7 +213,9 @@
                                 provider: plan.resolvedTarget.agentRaw,
                                 model: plan.resolvedTarget.modelRaw
                             ),
-                            output: nil,
+                            committedHandoff: nil,
+                            assistantOutput: nil,
+                            handoffUnavailableReason: "Context Builder failed before an immutable handoff was committed.",
                             fixtureDigestBefore: beforeDigest,
                             fixtureDigestAfter: try? verifyEnvironment(plan.environment)
                         )
@@ -262,7 +251,9 @@
                         provider: nil,
                         model: nil
                     ),
-                    output: nil,
+                    committedHandoff: nil,
+                    assistantOutput: nil,
+                    handoffUnavailableReason: "The accepted runtime attempt was no longer registered; committed handoff is unavailable.",
                     fixtureDigestBefore: "unavailable",
                     fixtureDigestAfter: nil
                 )
@@ -280,6 +271,66 @@
             }
             await windowState.contextBuilderAgentViewModel.cancelMCPContextBuilderRun(forTabID: attempt.tabID)
             return .requested
+        }
+
+        static func runtimeResult(
+            completion: ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion,
+            fallbackProvider: String,
+            fallbackModel: String,
+            fixtureDigestBefore: String,
+            fixtureDigestAfter: String?
+        ) -> PromptExperimentRuntimeResult {
+            let committedHandoff: PromptExperimentRuntimeHandoff?
+            let unavailableReason: String?
+            if let committed = completion.committedTab {
+                let overrides = committed.tab.contextOverrides
+                let prompt = overrides.useOverridePrompt
+                    ? overrides.overridePromptText
+                    : committed.tab.promptText
+                if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    committedHandoff = nil
+                    unavailableReason = "Context Builder committed a tab without a non-empty effective prompt handoff."
+                } else {
+                    committedHandoff = PromptExperimentRuntimeHandoff(
+                        prompt: prompt,
+                        selection: committed.tab.selection,
+                        selectionRevision: committed.selectionRevision,
+                        usedAgentOutputAsPrompt: committed.usedAgentOutputAsPrompt
+                    )
+                    unavailableReason = nil
+                }
+            } else {
+                committedHandoff = nil
+                unavailableReason = "Context Builder did not return its terminal committed-tab handoff snapshot."
+            }
+
+            var disposition: PromptExperimentRuntimeDisposition = switch completion.terminalDisposition {
+            case .completed:
+                .completed
+            case .cancelled:
+                .cancelled
+            case let .failed(message):
+                .failed(message)
+            }
+            if case .completed = disposition, committedHandoff == nil {
+                disposition = .failed(unavailableReason ?? "Committed handoff is unavailable.")
+            }
+
+            return PromptExperimentRuntimeResult(
+                disposition: disposition,
+                runtimeLink: PromptExperimentRuntimeLink(
+                    adapter: PromptExperimentPlan.executionAdapter,
+                    tabID: completion.tabID,
+                    runID: completion.runID,
+                    provider: completion.agentKind?.rawValue ?? fallbackProvider,
+                    model: completion.modelRaw ?? fallbackModel
+                ),
+                committedHandoff: committedHandoff,
+                assistantOutput: completion.agentOutput,
+                handoffUnavailableReason: unavailableReason,
+                fixtureDigestBefore: fixtureDigestBefore,
+                fixtureDigestAfter: fixtureDigestAfter
+            )
         }
 
         private func verifyEnvironment(_ environment: PromptExperimentEnvironment) throws -> String {

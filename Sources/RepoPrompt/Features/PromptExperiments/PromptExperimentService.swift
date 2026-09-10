@@ -36,7 +36,8 @@
 
         private let store: PromptExperimentStore
         private var runtime: PromptExperimentRuntime
-        private let resolveTarget: @MainActor (String) -> PromptExperimentResolvedTarget?
+        private let resolveTarget: @MainActor (String) throws -> PromptExperimentResolvedTarget?
+        private let listAvailableTargets: @MainActor () -> [PromptExperimentResolvedTarget]
         private let now: @MainActor () -> Date
         private var executionTasks: [UUID: Task<Void, Never>] = [:]
         private var admittedExperimentIDs: Set<UUID> = []
@@ -46,12 +47,14 @@
         init(
             store: PromptExperimentStore,
             runtime: PromptExperimentRuntime,
-            resolveTarget: @escaping @MainActor (String) -> PromptExperimentResolvedTarget? = PromptExperimentService.liveTarget,
+            resolveTarget: @escaping @MainActor (String) throws -> PromptExperimentResolvedTarget? = PromptExperimentService.liveTarget,
+            availableTargets: @escaping @MainActor () -> [PromptExperimentResolvedTarget] = PromptExperimentService.liveTargets,
             now: @escaping @MainActor () -> Date = Date.init
         ) {
             self.store = store
             self.runtime = runtime
             self.resolveTarget = resolveTarget
+            listAvailableTargets = availableTargets
             self.now = now
         }
 
@@ -213,9 +216,9 @@
                 throw PromptExperimentAuthorityError.draftDigestMismatch
             }
             let validated = try draft.validated()
-            guard let target = resolveTarget(validated.targetRole) else {
+            guard let target = try resolveTarget(validated.targetRole) else {
                 throw PromptExperimentAuthorityError.targetUnavailable(
-                    "No currently available catalog target resolves for role ‘\(validated.targetRole)’."
+                    "No currently available catalog target resolves for selector ‘\(validated.targetRole)’."
                 )
             }
             let date = now()
@@ -408,6 +411,10 @@
             records.first { $0.id == id }
         }
 
+        func availableTargets() -> [PromptExperimentResolvedTarget] {
+            listAvailableTargets()
+        }
+
         func ownedRecords(controllerSessionID: UUID) async throws -> [PromptExperimentRecord] {
             try await requireLoaded()
             return records.filter { $0.controllerSessionID == controllerSessionID }
@@ -418,6 +425,25 @@
             let record = try records[index(of: id)]
             try requireOwner(record, expectedControllerSessionID: controllerSessionID)
             return record
+        }
+
+        func readableArtifactText(for record: PromptExperimentRecord) async throws -> [String: String] {
+            var references: [PromptExperimentArtifactReference] = []
+            for attempt in record.attempts {
+                if let prompt = attempt.committedHandoff?.promptEvidence { references.append(prompt) }
+                if let assistant = attempt.assistantOutputEvidence { references.append(assistant) }
+            }
+            var textByDigest: [String: String] = [:]
+            for reference in references where textByDigest[reference.sha256] == nil {
+                let data = try await store.readArtifact(reference)
+                guard let text = String(data: data, encoding: .utf8) else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable(
+                        "Experiment artifact \(reference.sha256) is not valid UTF-8."
+                    )
+                }
+                textByDigest[reference.sha256] = text
+            }
+            return textByDigest
         }
 
         func rebuildReadableViews() async throws {
@@ -558,8 +584,19 @@
         }
 
         private func settle(experimentID: UUID, attemptID: UUID, result: PromptExperimentRuntimeResult) async throws {
-            let evidence: PromptExperimentArtifactReference? = if let output = result.output {
-                try await store.installArtifact(Data(output.utf8))
+            let committedHandoff: PromptExperimentCommittedHandoff? = if let handoff = result.committedHandoff {
+                try await PromptExperimentCommittedHandoff(
+                    promptEvidence: store.installArtifact(Data(handoff.prompt.utf8)),
+                    promptPreview: String(handoff.prompt.prefix(400)),
+                    selection: handoff.selection,
+                    selectionRevision: handoff.selectionRevision,
+                    usedAgentOutputAsPrompt: handoff.usedAgentOutputAsPrompt
+                )
+            } else {
+                nil
+            }
+            let assistantOutputEvidence: PromptExperimentArtifactReference? = if let assistantOutput = result.assistantOutput {
+                try await store.installArtifact(Data(assistantOutput.utf8))
             } else {
                 nil
             }
@@ -569,13 +606,15 @@
                 record.attempts[index].runtimeLink = result.runtimeLink
                 record.attempts[index].fixtureDigestBefore = result.fixtureDigestBefore
                 record.attempts[index].fixtureDigestAfter = result.fixtureDigestAfter
-                record.attempts[index].evidence = evidence
-                record.attempts[index].outputPreview = result.output.map { String($0.prefix(400)) }
+                record.attempts[index].committedHandoff = committedHandoff
+                record.attempts[index].assistantOutputEvidence = assistantOutputEvidence
+                record.attempts[index].assistantOutputPreview = result.assistantOutput.map { String($0.prefix(400)) }
+                record.attempts[index].handoffUnavailableReason = result.handoffUnavailableReason
                 record.attempts[index].settledAt = now()
                 record.attempts[index].lateResultAfterCancellation = cancelled
                 if cancelled {
                     record.attempts[index].status = .cancelledSettled
-                    record.attempts[index].statusText = "Provider settled after cancellation was requested; evidence retained but not scored."
+                    record.attempts[index].statusText = "Provider settled after cancellation was requested; committed handoff and assistant output are retained when available, but not scored."
                 } else if result.fixtureDigestBefore != record.plan(for: record.attempts[index])?.environment.fixtureDigest
                     || result.fixtureDigestAfter != result.fixtureDigestBefore
                 {
@@ -584,9 +623,14 @@
                     record.attempts[index].error = "Fixture digest mismatch"
                 } else {
                     switch result.disposition {
+                    case .completed where committedHandoff == nil:
+                        let message = result.handoffUnavailableReason ?? "Context Builder completion did not include an immutable committed handoff."
+                        record.attempts[index].status = .failed
+                        record.attempts[index].statusText = "Committed handoff unavailable; attempt is inconclusive: \(message)"
+                        record.attempts[index].error = message
                     case .completed:
                         record.attempts[index].status = .completed
-                        record.attempts[index].statusText = "Completed with immutable evidence."
+                        record.attempts[index].statusText = "Completed with immutable committed prompt and final selection evidence."
                     case let .failed(message):
                         record.attempts[index].status = .failed
                         record.attempts[index].statusText = "Runtime failed: \(message)"
@@ -677,20 +721,12 @@
             projectionError = report.message
         }
 
-        private static func liveTarget(role: String) -> PromptExperimentResolvedTarget? {
-            guard let selection = AgentModelCatalog.resolveTaskLabel(role) else { return nil }
-            switch selection.agent {
-            case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
-                break
-            case .openCode, .cursor, .grokBuild, .antigravity:
-                return nil
-            }
-            return PromptExperimentResolvedTarget(
-                role: role,
-                agentRaw: selection.agent.rawValue,
-                modelRaw: selection.modelRaw,
-                displayName: "\(selection.agent.displayName) \(AgentModelCatalog.displayName(for: selection.modelRaw, agentKind: selection.agent))"
-            )
+        private static func liveTarget(selector: String) throws -> PromptExperimentResolvedTarget? {
+            try PromptExperimentTargetCatalog.resolve(selector)
+        }
+
+        private static func liveTargets() -> [PromptExperimentResolvedTarget] {
+            PromptExperimentTargetCatalog.availableTargets()
         }
     }
 #endif

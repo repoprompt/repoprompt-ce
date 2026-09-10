@@ -291,17 +291,50 @@
                                         .font(.caption.monospaced())
                                         .foregroundStyle(.secondary)
                                 }
-                                if let preview = attempt.outputPreview, !preview.isEmpty {
-                                    Text(preview)
+                                if let handoff = attempt.committedHandoff {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Committed handoff").font(.caption.bold())
+                                        Text(handoff.promptPreview)
+                                            .font(.caption)
+                                            .textSelection(.enabled)
+                                            .padding(8)
+                                            .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                                        Text("Prompt SHA-256: \(handoff.promptEvidence.sha256)")
+                                            .font(.caption.monospaced())
+                                            .textSelection(.enabled)
+                                        Text("Final selection revision \(handoff.selectionRevision) · \(selectionSummary(handoff.selection))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                        Text("Agent output copied as prompt: \(handoff.usedAgentOutputAsPrompt ? "yes" : "no")")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                } else if let reason = attempt.handoffUnavailableReason {
+                                    Label("Committed handoff unavailable/inconclusive: \(reason)", systemImage: "exclamationmark.triangle")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                } else if let preview = attempt.outputPreview, !preview.isEmpty {
+                                    Text("Legacy unclassified output: \(preview)")
                                         .font(.caption)
                                         .textSelection(.enabled)
-                                        .padding(8)
-                                        .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
                                 }
-                                if let evidence = attempt.evidence {
-                                    Text("Evidence SHA-256: \(evidence.sha256)")
-                                        .font(.caption.monospaced())
-                                        .textSelection(.enabled)
+                                if let assistant = attempt.assistantOutputPreview, !assistant.isEmpty {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Assistant runtime output (not the handoff)").font(.caption.bold())
+                                        Text(assistant)
+                                            .font(.caption)
+                                            .textSelection(.enabled)
+                                    }
+                                }
+                                if let submittedAt = attempt.submittedAt, let settledAt = attempt.settledAt {
+                                    Text("Elapsed \(settledAt.timeIntervalSince(submittedAt), format: .number.precision(.fractionLength(3))) s · provider token usage unavailable from completion contract")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    Text("Elapsed and provider token usage unavailable")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
                             }
                             .padding(.vertical, 10)
@@ -312,6 +345,19 @@
                     }
                 }
             }
+        }
+
+        private func selectionSummary(_ selection: StoredSelection) -> String {
+            let paths = selection.selectedPaths.isEmpty
+                ? "no selected paths"
+                : selection.selectedPaths.joined(separator: ", ")
+            let slices = selection.slices.keys.sorted().map { path in
+                let ranges = selection.slices[path, default: []]
+                    .map { "\($0.start)-\($0.end)" }
+                    .joined(separator: ",")
+                return "\(path):\(ranges)"
+            }.joined(separator: "; ")
+            return slices.isEmpty ? paths : "\(paths); slices \(slices)"
         }
 
         private func perform(_ operation: @escaping @MainActor () async throws -> Void) {
@@ -362,11 +408,10 @@
                         instructionEditor("Candidate instructions", text: $draft.candidateInstructions)
                     }
                     HStack {
-                        Picker("Catalog role", selection: $draft.targetRole) {
-                            Text("Explore").tag("explore")
-                            Text("Engineer").tag("engineer")
-                            Text("Pair").tag("pair")
-                            Text("Design").tag("design")
+                        Picker("Catalog target", selection: $draft.targetRole) {
+                            ForEach(service.availableTargets(), id: \.selector) { target in
+                                Text("\(target.selector) — \(target.displayName)").tag(target.selector)
+                            }
                         }
                         Stepper("Repetitions: \(draft.repetitions)", value: $draft.repetitions, in: 1 ... 3)
                         Spacer()

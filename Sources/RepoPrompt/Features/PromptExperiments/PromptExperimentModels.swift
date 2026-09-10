@@ -233,16 +233,25 @@
             copy.syntheticFixture = trimmedFixture
             copy.originalInstructions = trimmedOriginal
             copy.candidateInstructions = trimmedCandidate
-            copy.targetRole = targetRole.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            copy.targetRole = targetRole.trimmingCharacters(in: .whitespacesAndNewlines)
             return copy
         }
     }
 
     struct PromptExperimentResolvedTarget: Codable, Equatable {
+        /// The user-selected task role or canonical `agent:model` catalog identifier.
         let role: String
         let agentRaw: String
         let modelRaw: String
         let displayName: String
+
+        var selector: String {
+            role
+        }
+
+        var canonicalSelectionID: String {
+            AgentModelSelectionID(agentRaw: agentRaw, modelRaw: modelRaw).rawValue
+        }
     }
 
     struct PromptExperimentFixtureFile: Codable, Equatable, Hashable {
@@ -429,6 +438,23 @@
         let model: String?
     }
 
+    /// Raw immutable handoff captured at the Context Builder terminal commit seam.
+    struct PromptExperimentRuntimeHandoff: Equatable {
+        let prompt: String
+        let selection: StoredSelection
+        let selectionRevision: UInt64
+        let usedAgentOutputAsPrompt: Bool
+    }
+
+    /// Durable evidence for the actual committed prompt and final selected context.
+    struct PromptExperimentCommittedHandoff: Codable, Equatable {
+        let promptEvidence: PromptExperimentArtifactReference
+        let promptPreview: String
+        let selection: StoredSelection
+        let selectionRevision: UInt64
+        let usedAgentOutputAsPrompt: Bool
+    }
+
     struct PromptExperimentAttempt: Codable, Equatable, Identifiable {
         let id: UUID
         let trialID: UUID
@@ -444,8 +470,14 @@
         var cancellationRequestedAt: Date?
         var settledAt: Date?
         var runtimeLink: PromptExperimentRuntimeLink?
+        /// Legacy pilot evidence. New runs store the committed prompt and assistant output separately.
         var evidence: PromptExperimentArtifactReference?
+        /// Legacy pilot preview. New runs use `committedHandoff.promptPreview`.
         var outputPreview: String?
+        var committedHandoff: PromptExperimentCommittedHandoff?
+        var assistantOutputEvidence: PromptExperimentArtifactReference?
+        var assistantOutputPreview: String?
+        var handoffUnavailableReason: String?
         var error: String?
         var lateResultAfterCancellation: Bool
         var fixtureDigestBefore: String?
@@ -468,6 +500,10 @@
             runtimeLink = nil
             evidence = nil
             outputPreview = nil
+            committedHandoff = nil
+            assistantOutputEvidence = nil
+            assistantOutputPreview = nil
+            handoffUnavailableReason = nil
             error = nil
             lateResultAfterCancellation = false
             fixtureDigestBefore = nil
@@ -562,7 +598,9 @@
     struct PromptExperimentRuntimeResult: Equatable {
         let disposition: PromptExperimentRuntimeDisposition
         let runtimeLink: PromptExperimentRuntimeLink
-        let output: String?
+        let committedHandoff: PromptExperimentRuntimeHandoff?
+        let assistantOutput: String?
+        let handoffUnavailableReason: String?
         let fixtureDigestBefore: String
         let fixtureDigestAfter: String?
     }

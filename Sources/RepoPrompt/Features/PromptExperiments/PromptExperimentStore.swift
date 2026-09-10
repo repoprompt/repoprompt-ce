@@ -276,11 +276,34 @@
                 for attempt in record.attempts.sorted(by: {
                     ($0.planRevision ?? 0, $0.ordinal) < ($1.planRevision ?? 0, $1.ordinal)
                 }) {
-                    var line = "- revision \(attempt.planRevision.map(String.init) ?? "legacy") / \(attempt.ordinal). \(attempt.condition.displayName) r\(attempt.repetition): `\(attempt.status.rawValue)` — \(attempt.statusText)"
-                    if let evidence = attempt.evidence {
-                        line += " — evidence `../../\(evidence.relativePath)`"
+                    lines.append("- revision \(attempt.planRevision.map(String.init) ?? "legacy") / \(attempt.ordinal). \(attempt.condition.displayName) r\(attempt.repetition): `\(attempt.status.rawValue)` — \(attempt.statusText)")
+                    if let handoff = attempt.committedHandoff {
+                        lines.append("  - Committed prompt: `../../\(handoff.promptEvidence.relativePath)`")
+                        lines.append("  - Prompt preview: \(Self.markdownInline(handoff.promptPreview))")
+                        lines.append("  - Final selection revision: \(handoff.selectionRevision)")
+                        lines.append("  - Final selected paths: \(handoff.selection.selectedPaths.isEmpty ? "none" : handoff.selection.selectedPaths.joined(separator: ", "))")
+                        lines.append("  - Final slices: \(Self.selectionSlicesSummary(handoff.selection))")
+                        lines.append("  - Agent output copied as prompt: \(handoff.usedAgentOutputAsPrompt ? "yes" : "no")")
+                    } else if let reason = attempt.handoffUnavailableReason {
+                        lines.append("  - Committed handoff: unavailable/inconclusive — \(reason)")
+                    } else {
+                        lines.append("  - Committed handoff: unavailable (legacy or unsettled attempt)")
                     }
-                    lines.append(line)
+                    if let assistantEvidence = attempt.assistantOutputEvidence {
+                        lines.append("  - Assistant runtime output: `../../\(assistantEvidence.relativePath)`")
+                        if let preview = attempt.assistantOutputPreview {
+                            lines.append("  - Assistant output preview: \(Self.markdownInline(preview))")
+                        }
+                    }
+                    if let legacyEvidence = attempt.evidence {
+                        lines.append("  - Legacy unclassified evidence: `../../\(legacyEvidence.relativePath)`")
+                    }
+                    if let elapsed = Self.elapsedSeconds(attempt) {
+                        lines.append("  - Elapsed: \(String(format: "%.3f", elapsed)) seconds")
+                    } else {
+                        lines.append("  - Elapsed: unavailable")
+                    }
+                    lines.append("  - Provider token usage: unavailable from the Context Builder completion contract")
                 }
             }
             lines += [
@@ -292,11 +315,16 @@
         }
 
         private func resultsCSV(_ record: PromptExperimentRecord) -> String {
-            var rows = ["plan_revision,plan_id,plan_digest,ordinal,condition,repetition,status,tab_id,run_id,evidence_sha256,error"]
-            rows += record.attempts.sorted(by: {
+            var rows = ["plan_revision,plan_id,plan_digest,ordinal,condition,repetition,status,tab_id,run_id,committed_prompt_sha256,assistant_output_sha256,selection_revision,selected_paths,slices,elapsed_seconds,usage,error"]
+            let attempts = record.attempts.sorted {
                 ($0.planRevision ?? 0, $0.ordinal) < ($1.planRevision ?? 0, $1.ordinal)
-            }).map { attempt in
-                [
+            }
+            for attempt in attempts {
+                let selectionRevision = attempt.committedHandoff.map { String($0.selectionRevision) } ?? ""
+                let selectedPaths = attempt.committedHandoff?.selection.selectedPaths.joined(separator: "\n") ?? ""
+                let slices = attempt.committedHandoff.map { Self.selectionSlicesSummary($0.selection) } ?? ""
+                let elapsed = Self.elapsedSeconds(attempt).map { String(format: "%.3f", $0) } ?? ""
+                let fields: [String] = [
                     attempt.planRevision.map(String.init) ?? "",
                     attempt.planID?.uuidString ?? "",
                     attempt.planDigest ?? "",
@@ -306,12 +334,45 @@
                     attempt.status.rawValue,
                     attempt.runtimeLink?.tabID?.uuidString ?? "",
                     attempt.runtimeLink?.runID?.uuidString ?? "",
-                    attempt.evidence?.sha256 ?? "",
+                    attempt.committedHandoff?.promptEvidence.sha256 ?? "",
+                    attempt.assistantOutputEvidence?.sha256 ?? "",
+                    selectionRevision,
+                    selectedPaths,
+                    slices,
+                    elapsed,
+                    "unavailable_from_context_builder_completion_contract",
                     attempt.error ?? ""
-                ].map(Self.csvField).joined(separator: ",")
+                ]
+                rows.append(fields.map(Self.csvField).joined(separator: ","))
             }
             rows.append("")
             return rows.joined(separator: "\n")
+        }
+
+        private static func elapsedSeconds(_ attempt: PromptExperimentAttempt) -> TimeInterval? {
+            guard let submittedAt = attempt.submittedAt,
+                  let settledAt = attempt.settledAt else { return nil }
+            return max(0, settledAt.timeIntervalSince(submittedAt))
+        }
+
+        private static func selectionSlicesSummary(_ selection: StoredSelection) -> String {
+            guard !selection.slices.isEmpty else { return "none" }
+            return selection.slices.keys.sorted().map { path in
+                let ranges = selection.slices[path, default: []].map { range in
+                    var value = "\(range.start)-\(range.end)"
+                    if let description = range.description, !description.isEmpty {
+                        value += " (\(description))"
+                    }
+                    return value
+                }.joined(separator: ", ")
+                return "\(path): \(ranges)"
+            }.joined(separator: "; ")
+        }
+
+        private static func markdownInline(_ value: String) -> String {
+            value
+                .replacingOccurrences(of: "\n", with: " ↩ ")
+                .replacingOccurrences(of: "`", with: "\\`")
         }
 
         private static func csvField(_ value: String) -> String {

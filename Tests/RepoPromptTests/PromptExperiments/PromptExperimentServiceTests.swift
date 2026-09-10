@@ -110,7 +110,9 @@ import XCTest
                 handle: PromptExperimentRuntimeHandle,
                 disposition: PromptExperimentRuntimeDisposition,
                 output: String?,
-                fixtureDigest: String = "fixture"
+                fixtureDigest: String = "fixture",
+                selection: StoredSelection = StoredSelection(selectedPaths: ["fixture.md"]),
+                assistantOutput: String? = "Done"
             ) -> PromptExperimentRuntimeResult {
                 PromptExperimentRuntimeResult(
                     disposition: disposition,
@@ -121,7 +123,16 @@ import XCTest
                         provider: "fake",
                         model: "fake-model"
                     ),
-                    output: output,
+                    committedHandoff: output.map {
+                        PromptExperimentRuntimeHandoff(
+                            prompt: $0,
+                            selection: selection,
+                            selectionRevision: 7,
+                            usedAgentOutputAsPrompt: false
+                        )
+                    },
+                    assistantOutput: assistantOutput,
+                    handoffUnavailableReason: output == nil ? "controlled missing handoff" : nil,
                     fixtureDigestBefore: fixtureDigest,
                     fixtureDigestAfter: fixtureDigest
                 )
@@ -320,7 +331,7 @@ import XCTest
             XCTAssertEqual(harness.runtime.submitted.map(\.attempt.ordinal), [1, 2])
             XCTAssertEqual(record.phase, .inconclusive)
             XCTAssertEqual(record.attempts.map(\.status), [.failed, .completed])
-            XCTAssertNotNil(record.attempts.first?.evidence)
+            XCTAssertNotNil(record.attempts.first?.committedHandoff)
         }
 
         func testCancellationPreservesRequestedThenLateSettlement() async throws {
@@ -344,7 +355,7 @@ import XCTest
             XCTAssertEqual(record.phase, .cancelled)
             XCTAssertEqual(record.attempts.first?.status, .cancelledSettled)
             XCTAssertEqual(record.attempts.first?.lateResultAfterCancellation, true)
-            XCTAssertNotNil(record.attempts.first?.evidence)
+            XCTAssertNotNil(record.attempts.first?.committedHandoff)
             XCTAssertEqual(record.attempts.dropFirst().first?.status, .planned)
         }
 
@@ -588,7 +599,7 @@ import XCTest
             let firstPlan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
             let firstAttempts = try XCTUnwrap(harness.service.record(id: id)?.attempts(for: firstPlan))
             XCTAssertEqual(firstAttempts.count, 2)
-            XCTAssertTrue(firstAttempts.allSatisfy { $0.evidence != nil })
+            XCTAssertTrue(firstAttempts.allSatisfy { $0.committedHandoff != nil })
 
             try await harness.service.startNextRevision(experimentID: id, expectedPlanDigest: firstPlan.digest)
             var secondDraft = try XCTUnwrap(harness.service.record(id: id)?.draft)
@@ -621,8 +632,8 @@ import XCTest
             XCTAssertEqual(record.plans.map(\.revision), [1, 2])
             XCTAssertEqual(record.attempts(for: firstPlan).count, 2)
             XCTAssertEqual(record.attempts(for: secondPlan).count, 2)
-            XCTAssertTrue(record.attempts(for: firstPlan).allSatisfy { $0.evidence != nil })
-            XCTAssertTrue(record.attempts(for: secondPlan).allSatisfy { $0.evidence != nil })
+            XCTAssertTrue(record.attempts(for: firstPlan).allSatisfy { $0.committedHandoff != nil })
+            XCTAssertTrue(record.attempts(for: secondPlan).allSatisfy { $0.committedHandoff != nil })
         }
 
         func testLoadMigratesUnambiguousLegacyAttemptLineage() async throws {
@@ -658,6 +669,197 @@ import XCTest
             XCTAssertEqual(persisted.first(where: { $0.id == id })?.attempts(for: plan).count, plan.trials.count)
         }
 
+        func testCommittedHandoffUsesOverridePromptAndFinalSelectionAcrossReopen() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await approvedExperiment(harness)
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(record.currentPlan)
+            let trial = try XCTUnwrap(plan.trials.first)
+            let finalSelection = StoredSelection(
+                selectedPaths: ["fixture.md", "notes.md"],
+                manualCodemapPaths: ["fixture.md"],
+                slices: ["fixture.md": [LineRange(start: 2, end: 4, description: "answer evidence")]],
+                codemapAutoEnabled: false
+            )
+            let tabID = UUID()
+            let committedTab = MCPServerViewModel.ContextBuilderCommittedTabSnapshot(
+                identity: WorkspaceSelectionIdentity(workspaceID: UUID(), tabID: tabID),
+                nestedRunID: UUID(),
+                tab: ComposeTabState(
+                    id: tabID,
+                    name: "Committed",
+                    selection: finalSelection,
+                    promptText: "stale prompt area",
+                    contextOverrides: ContextBuilderOverrides(
+                        useOverridePrompt: true,
+                        overridePromptText: "Actual immutable handoff"
+                    )
+                ),
+                selectionRevision: 42,
+                usedAgentOutputAsPrompt: false
+            )
+            let completion = ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion(
+                runID: UUID(),
+                tabID: tabID,
+                identity: committedTab.identity,
+                agentKind: .codexExec,
+                modelRaw: "catalog-model-high",
+                terminalDisposition: .completed,
+                agentOutput: "Done",
+                usedAgentOutputAsPrompt: false,
+                committedTab: committedTab
+            )
+            let runtimeResult = NativePromptExperimentContextBuilderRuntime.runtimeResult(
+                completion: completion,
+                fallbackProvider: "fallback",
+                fallbackModel: "fallback-model",
+                fixtureDigestBefore: plan.environment.fixtureDigest,
+                fixtureDigestAfter: plan.environment.fixtureDigest
+            )
+            XCTAssertEqual(runtimeResult.committedHandoff?.prompt, "Actual immutable handoff")
+            XCTAssertEqual(runtimeResult.committedHandoff?.selection, finalSelection)
+            XCTAssertEqual(runtimeResult.assistantOutput, "Done")
+            harness.runtime.immediateResults[trial.ordinal] = runtimeResult
+
+            try await harness.service.run(experimentID: id)
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+
+            let reopened = PromptExperimentService(
+                store: PromptExperimentStore(rootURL: harness.root),
+                runtime: FakeRuntime(),
+                resolveTarget: Self.fakeTarget
+            )
+            await reopened.load()
+            let reopenedRecord = try XCTUnwrap(reopened.record(id: id))
+            let attempt = try XCTUnwrap(reopenedRecord.attempts.first)
+            let handoff = try XCTUnwrap(attempt.committedHandoff)
+            XCTAssertEqual(handoff.selection, finalSelection)
+            XCTAssertEqual(handoff.selectionRevision, 42)
+            XCTAssertEqual(attempt.assistantOutputPreview, "Done")
+            XCTAssertNotEqual(handoff.promptPreview, attempt.assistantOutputPreview)
+            let promptArtifactData = try await harness.store.readArtifact(handoff.promptEvidence)
+            let assistantArtifact = try XCTUnwrap(attempt.assistantOutputEvidence)
+            let assistantArtifactData = try await harness.store.readArtifact(assistantArtifact)
+            XCTAssertEqual(String(data: promptArtifactData, encoding: .utf8), "Actual immutable handoff")
+            XCTAssertEqual(String(data: assistantArtifactData, encoding: .utf8), "Done")
+
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: reopenedRecord.controllerSessionID,
+                sourceTabID: reopenedRecord.sourceTabID
+            )
+            let response = try await PromptExperimentAgentInterface(service: reopened).execute(.read(experimentID: id), owner: owner)
+            guard case let .record(_, artifactTextBySHA256) = response else { return XCTFail("Expected record response") }
+            XCTAssertEqual(artifactTextBySHA256[handoff.promptEvidence.sha256], "Actual immutable handoff")
+            XCTAssertEqual(artifactTextBySHA256[attempt.assistantOutputEvidence?.sha256 ?? ""], "Done")
+
+            let directory = try await reopened.recordDirectoryURL(experimentID: id)
+            let overview = try String(contentsOf: directory.appendingPathComponent("overview.md"), encoding: .utf8)
+            XCTAssertTrue(overview.contains("Actual immutable handoff"))
+            XCTAssertTrue(overview.contains("fixture.md: 2-4 (answer evidence)"))
+            XCTAssertTrue(overview.contains("Assistant output preview: Done"))
+        }
+
+        func testCompletedRuntimeWithoutCommittedHandoffIsInconclusive() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await approvedExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            harness.runtime.immediateResults[1] = FakeRuntime.result(
+                handle: PromptExperimentRuntimeHandle(id: UUID(), tabID: nil, runID: nil),
+                disposition: .completed,
+                output: nil,
+                fixtureDigest: plan.environment.fixtureDigest,
+                assistantOutput: "Done"
+            )
+
+            try await harness.service.run(experimentID: id)
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            XCTAssertEqual(record.phase, .inconclusive)
+            XCTAssertEqual(record.attempts.first?.status, .failed)
+            XCTAssertEqual(record.attempts.first?.handoffUnavailableReason, "controlled missing handoff")
+            XCTAssertEqual(record.attempts.first?.assistantOutputPreview, "Done")
+        }
+
+        func testExplicitCatalogTargetsSealExactModelsWithoutChangingRoleDefaults() async throws {
+            let root = temporaryRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let targets = [
+                PromptExperimentResolvedTarget(
+                    role: "codexExec:gpt-6-astra-high",
+                    agentRaw: AgentProviderKind.codexExec.rawValue,
+                    modelRaw: "gpt-6-astra-high",
+                    displayName: "Codex GPT-6 Astra High"
+                ),
+                PromptExperimentResolvedTarget(
+                    role: "codexExec:gpt-6-astra-xhigh",
+                    agentRaw: AgentProviderKind.codexExec.rawValue,
+                    modelRaw: "gpt-6-astra-xhigh",
+                    displayName: "Codex GPT-6 Astra XHigh"
+                )
+            ]
+            let availability = AgentModelCatalog.AvailabilityContext(codexAvailable: true)
+            let beforeOverrides = GlobalSettingsStore.shared.globalAgentModelsProfile().mcpAgentRoleOverrides
+            let runtime = FakeRuntime()
+            let store = PromptExperimentStore(rootURL: root)
+            let service = PromptExperimentService(
+                store: store,
+                runtime: runtime,
+                resolveTarget: { selector in
+                    try PromptExperimentTargetCatalog.resolve(
+                        selector,
+                        availability: availability,
+                        exactTargets: targets
+                    )
+                },
+                availableTargets: { targets },
+                now: { Date(timeIntervalSince1970: 1000) }
+            )
+            let harness = Harness(root: root, store: store, runtime: runtime, service: service)
+
+            for target in targets {
+                let id = try await preparedExperiment(harness, targetSelector: target.selector)
+                let plan = try XCTUnwrap(service.record(id: id)?.currentPlan)
+                XCTAssertEqual(plan.resolvedTarget, target)
+                XCTAssertEqual(plan.resolvedTarget.canonicalSelectionID, target.selector)
+            }
+            XCTAssertEqual(GlobalSettingsStore.shared.globalAgentModelsProfile().mcpAgentRoleOverrides, beforeOverrides)
+            XCTAssertTrue(runtime.submitted.isEmpty)
+
+            await service.load()
+            let invalidID = try await service.createExperiment(controllerSessionID: UUID(), sourceTabID: UUID())
+            var invalidDraft = try XCTUnwrap(service.record(id: invalidID)?.draft)
+            let invalidBaseDigest = try invalidDraft.contentDigest()
+            invalidDraft.title = "Invalid target"
+            invalidDraft.taskInput = "Task"
+            invalidDraft.syntheticFixture = "Fixture"
+            invalidDraft.originalInstructions = "Original"
+            invalidDraft.candidateInstructions = "Candidate"
+            invalidDraft.targetRole = "codexExec:not-in-capabilities"
+            let updated = try await service.updateDraft(
+                experimentID: invalidID,
+                expectedDraftID: invalidDraft.id,
+                expectedDraftVersion: invalidDraft.optimisticVersion,
+                expectedDraftDigest: invalidBaseDigest,
+                draft: invalidDraft
+            )
+            do {
+                _ = try await service.seal(
+                    experimentID: invalidID,
+                    expectedDraftID: updated.id,
+                    expectedDraftVersion: updated.optimisticVersion,
+                    expectedDraftDigest: updated.contentDigest()
+                )
+                XCTFail("Unknown catalog selector must fail before approval or run")
+            } catch let error as PromptExperimentAuthorityError {
+                guard case .targetUnavailable = error else { return XCTFail("Unexpected error: \(error)") }
+            }
+            XCTAssertTrue(runtime.submitted.isEmpty)
+            XCTAssertEqual(GlobalSettingsStore.shared.globalAgentModelsProfile().mcpAgentRoleOverrides, beforeOverrides)
+        }
+
         private func makeHarness() -> Harness {
             let root = temporaryRoot()
             let store = PromptExperimentStore(rootURL: root)
@@ -671,7 +873,10 @@ import XCTest
             return Harness(root: root, store: store, runtime: runtime, service: service)
         }
 
-        private func preparedExperiment(_ harness: Harness) async throws -> UUID {
+        private func preparedExperiment(
+            _ harness: Harness,
+            targetSelector: String = "explore"
+        ) async throws -> UUID {
             await harness.service.load()
             let id = try await harness.service.createExperiment(controllerSessionID: UUID(), sourceTabID: UUID())
             let record = try XCTUnwrap(harness.service.record(id: id))
@@ -682,6 +887,7 @@ import XCTest
             draft.syntheticFixture = "# Synthetic fixture\n\nThe named value is cobalt."
             draft.originalInstructions = "Read the fixture and report the named value."
             draft.candidateInstructions = "Inspect only the fixture, then report the named value with one sentence of evidence."
+            draft.targetRole = targetSelector
             let updated = try await harness.service.updateDraft(
                 experimentID: id,
                 expectedDraftID: draft.id,

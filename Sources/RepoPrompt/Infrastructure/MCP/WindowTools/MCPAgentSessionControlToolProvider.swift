@@ -157,7 +157,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "synthetic_fixture": .string(description: "Optional synthetic fixture replacement. Loaded workspace content is unsupported."),
                         "original_instructions": .string(description: "Optional original instructions replacement."),
                         "candidate_instructions": .string(description: "Optional candidate instructions replacement."),
-                        "target_role": .string(description: "Optional catalog task-role label, such as explore."),
+                        "target_role": .string(description: "Optional catalog selector: a task role such as explore or an exact compound model_id returned by capabilities, such as codexExec:<model-and-effort>."),
                         "repetitions": .integer(description: "Optional repetitions per condition, 1 through 3.")
                     ],
                     required: ["op"]
@@ -253,16 +253,17 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
         private static func responseValue(_ response: PromptExperimentAgentResponse) throws -> Value {
             switch response {
-            case let .capabilities(operations, limitations):
+            case let .capabilities(operations, targets, limitations):
                 .object([
                     "operations": .array(operations.map(Value.string)),
+                    "available_targets": .array(targets.map(targetValue)),
                     "limitations": .array(limitations.map(Value.string)),
                     "native_approval_required": .bool(true)
                 ])
             case let .records(records):
-                try .object(["experiments": .array(records.map(recordValue))])
-            case let .record(record):
-                try recordValue(record)
+                try .object(["experiments": .array(records.map { try recordValue($0) })])
+            case let .record(record, artifactTextBySHA256):
+                try recordValue(record, artifactTextBySHA256: artifactTextBySHA256)
             case let .draft(experimentID, draft):
                 try .object([
                     "experiment_id": .string(experimentID.uuidString),
@@ -291,28 +292,22 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 "synthetic_fixture": .string(draft.syntheticFixture),
                 "original_instructions": .string(draft.originalInstructions),
                 "candidate_instructions": .string(draft.candidateInstructions),
-                "target_role": .string(draft.targetRole),
+                "target_selector": .string(draft.targetRole),
                 "repetitions": .int(draft.repetitions)
             ])
         }
 
-        private static func recordValue(_ record: PromptExperimentRecord) throws -> Value {
+        private static func recordValue(
+            _ record: PromptExperimentRecord,
+            artifactTextBySHA256: [String: String] = [:]
+        ) throws -> Value {
             var value: [String: Value] = [
                 "experiment_id": .string(record.id.uuidString),
                 "phase": .string(record.phase.rawValue),
                 "status": .string(record.statusMessage),
                 "plan_revisions": .array(record.plans.map { .int($0.revision) }),
-                "attempts": .array(record.attempts.map { attempt in
-                    .object([
-                        "id": .string(attempt.id.uuidString),
-                        "plan_revision": attempt.planRevision.map(Value.int) ?? .null,
-                        "plan_digest": attempt.planDigest.map(Value.string) ?? .null,
-                        "condition": .string(attempt.condition.rawValue),
-                        "ordinal": .int(attempt.ordinal),
-                        "status": .string(attempt.status.rawValue),
-                        "output_preview": attempt.outputPreview.map(Value.string) ?? .null,
-                        "error": attempt.error.map(Value.string) ?? .null
-                    ])
+                "attempts": .array(record.attempts.map {
+                    attemptValue($0, artifactTextBySHA256: artifactTextBySHA256)
                 })
             ]
             value["draft"] = try record.draft.map(draftValue) ?? .null
@@ -327,6 +322,93 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 value["current_plan"] = .null
             }
             return .object(value)
+        }
+
+        private static func targetValue(_ target: PromptExperimentResolvedTarget) -> Value {
+            .object([
+                "selector": .string(target.selector),
+                "canonical_model_id": .string(target.canonicalSelectionID),
+                "agent": .string(target.agentRaw),
+                "model": .string(target.modelRaw),
+                "display_name": .string(target.displayName)
+            ])
+        }
+
+        private static func attemptValue(
+            _ attempt: PromptExperimentAttempt,
+            artifactTextBySHA256: [String: String]
+        ) -> Value {
+            let elapsed: TimeInterval? = if let submittedAt = attempt.submittedAt, let settledAt = attempt.settledAt {
+                max(0, settledAt.timeIntervalSince(submittedAt))
+            } else {
+                nil
+            }
+            var value: [String: Value] = [
+                "id": .string(attempt.id.uuidString),
+                "plan_revision": attempt.planRevision.map(Value.int) ?? .null,
+                "plan_digest": attempt.planDigest.map(Value.string) ?? .null,
+                "condition": .string(attempt.condition.rawValue),
+                "ordinal": .int(attempt.ordinal),
+                "status": .string(attempt.status.rawValue),
+                "committed_handoff": attempt.committedHandoff.map {
+                    committedHandoffValue($0, artifactTextBySHA256: artifactTextBySHA256)
+                } ?? .null,
+                "assistant_output": attempt.assistantOutputEvidence.flatMap {
+                    artifactTextBySHA256[$0.sha256]
+                }.map(Value.string) ?? .null,
+                "assistant_output_preview": attempt.assistantOutputPreview.map(Value.string) ?? .null,
+                "assistant_output_evidence": attempt.assistantOutputEvidence.map(artifactValue) ?? .null,
+                "handoff_unavailable_reason": attempt.handoffUnavailableReason.map(Value.string) ?? .null,
+                "elapsed_seconds": elapsed.map(Value.double) ?? .null,
+                "provider_token_usage": .string("unavailable_from_context_builder_completion_contract"),
+                "legacy_unclassified_output_preview": attempt.outputPreview.map(Value.string) ?? .null,
+                "error": attempt.error.map(Value.string) ?? .null
+            ]
+            value["legacy_unclassified_evidence"] = attempt.evidence.map(artifactValue) ?? .null
+            return .object(value)
+        }
+
+        private static func committedHandoffValue(
+            _ handoff: PromptExperimentCommittedHandoff,
+            artifactTextBySHA256: [String: String]
+        ) -> Value {
+            .object([
+                "prompt": artifactTextBySHA256[handoff.promptEvidence.sha256].map(Value.string) ?? .null,
+                "prompt_preview": .string(handoff.promptPreview),
+                "prompt_evidence": artifactValue(handoff.promptEvidence),
+                "selection": selectionValue(handoff.selection),
+                "selection_revision": .int(Int(clamping: handoff.selectionRevision)),
+                "used_agent_output_as_prompt": .bool(handoff.usedAgentOutputAsPrompt)
+            ])
+        }
+
+        private static func artifactValue(_ artifact: PromptExperimentArtifactReference) -> Value {
+            .object([
+                "sha256": .string(artifact.sha256),
+                "relative_path": .string(artifact.relativePath),
+                "byte_count": .int(artifact.byteCount)
+            ])
+        }
+
+        private static func selectionValue(_ selection: StoredSelection) -> Value {
+            let slices = selection.slices.keys.sorted().map { path in
+                Value.object([
+                    "path": .string(path),
+                    "ranges": .array(selection.slices[path, default: []].map { range in
+                        .object([
+                            "start_line": .int(range.start),
+                            "end_line": .int(range.end),
+                            "description": range.description.map(Value.string) ?? .null
+                        ])
+                    })
+                ])
+            }
+            return .object([
+                "selected_paths": .array(selection.selectedPaths.map(Value.string)),
+                "manual_codemap_paths": .array(selection.manualCodemapPaths.map(Value.string)),
+                "slices": .array(slices),
+                "codemap_auto_enabled": .bool(selection.codemapAutoEnabled)
+            ])
         }
     #endif
 
