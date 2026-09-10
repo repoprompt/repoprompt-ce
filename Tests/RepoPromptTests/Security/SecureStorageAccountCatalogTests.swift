@@ -89,8 +89,13 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
             (.zAI, .zAIAPI)
         ]
 
-        XCTAssertEqual(mappings.map(\.0.secureStorageAccount), mappings.map(\.1))
+        XCTAssertEqual(mappings.map(\.0.secureStorageAccount), mappings.map { Optional($0.1) })
         XCTAssertEqual(mappings.map(\.1), SecureStorageAccountCatalog.providerAndCLIAccounts)
+
+        // Grok Build reuses the xAI account; Oh My Pi authenticates entirely through its own
+        // CLI, so it must not own or borrow a secure-storage account.
+        XCTAssertEqual(AIProviderType.grokBuild.secureStorageAccount, .grokAPI)
+        XCTAssertNil(AIProviderType.omp.secureStorageAccount)
     }
 
     func testClaudeCompatibleMappingsUseCatalogAccounts() {

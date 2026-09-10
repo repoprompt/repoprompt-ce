@@ -53,6 +53,8 @@ struct CLIProvidersSettingsView: View {
     @State private var isTestingAntigravity = false
     @State private var isAntigravityInstalled = false
     @State private var isAntigravityExpanded = false
+    @State private var isLoadingOMP = false
+    @State private var isLoadingDevin = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
@@ -76,6 +78,8 @@ struct CLIProvidersSettingsView: View {
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
     @State private var isGrokBuildExpanded: Bool = false
+    @State private var isOMPExpanded: Bool = false
+    @State private var isDevinExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -95,6 +99,8 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isOpenCodeConnected
             || viewModel.isCursorConnected
             || viewModel.isGrokBuildConnected
+            || viewModel.isOMPConnected
+            || viewModel.isDevinConnected
     }
 
     private var codexStatusText: String? {
@@ -127,7 +133,7 @@ struct CLIProvidersSettingsView: View {
                         .font(.title2)
                         .fontWeight(.semibold)
 
-                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, or Cursor to leverage your existing subscriptions — OpenCode can also proxy any API key.")
+                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, Oh My Pi, or Devin to leverage your existing subscriptions — OpenCode can also proxy any API key.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -156,6 +162,8 @@ struct CLIProvidersSettingsView: View {
                 cursorCard
                 grokBuildCard
                 antigravityCard
+                ompCard
+                devinCard
             }
             .padding(16)
         }
@@ -2246,6 +2254,110 @@ struct CLIProvidersSettingsView: View {
         return count == 1 ? "1 model available." : "\(count) models available (including Default)."
     }
 
+    // MARK: - Oh My Pi CLI / ACP card
+
+    private var ompCard: some View {
+        acpCLIProviderCard(
+            title: "Oh My Pi",
+            subtitle: "Uses the installed `omp acp` runtime for Agent Mode and headless tasks. OMP keeps authority over authentication, models, fallbacks, memory, compaction, and its built-in tools.",
+            infoURL: "https://github.com/can1357/oh-my-pi",
+            connectedNote: "Uses OMP's configured provider, model, and fallback behavior.",
+            disconnectedNote: "Install and authenticate OMP separately, then ensure `omp acp` is available.",
+            isConnected: viewModel.isOMPConnected,
+            isExpanded: $isOMPExpanded,
+            isLoading: isLoadingOMP,
+            error: viewModel.ompError,
+            connect: connectOMP,
+            disconnect: disconnectOMP
+        )
+    }
+
+    // MARK: - Devin CLI / ACP card
+
+    private var devinCard: some View {
+        acpCLIProviderCard(
+            title: "Devin",
+            subtitle: "Uses the installed `devin acp` runtime for interactive Agent Mode. Devin keeps authority over authentication, models, modes, and built-in tools.",
+            infoURL: "https://docs.devin.ai/cli/acp/zed",
+            connectedNote: "Devin owns model selection and its internal tools; RepoPrompt injects its MCP tools.",
+            disconnectedNote: "Install and authenticate Devin separately, then ensure `devin acp` is available.",
+            isConnected: viewModel.isDevinConnected,
+            isExpanded: $isDevinExpanded,
+            isLoading: isLoadingDevin,
+            error: viewModel.devinError,
+            connect: connectDevin,
+            disconnect: disconnectDevin
+        )
+    }
+
+    /// Card body shared by the ACP CLI providers whose only RepoPrompt-side control is the
+    /// connection itself: everything else stays under provider authority.
+    private func acpCLIProviderCard(
+        title: String,
+        subtitle: String,
+        infoURL: String,
+        connectedNote: String,
+        disconnectedNote: String,
+        isConnected: Bool,
+        isExpanded: Binding<Bool>,
+        isLoading: Bool,
+        error: String?,
+        connect: @escaping () -> Void,
+        disconnect: @escaping () -> Void
+    ) -> some View {
+        providerCard(
+            title: title,
+            subtitle: subtitle,
+            infoURL: infoURL,
+            isConnected: isConnected,
+            isExpanded: isExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Button(action: connect) {
+                        if isLoading {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                                .frame(height: 16)
+                        } else if isConnected {
+                            Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                        } else {
+                            Label("Connect", systemImage: "link")
+                        }
+                    }
+                    .disabled(isLoading)
+                    .buttonStyle(CustomButtonStyle())
+
+                    if isConnected {
+                        Spacer()
+
+                        Button(action: disconnect) {
+                            Text("Disconnect")
+                                .foregroundColor(.secondary)
+                        }
+                        .disabled(isLoading)
+                        .buttonStyle(CustomButtonStyle())
+                    } else if let error, !error.isEmpty {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(disconnectedNote)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                if isConnected {
+                    Text(connectedNote)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
     // MARK: - Cursor CLI / ACP card
 
     private var cursorCard: some View {
@@ -2804,6 +2916,62 @@ struct CLIProvidersSettingsView: View {
         viewModel.disconnectCursor()
         alertMessage = "Signed out from Cursor CLI"
         showCursorTraceDump = false
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func connectOMP() {
+        isLoadingOMP = true
+        Task {
+            do {
+                _ = try await viewModel.testOMPConnection()
+                await MainActor.run {
+                    isLoadingOMP = false
+                    alertMessage = "Oh My Pi connected. OMP will use its configured provider and model."
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingOMP = false
+                    alertMessage = viewModel.ompError ?? error.asFriendlyString()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func disconnectOMP() {
+        viewModel.disconnectOMP()
+        alertMessage = "Disconnected Oh My Pi"
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func connectDevin() {
+        isLoadingDevin = true
+        Task {
+            do {
+                _ = try await viewModel.testDevinConnection()
+                await MainActor.run {
+                    isLoadingDevin = false
+                    alertMessage = "Devin connected. Devin will use its configured model and modes."
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingDevin = false
+                    alertMessage = viewModel.devinError ?? error.asFriendlyString()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func disconnectDevin() {
+        viewModel.disconnectDevin()
+        alertMessage = "Disconnected Devin"
         showAlert = true
         onAPIKeyUpdated?()
     }

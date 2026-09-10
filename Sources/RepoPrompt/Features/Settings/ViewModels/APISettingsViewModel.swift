@@ -307,6 +307,12 @@ public class APISettingsViewModel: ObservableObject {
     @Published var grokBuildError: String? = nil
     @Published private(set) var availableGrokBuildModelOptions: [AgentModelOption] = []
     private var grokBuildLogCollector: CLIProcessLogCollector?
+    // Oh My Pi CLI / ACP
+    @Published var isOMPConnected: Bool = UserDefaults.standard.bool(forKey: "OMPCLIConnected")
+    @Published var ompError: String? = nil
+    // Devin CLI / ACP
+    @Published var isDevinConnected: Bool = UserDefaults.standard.bool(forKey: "DevinCLIConnected")
+    @Published var devinError: String? = nil
 
     /// CLI connection flags are persisted configuration hints, not proof that the provider is
     /// usable in the current process. Context Builder restoration waits for this validation pass
@@ -390,6 +396,8 @@ public class APISettingsViewModel: ObservableObject {
             cursorAvailable: isCursorConnected,
             grokBuildAvailable: isGrokBuildConnected,
             antigravityAvailable: AntigravityRuntimeManager.installedRuntimeSync() != nil,
+            ompAvailable: isOMPConnected,
+            devinAvailable: isDevinConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -421,6 +429,8 @@ public class APISettingsViewModel: ObservableObject {
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
             $isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isOMPConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isDevinConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
@@ -442,6 +452,9 @@ public class APISettingsViewModel: ObservableObject {
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
             grokBuildAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokBuildConnected,
+            ompAvailable: isVerifiedContextBuilderProvider(.omp) && isOMPConnected,
+            // Devin is interactive-only; it never backs a headless Context Builder run.
+            devinAvailable: false,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -499,6 +512,10 @@ public class APISettingsViewModel: ObservableObject {
             isGrokBuildConnected
         case .antigravity:
             AntigravityRuntimeManager.installedRuntimeSync() != nil
+        case .omp:
+            isOMPConnected
+        case .devin:
+            isDevinConnected
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -547,7 +564,9 @@ public class APISettingsViewModel: ObservableObject {
             NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
             NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
             NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
-            NotificationCenter.default.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild }
+            NotificationCenter.default.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild },
+            NotificationCenter.default.publisher(for: .ompConnectionChanged).map { _ in AgentProviderKind.omp },
+            NotificationCenter.default.publisher(for: .devinConnectionChanged).map { _ in AgentProviderKind.devin }
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] provider in
@@ -567,6 +586,22 @@ public class APISettingsViewModel: ObservableObject {
             }
         }
         .store(in: &cliConnectionCancellables)
+
+        // OMP and Devin feed their discovered catalogs into the non-agent
+        // (chat/Oracle) model list, so a run that discovers models must refresh it.
+        NotificationCenter.default.publisher(for: .acpDiscoveredModelsChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let self, !hasPreparedForWindowClose else { return }
+                let changedProviderID = notification.userInfo?[
+                    AgentACPModelRegistry.providerIDUserInfoKey
+                ] as? String
+                guard changedProviderID == nil || changedProviderID == ACPProviderID.omp.rawValue || changedProviderID == ACPProviderID.devin.rawValue else {
+                    return
+                }
+                Task { await self.updateAvailableModels() }
+            }
+            .store(in: &cliConnectionCancellables)
     }
 
     private func applyAuthoritativeCodexDisconnectedState() {
@@ -590,6 +625,8 @@ public class APISettingsViewModel: ObservableObject {
     private func reloadCLIConnectionFlagsFromDefaults() {
         let wasCursorConnected = isCursorConnected
         let wasGrokBuildConnected = isGrokBuildConnected
+        let wasOMPConnected = isOMPConnected
+        let wasDevinConnected = isDevinConnected
         isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
         if isClaudeCodeConnected {
             claudeCodeCLIStatus = .binaryPresent
@@ -601,6 +638,8 @@ public class APISettingsViewModel: ObservableObject {
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
         isGrokBuildConnected = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
+        isOMPConnected = UserDefaults.standard.bool(forKey: "OMPCLIConnected")
+        isDevinConnected = UserDefaults.standard.bool(forKey: "DevinCLIConnected")
         if wasGrokBuildConnected != isGrokBuildConnected {
             if isGrokBuildConnected {
                 startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
@@ -614,6 +653,9 @@ public class APISettingsViewModel: ObservableObject {
             } else {
                 stopCursorModelsSubscription(clearModels: true)
             }
+            Task { await updateAvailableModels() }
+        }
+        if wasOMPConnected != isOMPConnected || wasDevinConnected != isDevinConnected {
             Task { await updateAvailableModels() }
         }
     }
@@ -1223,6 +1265,7 @@ public class APISettingsViewModel: ObservableObject {
         let shouldValidateOpenCode = isOpenCodeConnected
         let shouldValidateCursor = isCursorConnected
         let shouldValidateGrokBuild = isGrokBuildConnected
+        let shouldValidateOMP = isOMPConnected
 
         let task = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
@@ -1235,7 +1278,8 @@ public class APISettingsViewModel: ObservableObject {
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
             async let grokBuildReady = probeCachedGrokBuildConnection(ifNeeded: shouldValidateGrokBuild)
-            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokBuildReady)
+            async let ompReady = probeCachedOMPConnection(ifNeeded: shouldValidateOMP)
+            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokBuildReady, ompReady)
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
@@ -1247,6 +1291,7 @@ public class APISettingsViewModel: ObservableObject {
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
             applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
             applyContextBuilderProviderValidationResult(readiness.4, provider: .grokBuild)
+            applyContextBuilderProviderValidationResult(readiness.5, provider: .omp)
             if codexPublicationAllowed,
                isCodexConnected,
                isVerifiedContextBuilderProvider(.codexExec)
@@ -1352,6 +1397,18 @@ public class APISettingsViewModel: ObservableObject {
             return true
         }
         return await GrokBuildACPModelPollingService.shared.refreshNow(workspacePath: nil)
+    }
+
+    private func probeCachedOMPConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        return await Self.probeACPCLISupport(spec: .omp, config: OMPAgentConfig())
+    }
+
+    private static func probeACPCLISupport(
+        spec: ACPCLILaunchSpec,
+        config: some ACPCLILaunchConfiguring
+    ) async -> Bool {
+        await (try? ACPCLILaunchResolver(spec: spec).probeSupport(for: config)) == .supported
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -1866,6 +1923,14 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
         }
 
+        if isOMPConnected {
+            modelSet.formUnion(AIModel.modelsForProvider(.omp))
+        }
+
+        if isDevinConnected {
+            modelSet.formUnion(AIModel.modelsForProvider(.devin))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -1935,6 +2000,8 @@ public class APISettingsViewModel: ObservableObject {
         case .claudeCode: "claude_code"
         case .codex: "codex"
         case .openCode: "opencode"
+        case .omp: "omp"
+        case .devin: "devin"
         }
     }
 
@@ -2011,6 +2078,8 @@ public class APISettingsViewModel: ObservableObject {
                 break
             case .grokBuild:
                 break
+            case .omp, .devin:
+                break
             }
 
             await updateAvailableModels()
@@ -2072,6 +2141,8 @@ public class APISettingsViewModel: ObservableObject {
         case .cursor:
             break
         case .grokBuild:
+            break
+        case .omp, .devin:
             break
         }
         await updateAvailableModels()
@@ -3731,6 +3802,111 @@ public class APISettingsViewModel: ObservableObject {
         if clearModels {
             availableCursorModelOptions = []
         }
+    }
+
+    // MARK: - Oh My Pi CLI / ACP
+
+    func testOMPConnection() async throws -> Bool {
+        try await testACPCLIConnection(
+            spec: .omp,
+            config: OMPAgentConfig(),
+            defaultsKey: "OMPCLIConnected",
+            notification: .ompConnectionChanged,
+            markContextBuilderVerified: true,
+            apply: { [weak self] connected, message in
+                self?.isOMPConnected = connected
+                self?.ompError = message
+            }
+        )
+    }
+
+    func disconnectOMP() {
+        isOMPConnected = false
+        setContextBuilderProviderVerified(.omp, verified: false)
+        ompError = nil
+        UserDefaults.standard.set(false, forKey: "OMPCLIConnected")
+        Task { await updateAvailableModels() }
+        postCLIConnectionChanged(.ompConnectionChanged)
+    }
+
+    // MARK: - Devin CLI / ACP
+
+    func testDevinConnection() async throws -> Bool {
+        try await testACPCLIConnection(
+            spec: .devin,
+            config: DevinAgentConfig(),
+            defaultsKey: "DevinCLIConnected",
+            notification: .devinConnectionChanged,
+            markContextBuilderVerified: false,
+            apply: { [weak self] connected, message in
+                self?.isDevinConnected = connected
+                self?.devinError = message
+            }
+        )
+    }
+
+    func disconnectDevin() {
+        isDevinConnected = false
+        devinError = nil
+        UserDefaults.standard.set(false, forKey: "DevinCLIConnected")
+        Task { await updateAvailableModels() }
+        postCLIConnectionChanged(.devinConnectionChanged)
+    }
+
+    /// Shared connect/verify flow for ACP providers whose only readiness signal is the
+    /// `<cli> acp --help` preflight. The resolver's failure text already names every
+    /// candidate path it tried, so it is surfaced verbatim as the user-facing error.
+    private func testACPCLIConnection(
+        spec: ACPCLILaunchSpec,
+        config: some ACPCLILaunchConfiguring,
+        defaultsKey: String,
+        notification: Notification.Name,
+        markContextBuilderVerified: Bool,
+        apply: @MainActor @escaping (_ connected: Bool, _ error: String?) -> Void
+    ) async throws -> Bool {
+        await CLIEnvironmentCache.shared.invalidate()
+        do {
+            let support = try await ACPCLILaunchResolver(spec: spec).probeSupport(for: config)
+            guard support == .supported else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: support.reason ?? "Installed \(spec.displayName) CLI does not support ACP mode."
+                )
+            }
+            apply(true, nil)
+            if markContextBuilderVerified {
+                setContextBuilderProviderVerified(spec.providerKind, verified: true)
+            }
+            UserDefaults.standard.set(true, forKey: defaultsKey)
+            // Best effort: publish the provider's advertised catalog now so the pickers are
+            // populated at connect time instead of only after the first run. An ACP-capable
+            // CLI that advertises nothing still connects and uses its own default model.
+            _ = try? await ACPCLIModelDiscoveryService.discoverModels(for: spec.providerKind)
+            await updateAvailableModels()
+            postCLIConnectionChanged(notification)
+            return true
+        } catch {
+            apply(false, friendlyACPCLIMessage(for: error))
+            if markContextBuilderVerified {
+                setContextBuilderProviderVerified(spec.providerKind, verified: false)
+            }
+            UserDefaults.standard.set(false, forKey: defaultsKey)
+            await updateAvailableModels()
+            postCLIConnectionChanged(notification)
+            throw error
+        }
+    }
+
+    private func friendlyACPCLIMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError,
+           case let .invalidConfiguration(detail) = providerError
+        {
+            return detail
+        }
+        return error.localizedDescription
+    }
+
+    private func postCLIConnectionChanged(_ name: Notification.Name) {
+        NotificationCenter.default.post(name: name, object: nil, userInfo: ["windowID": 0])
     }
 
     // MARK: - Grok Build CLI / ACP

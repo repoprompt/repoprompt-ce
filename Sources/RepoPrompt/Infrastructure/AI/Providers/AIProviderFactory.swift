@@ -18,7 +18,7 @@ class AIProviderFactory {
         }
 
         // CLI providers don't need API keys - they leverage existing authentication
-        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .grokBuild {
+        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .grokBuild || providerType == .omp || providerType == .devin {
             return try await createProvider(
                 for: providerType,
                 key: "",
@@ -89,6 +89,10 @@ class AIProviderFactory {
             return CursorCLIProvider()
         case .grokBuild:
             return GrokBuildCLIProvider()
+        case .omp:
+            return OMPCLIProvider()
+        case .devin:
+            return DevinCLIProvider()
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 
@@ -181,6 +185,8 @@ enum AIProviderType: Codable, Equatable {
     case openCode // OpenCode CLI provider case
     case cursor // Cursor CLI provider case
     case grokBuild // Grok Build CLI provider case
+    case omp // Oh My Pi CLI provider case
+    case devin // Devin CLI provider case
 }
 
 extension AIProviderType {
@@ -203,6 +209,8 @@ extension AIProviderType {
         case .openCode: "OpenCode"
         case .cursor: "Cursor CLI"
         case .grokBuild: "Grok Build"
+        case .omp: "Oh My Pi"
+        case .devin: "Devin"
         }
     }
 

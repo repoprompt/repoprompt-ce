@@ -725,7 +725,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor, .grokBuild, .antigravity:
+        case .openCode, .cursor, .grokBuild, .antigravity, .omp, .devin:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -2302,7 +2302,10 @@ actor ACPAgentSessionController {
         if error is ExecutableFileIdentityError {
             return "executable_identity"
         }
-        if error is CursorACPLaunchResolutionError || error is OpenCodeACPLaunchResolutionError {
+        if error is CursorACPLaunchResolutionError
+            || error is OpenCodeACPLaunchResolutionError
+            || error is ACPCLILaunchResolutionError
+        {
             return "launch_resolution"
         }
         if error is CLIProcessRunnerError {
@@ -2921,7 +2924,8 @@ actor ACPAgentSessionController {
             displayName: displayName,
             description: normalizedACPModelString(rawOption["description"] as? String),
             isPlaceholderDefault: false,
-            isProviderDefault: rawOption["isDefault"] as? Bool ?? false
+            isProviderDefault: rawOption["isDefault"] as? Bool ?? false,
+            modelFamily: provider.modelFamily(for: rawValue)
         )
     }
 
@@ -3259,7 +3263,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity:
+        case .openCode, .cursor, .antigravity, .omp, .devin:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
@@ -3310,7 +3314,7 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode, .grokBuild, .antigravity:
+        case .openCode, .grokBuild, .antigravity, .omp, .devin:
             // Grok full access is provider-native (`grok agent --always-approve stdio`); the
             // controller never auto-selects permission options for it.
             return nil
@@ -3355,7 +3359,7 @@ actor ACPAgentSessionController {
         }
 
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity:
+        case .openCode, .cursor, .antigravity, .omp, .devin:
             [
                 .optionID("always"),
                 .optionID("allow_always"),
@@ -3569,6 +3573,10 @@ actor ACPAgentSessionController {
                 "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
             case .antigravity:
                 "RP_ANTIGRAVITY_ACP_RAW_CAPTURE_PATH"
+            case .omp:
+                "RP_OMP_ACP_RAW_CAPTURE_PATH"
+            case .devin:
+                "RP_DEVIN_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)

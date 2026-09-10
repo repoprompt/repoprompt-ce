@@ -388,7 +388,7 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.grokBuild)
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
-            case .antigravity:
+            case .antigravity, .omp, .devin:
                 false
             }
         }) else {

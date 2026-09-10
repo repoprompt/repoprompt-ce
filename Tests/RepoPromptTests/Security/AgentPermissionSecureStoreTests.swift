@@ -136,6 +136,36 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertEqual(binding.codexTools?.bashToolEnabled, true)
     }
 
+    @MainActor
+    func testOMPProviderManagedPermissionsHaveNoMutableMode() throws {
+        let suiteName = "AgentPermissionSecureStoreTests.OMP.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let snapshots = AgentProviderPreferenceSnapshotStore(defaults: defaults, codexMCPServerEntries: { [] })
+        let level = AgentProviderPermissionLevelID.subagentDefault(for: .omp)
+
+        XCTAssertEqual(AgentProviderPermissionLevelID.options(for: .omp), [level])
+        XCTAssertEqual(level.subagentRawValue, "providerManaged")
+        XCTAssertEqual(AgentProviderPermissionLevelID(providerID: .omp, subagentRawValue: "providerManaged"), level)
+        XCTAssertNil(AgentProviderPermissionLevelID(providerID: .omp, subagentRawValue: "plan"))
+
+        let binding = snapshots.topLevelSettingsControlsBinding(providerID: .omp)
+        XCTAssertEqual(binding.permission.displayName, "Provider Managed")
+        XCTAssertEqual(binding.permission.options.map(\.id), [level])
+        XCTAssertTrue(binding.permission.options.allSatisfy { $0.isSelected && !$0.isEnabled })
+
+        for profile in [AgentProviderPermissionProfile.userConfigured, .mcpSafeDefaults, .providerOverride(level)] {
+            XCTAssertEqual(snapshots.runtimePermission(for: .omp, profile: profile), AgentProviderRuntimePermissionBinding())
+            XCTAssertNil(profile.acpSessionModeID(for: .omp))
+        }
+
+        snapshots.setPermissionLevel(level)
+        XCTAssertNil(defaults.object(forKey: "ompACPSessionMode"))
+        let settings = AgentProviderPermissionsSettingsViewModel(defaults: defaults, notificationCenter: NotificationCenter())
+        settings.setPermissionLevel(level)
+        XCTAssertNil(defaults.object(forKey: "ompACPSessionMode"))
+    }
+
     func testSuccessfulResetPersistsProductDefaultsAcrossRelaunch() throws {
         let secureStrings = FakeSecurePlainStringStore()
         let key = AgentPermissionSecureDomain.codex.storageKey

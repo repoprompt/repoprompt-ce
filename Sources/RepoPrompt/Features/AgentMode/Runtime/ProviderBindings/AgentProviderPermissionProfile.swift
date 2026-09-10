@@ -159,7 +159,8 @@ extension AgentProviderPermissionProfile {
         switch agent {
         case .openCode:
             openCodeSessionModeID
-        case .cursor, .grokBuild, .antigravity:
+        // Devin advertises session modes live per session; RepoPrompt never requests one.
+        case .cursor, .grokBuild, .antigravity, .omp, .devin:
             nil
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil

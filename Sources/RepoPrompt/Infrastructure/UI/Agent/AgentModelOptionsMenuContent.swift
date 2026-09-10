@@ -90,6 +90,34 @@ struct AgentModelOptionsMenuContent: View {
                     modelOptionButton(option)
                 }
             }
+        } else if agentKind == .devin {
+            ForEach(AgentModelCatalog.devinModelGroups(for: options)) { group in
+                if let family = group.family {
+                    Menu(family.displayName) {
+                        ForEach(group.options, id: \.rawValue) { option in
+                            modelOptionButton(option)
+                        }
+                    }
+                } else {
+                    ForEach(group.options, id: \.rawValue) { option in
+                        modelOptionButton(option)
+                    }
+                }
+            }
+        } else if agentKind == .omp {
+            ForEach(AgentModelCatalog.ompModelGroups(for: options)) { group in
+                if let providerID = group.providerID {
+                    Menu(providerID) {
+                        ForEach(group.options, id: \.rawValue) { option in
+                            modelOptionButton(option)
+                        }
+                    }
+                } else {
+                    ForEach(group.options, id: \.rawValue) { option in
+                        modelOptionButton(option)
+                    }
+                }
+            }
         } else if agentKind == .openCode {
             ForEach(AgentModelCatalog.openCodeMenu(for: options).providerGroups) { providerGroup in
                 if providerGroup.rendersAsSubmenu {
@@ -224,6 +252,37 @@ enum AgentModelStableMenuItems {
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
             )
+        }
+        if agentKind == .devin {
+            return AgentModelCatalog.devinModelGroups(for: visibleOptions).flatMap { group -> [StableMenuItem] in
+                let items = group.options.map { option in
+                    modelItem(
+                        option,
+                        agentKind: agentKind,
+                        selectedAgent: selectedAgent,
+                        selectedModelRaw: selectedModelRaw,
+                        onSelect: onSelect
+                    )
+                }
+                // An unlabelled group renders inline: a submenu with no title would be blank.
+                guard let family = group.family else { return items }
+                return [.submenu(family.displayName, items: items)]
+            }
+        }
+        if agentKind == .omp {
+            return AgentModelCatalog.ompModelGroups(for: visibleOptions).flatMap { group -> [StableMenuItem] in
+                let items = group.options.map { option in
+                    modelItem(
+                        option,
+                        agentKind: agentKind,
+                        selectedAgent: selectedAgent,
+                        selectedModelRaw: selectedModelRaw,
+                        onSelect: onSelect
+                    )
+                }
+                guard let providerID = group.providerID else { return items }
+                return [.submenu(providerID, items: items)]
+            }
         }
         if agentKind == .openCode, groupOpenCode {
             return AgentModelCatalog.openCodeMenu(for: visibleOptions).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
