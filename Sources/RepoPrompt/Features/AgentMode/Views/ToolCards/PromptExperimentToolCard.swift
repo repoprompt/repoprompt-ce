@@ -133,7 +133,7 @@
                     Text("\(optimization.examples.count) reviewed examples · \(optimization.gepa.maxEvaluations) evaluations · \(optimization.gepa.maxWallClockSeconds)s · reflection \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    DisclosureGroup("Inspect every sealed authority field") {
+                    DisclosureGroup("Human-readable sealed plan summary") {
                         VStack(alignment: .leading, spacing: 5) {
                             Text("Objective: \(optimization.objective)")
                             Text("Background: \(optimization.background.isEmpty ? "None" : optimization.background)")
@@ -155,6 +155,7 @@
                         .textSelection(.enabled)
                         .padding(.top, 4)
                     }
+                    PromptExperimentSealedPlanDisclosure(plan: plan)
                 }
             }
         }

@@ -70,7 +70,7 @@
             let environment = URL(fileURLWithPath: python).deletingLastPathComponent().deletingLastPathComponent().path
             let pip = URL(fileURLWithPath: python).deletingLastPathComponent().appendingPathComponent("pip").path
             let requirements = resolvedRequirementsURL()?.path ?? "<RepoPrompt checkout>/AppResources/PromptExperiments/gepa-requirements.txt"
-            return "Create the external pinned environment explicitly (no automatic install): /usr/bin/python3 -m venv '\(environment)' && '\(pip)' install -r '\(requirements)'. Then restart the DEBUG app with REPOPROMPT_GEPA_PYTHON set only if using a different reviewed environment."
+            return "GEPA \(PromptExperimentGEPAConfiguration.packageVersion) requires Python >=3.10,<3.15. Choose a compatible interpreter (for example python3.11) and verify it before installing: python3.11 -c 'import sys; assert (3, 10) <= sys.version_info < (3, 15), sys.version' && python3.11 -m venv '\(environment)' && '\(pip)' install -r '\(requirements)'. This requirements input pins GEPA itself; transitive dependencies are not hash-locked. No installation is automatic. Then restart the DEBUG app with REPOPROMPT_GEPA_PYTHON set only if using a different reviewed environment."
         }
 
         private static func resolvedRequirementsURL() -> URL? {
@@ -128,7 +128,7 @@
                     throw WorkerError.unavailable("The packaged GEPA worker is unreadable.")
                 }
                 guard resolvedRequirementsURL() != nil else {
-                    throw WorkerError.unavailable("The pinned GEPA requirements lock is unavailable.")
+                    throw WorkerError.unavailable("The pinned GEPA requirements input is unavailable.")
                 }
                 let process = Process()
                 let output = Pipe()

@@ -209,6 +209,7 @@
                     Text(plan.digest)
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
+                    PromptExperimentSealedPlanDisclosure(plan: plan)
                     DisclosureGroup("Isolation and pilot limitations") {
                         VStack(alignment: .leading, spacing: 5) {
                             ForEach(plan.environment.captureLimitations + plan.limitations, id: \.self) { limitation in

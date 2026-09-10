@@ -1172,6 +1172,74 @@ import XCTest
             XCTAssertNotEqual(try digest(original, targets: changedTargets), originalDigest)
         }
 
+        func testSealedPlanDisclosureIncludesCompleteApprovalAuthority() throws {
+            let date = Date(timeIntervalSince1970: 456)
+            let environment = try PromptExperimentEnvironment(
+                workspaceID: XCTUnwrap(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")),
+                sourceTabID: XCTUnwrap(UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")),
+                capturedAt: date,
+                isolatedRootPath: "/tmp/gepa-disclosure",
+                selection: StoredSelection(selectedPaths: ["project/Package.swift"]),
+                fixtureFiles: [PromptExperimentFixtureFile(
+                    path: "project/Package.swift",
+                    byteCount: 42,
+                    sha256: "manifest-sha-256-canary"
+                )],
+                fixtureDigest: "aggregate-manifest-digest-canary",
+                captureLimitations: ["reviewed snapshot"]
+            )
+            var specification = Self.validOptimization()
+            specification.examples[0].expectedOutput = "expected-output-canary"
+            specification.examples[0].reviewerNotes = "reviewer-notes-canary"
+            specification.evaluator.candidateFileName = "candidate-instructions.md"
+            specification.gepa.stopAtScore = 0.875
+            specification.projectSnapshot = PromptExperimentProjectSnapshotSpecification(
+                sourceRootPath: "/tmp/authorized-project",
+                includedPaths: ["Package.swift"]
+            )
+            let reflection = try XCTUnwrap(Self.fakeTarget("reflector"))
+            let execution = try XCTUnwrap(Self.fakeTarget("executor"))
+            let plan = try PromptExperimentPlan.seal(
+                draft: PromptExperimentDraft(
+                    revision: 1,
+                    title: "Disclosure coverage",
+                    optimization: specification,
+                    createdAt: date,
+                    updatedAt: date
+                ),
+                target: execution,
+                optimizationTargets: PromptExperimentOptimizationTargets(
+                    reflection: reflection,
+                    execution: execution,
+                    judge: nil
+                ),
+                environment: environment,
+                at: date
+            )
+
+            let rendered = try PromptExperimentSealedPlanPresentation.prettyPrintedJSON(plan)
+
+            for expected in [
+                "expectedOutput", "expected-output-canary",
+                "reviewerNotes", "reviewer-notes-canary",
+                "candidateFileName", "candidate-instructions.md",
+                "stopAtScore", "0.875",
+                "manifest-sha-256-canary", "aggregate-manifest-digest-canary"
+            ] {
+                XCTAssertTrue(rendered.contains(expected), "Missing sealed authority field/value: \(expected)")
+            }
+        }
+
+        func testGEPASetupInstructionsRequireCompatiblePythonAndDescribePinScope() {
+            let instructions = PromptExperimentGEPAWorker.setupInstructions
+
+            XCTAssertTrue(instructions.contains("Python >=3.10,<3.15"))
+            XCTAssertTrue(instructions.contains("python3.11 -c"))
+            XCTAssertTrue(instructions.contains("(3, 10) <= sys.version_info < (3, 15)"))
+            XCTAssertTrue(instructions.contains("transitive dependencies are not hash-locked"))
+            XCTAssertFalse(instructions.contains("/usr/bin/python3 -m venv"))
+        }
+
         func testCommandEvaluatorDistinguishesCandidateAndInfrastructureFailures() throws {
             let candidate = try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
                 stdout: #"{"score":0.25,"feedback":"candidate output was invalid","failure_kind":"candidate"}"#,
