@@ -266,6 +266,7 @@ final class AgentRuntimeProviderService {
             )
             var processConfig = CLIProcessConfiguration(
                 command: config.commandName,
+                workingDirectory: workspacePath,
                 enableDebugLogging: Self.enableDebugLogging,
                 captureStdoutTailBytes: 128 * 1024,
                 captureStderrTailBytes: 256 * 1024,

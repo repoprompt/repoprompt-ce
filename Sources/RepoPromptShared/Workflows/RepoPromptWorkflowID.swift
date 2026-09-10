@@ -10,6 +10,9 @@ public enum RepoPromptWorkflowID: String, CaseIterable, Sendable {
     case refactor
     case orchestrate
     case optimize
+    #if DEBUG
+        case promptExperiment
+    #endif
 
     public var commandName: String {
         switch self {
@@ -22,6 +25,9 @@ public enum RepoPromptWorkflowID: String, CaseIterable, Sendable {
         case .refactor: "rp-refactor"
         case .orchestrate: "rp-orchestrate"
         case .optimize: "rp-optimize"
+        #if DEBUG
+            case .promptExperiment: "rp-prompt-experiment"
+        #endif
         }
     }
 

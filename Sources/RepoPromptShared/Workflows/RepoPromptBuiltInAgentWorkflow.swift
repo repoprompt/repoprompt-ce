@@ -9,6 +9,9 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
     case orchestrate
     case optimize
     case deepPlan
+    #if DEBUG
+        case promptExperiment
+    #endif
 
     public struct Metadata: Equatable, Sendable {
         public let id: String
@@ -23,16 +26,22 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
         case unknownReference(String)
     }
 
-    public static let displayOrder: [Self] = [
-        .orchestrate,
-        .deepPlan,
-        .optimize,
-        .build,
-        .review,
-        .refactor,
-        .investigate,
-        .oracleExport
-    ]
+    public static var displayOrder: [Self] {
+        var workflows: [Self] = [
+            .orchestrate,
+            .deepPlan,
+            .optimize,
+            .build,
+            .review,
+            .refactor,
+            .investigate,
+            .oracleExport
+        ]
+        #if DEBUG
+            workflows.insert(.promptExperiment, at: 3)
+        #endif
+        return workflows
+    }
 
     public var id: String {
         rawValue
@@ -108,6 +117,16 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
                 tooltipText: "Deeply research and shape a polished plan document",
                 descriptionText: "Researches the code, asks how hands-on you want to be, and writes a clear implementation plan."
             )
+        #if DEBUG
+            case .promptExperiment:
+                Metadata(
+                    id: canonicalID,
+                    displayName: "Prompt Experiment",
+                    iconName: "flask.fill",
+                    tooltipText: "Prepare a native fixed prompt comparison",
+                    descriptionText: "Links this Agent session to a synthetic-fixture experiment that only the user can seal, approve, and run."
+                )
+        #endif
         }
     }
 
@@ -158,6 +177,9 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
         case .orchestrate: .orchestrate
         case .optimize: .optimize
         case .deepPlan: .deepPlan
+        #if DEBUG
+            case .promptExperiment: .promptExperiment
+        #endif
         }
     }
 

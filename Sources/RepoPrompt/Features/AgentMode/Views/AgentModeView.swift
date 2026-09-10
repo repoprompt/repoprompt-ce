@@ -11,6 +11,11 @@ struct AgentModeView: View {
 
     @StateObject private var navigationController: AgentModeNavigationController
     @StateObject private var rootsSidebarStore: AgentWorkspaceRootsSidebarStore
+    #if DEBUG
+        @StateObject private var promptExperimentService: PromptExperimentService
+        @State private var isPromptExperimentStudioPresented = false
+        @State private var didLoadPromptExperiments = false
+    #endif
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     private var currentTabID: UUID? {
@@ -33,6 +38,9 @@ struct AgentModeView: View {
 
         let isSystem = windowState.workspaceManager.activeWorkspace?.isSystemWorkspace ?? true
         _navigationController = StateObject(wrappedValue: AgentModeNavigationController(isSystemWorkspaceMode: isSystem))
+        #if DEBUG
+            _promptExperimentService = StateObject(wrappedValue: PromptExperimentService.live(windowState: windowState))
+        #endif
         _rootsSidebarStore = StateObject(wrappedValue: AgentWorkspaceRootsSidebarStore(
             rootProjections: { windowState.workspaceFilesViewModel.visibleRootShellProjections },
             rootChanges: windowState.workspaceFilesViewModel.rootShellProjectionsChangedPublisher,
@@ -151,6 +159,33 @@ struct AgentModeView: View {
                 toggleAgentSessionSidebar()
             }
         }
+        #if DEBUG
+        .overlay(alignment: .topTrailing) {
+                Button {
+                    promptExperimentService.bindRuntime(windowState: windowState)
+                    isPromptExperimentStudioPresented = true
+                } label: {
+                    Label("Prompt Experiments", systemImage: "flask.fill")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .padding(10)
+                .hoverTooltip("Open Prompt Experiments (DEBUG pilot)")
+            }
+            .sheet(isPresented: $isPromptExperimentStudioPresented) {
+                PromptExperimentStudioView(
+                    service: promptExperimentService,
+                    controllerSessionID: currentTabID.flatMap { agentModeVM.explicitActiveSessionID(for: $0) },
+                    sourceTabID: currentTabID
+                )
+            }
+            .task {
+                guard !didLoadPromptExperiments else { return }
+                didLoadPromptExperiments = true
+                await promptExperimentService.load()
+            }
+        #endif
     }
 
     private func toggleAgentSessionSidebar() {

@@ -92,6 +92,10 @@ public enum RepoPromptWorkflowPrompts {
             rpOrchestrate(variant: variant, includeSessionCleanupGuidance: includeSessionCleanupGuidance)
         case .optimize:
             rpOptimize(variant: variant, includeSessionCleanupGuidance: includeSessionCleanupGuidance)
+        #if DEBUG
+            case .promptExperiment:
+                rpPromptExperiment(variant: variant)
+        #endif
         }
     }
 

@@ -44,6 +44,10 @@ extension AgentWorkflow {
             "Describe what to optimize and how to measure it — the agent will instrument, baseline, and iterate."
         case .deepPlan:
             "Describe what you want planned — the agent will ask how involved you want to be, then research and write a polished plan."
+        #if DEBUG
+            case .promptExperiment:
+                "Shape the comparison here, then use the native flask view to seal, approve, and run it."
+        #endif
         }
     }
 
@@ -57,6 +61,9 @@ extension AgentWorkflow {
         case .orchestrate: .green
         case .optimize: .red
         case .deepPlan: .cyan
+        #if DEBUG
+            case .promptExperiment: .pink
+        #endif
         }
     }
 
@@ -72,6 +79,9 @@ extension AgentWorkflow {
         case .orchestrate: .pair
         case .optimize: .pair
         case .deepPlan: .pair
+        #if DEBUG
+            case .promptExperiment: .explore
+        #endif
         }
     }
 
