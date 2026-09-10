@@ -442,7 +442,8 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
 
         id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
         schemaVersion = (try? c.decode(Int.self, forKey: .schemaVersion)) ?? 1
-        dateModified = (try? c.decode(Date.self, forKey: .dateModified)) ?? Date()
+        let persistedDateModified = try? c.decode(Date.self, forKey: .dateModified)
+        dateModified = persistedDateModified ?? Date()
         customStoragePath = (try? c.decode(URL.self, forKey: .customStoragePath))
         isSystemWorkspace = (try? c.decode(Bool.self, forKey: .isSystemWorkspace)) ?? false
         isHiddenInMenus = (try? c.decode(Bool.self, forKey: .isHiddenInMenus)) ?? false
@@ -453,7 +454,9 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         repoPaths = (try? c.decode([String].self, forKey: .repoPaths)) ?? []
         presets = (try? c.decode([WorkspacePreset].self, forKey: .presets)) ?? []
         activePresetID = (try? c.decode(UUID.self, forKey: .activePresetID))
-        lastUsed = (try? c.decode(Date.self, forKey: .lastUsed)) ?? Date()
+        lastUsed = (try? c.decode(Date.self, forKey: .lastUsed))
+            ?? persistedDateModified
+            ?? .distantPast
         customPath = (try? c.decode(String.self, forKey: .customPath))
         currentPromptText = (try? c.decode(String.self, forKey: .currentPromptText))
         lastSearchQuery = (try? c.decode(String.self, forKey: .lastSearchQuery))

@@ -16,15 +16,15 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
         XCTAssertEqual(WorkspaceFolderOpenResolver.bestEligibleMatch(forFolderPath: "/tmp/selected", in: [workspace])?.id, workspace.id)
     }
 
-    func testSeveralMatchesPreferNewestRegardlessOfInputOrder() {
-        let older = makeWorkspace(id: 1, name: "Older", paths: ["/tmp/selected"], modified: 10)
-        let newest = makeWorkspace(id: 2, name: "Newest", paths: ["/tmp/selected"], modified: 20)
+    func testSeveralMatchesPreferMostRecentlyUsedRegardlessOfModificationTimeOrInputOrder() {
+        let older = makeWorkspace(id: 1, name: "Older", paths: ["/tmp/selected"], modified: 20, lastUsed: 10)
+        let newest = makeWorkspace(id: 2, name: "Newest", paths: ["/tmp/selected"], modified: 10, lastUsed: 20)
 
         XCTAssertEqual(ids(WorkspaceFolderOpenResolver.eligibleMatches(forFolderPath: "/tmp/selected", in: [older, newest])), [newest.id, older.id])
         XCTAssertEqual(WorkspaceFolderOpenResolver.bestEligibleMatch(forFolderPath: "/tmp/selected", in: [older, newest])?.id, newest.id)
     }
 
-    func testRecentOrderingUsesFoldedNameExactNameThenUUIDForTies() {
+    func testRecentOrderingUsesLocalizedCaseInsensitiveNameThenUUIDForTies() {
         let alphaLaterID = makeWorkspace(id: 2, name: "alpha", paths: ["/tmp/selected"])
         let alphaEarlierID = makeWorkspace(id: 1, name: "alpha", paths: ["/tmp/selected"])
         let uppercaseAlpha = makeWorkspace(id: 3, name: "Alpha", paths: ["/tmp/selected"])
@@ -32,7 +32,7 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
 
         XCTAssertEqual(
             ids(WorkspaceRecentOrdering.sorted([beta, alphaLaterID, uppercaseAlpha, alphaEarlierID])),
-            [uppercaseAlpha.id, alphaEarlierID.id, alphaLaterID.id, beta.id]
+            [alphaEarlierID.id, alphaLaterID.id, uppercaseAlpha.id, beta.id]
         )
     }
 
@@ -144,7 +144,7 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
         await manager.awaitInitialized()
         manager.workspaces = fixtures
 
-        XCTAssertEqual(ids(manager.workspacesForMenu()), ids(fixtures))
+        XCTAssertEqual(ids(manager.workspacesForMenu()), [fixtures[0].id, fixtures[1].id, fixtures[2].id, fixtures[3].id])
     }
 
     private func ids(_ workspaces: [WorkspaceModel]) -> [UUID] {
@@ -156,6 +156,7 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
         name: String,
         paths: [String],
         modified: TimeInterval = 0,
+        lastUsed: TimeInterval = 0,
         system: Bool = false,
         hidden: Bool = false,
         ephemeral: Bool = false,
@@ -166,7 +167,7 @@ final class WorkspaceFolderOpenResolverTests: XCTestCase {
             dateModified: Date(timeIntervalSince1970: modified),
             name: name,
             repoPaths: paths,
-            lastUsed: Date(timeIntervalSince1970: 0),
+            lastUsed: Date(timeIntervalSince1970: lastUsed),
             isSystemWorkspace: system,
             ephemeralFlag: ephemeral,
             isHiddenInMenus: hidden,

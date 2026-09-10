@@ -52,15 +52,17 @@ import XCTest
             let folder = try makeFolder(named: "RankedProject")
             let older = try WorkspaceModel(
                 id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001")),
-                dateModified: Date(timeIntervalSince1970: 10),
+                dateModified: Date(timeIntervalSince1970: 20),
                 name: "Older Match",
-                repoPaths: [folder.path]
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSince1970: 10)
             )
             let newest = try WorkspaceModel(
                 id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002")),
-                dateModified: Date(timeIntervalSince1970: 20),
+                dateModified: Date(timeIntervalSince1970: 10),
                 name: "Newest Match",
-                repoPaths: [folder.path]
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSince1970: 20)
             )
             window.workspaceManager.workspaces.append(contentsOf: [older, newest])
             let countBeforeCommand = window.workspaceManager.workspaces.count
@@ -116,14 +118,16 @@ import XCTest
             let payloadFile = folder.appendingPathComponent("Payload.swift")
             try Data("let payload = true\n".utf8).write(to: payloadFile)
             let initialWinner = WorkspaceModel(
-                dateModified: Date().addingTimeInterval(-3600),
+                dateModified: Date(timeIntervalSince1970: 20),
                 name: "Initial Persistent Winner",
-                repoPaths: [folder.path]
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSince1970: 10)
             )
             let replacementWinner = WorkspaceModel(
-                dateModified: Date().addingTimeInterval(3600),
+                dateModified: Date(timeIntervalSince1970: 10),
                 name: "Replacement Persistent Winner",
-                repoPaths: [folder.path]
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSince1970: 20)
             )
             try await saveAuthoritativeWorkspace(initialWinner, in: authorityWindow, runtime: runtime)
             try await waitUntil {
@@ -598,16 +602,18 @@ import XCTest
             try Data("let value = 1\n".utf8).write(to: payloadFile)
             let lowerRanked = try WorkspaceModel(
                 id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000011")),
-                dateModified: Date(timeIntervalSince1970: 10),
+                dateModified: Date(timeIntervalSince1970: 20),
                 name: "Lower Ranked Match",
                 repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSince1970: 10),
                 ephemeralFlag: true
             )
             let winner = try WorkspaceModel(
                 id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000012")),
-                dateModified: Date(timeIntervalSince1970: 20),
+                dateModified: Date(timeIntervalSince1970: 10),
                 name: "Resolver Winner",
                 repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSince1970: 20),
                 ephemeralFlag: true
             )
             lowerRankedWindow.workspaceManager.workspaces.append(lowerRanked)
@@ -1206,7 +1212,7 @@ import XCTest
             for flags in [(true, nil), (nil, false)] as [(Bool?, Bool?)] {
                 for ephemeralWins in [false, true] {
                     try await assertFlaggedQueuedOpenRanksLiveEphemeral(
-                        ephemeral: flags.0, persist: flags.1, persistentDate: ephemeralWins ? 100 : 200
+                        ephemeral: flags.0, persist: flags.1, persistentLastUsed: ephemeralWins ? 100 : 200
                     )
                 }
             }
@@ -1215,7 +1221,7 @@ import XCTest
         func testFlaggedQueuedOpenReusesLiveEphemeralWhenPersistentRecoveryIsBlocked() async throws {
             for flags in [(true, nil), (nil, false)] as [(Bool?, Bool?)] {
                 try await assertFlaggedQueuedOpenRanksLiveEphemeral(
-                    ephemeral: flags.0, persist: flags.1, persistentDate: nil
+                    ephemeral: flags.0, persist: flags.1, persistentLastUsed: nil
                 )
             }
         }
@@ -1223,7 +1229,7 @@ import XCTest
         private func assertFlaggedQueuedOpenRanksLiveEphemeral(
             ephemeral: Bool?,
             persist: Bool?,
-            persistentDate: TimeInterval?
+            persistentLastUsed: TimeInterval?
         ) async throws {
             let runtime = try await makeDomainRuntime()
             let owner = await makeWindow(domainRuntime: runtime)
@@ -1246,10 +1252,12 @@ import XCTest
                 window.promptManager.promptText = "before"
             }
             let persistent = WorkspaceModel(
-                dateModified: Date(timeIntervalSinceReferenceDate: persistentDate ?? 100),
-                name: "Eligible persistent A", repoPaths: [folder.path]
+                dateModified: Date(timeIntervalSinceReferenceDate: 1000),
+                name: "Eligible persistent A",
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSinceReferenceDate: persistentLastUsed ?? 100)
             )
-            if persistentDate != nil {
+            if persistentLastUsed != nil {
                 try await saveAuthoritativeWorkspace(persistent, in: receiver, runtime: runtime)
                 receiver.workspaceManager.workspaces.append(persistent)
             }
@@ -1266,10 +1274,10 @@ import XCTest
                     guard let index = owner.workspaceManager.workspaces.firstIndex(where: { $0.id == live.id }) else {
                         return XCTFail("Live ephemeral fixture disappeared")
                     }
-                    owner.workspaceManager.workspaces[index].dateModified = Date(timeIntervalSinceReferenceDate: 150)
+                    owner.workspaceManager.workspaces[index].lastUsed = Date(timeIntervalSinceReferenceDate: 150)
                 }
             }
-            let ephemeralWins = (persistentDate ?? 100) < 150
+            let ephemeralWins = (persistentLastUsed ?? 100) < 150
             let winner = ephemeralWins ? owner : receiver
             let loser = ephemeralWins ? receiver : owner
             let winnerID = ephemeralWins ? live.id : persistent.id
@@ -1312,7 +1320,7 @@ import XCTest
             let after = await client.snapshot()
             XCTAssertEqual(Set(after.workspaces.map(\.document.workspaceID)), Set(before.workspaces.map(\.document.workspaceID)))
             XCTAssertFalse(after.workspaces.contains { $0.document.workspaceID == live.id })
-            if persistentDate != nil {
+            if persistentLastUsed != nil {
                 let canonicalPersistent = try XCTUnwrap(after.workspaces.first { $0.document.workspaceID == persistent.id })
                 XCTAssertFalse(canonicalPersistent.document.metadata.isEphemeral)
                 if ephemeralWins {

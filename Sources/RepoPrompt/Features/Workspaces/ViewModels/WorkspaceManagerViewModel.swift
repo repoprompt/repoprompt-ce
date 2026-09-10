@@ -13306,11 +13306,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             items = items.filter { !$0.isTemporaryWorkspace }
         }
         if query.sortMostRecentFirst {
-            items = items.sorted {
-                if $0.lastUsed != $1.lastUsed { return $0.lastUsed > $1.lastUsed }
-                let order = $0.name.localizedCaseInsensitiveCompare($1.name)
-                return order == .orderedSame ? $0.id.uuidString < $1.id.uuidString : order == .orderedAscending
-            }
+            items = WorkspaceRecentOrdering.sorted(items)
         }
         return items
     }

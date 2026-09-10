@@ -99,30 +99,31 @@ final class WorkspaceExactRootPolicyTests: XCTestCase {
     func testExactRootCandidateRankIsDeterministicAcrossEveryTieBreaker() throws {
         let earlierID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
         let laterID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+        let latestID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000003"))
         let timestamp = Date(timeIntervalSinceReferenceDate: 100)
         let ranks = [
             WorkspaceExactRootCandidateRank(
-                dateModified: timestamp,
+                lastUsed: timestamp,
                 name: "alpha",
                 workspaceID: laterID
             ),
             WorkspaceExactRootCandidateRank(
-                dateModified: timestamp.addingTimeInterval(1),
+                lastUsed: timestamp.addingTimeInterval(1),
                 name: "zeta",
                 workspaceID: laterID
             ),
             WorkspaceExactRootCandidateRank(
-                dateModified: timestamp,
+                lastUsed: timestamp,
                 name: "beta",
                 workspaceID: earlierID
             ),
             WorkspaceExactRootCandidateRank(
-                dateModified: timestamp,
+                lastUsed: timestamp,
                 name: "Alpha",
-                workspaceID: laterID
+                workspaceID: latestID
             ),
             WorkspaceExactRootCandidateRank(
-                dateModified: timestamp,
+                lastUsed: timestamp,
                 name: "alpha",
                 workspaceID: earlierID
             )
@@ -130,11 +131,11 @@ final class WorkspaceExactRootPolicyTests: XCTestCase {
 
         XCTAssertEqual(
             ranks.sorted().map(\.workspaceID),
-            [laterID, laterID, earlierID, laterID, earlierID]
+            [laterID, earlierID, laterID, latestID, earlierID]
         )
         XCTAssertEqual(
             ranks.sorted().map(\.name),
-            ["zeta", "Alpha", "alpha", "alpha", "beta"]
+            ["zeta", "alpha", "alpha", "Alpha", "beta"]
         )
     }
 }

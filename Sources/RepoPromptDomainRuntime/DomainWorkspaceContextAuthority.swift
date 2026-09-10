@@ -1529,7 +1529,7 @@ actor DomainWorkspaceContextAuthority {
     private static func exactRootCandidateRank(for record: WorkspaceRecord) -> WorkspaceExactRootCandidateRank {
         let metadata = record.document.metadata
         return WorkspaceExactRootCandidateRank(
-            dateModified: metadata.dateModified,
+            lastUsed: metadata.lastUsed,
             name: metadata.name,
             workspaceID: metadata.workspaceID
         )

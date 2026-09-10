@@ -7,7 +7,7 @@ enum WorkspaceRecentOrdering {
 
     private nonisolated static func rank(for workspace: WorkspaceModel) -> WorkspaceExactRootCandidateRank {
         WorkspaceExactRootCandidateRank(
-            dateModified: workspace.dateModified,
+            lastUsed: workspace.lastUsed,
             name: workspace.name,
             workspaceID: workspace.id
         )

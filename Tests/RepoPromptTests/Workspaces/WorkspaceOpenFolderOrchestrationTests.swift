@@ -118,9 +118,10 @@ import XCTest
             let secondaryFolder = try makeFolder(named: "CurrentAuthorityOrderingSecondary")
             let older = try WorkspaceModel(
                 id: workspaceID(10),
-                dateModified: Date(timeIntervalSinceReferenceDate: 100),
+                dateModified: Date(timeIntervalSinceReferenceDate: 900),
                 name: "Older",
-                repoPaths: [requestedFolder.path]
+                repoPaths: [requestedFolder.path],
+                lastUsed: Date(timeIntervalSinceReferenceDate: 100)
             )
             try await createAuthorityWorkspace(older, using: client)
 
@@ -133,6 +134,7 @@ import XCTest
                 dateModified: Date(timeIntervalSinceReferenceDate: 400),
                 name: "Hidden",
                 repoPaths: [requestedFolder.path],
+                lastUsed: Date(timeIntervalSinceReferenceDate: 400),
                 isHiddenInMenus: true
             )
             let system = try WorkspaceModel(
@@ -140,38 +142,43 @@ import XCTest
                 dateModified: Date(timeIntervalSinceReferenceDate: 300),
                 name: "System",
                 repoPaths: [requestedFolder.path],
+                lastUsed: Date(timeIntervalSinceReferenceDate: 300),
                 isSystemWorkspace: true
             )
-            let foldedNameLater = try WorkspaceModel(
+            let beta = try WorkspaceModel(
                 id: workspaceID(5),
                 dateModified: commonDate,
                 name: "beta",
-                repoPaths: [requestedFolder.path]
+                repoPaths: [requestedFolder.path],
+                lastUsed: commonDate
             )
-            let exactNameLater = try WorkspaceModel(
+            let lowercaseAlphaLaterID = try WorkspaceModel(
                 id: workspaceID(4),
                 dateModified: commonDate,
                 name: "alpha",
-                repoPaths: [requestedFolder.path]
+                repoPaths: [requestedFolder.path],
+                lastUsed: commonDate
             )
-            let uuidLater = try WorkspaceModel(
+            let uppercaseAlphaLaterID = try WorkspaceModel(
                 id: workspaceID(2),
                 dateModified: commonDate,
                 name: "Alpha",
-                repoPaths: [requestedFolder.path]
+                repoPaths: [requestedFolder.path],
+                lastUsed: commonDate
             )
             let expectedWinner = try WorkspaceModel(
                 id: workspaceID(1),
                 dateModified: commonDate,
                 name: "Alpha",
-                repoPaths: [secondaryFolder.path, requestedFolder.path]
+                repoPaths: [secondaryFolder.path, requestedFolder.path],
+                lastUsed: commonDate
             )
             let insertedAfterSnapshot = [
                 hidden,
                 system,
-                foldedNameLater,
-                exactNameLater,
-                uuidLater,
+                beta,
+                lowercaseAlphaLaterID,
+                uppercaseAlphaLaterID,
                 expectedWinner
             ]
             openingManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
@@ -200,6 +207,19 @@ import XCTest
             )
             XCTAssertEqual(openingManager.activeWorkspaceID, expectedWinner.id)
             XCTAssertEqual(
+                openingManager.workspacesForMenu(.init(includeTemporary: true)).first(where: {
+                    WorkspaceFolderOpenResolver.containsExactRoot(requestedFolder.path, in: $0)
+                })?.id,
+                expectedWinner.id
+            )
+            let authoritySelection = try await client.exactRootSelection(
+                canonicalRootPath: canonicalRootPath(requestedFolder)
+            )
+            guard case let .matched(authorityWinner) = authoritySelection else {
+                return XCTFail("Expected the runtime read to select an existing workspace")
+            }
+            XCTAssertEqual(authorityWinner.document.workspaceID, expectedWinner.id)
+            XCTAssertEqual(
                 WorkspaceFolderOpenResolver.bestEligibleMatch(
                     forFolderPath: requestedFolder.path,
                     in: exactRootMatches
@@ -207,6 +227,48 @@ import XCTest
                 expectedWinner.id,
                 "The runtime winner must match the complete Recent Workspaces ordering"
             )
+        }
+
+        func testAuthorityRecentOrderingPersistsAcrossRestart() async throws {
+            let profileIdentifier = "workspace-open-folder-recent-ordering-\(UUID().uuidString)"
+            let runtime = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1322)
+            let folder = try makeFolder(named: "PersistedRecentOrdering")
+            let recentlyModified = try WorkspaceModel(
+                id: workspaceID(2),
+                dateModified: Date(timeIntervalSinceReferenceDate: 20),
+                name: "Recently Modified",
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSinceReferenceDate: 10)
+            )
+            let expectedWinner = try WorkspaceModel(
+                id: workspaceID(1),
+                dateModified: Date(timeIntervalSinceReferenceDate: 10),
+                name: "Recently Used",
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSinceReferenceDate: 20)
+            )
+            try await createAuthorityWorkspace(recentlyModified, using: client)
+            try await createAuthorityWorkspace(expectedWinner, using: client)
+            let proposed = WorkspaceModel(name: "Must Not Create", repoPaths: [folder.path])
+
+            let resolution = try await client.resolveOrCreatePersistentWorkspace(
+                proposed,
+                fileURL: authorityWorkspaceFileURL(proposed.id),
+                canonicalRootPath: canonicalRootPath(folder)
+            )
+            XCTAssertEqual(resolution.exactRootResolution, .reused)
+            XCTAssertEqual(resolution.workspace?.document.workspaceID, expectedWinner.id)
+
+            _ = await runtime.shutdown()
+            domainRuntimes.removeAll { $0 === runtime }
+            let restarted = try await makeDomainRuntime(profileIdentifier: profileIdentifier)
+            let restartedClient = DomainWorkspaceAuthorityClient(store: restarted.workspaceStore, windowID: -1323)
+            let selection = try await restartedClient.exactRootSelection(canonicalRootPath: canonicalRootPath(folder))
+            guard case let .matched(selected) = selection else {
+                return XCTFail("Expected persisted exact-root selection after restart")
+            }
+            XCTAssertEqual(selected.document.workspaceID, expectedWinner.id)
         }
 
         func testConcurrentRootAdditionIsReusedInsteadOfCreatingDuplicateWorkspace() async throws {
@@ -1709,15 +1771,17 @@ import XCTest
             let folder = try makeFolder(named: "RankedProject")
             let older = try WorkspaceModel(
                 id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001")),
-                dateModified: Date(timeIntervalSince1970: 10),
+                dateModified: Date(timeIntervalSince1970: 20),
                 name: "Older Match",
-                repoPaths: [folder.path]
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSince1970: 10)
             )
             let newest = try WorkspaceModel(
                 id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002")),
-                dateModified: Date(timeIntervalSince1970: 20),
+                dateModified: Date(timeIntervalSince1970: 10),
                 name: "Newest Match",
-                repoPaths: [folder.path]
+                repoPaths: [folder.path],
+                lastUsed: Date(timeIntervalSince1970: 20)
             )
             manager.workspaces.append(contentsOf: [older, newest])
             let countBeforeOpen = manager.workspaces.count
