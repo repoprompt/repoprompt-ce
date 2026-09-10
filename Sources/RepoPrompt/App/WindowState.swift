@@ -379,27 +379,15 @@ class WindowState: ObservableObject {
         case unspecified
     }
 
-    private struct QueuedAppCommand {
-        let id: UUID
-        let command: AppCommand
-        var folderRoute: FolderRouteState
-        var canonicalReresolutionAttempts: Int
-        var attemptedWindowIDs: Set<Int>
-        var forwardingCount: Int
-        var persistentResolution: PersistentFolderOpenProvenance?
-        var durableCreationCommit: DurablePersistentWorkspaceCreationCommit?
-        let completion: AppCommandCompletion?
-    }
-
     private enum CommandHandlingOutcome {
         case terminal(AppCommandExecutionResult)
-        case retry(FolderRouteState)
+        case retry(expectedRoot: WorkspaceRootSetKey, failure: AppCommandExecutionFailure)
         case forward(WindowState, FolderRouteState)
     }
 
     private enum FolderTargetResolution {
         case resolved(ResolvedFolderTarget)
-        case retry(FolderRouteState)
+        case retry(expectedRoot: WorkspaceRootSetKey, failure: AppCommandExecutionFailure)
         case terminal(AppCommandExecutionResult)
     }
 
@@ -407,14 +395,6 @@ class WindowState: ObservableObject {
         let workspace: WorkspaceModel
         let source: FolderTargetSource
         let activationState: FolderOpenActivationState
-        let persistentResolution: PersistentFolderOpenProvenance?
-        let durableCreationCommit: DurablePersistentWorkspaceCreationCommit?
-    }
-
-    private struct DurablePersistentWorkspaceCreationCommit: Equatable {
-        let workspaceID: UUID
-        let expectedRoot: WorkspaceRootSetKey
-        let operationID: UUID
     }
 
     private struct FolderCandidateRepresentation {
@@ -453,15 +433,9 @@ class WindowState: ObservableObject {
         }
     }
 
-    private static let commandLogger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "com.repoprompt.RepoPrompt",
-        category: "AppCommandQueue"
-    )
-
     /// Command queue to store all pending commands
-    private var commandQueue: [QueuedAppCommand] = []
+    private var commandQueue: [AppCommandLifetime] = []
     private var isProcessingCommandQueue = false
-    private var activeQueuedCommandID: UUID?
     #if DEBUG
         private var automaticallyProcessesEnqueuedCommands = true
         private var persistentFolderCreationCommitDidRecordHandlerForTesting: ((UUID) -> Void)?
@@ -1446,23 +1420,18 @@ class WindowState: ObservableObject {
         folderRoute: FolderRouteState,
         completion: AppCommandCompletion? = nil
     ) {
-        let queuedCommand = QueuedAppCommand(
-            id: UUID(),
+        let queuedCommand = AppCommandLifetime(
             command: command,
             folderRoute: folderRoute,
-            canonicalReresolutionAttempts: 0,
-            attemptedWindowIDs: [windowID],
-            forwardingCount: 0,
-            persistentResolution: folderRoute.routedPersistentResolution,
-            durableCreationCommit: nil,
+            windowID: windowID,
             completion: completion
         )
         enqueueQueuedCommand(queuedCommand)
     }
 
-    private func enqueueQueuedCommand(_ queuedCommand: QueuedAppCommand) {
+    private func enqueueQueuedCommand(_ queuedCommand: AppCommandLifetime) {
         guard !isClosing else {
-            finishCommand(queuedCommand, with: .failed(.windowClosed))
+            queuedCommand.windowClosed(in: windowID)
             return
         }
         commandQueue.append(queuedCommand)
@@ -1584,13 +1553,13 @@ class WindowState: ObservableObject {
     func processCommands() async {
         guard !isProcessingCommandQueue else { return }
         isProcessingCommandQueue = true
-        defer {
-            activeQueuedCommandID = nil
-            isProcessingCommandQueue = false
-        }
+        defer { isProcessingCommandQueue = false }
 
         while let queuedCommand = commandQueue.first {
-            activeQueuedCommandID = queuedCommand.id
+            guard queuedCommand.beginExecution(in: windowID) else {
+                commandQueue.removeFirst()
+                continue
+            }
             let outcome: CommandHandlingOutcome = if Task.isCancelled {
                 .terminal(.cancelled)
             } else if isClosing {
@@ -1598,146 +1567,30 @@ class WindowState: ObservableObject {
             } else {
                 await handleCommand(queuedCommand)
             }
-            activeQueuedCommandID = nil
 
-            guard let commandIndex = commandQueue.firstIndex(where: { $0.id == queuedCommand.id }) else {
-                continue
-            }
+            // Close retains the executing entry. Detach it before any transition
+            // can invoke a completion that reenters this window's queue.
+            commandQueue.removeFirst()
             switch outcome {
             case let .terminal(result):
-                let completedCommand = commandQueue.remove(at: commandIndex)
-                finishCommand(completedCommand, with: result)
-            case let .retry(folderRoute):
-                var retry = commandQueue[commandIndex]
-                retry.folderRoute = folderRoute
-                retry.canonicalReresolutionAttempts += 1
-                commandQueue[commandIndex] = retry
+                queuedCommand.finish(result, in: windowID)
+            case let .retry(expectedRoot, failure):
+                if queuedCommand.retry(expectedRoot: expectedRoot, failure: failure, in: windowID) {
+                    commandQueue.insert(queuedCommand, at: 0)
+                }
             case let .forward(targetWindow, folderRoute):
-                var forwarded = commandQueue.remove(at: commandIndex)
-                forwarded.folderRoute = folderRoute
-                forwarded.forwardingCount += 1
-                forwarded.attemptedWindowIDs.insert(targetWindow.windowID)
-                targetWindow.enqueueQueuedCommand(forwarded)
+                if queuedCommand.transfer(to: targetWindow.windowID, route: folderRoute, from: windowID) {
+                    targetWindow.enqueueQueuedCommand(queuedCommand)
+                }
             }
         }
     }
 
     private func failUnstartedCommandsForWindowClose() {
-        let unstartedCommands = commandQueue.filter { $0.id != activeQueuedCommandID }
-        commandQueue.removeAll { $0.id != activeQueuedCommandID }
-        for command in unstartedCommands {
-            finishCommand(command, with: .failed(.windowClosed))
-        }
-    }
-
-    private func finishCommand(
-        _ queuedCommand: QueuedAppCommand,
-        with result: AppCommandExecutionResult
-    ) {
-        let reportedResult = commandResult(
-            result,
-            accountingFor: queuedCommand.durableCreationCommit
-        )
-        let persistentResolutionLabel = switch queuedCommand.persistentResolution {
-        case .created:
-            "created"
-        case .reused:
-            "reused"
-        case nil:
-            "none"
-        }
-        switch reportedResult {
-        case let .failed(failure):
-            Self.commandLogger.error(
-                "App command failed route=\(queuedCommand.folderRoute.logLabel, privacy: .public) resolution=\(persistentResolutionLabel, privacy: .public) reason=\(failure.rawValue, privacy: .public)"
-            )
-        case let .partialSuccess(workspaceID, reason):
-            let reasonLabel = switch reason {
-            case .cancelled:
-                "cancelled"
-            case let .failed(failure):
-                failure.rawValue
-            }
-            Self.commandLogger.warning(
-                "App command partially succeeded route=\(queuedCommand.folderRoute.logLabel, privacy: .public) resolution=\(persistentResolutionLabel, privacy: .public) workspaceID=\(workspaceID.uuidString, privacy: .public) reason=\(reasonLabel, privacy: .public)"
-            )
-        case .completed, .cancelled:
-            break
-        }
-        queuedCommand.completion?(reportedResult)
-    }
-
-    private func commandResult(
-        _ result: AppCommandExecutionResult,
-        accountingFor creationCommit: DurablePersistentWorkspaceCreationCommit?
-    ) -> AppCommandExecutionResult {
-        guard let creationCommit else { return result }
-        return switch result {
-        case .completed, .partialSuccess:
-            result
-        case .cancelled:
-            .partialSuccess(
-                workspaceID: creationCommit.workspaceID,
-                reason: .cancelled
-            )
-        case let .failed(failure):
-            .partialSuccess(
-                workspaceID: creationCommit.workspaceID,
-                reason: .failed(failure)
-            )
-        }
-    }
-
-    private func recordResolvedFolderTarget(
-        _ target: ResolvedFolderTarget,
-        forCommandID commandID: UUID
-    ) {
-        guard let index = commandQueue.firstIndex(where: { $0.id == commandID }) else { return }
-        recordPersistentResolution(
-            target.persistentResolution,
-            durableCreationCommit: target.durableCreationCommit,
-            at: index
-        )
-    }
-
-    private func recordPersistentFolderResolution(
-        _ resolution: PersistentFolderOpenResolutionDetails,
-        expectedRoot: WorkspaceRootSetKey,
-        forCommandID commandID: UUID
-    ) -> DurablePersistentWorkspaceCreationCommit? {
-        let creationCommit: DurablePersistentWorkspaceCreationCommit? =
-            if resolution.provenance == .created, resolution.creationCommitted {
-                DurablePersistentWorkspaceCreationCommit(
-                    workspaceID: resolution.workspace.id,
-                    expectedRoot: expectedRoot,
-                    operationID: resolution.operationID
-                )
-            } else {
-                nil
-            }
-        guard let index = commandQueue.firstIndex(where: { $0.id == commandID }) else {
-            return creationCommit
-        }
-        recordPersistentResolution(
-            resolution.provenance,
-            durableCreationCommit: creationCommit,
-            at: index
-        )
-        return creationCommit
-    }
-
-    private func recordPersistentResolution(
-        _ persistentResolution: PersistentFolderOpenProvenance?,
-        durableCreationCommit: DurablePersistentWorkspaceCreationCommit?,
-        at commandIndex: Int
-    ) {
-        if persistentResolution == .created
-            || commandQueue[commandIndex].persistentResolution == nil
-        {
-            commandQueue[commandIndex].persistentResolution = persistentResolution
-        }
-        if commandQueue[commandIndex].durableCreationCommit == nil {
-            commandQueue[commandIndex].durableCreationCommit = durableCreationCommit
+        let closingCommands = commandQueue
+        commandQueue.removeAll { !$0.isExecuting(in: windowID) }
+        for command in closingCommands {
+            command.windowClosed(in: windowID)
         }
     }
 
@@ -1960,7 +1813,7 @@ class WindowState: ObservableObject {
     }
 
     @MainActor
-    private func handleCommand(_ queuedCommand: QueuedAppCommand) async -> CommandHandlingOutcome {
+    private func handleCommand(_ queuedCommand: AppCommandLifetime) async -> CommandHandlingOutcome {
         let command = queuedCommand.command
         if let folderPath = command.folderPath, !folderPath.isEmpty {
             return await handleFolderCommand(
@@ -1973,7 +1826,7 @@ class WindowState: ObservableObject {
     }
 
     private func handleFolderCommand(
-        _ queuedCommand: QueuedAppCommand,
+        _ queuedCommand: AppCommandLifetime,
         folderPath: String,
         shouldBeEphemeral: Bool
     ) async -> CommandHandlingOutcome {
@@ -2002,9 +1855,8 @@ class WindowState: ObservableObject {
         switch resolution {
         case let .resolved(resolvedTarget):
             target = resolvedTarget
-            recordResolvedFolderTarget(target, forCommandID: queuedCommand.id)
-        case let .retry(folderRoute):
-            return .retry(folderRoute)
+        case let .retry(expectedRoot, failure):
+            return .retry(expectedRoot: expectedRoot, failure: failure)
         case let .terminal(result):
             return .terminal(result)
         }
@@ -2042,8 +1894,7 @@ class WindowState: ObservableObject {
         guard let activeWorkspace = workspaceManager.activeWorkspace,
               activeWorkspace.id == target.workspace.id
         else {
-            return retryOrTerminal(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .routeChangedAfterRetry
             )
@@ -2055,8 +1906,7 @@ class WindowState: ObservableObject {
             in: [activeWorkspace],
             admittingEphemeral: admitsLocalEphemeralTarget
         )?.id == target.workspace.id else {
-            return retryOrTerminal(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .routeChangedAfterRetry
             )
@@ -2085,8 +1935,7 @@ class WindowState: ObservableObject {
                       in: [authoritativeTarget]
                   )?.id == target.workspace.id
             else {
-                return retryOrTerminal(
-                    queuedCommand,
+                return .retry(
                     expectedRoot: expectedRoot,
                     failure: .routeChangedAfterRetry
                 )
@@ -2102,8 +1951,7 @@ class WindowState: ObservableObject {
                       && target.source.permitsLocalEphemeralAdmission
               )?.id == target.workspace.id
         else {
-            return retryOrTerminal(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .routeChangedAfterRetry
             )
@@ -2116,7 +1964,7 @@ class WindowState: ObservableObject {
     }
 
     private func resolveFolderTarget(
-        for queuedCommand: QueuedAppCommand,
+        for queuedCommand: AppCommandLifetime,
         folderURL: URL,
         expectedRoot: WorkspaceRootSetKey,
         shouldBeEphemeral: Bool
@@ -2131,7 +1979,6 @@ class WindowState: ObservableObject {
         }
         if shouldBeEphemeral {
             return await resolveEphemeralFolderTarget(
-                for: queuedCommand,
                 folderURL: folderURL,
                 expectedRoot: expectedRoot
             )
@@ -2147,14 +1994,12 @@ class WindowState: ObservableObject {
                 expectedRoot: expectedRoot
             )
         case .pendingPersistentPublication:
-            return retryFolderResolution(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .routeChangedAfterRetry
             )
         case .ephemeralLiveWindowSupplement:
-            return retryFolderResolution(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .workspaceUnavailable
             )
@@ -2163,14 +2008,13 @@ class WindowState: ObservableObject {
 
     private func resolvePendingPersistentFolderTarget(
         _ publication: PendingPersistentWorkspacePublication,
-        for queuedCommand: QueuedAppCommand,
+        for queuedCommand: AppCommandLifetime,
         folderURL: URL,
         expectedRoot: WorkspaceRootSetKey
     ) async -> FolderTargetResolution {
         let activationState = workspaceManager.captureFolderOpenActivationState()
         guard publication.expectedRoot == expectedRoot else {
-            return retryFolderResolution(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .routeChangedAfterRetry
             )
@@ -2182,8 +2026,7 @@ class WindowState: ObservableObject {
                 || outcome.disposition == .unchanged
                 || outcome.disposition == .deduplicated
             else {
-                return retryFolderResolution(
-                    queuedCommand,
+                return .retry(
                     expectedRoot: expectedRoot,
                     failure: .authorityFailure
                 )
@@ -2191,8 +2034,7 @@ class WindowState: ObservableObject {
         } catch is CancellationError {
             return .terminal(.cancelled)
         } catch {
-            return retryFolderResolution(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .authorityFailure
             )
@@ -2223,40 +2065,35 @@ class WindowState: ObservableObject {
                   in: [authoritativeWorkspace]
               )?.id == publication.workspaceID
         else {
-            return retryFolderResolution(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .routeChangedAfterRetry
             )
         }
 
+        queuedCommand.recordPendingPublicationReuse()
         return .resolved(ResolvedFolderTarget(
             workspace: authoritativeWorkspace,
             source: .pendingPersistentPublication(publication),
-            activationState: activationState,
-            persistentResolution: .reused,
-            durableCreationCommit: nil
+            activationState: activationState
         ))
     }
 
     private func resolvePersistentFolderTarget(
-        for queuedCommand: QueuedAppCommand,
+        for queuedCommand: AppCommandLifetime,
         folderURL: URL,
         expectedRoot: WorkspaceRootSetKey
     ) async -> FolderTargetResolution {
         do {
-            let resolution = try await workspaceManager.resolveOrCreatePersistentWorkspaceWithProvenance(
-                fromFolderURL: folderURL
-            )
-            let durableCreationCommit = recordPersistentFolderResolution(
-                resolution,
-                expectedRoot: expectedRoot,
-                forCommandID: queuedCommand.id
-            )
+            let resolution = try await queuedCommand.resolvePersistentFolder(expectedRoot: expectedRoot) {
+                try await workspaceManager.resolveOrCreatePersistentWorkspaceWithProvenance(
+                    fromFolderURL: folderURL
+                )
+            }
             #if DEBUG
-                if let durableCreationCommit {
+                if resolution.provenance == .created, resolution.creationCommitted {
                     persistentFolderCreationCommitDidRecordHandlerForTesting?(
-                        durableCreationCommit.workspaceID
+                        resolution.workspace.id
                     )
                 }
             #endif
@@ -2265,8 +2102,7 @@ class WindowState: ObservableObject {
             }
             let workspace = resolution.workspace
             guard WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: workspace) else {
-                return retryFolderResolution(
-                    queuedCommand,
+                return .retry(
                     expectedRoot: expectedRoot,
                     failure: .routeChangedAfterRetry
                 )
@@ -2274,25 +2110,21 @@ class WindowState: ObservableObject {
             return .resolved(ResolvedFolderTarget(
                 workspace: workspace,
                 source: .authority,
-                activationState: resolution.activationState,
-                persistentResolution: resolution.provenance,
-                durableCreationCommit: durableCreationCommit
+                activationState: resolution.activationState
             ))
         } catch is CancellationError {
             return .terminal(.cancelled)
         } catch let error as DomainWorkspaceAuthorityOperationError
             where error.outcome.diagnostic == "exact_root_selection_changed"
         {
-            return retryFolderResolution(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .routeChangedAfterRetry
             )
         } catch let error as DomainWorkspaceAuthorityOperationError
             where error.outcome.errorCode == .workspaceUnavailable
         {
-            return retryFolderResolution(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .workspaceUnavailable
             )
@@ -2302,7 +2134,6 @@ class WindowState: ObservableObject {
     }
 
     private func resolveEphemeralFolderTarget(
-        for queuedCommand: QueuedAppCommand,
         folderURL: URL,
         expectedRoot: WorkspaceRootSetKey
     ) async -> FolderTargetResolution {
@@ -2348,8 +2179,7 @@ class WindowState: ObservableObject {
         case .recoveryBlocked:
             recoveryBlocked = true
         case .changed:
-            return retryFolderResolution(
-                queuedCommand,
+            return .retry(
                 expectedRoot: expectedRoot,
                 failure: .routeChangedAfterRetry
             )
@@ -2388,9 +2218,7 @@ class WindowState: ObservableObject {
             return .resolved(ResolvedFolderTarget(
                 workspace: winner,
                 source: representation.source,
-                activationState: activationState,
-                persistentResolution: nil,
-                durableCreationCommit: nil
+                activationState: activationState
             ))
         }
 
@@ -2410,38 +2238,14 @@ class WindowState: ObservableObject {
         return .resolved(ResolvedFolderTarget(
             workspace: workspace,
             source: .ephemeralLiveWindow(self),
-            activationState: activationState,
-            persistentResolution: nil,
-            durableCreationCommit: nil
+            activationState: activationState
         ))
-    }
-
-    private func retryFolderResolution(
-        _ queuedCommand: QueuedAppCommand,
-        expectedRoot: WorkspaceRootSetKey,
-        failure: AppCommandExecutionFailure
-    ) -> FolderTargetResolution {
-        guard queuedCommand.canonicalReresolutionAttempts == 0 else {
-            return .terminal(.failed(failure))
-        }
-        return .retry(.authorityExactRoot(expectedRoot: expectedRoot))
-    }
-
-    private func retryOrTerminal(
-        _ queuedCommand: QueuedAppCommand,
-        expectedRoot: WorkspaceRootSetKey,
-        failure: AppCommandExecutionFailure
-    ) -> CommandHandlingOutcome {
-        guard queuedCommand.canonicalReresolutionAttempts == 0 else {
-            return .terminal(.failed(failure))
-        }
-        return .retry(.authorityExactRoot(expectedRoot: expectedRoot))
     }
 
     private func forwardingOutcome(
         for target: ResolvedFolderTarget,
         expectedRoot: WorkspaceRootSetKey,
-        queuedCommand: QueuedAppCommand
+        queuedCommand: AppCommandLifetime
     ) -> CommandHandlingOutcome? {
         if case let .ephemeralLiveWindow(owningWindow) = target.source,
            owningWindow !== self
@@ -2449,8 +2253,7 @@ class WindowState: ObservableObject {
             guard !owningWindow.isClosing else {
                 return .terminal(.failed(.workspaceUnavailable))
             }
-            guard queuedCommand.forwardingCount == 0,
-                  !queuedCommand.attemptedWindowIDs.contains(owningWindow.windowID)
+            guard queuedCommand.canForward(to: owningWindow.windowID)
             else {
                 return .terminal(.failed(.routeChangedAfterRetry))
             }
@@ -2464,12 +2267,11 @@ class WindowState: ObservableObject {
         }
 
         guard queuedCommand.command.focus == true,
-              queuedCommand.forwardingCount == 0,
               let windowStatesManager,
               let activeWindow = windowStatesManager.allWindows.first(where: { window in
                   guard window !== self,
                         !window.isClosing,
-                        !queuedCommand.attemptedWindowIDs.contains(window.windowID),
+                        queuedCommand.canForward(to: window.windowID),
                         let activeWorkspace = window.workspaceManager.activeWorkspace,
                         activeWorkspace.id == target.workspace.id
                   else {
@@ -2503,7 +2305,7 @@ class WindowState: ObservableObject {
     }
 
     private func handleNonFolderCommand(
-        _ queuedCommand: QueuedAppCommand
+        _ queuedCommand: AppCommandLifetime
     ) async -> CommandHandlingOutcome {
         let command = queuedCommand.command
         guard applyStoredPromptIfNeeded(command) else {

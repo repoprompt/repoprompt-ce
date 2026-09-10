@@ -426,6 +426,116 @@ import XCTest
             ])
         }
 
+        func testTerminalCompletionCanReenterQueueAndClosePendingCommands() async {
+            for closeOnCompletion in [false, true] {
+                let window = await makeWindow()
+                window.setAutomaticCommandProcessingForTesting(false)
+                let command = folderCommand(
+                    folderPath: storageRoot.appendingPathComponent("Missing-\(UUID().uuidString)").path
+                )
+                var initialResults: [AppCommandExecutionResult] = []
+                var pendingResults: [AppCommandExecutionResult] = []
+                var reentrantResults: [AppCommandExecutionResult] = []
+                window.enqueueCommand(command) { result in
+                    initialResults.append(result)
+                    // The completed entry must already be detached; only its sibling remains.
+                    XCTAssertEqual(window.queuedCommandCountForTesting, 1)
+                    window.enqueueCommand(command) { reentrantResults.append($0) }
+                    if closeOnCompletion {
+                        window.beginClose()
+                    }
+                }
+                window.enqueueCommand(command) { pendingResults.append($0) }
+
+                await window.processCommands()
+                await window.processCommands()
+
+                let expected: AppCommandExecutionResult = closeOnCompletion
+                    ? .failed(.windowClosed) : .failed(.invalidFolder)
+                XCTAssertEqual(initialResults, [.failed(.invalidFolder)])
+                XCTAssertEqual(pendingResults, [expected])
+                XCTAssertEqual(reentrantResults, [expected])
+                XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            }
+        }
+
+        func testWindowCloseDuringOwnPersistentResolutionWaitsForCommitBeforeCompleting() async throws {
+            let runtime = try await makeDomainRuntime()
+            let window = await makeWindow(domainRuntime: runtime)
+            let folder = try makeFolder(named: "ClosedDuringOwnPersistentResolution")
+            let payloadFile = folder.appendingPathComponent("Payload.swift")
+            try Data("let payload = true\n".utf8).write(to: payloadFile)
+            let storedPromptTitle = "Closed During Resolution Stored Prompt \(UUID().uuidString)"
+            let gate = WindowFolderOpenCreationGate()
+            window.workspaceManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
+                await gate.pauseUntilReleased()
+            }
+            defer {
+                window.workspaceManager.setPersistentFolderOpenDidSnapshotHandlerForTesting(nil)
+            }
+            window.promptManager.promptText = "before"
+            window.setAutomaticCommandProcessingForTesting(false)
+            var completions: [AppCommandExecutionResult] = []
+            window.enqueueCommand(
+                folderCommand(
+                    folderPath: folder.path,
+                    fileList: [payloadFile.path],
+                    promptText: "after",
+                    newPrompt: (storedPromptTitle, "must not be stored")
+                )
+            ) { completions.append($0) }
+
+            let processingTask = Task {
+                await window.processCommands()
+            }
+            await gate.waitUntilPaused()
+            let beforePersistence = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(beforePersistence.workspaces.contains(where: {
+                $0.document.metadata.repoPaths == [folder.path]
+            }))
+
+            window.beginClose()
+
+            XCTAssertEqual(completions, [])
+            XCTAssertEqual(window.queuedCommandCountForTesting, 1)
+            XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertFalse(window.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
+
+            await gate.release()
+            await processingTask.value
+
+            let snapshot = await runtime.workspaceStore.snapshot()
+            let createdWorkspace = try XCTUnwrap(snapshot.workspaces.first(where: {
+                $0.document.metadata.repoPaths == [folder.path]
+            }))
+            XCTAssertEqual(snapshot.workspaces.count(where: {
+                $0.document.metadata.repoPaths == [folder.path]
+            }), 1)
+            XCTAssertEqual(completions, [
+                .partialSuccess(
+                    workspaceID: createdWorkspace.document.workspaceID,
+                    reason: .failed(.windowClosed)
+                )
+            ])
+            XCTAssertEqual(window.queuedCommandCountForTesting, 0)
+            XCTAssertNotEqual(window.workspaceManager.activeWorkspaceID, createdWorkspace.document.workspaceID)
+            XCTAssertEqual(window.promptManager.promptText, "before")
+            XCTAssertFalse(window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.fullPath == payloadFile.path
+            })
+            XCTAssertFalse(window.promptManager.storedPrompts.contains {
+                $0.title == storedPromptTitle
+            })
+
+            await window.processCommands()
+            XCTAssertEqual(completions.count, 1)
+        }
+
         func testQueuedCreationThenWindowCloseBeforeActivationReportsPartialSuccess() async throws {
             let runtime = try await makeDomainRuntime()
             let window = await makeWindow(domainRuntime: runtime)
