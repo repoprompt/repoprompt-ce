@@ -124,7 +124,7 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
                     displayName: "Prompt Experiment",
                     iconName: "flask.fill",
                     tooltipText: "Prepare a native fixed prompt comparison",
-                    descriptionText: "Links this Agent session to a synthetic-fixture experiment that only the user can seal, approve, and run."
+                    descriptionText: "Links this Agent session to a synthetic-fixture draft the agent can revise and seal for native user approval and execution."
                 )
         #endif
         }

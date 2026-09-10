@@ -18,9 +18,9 @@ enum MCPAppToolGroup: CaseIterable, Hashable {
     var orderedToolNames: [String] {
         switch self {
         case .selection:
-            [MCPWindowToolName.manageSelection]
+            return [MCPWindowToolName.manageSelection]
         case .files:
-            [
+            return [
                 MCPWindowToolName.fileActions,
                 MCPWindowToolName.getCodeStructure,
                 MCPWindowToolName.getFileTree,
@@ -28,43 +28,47 @@ enum MCPAppToolGroup: CaseIterable, Hashable {
                 MCPWindowToolName.search
             ]
         case .promptContext:
-            [
+            return [
                 MCPWindowToolName.workspaceContext,
                 MCPWindowToolName.prompt
             ]
         case .applyEdits:
-            [MCPWindowToolName.applyEdits]
+            return [MCPWindowToolName.applyEdits]
         case .oracle:
-            [
+            return [
                 MCPWindowToolName.oracleUtils,
                 MCPWindowToolName.askOracle,
                 MCPWindowToolName.oracleSend,
                 MCPWindowToolName.oracleChatLog
             ]
         case .git:
-            [
+            return [
                 MCPWindowToolName.git,
                 MCPWindowToolName.manageWorktree
             ]
         case .contextBuilder:
-            [MCPWindowToolName.contextBuilder]
+            return [MCPWindowToolName.contextBuilder]
         case .askUser:
-            [MCPWindowToolName.askUser]
+            return [MCPWindowToolName.askUser]
         case .agentControl:
-            [
+            return [
                 MCPWindowToolName.agentExplore,
                 MCPWindowToolName.agentRun,
                 MCPWindowToolName.agentManage,
                 MCPWindowToolName.agentSessionLink
             ]
         case .agentSessionControl:
-            [
+            var names = [
                 MCPWindowToolName.shareThoughts,
                 MCPWindowToolName.setStatus,
                 MCPWindowToolName.waitForNextInstruction
             ]
+            #if DEBUG
+                names.append(MCPWindowToolName.promptExperiment)
+            #endif
+            return names
         case .history:
-            [MCPWindowToolName.history]
+            return [MCPWindowToolName.history]
         }
     }
 

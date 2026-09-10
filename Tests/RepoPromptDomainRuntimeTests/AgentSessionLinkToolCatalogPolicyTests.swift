@@ -187,7 +187,10 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     func testAttentionRequestUsesTheSameDirectionalToolAndOnlyItsInverseGrant() throws {
-        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, 28)
+        XCTAssertEqual(
+            MCPDomainCanonicalToolDefinitions.definitions.count,
+            MCPDomainToolCatalog.orderedToolNames.count
+        )
         XCTAssertEqual(
             MCPDomainCanonicalToolDefinitions.definitions.map(\.name).filter { $0 == toolName }.count,
             1

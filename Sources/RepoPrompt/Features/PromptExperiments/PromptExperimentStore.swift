@@ -1,6 +1,21 @@
 #if DEBUG
     import Foundation
 
+    struct PromptExperimentProjectionReport: Equatable {
+        let failures: [String]
+
+        static let success = Self(failures: [])
+
+        var isDegraded: Bool {
+            !failures.isEmpty
+        }
+
+        var message: String? {
+            guard isDegraded else { return nil }
+            return "Canonical experiment state is saved, but readable views need rebuilding: \(failures.joined(separator: "; "))"
+        }
+    }
+
     /// Canonical local persistence for the single-writer pilot.
     ///
     /// There is no general SQLite wrapper in the current application target. This bounded
@@ -34,10 +49,19 @@
         private let artifactsURL: URL
         private let environmentsURL: URL
         private let recordsURL: URL
+        private let beforeLoad: @Sendable () async -> Void
+        private let beforeReadSyntheticFixture: @Sendable () async -> Void
 
-        init(rootURL: URL, fileManager: FileManager = .default) {
+        init(
+            rootURL: URL,
+            fileManager: FileManager = .default,
+            beforeLoad: @escaping @Sendable () async -> Void = {},
+            beforeReadSyntheticFixture: @escaping @Sendable () async -> Void = {}
+        ) {
             self.rootURL = rootURL
             self.fileManager = fileManager
+            self.beforeLoad = beforeLoad
+            self.beforeReadSyntheticFixture = beforeReadSyntheticFixture
             canonicalURL = rootURL.appendingPathComponent("experiments.json", isDirectory: false)
             artifactsURL = rootURL.appendingPathComponent("artifacts/sha256", isDirectory: true)
             environmentsURL = rootURL.appendingPathComponent("environments", isDirectory: true)
@@ -49,8 +73,9 @@
                 .appendingPathComponent("Experiments/v1", isDirectory: true)
         }
 
-        func loadRecords() throws -> [PromptExperimentRecord] {
-            try ensureLayout()
+        func loadRecords() async throws -> [PromptExperimentRecord] {
+            await beforeLoad()
+            try ensureDirectory(rootURL)
             guard fileManager.fileExists(atPath: canonicalURL.path) else { return [] }
             do {
                 let data = try Data(contentsOf: canonicalURL, options: [.mappedIfSafe])
@@ -70,15 +95,32 @@
             }
         }
 
-        func saveRecords(_ records: [PromptExperimentRecord]) throws {
-            try ensureLayout()
+        /// Commits canonical authority first. Projection failures are returned separately and
+        /// never make callers misclassify an already-committed approval or submission.
+        func saveRecords(_ records: [PromptExperimentRecord]) throws -> PromptExperimentProjectionReport {
+            try ensureDirectory(rootURL)
             let document = PromptExperimentDocument(records: records.sorted { $0.createdAt < $1.createdAt })
             let encoder = Self.makeEncoder(pretty: true)
             let data = try encoder.encode(document)
             try writeAtomically(data, to: canonicalURL)
-            for record in records {
-                try writeReadableViews(for: record)
+            return rebuildReadableViews(records)
+        }
+
+        func rebuildReadableViews(_ records: [PromptExperimentRecord]) -> PromptExperimentProjectionReport {
+            do {
+                try ensureDirectory(recordsURL)
+            } catch {
+                return PromptExperimentProjectionReport(failures: [error.localizedDescription])
             }
+            var failures: [String] = []
+            for record in records {
+                do {
+                    try writeReadableViews(for: record)
+                } catch {
+                    failures.append("\(record.id.uuidString.lowercased()): \(error.localizedDescription)")
+                }
+            }
+            return PromptExperimentProjectionReport(failures: failures)
         }
 
         /// Materializes a reviewed synthetic fixture under app support. Loaded-workspace
@@ -88,7 +130,8 @@
             planRevision: Int,
             fixtureText: String
         ) throws -> (rootURL: URL, fixture: PromptExperimentFixtureFile, digest: String) {
-            try ensureLayout()
+            try ensureDirectory(rootURL)
+            try ensureDirectory(environmentsURL)
             let environmentRoot = environmentsURL
                 .appendingPathComponent(experimentID.uuidString.lowercased(), isDirectory: true)
                 .appendingPathComponent("revision-\(planRevision)", isDirectory: true)
@@ -106,7 +149,8 @@
         }
 
         func installArtifact(_ data: Data, fileExtension: String = "txt") throws -> PromptExperimentArtifactReference {
-            try ensureLayout()
+            try ensureDirectory(rootURL)
+            try ensureDirectory(artifactsURL)
             let digest = PromptExperimentDigest.sha256(data)
             let shard = String(digest.prefix(2))
             let shardURL = artifactsURL.appendingPathComponent(shard, isDirectory: true)
@@ -144,7 +188,8 @@
             return data
         }
 
-        func readSyntheticFixture(environment: PromptExperimentEnvironment) throws -> String {
+        func readSyntheticFixture(environment: PromptExperimentEnvironment) async throws -> String {
+            await beforeReadSyntheticFixture()
             let rootPath = rootURL.standardizedFileURL.path
             let fixtureURL = URL(fileURLWithPath: environment.fixtureFiles.first?.path ?? "").standardizedFileURL
             guard fixtureURL.path.hasPrefix(rootPath + "/"),
@@ -165,15 +210,9 @@
         }
 
         func recordDirectoryURL(experimentID: UUID) throws -> URL {
-            try ensureLayout()
-            return recordsURL.appendingPathComponent(experimentID.uuidString.lowercased(), isDirectory: true)
-        }
-
-        private func ensureLayout() throws {
             try ensureDirectory(rootURL)
-            try ensureDirectory(artifactsURL)
-            try ensureDirectory(environmentsURL)
             try ensureDirectory(recordsURL)
+            return recordsURL.appendingPathComponent(experimentID.uuidString.lowercased(), isDirectory: true)
         }
 
         private func ensureDirectory(_ url: URL) throws {
@@ -197,6 +236,13 @@
                 let data = try Self.makeEncoder(pretty: true).encode(plan)
                 try writeAtomically(data, to: directory.appendingPathComponent("plan.json"))
             }
+            for plan in record.plans {
+                let data = try Self.makeEncoder(pretty: true).encode(plan)
+                try writeAtomically(
+                    data,
+                    to: directory.appendingPathComponent("plan-revision-\(plan.revision).json")
+                )
+            }
             try writeAtomically(Data(resultsCSV(record).utf8), to: directory.appendingPathComponent("results.csv"))
         }
 
@@ -212,22 +258,25 @@
             ]
             if let plan = record.currentPlan {
                 lines += [
-                    "- Plan revision: \(plan.revision)",
-                    "- Approved plan digest: `\(plan.digest)`",
+                    "- Current plan revision: \(plan.revision)",
+                    "- Current plan digest: `\(plan.digest)`",
                     "- Runtime target: \(plan.resolvedTarget.displayName)",
                     "- Adapter: `\(plan.executionAdapter)`",
                     "- Comparison: `\(plan.comparisonMode)`",
+                    "- Preserved plan revisions: \(record.plans.map { String($0.revision) }.joined(separator: ", "))",
                     "",
                     "## Pilot limitations"
                 ]
                 lines += plan.limitations.map { "- \($0)" }
             }
-            lines += ["", "## Attempts"]
+            lines += ["", "## Attempts by immutable plan revision"]
             if record.attempts.isEmpty {
                 lines.append("No attempts have been admitted.")
             } else {
-                for attempt in record.attempts.sorted(by: { $0.ordinal < $1.ordinal }) {
-                    var line = "- \(attempt.ordinal). \(attempt.condition.displayName) r\(attempt.repetition): `\(attempt.status.rawValue)` — \(attempt.statusText)"
+                for attempt in record.attempts.sorted(by: {
+                    ($0.planRevision ?? 0, $0.ordinal) < ($1.planRevision ?? 0, $1.ordinal)
+                }) {
+                    var line = "- revision \(attempt.planRevision.map(String.init) ?? "legacy") / \(attempt.ordinal). \(attempt.condition.displayName) r\(attempt.repetition): `\(attempt.status.rawValue)` — \(attempt.statusText)"
                     if let evidence = attempt.evidence {
                         line += " — evidence `../../\(evidence.relativePath)`"
                     }
@@ -243,9 +292,14 @@
         }
 
         private func resultsCSV(_ record: PromptExperimentRecord) -> String {
-            var rows = ["ordinal,condition,repetition,status,tab_id,run_id,evidence_sha256,error"]
-            rows += record.attempts.sorted(by: { $0.ordinal < $1.ordinal }).map { attempt in
+            var rows = ["plan_revision,plan_id,plan_digest,ordinal,condition,repetition,status,tab_id,run_id,evidence_sha256,error"]
+            rows += record.attempts.sorted(by: {
+                ($0.planRevision ?? 0, $0.ordinal) < ($1.planRevision ?? 0, $1.ordinal)
+            }).map { attempt in
                 [
+                    attempt.planRevision.map(String.init) ?? "",
+                    attempt.planID?.uuidString ?? "",
+                    attempt.planDigest ?? "",
                     String(attempt.ordinal),
                     attempt.condition.rawValue,
                     String(attempt.repetition),

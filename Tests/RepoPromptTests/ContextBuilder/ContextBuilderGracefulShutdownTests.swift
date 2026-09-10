@@ -376,7 +376,7 @@ final class ContextBuilderGracefulShutdownTests: XCTestCase {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
-        return WindowState(contextBuilderProviderFactory: { _, _, _ in
+        return WindowState(contextBuilderProviderFactory: { _, _, _, _ in
             UnsupportedHeadlessAgentProvider(reason: "Unused by synthetic lifecycle tests")
         })
     }

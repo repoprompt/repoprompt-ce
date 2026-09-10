@@ -251,7 +251,8 @@ final class AgentRuntimeProviderService {
         for agent: AgentProviderKind,
         modelString: String? = nil,
         runType: AgentRunType = .discover,
-        workspacePath: String? = nil
+        workspacePath: String? = nil,
+        codexRunConstraints: CodexExecRunConstraints? = nil
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
@@ -287,7 +288,8 @@ final class AgentRuntimeProviderService {
             let config = CodexExecAgentConfig(
                 modelString: modelString,
                 enableDebugLogging: Self.enableDebugLogging,
-                fullAccess: CodexAgentToolPreferences.permissionLevel() == .fullAccess
+                fullAccess: codexRunConstraints == nil && CodexAgentToolPreferences.permissionLevel() == .fullAccess,
+                runConstraints: codexRunConstraints
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CodexExecAgentProvider")

@@ -17,11 +17,15 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
     }
 
     func buildTools() -> [Tool] {
-        [
+        var tools = [
             shareThoughtsTool(),
             setStatusTool(),
             waitForNextInstructionTool()
         ]
+        #if DEBUG
+            tools.append(promptExperimentTool())
+        #endif
+        return tools
     }
 
     private func shareThoughtsTool() -> Tool {
@@ -125,6 +129,206 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             try await Self.executeWaitForNextInstruction(args: args, dependencies: dependencies)
         }
     }
+
+    #if DEBUG
+        private func promptExperimentTool() -> Tool {
+            runtime.tool(
+                name: MCPWindowToolName.promptExperiment,
+                freshnessPolicy: .none,
+                description: """
+                Create and revise a native Prompt Experiment draft owned by this Agent session.
+
+                Start with `op=capabilities`. Supported mutations are bounded draft creation/update,
+                sealing a proposal for native review, and proposing the next revision after settlement.
+                This tool cannot approve, start, cancel, score, or promote an experiment. The user must
+                approve the exact sealed digest and press Run in Prompt Experiment Studio.
+                """,
+                annotations: .repoPromptLocalEphemeralState,
+                inputSchema: .object(
+                    properties: [
+                        "op": .string(description: "capabilities | list | create_draft | update_draft | propose_seal | read | propose_next_revision"),
+                        "experiment_id": .string(description: "Experiment UUID for record operations."),
+                        "expected_draft_id": .string(description: "Exact draft UUID returned by create/read/update."),
+                        "expected_draft_version": .integer(description: "Exact optimistic draft version returned by create/read/update."),
+                        "expected_draft_digest": .string(description: "Exact draft digest returned by create/read/update."),
+                        "expected_plan_digest": .string(description: "Exact current sealed plan digest for proposing a next revision."),
+                        "title": .string(description: "Optional draft title replacement."),
+                        "task_input": .string(description: "Optional fixed task replacement."),
+                        "synthetic_fixture": .string(description: "Optional synthetic fixture replacement. Loaded workspace content is unsupported."),
+                        "original_instructions": .string(description: "Optional original instructions replacement."),
+                        "candidate_instructions": .string(description: "Optional candidate instructions replacement."),
+                        "target_role": .string(description: "Optional catalog task-role label, such as explore."),
+                        "repetitions": .integer(description: "Optional repetitions per condition, 1 through 3.")
+                    ],
+                    required: ["op"]
+                )
+            ) { [dependencies] _, args in
+                try await Self.executePromptExperiment(args: args, dependencies: dependencies)
+            }
+        }
+
+        private static func executePromptExperiment(
+            args: [String: Value],
+            dependencies: MCPAppPhysicalCapabilityAdapters.Execution
+        ) async throws -> Value {
+            guard let rawOperation = args["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  let operation = PromptExperimentAgentOperation(rawValue: rawOperation)
+            else {
+                throw MCPError.invalidParams("Unsupported Prompt Experiment operation. Call op=capabilities for the bounded schema; approval and run operations do not exist.")
+            }
+            let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.promptExperiment)
+            let targetWindow = try dependencies.requireTargetWindow()
+            let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .promptExperiment)
+            guard let identity = target.identity,
+                  let sessionID = identity.sessionID,
+                  identity.persistentBindingGeneration != nil
+            else {
+                throw MCPError.invalidParams("prompt_experiment requires a durably bound Agent session identity.")
+            }
+            try targetWindow.agentModeViewModel.validatePromptExperimentTarget(target)
+
+            let service = PromptExperimentService.live(windowState: targetWindow)
+            await service.load()
+            try targetWindow.agentModeViewModel.validatePromptExperimentTarget(target)
+            let owner = PromptExperimentAgentOwner(controllerSessionID: sessionID, sourceTabID: target.tabID)
+            let interface = PromptExperimentAgentInterface(service: service)
+            let command: PromptExperimentAgentCommand = switch operation {
+            case .capabilities:
+                .capabilities
+            case .list:
+                .list
+            case .createDraft:
+                .createDraft
+            case .updateDraft:
+                try .updateDraft(
+                    experimentID: requiredUUID("experiment_id", args: args),
+                    expectedDraftID: requiredUUID("expected_draft_id", args: args),
+                    expectedDraftVersion: requiredInt("expected_draft_version", args: args),
+                    expectedDraftDigest: requiredString("expected_draft_digest", args: args),
+                    patch: PromptExperimentAgentDraftPatch(
+                        title: args["title"]?.stringValue,
+                        taskInput: args["task_input"]?.stringValue,
+                        syntheticFixture: args["synthetic_fixture"]?.stringValue,
+                        originalInstructions: args["original_instructions"]?.stringValue,
+                        candidateInstructions: args["candidate_instructions"]?.stringValue,
+                        targetRole: args["target_role"]?.stringValue,
+                        repetitions: args["repetitions"]?.intValue
+                    )
+                )
+            case .proposeSeal:
+                try .proposeSeal(
+                    experimentID: requiredUUID("experiment_id", args: args),
+                    expectedDraftID: requiredUUID("expected_draft_id", args: args),
+                    expectedDraftVersion: requiredInt("expected_draft_version", args: args),
+                    expectedDraftDigest: requiredString("expected_draft_digest", args: args)
+                )
+            case .read:
+                try .read(experimentID: requiredUUID("experiment_id", args: args))
+            case .proposeNextRevision:
+                try .proposeNextRevision(
+                    experimentID: requiredUUID("experiment_id", args: args),
+                    expectedPlanDigest: requiredString("expected_plan_digest", args: args)
+                )
+            }
+            return try await responseValue(interface.execute(command, owner: owner))
+        }
+
+        private static func requiredString(_ key: String, args: [String: Value]) throws -> String {
+            guard let value = args[key]?.stringValue, !value.isEmpty else {
+                throw MCPError.invalidParams("\(key) is required")
+            }
+            return value
+        }
+
+        private static func requiredUUID(_ key: String, args: [String: Value]) throws -> UUID {
+            let raw = try requiredString(key, args: args)
+            guard let value = UUID(uuidString: raw) else { throw MCPError.invalidParams("\(key) must be a UUID") }
+            return value
+        }
+
+        private static func requiredInt(_ key: String, args: [String: Value]) throws -> Int {
+            guard let value = args[key]?.intValue else { throw MCPError.invalidParams("\(key) is required") }
+            return value
+        }
+
+        private static func responseValue(_ response: PromptExperimentAgentResponse) throws -> Value {
+            switch response {
+            case let .capabilities(operations, limitations):
+                .object([
+                    "operations": .array(operations.map(Value.string)),
+                    "limitations": .array(limitations.map(Value.string)),
+                    "native_approval_required": .bool(true)
+                ])
+            case let .records(records):
+                try .object(["experiments": .array(records.map(recordValue))])
+            case let .record(record):
+                try recordValue(record)
+            case let .draft(experimentID, draft):
+                try .object([
+                    "experiment_id": .string(experimentID.uuidString),
+                    "draft": draftValue(draft),
+                    "next_action": .string("Use update_draft with the exact ID/version/digest, then propose_seal. The user approves only in the native Studio.")
+                ])
+            case let .sealed(experimentID, plan):
+                .object([
+                    "experiment_id": .string(experimentID.uuidString),
+                    "phase": .string(PromptExperimentPhase.awaitingApproval.rawValue),
+                    "plan_revision": .int(plan.revision),
+                    "plan_digest": .string(plan.digest),
+                    "native_action_required": .string("Ask the user to review and approve this exact digest in Prompt Experiment Studio. This tool cannot approve or run it.")
+                ])
+            }
+        }
+
+        private static func draftValue(_ draft: PromptExperimentDraft) throws -> Value {
+            try .object([
+                "id": .string(draft.id.uuidString),
+                "revision": .int(draft.revision),
+                "version": .int(draft.optimisticVersion),
+                "digest": .string(draft.contentDigest()),
+                "title": .string(draft.title),
+                "task_input": .string(draft.taskInput),
+                "synthetic_fixture": .string(draft.syntheticFixture),
+                "original_instructions": .string(draft.originalInstructions),
+                "candidate_instructions": .string(draft.candidateInstructions),
+                "target_role": .string(draft.targetRole),
+                "repetitions": .int(draft.repetitions)
+            ])
+        }
+
+        private static func recordValue(_ record: PromptExperimentRecord) throws -> Value {
+            var value: [String: Value] = [
+                "experiment_id": .string(record.id.uuidString),
+                "phase": .string(record.phase.rawValue),
+                "status": .string(record.statusMessage),
+                "plan_revisions": .array(record.plans.map { .int($0.revision) }),
+                "attempts": .array(record.attempts.map { attempt in
+                    .object([
+                        "id": .string(attempt.id.uuidString),
+                        "plan_revision": attempt.planRevision.map(Value.int) ?? .null,
+                        "plan_digest": attempt.planDigest.map(Value.string) ?? .null,
+                        "condition": .string(attempt.condition.rawValue),
+                        "ordinal": .int(attempt.ordinal),
+                        "status": .string(attempt.status.rawValue),
+                        "output_preview": attempt.outputPreview.map(Value.string) ?? .null,
+                        "error": attempt.error.map(Value.string) ?? .null
+                    ])
+                })
+            ]
+            value["draft"] = try record.draft.map(draftValue) ?? .null
+            if let plan = record.currentPlan {
+                value["current_plan"] = .object([
+                    "id": .string(plan.id.uuidString),
+                    "revision": .int(plan.revision),
+                    "digest": .string(plan.digest),
+                    "approved": .bool(record.approval(for: plan) != nil)
+                ])
+            } else {
+                value["current_plan"] = .null
+            }
+            return .object(value)
+        }
+    #endif
 
     private static func executeShareThoughts(
         args: [String: Value],

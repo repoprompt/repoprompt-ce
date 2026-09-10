@@ -33,21 +33,30 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         )
         let canonicalNames = MCPDomainCanonicalToolDefinitions.definitions.map(\.name)
         XCTAssertEqual(canonicalNames, MCPDomainToolCatalog.orderedToolNames)
-        XCTAssertEqual(canonicalNames.count, 28)
-        XCTAssertEqual(Set(canonicalNames).count, 28)
+        XCTAssertEqual(canonicalNames.count, MCPDomainToolCatalog.orderedToolNames.count)
+        XCTAssertEqual(Set(canonicalNames).count, MCPDomainToolCatalog.orderedToolNames.count)
 
         for name in MCPGlobalToolName.orderedToolNames {
             let resolution = await runtime.toolRegistry.resolve(toolName: name, scope: .application)
             XCTAssertEqual(try XCTUnwrap(resolution).binding.definition.name, name)
         }
-        for name in MCPWindowToolName.orderedToolNames {
+        for name in MCPDomainToolCatalog.standaloneToolNames {
             let resolution = await runtime.toolRegistry.resolve(toolName: name, scope: .standalone(id: scopeID))
             XCTAssertEqual(try XCTUnwrap(resolution).binding.definition.name, name)
         }
+        #if DEBUG
+            let appOnlyResolution = await runtime.toolRegistry.resolve(
+                toolName: MCPWindowToolName.promptExperiment,
+                scope: .standalone(id: scopeID)
+            )
+            XCTAssertNil(appOnlyResolution)
+            XCTAssertFalse(try XCTUnwrap(MCPDomainToolCatalog.entry(named: MCPWindowToolName.promptExperiment)).supportsStandalone)
+        #endif
 
         let snapshot = await runtime.toolRegistry.snapshot()
-        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 28)
-        XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(canonicalNames))
+        let installedNames = MCPGlobalToolName.orderedToolNames + MCPDomainToolCatalog.standaloneToolNames
+        XCTAssertEqual(snapshot.fingerprintsByToolName.count, installedNames.count)
+        XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(installedNames))
 
         let protectedCandidate = await runtime.toolRegistry.resolve(
             toolName: MCPWindowToolName.manageSelection,

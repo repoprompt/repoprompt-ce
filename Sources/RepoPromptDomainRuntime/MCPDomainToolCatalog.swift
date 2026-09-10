@@ -36,6 +36,9 @@ package enum MCPWindowToolName {
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
     package static let waitForNextInstruction = "wait_for_next_user_instruction"
+    #if DEBUG
+        package static let promptExperiment = "prompt_experiment"
+    #endif
 
     package static var orderedToolNames: [String] {
         MCPDomainToolCatalog.windowToolNames
@@ -203,6 +206,7 @@ package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
         self.capability = capability
         self.admissionClass = admissionClass
         operationPolicy = nil
+        supportsStandalone = true
     }
 
     fileprivate init(
@@ -210,19 +214,25 @@ package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
         scope: MCPDomainToolScopeKind,
         capability: MCPToolCapability,
         admissionClass: MCPToolAdmissionClass,
-        operationPolicy: MCPDomainToolOperationPolicy
+        operationPolicy: MCPDomainToolOperationPolicy,
+        supportsStandalone: Bool = true
     ) {
         self.name = name
         self.scope = scope
         self.capability = capability
         self.admissionClass = admissionClass
         self.operationPolicy = operationPolicy
+        self.supportsStandalone = supportsStandalone
     }
+
+    package let supportsStandalone: Bool
 
     package func supports(registrationScope: MCPDomainToolRegistrationScope) -> Bool {
         switch (scope, registrationScope) {
-        case (.application, .application), (.window, .window), (.window, .standalone):
+        case (.application, .application), (.window, .window):
             true
+        case (.window, .standalone):
+            supportsStandalone
         default:
             false
         }
@@ -230,7 +240,7 @@ package struct MCPDomainToolCatalogEntry: Hashable, Sendable {
 }
 
 package enum MCPDomainToolCatalog {
-    package static let entries: [MCPDomainToolCatalogEntry] = [
+    private static let baseEntries: [MCPDomainToolCatalogEntry] = [
         .init(name: MCPGlobalToolName.appSettings, scope: .application, capability: .appSettings, admissionClass: .exclusive, operationPolicy: .init(
             operations: ["list", "get", "set", "options"],
             normalization: .trimmedLowercased
@@ -319,9 +329,32 @@ package enum MCPDomainToolCatalog {
         ))
     ]
 
+    package static let entries: [MCPDomainToolCatalogEntry] = {
+        var entries = baseEntries
+        #if DEBUG
+            let promptExperiment = MCPDomainToolCatalogEntry(
+                name: MCPWindowToolName.promptExperiment,
+                scope: .window,
+                capability: .agentReasoningControl,
+                admissionClass: .control,
+                operationPolicy: .init(
+                    operations: ["capabilities", "list", "create_draft", "update_draft", "propose_seal", "read", "propose_next_revision"],
+                    normalization: .trimmedLowercased
+                ),
+                supportsStandalone: false
+            )
+            let historyIndex = entries.firstIndex { $0.name == MCPWindowToolName.history } ?? entries.endIndex
+            entries.insert(promptExperiment, at: historyIndex)
+        #endif
+        return entries
+    }()
+
     package static let orderedToolNames = entries.map(\.name)
     package static let globalToolNames = entries.filter { $0.scope == .application }.map(\.name)
     package static let windowToolNames = entries.filter { $0.scope == .window }.map(\.name)
+    package static let standaloneToolNames = entries.filter {
+        $0.scope == .window && $0.supportsStandalone
+    }.map(\.name)
     package static let classifications = Dictionary(uniqueKeysWithValues: entries.map { ($0.name, $0.admissionClass) })
 
     private static let entriesByName = Dictionary(uniqueKeysWithValues: entries.map { ($0.name, $0) })

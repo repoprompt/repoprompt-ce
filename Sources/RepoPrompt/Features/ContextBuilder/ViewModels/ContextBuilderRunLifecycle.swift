@@ -190,6 +190,29 @@ struct ContextBuilderMCPRunConfiguration {
     let planningModelRaw: String?
     let agentModelsProfile: AgentModelsSettingsProfile
     let isSystemWorkspace: Bool
+    let codexRunConstraints: CodexExecRunConstraints?
+
+    init(
+        identity: WorkspaceSelectionIdentity,
+        nestedTabContext: MCPServerViewModel.TabContextSnapshot,
+        providerWorkspacePath: String,
+        runBehavior: ContextBuilderRunBehavior,
+        responseType: String?,
+        planningModelRaw: String?,
+        agentModelsProfile: AgentModelsSettingsProfile,
+        isSystemWorkspace: Bool,
+        codexRunConstraints: CodexExecRunConstraints? = nil
+    ) {
+        self.identity = identity
+        self.nestedTabContext = nestedTabContext
+        self.providerWorkspacePath = providerWorkspacePath
+        self.runBehavior = runBehavior
+        self.responseType = responseType
+        self.planningModelRaw = planningModelRaw
+        self.agentModelsProfile = agentModelsProfile
+        self.isSystemWorkspace = isSystemWorkspace
+        self.codexRunConstraints = codexRunConstraints
+    }
 
     var effectiveTokenBudget: Int {
         runBehavior.tokenBudget

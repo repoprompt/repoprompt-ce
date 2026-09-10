@@ -51,6 +51,9 @@
     enum PromptExperimentAuthorityError: LocalizedError, Equatable {
         case experimentNotFound
         case staleDraft
+        case draftDigestMismatch
+        case illegalPhase(String)
+        case ownerMismatch
         case noDraft
         case noSealedPlan
         case digestMismatch
@@ -68,6 +71,12 @@
                 "The Prompt Experiment no longer exists."
             case .staleDraft:
                 "The draft changed before this operation completed. Reload it and try again."
+            case .draftDigestMismatch:
+                "The draft content digest changed before this operation completed. Reload it and try again."
+            case let .illegalPhase(message):
+                message
+            case .ownerMismatch:
+                "The experiment does not belong to the calling Agent session."
             case .noDraft:
                 "There is no editable draft to seal."
             case .noSealedPlan:
@@ -88,9 +97,30 @@
     }
 
     struct PromptExperimentDraft: Codable, Equatable, Identifiable {
+        private struct DigestPayload: Codable {
+            let id: UUID
+            let revision: Int
+            let parentPlanID: UUID?
+            let title: String
+            let taskInput: String
+            let syntheticFixture: String
+            let originalInstructions: String
+            let candidateInstructions: String
+            let targetRole: String
+            let repetitions: Int
+            let createdAt: Date
+        }
+
+        static let maximumTitleCharacters = 200
+        static let maximumTaskCharacters = 20000
+        static let maximumFixtureBytes = 256 * 1024
+        static let maximumInstructionCharacters = 50000
+
         let id: UUID
         let revision: Int
         let parentPlanID: UUID?
+        /// Optional for backward-compatible decoding of the original DEBUG pilot document.
+        var version: Int?
         var title: String
         var taskInput: String
         var syntheticFixture: String
@@ -105,6 +135,7 @@
             id: UUID = UUID(),
             revision: Int,
             parentPlanID: UUID? = nil,
+            version: Int = 1,
             title: String,
             taskInput: String = "",
             syntheticFixture: String = "",
@@ -118,6 +149,7 @@
             self.id = id
             self.revision = revision
             self.parentPlanID = parentPlanID
+            self.version = version
             self.title = title
             self.taskInput = taskInput
             self.syntheticFixture = syntheticFixture
@@ -129,7 +161,46 @@
             self.updatedAt = updatedAt
         }
 
+        var optimisticVersion: Int {
+            version ?? 1
+        }
+
+        func contentDigest() throws -> String {
+            try PromptExperimentDigest.canonicalSHA256(DigestPayload(
+                id: id,
+                revision: revision,
+                parentPlanID: parentPlanID,
+                title: title,
+                taskInput: taskInput,
+                syntheticFixture: syntheticFixture,
+                originalInstructions: originalInstructions,
+                candidateInstructions: candidateInstructions,
+                targetRole: targetRole,
+                repetitions: repetitions,
+                createdAt: createdAt
+            ))
+        }
+
+        func validatedBounds() throws -> Self {
+            guard title.count <= Self.maximumTitleCharacters else {
+                throw PromptExperimentAuthorityError.invalidDraft("Experiment titles are limited to \(Self.maximumTitleCharacters) characters.")
+            }
+            guard taskInput.count <= Self.maximumTaskCharacters else {
+                throw PromptExperimentAuthorityError.invalidDraft("Evaluation tasks are limited to \(Self.maximumTaskCharacters) characters.")
+            }
+            guard Data(syntheticFixture.utf8).count <= Self.maximumFixtureBytes else {
+                throw PromptExperimentAuthorityError.invalidDraft("Synthetic fixtures are limited to \(Self.maximumFixtureBytes) UTF-8 bytes.")
+            }
+            guard originalInstructions.count <= Self.maximumInstructionCharacters,
+                  candidateInstructions.count <= Self.maximumInstructionCharacters
+            else {
+                throw PromptExperimentAuthorityError.invalidDraft("Each instruction variant is limited to \(Self.maximumInstructionCharacters) characters.")
+            }
+            return self
+        }
+
         func validated() throws -> Self {
+            _ = try validatedBounds()
             let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedTask = taskInput.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedFixture = syntheticFixture.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -278,7 +349,7 @@
                     "Single-stage Context Builder pilot; it does not execute the Investigate workflow or multi-agent handoffs.",
                     "Fixed original/candidate comparison only; there is no optimizer, GEPA attachment, semantic judge, or automatic promotion.",
                     "Runs use an app-owned synthetic fixture as the provider working directory and run-scoped lookup authority. Loaded-workspace experiments are unsupported.",
-                    "The pilot supports catalog-resolved Claude-compatible discovery targets only; Codex and ACP targets fail closed until exact-model sandbox authority is available.",
+                    "The pilot supports catalog-resolved Claude-compatible and Codex login-backed discovery targets. ACP and other target families remain unsupported.",
                     "The synthetic fixture digest is verified before and after each trial; a mismatch disqualifies the attempt.",
                     "Subscription-backed provider cost is not represented as a hard currency budget."
                 ]
@@ -361,6 +432,9 @@
     struct PromptExperimentAttempt: Codable, Equatable, Identifiable {
         let id: UUID
         let trialID: UUID
+        var planID: UUID?
+        var planRevision: Int?
+        var planDigest: String?
         let ordinal: Int
         let condition: PromptExperimentCondition
         let repetition: Int
@@ -377,9 +451,12 @@
         var fixtureDigestBefore: String?
         var fixtureDigestAfter: String?
 
-        init(trial: PromptExperimentTrial) {
+        init(trial: PromptExperimentTrial, plan: PromptExperimentPlan) {
             id = PromptExperimentDigest.deterministicUUID(namespace: "attempt", value: trial.id.uuidString)
             trialID = trial.id
+            planID = plan.id
+            planRevision = plan.revision
+            planDigest = plan.digest
             ordinal = trial.ordinal
             condition = trial.condition
             repetition = trial.repetition
@@ -422,6 +499,40 @@
 
         func approval(for plan: PromptExperimentPlan) -> PromptExperimentApproval? {
             approvals.last { $0.planID == plan.id && $0.planDigest == plan.digest && $0.source == .nativeUI }
+        }
+
+        func attempts(for plan: PromptExperimentPlan) -> [PromptExperimentAttempt] {
+            attempts.filter { $0.planID == plan.id && $0.planDigest == plan.digest }
+        }
+
+        func plan(for attempt: PromptExperimentAttempt) -> PromptExperimentPlan? {
+            guard let planID = attempt.planID else { return nil }
+            return plans.first { $0.id == planID }
+        }
+
+        /// Migrates evidence written by the earliest DEBUG pilot, before attempts carried
+        /// explicit plan lineage. A match must be unique; ambiguous evidence remains visible
+        /// but unassigned rather than being attached to the wrong immutable plan.
+        mutating func migrateLegacyAttemptLineage() -> Bool {
+            var changed = false
+            for index in attempts.indices where attempts[index].planID == nil
+                || attempts[index].planRevision == nil
+                || attempts[index].planDigest == nil
+            {
+                let attempt = attempts[index]
+                let candidates = plans.filter { plan in
+                    (attempt.planID == nil || attempt.planID == plan.id)
+                        && (attempt.planRevision == nil || attempt.planRevision == plan.revision)
+                        && (attempt.planDigest == nil || attempt.planDigest == plan.digest)
+                        && plan.trials.contains { $0.id == attempt.trialID }
+                }
+                guard candidates.count == 1, let plan = candidates.first else { continue }
+                attempts[index].planID = plan.id
+                attempts[index].planRevision = plan.revision
+                attempts[index].planDigest = plan.digest
+                changed = true
+            }
+            return changed
         }
     }
 

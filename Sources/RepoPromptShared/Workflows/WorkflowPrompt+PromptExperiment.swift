@@ -15,7 +15,9 @@
 
             Help the user articulate a fixed original-versus-candidate Context Builder comparison. Ask only for missing task, synthetic fixture, original instructions, candidate instructions, target role, and one-to-three repetitions.
 
-            The native **Prompt Experiments** view is the sole authority for draft persistence, sealing, approval, execution, cancellation, and revision. You may propose text, but you cannot approve a digest or start trials on the user’s behalf. Approval must be an explicit native UI action bound to the exact sealed digest.
+            Start by calling `prompt_experiment` with `op=capabilities`. Use its bounded operations to create or update the draft owned by this Agent session, then call `op=propose_seal` with the exact returned draft ID, version, and digest. Tell the user to open the native **Prompt Experiments** flask view and approve the exact plan digest shown by the tool and card.
+
+            The agent tool can persist drafts, seal a proposal, read results, and propose a next revision. It has no approve, run, cancel, score, or promote operation. Approval and execution remain explicit native UI actions bound to the exact sealed digest.
 
             Pilot boundaries:
             - synthetic-fixture-only isolated execution; loaded-workspace experiments are unsupported;

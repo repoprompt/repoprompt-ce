@@ -21,6 +21,18 @@
                     if let loadError = service.loadError {
                         Label(loadError, systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.red)
+                    } else if !service.isLoaded {
+                        ProgressView("Loading durable experiments…")
+                    }
+                    if let projectionError = service.projectionError {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label(projectionError, systemImage: "doc.badge.gearshape")
+                                .foregroundStyle(.orange)
+                            Button("Rebuild readable views") {
+                                Task { try? await service.rebuildReadableViews() }
+                            }
+                            .font(.caption)
+                        }
                     }
                     ForEach(linkedRecords) { record in
                         VStack(alignment: .leading, spacing: 3) {
@@ -38,7 +50,7 @@
                         } label: {
                             Label("New Experiment", systemImage: "plus")
                         }
-                        .disabled(controllerSessionID == nil || sourceTabID == nil || service.loadError != nil)
+                        .disabled(controllerSessionID == nil || sourceTabID == nil || !service.isLoaded || service.loadError != nil)
                     }
                 }
             } detail: {
@@ -123,6 +135,7 @@
                     }
                     if let plan = record.currentPlan {
                         planPanel(plan)
+                        revisionHistoryPanel(currentPlan: plan)
                         controls(plan)
                     }
                     attemptsPanel
@@ -177,6 +190,28 @@
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 4)
+            }
+        }
+
+        @ViewBuilder
+        private func revisionHistoryPanel(currentPlan: PromptExperimentPlan) -> some View {
+            let priorPlans = record.plans.filter { $0.id != currentPlan.id }
+            if !priorPlans.isEmpty {
+                GroupBox("Prior immutable revisions") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(priorPlans) { plan in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Revision \(plan.revision) · \(plan.trials.count) trials")
+                                    .font(.subheadline.bold())
+                                Text(plan.digest)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+                }
             }
         }
 
@@ -239,10 +274,13 @@
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
                     VStack(spacing: 0) {
-                        ForEach(record.attempts.sorted(by: { $0.ordinal < $1.ordinal })) { attempt in
+                        let sortedAttempts = record.attempts.sorted {
+                            ($0.planRevision ?? 0, $0.ordinal) < ($1.planRevision ?? 0, $1.ordinal)
+                        }
+                        ForEach(sortedAttempts) { attempt in
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack {
-                                    Text("\(attempt.ordinal). \(attempt.condition.displayName) · repetition \(attempt.repetition)")
+                                    Text("Revision \(attempt.planRevision ?? 0) · \(attempt.ordinal). \(attempt.condition.displayName) · repetition \(attempt.repetition)")
                                         .font(.headline)
                                     Spacer()
                                     Text(attempt.status.rawValue).font(.caption.monospaced())
@@ -267,7 +305,7 @@
                                 }
                             }
                             .padding(.vertical, 10)
-                            if attempt.id != record.attempts.sorted(by: { $0.ordinal < $1.ordinal }).last?.id {
+                            if attempt.id != sortedAttempts.last?.id {
                                 Divider()
                             }
                         }
@@ -288,6 +326,9 @@
         let experimentID: UUID
         @Binding var errorMessage: String?
         @State private var draft: PromptExperimentDraft
+        @State private var baseDraftID: UUID
+        @State private var baseDraftVersion: Int
+        @State private var baseDraftDigest: String
 
         init(
             service: PromptExperimentService,
@@ -298,6 +339,9 @@
             self.service = service
             self.experimentID = experimentID
             _draft = State(initialValue: draft)
+            _baseDraftID = State(initialValue: draft.id)
+            _baseDraftVersion = State(initialValue: draft.optimisticVersion)
+            _baseDraftDigest = State(initialValue: (try? draft.contentDigest()) ?? "")
             _errorMessage = errorMessage
         }
 
@@ -348,11 +392,14 @@
         private func save() {
             Task {
                 do {
-                    try await service.updateDraft(
+                    let updated = try await service.updateDraft(
                         experimentID: experimentID,
-                        expectedRevision: draft.revision,
+                        expectedDraftID: baseDraftID,
+                        expectedDraftVersion: baseDraftVersion,
+                        expectedDraftDigest: baseDraftDigest,
                         draft: draft
                     )
+                    adopt(updated)
                 } catch { errorMessage = error.localizedDescription }
             }
         }
@@ -360,14 +407,29 @@
         private func seal() {
             Task {
                 do {
-                    try await service.updateDraft(
+                    let updated = try await service.updateDraft(
                         experimentID: experimentID,
-                        expectedRevision: draft.revision,
+                        expectedDraftID: baseDraftID,
+                        expectedDraftVersion: baseDraftVersion,
+                        expectedDraftDigest: baseDraftDigest,
                         draft: draft
                     )
-                    _ = try await service.seal(experimentID: experimentID, expectedDraftRevision: draft.revision)
+                    adopt(updated)
+                    _ = try await service.seal(
+                        experimentID: experimentID,
+                        expectedDraftID: updated.id,
+                        expectedDraftVersion: updated.optimisticVersion,
+                        expectedDraftDigest: updated.contentDigest()
+                    )
                 } catch { errorMessage = error.localizedDescription }
             }
+        }
+
+        private func adopt(_ updated: PromptExperimentDraft) {
+            draft = updated
+            baseDraftID = updated.id
+            baseDraftVersion = updated.optimisticVersion
+            baseDraftDigest = (try? updated.contentDigest()) ?? ""
         }
     }
 #endif

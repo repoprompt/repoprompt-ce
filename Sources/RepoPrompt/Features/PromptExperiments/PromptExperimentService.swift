@@ -31,6 +31,8 @@
 
         @Published private(set) var records: [PromptExperimentRecord] = []
         @Published private(set) var loadError: String?
+        @Published private(set) var projectionError: String?
+        @Published private(set) var isLoaded = false
 
         private let store: PromptExperimentStore
         private var runtime: PromptExperimentRuntime
@@ -39,7 +41,7 @@
         private var executionTasks: [UUID: Task<Void, Never>] = [:]
         private var admittedExperimentIDs: Set<UUID> = []
         private var activeHandles: [UUID: PromptExperimentRuntimeHandle] = [:]
-        private var hasLoaded = false
+        private var loadTask: Task<Void, Never>?
 
         init(
             store: PromptExperimentStore,
@@ -59,13 +61,27 @@
         }
 
         func load() async {
-            guard !hasLoaded else { return }
-            hasLoaded = true
+            if let loadTask {
+                await loadTask.value
+                return
+            }
+            let task = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await performInitialLoad()
+            }
+            loadTask = task
+            await task.value
+        }
+
+        private func performInitialLoad() async {
             do {
                 var loaded = try await store.loadRecords()
                 let recoveryDate = now()
                 var changed = false
                 for index in loaded.indices {
+                    if loaded[index].migrateLegacyAttemptLineage() {
+                        changed = true
+                    }
                     guard loaded[index].phase == .running || loaded[index].phase == .cancelling else { continue }
                     changed = true
                     for attemptIndex in loaded[index].attempts.indices {
@@ -88,18 +104,31 @@
                 }
                 records = loaded.sorted { $0.updatedAt > $1.updatedAt }
                 loadError = nil
-                if changed { try await persist() }
+                isLoaded = true
+                if changed {
+                    try await persist()
+                } else {
+                    projectionError = await store.rebuildReadableViews(records).message
+                }
             } catch {
                 records = []
+                isLoaded = false
                 loadError = error.localizedDescription
+            }
+        }
+
+        private func requireLoaded() async throws {
+            await load()
+            guard isLoaded, loadError == nil else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable(
+                    loadError ?? "Prompt Experiment storage has not finished loading."
+                )
             }
         }
 
         @discardableResult
         func createExperiment(controllerSessionID: UUID, sourceTabID: UUID) async throws -> UUID {
-            guard loadError == nil else {
-                throw PromptExperimentAuthorityError.runtimeUnavailable(loadError ?? "Prompt Experiment storage is unavailable.")
-            }
+            try await requireLoaded()
             let date = now()
             let experimentID = UUID()
             let draft = PromptExperimentDraft(
@@ -126,25 +155,63 @@
             return experimentID
         }
 
-        func updateDraft(experimentID: UUID, expectedRevision: Int, draft: PromptExperimentDraft) async throws {
+        @discardableResult
+        func updateDraft(
+            experimentID: UUID,
+            expectedDraftID: UUID,
+            expectedDraftVersion: Int,
+            expectedDraftDigest: String,
+            draft: PromptExperimentDraft,
+            expectedControllerSessionID: UUID? = nil
+        ) async throws -> PromptExperimentDraft {
+            try await requireLoaded()
             let index = try index(of: experimentID)
-            guard records[index].draft?.revision == expectedRevision else {
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
+            guard records[index].phase == .drafting, let current = records[index].draft else {
+                throw PromptExperimentAuthorityError.illegalPhase("Only the active drafting phase can be updated.")
+            }
+            guard current.id == expectedDraftID,
+                  draft.id == current.id,
+                  draft.revision == current.revision,
+                  draft.parentPlanID == current.parentPlanID,
+                  draft.createdAt == current.createdAt,
+                  current.optimisticVersion == expectedDraftVersion
+            else {
                 throw PromptExperimentAuthorityError.staleDraft
             }
-            var draft = draft
-            draft.updatedAt = now()
-            records[index].draft = draft
-            records[index].phase = .drafting
-            records[index].updatedAt = draft.updatedAt
-            records[index].statusMessage = "Draft changed; seal again before approval."
+            guard try current.contentDigest() == expectedDraftDigest else {
+                throw PromptExperimentAuthorityError.draftDigestMismatch
+            }
+            var updated = try draft.validatedBounds()
+            updated.version = current.optimisticVersion + 1
+            updated.updatedAt = now()
+            records[index].draft = updated
+            records[index].updatedAt = updated.updatedAt
+            records[index].statusMessage = "Draft version \(updated.optimisticVersion) saved; seal again before approval."
             try await persist()
+            return updated
         }
 
         @discardableResult
-        func seal(experimentID: UUID, expectedDraftRevision: Int) async throws -> PromptExperimentPlan {
+        func seal(
+            experimentID: UUID,
+            expectedDraftID: UUID,
+            expectedDraftVersion: Int,
+            expectedDraftDigest: String,
+            expectedControllerSessionID: UUID? = nil
+        ) async throws -> PromptExperimentPlan {
+            try await requireLoaded()
             let originalIndex = try index(of: experimentID)
-            guard let draft = records[originalIndex].draft else { throw PromptExperimentAuthorityError.noDraft }
-            guard draft.revision == expectedDraftRevision else { throw PromptExperimentAuthorityError.staleDraft }
+            try requireOwner(records[originalIndex], expectedControllerSessionID: expectedControllerSessionID)
+            guard records[originalIndex].phase == .drafting,
+                  let draft = records[originalIndex].draft
+            else { throw PromptExperimentAuthorityError.noDraft }
+            guard draft.id == expectedDraftID,
+                  draft.optimisticVersion == expectedDraftVersion
+            else { throw PromptExperimentAuthorityError.staleDraft }
+            guard try draft.contentDigest() == expectedDraftDigest else {
+                throw PromptExperimentAuthorityError.draftDigestMismatch
+            }
             let validated = try draft.validated()
             guard let target = resolveTarget(validated.targetRole) else {
                 throw PromptExperimentAuthorityError.targetUnavailable(
@@ -158,7 +225,10 @@
                 fixtureText: validated.syntheticFixture
             )
             let currentIndex = try index(of: experimentID)
-            guard records[currentIndex].draft == draft else { throw PromptExperimentAuthorityError.staleDraft }
+            try requireOwner(records[currentIndex], expectedControllerSessionID: expectedControllerSessionID)
+            guard records[currentIndex].phase == .drafting,
+                  records[currentIndex].draft == draft
+            else { throw PromptExperimentAuthorityError.staleDraft }
             let environment = PromptExperimentEnvironment(
                 workspaceID: PromptExperimentDigest.deterministicUUID(
                     namespace: "environment-workspace",
@@ -179,7 +249,6 @@
             let plan = try PromptExperimentPlan.seal(draft: validated, target: target, environment: environment, at: date)
             records[currentIndex].plans.append(plan)
             records[currentIndex].draft = nil
-            records[currentIndex].attempts = []
             records[currentIndex].cancellationRequestedAt = nil
             records[currentIndex].phase = .awaitingApproval
             records[currentIndex].updatedAt = date
@@ -193,8 +262,15 @@
             displayedDigest: String,
             source: PromptExperimentApprovalActor = .nativeUI
         ) async throws {
+            try await requireLoaded()
             let index = try index(of: experimentID)
+            guard records[index].phase == .awaitingApproval else {
+                throw PromptExperimentAuthorityError.illegalPhase("Only a newly sealed plan awaiting approval can be approved.")
+            }
             guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
+            guard records[index].approval(for: plan) == nil else {
+                throw PromptExperimentAuthorityError.illegalPhase("This exact plan is already approved.")
+            }
             guard source == .nativeUI else { throw PromptExperimentAuthorityError.approvalRequiresNativeUI }
             guard displayedDigest == plan.digest, plan.verifiesIntegrity() else {
                 throw PromptExperimentAuthorityError.digestMismatch
@@ -215,15 +291,25 @@
         }
 
         func run(experimentID: UUID) async throws {
+            try await requireLoaded()
             let index = try index(of: experimentID)
+            guard !admittedExperimentIDs.contains(experimentID) else {
+                throw PromptExperimentAuthorityError.experimentAlreadyRunning
+            }
+            guard records[index].phase == .approved else {
+                throw PromptExperimentAuthorityError.illegalPhase("Only an approved, not-yet-run plan can start trials.")
+            }
             guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
             guard records[index].approval(for: plan) != nil, plan.verifiesIntegrity() else {
                 throw PromptExperimentAuthorityError.planNotApproved
             }
+            guard records[index].attempts(for: plan).isEmpty else {
+                throw PromptExperimentAuthorityError.illegalPhase("This immutable plan already has an execution history and cannot be run again.")
+            }
             guard admittedExperimentIDs.insert(experimentID).inserted else {
                 throw PromptExperimentAuthorityError.experimentAlreadyRunning
             }
-            records[index].attempts = plan.trials.map(PromptExperimentAttempt.init)
+            records[index].attempts.append(contentsOf: plan.trials.map { PromptExperimentAttempt(trial: $0, plan: plan) })
             records[index].phase = .running
             records[index].updatedAt = now()
             records[index].statusMessage = "Running fixed serial comparison (0/\(plan.trials.count))."
@@ -232,7 +318,7 @@
             } catch {
                 admittedExperimentIDs.remove(experimentID)
                 if let currentIndex = records.firstIndex(where: { $0.id == experimentID }) {
-                    records[currentIndex].attempts = []
+                    records[currentIndex].attempts.removeAll { $0.planID == plan.id }
                     records[currentIndex].phase = .approved
                 }
                 throw error
@@ -243,6 +329,7 @@
         }
 
         func cancel(experimentID: UUID) async throws {
+            try await requireLoaded()
             let index = try index(of: experimentID)
             guard records[index].phase == .running || records[index].phase == .cancelling else { return }
             let date = now()
@@ -251,7 +338,8 @@
             records[index].updatedAt = date
             records[index].statusMessage = "Cancellation requested; waiting for provider settlement."
             var handle: PromptExperimentRuntimeHandle?
-            for attemptIndex in records[index].attempts.indices {
+            let currentPlanID = records[index].currentPlan?.id
+            for attemptIndex in records[index].attempts.indices where records[index].attempts[attemptIndex].planID == currentPlanID {
                 if records[index].attempts[attemptIndex].status == .running || records[index].attempts[attemptIndex].status == .submitting {
                     records[index].attempts[attemptIndex].status = .cancellationRequested
                     records[index].attempts[attemptIndex].statusText = "Cancellation requested; settlement pending."
@@ -271,13 +359,31 @@
             }
         }
 
-        func startNextRevision(experimentID: UUID) async throws {
-            let index = try index(of: experimentID)
-            guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
-            guard records[index].phase != .running, records[index].phase != .cancelling else {
-                throw PromptExperimentAuthorityError.experimentAlreadyRunning
+        func startNextRevision(
+            experimentID: UUID,
+            expectedPlanDigest: String? = nil,
+            expectedControllerSessionID: UUID? = nil
+        ) async throws {
+            try await requireLoaded()
+            let originalIndex = try index(of: experimentID)
+            try requireOwner(records[originalIndex], expectedControllerSessionID: expectedControllerSessionID)
+            guard [.completed, .inconclusive, .cancelled].contains(records[originalIndex].phase) else {
+                throw PromptExperimentAuthorityError.illegalPhase("A next revision can only follow a settled experiment run.")
             }
+            guard records[originalIndex].draft == nil,
+                  let plan = records[originalIndex].currentPlan
+            else { throw PromptExperimentAuthorityError.noSealedPlan }
+            if let expectedPlanDigest, expectedPlanDigest != plan.digest {
+                throw PromptExperimentAuthorityError.digestMismatch
+            }
+            let originalPhase = records[originalIndex].phase
             let fixture = try await store.readSyntheticFixture(environment: plan.environment)
+            let index = try index(of: experimentID)
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
+            guard records[index].phase == originalPhase,
+                  records[index].draft == nil,
+                  records[index].currentPlan == plan
+            else { throw PromptExperimentAuthorityError.staleDraft }
             let date = now()
             records[index].draft = PromptExperimentDraft(
                 revision: plan.revision + 1,
@@ -300,6 +406,24 @@
 
         func record(id: UUID) -> PromptExperimentRecord? {
             records.first { $0.id == id }
+        }
+
+        func ownedRecords(controllerSessionID: UUID) async throws -> [PromptExperimentRecord] {
+            try await requireLoaded()
+            return records.filter { $0.controllerSessionID == controllerSessionID }
+        }
+
+        func ownedRecord(id: UUID, controllerSessionID: UUID) async throws -> PromptExperimentRecord {
+            try await requireLoaded()
+            let record = try records[index(of: id)]
+            try requireOwner(record, expectedControllerSessionID: controllerSessionID)
+            return record
+        }
+
+        func rebuildReadableViews() async throws {
+            try await requireLoaded()
+            let report = await store.rebuildReadableViews(records)
+            projectionError = report.message
         }
 
         func recordDirectoryURL(experimentID: UUID) async throws -> URL {
@@ -452,7 +576,7 @@
                 if cancelled {
                     record.attempts[index].status = .cancelledSettled
                     record.attempts[index].statusText = "Provider settled after cancellation was requested; evidence retained but not scored."
-                } else if result.fixtureDigestBefore != record.currentPlan?.environment.fixtureDigest
+                } else if result.fixtureDigestBefore != record.plan(for: record.attempts[index])?.environment.fixtureDigest
                     || result.fixtureDigestAfter != result.fixtureDigestBefore
                 {
                     record.attempts[index].status = .failed
@@ -498,10 +622,12 @@
         private func finishExperiment(experimentID: UUID) async {
             guard loadError == nil else { return }
             try? await mutate(experimentID: experimentID) { record in
+                guard let plan = record.currentPlan else { return }
+                let currentAttempts = record.attempts(for: plan)
                 if record.cancellationRequestedAt != nil {
                     record.phase = .cancelled
                     record.statusMessage = "Cancelled. Requested and settled/unknown states remain visible per attempt."
-                } else if record.attempts.allSatisfy({ $0.status == .completed }) {
+                } else if !currentAttempts.isEmpty, currentAttempts.allSatisfy({ $0.status == .completed }) {
                     record.phase = .completed
                     record.statusMessage = "Fixed serial comparison complete. Review outputs; no automatic winner or promotion is computed."
                 } else {
@@ -535,17 +661,28 @@
             return index
         }
 
+        private func requireOwner(
+            _ record: PromptExperimentRecord,
+            expectedControllerSessionID: UUID?
+        ) throws {
+            guard let expectedControllerSessionID else { return }
+            guard record.controllerSessionID == expectedControllerSessionID else {
+                throw PromptExperimentAuthorityError.ownerMismatch
+            }
+        }
+
         private func persist() async throws {
             records.sort { $0.updatedAt > $1.updatedAt }
-            try await store.saveRecords(records)
+            let report = try await store.saveRecords(records)
+            projectionError = report.message
         }
 
         private static func liveTarget(role: String) -> PromptExperimentResolvedTarget? {
             guard let selection = AgentModelCatalog.resolveTaskLabel(role) else { return nil }
             switch selection.agent {
-            case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
                 break
-            case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
+            case .openCode, .cursor, .grokBuild, .antigravity:
                 return nil
             }
             return PromptExperimentResolvedTarget(

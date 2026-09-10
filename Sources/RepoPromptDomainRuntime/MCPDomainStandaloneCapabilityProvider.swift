@@ -194,8 +194,9 @@ package enum MCPDomainStandaloneToolInstaller {
         var rawBindings = readProvider.bindings
         rawBindings.append(contentsOf: capabilityBindings(backends: backends))
         let names = rawBindings.map(\.definition.name)
-        guard names.count == MCPDomainToolCatalog.orderedToolNames.count,
-              Set(names) == Set(MCPDomainToolCatalog.orderedToolNames),
+        let expectedNames = MCPGlobalToolName.orderedToolNames + MCPDomainToolCatalog.standaloneToolNames
+        guard names.count == expectedNames.count,
+              Set(names) == Set(expectedNames),
               Set(names).count == names.count
         else {
             throw MCPDomainToolRegistryError.emptyRegistration
@@ -208,7 +209,7 @@ package enum MCPDomainStandaloneToolInstaller {
         }
         let byName = Dictionary(uniqueKeysWithValues: decorated.map { ($0.definition.name, $0) })
         let globalBindings = MCPGlobalToolName.orderedToolNames.compactMap { byName[$0] }
-        let standaloneBindings = MCPWindowToolName.orderedToolNames.compactMap { byName[$0] }
+        let standaloneBindings = MCPDomainToolCatalog.standaloneToolNames.compactMap { byName[$0] }
 
         let globalRegistration = try await runtime.toolRegistry.register(
             registrationID: MCPDomainToolRegistrationID(),

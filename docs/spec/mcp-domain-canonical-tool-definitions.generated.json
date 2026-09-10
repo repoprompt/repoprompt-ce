@@ -1992,6 +1992,73 @@
     {
       "annotations" : {
         "destructiveHint" : false,
+        "idempotentHint" : false,
+        "openWorldHint" : false,
+        "readOnlyHint" : false
+      },
+      "description" : "Create, update, seal, and inspect a DEBUG native Prompt Experiment draft owned by the bound Agent session. This tool cannot approve or start a run.",
+      "inputSchema" : {
+        "properties" : {
+          "candidate_instructions" : {
+            "type" : "string"
+          },
+          "expected_draft_digest" : {
+            "type" : "string"
+          },
+          "expected_draft_id" : {
+            "type" : "string"
+          },
+          "expected_draft_version" : {
+            "type" : "integer"
+          },
+          "expected_plan_digest" : {
+            "type" : "string"
+          },
+          "experiment_id" : {
+            "type" : "string"
+          },
+          "op" : {
+            "enum" : [
+              "capabilities",
+              "list",
+              "create_draft",
+              "update_draft",
+              "propose_seal",
+              "read",
+              "propose_next_revision"
+            ],
+            "type" : "string"
+          },
+          "original_instructions" : {
+            "type" : "string"
+          },
+          "repetitions" : {
+            "type" : "integer"
+          },
+          "synthetic_fixture" : {
+            "type" : "string"
+          },
+          "target_role" : {
+            "type" : "string"
+          },
+          "task_input" : {
+            "type" : "string"
+          },
+          "title" : {
+            "type" : "string"
+          }
+        },
+        "required" : [
+          "op"
+        ],
+        "type" : "object"
+      },
+      "isEnabledByDefault" : true,
+      "name" : "prompt_experiment"
+    },
+    {
+      "annotations" : {
+        "destructiveHint" : false,
         "idempotentHint" : true,
         "openWorldHint" : false,
         "readOnlyHint" : true

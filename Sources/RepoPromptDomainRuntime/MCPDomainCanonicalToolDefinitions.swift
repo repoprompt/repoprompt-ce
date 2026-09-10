@@ -1107,13 +1107,59 @@ package enum MCPDomainCanonicalToolDefinitions {
         "SGludCI6ZmFsc2V9LCJpc0VuYWJsZWRCeURlZmF1bHQiOnRydWV9XQ==",
         ].joined()
         guard let data = Data(base64Encoded: encoded),
-              let definitions = try? JSONDecoder().decode([MCPDomainToolDefinition].self, from: data),
-              definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames
+              let decoded = try? JSONDecoder().decode([MCPDomainToolDefinition].self, from: data)
         else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
-        return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions).map(advertiseModelParameters)
+        var definitions = (canonicalize ? decoded.map(canonicalizeGlobalSemantics) : decoded)
+            .map(advertiseModelParameters)
+        #if DEBUG
+            let historyIndex = definitions.firstIndex { $0.name == MCPWindowToolName.history } ?? definitions.endIndex
+            definitions.insert(promptExperimentDefinition(), at: historyIndex)
+        #endif
+        guard definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames else {
+            preconditionFailure("Canonical MCP domain tool definitions do not match the tool catalog")
+        }
+        return definitions
     }
+
+    #if DEBUG
+        private static func promptExperimentDefinition() -> MCPDomainToolDefinition {
+            let operations = ["capabilities", "list", "create_draft", "update_draft", "propose_seal", "read", "propose_next_revision"]
+            return MCPDomainToolDefinition(
+                name: MCPWindowToolName.promptExperiment,
+                description: "Create, update, seal, and inspect a DEBUG native Prompt Experiment draft owned by the bound Agent session. This tool cannot approve or start a run.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "op": .object([
+                            "type": .string("string"),
+                            "enum": .array(operations.map(Value.string))
+                        ]),
+                        "experiment_id": .object(["type": .string("string")]),
+                        "expected_draft_id": .object(["type": .string("string")]),
+                        "expected_draft_version": .object(["type": .string("integer")]),
+                        "expected_draft_digest": .object(["type": .string("string")]),
+                        "expected_plan_digest": .object(["type": .string("string")]),
+                        "title": .object(["type": .string("string")]),
+                        "task_input": .object(["type": .string("string")]),
+                        "synthetic_fixture": .object(["type": .string("string")]),
+                        "original_instructions": .object(["type": .string("string")]),
+                        "candidate_instructions": .object(["type": .string("string")]),
+                        "target_role": .object(["type": .string("string")]),
+                        "repetitions": .object(["type": .string("integer")])
+                    ]),
+                    "required": .array([.string("op")])
+                ]),
+                annotations: .init(
+                    readOnlyHint: false,
+                    destructiveHint: false,
+                    idempotentHint: false,
+                    openWorldHint: false
+                )
+            )
+        }
+    #endif
 
     private static func advertiseModelParameters(
         _ definition: MCPDomainToolDefinition

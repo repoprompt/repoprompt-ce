@@ -133,15 +133,29 @@
                     throw PromptExperimentSubmissionError.rejected("The sealed provider is no longer recognized.")
                 }
                 switch agent {
-                case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+                case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
                     break
-                case .codexExec, .openCode, .cursor, .grokBuild, .antigravity:
+                case .openCode, .cursor, .grokBuild, .antigravity:
                     throw PromptExperimentSubmissionError.rejected(
                         "This provider does not have a proven exact-model, synthetic-cwd, file/shell-free discovery profile for the isolated pilot."
                     )
                 }
+                let baseConfiguration = baseAuthority.configuration
+                let configuration = ContextBuilderMCPRunConfiguration(
+                    identity: baseConfiguration.identity,
+                    nestedTabContext: baseConfiguration.nestedTabContext,
+                    providerWorkspacePath: rootURL.path,
+                    runBehavior: baseConfiguration.runBehavior,
+                    responseType: baseConfiguration.responseType,
+                    planningModelRaw: baseConfiguration.planningModelRaw,
+                    agentModelsProfile: baseConfiguration.agentModelsProfile,
+                    isSystemWorkspace: baseConfiguration.isSystemWorkspace,
+                    codexRunConstraints: agent == .codexExec
+                        ? .promptExperiment(workingDirectory: rootURL.path)
+                        : nil
+                )
                 let authority = ContextBuilderResolvedRunAuthority(
-                    configuration: baseAuthority.configuration,
+                    configuration: configuration,
                     agentKind: agent,
                     modelRaw: plan.resolvedTarget.modelRaw
                 )
