@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 package enum DomainExternalReloadActivity: Equatable {
     case changed
@@ -1403,10 +1404,10 @@ actor DomainWorkspaceContextAuthority {
         if let recorded = await recordedOutcome(for: envelope, fingerprint: fingerprint) {
             return recorded
         }
-        guard !canonicalRootPath.isEmpty,
-              document.metadata.repoPaths.contains(where: {
-                  Self.canonicalFolderOpenRootPath($0) == canonicalRootPath
-              })
+        guard WorkspaceExactRootPath.contains(
+            canonicalComparisonPath: canonicalRootPath,
+            in: document.metadata.repoPaths
+        )
         else {
             return recordTransientOutcome(
                 envelope: envelope,
@@ -1507,21 +1508,8 @@ actor DomainWorkspaceContextAuthority {
             return .changed
         }
 
-        eligibleMatches.sort { lhs, rhs in
-            let lhsMetadata = lhs.document.metadata
-            let rhsMetadata = rhs.document.metadata
-            if lhsMetadata.dateModified != rhsMetadata.dateModified {
-                return lhsMetadata.dateModified > rhsMetadata.dateModified
-            }
-            let lhsFoldedName = lhsMetadata.name.lowercased()
-            let rhsFoldedName = rhsMetadata.name.lowercased()
-            if lhsFoldedName != rhsFoldedName {
-                return lhsFoldedName < rhsFoldedName
-            }
-            if lhsMetadata.name != rhsMetadata.name {
-                return lhsMetadata.name < rhsMetadata.name
-            }
-            return lhsMetadata.workspaceID.uuidString < rhsMetadata.workspaceID.uuidString
+        eligibleMatches.sort {
+            Self.exactRootCandidateRank(for: $0) < Self.exactRootCandidateRank(for: $1)
         }
         if let existing = eligibleMatches.first {
             return .matched(makeSnapshot(existing))
@@ -1531,19 +1519,20 @@ actor DomainWorkspaceContextAuthority {
 
     private func exactRootRecords(canonicalRootPath: String) -> [UUID: WorkspaceRecord] {
         records.filter { _, record in
-            record.document.metadata.repoPaths.contains {
-                Self.canonicalFolderOpenRootPath($0) == canonicalRootPath
-            }
+            WorkspaceExactRootPath.contains(
+                canonicalComparisonPath: canonicalRootPath,
+                in: record.document.metadata.repoPaths
+            )
         }
     }
 
-    private static func canonicalFolderOpenRootPath(_ path: String) -> String? {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let expanded = (trimmed as NSString).expandingTildeInPath
-        let normalized = URL(fileURLWithPath: expanded).standardizedFileURL.path
-        guard !normalized.isEmpty else { return nil }
-        return normalized.lowercased()
+    private static func exactRootCandidateRank(for record: WorkspaceRecord) -> WorkspaceExactRootCandidateRank {
+        let metadata = record.document.metadata
+        return WorkspaceExactRootCandidateRank(
+            dateModified: metadata.dateModified,
+            name: metadata.name,
+            workspaceID: metadata.workspaceID
+        )
     }
 
     private func createWorkspace(

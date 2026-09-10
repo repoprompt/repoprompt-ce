@@ -1,19 +1,16 @@
 enum WorkspaceRecentOrdering {
     nonisolated static func sorted(_ workspaces: [WorkspaceModel]) -> [WorkspaceModel] {
-        workspaces.sorted { lhs, rhs in
-            if lhs.dateModified != rhs.dateModified {
-                return lhs.dateModified > rhs.dateModified
-            }
-            let lhsFoldedName = lhs.name.lowercased()
-            let rhsFoldedName = rhs.name.lowercased()
-            if lhsFoldedName != rhsFoldedName {
-                return lhsFoldedName < rhsFoldedName
-            }
-            if lhs.name != rhs.name {
-                return lhs.name < rhs.name
-            }
-            return lhs.id.uuidString < rhs.id.uuidString
+        workspaces.sorted {
+            rank(for: $0) < rank(for: $1)
         }
+    }
+
+    private nonisolated static func rank(for workspace: WorkspaceModel) -> WorkspaceExactRootCandidateRank {
+        WorkspaceExactRootCandidateRank(
+            dateModified: workspace.dateModified,
+            name: workspace.name,
+            workspaceID: workspace.id
+        )
     }
 }
 
@@ -29,10 +26,7 @@ enum WorkspaceFolderOpenResolver {
         _ expectedRoot: WorkspaceRootSetKey,
         in workspace: WorkspaceModel
     ) -> Bool {
-        guard !expectedRoot.isEmpty else { return false }
-        return workspace.repoPaths.contains { rootPath in
-            WorkspaceRootSetKey(paths: [rootPath]) == expectedRoot
-        }
+        WorkspaceExactRootPath.contains(expectedRoot, in: workspace.repoPaths)
     }
 
     nonisolated static func eligibleMatches(
@@ -52,7 +46,7 @@ enum WorkspaceFolderOpenResolver {
                 return false
             }
 
-            return containsExactRoot(path, in: workspace)
+            return containsExactRoot(selectedRoot, in: workspace)
         }
         return WorkspaceRecentOrdering.sorted(matches)
     }

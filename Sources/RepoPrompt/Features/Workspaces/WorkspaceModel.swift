@@ -1,49 +1,6 @@
 import Foundation
 import OSLog
 
-struct WorkspaceRootSetKey: Hashable {
-    let normalizedPaths: [String]
-
-    var isEmpty: Bool {
-        normalizedPaths.isEmpty
-    }
-
-    init(paths: [String]) {
-        var canonicalByLowercasedPath: [String: String] = [:]
-        for rawPath in paths {
-            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            let expanded = (trimmed as NSString).expandingTildeInPath
-            let normalizedPath = URL(fileURLWithPath: expanded).standardizedFileURL.path
-            guard !normalizedPath.isEmpty else { continue }
-            let lowercasedPath = normalizedPath.lowercased()
-            if let existing = canonicalByLowercasedPath[lowercasedPath] {
-                canonicalByLowercasedPath[lowercasedPath] = min(existing, normalizedPath)
-            } else {
-                canonicalByLowercasedPath[lowercasedPath] = normalizedPath
-            }
-        }
-        normalizedPaths = canonicalByLowercasedPath.values.sorted {
-            let lhsKey = $0.lowercased()
-            let rhsKey = $1.lowercased()
-            if lhsKey != rhsKey {
-                return lhsKey < rhsKey
-            }
-            return $0 < $1
-        }
-    }
-
-    static func == (lhs: WorkspaceRootSetKey, rhs: WorkspaceRootSetKey) -> Bool {
-        lhs.normalizedPaths.map { $0.lowercased() } == rhs.normalizedPaths.map { $0.lowercased() }
-    }
-
-    func hash(into hasher: inout Hasher) {
-        for path in normalizedPaths {
-            hasher.combine(path.lowercased())
-        }
-    }
-}
-
 struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
     struct DuplicateWorkspaceRow: Identifiable, Equatable {
         let id: Int
