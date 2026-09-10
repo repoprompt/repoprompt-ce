@@ -65,94 +65,33 @@ struct ContextBuilderBoundWorkspaceProbe {
         _ operation: Operation,
         body: @escaping @Sendable () throws -> Value
     ) async throws -> Value {
-        let settlement = Settlement<Value>()
-        return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            let value: Value = try await withCheckedThrowingContinuation { continuation in
-                settlement.install(continuation)
-                let worker = Task.detached(priority: .utility) { [self] in
-                    #if DEBUG
-                        let id = UUID()
-                        defer { checkpoint?(.init(id: id, operation: operation, phase: .workerFinished)) }
-                    #endif
-                    let result: Result<Value, Error>
-                    do {
-                        try Task.checkCancellation()
-                        #if DEBUG
-                            checkpoint?(.init(id: id, operation: operation, phase: .beforeFileSystem))
-                        #endif
-                        try Task.checkCancellation()
-                        let value = try body()
-                        #if DEBUG
-                            checkpoint?(.init(id: id, operation: operation, phase: .afterFileSystem))
-                        #endif
-                        try Task.checkCancellation()
-                        result = .success(value)
-                    } catch { result = .failure(error) }
-                    settlement.complete(result)
-                }
+        try Task.checkCancellation()
+        return try await CancellableProbe.run { complete in
+            let worker = Task.detached(priority: .utility) { [self] in
                 #if DEBUG
-                    workerStarted?(worker)
+                    let id = UUID()
+                    defer { checkpoint?(.init(id: id, operation: operation, phase: .workerFinished)) }
                 #endif
-                settlement.attach(worker)
+                let result: Result<Value, Error>
+                do {
+                    try Task.checkCancellation()
+                    #if DEBUG
+                        checkpoint?(.init(id: id, operation: operation, phase: .beforeFileSystem))
+                    #endif
+                    try Task.checkCancellation()
+                    let value = try body()
+                    #if DEBUG
+                        checkpoint?(.init(id: id, operation: operation, phase: .afterFileSystem))
+                    #endif
+                    try Task.checkCancellation()
+                    result = .success(value)
+                } catch { result = .failure(error) }
+                complete(result)
             }
-            try Task.checkCancellation()
-            return value
-        } onCancel: {
-            settlement.cancel()
-        }
-    }
-
-    /// Cancellation settles the consumer, not an uninterruptible filesystem syscall.
-    /// The worker owns only frozen inputs and this latch until its late result is discarded.
-    private final class Settlement<Value: Sendable>: @unchecked Sendable {
-        private let lock = NSLock()
-        private var result: Result<Value, Error>?
-        private var continuation: CheckedContinuation<Value, Error>?
-        private var worker: Task<Void, Never>?
-
-        func install(_ continuation: CheckedContinuation<Value, Error>) {
-            let ready = lock.withLock { () -> Result<Value, Error>? in
-                if let result { return result }
-                self.continuation = continuation
-                return nil as Result<Value, Error>?
-            }
-            if let ready { continuation.resume(with: ready) }
-        }
-
-        func attach(_ worker: Task<Void, Never>) {
-            let settled = lock.withLock {
-                guard result == nil else { return true }
-                self.worker = worker
-                return false
-            }
-            if settled { worker.cancel() }
-        }
-
-        func complete(_ result: Result<Value, Error>) {
-            let pending = lock.withLock {
-                worker = nil
-                guard self.result == nil else { return nil as CheckedContinuation<Value, Error>? }
-                self.result = result
-                let pending = continuation
-                continuation = nil
-                return pending
-            }
-            pending?.resume(with: result)
-        }
-
-        func cancel() {
-            let (pending, worker) = lock.withLock {
-                let worker = self.worker
-                self.worker = nil
-                guard result == nil else { return (nil as CheckedContinuation<Value, Error>?, worker) }
-                result = .failure(CancellationError())
-                let pending = continuation
-                continuation = nil
-                return (pending, worker)
-            }
-            worker?.cancel()
-            pending?.resume(throwing: CancellationError())
+            #if DEBUG
+                workerStarted?(worker)
+            #endif
+            return worker
         }
     }
 }

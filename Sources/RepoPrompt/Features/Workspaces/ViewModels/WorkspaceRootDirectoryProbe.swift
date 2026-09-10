@@ -33,34 +33,25 @@ final class WorkspaceRootDirectoryProbe: @unchecked Sendable {
         try Task.checkCancellation()
         let workerID = UUID()
         guard reserve(workerID) else { throw CapacityExceeded() }
-        let settlement = Settlement<WorkspaceRootReadinessFailure.Availability?>()
-        let value: WorkspaceRootReadinessFailure.Availability? = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                settlement.install(continuation)
-                let worker = Task.detached(priority: .utility) { [self] in
-                    let result: Result<WorkspaceRootReadinessFailure.Availability?, Error>
-                    do {
-                        try Task.checkCancellation()
-                        await checkpoint?(.init(attemptID: attemptID, workerID: workerID, phase: .beforeFileSystem))
-                        try Task.checkCancellation()
-                        let value = try Self.readDirectories(paths)
-                        await checkpoint?(.init(attemptID: attemptID, workerID: workerID, phase: .afterFileSystem))
-                        try Task.checkCancellation()
-                        result = .success(value)
-                    } catch {
-                        result = .failure(error)
-                    }
-                    release(workerID)
-                    settlement.complete(result)
-                    await checkpoint?(.init(attemptID: attemptID, workerID: workerID, phase: .workerFinished))
+        return try await CancellableProbe.run { complete in
+            Task.detached(priority: .utility) { [self] in
+                let result: Result<WorkspaceRootReadinessFailure.Availability?, Error>
+                do {
+                    try Task.checkCancellation()
+                    await checkpoint?(.init(attemptID: attemptID, workerID: workerID, phase: .beforeFileSystem))
+                    try Task.checkCancellation()
+                    let value = try Self.readDirectories(paths)
+                    await checkpoint?(.init(attemptID: attemptID, workerID: workerID, phase: .afterFileSystem))
+                    try Task.checkCancellation()
+                    result = .success(value)
+                } catch {
+                    result = .failure(error)
                 }
-                settlement.attach(worker)
+                release(workerID)
+                complete(result)
+                await checkpoint?(.init(attemptID: attemptID, workerID: workerID, phase: .workerFinished))
             }
-        } onCancel: {
-            settlement.cancel()
         }
-        try Task.checkCancellation()
-        return value
     }
 
     private func reserve(_ workerID: UUID) -> Bool {
@@ -96,58 +87,5 @@ final class WorkspaceRootDirectoryProbe: @unchecked Sendable {
             }
         }
         return nil
-    }
-
-    /// Cancellation settles the owner task even when synchronous filesystem I/O cannot stop.
-    /// The detached worker retains only frozen paths and this latch; late results are discarded.
-    private final class Settlement<Value: Sendable>: @unchecked Sendable {
-        private let lock = NSLock()
-        private var result: Result<Value, Error>?
-        private var continuation: CheckedContinuation<Value, Error>?
-        private var worker: Task<Void, Never>?
-
-        func install(_ continuation: CheckedContinuation<Value, Error>) {
-            let ready = lock.withLock { () -> Result<Value, Error>? in
-                if let result { return result }
-                self.continuation = continuation
-                return nil
-            }
-            if let ready { continuation.resume(with: ready) }
-        }
-
-        func attach(_ worker: Task<Void, Never>) {
-            let settled = lock.withLock {
-                guard result == nil else { return true }
-                self.worker = worker
-                return false
-            }
-            if settled { worker.cancel() }
-        }
-
-        func complete(_ result: Result<Value, Error>) {
-            let pending = lock.withLock {
-                worker = nil
-                guard self.result == nil else { return nil as CheckedContinuation<Value, Error>? }
-                self.result = result
-                let pending = continuation
-                continuation = nil
-                return pending
-            }
-            pending?.resume(with: result)
-        }
-
-        func cancel() {
-            let (pending, worker) = lock.withLock {
-                let worker = self.worker
-                self.worker = nil
-                guard result == nil else { return (nil as CheckedContinuation<Value, Error>?, worker) }
-                result = .failure(CancellationError())
-                let pending = continuation
-                continuation = nil
-                return (pending, worker)
-            }
-            worker?.cancel()
-            pending?.resume(throwing: CancellationError())
-        }
     }
 }
