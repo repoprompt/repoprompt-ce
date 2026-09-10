@@ -12,11 +12,18 @@ import XCTest
             var submissionErrors: [Int: PromptExperimentSubmissionError] = [:]
             var holdResults = false
             var holdSubmission = false
+            var preflightedPlans: [PromptExperimentPlan] = []
+            var preflightError: PromptExperimentAuthorityError?
             private var submissionGate: CheckedContinuation<Void, Never>?
             private var blockedSubmissionWaiters: [CheckedContinuation<Void, Never>] = []
             private var resultContinuations: [UUID: CheckedContinuation<PromptExperimentRuntimeResult, Never>] = [:]
             private var submissionWaiters: [CheckedContinuation<Void, Never>] = []
             private var resultWaiters: [CheckedContinuation<Void, Never>] = []
+
+            func preflightOptimization(_ plan: PromptExperimentPlan) async throws {
+                preflightedPlans.append(plan)
+                if let preflightError { throw preflightError }
+            }
 
             func submit(
                 _ request: PromptExperimentRunRequest,
@@ -453,6 +460,15 @@ import XCTest
             let otherOwner = PromptExperimentAgentOwner(controllerSessionID: UUID(), sourceTabID: UUID())
             let interface = PromptExperimentAgentInterface(service: harness.service)
 
+            let capabilities = try await interface.execute(.capabilities, owner: owner)
+            guard case let .capabilities(operations, targets, gepaRuntime, _) = capabilities else {
+                return XCTFail("Expected capabilities")
+            }
+            XCTAssertFalse(operations.contains("approve"))
+            XCTAssertFalse(operations.contains("run"))
+            XCTAssertEqual(targets.map(\.selector), harness.service.availableTargets().map(\.selector))
+            XCTAssertEqual(gepaRuntime.pinnedRevision, PromptExperimentGEPAConfiguration.pinnedRevision)
+
             let createdResponse = try await interface.execute(.createDraft, owner: owner)
             guard case let .draft(id, created) = createdResponse else { return XCTFail("Expected draft") }
             let updatedResponse = try await interface.execute(.updateDraft(
@@ -467,7 +483,8 @@ import XCTest
                     originalInstructions: "Read and answer.",
                     candidateInstructions: "Read, cite, and answer.",
                     targetRole: "explore",
-                    repetitions: 1
+                    repetitions: 1,
+                    optimization: Self.validOptimization()
                 )
             ), owner: owner)
             guard case let .draft(_, updated) = updatedResponse else { return XCTFail("Expected updated draft") }
@@ -487,6 +504,8 @@ import XCTest
             ), owner: owner)
             let sealed = try XCTUnwrap(harness.service.record(id: id))
             XCTAssertEqual(sealed.phase, .awaitingApproval)
+            XCTAssertEqual(sealed.currentPlan?.schemaVersion, PromptExperimentPlan.optimizationSchemaVersion)
+            XCTAssertEqual(harness.runtime.preflightedPlans.map(\.id), sealed.currentPlan.map { [$0.id] } ?? [])
             XCTAssertNil(PromptExperimentAgentOperation(rawValue: "approve"))
             XCTAssertNil(PromptExperimentAgentOperation(rawValue: "run"))
 
@@ -860,6 +879,173 @@ import XCTest
             XCTAssertEqual(GlobalSettingsStore.shared.globalAgentModelsProfile().mcpAgentRoleOverrides, beforeOverrides)
         }
 
+        func testOptimizationSealPreflightsAndFailureLeavesDraftUncommitted() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let (id, draft) = try await updatedOptimizationDraft(harness)
+            harness.runtime.preflightError = .runtimeUnavailable("controlled pinned GEPA mismatch")
+
+            do {
+                _ = try await harness.service.seal(
+                    experimentID: id,
+                    expectedDraftID: draft.id,
+                    expectedDraftVersion: draft.optimisticVersion,
+                    expectedDraftDigest: draft.contentDigest()
+                )
+                XCTFail("Failed GEPA preflight must reject sealing")
+            } catch let error as PromptExperimentAuthorityError {
+                XCTAssertEqual(error, .runtimeUnavailable("controlled pinned GEPA mismatch"))
+            }
+
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            XCTAssertEqual(record.phase, .drafting)
+            XCTAssertNotNil(record.draft)
+            XCTAssertTrue(record.plans.isEmpty)
+            XCTAssertEqual(harness.runtime.preflightedPlans.count, 1)
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+        }
+
+        func testOptimizationResultPersistsCandidatesEvaluationsAndExactTargets() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            XCTAssertEqual(plan.schemaVersion, PromptExperimentPlan.optimizationSchemaVersion)
+            XCTAssertEqual(plan.optimizationTargets?.reflection.role, "reflector")
+            XCTAssertEqual(plan.optimizationTargets?.execution?.role, "executor")
+            XCTAssertEqual(plan.trials.map(\.condition), [.optimization])
+
+            var runtimeResult = FakeRuntime.result(
+                handle: PromptExperimentRuntimeHandle(id: plan.trials[0].id, tabID: nil, runID: nil),
+                disposition: .completed,
+                output: nil,
+                fixtureDigest: plan.environment.fixtureDigest,
+                assistantOutput: nil
+            )
+            runtimeResult.optimizationResult = PromptExperimentOptimizationRuntimeResult(
+                engine: "gepa",
+                upstreamRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
+                baselineScore: 0,
+                bestScore: 1,
+                bestCandidateIndex: 1,
+                candidates: ["baseline instructions", "improved instructions"],
+                parentIndices: [[], [0]],
+                aggregateScores: [0, 1],
+                evaluations: [
+                    PromptExperimentOptimizationRuntimeEvaluation(
+                        candidateIndex: 1,
+                        exampleID: "reviewed-1",
+                        split: .validation,
+                        score: 1,
+                        feedback: "matched reviewed answer",
+                        failureKind: nil,
+                        output: "cobalt",
+                        elapsedSeconds: 0.25
+                    )
+                ],
+                totalEvaluations: 2,
+                wallTimeSeconds: 1.5,
+                proposerUsage: "unavailable_from_connected_model_completion_contract",
+                runDirectoryRelativePath: "worker-runs/attempt/gepa-run",
+                rawResultJSON: Data("{\"engine\":\"gepa\"}".utf8)
+            )
+            harness.runtime.immediateResults[1] = runtimeResult
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+
+            let reopened = PromptExperimentService(
+                store: PromptExperimentStore(rootURL: harness.root),
+                runtime: FakeRuntime(),
+                resolveTarget: Self.fakeTarget
+            )
+            await reopened.load()
+            let record = try XCTUnwrap(reopened.record(id: id))
+            let result = try XCTUnwrap(record.attempts(for: plan).first?.optimizationResult)
+            XCTAssertEqual(result.bestCandidateIndex, 1)
+            XCTAssertEqual(result.candidates.map(\.candidatePreview), ["baseline instructions", "improved instructions"])
+            XCTAssertEqual(result.evaluations.first?.feedback, "matched reviewed answer")
+            XCTAssertEqual(result.runDirectoryRelativePath, "worker-runs/attempt/gepa-run")
+            XCTAssertEqual(result.proposerUsage, "unavailable_from_connected_model_completion_contract")
+            XCTAssertNotNil(result.rawResultEvidence)
+            let artifactText = try await reopened.readableArtifactText(for: record)
+            for candidate in result.candidates {
+                XCTAssertNotNil(artifactText[candidate.candidateEvidence.sha256])
+            }
+            let directory = try await reopened.recordDirectoryURL(experimentID: id)
+            let overview = try String(contentsOf: directory.appendingPathComponent("overview.md"), encoding: .utf8)
+            XCTAssertTrue(overview.contains("GEPA wall time: 1.500 seconds"))
+            XCTAssertTrue(overview.contains("worker-runs/attempt/gepa-run"))
+            XCTAssertTrue(overview.contains("matched reviewed answer"))
+
+            try await reopened.startNextRevision(experimentID: id, expectedPlanDigest: plan.digest)
+            let next = try XCTUnwrap(reopened.record(id: id))
+            XCTAssertEqual(next.draft?.optimization?.seedCandidate, "improved instructions")
+            XCTAssertEqual(next.attempts(for: plan).first?.optimizationResult?.bestScore, 1)
+            XCTAssertTrue(harness.runtime.submitted.count == 1)
+        }
+
+        func testOptimizationDigestBindsEvaluatorDataBudgetAndResolvedTargets() throws {
+            let date = Date(timeIntervalSince1970: 123)
+            let environment = try PromptExperimentEnvironment(
+                workspaceID: XCTUnwrap(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")),
+                sourceTabID: XCTUnwrap(UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")),
+                capturedAt: date,
+                isolatedRootPath: "/tmp/gepa-digest",
+                selection: StoredSelection(selectedPaths: ["reviewed-examples.json"]),
+                fixtureFiles: [PromptExperimentFixtureFile(path: "reviewed-examples.json", byteCount: 10, sha256: "fixture")],
+                fixtureDigest: "fixture",
+                captureLimitations: ["isolated"]
+            )
+            let reflection = try XCTUnwrap(Self.fakeTarget("reflector"))
+            let execution = try XCTUnwrap(Self.fakeTarget("executor"))
+            let targets = PromptExperimentOptimizationTargets(reflection: reflection, execution: execution, judge: nil)
+
+            func digest(_ specification: PromptExperimentOptimizationSpecification, targets selectedTargets: PromptExperimentOptimizationTargets = targets) throws -> String {
+                let draft = PromptExperimentDraft(
+                    revision: 1,
+                    title: "Digest coverage",
+                    optimization: specification,
+                    createdAt: date,
+                    updatedAt: date
+                )
+                return try PromptExperimentPlan.seal(
+                    draft: draft,
+                    target: execution,
+                    optimizationTargets: selectedTargets,
+                    environment: environment,
+                    at: date
+                ).digest
+            }
+
+            let original = Self.validOptimization()
+            let originalDigest = try digest(original)
+            var changedExample = original
+            changedExample.examples[0].expectedOutput = "azure"
+            var changedEvaluator = original
+            changedEvaluator.evaluator.minimumScore = -1
+            var changedBudget = original
+            changedBudget.gepa.maxEvaluations += 1
+            let changedTargets = try PromptExperimentOptimizationTargets(
+                reflection: XCTUnwrap(Self.fakeTarget("different-reflector")),
+                execution: execution,
+                judge: nil
+            )
+
+            XCTAssertNotEqual(try digest(changedExample), originalDigest)
+            XCTAssertNotEqual(try digest(changedEvaluator), originalDigest)
+            XCTAssertNotEqual(try digest(changedBudget), originalDigest)
+            XCTAssertNotEqual(try digest(original, targets: changedTargets), originalDigest)
+        }
+
+        func testGEPAWorkerEnvironmentDoesNotInheritProviderCredentials() {
+            let environment = PromptExperimentGEPAWorker.workerEnvironment(home: URL(fileURLWithPath: "/tmp/gepa-home"))
+            XCTAssertEqual(Set(environment.keys).subtracting(["HOME", "PATH", "PYTHONUNBUFFERED", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"]), [])
+            XCTAssertNil(environment["OPENAI_API_KEY"])
+            XCTAssertNil(environment["ANTHROPIC_API_KEY"])
+            XCTAssertNil(environment["CODEX_HOME"])
+        }
+
         private func makeHarness() -> Harness {
             let root = temporaryRoot()
             let store = PromptExperimentStore(rootURL: root)
@@ -904,6 +1090,39 @@ import XCTest
             return id
         }
 
+        private func updatedOptimizationDraft(
+            _ harness: Harness
+        ) async throws -> (id: UUID, draft: PromptExperimentDraft) {
+            await harness.service.load()
+            let id = try await harness.service.createOptimizationExperiment(
+                controllerSessionID: UUID(),
+                sourceTabID: UUID()
+            )
+            var draft = try XCTUnwrap(harness.service.record(id: id)?.draft)
+            let currentDigest = try draft.contentDigest()
+            draft.title = "Real GEPA test"
+            draft.optimization = Self.validOptimization()
+            let updated = try await harness.service.updateDraft(
+                experimentID: id,
+                expectedDraftID: draft.id,
+                expectedDraftVersion: draft.optimisticVersion,
+                expectedDraftDigest: currentDigest,
+                draft: draft
+            )
+            return (id, updated)
+        }
+
+        private func preparedOptimizationExperiment(_ harness: Harness) async throws -> UUID {
+            let (id, draft) = try await updatedOptimizationDraft(harness)
+            _ = try await harness.service.seal(
+                experimentID: id,
+                expectedDraftID: draft.id,
+                expectedDraftVersion: draft.optimisticVersion,
+                expectedDraftDigest: draft.contentDigest()
+            )
+            return id
+        }
+
         private func approvedExperiment(_ harness: Harness) async throws -> UUID {
             let id = try await preparedExperiment(harness)
             let digest = try XCTUnwrap(harness.service.record(id: id)?.currentPlan?.digest)
@@ -922,6 +1141,46 @@ import XCTest
                 agentRaw: "fake",
                 modelRaw: "fake-model",
                 displayName: "Fake Model"
+            )
+        }
+
+        private static func validOptimization() -> PromptExperimentOptimizationSpecification {
+            PromptExperimentOptimizationSpecification(
+                seedCandidate: nil,
+                objective: "Improve the instructions so the reviewed answer is extracted exactly.",
+                background: "Operate only on the reviewed example data.",
+                examples: [
+                    PromptExperimentExample(
+                        id: "reviewed-1",
+                        split: .validation,
+                        input: "The named value is cobalt.",
+                        expectedOutput: "cobalt",
+                        reviewerNotes: "Reviewed synthetic example"
+                    )
+                ],
+                evaluator: PromptExperimentEvaluatorSpecification(
+                    kind: .exactMatch,
+                    rubric: "",
+                    judgeTargetSelector: nil,
+                    command: nil,
+                    candidateFileName: nil,
+                    minimumScore: 0,
+                    maximumScore: 1
+                ),
+                execution: PromptExperimentExecutionSpecification(
+                    adapter: .contextBuilder,
+                    targetSelector: "executor",
+                    instructions: "Use the candidate as governing instructions and answer the example input."
+                ),
+                gepa: PromptExperimentGEPAConfiguration(
+                    engine: "gepa",
+                    pythonExecutablePath: "/usr/bin/python3",
+                    reflectionTargetSelector: "reflector",
+                    maxEvaluations: 20,
+                    maxWallClockSeconds: 120,
+                    stopAtScore: 1,
+                    randomSeed: 0
+                )
             )
         }
 

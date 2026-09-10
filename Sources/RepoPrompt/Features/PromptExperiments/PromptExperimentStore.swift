@@ -263,6 +263,8 @@
                     "- Runtime target: \(plan.resolvedTarget.displayName)",
                     "- Adapter: `\(plan.executionAdapter)`",
                     "- Comparison: `\(plan.comparisonMode)`",
+                    "- Engine: `\(plan.optimization?.gepa.engine ?? "legacy-fixed")`",
+                    "- GEPA upstream revision: `\(plan.optimization.map { _ in PromptExperimentGEPAConfiguration.pinnedRevision } ?? "not applicable")`",
                     "- Preserved plan revisions: \(record.plans.map { String($0.revision) }.joined(separator: ", "))",
                     "",
                     "## Pilot limitations"
@@ -297,6 +299,35 @@
                     }
                     if let legacyEvidence = attempt.evidence {
                         lines.append("  - Legacy unclassified evidence: `../../\(legacyEvidence.relativePath)`")
+                    }
+                    if let result = attempt.optimizationResult {
+                        lines.append("  - GEPA upstream revision: `\(result.upstreamRevision)`")
+                        lines.append("  - Baseline score: \(result.baselineScore.map { String($0) } ?? "unavailable")")
+                        lines.append("  - Best score: \(result.bestScore.map { String($0) } ?? "unavailable")")
+                        lines.append("  - Evaluations: \(result.totalEvaluations)")
+                        let wallTime = result.wallTimeSeconds.map { String(format: "%.3f", $0) } ?? "unavailable"
+                        lines.append("  - GEPA wall time: \(wallTime) seconds")
+                        lines.append("  - Proposer usage: \(result.proposerUsage)")
+                        if let runDirectory = result.runDirectoryRelativePath {
+                            lines.append("  - Worker artifacts and log: `../../\(runDirectory)`")
+                        } else {
+                            lines.append("  - Worker artifacts and log: unavailable")
+                        }
+                        if let rawResult = result.rawResultEvidence {
+                            lines.append("  - Raw versioned result: `../../\(rawResult.relativePath)`")
+                        }
+                        lines.append("  - Candidates:")
+                        for candidate in result.candidates {
+                            let labels = [candidate.isBaseline ? "baseline" : nil, candidate.isBest ? "best" : nil]
+                                .compactMap(\.self).joined(separator: ", ")
+                            lines.append("    - #\(candidate.index) \(labels) score \(candidate.aggregateScore.map { String($0) } ?? "unavailable"): `../../\(candidate.candidateEvidence.relativePath)`")
+                        }
+                        lines.append("  - Evaluation feedback:")
+                        for evaluation in result.evaluations {
+                            let score = evaluation.score.map { String($0) } ?? "unavailable"
+                            let failure = evaluation.failureKind.map { " / \($0.rawValue) failure" } ?? ""
+                            lines.append("    - candidate #\(evaluation.candidateIndex), \(evaluation.exampleID) [\(evaluation.split.rawValue)]: \(score)\(failure) — \(Self.markdownInline(evaluation.feedback))")
+                        }
                     }
                     if let elapsed = Self.elapsedSeconds(attempt) {
                         lines.append("  - Elapsed: \(String(format: "%.3f", elapsed)) seconds")

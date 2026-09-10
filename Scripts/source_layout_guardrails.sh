@@ -776,6 +776,7 @@ allowed_tracked_docs=(
   "docs/architecture/headless-mcp-runtime.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
+  "docs/architecture/prompt-experiments-gepa.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"

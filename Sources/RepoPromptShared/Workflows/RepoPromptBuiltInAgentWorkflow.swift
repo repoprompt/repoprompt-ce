@@ -123,8 +123,8 @@ public enum RepoPromptBuiltInAgentWorkflow: String, Codable, CaseIterable, Hasha
                     id: canonicalID,
                     displayName: "Prompt Experiment",
                     iconName: "flask.fill",
-                    tooltipText: "Prepare a native fixed prompt comparison",
-                    descriptionText: "Links this Agent session to a synthetic-fixture draft the agent can revise and seal for native user approval and execution."
+                    tooltipText: "Optimize with the real upstream GEPA engine",
+                    descriptionText: "An Agent-guided workflow for reviewed data, evaluator, connected models, and budgets, with exact native digest approval and durable GEPA results."
                 )
         #endif
         }

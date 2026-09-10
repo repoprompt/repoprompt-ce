@@ -7,23 +7,32 @@
             return """
             \(frontmatter(
                 name: name,
-                description: "Shape a native, explicitly approved Prompt Experiment draft for a fixed synthetic-fixture comparison",
+                description: "Shape and run a digest-approved optimization with the real upstream GEPA engine",
                 variant: variant
             ))
 
-            # Native Prompt Experiment pilot
+            # Prompt Experiment — upstream GEPA
 
-            Help the user articulate a fixed original-versus-candidate Context Builder comparison. Ask only for missing task, synthetic fixture, original instructions, candidate instructions, target role, and one-to-three repetitions.
+            You are the user's interactive optimization partner. Begin with `prompt_experiment` `op=capabilities`, then inspect only the workspace and context the user already authorized. Ask concise questions for genuinely missing success criteria, representative examples, evaluator behavior, model choices, budget, and candidate mutation constraints. Do not ask the user to write an improved candidate: `seed_candidate` may be null and GEPA can bootstrap from the objective and feedback.
 
-            Start by calling `prompt_experiment` with `op=capabilities`. Use its bounded operations to create or update the draft owned by this Agent session, then call `op=propose_seal` with the exact returned draft ID, version, and digest. Tell the user to open the native **Prompt Experiments** flask view and approve the exact plan digest shown by the tool and card.
+            Build a reviewable, versioned specification containing:
+            - an objective and task-preservation background;
+            - reviewed training/validation examples, with optional reporting-only hidden-test examples that must never be quoted to the proposer;
+            - one evaluator: exact match, a feedback-rich connected-model judge rubric, or a sealed command returning `{score, feedback}`;
+            - the Context Builder or sandboxed-command execution adapter;
+            - exact catalog selectors for reflection, execution, and judge models as applicable;
+            - the separately configured Python executable containing GEPA 0.1.4 pinned at revision `0632cdb5dcc052e690eab439e1b4a7e3e9cfe407`, an evaluation budget, wall-clock limit, seed, and optional stop score.
 
-            The agent tool can persist drafts, seal a proposal, read results, and propose a next revision. It has no approve, run, cancel, score, or promote operation. Approval and execution remain explicit native UI actions bound to the exact sealed digest.
+            Use `op=create_draft`, then `op=update_draft` with the exact draft ID/version/digest and the complete `specification_json` envelope returned by the tool. Conversational changes replace the specification only through another version-checked update. Call `op=propose_seal` only after summarizing the evaluator, data splits, permissions, exact targets, and budgets for review.
 
-            Pilot boundaries:
-            - synthetic-fixture-only isolated execution; loaded-workspace experiments are unsupported;
-            - fixed, serial Context Builder trials using an existing catalog-resolved provider path;
-            - no Investigate workflow, multi-agent optimizer, GEPA attachment, semantic judge, or automatic promotion;
-            - no claim that controlled trials prove live provider quality.
+            Ask the user to approve the exact digest on the native in-session Prompt Experiment card. The agent tool has no approve, run, cancel, or apply-winner operation. After the native run settles, use `op=read` to explain baseline vs best, candidate diffs, per-example feedback, candidate failures, infrastructure failures, and available/unavailable usage honestly. Use `op=propose_next_revision` only when the user wants to continue from the stored best candidate; all changed data/evaluator/budget fields require a new digest approval. Applying a winner is a separate explicit approval and is never automatic.
+
+            Capability boundaries:
+            - the actual upstream `gepa.optimize_anything` engine runs in an external pinned Python environment; RPCE never installs it silently and provider credentials remain in the app;
+            - reviewed examples are copied to an app-owned isolated environment; direct execution against the loaded source workspace is not admitted;
+            - generated-code evaluator commands run under a deny-by-default macOS Seatbelt profile, not merely a changed cwd;
+            - Context Builder is the implemented RPCE workflow adapter. Investigate and multi-agent adapters are extensible but currently unsupported and must be reported as such;
+            - deterministic tests establish the bridge and authority contracts, not live provider quality.
 
             User request:
             $ARGUMENTS

@@ -46,7 +46,7 @@ extension AgentWorkflow {
             "Describe what you want planned — the agent will ask how involved you want to be, then research and write a polished plan."
         #if DEBUG
             case .promptExperiment:
-                "Shape the comparison here, then use the native flask view to seal, approve, and run it."
+                "Shape a reviewed GEPA optimization here, then approve and run the exact digest from its native in-session card."
         #endif
         }
     }

@@ -94,36 +94,20 @@ struct ContextBuilderCardContext {
 }
 
 enum ToolCardRouter {
-    static let knownResultTools: Set<String> = [
-        "bash",
-        "read",
-        "read_file",
-        "apply_edits",
-        "apply_patch",
-        "edit",
-        "file_search",
-        "search",
-        "web_read",
-        "get_file_tree",
-        "get_code_structure",
-        "file_actions",
-        "manage_selection",
-        "workspace_context",
-        "prompt",
-        "ask_oracle",
-        "oracle_utils",
-        "oracle_chat_log",
-        "bind_context",
-        "manage_workspaces",
-        "git",
-        "manage_worktree",
-        "context_builder",
-        "request_user_input",
-        "agent_explore",
-        "agent_run",
-        "agent_manage",
-        "app_settings"
-    ]
+    static var knownResultTools: Set<String> {
+        var tools: Set = [
+            "bash", "read", "read_file", "apply_edits", "apply_patch", "edit",
+            "file_search", "search", "web_read", "get_file_tree", "get_code_structure",
+            "file_actions", "manage_selection", "workspace_context", "prompt", "ask_oracle",
+            "oracle_utils", "oracle_chat_log", "bind_context", "manage_workspaces", "git",
+            "manage_worktree", "context_builder", "request_user_input", "agent_explore",
+            "agent_run", "agent_manage", "app_settings"
+        ]
+        #if DEBUG
+            tools.insert("prompt_experiment")
+        #endif
+        return tools
+    }
 
     static func callView(
         for item: AgentChatItem,
@@ -219,6 +203,10 @@ enum ToolCardRouter {
             return AnyView(AgentManageResultCard(item: item))
         case "app_settings":
             return AnyView(AppSettingsResultCard(item: item))
+        #if DEBUG
+            case "prompt_experiment":
+                return AnyView(PromptExperimentResultCard(item: item))
+        #endif
         default:
             if NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: key) != nil {
                 return AnyView(NativeToolResultCard(item: item, normalizedToolName: key))

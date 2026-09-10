@@ -10,11 +10,13 @@
     enum PromptExperimentCondition: String, Codable, CaseIterable, Hashable {
         case original
         case candidate
+        case optimization
 
         var displayName: String {
             switch self {
             case .original: "Original"
             case .candidate: "Candidate"
+            case .optimization: "GEPA optimization"
             }
         }
     }
@@ -96,6 +98,150 @@
         }
     }
 
+    enum PromptExperimentDatasetSplit: String, Codable, CaseIterable, Hashable {
+        case training
+        case validation
+        case hiddenTest = "hidden_test"
+    }
+
+    struct PromptExperimentExample: Codable, Equatable, Identifiable {
+        let id: String
+        var split: PromptExperimentDatasetSplit
+        var input: String
+        var expectedOutput: String?
+        var reviewerNotes: String?
+    }
+
+    enum PromptExperimentEvaluatorKind: String, Codable, CaseIterable {
+        case exactMatch = "exact_match"
+        case connectedModelJudge = "connected_model_judge"
+        case sandboxedCommand = "sandboxed_command"
+    }
+
+    struct PromptExperimentEvaluatorSpecification: Codable, Equatable {
+        var kind: PromptExperimentEvaluatorKind
+        var rubric: String
+        var judgeTargetSelector: String?
+        var command: String?
+        var candidateFileName: String?
+        var minimumScore: Double
+        var maximumScore: Double
+    }
+
+    enum PromptExperimentWorkflowAdapter: String, Codable, CaseIterable {
+        case contextBuilder = "context_builder"
+        case sandboxedCommand = "sandboxed_command"
+    }
+
+    struct PromptExperimentExecutionSpecification: Codable, Equatable {
+        var adapter: PromptExperimentWorkflowAdapter
+        var targetSelector: String?
+        var instructions: String
+    }
+
+    struct PromptExperimentGEPAConfiguration: Codable, Equatable {
+        static let upstreamRepository = "https://github.com/gepa-ai/gepa.git"
+        static let pinnedRevision = "0632cdb5dcc052e690eab439e1b4a7e3e9cfe407"
+        static let packageVersion = "0.1.4"
+
+        var engine: String
+        var pythonExecutablePath: String
+        var reflectionTargetSelector: String
+        var maxEvaluations: Int
+        var maxWallClockSeconds: Int
+        var stopAtScore: Double?
+        var randomSeed: Int
+    }
+
+    /// Sealed input to the external upstream GEPA worker. Every field that can
+    /// influence proposals, scoring, permissions, or budget is digest-bound.
+    struct PromptExperimentOptimizationTargets: Codable, Equatable {
+        let reflection: PromptExperimentResolvedTarget
+        let execution: PromptExperimentResolvedTarget?
+        let judge: PromptExperimentResolvedTarget?
+    }
+
+    struct PromptExperimentOptimizationSpecification: Codable, Equatable {
+        var seedCandidate: String?
+        var objective: String
+        var background: String
+        var examples: [PromptExperimentExample]
+        var evaluator: PromptExperimentEvaluatorSpecification
+        var execution: PromptExperimentExecutionSpecification
+        var gepa: PromptExperimentGEPAConfiguration
+    }
+
+    enum PromptExperimentOptimizationFailureKind: String, Codable, Equatable {
+        case candidate
+        case infrastructure
+    }
+
+    struct PromptExperimentEvaluationEvidence: Codable, Equatable, Identifiable {
+        let id: UUID
+        let candidateIndex: Int
+        let exampleID: String
+        let split: PromptExperimentDatasetSplit
+        let score: Double?
+        let feedback: String
+        let failureKind: PromptExperimentOptimizationFailureKind?
+        let outputEvidence: PromptExperimentArtifactReference?
+        let elapsedSeconds: Double?
+    }
+
+    struct PromptExperimentCandidateEvidence: Codable, Equatable, Identifiable {
+        let id: UUID
+        let index: Int
+        let parentIndices: [Int]
+        let candidateEvidence: PromptExperimentArtifactReference
+        let candidatePreview: String
+        let aggregateScore: Double?
+        let isBaseline: Bool
+        let isBest: Bool
+    }
+
+    struct PromptExperimentOptimizationRuntimeEvaluation: Codable, Equatable {
+        let candidateIndex: Int
+        let exampleID: String
+        let split: PromptExperimentDatasetSplit
+        let score: Double?
+        let feedback: String
+        let failureKind: PromptExperimentOptimizationFailureKind?
+        let output: String?
+        let elapsedSeconds: Double?
+    }
+
+    struct PromptExperimentOptimizationRuntimeResult: Codable, Equatable {
+        let engine: String
+        let upstreamRevision: String
+        let baselineScore: Double?
+        let bestScore: Double?
+        let bestCandidateIndex: Int?
+        let candidates: [String]
+        let parentIndices: [[Int]]
+        let aggregateScores: [Double?]
+        let evaluations: [PromptExperimentOptimizationRuntimeEvaluation]
+        let totalEvaluations: Int
+        let wallTimeSeconds: Double?
+        let proposerUsage: String
+        let runDirectoryRelativePath: String?
+        let rawResultJSON: Data
+    }
+
+    struct PromptExperimentOptimizationResult: Codable, Equatable {
+        let engine: String
+        let upstreamRevision: String
+        let baselineScore: Double?
+        let bestScore: Double?
+        let bestCandidateIndex: Int?
+        let candidates: [PromptExperimentCandidateEvidence]
+        let evaluations: [PromptExperimentEvaluationEvidence]
+        let totalEvaluations: Int
+        let wallTimeSeconds: Double?
+        let proposerUsage: String
+        let runDirectoryRelativePath: String?
+        let rawResultEvidence: PromptExperimentArtifactReference?
+    }
+
     struct PromptExperimentDraft: Codable, Equatable, Identifiable {
         private struct DigestPayload: Codable {
             let id: UUID
@@ -108,6 +254,7 @@
             let candidateInstructions: String
             let targetRole: String
             let repetitions: Int
+            let optimization: PromptExperimentOptimizationSpecification?
             let createdAt: Date
         }
 
@@ -128,6 +275,7 @@
         var candidateInstructions: String
         var targetRole: String
         var repetitions: Int
+        var optimization: PromptExperimentOptimizationSpecification?
         let createdAt: Date
         var updatedAt: Date
 
@@ -143,6 +291,7 @@
             candidateInstructions: String = "",
             targetRole: String = "explore",
             repetitions: Int = 1,
+            optimization: PromptExperimentOptimizationSpecification? = nil,
             createdAt: Date,
             updatedAt: Date
         ) {
@@ -157,6 +306,7 @@
             self.candidateInstructions = candidateInstructions
             self.targetRole = targetRole
             self.repetitions = repetitions
+            self.optimization = optimization
             self.createdAt = createdAt
             self.updatedAt = updatedAt
         }
@@ -177,6 +327,7 @@
                 candidateInstructions: candidateInstructions,
                 targetRole: targetRole,
                 repetitions: repetitions,
+                optimization: optimization,
                 createdAt: createdAt
             ))
         }
@@ -192,7 +343,10 @@
                 throw PromptExperimentAuthorityError.invalidDraft("Synthetic fixtures are limited to \(Self.maximumFixtureBytes) UTF-8 bytes.")
             }
             guard originalInstructions.count <= Self.maximumInstructionCharacters,
-                  candidateInstructions.count <= Self.maximumInstructionCharacters
+                  candidateInstructions.count <= Self.maximumInstructionCharacters,
+                  (optimization?.seedCandidate?.count ?? 0) <= Self.maximumInstructionCharacters,
+                  (optimization?.objective.count ?? 0) <= Self.maximumTaskCharacters,
+                  (optimization?.background.count ?? 0) <= Self.maximumInstructionCharacters
             else {
                 throw PromptExperimentAuthorityError.invalidDraft("Each instruction variant is limited to \(Self.maximumInstructionCharacters) characters.")
             }
@@ -201,6 +355,72 @@
 
         func validated() throws -> Self {
             _ = try validatedBounds()
+            if var optimization {
+                optimization.objective = optimization.objective.trimmingCharacters(in: .whitespacesAndNewlines)
+                optimization.background = optimization.background.trimmingCharacters(in: .whitespacesAndNewlines)
+                optimization.seedCandidate = optimization.seedCandidate?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if optimization.seedCandidate?.isEmpty == true { optimization.seedCandidate = nil }
+                guard !optimization.objective.isEmpty else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Enter an optimization objective.")
+                }
+                guard optimization.gepa.engine == "gepa" else {
+                    throw PromptExperimentAuthorityError.invalidDraft("This integration currently admits only the upstream GEPA engine.")
+                }
+                guard (2 ... 10000).contains(optimization.gepa.maxEvaluations) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("GEPA max evaluations must be between 2 and 10,000.")
+                }
+                guard (30 ... 86400).contains(optimization.gepa.maxWallClockSeconds) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("GEPA wall-clock limit must be between 30 seconds and 24 hours.")
+                }
+                guard !optimization.gepa.pythonExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Configure the external Python executable containing pinned GEPA before sealing.")
+                }
+                let ids = optimization.examples.map(\.id)
+                guard Set(ids).count == ids.count, ids.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Dataset example IDs must be non-empty and unique.")
+                }
+                guard !optimization.examples.isEmpty else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Add at least one reviewed evaluation example.")
+                }
+                guard optimization.examples.contains(where: { $0.split != .hiddenTest }) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("At least one training or validation example must be visible to GEPA.")
+                }
+                switch optimization.execution.adapter {
+                case .contextBuilder:
+                    guard optimization.execution.targetSelector?.isEmpty == false else {
+                        throw PromptExperimentAuthorityError.invalidDraft("Select a Context Builder execution target.")
+                    }
+                case .sandboxedCommand:
+                    guard optimization.evaluator.kind == .sandboxedCommand else {
+                        throw PromptExperimentAuthorityError.invalidDraft("Sandboxed command execution requires a sandboxed command evaluator.")
+                    }
+                }
+                switch optimization.evaluator.kind {
+                case .exactMatch:
+                    guard optimization.examples.allSatisfy({ $0.expectedOutput?.isEmpty == false }) else {
+                        throw PromptExperimentAuthorityError.invalidDraft("Exact-match examples require reviewed expected outputs.")
+                    }
+                case .connectedModelJudge:
+                    guard !optimization.evaluator.rubric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                          optimization.evaluator.judgeTargetSelector?.isEmpty == false
+                    else {
+                        throw PromptExperimentAuthorityError.invalidDraft("A connected-model judge requires a rubric and exact judge target.")
+                    }
+                case .sandboxedCommand:
+                    guard optimization.evaluator.command?.isEmpty == false,
+                          optimization.evaluator.candidateFileName?.isEmpty == false
+                    else {
+                        throw PromptExperimentAuthorityError.invalidDraft("A sandboxed command evaluator requires a command and candidate file name.")
+                    }
+                }
+                var copy = self
+                copy.optimization = optimization
+                copy.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !copy.title.isEmpty else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Enter an experiment title.")
+                }
+                return copy
+            }
             let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedTask = taskInput.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedFixture = syntheticFixture.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -294,10 +514,27 @@
             let comparisonMode: String
         }
 
-        static let schemaVersion = 1
+        struct OptimizationDigestPayload: Codable {
+            let schemaVersion: Int
+            let revision: Int
+            let parentPlanID: UUID?
+            let title: String
+            let optimization: PromptExperimentOptimizationSpecification
+            let resolvedTargets: PromptExperimentOptimizationTargets
+            let environment: PromptExperimentEnvironment
+            let executionAdapter: String
+            let comparisonMode: String
+        }
+
+        static let legacySchemaVersion = 1
+        static let optimizationSchemaVersion = 2
+        static let schemaVersion = legacySchemaVersion
         static let executionAdapter = "context_builder_native_v1"
         static let comparisonMode = "fixed_serial_interleaved_v1"
+        static let gepaExecutionAdapter = "upstream_gepa_optimize_anything_v1"
+        static let gepaComparisonMode = "budgeted_pareto_search_v1"
 
+        let schemaVersion: Int?
         let id: UUID
         let revision: Int
         let parentPlanID: UUID?
@@ -314,14 +551,69 @@
         let sealedAt: Date
         let trials: [PromptExperimentTrial]
         let limitations: [String]
+        let optimization: PromptExperimentOptimizationSpecification?
+        let optimizationTargets: PromptExperimentOptimizationTargets?
 
         static func seal(
             draft: PromptExperimentDraft,
             target: PromptExperimentResolvedTarget,
+            optimizationTargets: PromptExperimentOptimizationTargets? = nil,
             environment: PromptExperimentEnvironment,
             at date: Date
         ) throws -> Self {
             let draft = try draft.validated()
+            if let optimization = draft.optimization {
+                guard let optimizationTargets else {
+                    throw PromptExperimentAuthorityError.targetUnavailable("The sealed GEPA envelope is missing resolved targets.")
+                }
+                let payload = OptimizationDigestPayload(
+                    schemaVersion: optimizationSchemaVersion,
+                    revision: draft.revision,
+                    parentPlanID: draft.parentPlanID,
+                    title: draft.title,
+                    optimization: optimization,
+                    resolvedTargets: optimizationTargets,
+                    environment: environment,
+                    executionAdapter: gepaExecutionAdapter,
+                    comparisonMode: gepaComparisonMode
+                )
+                let digest = try PromptExperimentDigest.canonicalSHA256(payload)
+                let planID = PromptExperimentDigest.deterministicUUID(namespace: "plan", value: digest)
+                let trial = PromptExperimentTrial(
+                    id: PromptExperimentDigest.deterministicUUID(namespace: "gepa-run", value: digest),
+                    ordinal: 1,
+                    condition: .optimization,
+                    repetition: 1
+                )
+                return Self(
+                    schemaVersion: optimizationSchemaVersion,
+                    id: planID,
+                    revision: draft.revision,
+                    parentPlanID: draft.parentPlanID,
+                    title: draft.title,
+                    taskInput: draft.taskInput,
+                    originalInstructions: draft.originalInstructions,
+                    candidateInstructions: draft.candidateInstructions,
+                    resolvedTarget: optimizationTargets.execution ?? optimizationTargets.reflection,
+                    environment: environment,
+                    repetitions: 1,
+                    executionAdapter: gepaExecutionAdapter,
+                    comparisonMode: gepaComparisonMode,
+                    digest: digest,
+                    sealedAt: date,
+                    trials: [trial],
+                    limitations: [
+                        "Runs the pinned upstream GEPA optimize_anything engine in a separately configured Python environment; RPCE does not install Python packages.",
+                        "Context Builder is the first workflow adapter. Investigate and multi-agent adapters use the same host bridge but are not yet implemented.",
+                        "Reviewed examples are copied into an app-owned isolated environment. Direct loaded-workspace execution and hidden source access are not admitted.",
+                        "Generated-code commands run only under the sealed macOS Seatbelt profile; unsupported sandbox hosts fail closed.",
+                        "Infrastructure failures remain inconclusive and are never converted to candidate score zero.",
+                        "Applying a winning candidate remains a separate user-authorized action and is not implemented by the agent tool."
+                    ],
+                    optimization: optimization,
+                    optimizationTargets: optimizationTargets
+                )
+            }
             let payload = DigestPayload(
                 schemaVersion: schemaVersion,
                 revision: draft.revision,
@@ -339,6 +631,7 @@
             let digest = try PromptExperimentDigest.canonicalSHA256(payload)
             let planID = PromptExperimentDigest.deterministicUUID(namespace: "plan", value: digest)
             return Self(
+                schemaVersion: legacySchemaVersion,
                 id: planID,
                 revision: draft.revision,
                 parentPlanID: draft.parentPlanID,
@@ -361,7 +654,9 @@
                     "The pilot supports catalog-resolved Claude-compatible and Codex login-backed discovery targets. ACP and other target families remain unsupported.",
                     "The synthetic fixture digest is verified before and after each trial; a mismatch disqualifies the attempt.",
                     "Subscription-backed provider cost is not represented as a hard currency budget."
-                ]
+                ],
+                optimization: nil,
+                optimizationTargets: nil
             )
         }
 
@@ -369,12 +664,34 @@
             switch condition {
             case .original: originalInstructions
             case .candidate: candidateInstructions
+            case .optimization: optimization?.execution.instructions ?? candidateInstructions
             }
         }
 
         func verifiesIntegrity() -> Bool {
+            if let optimization {
+                guard schemaVersion == Self.optimizationSchemaVersion,
+                      let optimizationTargets,
+                      trials.count == 1,
+                      trials.first?.condition == .optimization
+                else { return false }
+                let payload = OptimizationDigestPayload(
+                    schemaVersion: Self.optimizationSchemaVersion,
+                    revision: revision,
+                    parentPlanID: parentPlanID,
+                    title: title,
+                    optimization: optimization,
+                    resolvedTargets: optimizationTargets,
+                    environment: environment,
+                    executionAdapter: executionAdapter,
+                    comparisonMode: comparisonMode
+                )
+                return (try? PromptExperimentDigest.canonicalSHA256(payload)) == digest
+                    && id == PromptExperimentDigest.deterministicUUID(namespace: "plan", value: digest)
+                    && trials.first?.id == PromptExperimentDigest.deterministicUUID(namespace: "gepa-run", value: digest)
+            }
             let payload = DigestPayload(
-                schemaVersion: Self.schemaVersion,
+                schemaVersion: Self.legacySchemaVersion,
                 revision: revision,
                 parentPlanID: parentPlanID,
                 title: title,
@@ -482,6 +799,7 @@
         var lateResultAfterCancellation: Bool
         var fixtureDigestBefore: String?
         var fixtureDigestAfter: String?
+        var optimizationResult: PromptExperimentOptimizationResult?
 
         init(trial: PromptExperimentTrial, plan: PromptExperimentPlan) {
             id = PromptExperimentDigest.deterministicUUID(namespace: "attempt", value: trial.id.uuidString)
@@ -508,6 +826,7 @@
             lateResultAfterCancellation = false
             fixtureDigestBefore = nil
             fixtureDigestAfter = nil
+            optimizationResult = nil
         }
     }
 
@@ -603,6 +922,7 @@
         let handoffUnavailableReason: String?
         let fixtureDigestBefore: String
         let fixtureDigestAfter: String?
+        var optimizationResult: PromptExperimentOptimizationRuntimeResult?
     }
 
     enum PromptExperimentSubmissionError: LocalizedError, Equatable {

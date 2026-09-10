@@ -16,11 +16,40 @@
             let controlToken: UUID
         }
 
+        private struct RunningOptimization {
+            let task: Task<PromptExperimentRuntimeResult, Never>
+            let worker: PromptExperimentGEPAWorker
+        }
+
         private weak var windowState: WindowState?
         private var running: [UUID: RunningAttempt] = [:]
+        private var runningOptimizations: [UUID: RunningOptimization] = [:]
+        private var optimizationChildren: [UUID: [PromptExperimentRuntimeHandle]] = [:]
+        private var cancelledOptimizationIDs: Set<UUID> = []
 
         init(windowState: WindowState) {
             self.windowState = windowState
+        }
+
+        func preflightOptimization(_ plan: PromptExperimentPlan) async throws {
+            guard let optimization = plan.optimization else { return }
+            guard plan.executionAdapter == PromptExperimentPlan.gepaExecutionAdapter,
+                  plan.verifiesIntegrity(),
+                  plan.optimizationTargets != nil
+            else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed upstream GEPA plan is invalid.")
+            }
+            guard optimization.gepa.engine == "gepa" else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Only the pinned upstream GEPA engine is admitted.")
+            }
+            guard FileManager.default.fileExists(atPath: "/usr/bin/sandbox-exec")
+                || optimization.evaluator.kind != .sandboxedCommand
+            else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator requires macOS sandbox-exec, which is unavailable.")
+            }
+            try await PromptExperimentGEPAWorker.preflight(
+                pythonExecutable: optimization.gepa.pythonExecutablePath
+            )
         }
 
         func submit(
@@ -34,11 +63,14 @@
                 throw PromptExperimentSubmissionError.rejected("This attempt already has a runtime submission.")
             }
             let plan = request.plan
-            guard plan.executionAdapter == PromptExperimentPlan.executionAdapter,
-                  plan.verifiesIntegrity(),
-                  plan.environment.fixtureFiles.count == 1
-            else {
+            guard plan.verifiesIntegrity(), plan.environment.fixtureFiles.count == 1 else {
                 throw PromptExperimentSubmissionError.rejected("The sealed plan or synthetic environment is invalid.")
+            }
+            if plan.optimization != nil {
+                return try await submitOptimization(request, progress: progress)
+            }
+            guard plan.executionAdapter == PromptExperimentPlan.executionAdapter else {
+                throw PromptExperimentSubmissionError.rejected("The legacy Context Builder plan adapter is invalid.")
             }
             let rootURL = URL(fileURLWithPath: plan.environment.isolatedRootPath).standardizedFileURL
             let liveEnvironmentsURL = PromptExperimentStore.liveRootURL()
@@ -240,7 +272,462 @@
             }
         }
 
+        private enum OptimizationTimeoutError: LocalizedError {
+            case exceeded(Int)
+
+            var errorDescription: String? {
+                switch self {
+                case let .exceeded(seconds): "GEPA exceeded the sealed wall-clock limit of \(seconds) seconds."
+                }
+            }
+        }
+
+        private func submitOptimization(
+            _ request: PromptExperimentRunRequest,
+            progress: @escaping @MainActor @Sendable (String) async -> Void
+        ) async throws -> PromptExperimentRuntimeHandle {
+            guard request.plan.executionAdapter == PromptExperimentPlan.gepaExecutionAdapter,
+                  let optimization = request.plan.optimization,
+                  request.plan.optimizationTargets != nil
+            else {
+                throw PromptExperimentSubmissionError.rejected("The sealed GEPA optimization envelope is incomplete.")
+            }
+            guard runningOptimizations[request.attempt.id] == nil else {
+                throw PromptExperimentSubmissionError.rejected("This GEPA run already has a runtime submission.")
+            }
+            let beforeDigest: String
+            do {
+                beforeDigest = try verifyEnvironment(request.plan.environment)
+                try await preflightOptimization(request.plan)
+            } catch {
+                throw PromptExperimentSubmissionError.rejected(error.localizedDescription)
+            }
+            let worker = PromptExperimentGEPAWorker()
+            cancelledOptimizationIDs.remove(request.attempt.id)
+            let task = Task { @MainActor [self] in
+                do {
+                    let result = try await withThrowingTaskGroup(of: PromptExperimentOptimizationRuntimeResult.self) { group in
+                        group.addTask {
+                            try await worker.run(
+                                plan: request.plan,
+                                attemptID: request.attempt.id,
+                                host: { operation, payload in
+                                    await self.handleGEPAHostRequest(
+                                        parentRequest: request,
+                                        operation: operation,
+                                        payload: payload,
+                                        progress: progress
+                                    )
+                                },
+                                progress: progress
+                            )
+                        }
+                        group.addTask {
+                            try await Task.sleep(for: .seconds(optimization.gepa.maxWallClockSeconds))
+                            throw OptimizationTimeoutError.exceeded(optimization.gepa.maxWallClockSeconds)
+                        }
+                        guard let first = try await group.next() else {
+                            throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA produced no terminal result.")
+                        }
+                        group.cancelAll()
+                        worker.cancel()
+                        return first
+                    }
+                    return PromptExperimentRuntimeResult(
+                        disposition: .completed,
+                        runtimeLink: PromptExperimentRuntimeLink(
+                            adapter: PromptExperimentPlan.gepaExecutionAdapter,
+                            tabID: nil,
+                            runID: request.attempt.id,
+                            provider: request.plan.optimizationTargets?.reflection.agentRaw,
+                            model: request.plan.optimizationTargets?.reflection.modelRaw
+                        ),
+                        committedHandoff: nil,
+                        assistantOutput: nil,
+                        handoffUnavailableReason: nil,
+                        fixtureDigestBefore: beforeDigest,
+                        fixtureDigestAfter: try? verifyEnvironment(request.plan.environment),
+                        optimizationResult: result
+                    )
+                } catch is CancellationError {
+                    cancelledOptimizationIDs.insert(request.attempt.id)
+                    await cancelAndDrainOptimizationChildren(parentID: request.attempt.id)
+                    return PromptExperimentRuntimeResult(
+                        disposition: .cancelled,
+                        runtimeLink: PromptExperimentRuntimeLink(
+                            adapter: PromptExperimentPlan.gepaExecutionAdapter,
+                            tabID: nil,
+                            runID: request.attempt.id,
+                            provider: request.plan.optimizationTargets?.reflection.agentRaw,
+                            model: request.plan.optimizationTargets?.reflection.modelRaw
+                        ),
+                        committedHandoff: nil,
+                        assistantOutput: nil,
+                        handoffUnavailableReason: "GEPA was cancelled after active app-owned provider work settled.",
+                        fixtureDigestBefore: beforeDigest,
+                        fixtureDigestAfter: try? verifyEnvironment(request.plan.environment)
+                    )
+                } catch {
+                    cancelledOptimizationIDs.insert(request.attempt.id)
+                    await cancelAndDrainOptimizationChildren(parentID: request.attempt.id)
+                    worker.cancel()
+                    return PromptExperimentRuntimeResult(
+                        disposition: .failed(error.localizedDescription),
+                        runtimeLink: PromptExperimentRuntimeLink(
+                            adapter: PromptExperimentPlan.gepaExecutionAdapter,
+                            tabID: nil,
+                            runID: request.attempt.id,
+                            provider: request.plan.optimizationTargets?.reflection.agentRaw,
+                            model: request.plan.optimizationTargets?.reflection.modelRaw
+                        ),
+                        committedHandoff: nil,
+                        assistantOutput: nil,
+                        handoffUnavailableReason: "Upstream GEPA infrastructure failed before producing an immutable result.",
+                        fixtureDigestBefore: beforeDigest,
+                        fixtureDigestAfter: try? verifyEnvironment(request.plan.environment)
+                    )
+                }
+            }
+            runningOptimizations[request.attempt.id] = RunningOptimization(task: task, worker: worker)
+            optimizationChildren[request.attempt.id] = []
+            await progress("Pinned GEPA \(PromptExperimentGEPAConfiguration.packageVersion) worker admitted; model credentials remain in RepoPrompt.")
+            return PromptExperimentRuntimeHandle(id: request.attempt.id, tabID: nil, runID: request.attempt.id)
+        }
+
+        private func handleGEPAHostRequest(
+            parentRequest: PromptExperimentRunRequest,
+            operation: String,
+            payload: [String: Any],
+            progress: @escaping @MainActor @Sendable (String) async -> Void
+        ) async -> PromptExperimentGEPAHostReply {
+            guard !cancelledOptimizationIDs.contains(parentRequest.attempt.id) else {
+                return infrastructureReply("The GEPA run was cancelled before this host request could start.")
+            }
+            guard let specification = parentRequest.plan.optimization,
+                  let targets = parentRequest.plan.optimizationTargets
+            else {
+                return infrastructureReply("The sealed GEPA host configuration is unavailable.")
+            }
+            do {
+                switch operation {
+                case "reflect":
+                    let promptValue = payload["prompt"]
+                    let prompt: String
+                    if let value = promptValue as? String {
+                        prompt = value
+                    } else if JSONSerialization.isValidJSONObject(promptValue as Any) {
+                        prompt = try String(decoding: JSONSerialization.data(withJSONObject: promptValue as Any, options: [.sortedKeys]), as: UTF8.self)
+                    } else {
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA supplied an invalid reflection prompt.")
+                    }
+                    await progress("GEPA is requesting a reflection proposal from \(targets.reflection.displayName).")
+                    let output = try await invokeContextBuilder(
+                        parentRequest: parentRequest,
+                        target: targets.reflection,
+                        taskInput: prompt,
+                        instructions: "Act as GEPA's reflection language model. Return only the proposed replacement candidate; do not access or modify any source outside the sealed synthetic environment.",
+                        progress: progress
+                    )
+                    let wrapped = output.contains("```") ? output : "```\n\(output)\n```"
+                    return PromptExperimentGEPAHostReply(
+                        ok: true,
+                        output: wrapped,
+                        score: nil,
+                        feedback: nil,
+                        failureKind: nil,
+                        error: nil,
+                        elapsedSeconds: nil
+                    )
+                case "evaluate":
+                    guard let candidate = payload["candidate"] as? String,
+                          let example = payload["example"] as? [String: Any]
+                    else { throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA supplied an invalid evaluation request.") }
+                    return try await evaluate(
+                        candidate: candidate,
+                        example: example,
+                        parentRequest: parentRequest,
+                        specification: specification,
+                        targets: targets,
+                        progress: progress
+                    )
+                default:
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("Unsupported GEPA host operation: \(operation)")
+                }
+            } catch {
+                return infrastructureReply(error.localizedDescription)
+            }
+        }
+
+        private func evaluate(
+            candidate: String,
+            example: [String: Any],
+            parentRequest: PromptExperimentRunRequest,
+            specification: PromptExperimentOptimizationSpecification,
+            targets: PromptExperimentOptimizationTargets,
+            progress: @escaping @MainActor @Sendable (String) async -> Void
+        ) async throws -> PromptExperimentGEPAHostReply {
+            let started = Date()
+            if specification.evaluator.kind == .sandboxedCommand {
+                return try await evaluateSandboxedCommand(
+                    candidate: candidate,
+                    example: example,
+                    request: parentRequest,
+                    specification: specification,
+                    started: started
+                )
+            }
+            guard let executionTarget = targets.execution else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed execution target is unavailable.")
+            }
+            let input = example["input"] as? String ?? ""
+            await progress("Evaluating a GEPA candidate through Context Builder on reviewed example \(example["id"] as? String ?? "unknown").")
+            let output = try await invokeContextBuilder(
+                parentRequest: parentRequest,
+                target: executionTarget,
+                taskInput: input,
+                instructions: """
+                \(specification.execution.instructions)
+
+                Candidate instructions (immutable for this evaluation):
+                \(candidate)
+                """,
+                progress: progress
+            )
+            let elapsed = Date().timeIntervalSince(started)
+            switch specification.evaluator.kind {
+            case .exactMatch:
+                let expected = example["expected_output"] as? String ?? ""
+                let matched = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    == expected.trimmingCharacters(in: .whitespacesAndNewlines)
+                let score = matched ? specification.evaluator.maximumScore : specification.evaluator.minimumScore
+                let feedback = matched
+                    ? "Output matched the reviewed expected output. Preserve this behavior."
+                    : "Expected:\n\(expected)\nActual:\n\(output)\nRevise the candidate to close this concrete gap without memorizing the example."
+                return PromptExperimentGEPAHostReply(
+                    ok: true,
+                    output: output,
+                    score: score,
+                    feedback: feedback,
+                    failureKind: nil,
+                    error: nil,
+                    elapsedSeconds: elapsed
+                )
+            case .connectedModelJudge:
+                guard let judge = targets.judge else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed judge target is unavailable.")
+                }
+                let expected = example["expected_output"] as? String ?? "unavailable"
+                let judgePrompt = """
+                Evaluate the candidate run using the immutable rubric below. Return only JSON with numeric `score` and string `feedback`.
+                Score range: \(specification.evaluator.minimumScore)...\(specification.evaluator.maximumScore)
+                Rubric:\n\(specification.evaluator.rubric)
+                Input:\n\(input)
+                Reviewed expected output (may be unavailable):\n\(expected)
+                Actual output:\n\(output)
+                """
+                let rawJudgment = try await invokeContextBuilder(
+                    parentRequest: parentRequest,
+                    target: judge,
+                    taskInput: judgePrompt,
+                    instructions: "Return only the requested evaluator JSON. Do not propose or reveal hidden examples.",
+                    progress: progress
+                )
+                let object = try parseJSONObject(rawJudgment)
+                guard let score = (object["score"] as? NSNumber)?.doubleValue,
+                      score >= specification.evaluator.minimumScore,
+                      score <= specification.evaluator.maximumScore,
+                      let feedback = object["feedback"] as? String
+                else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("The connected-model evaluator returned invalid score JSON.")
+                }
+                return PromptExperimentGEPAHostReply(
+                    ok: true,
+                    output: output,
+                    score: score,
+                    feedback: feedback,
+                    failureKind: nil,
+                    error: nil,
+                    elapsedSeconds: elapsed
+                )
+            case .sandboxedCommand:
+                fatalError("handled above")
+            }
+        }
+
+        private func invokeContextBuilder(
+            parentRequest: PromptExperimentRunRequest,
+            target: PromptExperimentResolvedTarget,
+            taskInput: String,
+            instructions: String,
+            progress: @escaping @MainActor @Sendable (String) async -> Void
+        ) async throws -> String {
+            let date = Date()
+            let childDraft = PromptExperimentDraft(
+                revision: parentRequest.plan.revision,
+                title: "GEPA host callback",
+                taskInput: taskInput,
+                syntheticFixture: "Sealed evaluation dataset; see fixture inventory.",
+                originalInstructions: "GEPA host callback baseline (not executed).",
+                candidateInstructions: instructions,
+                targetRole: target.selector,
+                repetitions: 1,
+                createdAt: date,
+                updatedAt: date
+            )
+            let childPlan = try PromptExperimentPlan.seal(
+                draft: childDraft,
+                target: target,
+                environment: parentRequest.plan.environment,
+                at: date
+            )
+            guard let trial = childPlan.trials.first(where: { $0.condition == .candidate }) else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Could not construct the Context Builder callback trial.")
+            }
+            let childAttempt = PromptExperimentAttempt(trial: trial, plan: childPlan)
+            let childRequest = PromptExperimentRunRequest(
+                experimentID: parentRequest.experimentID,
+                controllerSessionID: parentRequest.controllerSessionID,
+                plan: childPlan,
+                attempt: childAttempt
+            )
+            let handle = try await submit(childRequest, progress: progress)
+            optimizationChildren[parentRequest.attempt.id, default: []].append(handle)
+            if cancelledOptimizationIDs.contains(parentRequest.attempt.id) {
+                _ = await cancel(handle)
+                _ = await wait(for: handle)
+                throw CancellationError()
+            }
+            let result = await wait(for: handle)
+            optimizationChildren[parentRequest.attempt.id]?.removeAll { $0.id == handle.id }
+            switch result.disposition {
+            case .completed:
+                guard let prompt = result.committedHandoff?.prompt else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable(result.handoffUnavailableReason ?? "Context Builder callback committed no output.")
+                }
+                return prompt
+            case let .failed(message):
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Context Builder callback failed: \(message)")
+            case .cancelled:
+                throw CancellationError()
+            }
+        }
+
+        private func evaluateSandboxedCommand(
+            candidate: String,
+            example: [String: Any],
+            request: PromptExperimentRunRequest,
+            specification: PromptExperimentOptimizationSpecification,
+            started: Date
+        ) async throws -> PromptExperimentGEPAHostReply {
+            guard let command = specification.evaluator.command,
+                  let fileName = specification.evaluator.candidateFileName,
+                  fileName == URL(fileURLWithPath: fileName).lastPathComponent,
+                  !fileName.contains("..")
+            else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed candidate file name is unsafe.")
+            }
+            let workspace = PromptExperimentStore.liveRootURL()
+                .appendingPathComponent("command-runs", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+            try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+            try Data(candidate.utf8).write(to: workspace.appendingPathComponent(fileName), options: [.atomic])
+            let exampleData = try JSONSerialization.data(withJSONObject: example, options: [.prettyPrinted, .sortedKeys])
+            try exampleData.write(to: workspace.appendingPathComponent("example.json"), options: [.atomic])
+            let escaped = workspace.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            let profile = """
+            (version 1)
+            (deny default)
+            (allow process*)
+            (allow sysctl-read)
+            (allow mach-lookup)
+            (allow file-read* (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/Library") (subpath "\(escaped)"))
+            (allow file-write* (subpath "\(escaped)"))
+            """
+            let runner = CLIProcessRunner(config: CLIProcessConfiguration(
+                command: "/usr/bin/sandbox-exec",
+                workingDirectory: workspace.path,
+                environment: ["HOME": workspace.path, "TMPDIR": workspace.path],
+                captureStdoutTailBytes: 1024 * 1024,
+                captureStderrTailBytes: 1024 * 1024
+            ))
+            let result = try await runner.run(
+                args: ["-p", profile, "/bin/zsh", "-lc", command],
+                stdin: nil,
+                outputMode: .none,
+                timeout: min(300, TimeInterval(specification.gepa.maxWallClockSeconds)),
+                cancelChildOnTaskCancellation: true
+            )
+            let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
+            let stderr = String(data: result.stderr, encoding: .utf8) ?? ""
+            if result.timedOut || result.status != 0 {
+                let message = result.timedOut
+                    ? "Candidate command exceeded its sealed per-evaluation timeout."
+                    : "Candidate command exited \(result.status).\n\(stderr)"
+                return PromptExperimentGEPAHostReply(
+                    ok: false,
+                    output: stdout,
+                    score: specification.evaluator.minimumScore,
+                    feedback: message,
+                    failureKind: .candidate,
+                    error: message,
+                    elapsedSeconds: Date().timeIntervalSince(started)
+                )
+            }
+            let object = try parseJSONObject(stdout)
+            guard let score = (object["score"] as? NSNumber)?.doubleValue,
+                  score >= specification.evaluator.minimumScore,
+                  score <= specification.evaluator.maximumScore,
+                  let feedback = object["feedback"] as? String
+            else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator did not return valid score/feedback JSON.")
+            }
+            return PromptExperimentGEPAHostReply(
+                ok: true,
+                output: stdout,
+                score: score,
+                feedback: feedback,
+                failureKind: nil,
+                error: nil,
+                elapsedSeconds: Date().timeIntervalSince(started)
+            )
+        }
+
+        private func parseJSONObject(_ raw: String) throws -> [String: Any] {
+            var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.hasPrefix("```"), let firstNewline = text.firstIndex(of: "\n") {
+                text = String(text[text.index(after: firstNewline)...])
+                if let fence = text.range(of: "```", options: .backwards) {
+                    text.removeSubrange(fence.lowerBound...)
+                }
+            }
+            guard let data = text.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Evaluator output is not a JSON object.")
+            }
+            return object
+        }
+
+        private func infrastructureReply(_ message: String) -> PromptExperimentGEPAHostReply {
+            PromptExperimentGEPAHostReply(
+                ok: false,
+                output: nil,
+                score: nil,
+                feedback: nil,
+                failureKind: .infrastructure,
+                error: message,
+                elapsedSeconds: nil
+            )
+        }
+
         func wait(for handle: PromptExperimentRuntimeHandle) async -> PromptExperimentRuntimeResult {
+            if let optimization = runningOptimizations[handle.id] {
+                let result = await optimization.task.value
+                runningOptimizations.removeValue(forKey: handle.id)
+                optimizationChildren.removeValue(forKey: handle.id)
+                cancelledOptimizationIDs.remove(handle.id)
+                return result
+            }
             guard let attempt = running[handle.id] else {
                 return PromptExperimentRuntimeResult(
                     disposition: .failed("The accepted runtime attempt is no longer registered."),
@@ -264,6 +751,13 @@
         }
 
         func cancel(_ handle: PromptExperimentRuntimeHandle) async -> PromptExperimentCancellationObservation {
+            if let optimization = runningOptimizations[handle.id] {
+                cancelledOptimizationIDs.insert(handle.id)
+                await cancelAndDrainOptimizationChildren(parentID: handle.id)
+                optimization.worker.cancel()
+                optimization.task.cancel()
+                return .requested
+            }
             guard let attempt = running[handle.id] else { return .alreadySettled }
             attempt.task.cancel()
             guard let windowState else {
@@ -271,6 +765,15 @@
             }
             await windowState.contextBuilderAgentViewModel.cancelMCPContextBuilderRun(forTabID: attempt.tabID)
             return .requested
+        }
+
+        private func cancelAndDrainOptimizationChildren(parentID: UUID) async {
+            let children = optimizationChildren[parentID, default: []]
+            for child in children {
+                _ = await cancel(child)
+                _ = await wait(for: child)
+            }
+            optimizationChildren[parentID] = []
         }
 
         static func runtimeResult(

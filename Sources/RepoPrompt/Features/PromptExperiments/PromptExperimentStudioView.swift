@@ -66,7 +66,7 @@
                         if controllerSessionID == nil {
                             Text("Start or select a persisted Agent session first. Experiments are linked to that session.")
                         } else {
-                            Text("Create a fixed, synthetic-fixture-only original/candidate comparison.")
+                            Text("Start the Prompt Experiment workflow so its Agent session can shape and seal a real GEPA optimization proposal.")
                         }
                     }
                 }
@@ -94,7 +94,7 @@
             guard let controllerSessionID, let sourceTabID else { return }
             Task {
                 do {
-                    selectedExperimentID = try await service.createExperiment(
+                    selectedExperimentID = try await service.createOptimizationExperiment(
                         controllerSessionID: controllerSessionID,
                         sourceTabID: sourceTabID
                     )
@@ -108,7 +108,7 @@
     private struct PromptExperimentRecordView: View {
         @ObservedObject var service: PromptExperimentService
         let record: PromptExperimentRecord
-        @State private var approvalAcknowledged = false
+        @State private var acknowledgedDigest: String?
         @State private var errorMessage: String?
 
         var body: some View {
@@ -126,12 +126,21 @@
                     }
                     statusPanel
                     if let draft = record.draft {
-                        PromptExperimentDraftEditor(
-                            service: service,
-                            experimentID: record.id,
-                            draft: draft,
-                            errorMessage: $errorMessage
-                        )
+                        GroupBox("Agent-owned proposal draft") {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Draft version \(draft.optimisticVersion) · revision \(draft.revision)")
+                                    .font(.subheadline.bold())
+                                Text("Continue the linked Agent conversation to revise the objective, reviewed examples, evaluator, targets, and budget. Native controls intentionally do not duplicate that schema.")
+                                    .foregroundStyle(.secondary)
+                                if let optimization = draft.optimization {
+                                    LabeledContent("Objective", value: optimization.objective.isEmpty ? "Not yet proposed" : optimization.objective)
+                                    LabeledContent("Reviewed examples", value: "\(optimization.examples.count)")
+                                    LabeledContent("Budget", value: "\(optimization.gepa.maxEvaluations) evaluations · \(optimization.gepa.maxWallClockSeconds)s")
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 4)
+                        }
                     }
                     if let plan = record.currentPlan {
                         planPanel(plan)
@@ -172,8 +181,16 @@
             GroupBox("Immutable plan revision \(plan.revision)") {
                 VStack(alignment: .leading, spacing: 10) {
                     LabeledContent("Target", value: plan.resolvedTarget.displayName)
-                    LabeledContent("Schedule", value: "\(plan.trials.count) serial trials")
-                    LabeledContent("Environment", value: "Synthetic fixture only")
+                    if let optimization = plan.optimization {
+                        LabeledContent("Engine", value: "Upstream GEPA \(PromptExperimentGEPAConfiguration.packageVersion)")
+                        LabeledContent("Budget", value: "\(optimization.gepa.maxEvaluations) evaluations · \(optimization.gepa.maxWallClockSeconds)s")
+                        LabeledContent("Examples", value: "\(optimization.examples.count) reviewed")
+                        LabeledContent("Evaluator", value: optimization.evaluator.kind.rawValue)
+                        LabeledContent("Environment", value: "App-owned reviewed dataset; command code Seatbelt-confined")
+                    } else {
+                        LabeledContent("Schedule", value: "\(plan.trials.count) serial trials")
+                        LabeledContent("Environment", value: "Legacy synthetic fixture")
+                    }
                     Text(plan.digest)
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
@@ -220,7 +237,10 @@
             if record.phase == .awaitingApproval {
                 GroupBox("Native approval") {
                     VStack(alignment: .leading, spacing: 10) {
-                        Toggle("I reviewed the exact digest displayed above", isOn: $approvalAcknowledged)
+                        Toggle("I reviewed the exact digest displayed above", isOn: Binding(
+                            get: { acknowledgedDigest == plan.digest },
+                            set: { acknowledgedDigest = $0 ? plan.digest : nil }
+                        ))
                         Button("Approve sealed plan") {
                             perform {
                                 try await service.approve(
@@ -231,7 +251,7 @@
                             }
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(!approvalAcknowledged)
+                        .disabled(acknowledgedDigest != plan.digest)
                         Text("Agents cannot invoke this authority. Approval does not start provider work.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -240,7 +260,7 @@
                     .padding(.vertical, 4)
                 }
             } else if record.phase == .approved {
-                Button("Run \(plan.trials.count) serial trials") {
+                Button(plan.optimization == nil ? "Run \(plan.trials.count) serial trials" : "Run approved GEPA search") {
                     perform { try await service.run(experimentID: record.id) }
                 }
                 .buttonStyle(.borderedProminent)
@@ -253,7 +273,7 @@
 
             if record.phase == .completed || record.phase == .inconclusive || record.phase == .cancelled {
                 HStack {
-                    Button("Next revision") {
+                    Button(plan.optimization == nil ? "Next revision" : "Continue from GEPA best") {
                         perform { try await service.startNextRevision(experimentID: record.id) }
                     }
                     Button("Reveal readable results") {
@@ -327,6 +347,47 @@
                                             .textSelection(.enabled)
                                     }
                                 }
+                                if let result = attempt.optimizationResult {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack {
+                                            Text("Upstream GEPA \(result.upstreamRevision.prefix(12))")
+                                                .font(.caption.bold())
+                                            Spacer()
+                                            Text("\(result.totalEvaluations) evaluations")
+                                                .font(.caption.monospaced())
+                                        }
+                                        Text("Best \(result.bestScore.map { String($0) } ?? "unavailable") vs baseline \(result.baselineScore.map { String($0) } ?? "unavailable")")
+                                            .font(.headline)
+                                        ForEach(result.candidates.sorted { ($0.aggregateScore ?? -.infinity) > ($1.aggregateScore ?? -.infinity) }) { candidate in
+                                            VStack(alignment: .leading, spacing: 3) {
+                                                Text("Candidate #\(candidate.index)\(candidate.isBaseline ? " · baseline" : "")\(candidate.isBest ? " · best" : "") · score \(candidate.aggregateScore.map { String($0) } ?? "unavailable")")
+                                                    .font(.subheadline.bold())
+                                                Text(candidate.candidatePreview)
+                                                    .font(.caption)
+                                                    .lineLimit(8)
+                                                    .textSelection(.enabled)
+                                                let feedback = result.evaluations.filter { $0.candidateIndex == candidate.index }
+                                                ForEach(feedback.prefix(3)) { evaluation in
+                                                    Text("\(evaluation.exampleID): \(evaluation.feedback)")
+                                                        .font(.caption)
+                                                        .foregroundStyle(evaluation.failureKind == .infrastructure ? .red : .secondary)
+                                                }
+                                            }
+                                            .padding(8)
+                                            .background(candidate.isBest ? Color.green.opacity(0.08) : Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                                        }
+                                        Text("Proposer usage: \(result.proposerUsage)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        Text("GEPA wall time: \(gepaWallTime(result))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        Text("Worker artifacts: \(gepaRunDirectory(result))")
+                                            .font(.caption.monospaced())
+                                            .textSelection(.enabled)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
                                 if let submittedAt = attempt.submittedAt, let settledAt = attempt.settledAt {
                                     Text("Elapsed \(settledAt.timeIntervalSince(submittedAt), format: .number.precision(.fractionLength(3))) s · provider token usage unavailable from completion contract")
                                         .font(.caption)
@@ -347,6 +408,14 @@
             }
         }
 
+        private func gepaWallTime(_ result: PromptExperimentOptimizationResult) -> String {
+            result.wallTimeSeconds.map { String(format: "%.3f s", $0) } ?? "unavailable"
+        }
+
+        private func gepaRunDirectory(_ result: PromptExperimentOptimizationResult) -> String {
+            result.runDirectoryRelativePath ?? "unavailable"
+        }
+
         private func selectionSummary(_ selection: StoredSelection) -> String {
             let paths = selection.selectedPaths.isEmpty
                 ? "no selected paths"
@@ -364,117 +433,6 @@
             Task {
                 do { try await operation() } catch { errorMessage = error.localizedDescription }
             }
-        }
-    }
-
-    private struct PromptExperimentDraftEditor: View {
-        @ObservedObject var service: PromptExperimentService
-        let experimentID: UUID
-        @Binding var errorMessage: String?
-        @State private var draft: PromptExperimentDraft
-        @State private var baseDraftID: UUID
-        @State private var baseDraftVersion: Int
-        @State private var baseDraftDigest: String
-
-        init(
-            service: PromptExperimentService,
-            experimentID: UUID,
-            draft: PromptExperimentDraft,
-            errorMessage: Binding<String?>
-        ) {
-            self.service = service
-            self.experimentID = experimentID
-            _draft = State(initialValue: draft)
-            _baseDraftID = State(initialValue: draft.id)
-            _baseDraftVersion = State(initialValue: draft.optimisticVersion)
-            _baseDraftDigest = State(initialValue: (try? draft.contentDigest()) ?? "")
-            _errorMessage = errorMessage
-        }
-
-        var body: some View {
-            GroupBox("Editable draft revision \(draft.revision)") {
-                VStack(alignment: .leading, spacing: 12) {
-                    TextField("Title", text: $draft.title)
-                    VStack(alignment: .leading) {
-                        Text("Fixed evaluation task").font(.caption.bold())
-                        TextEditor(text: $draft.taskInput).frame(minHeight: 70)
-                    }
-                    VStack(alignment: .leading) {
-                        Text("Synthetic fixture (the only trial-visible file)").font(.caption.bold())
-                        TextEditor(text: $draft.syntheticFixture).frame(minHeight: 100)
-                    }
-                    HStack(alignment: .top, spacing: 12) {
-                        instructionEditor("Original instructions", text: $draft.originalInstructions)
-                        instructionEditor("Candidate instructions", text: $draft.candidateInstructions)
-                    }
-                    HStack {
-                        Picker("Catalog target", selection: $draft.targetRole) {
-                            ForEach(service.availableTargets(), id: \.selector) { target in
-                                Text("\(target.selector) — \(target.displayName)").tag(target.selector)
-                            }
-                        }
-                        Stepper("Repetitions: \(draft.repetitions)", value: $draft.repetitions, in: 1 ... 3)
-                        Spacer()
-                        Button("Save draft") { save() }
-                        Button("Save and seal") { seal() }
-                            .buttonStyle(.borderedProminent)
-                    }
-                    Text("Loaded workspace content is intentionally unsupported. Sealing copies this synthetic fixture into app-owned durable storage.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 4)
-            }
-        }
-
-        private func instructionEditor(_ title: String, text: Binding<String>) -> some View {
-            VStack(alignment: .leading) {
-                Text(title).font(.caption.bold())
-                TextEditor(text: text).frame(minHeight: 120)
-            }
-        }
-
-        private func save() {
-            Task {
-                do {
-                    let updated = try await service.updateDraft(
-                        experimentID: experimentID,
-                        expectedDraftID: baseDraftID,
-                        expectedDraftVersion: baseDraftVersion,
-                        expectedDraftDigest: baseDraftDigest,
-                        draft: draft
-                    )
-                    adopt(updated)
-                } catch { errorMessage = error.localizedDescription }
-            }
-        }
-
-        private func seal() {
-            Task {
-                do {
-                    let updated = try await service.updateDraft(
-                        experimentID: experimentID,
-                        expectedDraftID: baseDraftID,
-                        expectedDraftVersion: baseDraftVersion,
-                        expectedDraftDigest: baseDraftDigest,
-                        draft: draft
-                    )
-                    adopt(updated)
-                    _ = try await service.seal(
-                        experimentID: experimentID,
-                        expectedDraftID: updated.id,
-                        expectedDraftVersion: updated.optimisticVersion,
-                        expectedDraftDigest: updated.contentDigest()
-                    )
-                } catch { errorMessage = error.localizedDescription }
-            }
-        }
-
-        private func adopt(_ updated: PromptExperimentDraft) {
-            draft = updated
-            baseDraftID = updated.id
-            baseDraftVersion = updated.optimisticVersion
-            baseDraftDigest = (try? updated.contentDigest()) ?? ""
         }
     }
 #endif

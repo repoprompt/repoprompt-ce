@@ -4,6 +4,7 @@
 
     @MainActor
     protocol PromptExperimentRuntime: AnyObject {
+        func preflightOptimization(_ plan: PromptExperimentPlan) async throws
         func submit(
             _ request: PromptExperimentRunRequest,
             progress: @escaping @MainActor @Sendable (String) async -> Void
@@ -12,9 +13,20 @@
         func cancel(_ handle: PromptExperimentRuntimeHandle) async -> PromptExperimentCancellationObservation
     }
 
+    extension PromptExperimentRuntime {
+        func preflightOptimization(_ plan: PromptExperimentPlan) async throws {
+            guard plan.optimization == nil else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The configured runtime does not support upstream GEPA optimization.")
+            }
+        }
+    }
+
     @MainActor
     final class PromptExperimentService: ObservableObject {
         private static var liveInstance: PromptExperimentService?
+        static var currentLiveInstance: PromptExperimentService? {
+            liveInstance
+        }
 
         static func live(windowState: WindowState) -> PromptExperimentService {
             if let liveInstance {
@@ -159,6 +171,66 @@
         }
 
         @discardableResult
+        func createOptimizationExperiment(controllerSessionID: UUID, sourceTabID: UUID) async throws -> UUID {
+            try await requireLoaded()
+            let date = now()
+            let experimentID = UUID()
+            let python = ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_PYTHON"] ?? ""
+            let draft = PromptExperimentDraft(
+                revision: 1,
+                title: "GEPA optimization",
+                targetRole: "",
+                optimization: PromptExperimentOptimizationSpecification(
+                    seedCandidate: nil,
+                    objective: "",
+                    background: "",
+                    examples: [],
+                    evaluator: PromptExperimentEvaluatorSpecification(
+                        kind: .exactMatch,
+                        rubric: "",
+                        judgeTargetSelector: nil,
+                        command: nil,
+                        candidateFileName: nil,
+                        minimumScore: 0,
+                        maximumScore: 1
+                    ),
+                    execution: PromptExperimentExecutionSpecification(
+                        adapter: .contextBuilder,
+                        targetSelector: nil,
+                        instructions: "Use the candidate as the governing instructions for this task."
+                    ),
+                    gepa: PromptExperimentGEPAConfiguration(
+                        engine: "gepa",
+                        pythonExecutablePath: python,
+                        reflectionTargetSelector: "",
+                        maxEvaluations: 40,
+                        maxWallClockSeconds: 1800,
+                        stopAtScore: 1,
+                        randomSeed: 0
+                    )
+                ),
+                createdAt: date,
+                updatedAt: date
+            )
+            records.insert(PromptExperimentRecord(
+                id: experimentID,
+                controllerSessionID: controllerSessionID,
+                sourceTabID: sourceTabID,
+                createdAt: date,
+                updatedAt: date,
+                phase: .drafting,
+                draft: draft,
+                plans: [],
+                approvals: [],
+                attempts: [],
+                cancellationRequestedAt: nil,
+                statusMessage: "Draft — the linked Agent session can propose a reviewed dataset, evaluator, targets, and GEPA budget."
+            ), at: 0)
+            try await persist()
+            return experimentID
+        }
+
+        @discardableResult
         func updateDraft(
             experimentID: UUID,
             expectedDraftID: UUID,
@@ -216,16 +288,58 @@
                 throw PromptExperimentAuthorityError.draftDigestMismatch
             }
             let validated = try draft.validated()
-            guard let target = try resolveTarget(validated.targetRole) else {
-                throw PromptExperimentAuthorityError.targetUnavailable(
-                    "No currently available catalog target resolves for selector ‘\(validated.targetRole)’."
+            let optimizationTargets: PromptExperimentOptimizationTargets?
+            let target: PromptExperimentResolvedTarget
+            if let optimization = validated.optimization {
+                guard let reflection = try resolveTarget(optimization.gepa.reflectionTargetSelector) else {
+                    throw PromptExperimentAuthorityError.targetUnavailable(
+                        "No available catalog target resolves the reflection selector ‘\(optimization.gepa.reflectionTargetSelector)’."
+                    )
+                }
+                let execution: PromptExperimentResolvedTarget? = if let selector = optimization.execution.targetSelector {
+                    try resolveTarget(selector)
+                } else {
+                    nil
+                }
+                if optimization.execution.adapter == .contextBuilder, execution == nil {
+                    throw PromptExperimentAuthorityError.targetUnavailable("The Context Builder execution target is unavailable.")
+                }
+                let judge: PromptExperimentResolvedTarget? = if let selector = optimization.evaluator.judgeTargetSelector {
+                    try resolveTarget(selector)
+                } else {
+                    nil
+                }
+                if optimization.evaluator.kind == .connectedModelJudge, judge == nil {
+                    throw PromptExperimentAuthorityError.targetUnavailable("The connected-model judge target is unavailable.")
+                }
+                optimizationTargets = PromptExperimentOptimizationTargets(
+                    reflection: reflection,
+                    execution: execution,
+                    judge: judge
                 )
+                target = execution ?? reflection
+            } else {
+                guard let legacyTarget = try resolveTarget(validated.targetRole) else {
+                    throw PromptExperimentAuthorityError.targetUnavailable(
+                        "No currently available catalog target resolves for selector ‘\(validated.targetRole)’."
+                    )
+                }
+                optimizationTargets = nil
+                target = legacyTarget
             }
             let date = now()
+            let fixtureText: String
+            if let optimization = validated.optimization {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+                fixtureText = try String(decoding: encoder.encode(optimization.examples), as: UTF8.self)
+            } else {
+                fixtureText = validated.syntheticFixture
+            }
             let materialized = try await store.materializeSyntheticEnvironment(
                 experimentID: experimentID,
                 planRevision: validated.revision,
-                fixtureText: validated.syntheticFixture
+                fixtureText: fixtureText
             )
             let currentIndex = try index(of: experimentID)
             try requireOwner(records[currentIndex], expectedControllerSessionID: expectedControllerSessionID)
@@ -249,7 +363,14 @@
                     "Loaded-workspace experiments are unsupported and fail closed in this pilot."
                 ]
             )
-            let plan = try PromptExperimentPlan.seal(draft: validated, target: target, environment: environment, at: date)
+            let plan = try PromptExperimentPlan.seal(
+                draft: validated,
+                target: target,
+                optimizationTargets: optimizationTargets,
+                environment: environment,
+                at: date
+            )
+            try await runtime.preflightOptimization(plan)
             records[currentIndex].plans.append(plan)
             records[currentIndex].draft = nil
             records[currentIndex].cancellationRequestedAt = nil
@@ -315,7 +436,9 @@
             records[index].attempts.append(contentsOf: plan.trials.map { PromptExperimentAttempt(trial: $0, plan: plan) })
             records[index].phase = .running
             records[index].updatedAt = now()
-            records[index].statusMessage = "Running fixed serial comparison (0/\(plan.trials.count))."
+            records[index].statusMessage = plan.optimization == nil
+                ? "Running fixed serial comparison (0/\(plan.trials.count))."
+                : "Starting pinned upstream GEPA search (0/\(plan.optimization?.gepa.maxEvaluations ?? 0) evaluations)."
             do {
                 try await persist()
             } catch {
@@ -365,7 +488,8 @@
         func startNextRevision(
             experimentID: UUID,
             expectedPlanDigest: String? = nil,
-            expectedControllerSessionID: UUID? = nil
+            expectedControllerSessionID: UUID? = nil,
+            seedCandidateIndex: Int? = nil
         ) async throws {
             try await requireLoaded()
             let originalIndex = try index(of: experimentID)
@@ -379,8 +503,21 @@
             if let expectedPlanDigest, expectedPlanDigest != plan.digest {
                 throw PromptExperimentAuthorityError.digestMismatch
             }
-            let originalPhase = records[originalIndex].phase
+            let recordSnapshot = records[originalIndex]
+            let originalPhase = recordSnapshot.phase
+            let chosenCandidateReference: PromptExperimentArtifactReference? = {
+                guard plan.optimization != nil,
+                      let result = recordSnapshot.attempts(for: plan).last?.optimizationResult
+                else { return nil }
+                let desired = seedCandidateIndex ?? result.bestCandidateIndex
+                return result.candidates.first { $0.index == desired }?.candidateEvidence
+            }()
             let fixture = try await store.readSyntheticFixture(environment: plan.environment)
+            let chosenCandidate: String? = if let chosenCandidateReference {
+                try await String(data: store.readArtifact(chosenCandidateReference), encoding: .utf8)
+            } else {
+                nil
+            }
             let index = try index(of: experimentID)
             try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
             guard records[index].phase == originalPhase,
@@ -388,6 +525,8 @@
                   records[index].currentPlan == plan
             else { throw PromptExperimentAuthorityError.staleDraft }
             let date = now()
+            var nextOptimization = plan.optimization
+            if let chosenCandidate { nextOptimization?.seedCandidate = chosenCandidate }
             records[index].draft = PromptExperimentDraft(
                 revision: plan.revision + 1,
                 parentPlanID: plan.id,
@@ -398,6 +537,7 @@
                 candidateInstructions: plan.candidateInstructions,
                 targetRole: plan.resolvedTarget.role,
                 repetitions: plan.repetitions,
+                optimization: nextOptimization,
                 createdAt: date,
                 updatedAt: date
             )
@@ -432,6 +572,11 @@
             for attempt in record.attempts {
                 if let prompt = attempt.committedHandoff?.promptEvidence { references.append(prompt) }
                 if let assistant = attempt.assistantOutputEvidence { references.append(assistant) }
+                if let result = attempt.optimizationResult {
+                    references.append(contentsOf: result.candidates.map(\.candidateEvidence))
+                    references.append(contentsOf: result.evaluations.compactMap(\.outputEvidence))
+                    if let raw = result.rawResultEvidence { references.append(raw) }
+                }
             }
             var textByDigest: [String: String] = [:]
             for reference in references where textByDigest[reference.sha256] == nil {
@@ -600,6 +745,7 @@
             } else {
                 nil
             }
+            let optimizationResult = try await installOptimizationResult(result.optimizationResult)
             try await mutate(experimentID: experimentID) { record in
                 guard let index = record.attempts.firstIndex(where: { $0.id == attemptID }) else { return }
                 let cancelled = record.attempts[index].cancellationRequestedAt != nil || record.cancellationRequestedAt != nil
@@ -610,6 +756,7 @@
                 record.attempts[index].assistantOutputEvidence = assistantOutputEvidence
                 record.attempts[index].assistantOutputPreview = result.assistantOutput.map { String($0.prefix(400)) }
                 record.attempts[index].handoffUnavailableReason = result.handoffUnavailableReason
+                record.attempts[index].optimizationResult = optimizationResult
                 record.attempts[index].settledAt = now()
                 record.attempts[index].lateResultAfterCancellation = cancelled
                 if cancelled {
@@ -623,7 +770,7 @@
                     record.attempts[index].error = "Fixture digest mismatch"
                 } else {
                     switch result.disposition {
-                    case .completed where committedHandoff == nil:
+                    case .completed where committedHandoff == nil && optimizationResult == nil:
                         let message = result.handoffUnavailableReason ?? "Context Builder completion did not include an immutable committed handoff."
                         record.attempts[index].status = .failed
                         record.attempts[index].statusText = "Committed handoff unavailable; attempt is inconclusive: \(message)"
@@ -641,6 +788,64 @@
                     }
                 }
             }
+        }
+
+        private func installOptimizationResult(
+            _ runtime: PromptExperimentOptimizationRuntimeResult?
+        ) async throws -> PromptExperimentOptimizationResult? {
+            guard let runtime else { return nil }
+            let rawResultEvidence = try await store.installArtifact(runtime.rawResultJSON, fileExtension: "json")
+            var candidates: [PromptExperimentCandidateEvidence] = []
+            for (index, candidate) in runtime.candidates.enumerated() {
+                let evidence = try await store.installArtifact(Data(candidate.utf8), fileExtension: "txt")
+                candidates.append(PromptExperimentCandidateEvidence(
+                    id: PromptExperimentDigest.deterministicUUID(namespace: "gepa-candidate", value: "\(evidence.sha256):\(index)"),
+                    index: index,
+                    parentIndices: index < runtime.parentIndices.count ? runtime.parentIndices[index] : [],
+                    candidateEvidence: evidence,
+                    candidatePreview: String(candidate.prefix(600)),
+                    aggregateScore: index < runtime.aggregateScores.count ? runtime.aggregateScores[index] : nil,
+                    isBaseline: index == 0,
+                    isBest: index == runtime.bestCandidateIndex
+                ))
+            }
+            var evaluations: [PromptExperimentEvaluationEvidence] = []
+            for (index, evaluation) in runtime.evaluations.enumerated() {
+                let scoreIdentity = evaluation.score.map { String($0) } ?? "unavailable"
+                let outputEvidence: PromptExperimentArtifactReference? = if let output = evaluation.output {
+                    try await store.installArtifact(Data(output.utf8), fileExtension: "txt")
+                } else {
+                    nil
+                }
+                evaluations.append(PromptExperimentEvaluationEvidence(
+                    id: PromptExperimentDigest.deterministicUUID(
+                        namespace: "gepa-evaluation",
+                        value: "\(evaluation.candidateIndex):\(evaluation.exampleID):\(index):\(scoreIdentity)"
+                    ),
+                    candidateIndex: evaluation.candidateIndex,
+                    exampleID: evaluation.exampleID,
+                    split: evaluation.split,
+                    score: evaluation.score,
+                    feedback: evaluation.feedback,
+                    failureKind: evaluation.failureKind,
+                    outputEvidence: outputEvidence,
+                    elapsedSeconds: evaluation.elapsedSeconds
+                ))
+            }
+            return PromptExperimentOptimizationResult(
+                engine: runtime.engine,
+                upstreamRevision: runtime.upstreamRevision,
+                baselineScore: runtime.baselineScore,
+                bestScore: runtime.bestScore,
+                bestCandidateIndex: runtime.bestCandidateIndex,
+                candidates: candidates,
+                evaluations: evaluations,
+                totalEvaluations: runtime.totalEvaluations,
+                wallTimeSeconds: runtime.wallTimeSeconds,
+                proposerUsage: runtime.proposerUsage,
+                runDirectoryRelativePath: runtime.runDirectoryRelativePath,
+                rawResultEvidence: rawResultEvidence
+            )
         }
 
         private func settleSubmissionFailure(
@@ -673,7 +878,13 @@
                     record.statusMessage = "Cancelled. Requested and settled/unknown states remain visible per attempt."
                 } else if !currentAttempts.isEmpty, currentAttempts.allSatisfy({ $0.status == .completed }) {
                     record.phase = .completed
-                    record.statusMessage = "Fixed serial comparison complete. Review outputs; no automatic winner or promotion is computed."
+                    if let result = currentAttempts.last?.optimizationResult {
+                        let best = result.bestScore.map { String($0) } ?? "unavailable"
+                        let baseline = result.baselineScore.map { String($0) } ?? "unavailable"
+                        record.statusMessage = "GEPA complete: \(result.totalEvaluations) evaluations; best \(best) vs baseline \(baseline). Applying a winner requires separate approval."
+                    } else {
+                        record.statusMessage = "Fixed serial comparison complete. Review outputs; no automatic winner or promotion is computed."
+                    }
                 } else {
                     record.phase = .inconclusive
                     record.statusMessage = "Comparison inconclusive. Failures and uncertain submissions were not retried."

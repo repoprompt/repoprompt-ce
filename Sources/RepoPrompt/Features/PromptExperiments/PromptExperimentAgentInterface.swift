@@ -24,6 +24,7 @@
         var candidateInstructions: String?
         var targetRole: String?
         var repetitions: Int?
+        var optimization: PromptExperimentOptimizationSpecification?
     }
 
     enum PromptExperimentAgentCommand {
@@ -47,8 +48,21 @@
         case proposeNextRevision(experimentID: UUID, expectedPlanDigest: String)
     }
 
+    struct PromptExperimentGEPARuntimeCapability {
+        let workerProtocolVersion: Int
+        let packageVersion: String
+        let pinnedRevision: String
+        let workerResourceAvailable: Bool
+        let defaultPythonExecutable: String?
+    }
+
     enum PromptExperimentAgentResponse {
-        case capabilities(operations: [String], targets: [PromptExperimentResolvedTarget], limitations: [String])
+        case capabilities(
+            operations: [String],
+            targets: [PromptExperimentResolvedTarget],
+            gepaRuntime: PromptExperimentGEPARuntimeCapability,
+            limitations: [String]
+        )
         case records([PromptExperimentRecord])
         case record(PromptExperimentRecord, artifactTextBySHA256: [String: String])
         case draft(experimentID: UUID, draft: PromptExperimentDraft)
@@ -69,17 +83,25 @@
                 return .capabilities(
                     operations: PromptExperimentAgentOperation.allCases.map(\.rawValue),
                     targets: service.availableTargets(),
+                    gepaRuntime: PromptExperimentGEPARuntimeCapability(
+                        workerProtocolVersion: 1,
+                        packageVersion: PromptExperimentGEPAConfiguration.packageVersion,
+                        pinnedRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
+                        workerResourceAvailable: (try? PromptExperimentGEPAWorker.resolveWorkerURL()) != nil,
+                        defaultPythonExecutable: ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_PYTHON"]
+                    ),
                     limitations: [
-                        "DEBUG pilot; synthetic-fixture, fixed-comparison, serial trials only.",
-                        "No agent operation can approve, start, cancel, score, or promote a plan.",
-                        "The user must approve the exact digest and start execution in the native Prompt Experiment Studio.",
-                        "This is not the full Investigate workflow, a multi-agent optimizer, or GEPA."
+                        "DEBUG integration using upstream GEPA optimize_anything from a separately configured pinned Python environment.",
+                        "The linked Agent session may create/update/seal/query only; it cannot approve, start, cancel, or apply a winner.",
+                        "The user approves the exact native digest card and starts or stops execution from that card.",
+                        "Context Builder and sandboxed-command adapters are supported. Investigate and multi-agent workflow adapters remain explicit unsupported capabilities.",
+                        "Reviewed inline examples are materialized into an app-owned isolated environment; loaded-workspace execution and hidden source access fail closed."
                     ]
                 )
             case .list:
                 return try await .records(service.ownedRecords(controllerSessionID: owner.controllerSessionID))
             case .createDraft:
-                let id = try await service.createExperiment(
+                let id = try await service.createOptimizationExperiment(
                     controllerSessionID: owner.controllerSessionID,
                     sourceTabID: owner.sourceTabID
                 )
@@ -102,6 +124,7 @@
                 if let candidateInstructions = patch.candidateInstructions { draft.candidateInstructions = candidateInstructions }
                 if let targetRole = patch.targetRole { draft.targetRole = targetRole }
                 if let repetitions = patch.repetitions { draft.repetitions = repetitions }
+                if let optimization = patch.optimization { draft.optimization = optimization }
                 let updated = try await service.updateDraft(
                     experimentID: experimentID,
                     expectedDraftID: draftID,

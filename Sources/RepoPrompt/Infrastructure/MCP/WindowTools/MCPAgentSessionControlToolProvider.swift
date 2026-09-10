@@ -136,12 +136,12 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 name: MCPWindowToolName.promptExperiment,
                 freshnessPolicy: .none,
                 description: """
-                Create and revise a native Prompt Experiment draft owned by this Agent session.
+                Create and revise a native, upstream-GEPA Prompt Experiment owned by this Agent session.
 
-                Start with `op=capabilities`. Supported mutations are bounded draft creation/update,
-                sealing a proposal for native review, and proposing the next revision after settlement.
-                This tool cannot approve, start, cancel, score, or promote an experiment. The user must
-                approve the exact sealed digest and press Run in Prompt Experiment Studio.
+                Start with `op=capabilities`, inspect the authorized workspace, ask for missing goals,
+                then create/update a versioned optimization specification and seal it for native review.
+                This tool cannot approve, start, cancel, or apply a winner. The user must approve and
+                run the exact digest from the native in-session experiment card.
                 """,
                 annotations: .repoPromptLocalEphemeralState,
                 inputSchema: .object(
@@ -158,7 +158,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "original_instructions": .string(description: "Optional original instructions replacement."),
                         "candidate_instructions": .string(description: "Optional candidate instructions replacement."),
                         "target_role": .string(description: "Optional catalog selector: a task role such as explore or an exact compound model_id returned by capabilities, such as codexExec:<model-and-effort>."),
-                        "repetitions": .integer(description: "Optional repetitions per condition, 1 through 3.")
+                        "repetitions": .integer(description: "Legacy v1 comparison field. New GEPA drafts do not use it."),
+                        "specification_json": .string(description: "Complete versioned optimization specification JSON returned by create/read, with seed_candidate optional, objective/background, reviewed examples, evaluator, execution adapter, and pinned GEPA configuration. Replaces the specification atomically under draft version/digest checks.")
                     ],
                     required: ["op"]
                 )
@@ -212,7 +213,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         originalInstructions: args["original_instructions"]?.stringValue,
                         candidateInstructions: args["candidate_instructions"]?.stringValue,
                         targetRole: args["target_role"]?.stringValue,
-                        repetitions: args["repetitions"]?.intValue
+                        repetitions: args["repetitions"]?.intValue,
+                        optimization: args["specification_json"]?.stringValue.map(decodeOptimizationSpecification)
                     )
                 )
             case .proposeSeal:
@@ -251,12 +253,62 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             return value
         }
 
+        private struct PromptExperimentOptimizationEnvelope: Codable {
+            let schemaVersion: Int
+            let specification: PromptExperimentOptimizationSpecification
+
+            enum CodingKeys: String, CodingKey {
+                case schemaVersion = "schema_version"
+                case specification
+            }
+        }
+
+        private static func decodeOptimizationSpecification(_ raw: String) throws -> PromptExperimentOptimizationSpecification {
+            guard let data = raw.data(using: .utf8) else {
+                throw MCPError.invalidParams("specification_json must be UTF-8")
+            }
+            do {
+                let decoder = JSONDecoder()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                let envelope = try decoder.decode(PromptExperimentOptimizationEnvelope.self, from: data)
+                guard envelope.schemaVersion == 1 else {
+                    throw MCPError.invalidParams("Unsupported optimization specification schema \(envelope.schemaVersion)")
+                }
+                return envelope.specification
+            } catch let error as MCPError {
+                throw error
+            } catch {
+                throw MCPError.invalidParams("Invalid specification_json: \(error.localizedDescription)")
+            }
+        }
+
+        private static func encodeOptimizationSpecification(
+            _ specification: PromptExperimentOptimizationSpecification
+        ) throws -> String {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            let data = try encoder.encode(PromptExperimentOptimizationEnvelope(
+                schemaVersion: 1,
+                specification: specification
+            ))
+            return String(decoding: data, as: UTF8.self)
+        }
+
         private static func responseValue(_ response: PromptExperimentAgentResponse) throws -> Value {
             switch response {
-            case let .capabilities(operations, targets, limitations):
+            case let .capabilities(operations, targets, gepaRuntime, limitations):
                 .object([
                     "operations": .array(operations.map(Value.string)),
                     "available_targets": .array(targets.map(targetValue)),
+                    "gepa_runtime": .object([
+                        "worker_protocol_version": .int(gepaRuntime.workerProtocolVersion),
+                        "package_version": .string(gepaRuntime.packageVersion),
+                        "pinned_revision": .string(gepaRuntime.pinnedRevision),
+                        "worker_resource_available": .bool(gepaRuntime.workerResourceAvailable),
+                        "default_python_executable": gepaRuntime.defaultPythonExecutable.map(Value.string) ?? .null,
+                        "preflight_behavior": .string("Seal checks the exact external environment without installing packages or making model calls.")
+                    ]),
                     "limitations": .array(limitations.map(Value.string)),
                     "native_approval_required": .bool(true)
                 ])
@@ -268,7 +320,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 try .object([
                     "experiment_id": .string(experimentID.uuidString),
                     "draft": draftValue(draft),
-                    "next_action": .string("Use update_draft with the exact ID/version/digest, then propose_seal. The user approves only in the native Studio.")
+                    "next_action": .string("Use update_draft with the exact ID/version/digest and a complete reviewed specification_json, then propose_seal. Ask the user to approve the exact native card; this tool cannot approve or run.")
                 ])
             case let .sealed(experimentID, plan):
                 .object([
@@ -276,7 +328,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     "phase": .string(PromptExperimentPhase.awaitingApproval.rawValue),
                     "plan_revision": .int(plan.revision),
                     "plan_digest": .string(plan.digest),
-                    "native_action_required": .string("Ask the user to review and approve this exact digest in Prompt Experiment Studio. This tool cannot approve or run it.")
+                    "native_action_required": .string("Ask the user to review and approve this exact digest on the native in-session Prompt Experiment card. This tool cannot approve or run it.")
                 ])
             }
         }
@@ -293,7 +345,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 "original_instructions": .string(draft.originalInstructions),
                 "candidate_instructions": .string(draft.candidateInstructions),
                 "target_selector": .string(draft.targetRole),
-                "repetitions": .int(draft.repetitions)
+                "repetitions": .int(draft.repetitions),
+                "optimization_specification_json": draft.optimization.map(encodeOptimizationSpecification).map(Value.string) ?? .null
             ])
         }
 
@@ -316,7 +369,10 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     "id": .string(plan.id.uuidString),
                     "revision": .int(plan.revision),
                     "digest": .string(plan.digest),
-                    "approved": .bool(record.approval(for: plan) != nil)
+                    "approved": .bool(record.approval(for: plan) != nil),
+                    "schema_version": .int(plan.schemaVersion ?? PromptExperimentPlan.legacySchemaVersion),
+                    "engine": .string(plan.optimization?.gepa.engine ?? "legacy_fixed_comparison"),
+                    "max_evaluations": plan.optimization.map { .int($0.gepa.maxEvaluations) } ?? .null
                 ])
             } else {
                 value["current_plan"] = .null
@@ -362,10 +418,55 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 "elapsed_seconds": elapsed.map(Value.double) ?? .null,
                 "provider_token_usage": .string("unavailable_from_context_builder_completion_contract"),
                 "legacy_unclassified_output_preview": attempt.outputPreview.map(Value.string) ?? .null,
-                "error": attempt.error.map(Value.string) ?? .null
+                "error": attempt.error.map(Value.string) ?? .null,
+                "optimization_result": attempt.optimizationResult.map {
+                    optimizationResultValue($0, artifactTextBySHA256: artifactTextBySHA256)
+                } ?? .null
             ]
             value["legacy_unclassified_evidence"] = attempt.evidence.map(artifactValue) ?? .null
             return .object(value)
+        }
+
+        private static func optimizationResultValue(
+            _ result: PromptExperimentOptimizationResult,
+            artifactTextBySHA256: [String: String]
+        ) -> Value {
+            .object([
+                "engine": .string(result.engine),
+                "upstream_revision": .string(result.upstreamRevision),
+                "baseline_score": result.baselineScore.map(Value.double) ?? .null,
+                "best_score": result.bestScore.map(Value.double) ?? .null,
+                "best_candidate_index": result.bestCandidateIndex.map(Value.int) ?? .null,
+                "total_evaluations": .int(result.totalEvaluations),
+                "wall_time_seconds": result.wallTimeSeconds.map(Value.double) ?? .null,
+                "proposer_usage": .string(result.proposerUsage),
+                "run_directory_relative_path": result.runDirectoryRelativePath.map(Value.string) ?? .null,
+                "raw_result_evidence": result.rawResultEvidence.map(artifactValue) ?? .null,
+                "candidates": .array(result.candidates.map { candidate in
+                    .object([
+                        "index": .int(candidate.index),
+                        "parents": .array(candidate.parentIndices.map(Value.int)),
+                        "score": candidate.aggregateScore.map(Value.double) ?? .null,
+                        "is_baseline": .bool(candidate.isBaseline),
+                        "is_best": .bool(candidate.isBest),
+                        "candidate": artifactTextBySHA256[candidate.candidateEvidence.sha256].map(Value.string) ?? .null,
+                        "preview": .string(candidate.candidatePreview),
+                        "evidence": artifactValue(candidate.candidateEvidence)
+                    ])
+                }),
+                "evaluations": .array(result.evaluations.map { evaluation in
+                    .object([
+                        "candidate_index": .int(evaluation.candidateIndex),
+                        "example_id": .string(evaluation.exampleID),
+                        "split": .string(evaluation.split.rawValue),
+                        "score": evaluation.score.map(Value.double) ?? .null,
+                        "feedback": .string(evaluation.feedback),
+                        "failure_kind": evaluation.failureKind.map { .string($0.rawValue) } ?? .null,
+                        "output": evaluation.outputEvidence.flatMap { artifactTextBySHA256[$0.sha256] }.map(Value.string) ?? .null,
+                        "elapsed_seconds": evaluation.elapsedSeconds.map(Value.double) ?? .null
+                    ])
+                })
+            ])
         }
 
         private static func committedHandoffValue(
