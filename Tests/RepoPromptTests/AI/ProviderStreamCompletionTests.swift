@@ -4,6 +4,37 @@ import SwiftOpenAI
 import XCTest
 
 final class ProviderStreamCompletionTests: XCTestCase {
+    func testACPChatStreamExcludesSystemAndStatusWithoutDroppingAssistantOrTransportResults() async throws {
+        let engine = ACPCLIChatProviderEngine(
+            providerName: "Devin",
+            providerType: .devin,
+            makeProvider: { _ in ScriptedACPChatProvider() }
+        )
+        let stream = try await engine.streamMessage(
+            AIMessage(systemPrompt: "system", userMessage: "question"),
+            model: .devinCustom(name: "claude-opus-4-6")
+        )
+        var results: [AIStreamResult] = []
+        for try await result in stream {
+            results.append(result)
+        }
+        await engine.dispose()
+
+        XCTAssertEqual(results.compactMap(\.text), ["answer", "final answer"])
+        XCTAssertEqual(results.compactMap(\.reasoning), ["thinking"])
+        XCTAssertEqual(results.map(\.type), [
+            AIStreamResult.lifecycleType,
+            "content",
+            AIStreamResult.transportActivityType,
+            "final_content",
+            "message_stop"
+        ])
+        XCTAssertEqual(results.last?.promptTokens, 11)
+        XCTAssertEqual(results.last?.completionTokens, 7)
+        XCTAssertEqual(results.last?.cost, 0.25)
+        XCTAssertEqual(results.last?.providerSessionID, "session-1")
+    }
+
     func testOpenAIStopReasonReportsSuccessfulCompletion() {
         XCTAssertEqual(openAIChatCompletionOutcome(.string("stop")), .completed)
         XCTAssertNil(openAIChatCompletionOutcome(nil))
@@ -46,4 +77,32 @@ final class ProviderStreamCompletionTests: XCTestCase {
             )
         }
     }
+}
+
+private final class ScriptedACPChatProvider: HeadlessAgentProvider {
+    func streamAgentMessage(_: AgentMessage, runID _: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        AsyncThrowingStream { continuation in
+            for result in [
+                AIStreamResult(type: "system", text: "provider warning"),
+                AIStreamResult(type: "status", text: "Oracle prompt title"),
+                AIStreamResult(type: AIStreamResult.lifecycleType, text: nil),
+                AIStreamResult(type: "content", text: "answer", reasoning: "thinking"),
+                AIStreamResult(type: AIStreamResult.transportActivityType, text: nil),
+                AIStreamResult(type: "final_content", text: "final answer"),
+                AIStreamResult(
+                    type: "message_stop",
+                    text: nil,
+                    promptTokens: 11,
+                    completionTokens: 7,
+                    cost: 0.25,
+                    providerSessionID: "session-1"
+                )
+            ] {
+                continuation.yield(result)
+            }
+            continuation.finish()
+        }
+    }
+
+    func dispose() async {}
 }
