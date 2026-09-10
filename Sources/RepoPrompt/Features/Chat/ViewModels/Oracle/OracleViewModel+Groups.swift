@@ -80,6 +80,8 @@ enum AppOracleGroupRouting {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .omp: "omp"
+        case .devin: "devin"
         }
     }
 }
@@ -677,7 +679,8 @@ extension OracleViewModel {
             agentModeSessionID: context.agentModeSessionID,
             agentModeRunID: context.agentModeRunID,
             activationPolicy: .background,
-            packaging: context.packaging
+            packaging: context.packaging,
+            transientImages: context.transientImages
         )
     }
 
@@ -738,6 +741,7 @@ extension OracleViewModel {
                 }
             }
             purgeSessionStorage(projection.id)
+            discardTransientImages(for: projection.id)
         }
         sessions.removeAll { memberIDs.contains($0.id) }
         for projection in removed {

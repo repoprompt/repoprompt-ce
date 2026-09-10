@@ -97,7 +97,7 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         XCTAssertFalse(text.contains("- Status: Failed"), text)
     }
 
-    func testFailedOrCancelledPrimaryIsNotPublishable() throws {
+    func testStrictPrimaryResponseAccessorStillRejectsFailedOrCancelledPrimary() throws {
         for status in [OracleLaneResultStatus.failed, .cancelled] {
             let reply = try ContextBuilderOracleGroupReply(result: groupResult(
                 status: .failed,
@@ -170,6 +170,174 @@ final class ContextBuilderOracleResultTests: XCTestCase {
             reply.toMCPFields()["oracle_results"]?.arrayValue?[0]
                 .objectValue?["execution_profile"]
         )
+    }
+
+    @MainActor
+    func testSettledReplyBoundaryDeliversFailedPrimaryAndKeepsErrorNavigation() throws {
+        for mode in [HeadlessMode.plan, .review] {
+            for primaryStatus in [OracleLaneResultStatus.failed, .cancelled] {
+                let result = try groupResult(status: .failed, lanes: [
+                    lane(index: 0, status: primaryStatus, error: laneError(
+                        code: "primary_stopped", message: "primary stopped", partialResponse: "primary partial"
+                    )),
+                    lane(index: 1, status: .completed, response: "Error: is legitimate answer text"),
+                    lane(index: 2, status: .completed, response: "third answer")
+                ])
+                let (session, generation, members) = try preparedSession(for: result)
+                let workspaceID = UUID()
+                let reply = try session.completeOracleGroupReply(
+                    ContextBuilderOracleGroupReply(result: result),
+                    generation: generation,
+                    originWorkspaceID: workspaceID,
+                    mode: mode
+                )
+                XCTAssertEqual(reply.chatId, members[0].sessionID)
+                XCTAssertEqual(reply.shortId, "chat-0")
+                XCTAssertNil(reply.response, "A secondary answer must never become the primary response")
+                XCTAssertEqual(reply.oracleGroup?.result, result)
+                XCTAssertEqual(reply.errors, ["Oracle \(primaryStatus.rawValue): primary stopped"])
+                XCTAssertFalse(session.isBackgroundPlanGenerating)
+                XCTAssertEqual(session.backgroundPlanResponseText, "primary partial")
+                guard case let .error(message) = session.planStatus else {
+                    return XCTFail("Primary failure must remain visible")
+                }
+                XCTAssertTrue(message.contains("primary stopped"))
+                XCTAssertEqual(session.failedAnswerRoute, ContextBuilderGeneratedAnswerRoute(
+                    workspaceID: workspaceID, tabID: session.tabID, chatID: "chat-0"
+                ))
+                XCTAssertTrue(session.followUpOracleGroupState.members.isEmpty)
+
+                let branch = mode == .review ? "review" : "plan"
+                let raw: Value = .object([
+                    "response_type": .string(branch),
+                    branch: reply.toMCPValue()
+                ])
+                let dto = try XCTUnwrap(raw.decode(ToolResultDTOs.ContextBuilderDTO.self))
+                let summaries = contextBuilderOracleLaneSummaries(for: dto)
+                XCTAssertEqual(summaries.map(\.chatID), ["chat-0", "chat-1", "chat-2"])
+                XCTAssertEqual(summaries.map(\.status), [primaryStatus.rawValue, "done", "done"])
+                XCTAssertEqual(contextBuilderFollowUpChatID(for: dto), "chat-0")
+                let text = ToolOutputFormatter.formatDiscoverContext(value: raw).compactMap { block -> String? in
+                    guard case let .text(text, _, _) = block else { return nil }
+                    return text
+                }.joined(separator: "\n")
+                XCTAssertTrue(text.contains("primary stopped"), text)
+                XCTAssertTrue(text.contains("Error: is legitimate answer text"), text)
+                XCTAssertTrue(text.contains("third answer"), text)
+            }
+        }
+    }
+
+    @MainActor
+    func testSettledReplyBoundaryPreservesSuccessAndPartialFailure() throws {
+        for additionalStatus in [OracleLaneResultStatus.completed, .failed] {
+            let result = try groupResult(
+                status: additionalStatus == .completed ? .completed : .partialFailure,
+                lanes: [
+                    lane(index: 0, status: .completed, response: "primary answer"),
+                    lane(
+                        index: 1,
+                        status: additionalStatus,
+                        response: additionalStatus == .completed ? "second answer" : nil,
+                        error: additionalStatus == .failed ? laneError(message: "second failed") : nil
+                    )
+                ]
+            )
+            let (session, generation, _) = try preparedSession(for: result)
+            let reply = try session.completeOracleGroupReply(
+                ContextBuilderOracleGroupReply(result: result), generation: generation,
+                originWorkspaceID: UUID(), mode: .plan
+            )
+            XCTAssertEqual(reply.response, "primary answer")
+            XCTAssertEqual(reply.oracleGroup?.result, result)
+            XCTAssertNil(session.backgroundPlanError)
+            XCTAssertNil(session.failedAnswerRoute)
+            guard case .ready = session.planStatus else { return XCTFail("Expected ready") }
+        }
+    }
+
+    @MainActor
+    func testSettledReplyBoundaryRejectsStaleGenerationAndMismatchedMembershipBeforeMutation() throws {
+        let result = try groupResult(lanes: [
+            lane(index: 0, status: .completed, response: "primary"),
+            lane(index: 1, status: .completed, response: "secondary")
+        ])
+        let (session, generation, members) = try preparedSession(for: result)
+        let differentGroup = try groupResult(lanes: result.oracleResults)
+        XCTAssertThrowsError(try session.completeOracleGroupReply(
+            ContextBuilderOracleGroupReply(result: differentGroup), generation: generation,
+            originWorkspaceID: UUID(), mode: .review
+        ))
+        XCTAssertEqual(session.followUpOracleGroupState.members, members)
+        XCTAssertTrue(session.isBackgroundPlanGenerating)
+        XCTAssertNil(session.generatedAnswerRoute)
+
+        let wrongMember = try OracleLaneResult(
+            laneIndex: 1, chatID: "different-chat", providerID: "provider-1", modelID: "model-1",
+            status: .completed, response: "unrelated answer"
+        )
+        let mismatchedMembers = try groupResult(
+            groupID: result.groupID.rawValue, lanes: [result.primary, wrongMember]
+        )
+        XCTAssertThrowsError(try session.completeOracleGroupReply(
+            ContextBuilderOracleGroupReply(result: mismatchedMembers), generation: generation,
+            originWorkspaceID: UUID(), mode: .review
+        ))
+        XCTAssertEqual(session.followUpOracleGroupState.members, members)
+        XCTAssertNil(session.generatedAnswerRoute)
+
+        _ = session.followUpOracleGroupState.beginRun()
+        XCTAssertThrowsError(try session.completeOracleGroupReply(
+            ContextBuilderOracleGroupReply(result: result), generation: generation,
+            originWorkspaceID: UUID(), mode: .review
+        )) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertTrue(session.isBackgroundPlanGenerating)
+        XCTAssertNil(session.generatedAnswerRoute)
+    }
+
+    @MainActor
+    func testSettledReplyBoundaryHonorsTaskCancellation() async throws {
+        let result = try groupResult(lanes: [
+            lane(index: 0, status: .completed, response: "primary"),
+            lane(index: 1, status: .completed, response: "secondary")
+        ])
+        let (session, generation, members) = try preparedSession(for: result)
+        let task = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try session.completeOracleGroupReply(
+                ContextBuilderOracleGroupReply(result: result), generation: generation,
+                originWorkspaceID: UUID(), mode: .review
+            )
+        }
+        do {
+            _ = try await task.value
+            XCTFail("Cancelled work must not publish a reply")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(session.followUpOracleGroupState.members, members)
+        XCTAssertTrue(session.isBackgroundPlanGenerating)
+        XCTAssertNil(session.generatedAnswerRoute)
+    }
+
+    @MainActor
+    private func preparedSession(for result: OracleGroupResult) throws -> (
+        ContextBuilderAgentViewModel.TabSession, UInt64, [ContextBuilderOracleMemberHandle]
+    ) {
+        let session = ContextBuilderAgentViewModel.TabSession(tabID: UUID())
+        session.isBackgroundPlanGenerating = true
+        let generation = session.followUpOracleGroupState.beginRun()
+        let members = try result.oracleResults.map {
+            try ContextBuilderOracleMemberHandle(
+                laneID: OracleLaneID(index: $0.laneIndex), sessionID: UUID(), chatID: $0.chatID
+            )
+        }
+        XCTAssertTrue(session.followUpOracleGroupState.bind(
+            groupID: result.groupID, turnID: OracleTurnID(), members: members, generation: generation
+        ))
+        return (session, generation, members)
     }
 
     private func groupResult(

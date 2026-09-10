@@ -85,7 +85,11 @@ enum PromptPackagingService {
 
             // Replace the immutable entry with a new one
             updatedConversation[lastUserIndex] =
-                ConversationEntry(role: lastUserEntry.role, content: newContent)
+                ConversationEntry(
+                    role: lastUserEntry.role,
+                    content: newContent,
+                    images: lastUserEntry.images
+                )
         }
 
         // 3️⃣  Package everything into AIMessage

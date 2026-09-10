@@ -1,6 +1,35 @@
 import Foundation
 import SwiftOpenAI
 
+enum AIImageMediaType: String, Equatable {
+    case png = "image/png"
+    case jpeg = "image/jpeg"
+    case gif = "image/gif"
+    case webp = "image/webp"
+}
+
+/// Image data for a single Oracle user turn. Deliberately non-Codable
+/// and path-free so it never lands in persisted chat history.
+struct AITransientImage: Equatable {
+    let bytes: Data
+    let mediaType: AIImageMediaType
+    let title: String?
+
+    var base64Payload: String {
+        bytes.base64EncodedString()
+    }
+
+    var openAIDataURL: String {
+        "data:\(mediaType.rawValue);base64,\(base64Payload)"
+    }
+
+    var normalizedTitle: String? {
+        guard let title else { return nil }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 /// A single conversation entry
 struct ConversationEntry {
     enum Role {
@@ -10,6 +39,13 @@ struct ConversationEntry {
 
     let role: Role
     let content: String
+    let images: [AITransientImage]
+
+    init(role: Role, content: String, images: [AITransientImage] = []) {
+        self.role = role
+        self.content = content
+        self.images = images
+    }
 }
 
 /// Keep each piece separate. We also provide "XML getters" for certain fields.
@@ -227,10 +263,49 @@ struct AIMessage {
             let role: ChatCompletionParameters.Message.Role = (entry.role == .user)
                 ? .user
                 : .assistant
-            msgs.append(.init(role: role, content: .text(text)))
+            if entry.role == .user, !entry.images.isEmpty {
+                msgs.append(.init(role: role, content: openAIChatContent(text: text, images: entry.images)))
+            } else {
+                msgs.append(.init(role: role, content: .text(text)))
+            }
         }
 
         return msgs
+    }
+
+    private func openAIChatContent(
+        text: String,
+        images: [AITransientImage]
+    ) -> ChatCompletionParameters.Message.ContentType {
+        var parts: [ChatCompletionParameters.Message.ContentType.MessageContent] = []
+        if !text.isEmpty {
+            parts.append(.text(text))
+        }
+        for image in images {
+            if let title = image.normalizedTitle {
+                parts.append(.text("Image title: \(title)"))
+            }
+            guard let url = URL(string: image.openAIDataURL) else { continue }
+            parts.append(.imageUrl(.init(url: url, detail: nil)))
+        }
+        return .contentArray(parts)
+    }
+
+    private func openAIResponsesContent(
+        text: String,
+        images: [AITransientImage]
+    ) -> SwiftOpenAI.MessageContent {
+        var parts: [SwiftOpenAI.ContentItem] = []
+        if !text.isEmpty {
+            parts.append(.text(SwiftOpenAI.TextContent(text: text)))
+        }
+        for image in images {
+            if let title = image.normalizedTitle {
+                parts.append(.text(SwiftOpenAI.TextContent(text: "Image title: \(title)")))
+            }
+            parts.append(.image(SwiftOpenAI.ImageContent(detail: "auto", imageUrl: image.openAIDataURL)))
+        }
+        return .array(parts)
     }
 
     /// Generates the full array of `InputItem`s for the Responses-API,
@@ -259,9 +334,12 @@ struct AIMessage {
                     firstUser = false
                 }
 
+                let content: SwiftOpenAI.MessageContent = entry.images.isEmpty
+                    ? .text(text)
+                    : openAIResponsesContent(text: text, images: entry.images)
                 let msg = SwiftOpenAI.InputMessage(
                     role: "user",
-                    content: .text(text)
+                    content: content
                 )
                 items.append(.message(msg))
 
@@ -285,6 +363,32 @@ struct AIMessage {
         }
 
         return .array(items)
+    }
+
+    func attachingImagesToFinalUserTurn(_ images: [AITransientImage]) -> AIMessage {
+        guard !images.isEmpty,
+              let lastUserIndex = conversationMessages.lastIndex(where: { $0.role == .user })
+        else {
+            return self
+        }
+        var updated = conversationMessages
+        updated[lastUserIndex] = ConversationEntry(
+            role: .user,
+            content: updated[lastUserIndex].content,
+            images: images
+        )
+        return AIMessage(
+            systemPrompt: systemPrompt,
+            metaPrompts: metaPrompts,
+            fileTree: fileTree,
+            fileBlocks: fileBlocks,
+            gitDiff: gitDiff,
+            conversationMessages: updated,
+            temperature: temperature,
+            promptSectionsOrder: promptSectionsOrder,
+            disabledPromptSections: disabledPromptSections,
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
+        )
     }
 
     // MARK: - Temperature helpers

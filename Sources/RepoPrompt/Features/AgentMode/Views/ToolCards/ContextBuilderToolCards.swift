@@ -647,7 +647,7 @@ func contextBuilderOracleLaneSummaries(
             chatID: lane.chatID,
             modelID: lane.executionProfile?.modelID ?? lane.modelID,
             effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
-            status: lane.status == OracleLaneResultStatus.completed.rawValue ? "done" : "failed"
+            status: lane.status == OracleLaneResultStatus.completed.rawValue ? "done" : lane.status
         )
     }
 }

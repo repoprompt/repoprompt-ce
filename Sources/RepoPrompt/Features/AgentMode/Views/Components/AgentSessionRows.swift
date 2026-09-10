@@ -1546,6 +1546,8 @@ extension AgentProviderKind {
         case .openCode, .antigravity: "curlybraces.square"
         case .cursor: "cursorarrow"
         case .grokBuild: "bolt.circle.fill"
+        case .omp: "circle.hexagongrid"
+        case .devin: "sparkles"
         }
     }
 }

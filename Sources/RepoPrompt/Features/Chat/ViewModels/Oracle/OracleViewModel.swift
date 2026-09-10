@@ -465,6 +465,8 @@ class OracleViewModel: ObservableObject {
     /// Per-session sequence numbering
     private var nextSequenceIndexBySession: [UUID: Int] = [:]
 
+    private var transientImagesBySession: [UUID: [UUID: [AITransientImage]]] = [:]
+
     /// Maps AI message/query IDs to the underlying AIQueriesService stream IDs for targeted cancellation.
     private var streamIDsByQueryId: [UUID: ChatStreamID] = [:]
 
@@ -1016,6 +1018,7 @@ class OracleViewModel: ObservableObject {
     private func clearAllSessionStorage() {
         sessionSwitchGeneration += 1
         messageStore.removeAll(keepingCapacity: false)
+        transientImagesBySession.removeAll(keepingCapacity: false)
         messageStoreRevision &+= 1
         sessionIDByMessageId.removeAll(keepingCapacity: false)
         runStateBySession.removeAll(keepingCapacity: false)
@@ -1727,6 +1730,7 @@ class OracleViewModel: ObservableObject {
         withAnimation {
             guard let idx = sessions.firstIndex(where: { $0.id == session.id }) else { return }
             purgeSessionStorage(session.id)
+            discardTransientImages(for: session.id)
             sessions.remove(at: idx)
 
             if let tabID = session.composeTabID,
@@ -2394,6 +2398,12 @@ class OracleViewModel: ObservableObject {
             selectedChatPresetID: originalSession.selectedChatPresetID
         )
 
+        copyTransientImages(
+            from: originalSession.id,
+            to: newSession.id,
+            messageIDs: Set(messagesToCopy.map(\.id))
+        )
+
         // Add the new session to the list and switch to it
         sessions.append(newSession)
         await switchToSession(newSession.id)
@@ -2971,6 +2981,7 @@ class OracleViewModel: ObservableObject {
             msgs.removeAll { $0.id == messageId }
         }
         sessionIDByMessageId.removeValue(forKey: messageId)
+        discardTransientImages(for: messageId, in: sessionID)
 
         // if no more AI messages exist, reset the current query ID:
         if runStateBySession[sessionID]?.activeQueryId == messageId {
@@ -3011,6 +3022,7 @@ class OracleViewModel: ObservableObject {
                 for id in removedIds {
                     sessionIDByMessageId.removeValue(forKey: id)
                 }
+                discardTransientImages(for: session.id)
             } else {
                 // Fork to the message BEFORE the one we're editing
                 // This way the forked chat will end right before the message we want to replace
@@ -3023,6 +3035,7 @@ class OracleViewModel: ObservableObject {
                 msgs.removeAll { $0.id == messageId }
             }
             sessionIDByMessageId.removeValue(forKey: messageId)
+            discardTransientImages(for: messageId, in: session.id)
         }
 
         // Send the edited message (this creates a new user message and gets AI response)
@@ -3068,6 +3081,7 @@ class OracleViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
+        oracleTransientImages: [AITransientImage] = [],
         completionPolicy: OracleResponseCompletionPolicy = .interactive,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async -> UUID? {
@@ -3107,6 +3121,7 @@ class OracleViewModel: ObservableObject {
             msgs.append(userMessage)
         }
         registerMessage(userId, sessionID: targetSessionID)
+        recordTransientImages(oracleTransientImages, for: userId, in: targetSessionID)
 
         let conversation = buildConversationEntries(for: targetSessionID)
 
@@ -3189,7 +3204,7 @@ class OracleViewModel: ObservableObject {
                         overrideMode: overrideMode
                     )
                 }) {
-                    aiMessage = overrideAIMessage
+                    aiMessage = overrideAIMessage.attachingImagesToFinalUserTurn(oracleTransientImages)
                 } else {
                     // Build override context from the specified chat preset or current one
                     let chatPreset: ChatPreset = if let presetID = overrideChatPresetID,
@@ -3572,12 +3587,52 @@ class OracleViewModel: ObservableObject {
 
     /// Builds conversation entries from raw user and assistant text.
     @MainActor
-    private func buildConversationEntries(for sessionID: UUID) -> [ConversationEntry] {
+    func buildConversationEntries(for sessionID: UUID) -> [ConversationEntry] {
         guard let sessionMessages = messageStore[sessionID] else { return [] }
         return sessionMessages.map { msg in
             let role: ConversationEntry.Role = msg.isUser ? .user : .assistant
-            return ConversationEntry(role: role, content: msg.content)
+            return ConversationEntry(
+                role: role,
+                content: msg.content,
+                images: msg.isUser ? transientImages(for: msg.id, in: sessionID) : []
+            )
         }
+    }
+
+    @MainActor
+    func recordTransientImages(_ images: [AITransientImage], for messageID: UUID, in sessionID: UUID) {
+        guard !images.isEmpty else { return }
+        transientImagesBySession[sessionID, default: [:]][messageID] = images
+    }
+
+    @MainActor
+    private func transientImages(for messageID: UUID, in sessionID: UUID) -> [AITransientImage] {
+        transientImagesBySession[sessionID]?[messageID] ?? []
+    }
+
+    @MainActor
+    func discardTransientImages(for sessionID: UUID) {
+        transientImagesBySession.removeValue(forKey: sessionID)
+    }
+
+    @MainActor
+    func discardTransientImages(for messageID: UUID, in sessionID: UUID) {
+        transientImagesBySession[sessionID]?.removeValue(forKey: messageID)
+        if transientImagesBySession[sessionID]?.isEmpty == true {
+            transientImagesBySession.removeValue(forKey: sessionID)
+        }
+    }
+
+    @MainActor
+    private func copyTransientImages(from sessionID: UUID, to targetSessionID: UUID, messageIDs: Set<UUID>) {
+        let carried = transientImagesBySession[sessionID]?.filter { messageIDs.contains($0.key) } ?? [:]
+        guard !carried.isEmpty else { return }
+        transientImagesBySession[targetSessionID, default: [:]].merge(carried) { _, new in new }
+    }
+
+    @MainActor
+    func hasHistoricalTransientImages(in sessionID: UUID) -> Bool {
+        transientImagesBySession[sessionID]?.isEmpty == false
     }
 
     private func userFriendlyErrorMessage(for error: Error, tokenCount: Int = 0) -> String {

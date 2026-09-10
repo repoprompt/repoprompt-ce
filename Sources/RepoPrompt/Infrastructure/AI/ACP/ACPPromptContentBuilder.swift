@@ -4,11 +4,14 @@ import UniformTypeIdentifiers
 enum ACPPromptContentBuilder {
     enum Error: LocalizedError, Equatable {
         case unreadableLocalImage(String)
+        case unsupportedRemoteImage(String)
 
         var errorDescription: String? {
             switch self {
             case let .unreadableLocalImage(path):
                 "Unable to read image attachment at \(path)."
+            case let .unsupportedRemoteImage(url):
+                "Unable to send remote image attachment at \(url) because ACP requires inline image data."
             }
         }
     }
@@ -17,18 +20,48 @@ enum ACPPromptContentBuilder {
         text: String,
         attachments: [AgentImageAttachment]
     ) throws -> [[String: Any]] {
+        try blocks(content: [.text(text)], attachments: attachments)
+    }
+
+    static func blocks(
+        content: [AgentPromptContentPart],
+        attachments: [AgentImageAttachment]
+    ) throws -> [[String: Any]] {
         var blocks: [[String: Any]] = []
-        if !text.isEmpty || attachments.isEmpty {
-            blocks.append([
-                "type": "text",
-                "text": text
-            ])
+        for part in content {
+            switch part {
+            case let .text(text):
+                guard !text.isEmpty else { continue }
+                blocks.append([
+                    "type": "text",
+                    "text": text
+                ])
+            case let .image(image):
+                if let title = image.normalizedTitle {
+                    blocks.append([
+                        "type": "text",
+                        "text": "Image title: \(title)"
+                    ])
+                }
+                blocks.append([
+                    "type": "image",
+                    "mimeType": image.mediaType.rawValue,
+                    "data": image.base64Payload
+                ])
+            }
         }
 
         for attachment in attachments {
             if let block = try imageBlock(for: attachment) {
                 blocks.append(block)
             }
+        }
+
+        if blocks.isEmpty {
+            blocks.append([
+                "type": "text",
+                "text": ""
+            ])
         }
 
         return blocks
@@ -53,14 +86,7 @@ enum ACPPromptContentBuilder {
                 "uri": url.absoluteString
             ]
         case let .url(rawURL):
-            let urlString = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !urlString.isEmpty else { return nil }
-            let extensionCandidate = URL(string: urlString)?.pathExtension
-            return [
-                "type": "image",
-                "mimeType": mimeType(forPathExtension: extensionCandidate, fallbackTitle: attachment.title),
-                "uri": urlString
-            ]
+            throw Error.unsupportedRemoteImage(rawURL.trimmingCharacters(in: .whitespacesAndNewlines))
         }
     }
 
