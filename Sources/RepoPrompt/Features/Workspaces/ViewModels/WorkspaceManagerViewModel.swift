@@ -13722,16 +13722,35 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
         guard !Self.repoPathsEquivalent(workspaces[index].repoPaths, reorderedRepoPaths) else { return }
 
-        let edit = beginExplicitRootEdit(workspaces[index], proposedPaths: reorderedRepoPaths)
+        do {
+            try await performExplicitRootEdit(
+                proposedPaths: reorderedRepoPaths,
+                workspaceID: activeWS.id,
+                source: .rootReorder
+            )
+        } catch {
+            reportRootEditFailure(error, workspaceID: activeWS.id, source: .rootReorder)
+        }
+    }
+
+    private func performExplicitRootEdit(
+        proposedPaths: [String],
+        workspaceID: UUID,
+        source: WorkspaceSaveSource
+    ) async throws {
+        guard let index = workspaceIndex(for: workspaceID) else {
+            throw rootFailure(.workspaceUnavailable)
+        }
+
+        let edit = beginExplicitRootEdit(workspaces[index], proposedPaths: proposedPaths)
         defer { endExplicitRootEdit(edit) }
-        workspaces[index].repoPaths = reorderedRepoPaths
+        workspaces[index].repoPaths = proposedPaths
         workspaces[index].dateModified = Date()
-        bumpStateVersion(for: activeWS.id)
+        bumpStateVersion(for: workspaceID)
         #if DEBUG
-            await rootEditDidApplyHandlerForTesting?(activeWS.id, .rootReorder)
+            await rootEditDidApplyHandlerForTesting?(workspaceID, source)
         #endif
-        do { try await persistAndReconcileRootEdit(edit, source: .rootReorder) }
-        catch { reportRootEditFailure(error, workspaceID: activeWS.id, source: .rootReorder) }
+        try await persistAndReconcileRootEdit(edit, source: source)
     }
 
     private func persistAndReconcileRootEdit(_ context: RootEditSaveContext, source: WorkspaceSaveSource) async throws {
@@ -13829,17 +13848,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             return
         }
-        let edit = beginExplicitRootEdit(workspaces[index], proposedPaths: newPaths)
-        defer { endExplicitRootEdit(edit) }
-        workspaces[index].repoPaths = newPaths
-        workspaces[index].dateModified = Date()
-        bumpStateVersion(for: workspace.id)
-        #if DEBUG
-            await rootEditDidApplyHandlerForTesting?(workspace.id, .rootRemove)
-        #endif
-
-        do { try await persistAndReconcileRootEdit(edit, source: .rootRemove) }
-        catch { reportRootEditFailure(error, workspaceID: workspace.id, source: .rootRemove) }
+        do {
+            try await performExplicitRootEdit(
+                proposedPaths: newPaths,
+                workspaceID: workspace.id,
+                source: .rootRemove
+            )
+        } catch {
+            reportRootEditFailure(error, workspaceID: workspace.id, source: .rootRemove)
+        }
     }
 
     @MainActor
@@ -13854,17 +13871,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             return normalized.caseInsensitiveCompare(path) == .orderedSame
         }
         if !alreadyHas {
-            let edit = beginExplicitRootEdit(workspaces[index], proposedPaths: workspaces[index].repoPaths + [path])
-            defer { endExplicitRootEdit(edit) }
-            workspaces[index].repoPaths.append(path)
-            workspaces[index].dateModified = Date()
-            bumpStateVersion(for: workspace.id)
-            #if DEBUG
-                await rootEditDidApplyHandlerForTesting?(workspace.id, .rootAdd)
-            #endif
-
-            do { try await persistAndReconcileRootEdit(edit, source: .rootAdd) }
-            catch {
+            let proposedPaths = workspaces[index].repoPaths + [path]
+            do {
+                try await performExplicitRootEdit(
+                    proposedPaths: proposedPaths,
+                    workspaceID: workspace.id,
+                    source: .rootAdd
+                )
+            } catch {
                 reportRootEditFailure(error, workspaceID: workspace.id, source: .rootAdd)
                 throw error
             }

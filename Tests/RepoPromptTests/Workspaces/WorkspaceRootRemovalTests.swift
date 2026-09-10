@@ -637,6 +637,32 @@ import XCTest
             }
         }
 
+        func testActiveRemovalRereadsRootsAfterBeforeSaveListenerMutation() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(
+                rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }
+            ) { fixture in
+                var listenerCalls = 0
+                let token = fixture.manager.addBeforeSaveListener { workspace in
+                    guard workspace.id == fixture.workspace.id, listenerCalls == 0,
+                          let index = fixture.manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+                    else { return }
+                    listenerCalls += 1
+                    fixture.manager.workspaces[index].repoPaths.append(fixture.rootPaths[2])
+                    fixture.manager.markWorkspaceDirty(workspaceID: workspace.id)
+                }
+                defer { fixture.manager.removeBeforeSaveListener(token) }
+
+                try await fixture.perform("removal preserves root added by before-save listener") {
+                    await fixture.manager.removeActiveWorkspaceRoot(path: fixture.rootPaths[1])
+                }
+
+                XCTAssertEqual(listenerCalls, 1)
+                let after = try await fixture.capturePassive()
+                assertPassiveConvergence(after, paths: [fixture.rootPaths[0], fixture.rootPaths[2]])
+                await assertAdmission(fixture, capture: after)
+            }
+        }
+
         func testStalePassedWorkspacePreservesNewerUnrelatedRoot() async throws {
             try await WorkspaceAuthorityRootTestFixture.withFixture(
                 rootNames: ["A", "B", "C"], configuration: { Array($0.prefix(2)) }
