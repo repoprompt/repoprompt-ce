@@ -9,7 +9,7 @@ struct ContextBuilderWorkspaceContext {
     let providerWorkspacePath: String
     let reviewGitContext: FrozenPromptGitReviewContext
     let reviewTargetResolution: ContextBuilderReviewTargetResolution
-    let boundWorkspaceProbe: ContextBuilderBoundWorkspaceProbe
+    private let boundWorkspaceProbe: ContextBuilderBoundWorkspaceProbe
     private let reviewDiagnosticSink: ContextBuilderReviewDiagnosticSink?
     private let readinessDiagnosticSink: ContextBuilderWorkspaceReadinessDiagnosticSink?
 
@@ -224,6 +224,14 @@ struct ContextBuilderWorkspaceContext {
         )
         sink?(event)
         ContextBuilderWorkspaceReadinessDiagnosticTracer.emit(event)
+    }
+
+    /// Run authority trusts the frozen primary-root validation fences, but bound invocations
+    /// recheck their provider CWD through the invocation-owned off-main filesystem probe.
+    @MainActor
+    func isProviderWorkspaceAvailableForRunAuthority() async throws -> Bool {
+        guard primaryRootSnapshot == nil else { return true }
+        return try await boundWorkspaceProbe.directoryExists(at: providerWorkspacePath)
     }
 
     func validateAvailability() throws {

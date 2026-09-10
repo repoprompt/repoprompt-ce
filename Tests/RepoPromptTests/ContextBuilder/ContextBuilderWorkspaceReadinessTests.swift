@@ -732,6 +732,7 @@ import XCTest
         private var workers: [Task<Void, Never>] = []
         private var offMain = false
         private var completed = false
+        private var providerDirectoryStarts = 0
         let entered = XCTestExpectation(description: "real bound filesystem worker held")
         let finished = XCTestExpectation(description: "late bound filesystem worker joined")
 
@@ -763,6 +764,10 @@ import XCTest
             lock.withLock { completed }
         }
 
+        var providerDirectoryStartCount: Int {
+            lock.withLock { providerDirectoryStarts }
+        }
+
         func arm(_ operation: ContextBuilderBoundWorkspaceProbe.Operation, phase: ContextBuilderBoundWorkspaceProbe.Phase = .beforeFileSystem) {
             lock.withLock { self.operation = operation
                 heldPhase = phase
@@ -783,6 +788,9 @@ import XCTest
         private func observe(_ event: ContextBuilderBoundWorkspaceProbe.Event) {
             let operation = event.operation
             let phase = event.phase
+            if operation == .providerDirectory, phase == .beforeFileSystem {
+                lock.withLock { providerDirectoryStarts += 1 }
+            }
             if phase != .workerFinished {
                 let hold = lock.withLock {
                     guard self.operation == operation, heldPhase == phase, heldID == nil else { return false }

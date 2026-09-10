@@ -847,6 +847,17 @@ import XCTest
             }
         }
 
+        func testUnboundRunAuthoritySkipsBoundProviderCWDProbe() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver { driver in
+                try await BoundWorkspaceProbeTestCheckpoint.withCheckpoint { checkpoint in
+                    let context = try await driver.resolve(boundWorkspaceProbe: checkpoint.probe)
+                    _ = try await driver.authority(context)
+                    XCTAssertTrue(context.worktreeBindings.isEmpty)
+                    XCTAssertEqual(checkpoint.providerDirectoryStartCount, 0)
+                }
+            }
+        }
+
         func testBoundRunAuthorityCWDProbeCancelsBeforeHeldResultWithoutConstructingProvider() async throws {
             try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["A", "B", "Worktree"]) { driver in
                 try await BoundWorkspaceProbeTestCheckpoint.withCheckpoint { checkpoint in

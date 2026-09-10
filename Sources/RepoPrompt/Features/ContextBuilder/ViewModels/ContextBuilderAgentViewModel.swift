@@ -1888,23 +1888,21 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "The target workspace has no usable provider root. Open or repair that workspace before running Context Builder."]
             )
         }
-        if workspaceContext?.primaryRootSnapshot == nil {
-            let directoryExists: Bool
-            if let workspaceContext {
-                directoryExists = try await workspaceContext.boundWorkspaceProbe.directoryExists(at: providerWorkspacePath)
-            } else {
-                // Preserve the existing context-free/UI path; bound MCP invocations probe off MainActor.
-                var isDirectory: ObjCBool = false
-                directoryExists = FileManager.default.fileExists(atPath: providerWorkspacePath, isDirectory: &isDirectory)
-                    && isDirectory.boolValue
-            }
-            guard directoryExists else {
-                throw NSError(
-                    domain: "DiscoverAgent",
-                    code: 8,
-                    userInfo: [NSLocalizedDescriptionKey: "The target workspace provider root is unavailable: \(providerWorkspacePath)"]
-                )
-            }
+        let directoryExists: Bool
+        if let workspaceContext {
+            directoryExists = try await workspaceContext.isProviderWorkspaceAvailableForRunAuthority()
+        } else {
+            // Preserve the existing context-free/UI path; bound MCP invocations probe off MainActor.
+            var isDirectory: ObjCBool = false
+            directoryExists = FileManager.default.fileExists(atPath: providerWorkspacePath, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+        }
+        guard directoryExists else {
+            throw NSError(
+                domain: "DiscoverAgent",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "The target workspace provider root is unavailable: \(providerWorkspacePath)"]
+            )
         }
         let wantsResponse = responseType.flatMap {
             ContextBuilderResponseType(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
