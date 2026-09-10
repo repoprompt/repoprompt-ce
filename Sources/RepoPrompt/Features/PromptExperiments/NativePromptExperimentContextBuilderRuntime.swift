@@ -1,11 +1,11 @@
 #if DEBUG
     import Foundation
 
-    /// Executes approved Prompt Experiment trials through the existing Context Builder runtime.
+    /// Executes approved Prompt Experiment trials through existing provider and Context Builder runtimes.
     ///
-    /// Isolation is structural, not prompt-based: native provider file/shell tools are disabled by
-    /// discovery configuration, the provider cwd is the experiment’s synthetic root, and every
-    /// RepoPrompt file tool inherits a frozen lookup context containing only that root.
+    /// Isolation is structural, not prompt-based: connected-model callbacks use a run-scoped
+    /// prompt-only policy, Context Builder receives only an app-owned sealed root, and command
+    /// evaluators run in Seatbelt-confined scratch against a read-only reviewed project snapshot.
     @MainActor
     final class NativePromptExperimentContextBuilderRuntime: PromptExperimentRuntime {
         private struct RunningAttempt {
@@ -22,6 +22,7 @@
         }
 
         private weak var windowState: WindowState?
+        private let connectedModelRunner: PromptExperimentConnectedModelRunner
         private var running: [UUID: RunningAttempt] = [:]
         private var runningOptimizations: [UUID: RunningOptimization] = [:]
         private var optimizationChildren: [UUID: [PromptExperimentRuntimeHandle]] = [:]
@@ -29,6 +30,7 @@
 
         init(windowState: WindowState) {
             self.windowState = windowState
+            connectedModelRunner = PromptExperimentConnectedModelRunner(windowState: windowState)
         }
 
         func preflightOptimization(_ plan: PromptExperimentPlan) async throws {
@@ -63,7 +65,7 @@
                 throw PromptExperimentSubmissionError.rejected("This attempt already has a runtime submission.")
             }
             let plan = request.plan
-            guard plan.verifiesIntegrity(), plan.environment.fixtureFiles.count == 1 else {
+            guard plan.verifiesIntegrity(), !plan.environment.fixtureFiles.isEmpty else {
                 throw PromptExperimentSubmissionError.rejected("The sealed plan or synthetic environment is invalid.")
             }
             if plan.optimization != nil {
@@ -326,12 +328,23 @@
                             try await Task.sleep(for: .seconds(optimization.gepa.maxWallClockSeconds))
                             throw OptimizationTimeoutError.exceeded(optimization.gepa.maxWallClockSeconds)
                         }
-                        guard let first = try await group.next() else {
+                        guard let first = await group.nextResult() else {
                             throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA produced no terminal result.")
                         }
-                        group.cancelAll()
-                        worker.cancel()
-                        return first
+                        switch first {
+                        case let .success(result):
+                            group.cancelAll()
+                            worker.cancel()
+                            return result
+                        case let .failure(error):
+                            cancelledOptimizationIDs.insert(request.attempt.id)
+                            group.cancelAll()
+                            worker.cancel()
+                            await connectedModelRunner.cancelAll()
+                            await cancelAndDrainOptimizationChildren(parentID: request.attempt.id)
+                            while await group.nextResult() != nil {}
+                            throw error
+                        }
                     }
                     return PromptExperimentRuntimeResult(
                         disposition: .completed,
@@ -421,13 +434,13 @@
                         throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA supplied an invalid reflection prompt.")
                     }
                     await progress("GEPA is requesting a reflection proposal from \(targets.reflection.displayName).")
-                    let output = try await invokeContextBuilder(
+                    let completion = try await invokeConnectedModel(
                         parentRequest: parentRequest,
                         target: targets.reflection,
-                        taskInput: prompt,
-                        instructions: "Act as GEPA's reflection language model. Return only the proposed replacement candidate; do not access or modify any source outside the sealed synthetic environment.",
-                        progress: progress
+                        systemPrompt: "Act as GEPA's reflection language model. Return only the complete proposed replacement candidate. All tools are disabled.",
+                        userPrompt: prompt
                     )
+                    let output = completion.output
                     let wrapped = output.contains("```") ? output : "```\n\(output)\n```"
                     return PromptExperimentGEPAHostReply(
                         ok: true,
@@ -436,7 +449,9 @@
                         feedback: nil,
                         failureKind: nil,
                         error: nil,
-                        elapsedSeconds: nil
+                        elapsedSeconds: nil,
+                        promptTokens: completion.promptTokens,
+                        completionTokens: completion.completionTokens
                     )
                 case "evaluate":
                     guard let candidate = payload["candidate"] as? String,
@@ -467,10 +482,17 @@
             progress: @escaping @MainActor @Sendable (String) async -> Void
         ) async throws -> PromptExperimentGEPAHostReply {
             let started = Date()
+            guard let exampleID = example["id"] as? String,
+                  let sealedExample = specification.examples.first(where: { $0.id == exampleID }),
+                  example["input"] as? String == sealedExample.input,
+                  example["split"] as? String == sealedExample.split.rawValue
+            else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA requested an example outside the sealed dataset identity.")
+            }
             if specification.evaluator.kind == .sandboxedCommand {
                 return try await evaluateSandboxedCommand(
                     candidate: candidate,
-                    example: example,
+                    example: sealedExample,
                     request: parentRequest,
                     specification: specification,
                     started: started
@@ -479,24 +501,48 @@
             guard let executionTarget = targets.execution else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed execution target is unavailable.")
             }
-            let input = example["input"] as? String ?? ""
-            await progress("Evaluating a GEPA candidate through Context Builder on reviewed example \(example["id"] as? String ?? "unknown").")
-            let output = try await invokeContextBuilder(
-                parentRequest: parentRequest,
-                target: executionTarget,
-                taskInput: input,
-                instructions: """
-                \(specification.execution.instructions)
+            guard example["input"] as? String == sealedExample.input else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA requested an example outside the sealed dataset identity.")
+            }
+            let input = sealedExample.input
+            await progress("Evaluating a GEPA candidate through \(specification.execution.adapter.rawValue) on reviewed example \(exampleID).")
+            let executionInstructions = """
+            \(specification.execution.instructions)
 
-                Candidate instructions (immutable for this evaluation):
-                \(candidate)
-                """,
-                progress: progress
-            )
+            Candidate instructions (immutable for this evaluation):
+            \(candidate)
+            """
+            let execution: (output: String, promptTokens: Int?, completionTokens: Int?) = switch specification.execution.adapter {
+            case .connectedModel:
+                try await {
+                    let completion = try await invokeConnectedModel(
+                        parentRequest: parentRequest,
+                        target: executionTarget,
+                        systemPrompt: executionInstructions,
+                        userPrompt: input
+                    )
+                    return (completion.output, completion.promptTokens, completion.completionTokens)
+                }()
+            case .contextBuilder:
+                try await (
+                    invokeContextBuilder(
+                        parentRequest: parentRequest,
+                        target: executionTarget,
+                        taskInput: input,
+                        instructions: executionInstructions,
+                        progress: progress
+                    ),
+                    nil,
+                    nil
+                )
+            case .sandboxedCommand:
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Sandboxed command execution was routed to a connected-model evaluator.")
+            }
+            let output = execution.output
             let elapsed = Date().timeIntervalSince(started)
             switch specification.evaluator.kind {
             case .exactMatch:
-                let expected = example["expected_output"] as? String ?? ""
+                let expected = sealedExample.expectedOutput ?? ""
                 let matched = output.trimmingCharacters(in: .whitespacesAndNewlines)
                     == expected.trimmingCharacters(in: .whitespacesAndNewlines)
                 let score = matched ? specification.evaluator.maximumScore : specification.evaluator.minimumScore
@@ -510,13 +556,15 @@
                     feedback: feedback,
                     failureKind: nil,
                     error: nil,
-                    elapsedSeconds: elapsed
+                    elapsedSeconds: elapsed,
+                    promptTokens: execution.promptTokens,
+                    completionTokens: execution.completionTokens
                 )
             case .connectedModelJudge:
                 guard let judge = targets.judge else {
                     throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed judge target is unavailable.")
                 }
-                let expected = example["expected_output"] as? String ?? "unavailable"
+                let expected = sealedExample.expectedOutput ?? "unavailable"
                 let judgePrompt = """
                 Evaluate the candidate run using the immutable rubric below. Return only JSON with numeric `score` and string `feedback`.
                 Score range: \(specification.evaluator.minimumScore)...\(specification.evaluator.maximumScore)
@@ -525,14 +573,13 @@
                 Reviewed expected output (may be unavailable):\n\(expected)
                 Actual output:\n\(output)
                 """
-                let rawJudgment = try await invokeContextBuilder(
+                let judgment = try await invokeConnectedModel(
                     parentRequest: parentRequest,
                     target: judge,
-                    taskInput: judgePrompt,
-                    instructions: "Return only the requested evaluator JSON. Do not propose or reveal hidden examples.",
-                    progress: progress
+                    systemPrompt: "Return only the requested evaluator JSON. All tools are disabled; do not propose or reveal held-out examples.",
+                    userPrompt: judgePrompt
                 )
-                let object = try parseJSONObject(rawJudgment)
+                let object = try parseJSONObject(judgment.output)
                 guard let score = (object["score"] as? NSNumber)?.doubleValue,
                       score >= specification.evaluator.minimumScore,
                       score <= specification.evaluator.maximumScore,
@@ -547,11 +594,39 @@
                     feedback: feedback,
                     failureKind: nil,
                     error: nil,
-                    elapsedSeconds: elapsed
+                    elapsedSeconds: elapsed,
+                    promptTokens: Self.sumAvailable(execution.promptTokens, judgment.promptTokens),
+                    completionTokens: Self.sumAvailable(execution.completionTokens, judgment.completionTokens)
                 )
             case .sandboxedCommand:
                 fatalError("handled above")
             }
+        }
+
+        private func invokeConnectedModel(
+            parentRequest: PromptExperimentRunRequest,
+            target: PromptExperimentResolvedTarget,
+            systemPrompt: String,
+            userPrompt: String
+        ) async throws -> PromptExperimentConnectedModelCompletion {
+            guard !cancelledOptimizationIDs.contains(parentRequest.attempt.id) else {
+                throw CancellationError()
+            }
+            let callbackRoot = PromptExperimentStore.liveRootURL()
+                .appendingPathComponent("callback-roots", isDirectory: true)
+                .appendingPathComponent(parentRequest.attempt.id.uuidString.lowercased(), isDirectory: true)
+                .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+            return try await connectedModelRunner.complete(
+                target: target,
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                callbackRoot: callbackRoot
+            )
+        }
+
+        private nonisolated static func sumAvailable(_ left: Int?, _ right: Int?) -> Int? {
+            guard left != nil || right != nil else { return nil }
+            return (left ?? 0) + (right ?? 0)
         }
 
         private func invokeContextBuilder(
@@ -614,7 +689,7 @@
 
         private func evaluateSandboxedCommand(
             candidate: String,
-            example: [String: Any],
+            example: PromptExperimentExample,
             request: PromptExperimentRunRequest,
             specification: PromptExperimentOptimizationSpecification,
             started: Date
@@ -622,36 +697,62 @@
             guard let command = specification.evaluator.command,
                   let fileName = specification.evaluator.candidateFileName,
                   fileName == URL(fileURLWithPath: fileName).lastPathComponent,
-                  !fileName.contains("..")
+                  !fileName.contains(".."),
+                  !["example.json", ".zshenv", ".profile"].contains(fileName)
             else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed candidate file name is unsafe.")
             }
             let workspace = PromptExperimentStore.liveRootURL()
                 .appendingPathComponent("command-runs", isDirectory: true)
+                .appendingPathComponent(request.attempt.id.uuidString.lowercased(), isDirectory: true)
                 .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
-            try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
-            try Data(candidate.utf8).write(to: workspace.appendingPathComponent(fileName), options: [.atomic])
-            let exampleData = try JSONSerialization.data(withJSONObject: example, options: [.prettyPrinted, .sortedKeys])
-            try exampleData.write(to: workspace.appendingPathComponent("example.json"), options: [.atomic])
-            let escaped = workspace.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            let scratch = workspace.appendingPathComponent("work", isDirectory: true)
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            try Data(candidate.utf8).write(to: scratch.appendingPathComponent(fileName), options: [.atomic])
+            let visibleExample: [String: Any] = [
+                "id": example.id,
+                "split": example.split.rawValue,
+                "input": example.input
+            ]
+            let exampleData = try JSONSerialization.data(withJSONObject: visibleExample, options: [.prettyPrinted, .sortedKeys])
+            try exampleData.write(to: scratch.appendingPathComponent("example.json"), options: [.atomic])
+
+            let project = URL(fileURLWithPath: request.plan.environment.isolatedRootPath, isDirectory: true)
+                .appendingPathComponent("project", isDirectory: true)
+            let escapedScratch = Self.sandboxEscapedPath(scratch.path)
+            let projectRule: String
+            var environment = [
+                "HOME": scratch.path,
+                "TMPDIR": scratch.path,
+                "ZDOTDIR": scratch.path,
+                "PATH": "/usr/bin:/bin"
+            ]
+            if FileManager.default.fileExists(atPath: project.path) {
+                projectRule = " (subpath \"\(Self.sandboxEscapedPath(project.path))\")"
+                environment["RPCE_PROJECT_ROOT"] = project.path
+            } else {
+                projectRule = ""
+            }
             let profile = """
             (version 1)
             (deny default)
             (allow process*)
             (allow sysctl-read)
-            (allow mach-lookup)
-            (allow file-read* (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/Library") (subpath "\(escaped)"))
-            (allow file-write* (subpath "\(escaped)"))
+            (allow file-read* (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/Library") (subpath "\(escapedScratch)")\(projectRule))
+            (allow file-write* (subpath "\(escapedScratch)"))
             """
             let runner = CLIProcessRunner(config: CLIProcessConfiguration(
                 command: "/usr/bin/sandbox-exec",
-                workingDirectory: workspace.path,
-                environment: ["HOME": workspace.path, "TMPDIR": workspace.path],
+                workingDirectory: scratch.path,
+                environment: environment,
+                environmentPolicy: .replacement,
+                additionalPaths: [],
+                shellLookupMode: .disabled,
                 captureStdoutTailBytes: 1024 * 1024,
                 captureStderrTailBytes: 1024 * 1024
             ))
             let result = try await runner.run(
-                args: ["-p", profile, "/bin/zsh", "-lc", command],
+                args: ["-p", profile, "/bin/sh", "-c", command],
                 stdin: nil,
                 outputMode: .none,
                 timeout: min(300, TimeInterval(specification.gepa.maxWallClockSeconds)),
@@ -659,37 +760,61 @@
             )
             let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
             let stderr = String(data: result.stderr, encoding: .utf8) ?? ""
-            if result.timedOut || result.status != 0 {
-                let message = result.timedOut
-                    ? "Candidate command exceeded its sealed per-evaluation timeout."
-                    : "Candidate command exited \(result.status).\n\(stderr)"
-                return PromptExperimentGEPAHostReply(
-                    ok: false,
-                    output: stdout,
-                    score: specification.evaluator.minimumScore,
-                    feedback: message,
-                    failureKind: .candidate,
-                    error: message,
-                    elapsedSeconds: Date().timeIntervalSince(started)
+            guard !result.timedOut else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator exceeded its timeout.")
+            }
+            guard result.status == 0 else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable(
+                    "The sealed command evaluator failed with exit \(result.status): \(stderr)"
                 )
             }
-            let object = try parseJSONObject(stdout)
-            guard let score = (object["score"] as? NSNumber)?.doubleValue,
-                  score >= specification.evaluator.minimumScore,
-                  score <= specification.evaluator.maximumScore,
+            return try Self.commandEvaluationReply(
+                stdout: stdout,
+                minimumScore: specification.evaluator.minimumScore,
+                maximumScore: specification.evaluator.maximumScore,
+                elapsedSeconds: Date().timeIntervalSince(started)
+            )
+        }
+
+        nonisolated static func commandEvaluationReply(
+            stdout: String,
+            minimumScore: Double,
+            maximumScore: Double,
+            elapsedSeconds: Double
+        ) throws -> PromptExperimentGEPAHostReply {
+            guard let data = stdout.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let score = (object["score"] as? NSNumber)?.doubleValue,
+                  score.isFinite,
+                  score >= minimumScore,
+                  score <= maximumScore,
                   let feedback = object["feedback"] as? String
             else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator did not return valid score/feedback JSON.")
             }
+            let failureRaw = object["failure_kind"] as? String
+            let failureKind = failureRaw.flatMap(PromptExperimentOptimizationFailureKind.init(rawValue:))
+            guard failureRaw == nil || failureKind != nil else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator returned an unknown failure classification.")
+            }
+            guard failureKind != .infrastructure else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator reported an infrastructure failure: \(feedback)")
+            }
+            let candidateFailure = failureKind == .candidate
             return PromptExperimentGEPAHostReply(
-                ok: true,
+                ok: !candidateFailure,
                 output: stdout,
                 score: score,
                 feedback: feedback,
-                failureKind: nil,
-                error: nil,
-                elapsedSeconds: Date().timeIntervalSince(started)
+                failureKind: failureKind,
+                error: candidateFailure ? feedback : nil,
+                elapsedSeconds: elapsedSeconds
             )
+        }
+
+        private nonisolated static func sandboxEscapedPath(_ path: String) -> String {
+            path.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
         }
 
         private func parseJSONObject(_ raw: String) throws -> [String: Any] {
@@ -753,6 +878,7 @@
         func cancel(_ handle: PromptExperimentRuntimeHandle) async -> PromptExperimentCancellationObservation {
             if let optimization = runningOptimizations[handle.id] {
                 cancelledOptimizationIDs.insert(handle.id)
+                await connectedModelRunner.cancelAll()
                 await cancelAndDrainOptimizationChildren(parentID: handle.id)
                 optimization.worker.cancel()
                 optimization.task.cancel()
@@ -861,30 +987,40 @@
             for case let url as URL in enumerator {
                 let values = try url.resourceValues(forKeys: keys)
                 guard values.isSymbolicLink != true,
-                      values.isRegularFile == true,
-                      values.isDirectory != true,
                       url.resolvingSymlinksInPath().path.hasPrefix(resolvedRoot.path + "/")
                 else {
-                    throw PromptExperimentAuthorityError.environmentUnavailable("Synthetic fixture roots cannot contain directories, symbolic links, or non-file entries.")
+                    throw PromptExperimentAuthorityError.environmentUnavailable("Experiment environments cannot contain symbolic links or path escapes.")
+                }
+                if values.isDirectory == true {
+                    continue
+                }
+                guard values.isRegularFile == true else {
+                    throw PromptExperimentAuthorityError.environmentUnavailable("Experiment environments may contain only directories and regular files.")
                 }
                 observedPaths.insert(url.standardizedFileURL.path)
             }
             guard observedPaths == expectedPaths else {
-                throw PromptExperimentAuthorityError.environmentUnavailable("Synthetic fixture contents differ from the sealed file inventory.")
+                throw PromptExperimentAuthorityError.environmentUnavailable("Experiment environment contents differ from the sealed file inventory.")
             }
             for fixture in environment.fixtureFiles {
                 let data = try Data(contentsOf: URL(fileURLWithPath: fixture.path), options: [.mappedIfSafe])
                 guard data.count == fixture.byteCount,
                       PromptExperimentDigest.sha256(data) == fixture.sha256
                 else {
-                    throw PromptExperimentAuthorityError.environmentUnavailable("Synthetic fixture digest verification failed.")
+                    throw PromptExperimentAuthorityError.environmentUnavailable("Experiment environment digest verification failed.")
                 }
             }
-            let inventoryDigest = environment.fixtureFiles.first?.sha256 ?? ""
-            guard inventoryDigest == environment.fixtureDigest else {
-                throw PromptExperimentAuthorityError.environmentUnavailable("Synthetic environment digest does not match the sealed plan.")
+            let inventoryDigest = PromptExperimentDigest.environmentInventorySHA256(
+                rootPath: root.path,
+                files: environment.fixtureFiles
+            )
+            let legacySingleFileDigest = environment.fixtureFiles.count == 1
+                ? environment.fixtureFiles[0].sha256
+                : nil
+            guard inventoryDigest == environment.fixtureDigest || legacySingleFileDigest == environment.fixtureDigest else {
+                throw PromptExperimentAuthorityError.environmentUnavailable("Experiment environment digest does not match the sealed plan.")
             }
-            return inventoryDigest
+            return environment.fixtureDigest
         }
 
         private func cleanup(

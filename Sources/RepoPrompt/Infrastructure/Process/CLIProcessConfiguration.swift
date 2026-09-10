@@ -1,5 +1,10 @@
 import Foundation
 
+enum CLIProcessEnvironmentPolicy {
+    case merged
+    case replacement
+}
+
 struct CLIProcessConfiguration {
     static func resolvedWorkingDirectory(_ workingDirectory: String?) -> String {
         workingDirectory ?? FileManager.default.temporaryDirectory.path
@@ -9,6 +14,8 @@ struct CLIProcessConfiguration {
     /// Working directory for the CLI process. Defaults to temp directory to avoid macOS security popups.
     var workingDirectory: String
     var environment: [String: String]
+    /// Whether the child inherits the app's sanitized environment or receives only explicit values.
+    var environmentPolicy: CLIProcessEnvironmentPolicy
     var additionalPaths: [String]
     var commandSuffix: [String]
     var enableDebugLogging: Bool
@@ -28,6 +35,7 @@ struct CLIProcessConfiguration {
         command: String = "claude",
         workingDirectory: String? = nil, // nil → temp directory to avoid macOS security popups
         environment: [String: String] = [:],
+        environmentPolicy: CLIProcessEnvironmentPolicy = .merged,
         additionalPaths: [String] = CLINativePathDefaults.defaultAdditionalPaths,
         commandSuffix: [String] = [],
         enableDebugLogging: Bool = false,
@@ -41,6 +49,7 @@ struct CLIProcessConfiguration {
         self.command = command
         self.workingDirectory = Self.resolvedWorkingDirectory(workingDirectory)
         self.environment = environment
+        self.environmentPolicy = environmentPolicy
         self.additionalPaths = additionalPaths
         self.commandSuffix = commandSuffix
         self.enableDebugLogging = enableDebugLogging

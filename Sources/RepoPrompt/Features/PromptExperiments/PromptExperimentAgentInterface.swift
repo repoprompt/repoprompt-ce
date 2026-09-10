@@ -8,12 +8,21 @@
         case updateDraft = "update_draft"
         case proposeSeal = "propose_seal"
         case read
+        case cloneDraft = "clone_draft"
+        case proposeRunAgain = "propose_run_again"
         case proposeNextRevision = "propose_next_revision"
     }
 
     struct PromptExperimentAgentOwner: Equatable {
         let controllerSessionID: UUID
         let sourceTabID: UUID
+        let authorizedSourceRoots: [String]
+
+        init(controllerSessionID: UUID, sourceTabID: UUID, authorizedSourceRoots: [String] = []) {
+            self.controllerSessionID = controllerSessionID
+            self.sourceTabID = sourceTabID
+            self.authorizedSourceRoots = authorizedSourceRoots
+        }
     }
 
     struct PromptExperimentAgentDraftPatch: Equatable {
@@ -45,7 +54,9 @@
             expectedDraftDigest: String
         )
         case read(experimentID: UUID)
-        case proposeNextRevision(experimentID: UUID, expectedPlanDigest: String)
+        case cloneDraft(experimentID: UUID)
+        case proposeRunAgain(experimentID: UUID, expectedPlanDigest: String)
+        case proposeNextRevision(experimentID: UUID, expectedPlanDigest: String, candidateIndex: Int?)
     }
 
     struct PromptExperimentGEPARuntimeCapability {
@@ -53,7 +64,8 @@
         let packageVersion: String
         let pinnedRevision: String
         let workerResourceAvailable: Bool
-        let defaultPythonExecutable: String?
+        let configuredPythonExecutable: String?
+        let setupInstructions: String
     }
 
     enum PromptExperimentAgentResponse {
@@ -88,14 +100,15 @@
                         packageVersion: PromptExperimentGEPAConfiguration.packageVersion,
                         pinnedRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
                         workerResourceAvailable: (try? PromptExperimentGEPAWorker.resolveWorkerURL()) != nil,
-                        defaultPythonExecutable: ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_PYTHON"]
+                        configuredPythonExecutable: PromptExperimentGEPAWorker.configuredPythonExecutable(),
+                        setupInstructions: PromptExperimentGEPAWorker.setupInstructions
                     ),
                     limitations: [
                         "DEBUG integration using upstream GEPA optimize_anything from a separately configured pinned Python environment.",
                         "The linked Agent session may create/update/seal/query only; it cannot approve, start, cancel, or apply a winner.",
                         "The user approves the exact native digest card and starts or stops execution from that card.",
-                        "Context Builder and sandboxed-command adapters are supported. Investigate and multi-agent workflow adapters remain explicit unsupported capabilities.",
-                        "Reviewed inline examples are materialized into an app-owned isolated environment; loaded-workspace execution and hidden source access fail closed."
+                        "Prompt-only connected-model, Context Builder, and sandboxed-command adapters are supported for catalog targets shown here. ACP, Investigate, and multi-agent adapters remain explicit unsupported capabilities.",
+                        "Reviewed project files may be copied from the Agent session's currently loaded root into an app-owned snapshot. Expected outputs, notes, and held-out grading data remain host-private."
                     ]
                 )
             case .list:
@@ -140,7 +153,8 @@
                     expectedDraftID: draftID,
                     expectedDraftVersion: version,
                     expectedDraftDigest: digest,
-                    expectedControllerSessionID: owner.controllerSessionID
+                    expectedControllerSessionID: owner.controllerSessionID,
+                    authorizedSourceRoots: owner.authorizedSourceRoots
                 )
                 return .sealed(experimentID: experimentID, plan: plan)
             case let .read(experimentID):
@@ -152,11 +166,30 @@
                     record,
                     artifactTextBySHA256: service.readableArtifactText(for: record)
                 )
-            case let .proposeNextRevision(experimentID, digest):
+            case let .cloneDraft(experimentID):
+                let cloneID = try await service.cloneExperiment(
+                    experimentID: experimentID,
+                    expectedControllerSessionID: owner.controllerSessionID
+                )
+                return try await .draft(
+                    experimentID: cloneID,
+                    draft: requireDraft(service.ownedRecord(id: cloneID, controllerSessionID: owner.controllerSessionID))
+                )
+            case let .proposeRunAgain(experimentID, digest):
                 try await service.startNextRevision(
                     experimentID: experimentID,
                     expectedPlanDigest: digest,
-                    expectedControllerSessionID: owner.controllerSessionID
+                    expectedControllerSessionID: owner.controllerSessionID,
+                    revisionMode: .repeatCurrentSeed
+                )
+                let record = try await service.ownedRecord(id: experimentID, controllerSessionID: owner.controllerSessionID)
+                return try await .record(record, artifactTextBySHA256: service.readableArtifactText(for: record))
+            case let .proposeNextRevision(experimentID, digest, candidateIndex):
+                try await service.startNextRevision(
+                    experimentID: experimentID,
+                    expectedPlanDigest: digest,
+                    expectedControllerSessionID: owner.controllerSessionID,
+                    revisionMode: candidateIndex.map(PromptExperimentRevisionMode.continueCandidate) ?? .continueBest
                 )
                 let record = try await service.ownedRecord(
                     id: experimentID,

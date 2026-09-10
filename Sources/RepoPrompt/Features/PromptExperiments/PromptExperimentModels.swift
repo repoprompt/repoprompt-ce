@@ -4,9 +4,9 @@
 
     // MARK: - Prompt Experiment authority records
 
-    /// The first native Prompt Experiment slice is deliberately narrow: a fixed, serial
-    /// comparison of Context Builder instructions. These records are the app-owned authority;
-    /// the provider runtime remains authoritative for each underlying execution.
+    /// Native Prompt Experiment authority records support legacy fixed comparisons and current
+    /// digest-approved upstream GEPA runs. The service owns scheduling/evidence while existing
+    /// Agent/provider runtimes remain authoritative for every connected-model execution.
     enum PromptExperimentCondition: String, Codable, CaseIterable, Hashable {
         case original
         case candidate
@@ -112,6 +112,13 @@
         var reviewerNotes: String?
     }
 
+    /// A user-reviewed, bounded set of regular files copied from an authorized loaded root.
+    /// Runtime commands receive the immutable copy, never the source workspace.
+    struct PromptExperimentProjectSnapshotSpecification: Codable, Equatable {
+        var sourceRootPath: String
+        var includedPaths: [String]
+    }
+
     enum PromptExperimentEvaluatorKind: String, Codable, CaseIterable {
         case exactMatch = "exact_match"
         case connectedModelJudge = "connected_model_judge"
@@ -129,6 +136,7 @@
     }
 
     enum PromptExperimentWorkflowAdapter: String, Codable, CaseIterable {
+        case connectedModel = "connected_model"
         case contextBuilder = "context_builder"
         case sandboxedCommand = "sandboxed_command"
     }
@@ -151,6 +159,10 @@
         var maxWallClockSeconds: Int
         var stopAtScore: Double?
         var randomSeed: Int
+        var reflectionMinibatchSize: Int? = nil
+        var useMerge: Bool? = nil
+        var maxMergeInvocations: Int? = nil
+        var skipPerfectScore: Bool? = nil
     }
 
     /// Sealed input to the external upstream GEPA worker. Every field that can
@@ -166,6 +178,7 @@
         var objective: String
         var background: String
         var examples: [PromptExperimentExample]
+        var projectSnapshot: PromptExperimentProjectSnapshotSpecification? = nil
         var evaluator: PromptExperimentEvaluatorSpecification
         var execution: PromptExperimentExecutionSpecification
         var gepa: PromptExperimentGEPAConfiguration
@@ -262,6 +275,10 @@
         static let maximumTaskCharacters = 20000
         static let maximumFixtureBytes = 256 * 1024
         static let maximumInstructionCharacters = 50000
+        static let maximumExamples = 200
+        static let maximumExampleCharacters = 100_000
+        static let maximumSpecificationBytes = 4 * 1024 * 1024
+        static let maximumProjectFiles = 256
 
         let id: UUID
         let revision: Int
@@ -346,9 +363,36 @@
                   candidateInstructions.count <= Self.maximumInstructionCharacters,
                   (optimization?.seedCandidate?.count ?? 0) <= Self.maximumInstructionCharacters,
                   (optimization?.objective.count ?? 0) <= Self.maximumTaskCharacters,
-                  (optimization?.background.count ?? 0) <= Self.maximumInstructionCharacters
+                  (optimization?.background.count ?? 0) <= Self.maximumInstructionCharacters,
+                  (optimization?.execution.instructions.count ?? 0) <= Self.maximumInstructionCharacters,
+                  (optimization?.evaluator.rubric.count ?? 0) <= Self.maximumExampleCharacters,
+                  (optimization?.evaluator.command?.count ?? 0) <= Self.maximumInstructionCharacters
             else {
-                throw PromptExperimentAuthorityError.invalidDraft("Each instruction variant is limited to \(Self.maximumInstructionCharacters) characters.")
+                throw PromptExperimentAuthorityError.invalidDraft("Each instruction, rubric, command, and background field must remain within its documented bound.")
+            }
+            if let optimization {
+                guard optimization.examples.count <= Self.maximumExamples else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Optimization datasets are limited to \(Self.maximumExamples) examples.")
+                }
+                guard optimization.examples.allSatisfy({ example in
+                    example.id.count <= 200
+                        && example.input.count <= Self.maximumExampleCharacters
+                        && (example.expectedOutput?.count ?? 0) <= Self.maximumExampleCharacters
+                        && (example.reviewerNotes?.count ?? 0) <= Self.maximumExampleCharacters
+                }) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Example IDs, inputs, expected outputs, or reviewer notes exceed their field bounds.")
+                }
+                guard (optimization.projectSnapshot?.includedPaths.count ?? 0) <= Self.maximumProjectFiles,
+                      (optimization.projectSnapshot?.sourceRootPath.count ?? 0) <= 4096,
+                      optimization.projectSnapshot?.includedPaths.allSatisfy({ $0.count <= 4096 }) ?? true
+                else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Reviewed project snapshots are limited to \(Self.maximumProjectFiles) bounded paths.")
+                }
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                guard try encoder.encode(optimization).count <= Self.maximumSpecificationBytes else {
+                    throw PromptExperimentAuthorityError.invalidDraft("The encoded optimization specification exceeds the \(Self.maximumSpecificationBytes)-byte bound.")
+                }
             }
             return self
         }
@@ -372,6 +416,26 @@
                 guard (30 ... 86400).contains(optimization.gepa.maxWallClockSeconds) else {
                     throw PromptExperimentAuthorityError.invalidDraft("GEPA wall-clock limit must be between 30 seconds and 24 hours.")
                 }
+                guard optimization.evaluator.minimumScore.isFinite,
+                      optimization.evaluator.maximumScore.isFinite,
+                      optimization.evaluator.minimumScore < optimization.evaluator.maximumScore
+                else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Evaluator score bounds must be finite and minimum must be less than maximum.")
+                }
+                if let stop = optimization.gepa.stopAtScore {
+                    guard stop.isFinite,
+                          stop >= optimization.evaluator.minimumScore,
+                          stop <= optimization.evaluator.maximumScore
+                    else {
+                        throw PromptExperimentAuthorityError.invalidDraft("GEPA stop score must be finite and within the evaluator score range.")
+                    }
+                }
+                guard (1 ... 100).contains(optimization.gepa.reflectionMinibatchSize ?? 3) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Reflection minibatch size must be between 1 and 100.")
+                }
+                guard (0 ... 20).contains(optimization.gepa.maxMergeInvocations ?? 5) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Merge invocations must be between 0 and 20.")
+                }
                 guard !optimization.gepa.pythonExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw PromptExperimentAuthorityError.invalidDraft("Configure the external Python executable containing pinned GEPA before sealing.")
                 }
@@ -385,10 +449,22 @@
                 guard optimization.examples.contains(where: { $0.split != .hiddenTest }) else {
                     throw PromptExperimentAuthorityError.invalidDraft("At least one training or validation example must be visible to GEPA.")
                 }
+                if let project = optimization.projectSnapshot {
+                    guard !project.sourceRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                          !project.includedPaths.isEmpty,
+                          project.includedPaths.allSatisfy({ path in
+                              !path.hasPrefix("/")
+                                  && !path.split(separator: "/").contains("..")
+                                  && path != "."
+                          })
+                    else {
+                        throw PromptExperimentAuthorityError.invalidDraft("Project snapshots require an authorized source root and safe relative file paths.")
+                    }
+                }
                 switch optimization.execution.adapter {
-                case .contextBuilder:
+                case .connectedModel, .contextBuilder:
                     guard optimization.execution.targetSelector?.isEmpty == false else {
-                        throw PromptExperimentAuthorityError.invalidDraft("Select a Context Builder execution target.")
+                        throw PromptExperimentAuthorityError.invalidDraft("Select an exact connected execution target.")
                     }
                 case .sandboxedCommand:
                     guard optimization.evaluator.kind == .sandboxedCommand else {
@@ -407,10 +483,18 @@
                         throw PromptExperimentAuthorityError.invalidDraft("A connected-model judge requires a rubric and exact judge target.")
                     }
                 case .sandboxedCommand:
+                    guard optimization.execution.adapter == .sandboxedCommand else {
+                        throw PromptExperimentAuthorityError.invalidDraft("A sandboxed command evaluator must use the sandboxed-command execution adapter.")
+                    }
+                    let reserved = ["example.json", ".zshenv", ".zprofile", ".zshrc", ".profile"]
                     guard optimization.evaluator.command?.isEmpty == false,
-                          optimization.evaluator.candidateFileName?.isEmpty == false
+                          let candidateFileName = optimization.evaluator.candidateFileName,
+                          !candidateFileName.isEmpty,
+                          candidateFileName == URL(fileURLWithPath: candidateFileName).lastPathComponent,
+                          !candidateFileName.contains(".."),
+                          !reserved.contains(candidateFileName.lowercased())
                     else {
-                        throw PromptExperimentAuthorityError.invalidDraft("A sandboxed command evaluator requires a command and candidate file name.")
+                        throw PromptExperimentAuthorityError.invalidDraft("A sandboxed command evaluator requires a safe, non-reserved candidate file name and command.")
                     }
                 }
                 var copy = self
@@ -527,7 +611,8 @@
         }
 
         static let legacySchemaVersion = 1
-        static let optimizationSchemaVersion = 2
+        static let legacyOptimizationSchemaVersion = 2
+        static let optimizationSchemaVersion = 3
         static let schemaVersion = legacySchemaVersion
         static let executionAdapter = "context_builder_native_v1"
         static let comparisonMode = "fixed_serial_interleaved_v1"
@@ -670,13 +755,13 @@
 
         func verifiesIntegrity() -> Bool {
             if let optimization {
-                guard schemaVersion == Self.optimizationSchemaVersion,
+                guard [Self.legacyOptimizationSchemaVersion, Self.optimizationSchemaVersion].contains(schemaVersion ?? -1),
                       let optimizationTargets,
                       trials.count == 1,
                       trials.first?.condition == .optimization
                 else { return false }
                 let payload = OptimizationDigestPayload(
-                    schemaVersion: Self.optimizationSchemaVersion,
+                    schemaVersion: schemaVersion ?? Self.legacyOptimizationSchemaVersion,
                     revision: revision,
                     parentPlanID: parentPlanID,
                     title: title,
@@ -943,6 +1028,12 @@
         let attempt: PromptExperimentAttempt
     }
 
+    enum PromptExperimentRevisionMode: Equatable {
+        case continueBest
+        case continueCandidate(Int)
+        case repeatCurrentSeed
+    }
+
     enum PromptExperimentCancellationObservation: Equatable {
         case requested
         case alreadySettled
@@ -960,6 +1051,19 @@
 
         static func sha256(_ data: Data) -> String {
             SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+
+        static func environmentInventorySHA256(
+            rootPath: String,
+            files: [PromptExperimentFixtureFile]
+        ) -> String {
+            let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+            let inventory = files.map { file -> String in
+                let path = URL(fileURLWithPath: file.path).standardizedFileURL.path
+                let relative = path.hasPrefix(root + "/") ? String(path.dropFirst(root.count + 1)) : path
+                return "\(relative)\u{0}\(file.byteCount)\u{0}\(file.sha256)"
+            }.sorted().joined(separator: "\n")
+            return sha256(Data(inventory.utf8))
         }
 
         static func deterministicUUID(namespace: String, value: String) -> UUID {

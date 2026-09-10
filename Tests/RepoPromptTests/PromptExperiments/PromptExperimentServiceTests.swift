@@ -505,13 +505,50 @@ import XCTest
             let sealed = try XCTUnwrap(harness.service.record(id: id))
             XCTAssertEqual(sealed.phase, .awaitingApproval)
             XCTAssertEqual(sealed.currentPlan?.schemaVersion, PromptExperimentPlan.optimizationSchemaVersion)
-            XCTAssertEqual(harness.runtime.preflightedPlans.map(\.id), sealed.currentPlan.map { [$0.id] } ?? [])
+            XCTAssertTrue(harness.runtime.preflightedPlans.isEmpty, "Preflight must not probe the external runtime before native approval")
             XCTAssertNil(PromptExperimentAgentOperation(rawValue: "approve"))
             XCTAssertNil(PromptExperimentAgentOperation(rawValue: "run"))
 
             let plan = try XCTUnwrap(sealed.currentPlan)
             try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
             XCTAssertEqual(harness.service.record(id: id)?.phase, .approved)
+
+            let cloneResponse = try await interface.execute(.cloneDraft(experimentID: id), owner: owner)
+            guard case let .draft(cloneID, cloneDraft) = cloneResponse else { return XCTFail("Expected owned clone draft") }
+            XCTAssertNotEqual(cloneID, id)
+            XCTAssertEqual(cloneDraft.optimization, plan.optimization)
+            do {
+                _ = try await interface.execute(.cloneDraft(experimentID: id), owner: otherOwner)
+                XCTFail("A different Agent session must not clone the experiment")
+            } catch let error as PromptExperimentAuthorityError {
+                XCTAssertEqual(error, .ownerMismatch)
+            }
+        }
+
+        func testAgentCanProposeRunAgainButCannotStartIt() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(record.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: record.controllerSessionID,
+                sourceTabID: record.sourceTabID
+            )
+            let response = try await PromptExperimentAgentInterface(service: harness.service).execute(
+                .proposeRunAgain(experimentID: id, expectedPlanDigest: plan.digest),
+                owner: owner
+            )
+            guard case let .record(next, _) = response else { return XCTFail("Expected next-revision record") }
+            XCTAssertEqual(next.phase, .drafting)
+            XCTAssertEqual(next.draft?.parentPlanID, plan.id)
+            XCTAssertEqual(next.draft?.optimization?.seedCandidate, plan.optimization?.seedCandidate)
+            XCTAssertTrue(next.attempts(for: plan).count == 1)
+            XCTAssertNil(PromptExperimentAgentOperation(rawValue: "start"))
         }
 
         func testCanonicalCommitSurvivesReadableProjectionFailure() async throws {
@@ -879,30 +916,34 @@ import XCTest
             XCTAssertEqual(GlobalSettingsStore.shared.globalAgentModelsProfile().mcpAgentRoleOverrides, beforeOverrides)
         }
 
-        func testOptimizationSealPreflightsAndFailureLeavesDraftUncommitted() async throws {
+        func testOptimizationPreflightRunsOnlyAfterNativeApprovalAndFailureDoesNotSubmit() async throws {
             let harness = makeHarness()
             defer { try? FileManager.default.removeItem(at: harness.root) }
             let (id, draft) = try await updatedOptimizationDraft(harness)
             harness.runtime.preflightError = .runtimeUnavailable("controlled pinned GEPA mismatch")
 
+            let plan = try await harness.service.seal(
+                experimentID: id,
+                expectedDraftID: draft.id,
+                expectedDraftVersion: draft.optimisticVersion,
+                expectedDraftDigest: draft.contentDigest()
+            )
+            XCTAssertTrue(harness.runtime.preflightedPlans.isEmpty)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+
             do {
-                _ = try await harness.service.seal(
-                    experimentID: id,
-                    expectedDraftID: draft.id,
-                    expectedDraftVersion: draft.optimisticVersion,
-                    expectedDraftDigest: draft.contentDigest()
-                )
-                XCTFail("Failed GEPA preflight must reject sealing")
+                try await harness.service.run(experimentID: id)
+                XCTFail("Failed GEPA preflight must reject runtime admission")
             } catch let error as PromptExperimentAuthorityError {
                 XCTAssertEqual(error, .runtimeUnavailable("controlled pinned GEPA mismatch"))
             }
 
             let record = try XCTUnwrap(harness.service.record(id: id))
-            XCTAssertEqual(record.phase, .drafting)
-            XCTAssertNotNil(record.draft)
-            XCTAssertTrue(record.plans.isEmpty)
-            XCTAssertEqual(harness.runtime.preflightedPlans.count, 1)
+            XCTAssertEqual(record.phase, .approved)
+            XCTAssertEqual(record.currentPlan?.id, plan.id)
+            XCTAssertEqual(harness.runtime.preflightedPlans.map(\.id), [plan.id])
             XCTAssertTrue(harness.runtime.submitted.isEmpty)
+            XCTAssertTrue(record.attempts(for: plan).isEmpty)
         }
 
         func testOptimizationResultPersistsCandidatesEvaluationsAndExactTargets() async throws {
@@ -977,12 +1018,93 @@ import XCTest
             XCTAssertTrue(overview.contains("GEPA wall time: 1.500 seconds"))
             XCTAssertTrue(overview.contains("worker-runs/attempt/gepa-run"))
             XCTAssertTrue(overview.contains("matched reviewed answer"))
+            XCTAssertTrue(overview.contains("Sealed optimization authority"))
+
+            let cloneID = try await reopened.cloneExperiment(experimentID: id)
+            let clone = try XCTUnwrap(reopened.record(id: cloneID))
+            XCTAssertEqual(clone.phase, .drafting)
+            XCTAssertEqual(clone.draft?.optimization, plan.optimization)
+            XCTAssertTrue(clone.plans.isEmpty)
+            XCTAssertTrue(clone.attempts.isEmpty)
 
             try await reopened.startNextRevision(experimentID: id, expectedPlanDigest: plan.digest)
             let next = try XCTUnwrap(reopened.record(id: id))
             XCTAssertEqual(next.draft?.optimization?.seedCandidate, "improved instructions")
             XCTAssertEqual(next.attempts(for: plan).first?.optimizationResult?.bestScore, 1)
             XCTAssertTrue(harness.runtime.submitted.count == 1)
+        }
+
+        func testOversizedOptimizationUpdatePreservesMemoryAndCanonicalStore() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let (id, current) = try await updatedOptimizationDraft(harness)
+            let canonicalURL = harness.root.appendingPathComponent("experiments.json")
+            let canonicalBefore = try Data(contentsOf: canonicalURL)
+            var oversized = current
+            let largeInput = String(repeating: "x", count: PromptExperimentDraft.maximumExampleCharacters)
+            for index in 0 ..< 50 {
+                oversized.optimization?.examples.append(PromptExperimentExample(
+                    id: "large-\(index)",
+                    split: .training,
+                    input: largeInput,
+                    expectedOutput: "ok",
+                    reviewerNotes: nil
+                ))
+            }
+
+            do {
+                _ = try await harness.service.updateDraft(
+                    experimentID: id,
+                    expectedDraftID: current.id,
+                    expectedDraftVersion: current.optimisticVersion,
+                    expectedDraftDigest: current.contentDigest(),
+                    draft: oversized
+                )
+                XCTFail("An aggregate specification over the encoded limit must be rejected")
+            } catch let error as PromptExperimentAuthorityError {
+                guard case .invalidDraft = error else { return XCTFail("Unexpected error: \(error)") }
+            }
+
+            XCTAssertEqual(harness.service.record(id: id)?.draft, current)
+            XCTAssertEqual(try Data(contentsOf: canonicalURL), canonicalBefore)
+        }
+
+        func testReviewedProjectSnapshotIsImmutableAndExcludesPrivateGradingData() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let sourceRoot = harness.root.appendingPathComponent("authorized-source", isDirectory: true)
+            let sourceFile = sourceRoot.appendingPathComponent("Package.swift")
+            try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+            try Data("reviewed source v1".utf8).write(to: sourceFile)
+
+            let environment = try await harness.store.materializeOptimizationEnvironment(
+                experimentID: UUID(),
+                planRevision: 1,
+                project: PromptExperimentProjectSnapshotSpecification(
+                    sourceRootPath: sourceRoot.path,
+                    includedPaths: ["Package.swift"]
+                ),
+                authorizedSourceRoots: [sourceRoot.path]
+            )
+            XCTAssertEqual(environment.files.count, 2)
+            let snapshot = environment.rootURL.appendingPathComponent("project/Package.swift")
+            XCTAssertEqual(try String(contentsOf: snapshot, encoding: .utf8), "reviewed source v1")
+            try Data("source changed after sealing".utf8).write(to: sourceFile)
+            XCTAssertEqual(try String(contentsOf: snapshot, encoding: .utf8), "reviewed source v1")
+
+            let visibleData = try environment.files
+                .map { try Data(contentsOf: URL(fileURLWithPath: $0.path)) }
+                .reduce(into: Data()) { $0.append($1) }
+            let visibleText = String(decoding: visibleData, as: UTF8.self)
+            XCTAssertFalse(visibleText.contains("HOST_PRIVATE_EXPECTED_CANARY"))
+            XCTAssertFalse(visibleText.contains("HOST_PRIVATE_REVIEWER_NOTES_CANARY"))
+            XCTAssertEqual(
+                environment.digest,
+                PromptExperimentDigest.environmentInventorySHA256(
+                    rootPath: environment.rootURL.path,
+                    files: environment.files
+                )
+            )
         }
 
         func testOptimizationDigestBindsEvaluatorDataBudgetAndResolvedTargets() throws {
@@ -1026,6 +1148,16 @@ import XCTest
             changedEvaluator.evaluator.minimumScore = -1
             var changedBudget = original
             changedBudget.gepa.maxEvaluations += 1
+            var changedGEPAOptions = original
+            changedGEPAOptions.gepa.reflectionMinibatchSize = 7
+            changedGEPAOptions.gepa.useMerge = true
+            changedGEPAOptions.gepa.maxMergeInvocations = 4
+            changedGEPAOptions.gepa.skipPerfectScore = false
+            var changedProject = original
+            changedProject.projectSnapshot = PromptExperimentProjectSnapshotSpecification(
+                sourceRootPath: "/tmp/reviewed",
+                includedPaths: ["Package.swift"]
+            )
             let changedTargets = try PromptExperimentOptimizationTargets(
                 reflection: XCTUnwrap(Self.fakeTarget("different-reflector")),
                 execution: execution,
@@ -1035,7 +1167,41 @@ import XCTest
             XCTAssertNotEqual(try digest(changedExample), originalDigest)
             XCTAssertNotEqual(try digest(changedEvaluator), originalDigest)
             XCTAssertNotEqual(try digest(changedBudget), originalDigest)
+            XCTAssertNotEqual(try digest(changedGEPAOptions), originalDigest)
+            XCTAssertNotEqual(try digest(changedProject), originalDigest)
             XCTAssertNotEqual(try digest(original, targets: changedTargets), originalDigest)
+        }
+
+        func testCommandEvaluatorDistinguishesCandidateAndInfrastructureFailures() throws {
+            let candidate = try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
+                stdout: #"{"score":0.25,"feedback":"candidate output was invalid","failure_kind":"candidate"}"#,
+                minimumScore: 0,
+                maximumScore: 1,
+                elapsedSeconds: 0.1
+            )
+            XCTAssertFalse(candidate.ok)
+            XCTAssertEqual(candidate.failureKind, .candidate)
+            XCTAssertEqual(candidate.score, 0.25)
+
+            XCTAssertThrowsError(try NativePromptExperimentContextBuilderRuntime.commandEvaluationReply(
+                stdout: #"{"score":0,"feedback":"sandbox bootstrap failed","failure_kind":"infrastructure"}"#,
+                minimumScore: 0,
+                maximumScore: 1,
+                elapsedSeconds: 0.1
+            )) { error in
+                XCTAssertTrue(error.localizedDescription.contains("infrastructure failure"))
+            }
+        }
+
+        func testPromptOnlyClaudeProfileDisablesNativeAndWebTools() {
+            let configuration = ClaudeCodeAgentConfig.promptExperiment(modelString: "claude-sonnet-4-6")
+            XCTAssertFalse(configuration.allowNativeBashTool)
+            XCTAssertTrue(configuration.mcpStrictMode)
+            XCTAssertFalse(configuration.toolSearchEnabled)
+            for tool in ["Bash", "Read", "Write", "Edit", "WebSearch", "WebFetch", "Task"] {
+                XCTAssertTrue(configuration.disallowedBuiltInTools.contains(tool))
+            }
+            XCTAssertTrue(configuration.processEnvironmentOverrides.isEmpty)
         }
 
         func testGEPAWorkerEnvironmentDoesNotInheritProviderCredentials() {

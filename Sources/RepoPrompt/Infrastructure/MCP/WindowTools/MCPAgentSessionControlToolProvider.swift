@@ -146,12 +146,13 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 annotations: .repoPromptLocalEphemeralState,
                 inputSchema: .object(
                     properties: [
-                        "op": .string(description: "capabilities | list | create_draft | update_draft | propose_seal | read | propose_next_revision"),
+                        "op": .string(description: "capabilities | list | create_draft | update_draft | propose_seal | read | clone_draft | propose_run_again | propose_next_revision"),
                         "experiment_id": .string(description: "Experiment UUID for record operations."),
                         "expected_draft_id": .string(description: "Exact draft UUID returned by create/read/update."),
                         "expected_draft_version": .integer(description: "Exact optimistic draft version returned by create/read/update."),
                         "expected_draft_digest": .string(description: "Exact draft digest returned by create/read/update."),
-                        "expected_plan_digest": .string(description: "Exact current sealed plan digest for proposing a next revision."),
+                        "expected_plan_digest": .string(description: "Exact current sealed plan digest for cloning or proposing a next revision."),
+                        "candidate_index": .integer(description: "Optional exact GEPA candidate index to continue; omitted means the recorded best candidate."),
                         "title": .string(description: "Optional draft title replacement."),
                         "task_input": .string(description: "Optional fixed task replacement."),
                         "synthetic_fixture": .string(description: "Optional synthetic fixture replacement. Loaded workspace content is unsupported."),
@@ -159,7 +160,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "candidate_instructions": .string(description: "Optional candidate instructions replacement."),
                         "target_role": .string(description: "Optional catalog selector: a task role such as explore or an exact compound model_id returned by capabilities, such as codexExec:<model-and-effort>."),
                         "repetitions": .integer(description: "Legacy v1 comparison field. New GEPA drafts do not use it."),
-                        "specification_json": .string(description: "Complete versioned optimization specification JSON returned by create/read, with seed_candidate optional, objective/background, reviewed examples, evaluator, execution adapter, and pinned GEPA configuration. Replaces the specification atomically under draft version/digest checks.")
+                        "specification_json": .string(description: "Complete versioned optimization specification JSON returned by create/read, with objective/background, reviewed examples, optional reviewed project snapshot, evaluator, execution adapter, and pinned GEPA configuration. Replaces the specification atomically under draft version/digest checks.")
                     ],
                     required: ["op"]
                 )
@@ -191,7 +192,11 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             let service = PromptExperimentService.live(windowState: targetWindow)
             await service.load()
             try targetWindow.agentModeViewModel.validatePromptExperimentTarget(target)
-            let owner = PromptExperimentAgentOwner(controllerSessionID: sessionID, sourceTabID: target.tabID)
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: sessionID,
+                sourceTabID: target.tabID,
+                authorizedSourceRoots: targetWindow.workspaceManager.activeWorkspace?.repoPaths ?? []
+            )
             let interface = PromptExperimentAgentInterface(service: service)
             let command: PromptExperimentAgentCommand = switch operation {
             case .capabilities:
@@ -226,10 +231,18 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 )
             case .read:
                 try .read(experimentID: requiredUUID("experiment_id", args: args))
+            case .cloneDraft:
+                try .cloneDraft(experimentID: requiredUUID("experiment_id", args: args))
+            case .proposeRunAgain:
+                try .proposeRunAgain(
+                    experimentID: requiredUUID("experiment_id", args: args),
+                    expectedPlanDigest: requiredString("expected_plan_digest", args: args)
+                )
             case .proposeNextRevision:
                 try .proposeNextRevision(
                     experimentID: requiredUUID("experiment_id", args: args),
-                    expectedPlanDigest: requiredString("expected_plan_digest", args: args)
+                    expectedPlanDigest: requiredString("expected_plan_digest", args: args),
+                    candidateIndex: args["candidate_index"]?.intValue
                 )
             }
             return try await responseValue(interface.execute(command, owner: owner))
@@ -271,7 +284,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 let decoder = JSONDecoder()
                 decoder.keyDecodingStrategy = .convertFromSnakeCase
                 let envelope = try decoder.decode(PromptExperimentOptimizationEnvelope.self, from: data)
-                guard envelope.schemaVersion == 1 else {
+                guard [1, 2].contains(envelope.schemaVersion) else {
                     throw MCPError.invalidParams("Unsupported optimization specification schema \(envelope.schemaVersion)")
                 }
                 return envelope.specification
@@ -289,7 +302,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
             encoder.keyEncodingStrategy = .convertToSnakeCase
             let data = try encoder.encode(PromptExperimentOptimizationEnvelope(
-                schemaVersion: 1,
+                schemaVersion: 2,
                 specification: specification
             ))
             return String(decoding: data, as: UTF8.self)
@@ -306,8 +319,9 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "package_version": .string(gepaRuntime.packageVersion),
                         "pinned_revision": .string(gepaRuntime.pinnedRevision),
                         "worker_resource_available": .bool(gepaRuntime.workerResourceAvailable),
-                        "default_python_executable": gepaRuntime.defaultPythonExecutable.map(Value.string) ?? .null,
-                        "preflight_behavior": .string("Seal checks the exact external environment without installing packages or making model calls.")
+                        "configured_python_executable": gepaRuntime.configuredPythonExecutable.map(Value.string) ?? .null,
+                        "setup_instructions": .string(gepaRuntime.setupInstructions),
+                        "preflight_behavior": .string("Run checks the exact external environment after native approval, without installing packages or making model calls.")
                     ]),
                     "limitations": .array(limitations.map(Value.string)),
                     "native_approval_required": .bool(true)
@@ -365,17 +379,64 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             ]
             value["draft"] = try record.draft.map(draftValue) ?? .null
             if let plan = record.currentPlan {
-                value["current_plan"] = .object([
-                    "id": .string(plan.id.uuidString),
-                    "revision": .int(plan.revision),
-                    "digest": .string(plan.digest),
-                    "approved": .bool(record.approval(for: plan) != nil),
-                    "schema_version": .int(plan.schemaVersion ?? PromptExperimentPlan.legacySchemaVersion),
-                    "engine": .string(plan.optimization?.gepa.engine ?? "legacy_fixed_comparison"),
-                    "max_evaluations": plan.optimization.map { .int($0.gepa.maxEvaluations) } ?? .null
-                ])
+                value["current_plan"] = sealedPlanValue(plan, approved: record.approval(for: plan) != nil)
             } else {
                 value["current_plan"] = .null
+            }
+            return .object(value)
+        }
+
+        private static func sealedPlanValue(_ plan: PromptExperimentPlan, approved: Bool) -> Value {
+            var value: [String: Value] = [
+                "id": .string(plan.id.uuidString),
+                "revision": .int(plan.revision),
+                "digest": .string(plan.digest),
+                "approved": .bool(approved),
+                "schema_version": .int(plan.schemaVersion ?? PromptExperimentPlan.legacySchemaVersion),
+                "engine": .string(plan.optimization?.gepa.engine ?? "legacy_fixed_comparison"),
+                "environment_digest": .string(plan.environment.fixtureDigest),
+                "environment_files": .array(plan.environment.fixtureFiles.map { .object([
+                    "path": .string($0.path), "byte_count": .int($0.byteCount), "sha256": .string($0.sha256)
+                ]) })
+            ]
+            if let optimization = plan.optimization {
+                value["objective"] = .string(optimization.objective)
+                value["background"] = .string(optimization.background)
+                value["examples"] = .array(optimization.examples.map { example in .object([
+                    "id": .string(example.id),
+                    "split": .string(example.split.rawValue),
+                    "input": .string(example.input),
+                    "expected_output": example.expectedOutput.map(Value.string) ?? .null,
+                    "reviewer_notes": example.reviewerNotes.map(Value.string) ?? .null
+                ]) })
+                value["project_snapshot"] = optimization.projectSnapshot.map { snapshot in .object([
+                    "source_root_path": .string(snapshot.sourceRootPath),
+                    "included_paths": .array(snapshot.includedPaths.map(Value.string))
+                ]) } ?? .null
+                value["execution"] = .object([
+                    "adapter": .string(optimization.execution.adapter.rawValue),
+                    "target": plan.optimizationTargets?.execution.map(targetValue) ?? .null,
+                    "instructions": .string(optimization.execution.instructions)
+                ])
+                value["evaluator"] = .object([
+                    "kind": .string(optimization.evaluator.kind.rawValue),
+                    "rubric": .string(optimization.evaluator.rubric),
+                    "command": optimization.evaluator.command.map(Value.string) ?? .null,
+                    "candidate_file_name": optimization.evaluator.candidateFileName.map(Value.string) ?? .null,
+                    "minimum_score": .double(optimization.evaluator.minimumScore),
+                    "maximum_score": .double(optimization.evaluator.maximumScore),
+                    "judge_target": plan.optimizationTargets?.judge.map(targetValue) ?? .null
+                ])
+                value["gepa"] = .object([
+                    "reflection_target": plan.optimizationTargets.map { targetValue($0.reflection) } ?? .null,
+                    "max_evaluations": .int(optimization.gepa.maxEvaluations),
+                    "max_wall_clock_seconds": .int(optimization.gepa.maxWallClockSeconds),
+                    "reflection_minibatch_size": .int(optimization.gepa.reflectionMinibatchSize ?? 3),
+                    "use_merge": .bool(optimization.gepa.useMerge ?? false),
+                    "max_merge_invocations": .int(optimization.gepa.maxMergeInvocations ?? 5),
+                    "skip_perfect_score": .bool(optimization.gepa.skipPerfectScore ?? true),
+                    "random_seed": .int(optimization.gepa.randomSeed)
+                ])
             }
             return .object(value)
         }

@@ -49,8 +49,20 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                         "id": "example-1",
                         "split": "training",
                         "input": "Return the required words.",
-                        "expected_output": "improved candidate",
+                        "expected_output": "HOST_PRIVATE_EXPECTED_CANARY",
+                        "reviewer_notes": "HOST_PRIVATE_NOTES_CANARY",
+                    }, {
+                        "id": "hidden-1",
+                        "split": "hidden_test",
+                        "input": "Final reporting input.",
+                        "expected_output": "HOST_PRIVATE_HIDDEN_CANARY",
+                        "reviewer_notes": "HOST_PRIVATE_HIDDEN_NOTES_CANARY",
                     }],
+                    "reflection_minibatch_size": 2,
+                    "use_merge": False,
+                    "max_merge_invocations": 0,
+                    "skip_perfect_score": True,
+                    "perfect_score": 1.0,
                     "max_evaluations": 20,
                     "stop_at_score": 1.0,
                     "random_seed": 0,
@@ -68,6 +80,11 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                 self.assertTrue(raw, "worker closed stdout before completion")
                 message = json.loads(raw)
                 if message["type"] == "host_request":
+                    serialized = json.dumps(message, sort_keys=True)
+                    self.assertNotIn("HOST_PRIVATE_EXPECTED_CANARY", serialized)
+                    self.assertNotIn("HOST_PRIVATE_NOTES_CANARY", serialized)
+                    self.assertNotIn("HOST_PRIVATE_HIDDEN_CANARY", serialized)
+                    self.assertNotIn("HOST_PRIVATE_HIDDEN_NOTES_CANARY", serialized)
                     operation = message["operation"]
                     host_operations.append(operation)
                     if operation == "reflect":
@@ -76,8 +93,14 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                             "id": message["id"],
                             "ok": True,
                             "output": "```\nimproved candidate\n```",
+                            "prompt_tokens": 11,
+                            "completion_tokens": 5,
                         }
                     else:
+                        self.assertEqual(
+                            set(message["payload"]["example"]),
+                            {"id", "split", "input"},
+                        )
                         candidate = message["payload"]["candidate"]
                         score = 1.0 if candidate.strip() == "improved candidate" else 0.0
                         response = {
@@ -88,6 +111,8 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                             "feedback": "exact match" if score == 1 else "must equal improved candidate",
                             "output": candidate,
                             "elapsed_seconds": 0.001,
+                            "prompt_tokens": 7,
+                            "completion_tokens": 3,
                         }
                     process.stdin.write(json.dumps(response) + "\n")
                     process.stdin.flush()
@@ -112,6 +137,8 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
             self.assertIn("improved candidate", completed["candidates"])
             self.assertIn("reflect", host_operations)
             self.assertGreaterEqual(host_operations.count("evaluate"), 2)
+            self.assertIn("prompt_tokens=", completed["proposer_usage"])
+            self.assertIn("unavailable_callbacks=0", completed["proposer_usage"])
 
     def test_infrastructure_failure_is_not_reported_as_candidate_score_zero(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -143,6 +170,7 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                     "examples": [{"id": "example-1", "split": "training", "input": "input"}],
                     "max_evaluations": 2,
                     "random_seed": 0,
+                    "perfect_score": 1.0,
                     "run_dir": str(root / "gepa-run"),
                     "output_dir": str(root / "gepa-output"),
                 },

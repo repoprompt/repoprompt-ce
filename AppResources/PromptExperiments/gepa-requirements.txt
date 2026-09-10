@@ -1,0 +1,4 @@
+# Prompt Experiment worker dependency. Installed only by an explicit developer/user action.
+# The native preflight additionally verifies distribution metadata and direct_url.json
+# against this exact upstream revision before admitting a paid model run.
+gepa @ git+https://github.com/gepa-ai/gepa.git@0632cdb5dcc052e690eab439e1b4a7e3e9cfe407

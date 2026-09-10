@@ -184,9 +184,24 @@
                     if let optimization = plan.optimization {
                         LabeledContent("Engine", value: "Upstream GEPA \(PromptExperimentGEPAConfiguration.packageVersion)")
                         LabeledContent("Budget", value: "\(optimization.gepa.maxEvaluations) evaluations · \(optimization.gepa.maxWallClockSeconds)s")
-                        LabeledContent("Examples", value: "\(optimization.examples.count) reviewed")
-                        LabeledContent("Evaluator", value: optimization.evaluator.kind.rawValue)
+                        LabeledContent("Objective", value: optimization.objective)
+                        LabeledContent("Background", value: optimization.background.isEmpty ? "None" : optimization.background)
+                        LabeledContent("Seed candidate", value: optimization.seedCandidate ?? "GEPA proposes from objective and evidence")
+                        LabeledContent("Reflection", value: plan.optimizationTargets?.reflection.displayName ?? "unavailable")
+                        LabeledContent("Execution", value: "\(optimization.execution.adapter.rawValue) · \(plan.optimizationTargets?.execution?.displayName ?? "no model target")")
+                        LabeledContent("Judge", value: plan.optimizationTargets?.judge?.displayName ?? "not used")
+                        LabeledContent("Examples", value: optimization.examples.map { "\($0.id)=\($0.split.rawValue)" }.joined(separator: ", "))
+                        LabeledContent("Evaluator", value: "\(optimization.evaluator.kind.rawValue) · \(optimization.evaluator.minimumScore)...\(optimization.evaluator.maximumScore)")
+                        LabeledContent("Rubric", value: optimization.evaluator.rubric)
+                        LabeledContent("Command", value: optimization.evaluator.command ?? "not used")
+                        LabeledContent("Project root", value: optimization.projectSnapshot?.sourceRootPath ?? "none")
+                        LabeledContent("Reviewed paths", value: optimization.projectSnapshot?.includedPaths.joined(separator: ", ") ?? "none")
+                        LabeledContent("GEPA options", value: "minibatch \(optimization.gepa.reflectionMinibatchSize ?? 1) · merge \((optimization.gepa.useMerge ?? false) ? "on" : "off") · max merge \(optimization.gepa.maxMergeInvocations ?? 0) · skip perfect \((optimization.gepa.skipPerfectScore ?? true) ? "yes" : "no") · seed \(optimization.gepa.randomSeed)")
+                        LabeledContent("Python", value: optimization.gepa.pythonExecutablePath)
                         LabeledContent("Environment", value: "App-owned reviewed dataset; command code Seatbelt-confined")
+                        Text("Permissions: connected model roles are prompt-only. Commands can read the immutable project copy and write only app-owned scratch. The source workspace and hidden expected outputs are unavailable to proposers.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     } else {
                         LabeledContent("Schedule", value: "\(plan.trials.count) serial trials")
                         LabeledContent("Environment", value: "Legacy synthetic fixture")
@@ -273,8 +288,30 @@
 
             if record.phase == .completed || record.phase == .inconclusive || record.phase == .cancelled {
                 HStack {
-                    Button(plan.optimization == nil ? "Next revision" : "Continue from GEPA best") {
-                        perform { try await service.startNextRevision(experimentID: record.id) }
+                    if plan.optimization == nil {
+                        Button("Next revision") {
+                            perform { try await service.startNextRevision(experimentID: record.id) }
+                        }
+                    } else {
+                        Button("Continue best") {
+                            perform {
+                                try await service.startNextRevision(
+                                    experimentID: record.id,
+                                    revisionMode: .continueBest
+                                )
+                            }
+                        }
+                        Button("Run again") {
+                            perform {
+                                try await service.startNextRevision(
+                                    experimentID: record.id,
+                                    revisionMode: .repeatCurrentSeed
+                                )
+                            }
+                        }
+                        Button("Clone as draft") {
+                            perform { _ = try await service.cloneExperiment(experimentID: record.id) }
+                        }
                     }
                     Button("Reveal readable results") {
                         perform {

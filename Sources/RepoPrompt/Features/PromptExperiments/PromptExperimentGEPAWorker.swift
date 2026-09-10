@@ -1,4 +1,5 @@
 #if DEBUG
+    import Darwin
     import Foundation
 
     struct PromptExperimentGEPAHostReply {
@@ -9,6 +10,8 @@
         let failureKind: PromptExperimentOptimizationFailureKind?
         let error: String?
         let elapsedSeconds: Double?
+        var promptTokens: Int?
+        var completionTokens: Int?
 
         var jsonObject: [String: Any] {
             var value: [String: Any] = ["ok": ok]
@@ -18,6 +21,8 @@
             if let failureKind { value["failure_kind"] = failureKind.rawValue }
             if let error { value["error"] = error }
             if let elapsedSeconds { value["elapsed_seconds"] = elapsedSeconds }
+            if let promptTokens { value["prompt_tokens"] = promptTokens }
+            if let completionTokens { value["completion_tokens"] = completionTokens }
             return value
         }
     }
@@ -60,10 +65,53 @@
             return sourceTree
         }
 
+        static var setupInstructions: String {
+            let python = defaultPythonExecutableURL().path
+            let environment = URL(fileURLWithPath: python).deletingLastPathComponent().deletingLastPathComponent().path
+            let pip = URL(fileURLWithPath: python).deletingLastPathComponent().appendingPathComponent("pip").path
+            let requirements = resolvedRequirementsURL()?.path ?? "<RepoPrompt checkout>/AppResources/PromptExperiments/gepa-requirements.txt"
+            return "Create the external pinned environment explicitly (no automatic install): /usr/bin/python3 -m venv '\(environment)' && '\(pip)' install -r '\(requirements)'. Then restart the DEBUG app with REPOPROMPT_GEPA_PYTHON set only if using a different reviewed environment."
+        }
+
+        private static func resolvedRequirementsURL() -> URL? {
+            if let resource = Bundle.main.resourceURL?
+                .appendingPathComponent("PromptExperiments/gepa-requirements.txt"),
+                FileManager.default.isReadableFile(atPath: resource.path)
+            {
+                return resource
+            }
+            let sourceTree = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("AppResources/PromptExperiments/gepa-requirements.txt")
+            return FileManager.default.isReadableFile(atPath: sourceTree.path) ? sourceTree : nil
+        }
+
+        static func configuredPythonExecutable() -> String? {
+            if let override = ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_PYTHON"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty
+            {
+                return override
+            }
+            let candidate = defaultPythonExecutableURL().path
+            return FileManager.default.isExecutableFile(atPath: candidate) ? candidate : nil
+        }
+
+        private static func defaultPythonExecutableURL() -> URL {
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/RepoPrompt CE/GEPA/venv/bin/python3")
+        }
+
         static func preflight(pythonExecutable: String) async throws {
             let workerURL = try resolveWorkerURL()
             let expectedRevision = PromptExperimentGEPAConfiguration.pinnedRevision
             let expectedVersion = PromptExperimentGEPAConfiguration.packageVersion
+            guard let configured = configuredPythonExecutable() else {
+                throw WorkerError.unavailable("No native-owned external GEPA environment is configured. \(setupInstructions)")
+            }
+            let requested = URL(fileURLWithPath: pythonExecutable).standardizedFileURL.resolvingSymlinksInPath().path
+            let approved = URL(fileURLWithPath: configured).standardizedFileURL.resolvingSymlinksInPath().path
+            guard requested == approved else {
+                throw WorkerError.unavailable("The sealed interpreter does not match the native configured GEPA environment. Refresh capabilities and reseal the draft.")
+            }
             let script = """
             import importlib.metadata, json
             d=importlib.metadata.distribution('gepa')
@@ -79,6 +127,9 @@
                 guard FileManager.default.isReadableFile(atPath: workerURL.path) else {
                     throw WorkerError.unavailable("The packaged GEPA worker is unreadable.")
                 }
+                guard resolvedRequirementsURL() != nil else {
+                    throw WorkerError.unavailable("The pinned GEPA requirements lock is unavailable.")
+                }
                 let process = Process()
                 let output = Pipe()
                 process.executableURL = URL(fileURLWithPath: pythonExecutable)
@@ -88,8 +139,8 @@
                 process.standardOutput = output
                 process.standardError = output
                 try process.run()
-                process.waitUntilExit()
                 let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
                 guard process.terminationStatus == 0 else {
                     let message = String(data: data, encoding: .utf8) ?? "unknown preflight failure"
                     throw WorkerError.unavailable("Pinned GEPA preflight failed without making a model call: \(message)")
@@ -123,15 +174,14 @@
             let stderrURL = runRoot.appendingPathComponent("worker-stderr.log")
             try FileManager.default.createDirectory(at: runRoot, withIntermediateDirectories: true)
 
+            // The worker receives only opaque IDs, splits, and current inputs. Expected outputs
+            // and reviewer notes remain in the app-owned sealed plan and are looked up by ID.
             let examples: [[String: Any]] = specification.examples.map { example in
-                var value: [String: Any] = [
+                [
                     "id": example.id,
                     "split": example.split.rawValue,
                     "input": example.input
                 ]
-                if let expected = example.expectedOutput { value["expected_output"] = expected }
-                if let notes = example.reviewerNotes { value["reviewer_notes"] = notes }
-                return value
             }
             var request: [String: Any] = [
                 "run_name": "rpce-\(plan.id.uuidString.lowercased())",
@@ -141,6 +191,11 @@
                 "examples": examples,
                 "max_evaluations": specification.gepa.maxEvaluations,
                 "random_seed": specification.gepa.randomSeed,
+                "reflection_minibatch_size": specification.gepa.reflectionMinibatchSize ?? 3,
+                "use_merge": specification.gepa.useMerge ?? false,
+                "max_merge_invocations": specification.gepa.maxMergeInvocations ?? 5,
+                "skip_perfect_score": specification.gepa.skipPerfectScore ?? true,
+                "perfect_score": specification.evaluator.maximumScore,
                 "run_dir": runDirectory.path,
                 "run_directory_relative_path": "worker-runs/\(attemptID.uuidString.lowercased())",
                 "output_dir": outputDirectory.path
@@ -163,7 +218,8 @@
                                 initial: initial,
                                 stderrURL: stderrURL,
                                 host: host,
-                                progress: progress
+                                progress: progress,
+                                hostCallbackTimeoutSeconds: min(300, specification.gepa.maxWallClockSeconds)
                             ))
                         } catch {
                             continuation.resume(throwing: error)
@@ -181,7 +237,8 @@
             initial: [String: Any],
             stderrURL: URL,
             host: @escaping @MainActor @Sendable (_ operation: String, _ payload: [String: Any]) async -> PromptExperimentGEPAHostReply,
-            progress: @escaping @MainActor @Sendable (String) async -> Void
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            hostCallbackTimeoutSeconds: Int
         ) throws -> PromptExperimentOptimizationRuntimeResult {
             let child = Process()
             let stdinPipe = Pipe()
@@ -201,15 +258,26 @@
             child.standardOutput = stdoutPipe
             child.standardError = stderrHandle
             lock.lock()
+            if didRequestCancellation {
+                lock.unlock()
+                throw CancellationError()
+            }
             process = child
-            didRequestCancellation = false
             lock.unlock()
             defer {
+                Self.terminateAndReap(child)
                 lock.lock()
                 process = nil
                 lock.unlock()
             }
             try child.run()
+            lock.lock()
+            let cancelledAfterLaunch = didRequestCancellation
+            lock.unlock()
+            if cancelledAfterLaunch {
+                child.interrupt()
+                throw CancellationError()
+            }
             try writeJSONLine(initial, to: stdinPipe.fileHandleForWriting)
             var reader = LineReader(handle: stdoutPipe.fileHandleForReading)
             var terminal: PromptExperimentOptimizationRuntimeResult?
@@ -228,13 +296,27 @@
                           let payload = object["payload"] as? [String: Any]
                     else { throw WorkerError.protocolFailure("GEPA host request is incomplete.") }
                     let semaphore = DispatchSemaphore(value: 0)
-                    var reply: PromptExperimentGEPAHostReply?
-                    Task { @MainActor in
-                        reply = await host(operation, payload)
+                    let replyBox = PromptExperimentGEPAHostReplyBox()
+                    let callback = Task { @MainActor in
+                        let reply = await host(operation, payload)
+                        replyBox.store(reply)
                         semaphore.signal()
                     }
-                    semaphore.wait()
-                    guard let reply else { throw WorkerError.protocolFailure("The app did not produce a host reply.") }
+                    let deadline = DispatchTime.now() + .seconds(hostCallbackTimeoutSeconds)
+                    while semaphore.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
+                        lock.lock()
+                        let cancelled = didRequestCancellation
+                        lock.unlock()
+                        if cancelled {
+                            callback.cancel()
+                            throw CancellationError()
+                        }
+                        if DispatchTime.now() >= deadline {
+                            callback.cancel()
+                            throw WorkerError.infrastructureFailure("A RepoPrompt model/evaluator callback exceeded the sealed host timeout.")
+                        }
+                    }
+                    guard let reply = replyBox.load() else { throw WorkerError.protocolFailure("The app did not produce a host reply.") }
                     var response = reply.jsonObject
                     response["protocol_version"] = 1
                     response["type"] = "host_response"
@@ -277,46 +359,88 @@
 
         private func decodeResult(_ result: [String: Any]) throws -> PromptExperimentOptimizationRuntimeResult {
             let raw = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
-            let candidates = result["candidates"] as? [String] ?? []
-            let parents = (result["parent_indices"] as? [[Any]] ?? []).map { values in
-                values.compactMap { ($0 as? NSNumber)?.intValue }
+            guard result["engine"] as? String == "gepa",
+                  result["upstream_revision"] as? String == PromptExperimentGEPAConfiguration.pinnedRevision,
+                  let candidates = result["candidates"] as? [String], !candidates.isEmpty,
+                  let rawParents = result["parent_indices"] as? [[Any]], rawParents.count == candidates.count,
+                  let rawScores = result["aggregate_scores"] as? [Any], rawScores.count == candidates.count,
+                  let rawEvaluations = result["evaluations"] as? [[String: Any]],
+                  let totalEvaluations = (result["total_evaluations"] as? NSNumber)?.intValue,
+                  totalEvaluations >= 0
+            else {
+                throw WorkerError.protocolFailure("GEPA result identity, candidate arrays, or evaluation counts are invalid.")
             }
-            let scores = (result["aggregate_scores"] as? [Any] ?? []).map { value -> Double? in
+            let parents = try rawParents.enumerated().map { index, values in
+                let decoded = values.compactMap { ($0 as? NSNumber)?.intValue }
+                guard decoded.count == values.count,
+                      decoded.allSatisfy({ $0 >= 0 && $0 < index })
+                else { throw WorkerError.protocolFailure("GEPA parent indices are invalid.") }
+                return decoded
+            }
+            let scores = try rawScores.map { value -> Double? in
                 guard !(value is NSNull) else { return nil }
-                return (value as? NSNumber)?.doubleValue
+                guard let score = (value as? NSNumber)?.doubleValue, score.isFinite else {
+                    throw WorkerError.protocolFailure("GEPA emitted a non-finite aggregate score.")
+                }
+                return score
             }
-            let evaluations = (result["evaluations"] as? [[String: Any]] ?? []).compactMap { value -> PromptExperimentOptimizationRuntimeEvaluation? in
+            let bestIndex = (result["best_candidate_index"] as? NSNumber)?.intValue
+            if let bestIndex, !(0 ..< candidates.count).contains(bestIndex) {
+                throw WorkerError.protocolFailure("GEPA best candidate index is invalid.")
+            }
+            let evaluations = try rawEvaluations.map { value -> PromptExperimentOptimizationRuntimeEvaluation in
                 guard let candidate = (value["candidate_index"] as? NSNumber)?.intValue,
-                      let exampleID = value["example_id"] as? String,
+                      candidate == -1 || (candidate >= 0 && candidate < candidates.count),
+                      let exampleID = value["example_id"] as? String, !exampleID.isEmpty,
                       let splitRaw = value["split"] as? String,
                       let split = PromptExperimentDatasetSplit(rawValue: splitRaw)
-                else { return nil }
-                let failure = (value["failure_kind"] as? String).flatMap(PromptExperimentOptimizationFailureKind.init(rawValue:))
+                else { throw WorkerError.protocolFailure("GEPA evaluation identity is invalid.") }
+                let score = (value["score"] as? NSNumber)?.doubleValue
+                guard score?.isFinite != false else {
+                    throw WorkerError.protocolFailure("GEPA emitted a non-finite evaluation score.")
+                }
+                let failureRaw = value["failure_kind"] as? String
+                let failure = failureRaw.flatMap(PromptExperimentOptimizationFailureKind.init(rawValue:))
+                guard failureRaw == nil || failure != nil else {
+                    throw WorkerError.protocolFailure("GEPA emitted an unknown evaluation failure classification.")
+                }
                 return PromptExperimentOptimizationRuntimeEvaluation(
                     candidateIndex: candidate,
                     exampleID: exampleID,
                     split: split,
-                    score: (value["score"] as? NSNumber)?.doubleValue,
+                    score: score,
                     feedback: value["feedback"] as? String ?? "",
                     failureKind: failure,
                     output: value["output"] as? String,
                     elapsedSeconds: (value["elapsed_seconds"] as? NSNumber)?.doubleValue
                 )
             }
+            let baselineScore = (result["baseline_score"] as? NSNumber)?.doubleValue
+            let bestScore = (result["best_score"] as? NSNumber)?.doubleValue
+            let wallTime = (result["wall_time_seconds"] as? NSNumber)?.doubleValue
+            guard baselineScore?.isFinite != false,
+                  bestScore?.isFinite != false,
+                  wallTime?.isFinite != false,
+                  wallTime.map({ $0 >= 0 }) != false
+            else { throw WorkerError.protocolFailure("GEPA result metrics are invalid.") }
+            let relativeRunDirectory = result["run_directory_relative_path"] as? String
+            guard relativeRunDirectory.map({ !$0.hasPrefix("/") && !$0.split(separator: "/").contains("..") }) != false else {
+                throw WorkerError.protocolFailure("GEPA result artifact path is unsafe.")
+            }
             return PromptExperimentOptimizationRuntimeResult(
-                engine: result["engine"] as? String ?? "gepa",
-                upstreamRevision: result["upstream_revision"] as? String ?? "unavailable",
-                baselineScore: (result["baseline_score"] as? NSNumber)?.doubleValue,
-                bestScore: (result["best_score"] as? NSNumber)?.doubleValue,
-                bestCandidateIndex: (result["best_candidate_index"] as? NSNumber)?.intValue,
+                engine: "gepa",
+                upstreamRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
+                baselineScore: baselineScore,
+                bestScore: bestScore,
+                bestCandidateIndex: bestIndex,
                 candidates: candidates,
                 parentIndices: parents,
                 aggregateScores: scores,
                 evaluations: evaluations,
-                totalEvaluations: (result["total_evaluations"] as? NSNumber)?.intValue ?? evaluations.count,
-                wallTimeSeconds: (result["wall_time_seconds"] as? NSNumber)?.doubleValue,
+                totalEvaluations: totalEvaluations,
+                wallTimeSeconds: wallTime,
                 proposerUsage: result["proposer_usage"] as? String ?? "unavailable",
-                runDirectoryRelativePath: result["run_directory_relative_path"] as? String,
+                runDirectoryRelativePath: relativeRunDirectory,
                 rawResultJSON: raw
             )
         }
@@ -325,6 +449,26 @@
             var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
             data.append(0x0A)
             try handle.write(contentsOf: data)
+        }
+
+        private static func terminateAndReap(_ child: Process) {
+            guard child.isRunning else { return }
+            child.interrupt()
+            let interruptDeadline = Date().addingTimeInterval(1)
+            while child.isRunning, Date() < interruptDeadline {
+                usleep(20000)
+            }
+            if child.isRunning {
+                child.terminate()
+                let terminateDeadline = Date().addingTimeInterval(1)
+                while child.isRunning, Date() < terminateDeadline {
+                    usleep(20000)
+                }
+            }
+            if child.isRunning {
+                kill(child.processIdentifier, SIGKILL)
+            }
+            child.waitUntilExit()
         }
 
         static func workerEnvironment(home: URL) -> [String: String] {
@@ -341,6 +485,23 @@
                 }
             }
             return environment
+        }
+    }
+
+    private final class PromptExperimentGEPAHostReplyBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: PromptExperimentGEPAHostReply?
+
+        func store(_ reply: PromptExperimentGEPAHostReply) {
+            lock.lock()
+            value = reply
+            lock.unlock()
+        }
+
+        func load() -> PromptExperimentGEPAHostReply? {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
         }
     }
 

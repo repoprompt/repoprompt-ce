@@ -133,6 +133,28 @@
                     Text("\(optimization.examples.count) reviewed examples · \(optimization.gepa.maxEvaluations) evaluations · \(optimization.gepa.maxWallClockSeconds)s · reflection \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    DisclosureGroup("Inspect every sealed authority field") {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Objective: \(optimization.objective)")
+                            Text("Background: \(optimization.background.isEmpty ? "None" : optimization.background)")
+                            Text("Seed candidate: \(optimization.seedCandidate ?? "GEPA will propose from the objective and reviewed evidence")")
+                            Text("Execution: \(optimization.execution.adapter.rawValue) · \(plan.optimizationTargets?.execution?.displayName ?? "no model target")")
+                            Text("Execution instructions: \(optimization.execution.instructions)")
+                            Text("Judge: \(plan.optimizationTargets?.judge?.displayName ?? "not used")")
+                            Text("Evaluator: \(optimization.evaluator.kind.rawValue), range \(optimization.evaluator.minimumScore)...\(optimization.evaluator.maximumScore)")
+                            Text("Rubric: \(optimization.evaluator.rubric)")
+                            Text("Command: \(optimization.evaluator.command ?? "not used")")
+                            Text("Project source: \(optimization.projectSnapshot?.sourceRootPath ?? "none")")
+                            Text("Project paths: \(optimization.projectSnapshot?.includedPaths.joined(separator: ", ") ?? "none")")
+                            Text("Splits: \(optimization.examples.map { "\($0.id)=\($0.split.rawValue)" }.joined(separator: ", "))")
+                            Text("GEPA: minibatch \(optimization.gepa.reflectionMinibatchSize ?? 1), merge \((optimization.gepa.useMerge ?? false) ? "on" : "off"), max merge \(optimization.gepa.maxMergeInvocations ?? 0), skip perfect \((optimization.gepa.skipPerfectScore ?? true) ? "yes" : "no"), seed \(optimization.gepa.randomSeed)")
+                            Text("Python: \(optimization.gepa.pythonExecutablePath)")
+                            Text("Permissions: target/reflection/judge model calls are prompt-only; command reads only the sealed project copy and writes only app-owned scratch; source workspace and hidden expected outputs are unavailable to proposers.")
+                        }
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .padding(.top, 4)
+                    }
                 }
             }
         }
@@ -168,8 +190,32 @@
                 }
                 .disabled(record.phase == .cancelling)
             case .completed, .inconclusive, .cancelled:
-                Button(plan.optimization == nil ? "Next revision" : "Continue from best candidate") {
-                    perform { try await service?.startNextRevision(experimentID: record.id) }
+                if plan.optimization == nil {
+                    Button("Next revision") {
+                        perform { try await service?.startNextRevision(experimentID: record.id) }
+                    }
+                } else {
+                    HStack {
+                        Button("Continue best") {
+                            perform {
+                                try await service?.startNextRevision(
+                                    experimentID: record.id,
+                                    revisionMode: .continueBest
+                                )
+                            }
+                        }
+                        Button("Run again") {
+                            perform {
+                                try await service?.startNextRevision(
+                                    experimentID: record.id,
+                                    revisionMode: .repeatCurrentSeed
+                                )
+                            }
+                        }
+                        Button("Clone draft") {
+                            perform { _ = try await service?.cloneExperiment(experimentID: record.id) }
+                        }
+                    }
                 }
             case .drafting:
                 EmptyView()

@@ -814,6 +814,12 @@ final class CLIProcessRunner {
         for (key, value) in additionalEnvironment {
             overrides[key] = value
         }
+        if config.environmentPolicy == .replacement {
+            for key in additionalRemovedKeys {
+                overrides.removeValue(forKey: key)
+            }
+            return overrides
+        }
         let result = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(
                 purpose: .cliRunner,

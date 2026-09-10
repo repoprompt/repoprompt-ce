@@ -260,11 +260,20 @@ final class AgentRuntimeProviderService {
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             let runtimeVariant = agent.claudeRuntimeVariant ?? .standard
-            let config: ClaudeCodeAgentConfig = .discovery(
-                modelString: modelString,
-                runtimeVariant: runtimeVariant,
-                enableDebugLogging: Self.enableDebugLogging
-            )
+            let config: ClaudeCodeAgentConfig = switch runType {
+            case .discover:
+                .discovery(
+                    modelString: modelString,
+                    runtimeVariant: runtimeVariant,
+                    enableDebugLogging: Self.enableDebugLogging
+                )
+            case .promptExperiment:
+                .promptExperiment(
+                    modelString: modelString,
+                    runtimeVariant: runtimeVariant,
+                    enableDebugLogging: Self.enableDebugLogging
+                )
+            }
             var processConfig = CLIProcessConfiguration(
                 command: config.commandName,
                 workingDirectory: workspacePath,

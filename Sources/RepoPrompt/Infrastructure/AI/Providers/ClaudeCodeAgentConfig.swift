@@ -133,6 +133,37 @@ struct ClaudeCodeAgentConfig {
         )
     }
 
+    /// Prompt-only completion profile for app-owned Prompt Experiment callbacks.
+    /// Unlike discovery, this disables web tools as well as every native file/shell/agent tool.
+    static func promptExperiment(
+        commandName: String? = nil,
+        modelString: String? = nil,
+        runtimeVariant: ClaudeCodeRuntimeVariant = .standard,
+        enableDebugLogging: Bool = false
+    ) -> ClaudeCodeAgentConfig {
+        ClaudeCodeAgentConfig(
+            commandName: commandName,
+            modelString: modelString,
+            runtimeVariant: runtimeVariant,
+            enableDebugLogging: enableDebugLogging,
+            sdkConnectTimeoutSeconds: 10,
+            sdkRelaunchMaxAttempts: 1,
+            permissionMode: "bypassPermissions",
+            allowNativeBashTool: false,
+            toolContext: .promptOnly,
+            disallowedBuiltInTools: [
+                "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "WebSearch", "WebFetch",
+                "SlashCommand", "BashOutput", "KillShell", "Monitor", "NotebookEdit", "TodoWrite",
+                "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree", "CronCreate",
+                "CronDelete", "CronList", "RemoteTrigger", "Skill", "TaskOutput", "TaskStop",
+                "AskUserQuestion", "ScheduleWakeup", "PushNotification"
+            ],
+            mcpStrictMode: true,
+            toolSearchEnabled: false,
+            effortLevel: nil
+        )
+    }
+
     // MARK: - Private memberwise init
 
     /// Low-level initializer. Prefer the named factory methods above.

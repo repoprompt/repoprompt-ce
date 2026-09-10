@@ -175,7 +175,7 @@
             try await requireLoaded()
             let date = now()
             let experimentID = UUID()
-            let python = ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_PYTHON"] ?? ""
+            let python = PromptExperimentGEPAWorker.configuredPythonExecutable() ?? ""
             let draft = PromptExperimentDraft(
                 revision: 1,
                 title: "GEPA optimization",
@@ -195,7 +195,7 @@
                         maximumScore: 1
                     ),
                     execution: PromptExperimentExecutionSpecification(
-                        adapter: .contextBuilder,
+                        adapter: .connectedModel,
                         targetSelector: nil,
                         instructions: "Use the candidate as the governing instructions for this task."
                     ),
@@ -260,10 +260,16 @@
             var updated = try draft.validatedBounds()
             updated.version = current.optimisticVersion + 1
             updated.updatedAt = now()
+            let previousRecord = records[index]
             records[index].draft = updated
             records[index].updatedAt = updated.updatedAt
             records[index].statusMessage = "Draft version \(updated.optimisticVersion) saved; seal again before approval."
-            try await persist()
+            do {
+                try await persist()
+            } catch {
+                restoreRecord(previousRecord)
+                throw error
+            }
             return updated
         }
 
@@ -273,7 +279,8 @@
             expectedDraftID: UUID,
             expectedDraftVersion: Int,
             expectedDraftDigest: String,
-            expectedControllerSessionID: UUID? = nil
+            expectedControllerSessionID: UUID? = nil,
+            authorizedSourceRoots: [String] = []
         ) async throws -> PromptExperimentPlan {
             try await requireLoaded()
             let originalIndex = try index(of: experimentID)
@@ -301,8 +308,10 @@
                 } else {
                     nil
                 }
-                if optimization.execution.adapter == .contextBuilder, execution == nil {
-                    throw PromptExperimentAuthorityError.targetUnavailable("The Context Builder execution target is unavailable.")
+                if optimization.execution.adapter != .sandboxedCommand, execution == nil {
+                    throw PromptExperimentAuthorityError.targetUnavailable(
+                        "The \(optimization.execution.adapter.rawValue) execution target is unavailable."
+                    )
                 }
                 let judge: PromptExperimentResolvedTarget? = if let selector = optimization.evaluator.judgeTargetSelector {
                     try resolveTarget(selector)
@@ -328,19 +337,23 @@
                 target = legacyTarget
             }
             let date = now()
-            let fixtureText: String
+            let materialized: (rootURL: URL, files: [PromptExperimentFixtureFile], digest: String)
             if let optimization = validated.optimization {
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-                fixtureText = try String(decoding: encoder.encode(optimization.examples), as: UTF8.self)
+                let value = try await store.materializeOptimizationEnvironment(
+                    experimentID: experimentID,
+                    planRevision: validated.revision,
+                    project: optimization.projectSnapshot,
+                    authorizedSourceRoots: authorizedSourceRoots
+                )
+                materialized = (value.rootURL, value.files, value.digest)
             } else {
-                fixtureText = validated.syntheticFixture
+                let value = try await store.materializeSyntheticEnvironment(
+                    experimentID: experimentID,
+                    planRevision: validated.revision,
+                    fixtureText: validated.syntheticFixture
+                )
+                materialized = (value.rootURL, [value.fixture], value.digest)
             }
-            let materialized = try await store.materializeSyntheticEnvironment(
-                experimentID: experimentID,
-                planRevision: validated.revision,
-                fixtureText: fixtureText
-            )
             let currentIndex = try index(of: experimentID)
             try requireOwner(records[currentIndex], expectedControllerSessionID: expectedControllerSessionID)
             guard records[currentIndex].phase == .drafting,
@@ -354,13 +367,16 @@
                 sourceTabID: records[currentIndex].sourceTabID,
                 capturedAt: date,
                 isolatedRootPath: materialized.rootURL.standardizedFileURL.path,
-                selection: StoredSelection(selectedPaths: [materialized.fixture.path]),
-                fixtureFiles: [materialized.fixture],
+                selection: StoredSelection(selectedPaths: materialized.files.map(\.path)),
+                fixtureFiles: materialized.files,
                 fixtureDigest: materialized.digest,
-                captureLimitations: [
+                captureLimitations: validated.optimization == nil ? [
                     "Only the reviewed synthetic fixture is available to trial tools.",
-                    "The user’s loaded workspace, worktrees, session bindings, and hidden grading data are not attached.",
-                    "Loaded-workspace experiments are unsupported and fail closed in this pilot."
+                    "The user’s loaded workspace, worktrees, session bindings, and hidden grading data are not attached."
+                ] : [
+                    "Only explicitly reviewed regular project files were copied into this immutable app-owned snapshot.",
+                    "Expected outputs, reviewer notes, and held-out grading data are host-private and are not present in the runtime root.",
+                    "Commands receive the copied project read-only and a separate writable scratch directory; the source workspace is never an execution cwd."
                 ]
             )
             let plan = try PromptExperimentPlan.seal(
@@ -370,7 +386,6 @@
                 environment: environment,
                 at: date
             )
-            try await runtime.preflightOptimization(plan)
             records[currentIndex].plans.append(plan)
             records[currentIndex].draft = nil
             records[currentIndex].cancellationRequestedAt = nil
@@ -426,6 +441,12 @@
             guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
             guard records[index].approval(for: plan) != nil, plan.verifiesIntegrity() else {
                 throw PromptExperimentAuthorityError.planNotApproved
+            }
+            if plan.optimization != nil {
+                guard plan.schemaVersion == PromptExperimentPlan.optimizationSchemaVersion else {
+                    throw PromptExperimentAuthorityError.illegalPhase("Earlier optimization schemas are preserved read-only. Clone the result into a current reviewed draft before execution.")
+                }
+                try await runtime.preflightOptimization(plan)
             }
             guard records[index].attempts(for: plan).isEmpty else {
                 throw PromptExperimentAuthorityError.illegalPhase("This immutable plan already has an execution history and cannot be run again.")
@@ -489,7 +510,7 @@
             experimentID: UUID,
             expectedPlanDigest: String? = nil,
             expectedControllerSessionID: UUID? = nil,
-            seedCandidateIndex: Int? = nil
+            revisionMode: PromptExperimentRevisionMode = .continueBest
         ) async throws {
             try await requireLoaded()
             let originalIndex = try index(of: experimentID)
@@ -505,14 +526,33 @@
             }
             let recordSnapshot = records[originalIndex]
             let originalPhase = recordSnapshot.phase
-            let chosenCandidateReference: PromptExperimentArtifactReference? = {
-                guard plan.optimization != nil,
-                      let result = recordSnapshot.attempts(for: plan).last?.optimizationResult
-                else { return nil }
-                let desired = seedCandidateIndex ?? result.bestCandidateIndex
-                return result.candidates.first { $0.index == desired }?.candidateEvidence
+            let chosenCandidateReference: PromptExperimentArtifactReference? = try {
+                guard plan.optimization != nil else { return nil }
+                switch revisionMode {
+                case .repeatCurrentSeed:
+                    return nil
+                case .continueBest, .continueCandidate:
+                    guard let result = recordSnapshot.attempts(for: plan).last?.optimizationResult else {
+                        throw PromptExperimentAuthorityError.invalidDraft("No settled GEPA candidate evidence is available to continue.")
+                    }
+                    let desired: Int? = switch revisionMode {
+                    case .continueBest: result.bestCandidateIndex
+                    case let .continueCandidate(index): index
+                    case .repeatCurrentSeed: nil
+                    }
+                    guard let desired,
+                          let reference = result.candidates.first(where: { $0.index == desired })?.candidateEvidence
+                    else {
+                        throw PromptExperimentAuthorityError.invalidDraft("The selected GEPA candidate is unavailable; no silent seed fallback was applied.")
+                    }
+                    return reference
+                }
             }()
-            let fixture = try await store.readSyntheticFixture(environment: plan.environment)
+            let fixture = if plan.optimization == nil {
+                try await store.readSyntheticFixture(environment: plan.environment)
+            } else {
+                ""
+            }
             let chosenCandidate: String? = if let chosenCandidateReference {
                 try await String(data: store.readArtifact(chosenCandidateReference), encoding: .utf8)
             } else {
@@ -545,6 +585,58 @@
             records[index].updatedAt = date
             records[index].statusMessage = "Revision \(plan.revision + 1) draft created; prior plans and evidence remain immutable."
             try await persist()
+        }
+
+        @discardableResult
+        func cloneExperiment(
+            experimentID: UUID,
+            expectedControllerSessionID: UUID? = nil
+        ) async throws -> UUID {
+            try await requireLoaded()
+            let sourceIndex = try index(of: experimentID)
+            let source = records[sourceIndex]
+            try requireOwner(source, expectedControllerSessionID: expectedControllerSessionID)
+            guard [.approved, .completed, .inconclusive, .cancelled].contains(source.phase),
+                  let plan = source.currentPlan
+            else {
+                throw PromptExperimentAuthorityError.illegalPhase("Only a sealed or settled experiment can be cloned into a new draft.")
+            }
+            let date = now()
+            let cloneID = UUID()
+            let draft = try await PromptExperimentDraft(
+                revision: 1,
+                title: "\(plan.title) copy",
+                taskInput: plan.taskInput,
+                syntheticFixture: plan.optimization == nil ? store.readSyntheticFixture(environment: plan.environment) : "",
+                originalInstructions: plan.originalInstructions,
+                candidateInstructions: plan.candidateInstructions,
+                targetRole: plan.resolvedTarget.selector,
+                repetitions: plan.repetitions,
+                optimization: plan.optimization,
+                createdAt: date,
+                updatedAt: date
+            )
+            records.insert(PromptExperimentRecord(
+                id: cloneID,
+                controllerSessionID: source.controllerSessionID,
+                sourceTabID: source.sourceTabID,
+                createdAt: date,
+                updatedAt: date,
+                phase: .drafting,
+                draft: draft,
+                plans: [],
+                approvals: [],
+                attempts: [],
+                cancellationRequestedAt: nil,
+                statusMessage: "Cloned as an unsealed draft. Review and seal a new digest before approval or execution."
+            ), at: 0)
+            do {
+                try await persist()
+            } catch {
+                records.removeAll { $0.id == cloneID }
+                throw error
+            }
+            return cloneID
         }
 
         func record(id: UUID) -> PromptExperimentRecord? {
@@ -907,6 +999,15 @@
             body(&records[index])
             records[index].updatedAt = now()
             try await persist()
+        }
+
+        private func restoreRecord(_ record: PromptExperimentRecord) {
+            if let index = records.firstIndex(where: { $0.id == record.id }) {
+                records[index] = record
+            } else {
+                records.append(record)
+            }
+            records.sort { $0.updatedAt > $1.updatedAt }
         }
 
         private func index(of experimentID: UUID) throws -> Int {

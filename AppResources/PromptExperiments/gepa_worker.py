@@ -135,11 +135,23 @@ def main() -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         evaluations: list[dict[str, Any]] = []
-        candidate_indices: dict[str, int] = {}
+        provisional_candidate_indices: dict[str, int] = {}
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "reported": 0, "unavailable": 0}
+
+        def record_usage(response: dict[str, Any]) -> None:
+            prompt_tokens = response.get("prompt_tokens")
+            completion_tokens = response.get("completion_tokens")
+            if isinstance(prompt_tokens, int) or isinstance(completion_tokens, int):
+                usage["prompt_tokens"] += prompt_tokens if isinstance(prompt_tokens, int) else 0
+                usage["completion_tokens"] += completion_tokens if isinstance(completion_tokens, int) else 0
+                usage["reported"] += 1
+            else:
+                usage["unavailable"] += 1
 
         class HostLanguageModel:
             def __call__(self, prompt: str | list[dict[str, Any]]) -> str:
                 response = host_call("reflect", {"prompt": prompt})
+                record_usage(response)
                 output = response.get("output")
                 if not isinstance(output, str) or not output.strip():
                     raise InfrastructureFailure("reflection host returned no candidate text")
@@ -147,17 +159,18 @@ def main() -> int:
 
         def evaluate(candidate: Any, example: Any = None) -> tuple[float, dict[str, Any]]:
             text = candidate_text(candidate)
-            if text not in candidate_indices:
-                candidate_indices[text] = len(candidate_indices)
-            candidate_index = candidate_indices[text]
+            if text not in provisional_candidate_indices:
+                provisional_candidate_indices[text] = len(provisional_candidate_indices)
+            candidate_index = provisional_candidate_indices[text]
             example_value = example if isinstance(example, dict) else {"id": "single", "input": example}
-            split = str(example_value.get("_rpce_split", "training"))
+            split = str(example_value.get("split", "training"))
             response = host_call("evaluate", {
                 "candidate": text,
                 "candidate_index": candidate_index,
                 "example": example_value,
                 "split": split,
             })
+            record_usage(response)
             score_value = response.get("score")
             if score_value is None:
                 raise InfrastructureFailure("evaluation host returned no score")
@@ -165,6 +178,7 @@ def main() -> int:
             feedback = str(response.get("feedback") or "")
             evaluation = {
                 "candidate_index": candidate_index,
+                "candidate_text": text,
                 "example_id": str(example_value.get("id", "single")),
                 "split": split,
                 "score": score,
@@ -195,9 +209,11 @@ def main() -> int:
             values = []
             for raw in body.get("examples", []):
                 if raw.get("split") == split:
-                    item = dict(raw)
-                    item["_rpce_split"] = split
-                    values.append(item)
+                    values.append({
+                        "id": str(raw.get("id", "single")),
+                        "input": str(raw.get("input", "")),
+                        "split": split,
+                    })
             return values
 
         dataset = examples_for("training")
@@ -219,8 +235,15 @@ def main() -> int:
             engine_config={
                 "reflection": {
                     "reflection_lm": HostLanguageModel(),
-                    "reflection_minibatch_size": 1,
+                    "reflection_minibatch_size": int(body.get("reflection_minibatch_size", 3)),
+                    "skip_perfect_score": bool(body.get("skip_perfect_score", True)),
+                    "perfect_score": float(body["perfect_score"]),
                 },
+                "merge": (
+                    {"max_merge_invocations": int(body.get("max_merge_invocations", 5))}
+                    if bool(body.get("use_merge", False))
+                    else None
+                ),
                 "engine": {
                     "seed": int(body.get("random_seed", 0)),
                     "parallel": False,
@@ -248,6 +271,16 @@ def main() -> int:
         ]
         scores = [float(value) if value is not None else None for value in result.val_aggregate_scores]
         best_index = int(result.best_idx) if result.best_idx is not None else None
+        final_indices = {text: index for index, text in enumerate(candidates)}
+        for evaluation in evaluations:
+            evaluated_text = str(evaluation.pop("candidate_text", ""))
+            evaluation["candidate_index"] = final_indices.get(evaluated_text, -1)
+        proposer_usage = (
+            f"prompt_tokens={usage['prompt_tokens']},completion_tokens={usage['completion_tokens']},"
+            f"reported_callbacks={usage['reported']},unavailable_callbacks={usage['unavailable']}"
+            if usage["reported"]
+            else f"unavailable_callbacks={usage['unavailable']}"
+        )
         payload = {
             "engine": "gepa",
             "upstream_revision": EXPECTED_GEPA_REVISION,
@@ -260,7 +293,7 @@ def main() -> int:
             "evaluations": evaluations,
             "total_evaluations": int(result.eval_server_calls or len(evaluations)),
             "wall_time_seconds": float(result.metadata.get("wall_time", time.monotonic() - started)),
-            "proposer_usage": "unavailable_from_connected_model_completion_contract",
+            "proposer_usage": proposer_usage,
             "run_directory_relative_path": body.get("run_directory_relative_path"),
             "upstream_result": json_safe(result.to_dict()),
             "metadata": json_safe(result.metadata),

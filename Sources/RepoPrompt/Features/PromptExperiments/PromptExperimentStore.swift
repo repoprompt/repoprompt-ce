@@ -28,6 +28,7 @@
             case corruptCanonicalDocument(String)
             case artifactDigestCollision
             case invalidArtifactReference
+            case canonicalDocumentTooLarge(Int)
 
             var errorDescription: String? {
                 switch self {
@@ -39,6 +40,8 @@
                     "A content-addressed artifact did not match its expected digest."
                 case .invalidArtifactReference:
                     "The experiment evidence reference is outside the Prompt Experiment store."
+                case let .canonicalDocumentTooLarge(bytes):
+                    "Prompt Experiment canonical storage would exceed the 32 MiB limit (\(bytes) bytes); no state was committed."
                 }
             }
         }
@@ -102,6 +105,9 @@
             let document = PromptExperimentDocument(records: records.sorted { $0.createdAt < $1.createdAt })
             let encoder = Self.makeEncoder(pretty: true)
             let data = try encoder.encode(document)
+            guard data.count <= 32 * 1024 * 1024 else {
+                throw StoreError.canonicalDocumentTooLarge(data.count)
+            }
             try writeAtomically(data, to: canonicalURL)
             return rebuildReadableViews(records)
         }
@@ -135,6 +141,9 @@
             let environmentRoot = environmentsURL
                 .appendingPathComponent(experimentID.uuidString.lowercased(), isDirectory: true)
                 .appendingPathComponent("revision-\(planRevision)", isDirectory: true)
+            if fileManager.fileExists(atPath: environmentRoot.path) {
+                try fileManager.removeItem(at: environmentRoot)
+            }
             try ensureDirectory(environmentRoot)
             let fixtureURL = environmentRoot.appendingPathComponent("fixture.md", isDirectory: false)
             let data = Data(fixtureText.utf8)
@@ -146,6 +155,91 @@
                 sha256: digest
             )
             return (environmentRoot, fixture, digest)
+        }
+
+        /// Copies only explicitly reviewed regular files from a trusted loaded root into an
+        /// app-owned immutable snapshot. The source root is never used as an execution cwd.
+        func materializeOptimizationEnvironment(
+            experimentID: UUID,
+            planRevision: Int,
+            project: PromptExperimentProjectSnapshotSpecification?,
+            authorizedSourceRoots: [String]
+        ) throws -> (rootURL: URL, files: [PromptExperimentFixtureFile], digest: String) {
+            try ensureDirectory(rootURL)
+            try ensureDirectory(environmentsURL)
+            let environmentRoot = environmentsURL
+                .appendingPathComponent(experimentID.uuidString.lowercased(), isDirectory: true)
+                .appendingPathComponent("revision-\(planRevision)", isDirectory: true)
+            if fileManager.fileExists(atPath: environmentRoot.path) {
+                try fileManager.removeItem(at: environmentRoot)
+            }
+            try ensureDirectory(environmentRoot)
+
+            var files: [PromptExperimentFixtureFile] = []
+            let scopeData = Data("Inputs are supplied one at a time by the app. Expected outputs, reviewer notes, and held-out grading data are not stored in this runtime root.\n".utf8)
+            let scopeURL = environmentRoot.appendingPathComponent("input-scope.md")
+            try writeAtomically(scopeData, to: scopeURL)
+            files.append(PromptExperimentFixtureFile(
+                path: scopeURL.path,
+                byteCount: scopeData.count,
+                sha256: PromptExperimentDigest.sha256(scopeData)
+            ))
+
+            if let project {
+                let sourceRoot = URL(fileURLWithPath: project.sourceRootPath).standardizedFileURL
+                let resolvedSourceRoot = sourceRoot.resolvingSymlinksInPath()
+                let authorized = authorizedSourceRoots.map {
+                    URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
+                }
+                guard authorized.contains(resolvedSourceRoot.path),
+                      try sourceRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]).isDirectory == true,
+                      try sourceRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]).isSymbolicLink != true
+                else {
+                    throw PromptExperimentAuthorityError.environmentUnavailable(
+                        "The proposed project source root is not the Agent session's currently authorized loaded root."
+                    )
+                }
+                var totalBytes = scopeData.count
+                for relativePath in project.includedPaths.sorted() {
+                    guard !relativePath.hasPrefix("/"),
+                          !relativePath.split(separator: "/").contains(".."),
+                          relativePath != "."
+                    else { throw StoreError.invalidArtifactReference }
+                    let source = sourceRoot.appendingPathComponent(relativePath).standardizedFileURL
+                    let resolved = source.resolvingSymlinksInPath()
+                    let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+                    guard resolved.path.hasPrefix(resolvedSourceRoot.path + "/"),
+                          values.isRegularFile == true,
+                          values.isSymbolicLink != true
+                    else {
+                        throw PromptExperimentAuthorityError.environmentUnavailable(
+                            "Reviewed project path ‘\(relativePath)’ is missing, non-regular, symbolic, or outside the authorized root."
+                        )
+                    }
+                    let data = try Data(contentsOf: source, options: [.mappedIfSafe])
+                    totalBytes += data.count
+                    guard data.count <= 2 * 1024 * 1024, totalBytes <= 8 * 1024 * 1024 else {
+                        throw PromptExperimentAuthorityError.environmentUnavailable(
+                            "Reviewed project snapshots are limited to 2 MiB per file and 8 MiB total."
+                        )
+                    }
+                    let destination = environmentRoot
+                        .appendingPathComponent("project", isDirectory: true)
+                        .appendingPathComponent(relativePath, isDirectory: false)
+                    try writeAtomically(data, to: destination)
+                    try fileManager.setAttributes([.posixPermissions: 0o400], ofItemAtPath: destination.path)
+                    files.append(PromptExperimentFixtureFile(
+                        path: destination.path,
+                        byteCount: data.count,
+                        sha256: PromptExperimentDigest.sha256(data)
+                    ))
+                }
+            }
+            let digest = PromptExperimentDigest.environmentInventorySHA256(
+                rootPath: environmentRoot.path,
+                files: files
+            )
+            return (environmentRoot, files, digest)
         }
 
         func installArtifact(_ data: Data, fileExtension: String = "txt") throws -> PromptExperimentArtifactReference {
@@ -270,6 +364,28 @@
                     "## Pilot limitations"
                 ]
                 lines += plan.limitations.map { "- \($0)" }
+                if let optimization = plan.optimization {
+                    lines += [
+                        "",
+                        "## Sealed optimization authority",
+                        "- Objective: \(Self.markdownInline(optimization.objective))",
+                        "- Background: \(Self.markdownInline(optimization.background))",
+                        "- Seed candidate: \(Self.markdownInline(optimization.seedCandidate ?? "GEPA bootstrap"))",
+                        "- Reflection: \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")",
+                        "- Execution: `\(optimization.execution.adapter.rawValue)` / \(plan.optimizationTargets?.execution?.displayName ?? "no model target")",
+                        "- Judge: \(plan.optimizationTargets?.judge?.displayName ?? "not used")",
+                        "- Evaluator: `\(optimization.evaluator.kind.rawValue)` / \(optimization.evaluator.minimumScore)...\(optimization.evaluator.maximumScore)",
+                        "- Rubric: \(Self.markdownInline(optimization.evaluator.rubric))",
+                        "- Command: \(Self.markdownInline(optimization.evaluator.command ?? "not used"))",
+                        "- Reviewed project root: `\(optimization.projectSnapshot?.sourceRootPath ?? "none")`",
+                        "- Reviewed project paths: \(optimization.projectSnapshot?.includedPaths.joined(separator: ", ") ?? "none")",
+                        "- Data splits: \(optimization.examples.map { "\($0.id)=\($0.split.rawValue)" }.joined(separator: ", "))",
+                        "- Budget: \(optimization.gepa.maxEvaluations) evaluations / \(optimization.gepa.maxWallClockSeconds) seconds",
+                        "- GEPA options: minibatch \(optimization.gepa.reflectionMinibatchSize ?? 1), merge \((optimization.gepa.useMerge ?? false) ? "on" : "off"), max merge \(optimization.gepa.maxMergeInvocations ?? 0), skip perfect \((optimization.gepa.skipPerfectScore ?? true) ? "yes" : "no"), seed \(optimization.gepa.randomSeed)",
+                        "- Python: `\(optimization.gepa.pythonExecutablePath)`",
+                        "- Permissions: model callbacks are prompt-only; command evaluation reads only the immutable project copy and writes only app-owned scratch; hidden expected outputs remain native-host-private."
+                    ]
+                }
             }
             lines += ["", "## Attempts by immutable plan revision"]
             if record.attempts.isEmpty {

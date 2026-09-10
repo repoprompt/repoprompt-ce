@@ -4,6 +4,7 @@ import OSLog
 /// Identifies the type of headless agent run.
 enum AgentRunType {
     case discover
+    case promptExperiment
 }
 
 /// Specification describing a single agent run instance.
@@ -55,7 +56,7 @@ final class AgentRunCoordinator {
     /// Maps agent run type to MCP run purpose for UI routing (e.g., ask_user).
     private func runPurpose(for type: AgentRunType) -> MCPRunPurpose {
         switch type {
-        case .discover:
+        case .discover, .promptExperiment:
             .discoverRun
         }
     }
@@ -101,13 +102,15 @@ final class AgentRunCoordinator {
         agentKind: AgentProviderKind,
         modelString: String?,
         runType: AgentRunType = .discover,
-        workspacePath: String? = nil
+        workspacePath: String? = nil,
+        codexRunConstraints: CodexExecRunConstraints? = nil
     ) -> HeadlessAgentProvider {
         AgentRuntimeProviderService.shared.makeProvider(
             for: agentKind,
             modelString: modelString,
             runType: runType,
-            workspacePath: workspacePath
+            workspacePath: workspacePath,
+            codexRunConstraints: codexRunConstraints
         )
     }
 

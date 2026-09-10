@@ -442,6 +442,30 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         XCTAssertEqual(result.status, .exited(code: 7))
     }
 
+    func testReplacementEnvironmentDoesNotMergeAmbientCredentials() async throws {
+        let runner = CLIProcessRunner(config: CLIProcessConfiguration(
+            command: "/usr/bin/env",
+            environment: [
+                "HOME": "/tmp/rpce-command-home",
+                "PATH": "/usr/bin:/bin",
+                "RPCE_EXPLICIT": "yes"
+            ],
+            environmentPolicy: .replacement,
+            additionalPaths: [],
+            shellLookupMode: .disabled,
+            captureStdoutTailBytes: 64 * 1024
+        ))
+
+        let result = try await runner.run(args: [], stdin: nil, outputMode: .none, timeout: 5)
+        XCTAssertEqual(result.status, 0)
+        let lines = Set(String(decoding: result.stdout, as: UTF8.self).split(separator: "\n").map(String.init))
+        XCTAssertEqual(lines, [
+            "HOME=/tmp/rpce-command-home",
+            "PATH=/usr/bin:/bin",
+            "RPCE_EXPLICIT=yes"
+        ])
+    }
+
     private func makeRunner(
         statusObserver: @escaping ChildProcessExitObserver.StatusObserver
     ) -> CLIProcessRunner {
