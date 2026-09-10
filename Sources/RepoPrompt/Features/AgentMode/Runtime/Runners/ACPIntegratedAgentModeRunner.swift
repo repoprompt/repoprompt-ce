@@ -921,7 +921,11 @@ final class ACPIntegratedAgentModeRunner {
         agentKind: AgentProviderKind,
         modelString: String?
     ) throws -> String? {
-        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity else { return nil }
+        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild
+            || agentKind == .antigravity || agentKind == .omp || agentKind == .devin
+        else {
+            return nil
+        }
         guard let model = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
@@ -936,7 +940,7 @@ final class ACPIntegratedAgentModeRunner {
                 detail: "Cursor model `\(model)` is not in this release's supported model catalog. Update RepoPrompt CE or choose Cursor Auto."
             )
         }
-        if agentKind == .grokBuild || agentKind == .antigravity,
+        if agentKind == .grokBuild || agentKind == .antigravity || agentKind == .omp || agentKind == .devin,
            let providerID = agentKind.acpProviderID,
            AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)?.contains(rawModel: model) != true
         {

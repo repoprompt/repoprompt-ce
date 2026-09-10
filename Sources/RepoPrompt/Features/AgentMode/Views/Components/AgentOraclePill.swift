@@ -124,13 +124,60 @@ enum AgentOraclePillLogic {
         session.oracleGroupID != nil && (session.oracleGroupSize ?? 1) > 1
     }
 
-    static func aggregateOracleCount(configuredAdditionalCount: Int, sessions: [ChatSession]) -> Int {
-        let configured = 1 + configuredAdditionalCount
-        guard let latest = sessions.max(by: { $0.savedAt < $1.savedAt }),
-              latest.oracleGroupID != nil
-        else { return configured }
-        let projected = min(max(latest.oracleGroupSize ?? 1, 1), 5)
-        return max(configured, projected)
+    struct LanePresentation: Identifiable, Equatable {
+        let laneIndex: Int
+        let sessionID: UUID?
+        let modelID: String
+        let status: OracleLaneMarkdownPayload.Status
+
+        var id: Int {
+            laneIndex
+        }
+    }
+
+    static func aggregateOracleCount(session: ChatSession?, payload: OracleLaneMarkdownPayload? = nil) -> Int {
+        guard let session, session.oracleGroupID != nil else { return 1 }
+        return min(max(payload?.lanes.count ?? session.oracleGroupSize ?? 1, 1), 5)
+    }
+
+    static func groupMemberSessions(for session: ChatSession, in sessions: [ChatSession]) -> [ChatSession] {
+        guard let groupID = session.oracleGroupID else { return [] }
+        return sessions.filter {
+            $0.oracleGroupID == groupID && $0.workspaceID == session.workspaceID
+                && $0.composeTabID == session.composeTabID
+        }.sorted { ($0.oracleLaneIndex ?? .max) < ($1.oracleLaneIndex ?? .max) }
+    }
+
+    static func lanePresentations(
+        for session: ChatSession,
+        in sessions: [ChatSession],
+        streamingSessionIDs: Set<UUID>,
+        payload: OracleLaneMarkdownPayload?
+    ) -> [LanePresentation] {
+        let members = groupMemberSessions(for: session, in: sessions)
+        guard let payload else {
+            let count = aggregateOracleCount(session: session)
+            return (0 ..< count).map { laneIndex in
+                let member = members.first { $0.oracleLaneIndex == laneIndex }
+                return LanePresentation(
+                    laneIndex: laneIndex,
+                    sessionID: member?.id,
+                    modelID: member?.oracleModelRaw ?? "Oracle model",
+                    status: member.map { streamingSessionIDs.contains($0.id) } == true ? .running : .unavailable
+                )
+            }
+        }
+        return payload.lanes.sorted { $0.laneIndex < $1.laneIndex }.map { lane in
+            let member = members.first {
+                $0.shortID == lane.chatID && $0.oracleLaneIndex == lane.laneIndex
+            }
+            return LanePresentation(
+                laneIndex: lane.laneIndex,
+                sessionID: member?.id,
+                modelID: lane.modelID,
+                status: member.map { streamingSessionIDs.contains($0.id) } == true ? .running : lane.status
+            )
+        }
     }
 
     static func latestStreamingSession(
@@ -196,33 +243,15 @@ enum AgentOraclePillLogic {
         return matches[0]
     }
 
-    enum LaneDotState: Equatable {
-        case streaming
-        case failed
-        case completed
-    }
-
-    static func lastAssistantContent(
-        liveMessages: [AIChatMessage],
-        storedMessages: [StoredMessage]
-    ) -> String? {
-        if let last = liveMessages.last(where: { !$0.isUser }) {
-            return last.content
-        }
-        return storedMessages.last(where: { !$0.isUser })?.rawText
-    }
-
-    static func assistantContentIndicatesFailure(_ content: String?) -> Bool {
-        guard let content else { return false }
-        if content.contains("\n--\nError:\n") { return true }
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.hasPrefix("Error:")
-    }
-
-    static func laneDotState(isStreaming: Bool, lastAssistantContent: String?) -> LaneDotState {
-        if isStreaming { return .streaming }
-        if assistantContentIndicatesFailure(lastAssistantContent) { return .failed }
-        return .completed
+    static func laneStatus(
+        session: ChatSession,
+        isStreaming: Bool,
+        payload: OracleLaneMarkdownPayload?
+    ) -> OracleLaneMarkdownPayload.Status {
+        if isStreaming { return .running }
+        return payload?.lanes.first {
+            $0.chatID == session.shortID && $0.laneIndex == session.oracleLaneIndex
+        }?.status ?? .unavailable
     }
 }
 
@@ -251,10 +280,18 @@ struct AgentOraclePill: View {
 
     @State private var presentedPopover: PopoverPresentation?
     @State private var copyAllFeedback: CopyAllFeedback?
+    @State private var groupPayload: OracleLaneMarkdownPayload?
+    @State private var groupPayloadGroupID: UUID?
+    @State private var groupPayloadError: String?
+
+    private struct GroupReadKey: Hashable {
+        let groupID: UUID?
+        let streamingSessionIDs: Set<UUID>
+    }
+
     @State private var autoScrollEnabled = false
     @State private var openRequestGeneration: UInt64 = 0
     @ObservedObject private var fontScale = FontScaleManager.shared
-    @ObservedObject private var settingsStore = GlobalSettingsStore.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -281,25 +318,28 @@ struct AgentOraclePill: View {
         currentTabID.map(oracleViewModel.sessions(forTabID:)) ?? []
     }
 
+    private var displayedSession: ChatSession? {
+        if let presentedPopover { return presentedSession(for: presentedPopover) }
+        return latestTabSession
+    }
+
+    private var displayedPayload: OracleLaneMarkdownPayload? {
+        guard displayedSession?.oracleGroupID == groupPayloadGroupID else { return nil }
+        return groupPayload
+    }
+
     private var oracleCount: Int {
-        let workspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
-        let configuredAdditional = settingsStore
-            .effectiveAgentModelsProfile(workspaceID: workspaceID)
-            .additionalOracleModelRaws.count
-        return AgentOraclePillLogic.aggregateOracleCount(
-            configuredAdditionalCount: configuredAdditional,
-            sessions: currentTabSessions
-        )
+        AgentOraclePillLogic.aggregateOracleCount(session: displayedSession, payload: displayedPayload)
     }
 
     private var isStreaming: Bool {
-        guard let latestTabSession else { return false }
-        if let groupID = latestTabSession.oracleGroupID {
-            return currentTabSessions.contains {
-                $0.oracleGroupID == groupID && oracleViewModel.streamingSessions.contains($0.id)
+        guard let session = displayedSession else { return false }
+        if session.oracleGroupID != nil {
+            return groupMemberSessions(for: session).contains {
+                oracleViewModel.streamingSessions.contains($0.id)
             }
         }
-        return oracleViewModel.streamingSessions.contains(latestTabSession.id)
+        return oracleViewModel.streamingSessions.contains(session.id)
     }
 
     private func presentedSession(for presentation: PopoverPresentation) -> ChatSession? {
@@ -319,17 +359,40 @@ struct AgentOraclePill: View {
         return session.name
     }
 
-    private func laneDotColor(for session: ChatSession) -> Color {
-        switch AgentOraclePillLogic.laneDotState(
+    private func canonicalPayload(for presentation: PopoverPresentation) -> OracleLaneMarkdownPayload? {
+        guard presentedSession(for: presentation)?.oracleGroupID == groupPayloadGroupID else { return nil }
+        return groupPayload
+    }
+
+    private func canonicalPayloadError(for presentation: PopoverPresentation) -> String? {
+        guard presentedSession(for: presentation)?.oracleGroupID == groupPayloadGroupID else { return nil }
+        return groupPayloadError
+    }
+
+    private func lanePresentations(for session: ChatSession, presentation: PopoverPresentation) -> [AgentOraclePillLogic.LanePresentation] {
+        AgentOraclePillLogic.lanePresentations(
+            for: session,
+            in: currentTabSessions,
+            streamingSessionIDs: oracleViewModel.streamingSessions,
+            payload: canonicalPayload(for: presentation)
+        )
+    }
+
+    private func laneStatus(for session: ChatSession, presentation: PopoverPresentation) -> OracleLaneMarkdownPayload.Status {
+        AgentOraclePillLogic.laneStatus(
+            session: session,
             isStreaming: oracleViewModel.streamingSessions.contains(session.id),
-            lastAssistantContent: AgentOraclePillLogic.lastAssistantContent(
-                liveMessages: oracleViewModel.messagesSnapshot(for: session.id),
-                storedMessages: session.messages
-            )
-        ) {
-        case .streaming: Color.purple
-        case .failed: Color.red
-        case .completed: Color.green
+            payload: canonicalPayload(for: presentation)
+        )
+    }
+
+    private func laneDotColor(for status: OracleLaneMarkdownPayload.Status) -> Color {
+        switch status {
+        case .running: .purple
+        case .failed: .red
+        case .completed: .green
+        case .cancelled: .orange
+        case .unavailable: .secondary
         }
     }
 
@@ -427,10 +490,7 @@ struct AgentOraclePill: View {
     }
 
     private func groupMemberSessions(for session: ChatSession) -> [ChatSession] {
-        guard let groupID = session.oracleGroupID else { return [] }
-        return currentTabSessions
-            .filter { $0.oracleGroupID == groupID }
-            .sorted { ($0.oracleLaneIndex ?? .max) < ($1.oracleLaneIndex ?? .max) }
+        AgentOraclePillLogic.groupMemberSessions(for: session, in: currentTabSessions)
     }
 
     @ViewBuilder
@@ -470,15 +530,18 @@ struct AgentOraclePill: View {
             }
 
             if let presented = presentedSession(for: presentation) {
-                let members = groupMemberSessions(for: presented)
-                if members.count > 1 {
+                let lanes = lanePresentations(for: presented, presentation: presentation)
+                if lanes.count > 1 {
                     HStack(spacing: 6) {
-                        ForEach(members) { member in
-                            let laneIndex = member.oracleLaneIndex ?? 0
+                        ForEach(lanes) { lane in
+                            let statusDetail = lane.status == .unavailable
+                                ? (canonicalPayloadError(for: presentation) ?? lane.status.rawValue)
+                                : lane.status.rawValue
                             Button {
+                                guard let sessionID = lane.sessionID else { return }
                                 openRequestGeneration &+= 1
                                 present(
-                                    sessionID: member.id,
+                                    sessionID: sessionID,
                                     isExplicit: presentation.isExplicit,
                                     actionPolicy: presentation.actionPolicy,
                                     generation: openRequestGeneration
@@ -486,17 +549,40 @@ struct AgentOraclePill: View {
                             } label: {
                                 HStack(spacing: 4) {
                                     Circle()
-                                        .fill(laneDotColor(for: member))
+                                        .fill(laneDotColor(for: lane.status))
                                         .frame(width: 6, height: 6)
-                                    Text(OracleViewModel.oracleLabel(laneIndex: laneIndex))
+                                    Text(OracleViewModel.oracleLabel(laneIndex: lane.laneIndex))
                                         .lineLimit(1)
                                 }
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
-                            .hoverTooltip(member.oracleModelRaw ?? "Oracle model")
+                            .disabled(lane.sessionID == nil)
+                            .hoverTooltip("\(lane.modelID) · \(statusDetail)")
+                            .accessibilityLabel("\(OracleViewModel.oracleLabel(laneIndex: lane.laneIndex)): \(lane.status.rawValue)")
                         }
                     }
+                }
+            }
+
+            if let presented = presentedSession(for: presentation), presented.oracleGroupID != nil {
+                let lane = canonicalPayload(for: presentation)?.lanes.first {
+                    $0.chatID == presented.shortID && $0.laneIndex == presented.oracleLaneIndex
+                }
+                let status = laneStatus(for: presented, presentation: presentation)
+                Text(status.rawValue)
+                    .font(.caption)
+                    .foregroundStyle(laneDotColor(for: status))
+                if let error = lane?.errorMessage, status != .running {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                } else if status == .unavailable, let payloadError = canonicalPayloadError(for: presentation) {
+                    Text(payloadError)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
             }
 
@@ -514,6 +600,45 @@ struct AgentOraclePill: View {
         }
         .padding(14)
         .frame(width: popoverWidth)
+        .task(id: GroupReadKey(
+            groupID: presentedSession(for: presentation)?.oracleGroupID,
+            streamingSessionIDs: oracleViewModel.streamingSessions
+        )) {
+            await refreshGroupPayload(presentation)
+        }
+    }
+
+    @MainActor
+    private func refreshGroupPayload(_ presentation: PopoverPresentation) async {
+        guard let session = presentedSession(for: presentation), let groupID = session.oracleGroupID else { return }
+        if groupPayloadGroupID != groupID {
+            groupPayload = nil
+            groupPayloadError = nil
+        }
+        groupPayloadGroupID = groupID
+        // A stream can end before the runtime publishes its terminal turn. Continue reading
+        // the existing canonical seam until publication; never infer completion from text.
+        while !Task.isCancelled {
+            do {
+                let payload = try await oracleViewModel.oracleGroupCopyPayload(containing: session)
+                try Task.checkCancellation()
+                guard let current = presentedPopover,
+                      presentedSession(for: current)?.oracleGroupID == groupID else { return }
+                groupPayload = payload
+                groupPayloadGroupID = groupID
+                groupPayloadError = nil
+                guard payload.lanes.contains(where: { $0.status == .running }) else { return }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            } catch {
+                if !Task.isCancelled,
+                   let current = presentedPopover,
+                   presentedSession(for: current)?.oracleGroupID == groupID
+                {
+                    groupPayloadError = error.localizedDescription
+                }
+                return
+            }
+        }
     }
 
     private func copyAllLanes(containing session: ChatSession) {

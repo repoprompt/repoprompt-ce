@@ -13,7 +13,7 @@ protocol TerminationSignalObserving: AnyObject {
     func observe(_ signal: Int32, handler: @escaping () -> Void)
 }
 
-/// Bridges POSIX signals onto the main queue where AppKit lifecycle work is serialized.
+/// Delivers signals through a main run-loop callout.
 final class DispatchTerminationSignalObserver: TerminationSignalObserving {
     /// Dispatch sources only remain active while retained, so the observer owns them for its
     /// lifetime rather than relying on the caller to preserve an implementation detail.
@@ -25,7 +25,9 @@ final class DispatchTerminationSignalObserver: TerminationSignalObserving {
 
     func observe(_ signal: Int32, handler: @escaping () -> Void) {
         let source = DispatchSource.makeSignalSource(signal: signal, queue: .main)
-        source.setEventHandler(handler: handler)
+        source.setEventHandler {
+            RunLoop.main.perform(inModes: [.common], block: handler)
+        }
         sources[signal] = source
         source.activate()
     }

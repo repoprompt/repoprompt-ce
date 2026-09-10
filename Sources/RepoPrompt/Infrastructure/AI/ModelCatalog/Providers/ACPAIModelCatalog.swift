@@ -11,6 +11,8 @@ struct ACPDynamicModelRecord: Codable, Hashable {
     /// Variant provenance for synthesized effort options. Optional so records persisted
     /// before effort support decode unchanged.
     var effortVariant: AgentModelEffortVariant? = nil
+    /// Advisory native grouping. Optional so records persisted before family support decode unchanged.
+    var modelFamily: AgentModelFamily? = nil
 }
 
 struct ACPDynamicProviderRecord: Codable, Hashable {
@@ -206,7 +208,8 @@ enum ACPDynamicModelStore {
             isProviderDefault: option.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
             defaultReasoningEffort: option.defaultReasoningEffort?.rawValue,
-            effortVariant: option.effortVariant
+            effortVariant: option.effortVariant,
+            modelFamily: option.modelFamily
         )
     }
 
@@ -224,7 +227,8 @@ enum ACPDynamicModelStore {
             isProviderDefault: record.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
             defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort),
-            effortVariant: record.effortVariant
+            effortVariant: record.effortVariant,
+            modelFamily: record.modelFamily
         )
     }
 
@@ -278,7 +282,8 @@ enum ACPDynamicModelStore {
             defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort,
             // Variant provenance is semantic identity, not metadata: keep it only when both
             // records agree, so a real base (nil) never inherits stale variant provenance.
-            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil
+            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil,
+            modelFamily: metadataRecord.modelFamily ?? fallbackRecord.modelFamily
         )
     }
 
@@ -377,11 +382,33 @@ enum ACPAIModelCatalog {
         grokBuildModelOptionsFromStore().map { .grokBuildCustom(name: $0.rawValue) }
     }
 
+    /// Keep `AIModel`'s static paths one-way: registry data only, never `AgentModelCatalog`.
+    static func ompModelOptionsFromStore() -> [AgentModelOption] {
+        AgentACPModelRegistry.shared.resolvedSnapshot(for: .omp)?.options ?? []
+    }
+
+    static func ompModelsFromStore() -> [AIModel] {
+        ompModelOptionsFromStore().map { .ompCustom(name: $0.rawValue) }
+    }
+
+    static func devinModelOptionsFromStore() -> [AgentModelOption] {
+        AgentACPModelRegistry.shared.resolvedSnapshot(for: .devin)?.options ?? []
+    }
+
+    static func devinModelsFromStore() -> [AIModel] {
+        devinModelOptionsFromStore().map { .devinCustom(name: $0.rawValue) }
+    }
+
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
-        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else { return nil }
-        return openCodeModelOptionsFromStore()
-            .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+        option(for: rawValue, in: openCodeModelOptionsFromStore())
+    }
+
+    static func ompModelOption(for rawValue: String) -> AgentModelOption? {
+        option(for: rawValue, in: ompModelOptionsFromStore())
+    }
+
+    static func devinModelOption(for rawValue: String) -> AgentModelOption? {
+        option(for: rawValue, in: devinModelOptionsFromStore())
     }
 
     static func cursorModelOption(for rawValue: String) -> AgentModelOption? {
@@ -389,10 +416,13 @@ enum ACPAIModelCatalog {
     }
 
     static func grokBuildModelOption(for rawValue: String) -> AgentModelOption? {
+        option(for: rawValue, in: grokBuildModelOptionsFromStore())
+    }
+
+    private static func option(for rawValue: String, in options: [AgentModelOption]) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
-        return grokBuildModelOptionsFromStore()
-            .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+        return options.first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
     }
 
     static func normalizedCursorModelAlias(_ value: String) -> String {

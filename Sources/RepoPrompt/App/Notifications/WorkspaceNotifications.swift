@@ -41,4 +41,13 @@ extension Notification.Name {
     /// Posted when Grok Build CLI connection status changes
     /// userInfo mirrors `claudeCodeConnectionChanged`
     static let grokBuildConnectionChanged = Notification.Name("grokBuildConnectionChanged")
+    /// Posted when Oh My Pi CLI connection status changes
+    /// userInfo mirrors `claudeCodeConnectionChanged`
+    static let ompConnectionChanged = Notification.Name("ompConnectionChanged")
+    /// Posted when Devin CLI connection status changes
+    /// userInfo mirrors `claudeCodeConnectionChanged`
+    static let devinConnectionChanged = Notification.Name("devinConnectionChanged")
+    /// Posted when ACP model discovery changes for one provider (`userInfo["providerID"]`),
+    /// or with no userInfo when the persisted catalogs finish warming.
+    static let acpDiscoveredModelsChanged = Notification.Name("acpDiscoveredModelsChanged")
 }

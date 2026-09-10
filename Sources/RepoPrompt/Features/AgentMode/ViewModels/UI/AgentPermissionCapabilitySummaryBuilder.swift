@@ -172,6 +172,30 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: level.autoApprovesACPToolPermissions ? "Auto-approve: on" : "Auto-approve: off",
                 warnings: warnings
             )
+        case .omp:
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Managed by Oh My Pi",
+                shell: "Handled by Oh My Pi",
+                externalMCP: "Third-party MCP: managed by Oh My Pi",
+                search: "Managed by Oh My Pi",
+                approvalModeDescription: "Provider managed",
+                warnings: []
+            )
+        case .devin:
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Managed by Devin",
+                shell: "Handled by Devin",
+                externalMCP: "Third-party MCP: managed by Devin",
+                search: "Managed by Devin",
+                approvalModeDescription: "Provider managed",
+                warnings: []
+            )
         case .grokBuild:
             let level = grokBuildPermissionLevel(profile: profile)
             let warnings = level == .fullAccess
@@ -229,6 +253,8 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .cursor: availability.cursorAvailable
         case .grokBuild: availability.grokBuildAvailable
         case .antigravity: availability.antigravityAvailable
+        case .omp: availability.ompAvailable
+        case .devin: availability.devinAvailable
         }
     }
 

@@ -4,6 +4,31 @@ import XCTest
 
 @MainActor
 final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
+    func testOMPAndDevinRemainExplicitSelectionsButNotAutomaticFallbacks() {
+        for agent in [AgentProviderKind.omp, .devin] {
+            let availability = AgentModelCatalog.AvailabilityContext(
+                claudeCodeAvailable: false,
+                codexAvailable: false,
+                openCodeAvailable: false,
+                ompAvailable: agent == .omp,
+                devinAvailable: agent == .devin
+            )
+            XCTAssertNil(AutoRecommendationEngine.resolveContextBuilderSelection(
+                persistedAgentRaw: nil,
+                persistedModelRaw: nil,
+                availability: availability
+            ))
+
+            let restored = AutoRecommendationEngine.resolveContextBuilderSelection(
+                persistedAgentRaw: agent.rawValue,
+                persistedModelRaw: AgentModel.defaultModel.rawValue,
+                availability: availability
+            )
+            XCTAssertEqual(restored?.agent, agent)
+            XCTAssertEqual(restored?.modelRaw, AgentModel.defaultModel.rawValue)
+        }
+    }
+
     func testOperationIdentityRejectsWorkspaceAndInheritanceChanges() {
         let workspaceID = UUID()
         let identity = AgentModelsOperationIdentity(

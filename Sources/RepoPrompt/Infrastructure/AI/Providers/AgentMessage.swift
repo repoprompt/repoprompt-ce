@@ -9,6 +9,16 @@
 
 import Foundation
 
+enum AgentPromptContentPart: Equatable {
+    case text(String)
+    case image(AITransientImage)
+
+    var text: String? {
+        guard case let .text(text) = self else { return nil }
+        return text
+    }
+}
+
 /// A minimal message for headless agent providers.
 /// Contains just the system prompt channel and user message channel.
 public struct AgentMessage: Sendable, Equatable {
@@ -17,6 +27,8 @@ public struct AgentMessage: Sendable, Equatable {
 
     /// The user's message / task
     public var userMessage: String
+
+    var promptContentParts: [AgentPromptContentPart] = []
 
     /// Optional provider-specific session ID for resuming conversations
     /// Used by Claude CLI to resume with --resume <session-id> instead of replaying history

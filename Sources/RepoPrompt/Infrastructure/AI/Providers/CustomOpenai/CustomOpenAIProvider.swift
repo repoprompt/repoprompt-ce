@@ -2,16 +2,55 @@ import Foundation
 
 /// Common chat completion parameters
 enum CompletionParams {
-    struct Message {
-        enum Role: String {
+    struct Message: Encodable {
+        enum Role: String, Encodable {
             case system
             case user
             case assistant
         }
 
-        enum Content {
+        /// Wire content: a bare string, or the OpenAI multimodal part array.
+        enum Content: Encodable {
             case text(String)
-            case contentArray([Content])
+            case parts([Part])
+
+            enum Part: Encodable {
+                case text(String)
+                case imageURL(url: String, detail: String)
+
+                private struct ImageURL: Encodable {
+                    let url: String
+                    let detail: String
+                }
+
+                private enum CodingKeys: String, CodingKey {
+                    case type
+                    case text
+                    case imageURL = "image_url"
+                }
+
+                func encode(to encoder: Encoder) throws {
+                    var container = encoder.container(keyedBy: CodingKeys.self)
+                    switch self {
+                    case let .text(text):
+                        try container.encode("text", forKey: .type)
+                        try container.encode(text, forKey: .text)
+                    case let .imageURL(url, detail):
+                        try container.encode("image_url", forKey: .type)
+                        try container.encode(ImageURL(url: url, detail: detail), forKey: .imageURL)
+                    }
+                }
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.singleValueContainer()
+                switch self {
+                case let .text(text):
+                    try container.encode(text)
+                case let .parts(parts):
+                    try container.encode(parts)
+                }
+            }
         }
 
         let role: Role
@@ -120,20 +159,20 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         }
     }
 
-    struct ChatMessage: Codable {
+    struct ChatMessage: Encodable {
         let role: String
-        let content: String
+        let content: CompletionParams.Message.Content
     }
 
     /// Added support for max_tokens and temperature in the request payload
-    struct ChatRequest: Codable {
+    struct ChatRequest: Encodable {
         let model: String
         let messages: [ChatMessage]
         let max_tokens: Int?
         let temperature: Double?
     }
 
-    struct ChatStreamRequest: Codable {
+    struct ChatStreamRequest: Encodable {
         let model: String
         let messages: [ChatMessage]
         let stream: Bool
@@ -432,12 +471,10 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                     userContent = entry.content
                 }
 
-                results.append(
-                    CompletionParams.Message(
-                        role: .user,
-                        content: .text(userContent)
-                    )
-                )
+                let content: CompletionParams.Message.Content = entry.images.isEmpty
+                    ? .text(userContent)
+                    : .parts(Self.imageParts(text: userContent, images: entry.images))
+                results.append(CompletionParams.Message(role: .user, content: content))
             } else {
                 results.append(
                     CompletionParams.Message(
@@ -449,6 +486,23 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         }
 
         return results
+    }
+
+    private static func imageParts(
+        text: String,
+        images: [AITransientImage]
+    ) -> [CompletionParams.Message.Content.Part] {
+        var parts: [CompletionParams.Message.Content.Part] = []
+        if !text.isEmpty {
+            parts.append(.text(text))
+        }
+        for image in images {
+            if let title = image.normalizedTitle {
+                parts.append(.text("Image title: \(title)"))
+            }
+            parts.append(.imageURL(url: image.openAIDataURL, detail: "auto"))
+        }
+        return parts
     }
 
     #if DEBUG
@@ -674,22 +728,8 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        let openAIMessages = messages.map { message -> ChatMessage in
-            let content: String = switch message.content {
-            case let .text(text):
-                text
-            case let .contentArray(array):
-                array.compactMap { chunk -> String? in
-                    if case let .text(part) = chunk {
-                        return part
-                    }
-                    return nil
-                }.joined(separator: "\n")
-            }
-            return ChatMessage(
-                role: message.role.rawValue,
-                content: content
-            )
+        let openAIMessages = messages.map { message in
+            ChatMessage(role: message.role.rawValue, content: message.content)
         }
 
         // Use the provided temperature if available, or fall back to the provider default
