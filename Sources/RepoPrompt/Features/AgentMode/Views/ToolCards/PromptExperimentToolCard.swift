@@ -3,7 +3,7 @@
     import SwiftUI
 
     /// In-session native authority and status surface for the `prompt_experiment` tool.
-    /// Agent tool calls may shape/query records, but these buttons are deliberately local UI actions.
+    /// The run request can wait here, but only these native actions can approve its exact digest.
     struct PromptExperimentResultCard: View {
         let item: AgentChatItem
         @State private var isExpanded = true
@@ -13,14 +13,25 @@
         @State private var errorMessage: String?
 
         private var resultObject: [String: Any]? {
-            guard let raw = item.toolResultJSON,
-                  let data = raw.data(using: .utf8)
-            else { return nil }
-            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            jsonObject(item.toolResultJSON)
+        }
+
+        private var argumentsObject: [String: Any]? {
+            jsonObject(item.toolArgsJSON)
         }
 
         private var experimentID: UUID? {
-            (resultObject?["experiment_id"] as? String).flatMap(UUID.init(uuidString:))
+            ((resultObject?["experiment_id"] ?? argumentsObject?["experiment_id"]) as? String)
+                .flatMap(UUID.init(uuidString:))
+        }
+
+        private var isRunRequest: Bool {
+            (argumentsObject?["op"] as? String)?.lowercased() == "run"
+        }
+
+        private func jsonObject(_ raw: String?) -> [String: Any]? {
+            guard let raw, let data = raw.data(using: .utf8) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         }
 
         private var service: PromptExperimentService? {
@@ -44,6 +55,7 @@
         private var status: ToolCardStatus {
             if item.toolIsError == true { return .failure }
             switch phase {
+            case .awaitingApproval where isRunRequest: return .running
             case .running, .cancelling: return .running
             case .completed: return .success
             case .inconclusive: return .warning
@@ -162,29 +174,54 @@
 
         @ViewBuilder
         private func nativeControls(record: PromptExperimentRecord, plan: PromptExperimentPlan) -> some View {
+            let hasPendingRequest = service?.hasPendingRunApproval(
+                experimentID: record.id,
+                planDigest: plan.digest
+            ) == true
             switch record.phase {
             case .awaitingApproval:
-                Toggle("I reviewed this exact digest", isOn: Binding(
+                Toggle("I reviewed every sealed field for this exact digest", isOn: Binding(
                     get: { acknowledgedDigest == plan.digest },
                     set: { acknowledgedDigest = $0 ? plan.digest : nil }
                 ))
                 .font(.caption)
-                Button("Approve exact sealed proposal") {
-                    perform {
-                        try await service?.approve(
-                            experimentID: record.id,
-                            displayedDigest: plan.digest,
-                            source: .nativeUI
-                        )
+                HStack {
+                    Button("Approve & Run exact proposal") {
+                        perform {
+                            try await service?.approveAndRun(
+                                experimentID: record.id,
+                                displayedDigest: plan.digest,
+                                source: .nativeUI
+                            )
+                        }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(acknowledgedDigest != plan.digest || !hasPendingRequest)
+
+                    Button("Request changes") {
+                        perform {
+                            try await service?.declineRunAndRevise(
+                                experimentID: record.id,
+                                displayedDigest: plan.digest,
+                                source: .nativeUI
+                            )
+                        }
+                    }
+                    .disabled(!hasPendingRequest)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(acknowledgedDigest != plan.digest)
+                if hasPendingRequest {
+                    Text("This Agent tool call is waiting. Approval starts automatically and wakes the conversation with running status; requesting changes returns the new draft.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("The owning Agent session must call run with this exact digest before native approval is available.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             case .approved:
-                Button("Run approved GEPA search") {
-                    perform { try await service?.run(experimentID: record.id) }
-                }
-                .buttonStyle(.borderedProminent)
+                Text("Approval is recorded. The owning Agent session can call run with this exact digest to resume safely.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             case .running, .cancelling:
                 Button("Stop after provider settlement", role: .destructive) {
                     perform { try await service?.cancel(experimentID: record.id) }

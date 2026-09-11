@@ -136,23 +136,24 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 name: MCPWindowToolName.promptExperiment,
                 freshnessPolicy: .none,
                 description: """
-                Create and revise a native, upstream-GEPA Prompt Experiment owned by this Agent session.
+                Set up, run, observe, and iterate on a native upstream-GEPA Prompt Experiment owned by this Agent session.
 
-                Start with `op=capabilities`, inspect the authorized workspace, ask for missing goals,
-                then create/update a versioned optimization specification and seal it for native review.
-                This tool cannot approve, start, cancel, or apply a winner. The user must approve and
-                run the exact digest from the native in-session experiment card.
+                Start with `op=capabilities`, inspect only authorized context, and ask for genuinely missing goals.
+                `setup` seals a complete reviewed specification in one call. `run` suspends for authentic native
+                digest approval; one Approve & Run action starts automatically. Then use `wait`, `status`, `cancel`,
+                and the revision/clone operations. The agent cannot approve or apply a winner.
                 """,
                 annotations: .repoPromptLocalEphemeralState,
                 inputSchema: .object(
                     properties: [
-                        "op": .string(description: "capabilities | list | create_draft | update_draft | propose_seal | read | clone_draft | propose_run_again | propose_next_revision"),
+                        "op": .string(description: "capabilities | list | setup | create_draft | update_draft | propose_seal | status | run | wait | cancel | read | clone | clone_draft | rerun | propose_run_again | continue | propose_next_revision"),
                         "experiment_id": .string(description: "Experiment UUID for record operations."),
                         "expected_draft_id": .string(description: "Exact draft UUID returned by create/read/update."),
                         "expected_draft_version": .integer(description: "Exact optimistic draft version returned by create/read/update."),
                         "expected_draft_digest": .string(description: "Exact draft digest returned by create/read/update."),
                         "expected_plan_digest": .string(description: "Exact current sealed plan digest for cloning or proposing a next revision."),
                         "candidate_index": .integer(description: "Optional exact GEPA candidate index to continue; omitted means the recorded best candidate."),
+                        "timeout_seconds": .number(description: "For wait only: 0-3600 seconds to await terminal settlement before returning current progress. Default 120."),
                         "title": .string(description: "Optional draft title replacement."),
                         "task_input": .string(description: "Optional fixed task replacement."),
                         "synthetic_fixture": .string(description: "Optional synthetic fixture replacement. Loaded workspace content is unsupported."),
@@ -173,11 +174,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             args: [String: Value],
             dependencies: MCPAppPhysicalCapabilityAdapters.Execution
         ) async throws -> Value {
-            guard let rawOperation = args["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                  let operation = PromptExperimentAgentOperation(rawValue: rawOperation)
-            else {
-                throw MCPError.invalidParams("Unsupported Prompt Experiment operation. Call op=capabilities for the bounded schema; approval and run operations do not exist.")
-            }
+            let command = try promptExperimentCommand(args: args)
             let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.promptExperiment)
             let targetWindow = try dependencies.requireTargetWindow()
             let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .promptExperiment)
@@ -198,11 +195,31 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 authorizedSourceRoots: targetWindow.workspaceManager.activeWorkspace?.repoPaths ?? []
             )
             let interface = PromptExperimentAgentInterface(service: service)
-            let command: PromptExperimentAgentCommand = switch operation {
+            return try await responseValue(interface.execute(command, owner: owner))
+        }
+
+        static func promptExperimentCommand(args: [String: Value]) throws -> PromptExperimentAgentCommand {
+            guard let rawOperation = args["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  let operation = PromptExperimentAgentOperation(rawValue: rawOperation)
+            else {
+                throw MCPError.invalidParams("Unsupported Prompt Experiment operation. Call op=capabilities for the session-driven schema; approval remains a native user action.")
+            }
+            return switch operation {
             case .capabilities:
                 .capabilities
             case .list:
                 .list
+            case .setup:
+                try .setup(patch: PromptExperimentAgentDraftPatch(
+                    title: args["title"]?.stringValue,
+                    taskInput: args["task_input"]?.stringValue,
+                    syntheticFixture: args["synthetic_fixture"]?.stringValue,
+                    originalInstructions: args["original_instructions"]?.stringValue,
+                    candidateInstructions: args["candidate_instructions"]?.stringValue,
+                    targetRole: args["target_role"]?.stringValue,
+                    repetitions: args["repetitions"]?.intValue,
+                    optimization: decodeOptimizationSpecification(requiredString("specification_json", args: args))
+                ))
             case .createDraft:
                 .createDraft
             case .updateDraft:
@@ -229,23 +246,42 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     expectedDraftVersion: requiredInt("expected_draft_version", args: args),
                     expectedDraftDigest: requiredString("expected_draft_digest", args: args)
                 )
+            case .status:
+                try .status(experimentID: requiredUUID("experiment_id", args: args))
+            case .run:
+                try .run(
+                    experimentID: requiredUUID("experiment_id", args: args),
+                    expectedPlanDigest: requiredString("expected_plan_digest", args: args)
+                )
+            case .wait:
+                try .wait(
+                    experimentID: requiredUUID("experiment_id", args: args),
+                    expectedPlanDigest: requiredString("expected_plan_digest", args: args),
+                    timeoutSeconds: args["timeout_seconds"]?.doubleValue
+                        ?? args["timeout_seconds"]?.intValue.map(TimeInterval.init)
+                        ?? 120
+                )
+            case .cancel:
+                try .cancel(
+                    experimentID: requiredUUID("experiment_id", args: args),
+                    expectedPlanDigest: requiredString("expected_plan_digest", args: args)
+                )
             case .read:
                 try .read(experimentID: requiredUUID("experiment_id", args: args))
-            case .cloneDraft:
+            case .clone, .cloneDraft:
                 try .cloneDraft(experimentID: requiredUUID("experiment_id", args: args))
-            case .proposeRunAgain:
+            case .rerun, .proposeRunAgain:
                 try .proposeRunAgain(
                     experimentID: requiredUUID("experiment_id", args: args),
                     expectedPlanDigest: requiredString("expected_plan_digest", args: args)
                 )
-            case .proposeNextRevision:
+            case .continueRevision, .proposeNextRevision:
                 try .proposeNextRevision(
                     experimentID: requiredUUID("experiment_id", args: args),
                     expectedPlanDigest: requiredString("expected_plan_digest", args: args),
                     candidateIndex: args["candidate_index"]?.intValue
                 )
             }
-            return try await responseValue(interface.execute(command, owner: owner))
         }
 
         private static func requiredString(_ key: String, args: [String: Value]) throws -> String {
@@ -318,10 +354,12 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "worker_protocol_version": .int(gepaRuntime.workerProtocolVersion),
                         "package_version": .string(gepaRuntime.packageVersion),
                         "pinned_revision": .string(gepaRuntime.pinnedRevision),
+                        "python_version": .string(gepaRuntime.pythonVersion),
                         "worker_resource_available": .bool(gepaRuntime.workerResourceAvailable),
+                        "bundled_runtime_available": .bool(gepaRuntime.bundledRuntimeAvailable),
                         "configured_python_executable": gepaRuntime.configuredPythonExecutable.map(Value.string) ?? .null,
-                        "setup_instructions": .string(gepaRuntime.setupInstructions),
-                        "preflight_behavior": .string("Run checks the exact external environment after native approval, without installing packages or making model calls.")
+                        "runtime_status": .string(gepaRuntime.runtimeStatus),
+                        "preflight_behavior": .string("After native approval, Run verifies the bundled provenance, exact CPython/GEPA metadata, dependency-free package contract, and worker import without a model call.")
                     ]),
                     "limitations": .array(limitations.map(Value.string)),
                     "native_approval_required": .bool(true)
@@ -334,7 +372,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 try .object([
                     "experiment_id": .string(experimentID.uuidString),
                     "draft": draftValue(draft),
-                    "next_action": .string("Use update_draft with the exact ID/version/digest and a complete reviewed specification_json, then propose_seal. Ask the user to approve the exact native card; this tool cannot approve or run.")
+                    "next_action": .string("Revise with update_draft under the exact ID/version/digest, then propose_seal. For a new complete proposal, setup performs create/update/seal in one call.")
                 ])
             case let .sealed(experimentID, plan):
                 .object([
@@ -342,7 +380,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     "phase": .string(PromptExperimentPhase.awaitingApproval.rawValue),
                     "plan_revision": .int(plan.revision),
                     "plan_digest": .string(plan.digest),
-                    "native_action_required": .string("Ask the user to review and approve this exact digest on the native in-session Prompt Experiment card. This tool cannot approve or run it.")
+                    "next_action": .string("Call run with this exact experiment_id and expected_plan_digest. The call will wait for one native Approve & Run or Request Changes action; approval starts automatically.")
                 ])
             }
         }
@@ -378,6 +416,19 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 })
             ]
             value["draft"] = try record.draft.map(draftValue) ?? .null
+            let nextAction = switch record.phase {
+            case .drafting:
+                "Revise the returned draft under exact version/digest checks, then propose_seal."
+            case .awaitingApproval:
+                "Call run with the exact plan digest; the native card will resolve approval or requested changes."
+            case .approved:
+                "Call run with the exact plan digest to resume the already-approved run after interruption."
+            case .running, .cancelling:
+                "Call wait with the exact plan digest for bounded progress or terminal results; cancel remains available to the owning session."
+            case .completed, .inconclusive, .cancelled:
+                "Inspect results, then use continue/rerun/clone if the user wants another reviewed iteration."
+            }
+            value["next_action"] = .string(nextAction)
             if let plan = record.currentPlan {
                 value["current_plan"] = sealedPlanValue(plan, approved: record.approval(for: plan) != nil)
             } else {

@@ -1,38 +1,42 @@
 # Prompt Experiments and upstream GEPA
 
-Prompt Experiments is a DEBUG-gated, Agent-first optimization workflow. It keeps RepoPrompt's existing session, model catalog, provider, Context Builder, persistence, and native approval authorities while delegating candidate search to the real upstream `gepa.optimize_anything` implementation.
+Prompt Experiments is a DEBUG-gated, Agent-first optimization lab. It keeps RepoPrompt's existing session, model catalog, provider, Context Builder, persistence, native approval, and cancellation authorities while delegating candidate search to the real upstream `gepa.optimize_anything` implementation.
 
-## User flow
+## Session-driven user flow
 
-1. Start the **Prompt Experiment** Agent workflow from the normal new-session workflow picker.
-2. Describe the workflow or prompt behavior to improve. The Agent inspects only already-authorized context, asks for missing success criteria, and uses the `prompt_experiment` tool to create and revise a bounded proposal with reviewed examples, an evaluator, exact connected-model selectors, project inputs, and budgets.
-3. Review the in-session native Prompt Experiment card. Its human summary is accompanied by selectable, pretty-printed JSON for every field in the immutable plan. Approval is bound to that plan's displayed digest; the Agent tool cannot approve, start, stop, or apply a winner.
-4. Start the run from that card. Progress, baseline and candidate scores, per-example feedback, failures, usage availability, and stop settlement remain visible and durable.
-5. Reopen a past result from the card's experiment library. **Continue best** creates a revision seeded by the selected winner, **Run again** creates a revision with the same seed, and **Clone as draft** creates a separate experiment. Any changed data, evaluator, permissions, targets, or budget produces a new digest and requires new native approval. Applying a winner remains a separate explicit action and is not automatic.
+1. Start the **Prompt Experiment** Agent workflow from the normal new-session workflow picker and describe the workflow or prompt behavior to improve.
+2. The Agent asks for missing goals or success criteria and uses the `prompt_experiment` session tool to set up and revise a bounded proposal with reviewed examples, evaluator, exact connected-model selectors, project inputs, permissions, and budgets.
+3. The Agent calls `run` with the exact sealed digest. That same tool call remains pending while its native in-session card exposes every serialized field of the immutable authority. The Agent cannot approve itself.
+4. **Approve & Run exact proposal** authenticates the native user action, validates the digest and owning session again, and starts automatically. **Request changes** denies that request and returns a new draft revision to the waiting conversation. Closing or cancelling the session cancels its pending request rather than creating ambient approval.
+5. The resumed Agent uses bounded `wait` or `status` operations to receive progress and terminal results, then explains the evidence and proposes an iteration. `cancel` is owner- and digest-bound. The card remains the visible progress/results surface; no external console or follow-up user nudge is required.
+6. **Continue best**, **Run again**, and **Clone as draft** create reviewable drafts. Any changed data, evaluator, permissions, targets, model, or budget produces a new digest and requires a new native approval. Applying a winner remains separate and is never automatic.
 
-The former title-bar flask entry and modal form are intentionally not the primary workflow. The experiment library is available from the result card for reopening history.
+Restart recovery preserves immutable records. An approved record can resume execution only through an owner-bound run request, while an interrupted active attempt is quarantined for explicit inspection instead of being silently replayed.
 
-## External pinned environment
+## Bundled, pinned Python runtime
 
-RepoPrompt does not bundle Python, install packages, or give provider credentials to the worker. GEPA 0.1.4 declares Python `>=3.10,<3.15`; do not assume Apple's or Xcode's `/usr/bin/python3` is compatible. Choose an installed compatible interpreter and check it before explicitly creating the native-configured environment:
+Normal users do not install Python, create a virtual environment, run pip, set environment variables, or download dependencies. Packaging embeds an architecture-specific CPython 3.11.16 runtime and GEPA 0.1.4 at revision `0632cdb5dcc052e690eab439e1b4a7e3e9cfe407` under:
 
-```bash
-python3.11 -c 'import sys; assert (3, 10) <= sys.version_info < (3, 15), sys.version'
-python3.11 -m venv "$HOME/Library/Application Support/RepoPrompt CE/GEPA/venv"
-"$HOME/Library/Application Support/RepoPrompt CE/GEPA/venv/bin/pip" install -r \
-  AppResources/PromptExperiments/gepa-requirements.txt
+```text
+RepoPrompt.app/Contents/Resources/BundledRuntimes/PromptExperimentPython/<arch>/
 ```
 
-`gepa-requirements.txt` pins GEPA to upstream revision `0632cdb5dcc052e690eab439e1b4a7e3e9cfe407`, but it is not a complete hash lock: pip resolves transitive dependencies during the explicit install. `REPOPROMPT_GEPA_PYTHON` can select another reviewed environment for the DEBUG app. The sealed specification always records the exact interpreter path. Preflight checks that exact executable, package version `0.1.4`, PEP 610 installed git revision, worker resource, connected model selections, evaluator shape, and budgets before execution. Preflight neither installs dependencies nor makes model calls.
+`Vendor/PromptExperimentPython/manifest.json` pins the official `python-build-standalone` 20260901 full distributions and GEPA source archive by URL, byte size, and SHA-256. `Scripts/prompt_experiment_runtime_artifact.py` acquires and verifies developer-side artifacts, installs the dependency-free GEPA source package without PyPI resolution, records source and tree provenance, stages the correct target payloads, and performs a relocated clean-environment smoke. Public universal packaging requires both `arm64` and `x86_64`; host-native debug packaging embeds the host target.
+
+The app executes the bundle-relative interpreter with `-I -B -u`, a minimal fixed `PATH`, app-owned `HOME` and temporary directories, and no inherited Python/provider configuration. `-B` is explicit because isolated mode ignores `PYTHONDONTWRITEBYTECODE`; signed bundle contents must remain immutable. Preflight checks bundle provenance, target architecture, CPython version, GEPA metadata, PEP 610 source revision, empty dependency metadata, worker resource, connected model selections, evaluator shape, and budgets before execution.
+
+The full upstream `PYTHON.json` and license tree are retained beside each runtime target, including `license_paths` selected for extension modules. GEPA's license is retained both in the runtime and under `ThirdPartyLicenses/gepa/`. Packaging signs every nested Mach-O inside-out, verifies each nested signature explicitly, then verifies the outer app and the non-code runtime provenance.
+
+`REPOPROMPT_GEPA_PYTHON` remains a DEBUG/developer diagnostic override only. It is never part of normal setup or a prerequisite for a user run.
 
 ## Ownership, adapters, and protocol
 
-- `PromptExperimentService` is the single writer for experiment scheduling, immutable plan revisions, approvals, evidence references, and cancellation observations.
+- `PromptExperimentService` is the single writer for scheduling, immutable plan revisions, approvals, evidence references, pending interaction continuations, execution waits, and cancellation observations.
 - Existing Agent Mode and Context Builder runtime code remains the authority for sessions and connected-model requests. Exact resolved catalog targets are sealed without changing global role defaults.
-- The execution adapter is explicitly sealed as one of three implemented paths: `connected_model` for a prompt-only connected Agent provider completion, `context_builder` for a native Context Builder run in the isolated environment, or `sandboxed_command` for a reviewed command under Seatbelt.
-- Evaluators are likewise explicit: host-side exact match, a prompt-only connected-model judge with a sealed rubric and target, or the paired sandboxed-command evaluator.
-- `PromptExperimentGEPAWorker` runs the packaged, versioned NDJSON bridge with the configured external interpreter. The worker calls upstream `optimize_anything`; reflection and model-backed execution/evaluation synchronously round-trip to app-owned provider routes.
-- The worker receives an allowlisted process environment only. Provider credentials, authentication configuration, workspace bindings, and source paths are not passed to Python.
+- Implemented execution adapters are `connected_model` for a prompt-only connected Agent provider completion, `context_builder` for a native Context Builder run in the isolated environment, and `sandboxed_command` for a reviewed command under Seatbelt.
+- Evaluators are host-side exact match, a prompt-only connected-model judge with a sealed rubric and target, or the paired sandboxed-command evaluator.
+- `PromptExperimentGEPAWorker` runs the packaged, versioned NDJSON bridge. It calls upstream `optimize_anything`; reflection and model-backed execution/evaluation synchronously round-trip to app-owned provider routes.
+- Provider credentials, authentication configuration, workspace bindings, source paths, shell profiles, `PYTHONHOME`, and `PYTHONPATH` are not passed to Python.
 - Canonical experiment JSON and content-addressed artifacts live under Application Support. Human-readable Markdown/CSV views are derived projections; projection failure degrades export state without rolling back a successful canonical commit.
 
 The Python request/result protocol is version 1 and the current sealed optimization plan schema is version 3. Existing comparison schema v1 and optimization schema v2 records remain readable, are never rescored during migration, and must be cloned into a current draft before execution.
@@ -47,12 +51,12 @@ The command adapter receives the sealed project copy plus the current example in
 
 ## Failure and cancellation semantics
 
-Candidate failures are reviewable feedback and may receive an evaluator-defined score. Transport, worker, provider, sandbox, or other infrastructure failures are inconclusive and are never silently converted to score zero or automatically retried. Stop requests cancel and drain app-owned provider requests before the Python worker is interrupted; requested and settled states remain distinct.
+Candidate failures are reviewable feedback and may receive an evaluator-defined score. Transport, worker, provider, sandbox, or other infrastructure failures are inconclusive and are never silently converted to score zero or automatically retried. Denied or stale approvals cannot start. Stop requests cancel and drain app-owned provider requests before the Python worker is interrupted; requested and settled states remain distinct, and bounded waits return durable progress or terminal status.
 
 ## Current capability limits
 
 - The connected-model, Context Builder, and generic sandboxed-command execution adapters are implemented. Dedicated Investigate and multi-agent adapters remain explicit follow-ups rather than being simulated by prompt text.
 - Project snapshots require an already-authorized loaded root and an explicit reviewed relative-path list; automatic repository-wide discovery, unreviewed glob expansion, and live source editing are not supported.
-- The GEPA direct dependency is revision-pinned and runtime-verified, but transitive Python dependencies are not yet reproducibly hash-locked.
+- GEPA declares no required Python dependencies at the pinned revision. Optional provider integrations are deliberately not installed because RepoPrompt owns provider calls.
 - GEPA-reported candidate lineage, scores, feedback, wall time, and app-exposed timing are retained. Connected-provider token usage is labeled unavailable when the completion contract does not expose it; unavailable never means zero.
-- Deterministic fake-provider and pinned-worker tests validate integration and authority boundaries. They do not establish live provider quality or visible UI behavior.
+- Deterministic fake-provider, handler, interaction, and pinned-worker tests validate integration and authority boundaries. They do not establish live provider quality or visible UI behavior.

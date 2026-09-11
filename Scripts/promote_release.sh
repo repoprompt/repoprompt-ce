@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$ROOT_DIR/Scripts}"
 TRUSTED_ROOT="$(cd "$CONTROL_PLANE_SCRIPTS_DIR/.." && pwd)"
+PROMPT_EXPERIMENT_RUNTIME_TOOL="$CONTROL_PLANE_SCRIPTS_DIR/prompt_experiment_runtime_artifact.py"
+PROMPT_EXPERIMENT_RUNTIME_MANIFEST="$ROOT_DIR/Vendor/PromptExperimentPython/manifest.json"
 cd "$ROOT_DIR"
 
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
@@ -458,6 +460,11 @@ validate_app_bundle() {
         --arch all \
         --bundle "$app_bundle/Contents/Resources/BundledRuntimes/Codex" \
         --signed-team-identifier "$SIGNING_TEAM_ID"
+    python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
+        --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
+        --arch all \
+        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/PromptExperimentPython" \
+        --allow-signed-macho
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$app_bundle" \
@@ -484,6 +491,11 @@ validate_dmg_matches_zip_app() {
         --arch all \
         --bundle "$dmg_app/Contents/Resources/BundledRuntimes/Codex" \
         --signed-team-identifier "$SIGNING_TEAM_ID"
+    python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
+        --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
+        --arch all \
+        --bundle "$dmg_app/Contents/Resources/BundledRuntimes/PromptExperimentPython" \
+        --allow-signed-macho
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$dmg_app" \
         "arm64,x86_64" \
@@ -593,6 +605,8 @@ verify_source_release() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py"
     require_file "$ROOT_DIR/Vendor/Codex/manifest.json"
+    require_file "$PROMPT_EXPERIMENT_RUNTIME_TOOL"
+    require_file "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST"
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"

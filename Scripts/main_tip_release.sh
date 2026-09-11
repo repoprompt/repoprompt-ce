@@ -8,6 +8,7 @@ CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$SCRIPT_DIR}"
 TRUSTED_ROOT="$(cd "$CONTROL_PLANE_SCRIPTS_DIR/.." && pwd)"
 APPROVED_SOURCE_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
 CODEX_MANIFEST="$APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json"
+PROMPT_EXPERIMENT_RUNTIME_MANIFEST="$APPROVED_SOURCE_ROOT/Vendor/PromptExperimentPython/manifest.json"
 cd "$ROOT_DIR"
 
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
@@ -132,6 +133,11 @@ validate_public_app() {
         codex_verification_args+=(--signed-team-identifier "$signed_team_identifier")
     fi
     python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" "${codex_verification_args[@]}"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/prompt_experiment_runtime_artifact.py" \
+        --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
+        --arch all \
+        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/PromptExperimentPython" \
+        --allow-signed-macho
     "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
         --app "$app_bundle" \
         --manifest "$manifest" \

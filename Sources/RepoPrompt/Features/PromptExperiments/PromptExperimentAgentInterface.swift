@@ -4,12 +4,20 @@
     enum PromptExperimentAgentOperation: String, CaseIterable {
         case capabilities
         case list
+        case setup
         case createDraft = "create_draft"
         case updateDraft = "update_draft"
         case proposeSeal = "propose_seal"
+        case status
+        case run
+        case wait
+        case cancel
         case read
+        case clone
         case cloneDraft = "clone_draft"
+        case rerun
         case proposeRunAgain = "propose_run_again"
+        case continueRevision = "continue"
         case proposeNextRevision = "propose_next_revision"
     }
 
@@ -39,6 +47,7 @@
     enum PromptExperimentAgentCommand {
         case capabilities
         case list
+        case setup(patch: PromptExperimentAgentDraftPatch)
         case createDraft
         case updateDraft(
             experimentID: UUID,
@@ -53,6 +62,10 @@
             expectedDraftVersion: Int,
             expectedDraftDigest: String
         )
+        case status(experimentID: UUID)
+        case run(experimentID: UUID, expectedPlanDigest: String)
+        case wait(experimentID: UUID, expectedPlanDigest: String, timeoutSeconds: TimeInterval)
+        case cancel(experimentID: UUID, expectedPlanDigest: String)
         case read(experimentID: UUID)
         case cloneDraft(experimentID: UUID)
         case proposeRunAgain(experimentID: UUID, expectedPlanDigest: String)
@@ -63,9 +76,11 @@
         let workerProtocolVersion: Int
         let packageVersion: String
         let pinnedRevision: String
+        let pythonVersion: String
         let workerResourceAvailable: Bool
+        let bundledRuntimeAvailable: Bool
         let configuredPythonExecutable: String?
-        let setupInstructions: String
+        let runtimeStatus: String
     }
 
     enum PromptExperimentAgentResponse {
@@ -81,7 +96,8 @@
         case sealed(experimentID: UUID, plan: PromptExperimentPlan)
     }
 
-    /// Agent-facing draft/query authority. The native UI remains the sole approval and run authority.
+    /// Session-facing experiment authority. Agents can request and observe runs, but only the
+    /// native digest card can grant approval; approved work executes through the existing runtime.
     @MainActor
     struct PromptExperimentAgentInterface {
         let service: PromptExperimentService
@@ -99,20 +115,61 @@
                         workerProtocolVersion: 1,
                         packageVersion: PromptExperimentGEPAConfiguration.packageVersion,
                         pinnedRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
+                        pythonVersion: PromptExperimentGEPAWorker.pythonVersion,
                         workerResourceAvailable: (try? PromptExperimentGEPAWorker.resolveWorkerURL()) != nil,
+                        bundledRuntimeAvailable: PromptExperimentGEPAWorker.bundledRuntimeAvailable,
                         configuredPythonExecutable: PromptExperimentGEPAWorker.configuredPythonExecutable(),
-                        setupInstructions: PromptExperimentGEPAWorker.setupInstructions
+                        runtimeStatus: PromptExperimentGEPAWorker.runtimeStatus
                     ),
                     limitations: [
-                        "DEBUG integration using upstream GEPA optimize_anything from a separately configured pinned Python environment.",
-                        "The linked Agent session may create/update/seal/query only; it cannot approve, start, cancel, or apply a winner.",
-                        "The user approves the exact native digest card and starts or stops execution from that card.",
+                        "DEBUG integration using the packaged CPython and upstream GEPA optimize_anything runtime; no user Python setup or provider credentials are delegated to Python.",
+                        "The linked Agent session may draft, seal, request, wait for, and cancel owned runs, but it cannot approve or apply a winner.",
+                        "The user approves one exact native digest card; that action automatically starts the sealed run.",
                         "Prompt-only connected-model, Context Builder, and sandboxed-command adapters are supported for catalog targets shown here. ACP, Investigate, and multi-agent adapters remain explicit unsupported capabilities.",
                         "Reviewed project files may be copied from the Agent session's currently loaded root into an app-owned snapshot. Expected outputs, notes, and held-out grading data remain host-private."
                     ]
                 )
             case .list:
                 return try await .records(service.ownedRecords(controllerSessionID: owner.controllerSessionID))
+            case let .setup(patch):
+                guard patch.optimization != nil else {
+                    throw PromptExperimentAuthorityError.invalidDraft("setup requires a complete specification_json optimization envelope.")
+                }
+                let id = try await service.createOptimizationExperiment(
+                    controllerSessionID: owner.controllerSessionID,
+                    sourceTabID: owner.sourceTabID
+                )
+                let createdRecord = try await service.ownedRecord(id: id, controllerSessionID: owner.controllerSessionID)
+                let created = try requireDraft(createdRecord)
+                var draft = created
+                if let title = patch.title { draft.title = title }
+                if let taskInput = patch.taskInput { draft.taskInput = taskInput }
+                if let syntheticFixture = patch.syntheticFixture { draft.syntheticFixture = syntheticFixture }
+                if let originalInstructions = patch.originalInstructions { draft.originalInstructions = originalInstructions }
+                if let candidateInstructions = patch.candidateInstructions { draft.candidateInstructions = candidateInstructions }
+                if let targetRole = patch.targetRole { draft.targetRole = targetRole }
+                if let repetitions = patch.repetitions { draft.repetitions = repetitions }
+                if var optimization = patch.optimization {
+                    optimization.gepa.pythonExecutablePath = PromptExperimentGEPAWorker.configuredPythonSealValue()
+                    draft.optimization = optimization
+                }
+                let updated = try await service.updateDraft(
+                    experimentID: id,
+                    expectedDraftID: created.id,
+                    expectedDraftVersion: created.optimisticVersion,
+                    expectedDraftDigest: created.contentDigest(),
+                    draft: draft,
+                    expectedControllerSessionID: owner.controllerSessionID
+                )
+                let plan = try await service.seal(
+                    experimentID: id,
+                    expectedDraftID: updated.id,
+                    expectedDraftVersion: updated.optimisticVersion,
+                    expectedDraftDigest: updated.contentDigest(),
+                    expectedControllerSessionID: owner.controllerSessionID,
+                    authorizedSourceRoots: owner.authorizedSourceRoots
+                )
+                return .sealed(experimentID: id, plan: plan)
             case .createDraft:
                 let id = try await service.createOptimizationExperiment(
                     controllerSessionID: owner.controllerSessionID,
@@ -137,7 +194,10 @@
                 if let candidateInstructions = patch.candidateInstructions { draft.candidateInstructions = candidateInstructions }
                 if let targetRole = patch.targetRole { draft.targetRole = targetRole }
                 if let repetitions = patch.repetitions { draft.repetitions = repetitions }
-                if let optimization = patch.optimization { draft.optimization = optimization }
+                if var optimization = patch.optimization {
+                    optimization.gepa.pythonExecutablePath = PromptExperimentGEPAWorker.configuredPythonSealValue()
+                    draft.optimization = optimization
+                }
                 let updated = try await service.updateDraft(
                     experimentID: experimentID,
                     expectedDraftID: draftID,
@@ -157,7 +217,42 @@
                     authorizedSourceRoots: owner.authorizedSourceRoots
                 )
                 return .sealed(experimentID: experimentID, plan: plan)
-            case let .read(experimentID):
+            case let .status(experimentID), let .read(experimentID):
+                let record = try await service.ownedRecord(
+                    id: experimentID,
+                    controllerSessionID: owner.controllerSessionID
+                )
+                return try await .record(
+                    record,
+                    artifactTextBySHA256: service.readableArtifactText(for: record)
+                )
+            case let .run(experimentID, expectedPlanDigest):
+                let record = try await service.requestRun(
+                    experimentID: experimentID,
+                    expectedPlanDigest: expectedPlanDigest,
+                    expectedControllerSessionID: owner.controllerSessionID
+                )
+                return try await .record(
+                    record,
+                    artifactTextBySHA256: service.readableArtifactText(for: record)
+                )
+            case let .wait(experimentID, expectedPlanDigest, timeoutSeconds):
+                let record = try await service.waitForExecution(
+                    experimentID: experimentID,
+                    expectedPlanDigest: expectedPlanDigest,
+                    expectedControllerSessionID: owner.controllerSessionID,
+                    timeoutSeconds: timeoutSeconds
+                )
+                return try await .record(
+                    record,
+                    artifactTextBySHA256: service.readableArtifactText(for: record)
+                )
+            case let .cancel(experimentID, expectedPlanDigest):
+                try await service.cancel(
+                    experimentID: experimentID,
+                    expectedPlanDigest: expectedPlanDigest,
+                    expectedControllerSessionID: owner.controllerSessionID
+                )
                 let record = try await service.ownedRecord(
                     id: experimentID,
                     controllerSessionID: owner.controllerSessionID

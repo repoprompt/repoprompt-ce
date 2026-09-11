@@ -261,6 +261,25 @@ phase "Acquiring pinned Codex $CODEX_VERSION package artifacts"
 run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" acquire \
     --arch "$CODEX_BUNDLE_ARCH" --cache-root "$CODEX_CACHE_ROOT"
 
+PROMPT_EXPERIMENT_RUNTIME_TOOL="$ROOT_DIR/Scripts/prompt_experiment_runtime_artifact.py"
+PROMPT_EXPERIMENT_RUNTIME_MANIFEST="$ROOT_DIR/Vendor/PromptExperimentPython/manifest.json"
+PROMPT_EXPERIMENT_RUNTIME_VERSION="$(python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" manifest-version)"
+PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT="${REPOPROMPT_PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT:-$ROOT_DIR/.build/prompt-experiment-python}"
+PROMPT_EXPERIMENT_RUNTIME_ARCH="${REPOPROMPT_PROMPT_EXPERIMENT_RUNTIME_ARCH:-}"
+if (( PUBLIC_UNIVERSAL_RELEASE )); then
+    if [[ -n "$PROMPT_EXPERIMENT_RUNTIME_ARCH" && "$PROMPT_EXPERIMENT_RUNTIME_ARCH" != "all" ]]; then
+        fail "Public universal release packaging requires REPOPROMPT_PROMPT_EXPERIMENT_RUNTIME_ARCH=all when explicitly set"
+    fi
+    PROMPT_EXPERIMENT_RUNTIME_ARCH="all"
+elif [[ -z "$PROMPT_EXPERIMENT_RUNTIME_ARCH" ]]; then
+    PROMPT_EXPERIMENT_RUNTIME_ARCH="host"
+fi
+PROMPT_EXPERIMENT_RUNTIME_APP_DIR=""
+phase "Acquiring pinned Prompt Experiment runtime $PROMPT_EXPERIMENT_RUNTIME_VERSION"
+run python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" acquire \
+    --arch "$PROMPT_EXPERIMENT_RUNTIME_ARCH" \
+    --cache-root "$PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT"
+
 # KeyboardShortcuts' default Bundle.module lookup does not match RepoPrompt's
 # packaged resource layout. Host-native builds patch the default checkout below;
 # the universal builder patches each isolated architecture checkout before compiling.
@@ -333,6 +352,12 @@ run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" stage-bundle \
     --arch "$CODEX_BUNDLE_ARCH" \
     --cache-root "$CODEX_CACHE_ROOT" \
     --bundle "$CODEX_APP_DIR"
+phase "Embedding verified Prompt Experiment runtime $PROMPT_EXPERIMENT_RUNTIME_VERSION"
+PROMPT_EXPERIMENT_RUNTIME_APP_DIR="$APP_BUNDLE/Contents/Resources/BundledRuntimes/PromptExperimentPython"
+run python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" stage-bundle \
+    --arch "$PROMPT_EXPERIMENT_RUNTIME_ARCH" \
+    --cache-root "$PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT" \
+    --bundle "$PROMPT_EXPERIMENT_RUNTIME_APP_DIR"
 [[ ! -d AppResources ]] || run rsync -a AppResources/ "$APP_BUNDLE/Contents/Resources/"
 shopt -s nullglob
 for bundle in "$BUILD_DIR"/*.bundle; do run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"; done
@@ -516,6 +541,14 @@ verify_signed_app_identity(){
     fi
 }
 if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
+PROMPT_EXPERIMENT_MACHO_PATHS="$(
+    python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" mach-o-paths \
+        --arch "$PROMPT_EXPERIMENT_RUNTIME_ARCH" \
+        --bundle "$PROMPT_EXPERIMENT_RUNTIME_APP_DIR"
+)"
+while IFS= read -r prompt_experiment_macho; do
+    [[ -z "$prompt_experiment_macho" ]] || sign_path "$prompt_experiment_macho"
+done <<< "$PROMPT_EXPERIMENT_MACHO_PATHS"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 APP_SIGN_ARGS=()
@@ -542,6 +575,13 @@ fi
 # OpenAI's nested Developer ID signatures. Re-run the byte/signature contract.
 run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" verify-bundle \
     --arch "$CODEX_BUNDLE_ARCH" --bundle "$CODEX_APP_DIR"
+while IFS= read -r prompt_experiment_macho; do
+    [[ -z "$prompt_experiment_macho" ]] || run codesign --verify --strict --verbose=2 "$prompt_experiment_macho"
+done <<< "$PROMPT_EXPERIMENT_MACHO_PATHS"
+run python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
+    --arch "$PROMPT_EXPERIMENT_RUNTIME_ARCH" \
+    --bundle "$PROMPT_EXPERIMENT_RUNTIME_APP_DIR" \
+    --allow-signed-macho
 verify_signed_app_identity
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Post-sign packaged app"
 if (( PUBLIC_UNIVERSAL_RELEASE )); then

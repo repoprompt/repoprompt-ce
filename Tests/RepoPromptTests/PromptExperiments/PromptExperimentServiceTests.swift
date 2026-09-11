@@ -473,7 +473,9 @@ import XCTest
                 return XCTFail("Expected capabilities")
             }
             XCTAssertFalse(operations.contains("approve"))
-            XCTAssertFalse(operations.contains("run"))
+            XCTAssertTrue(operations.contains("run"))
+            XCTAssertTrue(operations.contains("wait"))
+            XCTAssertTrue(operations.contains("cancel"))
             XCTAssertEqual(targets.map(\.selector), harness.service.availableTargets().map(\.selector))
             XCTAssertEqual(gepaRuntime.pinnedRevision, PromptExperimentGEPAConfiguration.pinnedRevision)
 
@@ -515,7 +517,7 @@ import XCTest
             XCTAssertEqual(sealed.currentPlan?.schemaVersion, PromptExperimentPlan.optimizationSchemaVersion)
             XCTAssertTrue(harness.runtime.preflightedPlans.isEmpty, "Preflight must not probe the external runtime before native approval")
             XCTAssertNil(PromptExperimentAgentOperation(rawValue: "approve"))
-            XCTAssertNil(PromptExperimentAgentOperation(rawValue: "run"))
+            XCTAssertEqual(PromptExperimentAgentOperation(rawValue: "run"), .run)
 
             let plan = try XCTUnwrap(sealed.currentPlan)
             try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
@@ -533,7 +535,286 @@ import XCTest
             }
         }
 
-        func testAgentCanProposeRunAgainButCannotStartIt() async throws {
+        func testSetupSealsCompleteSessionProposalWithBundledRuntime() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            await harness.service.load()
+            let owner = PromptExperimentAgentOwner(controllerSessionID: UUID(), sourceTabID: UUID())
+            let interface = PromptExperimentAgentInterface(service: harness.service)
+
+            let response = try await interface.execute(.setup(patch: PromptExperimentAgentDraftPatch(
+                title: "Session lab",
+                taskInput: nil,
+                syntheticFixture: nil,
+                originalInstructions: nil,
+                candidateInstructions: nil,
+                targetRole: nil,
+                repetitions: nil,
+                optimization: Self.validOptimization()
+            )), owner: owner)
+
+            guard case let .sealed(id, plan) = response else { return XCTFail("Expected sealed proposal") }
+            XCTAssertEqual(harness.service.record(id: id)?.phase, .awaitingApproval)
+            XCTAssertEqual(plan.optimization?.gepa.pythonExecutablePath, PromptExperimentGEPAWorker.configuredPythonSealValue())
+            XCTAssertEqual(harness.service.record(id: id)?.controllerSessionID, owner.controllerSessionID)
+        }
+
+        func testHandlerParsesRunWaitAndRevisionAliases() throws {
+            let experimentID = UUID()
+            let digest = "digest"
+            let wait = try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: [
+                "op": .string("wait"),
+                "experiment_id": .string(experimentID.uuidString),
+                "expected_plan_digest": .string(digest),
+                "timeout_seconds": .int(7)
+            ])
+            guard case let .wait(parsedID, parsedDigest, timeout) = wait else {
+                return XCTFail("Expected wait command")
+            }
+            XCTAssertEqual(parsedID, experimentID)
+            XCTAssertEqual(parsedDigest, digest)
+            XCTAssertEqual(timeout, 7)
+
+            let next = try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: [
+                "op": .string("continue"),
+                "experiment_id": .string(experimentID.uuidString),
+                "expected_plan_digest": .string(digest),
+                "candidate_index": .int(2)
+            ])
+            guard case let .proposeNextRevision(parsedID, parsedDigest, candidateIndex) = next else {
+                return XCTFail("Expected continue alias")
+            }
+            XCTAssertEqual(parsedID, experimentID)
+            XCTAssertEqual(parsedDigest, digest)
+            XCTAssertEqual(candidateIndex, 2)
+        }
+
+        func testSessionRunApprovalAutomaticallyStartsWaitsCompletesAndClones() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: sealed.controllerSessionID,
+                sourceTabID: sealed.sourceTabID
+            )
+            let interface = PromptExperimentAgentInterface(service: harness.service)
+
+            let runRequest = Task {
+                try await interface.execute(.run(experimentID: id, expectedPlanDigest: plan.digest), owner: owner)
+            }
+            await harness.service.waitForPendingRunApprovalForTesting(experimentID: id)
+            XCTAssertTrue(harness.service.hasPendingRunApproval(experimentID: id, planDigest: plan.digest))
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+
+            try await harness.service.approveAndRun(experimentID: id, displayedDigest: plan.digest)
+            guard case let .record(started, _) = try await runRequest.value else {
+                return XCTFail("Expected started record")
+            }
+            XCTAssertEqual(started.phase, .running)
+            await harness.runtime.waitUntilWaitingForResult()
+
+            let waitRequest = Task {
+                try await interface.execute(
+                    .wait(experimentID: id, expectedPlanDigest: plan.digest, timeoutSeconds: 30),
+                    owner: owner
+                )
+            }
+            harness.runtime.settleFirst()
+            guard case let .record(completed, _) = try await waitRequest.value else {
+                return XCTFail("Expected completed record")
+            }
+            XCTAssertEqual(completed.phase, .completed)
+            XCTAssertEqual(completed.attempts(for: plan).count, 1)
+
+            let clone = try await interface.execute(.cloneDraft(experimentID: id), owner: owner)
+            guard case let .draft(cloneID, cloneDraft) = clone else { return XCTFail("Expected clone draft") }
+            XCTAssertNotEqual(cloneID, id)
+            XCTAssertEqual(cloneDraft.optimization, plan.optimization)
+        }
+
+        func testNativeDenialReturnsNewDraftToWaitingSession() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: sealed.controllerSessionID,
+                sourceTabID: sealed.sourceTabID
+            )
+            let interface = PromptExperimentAgentInterface(service: harness.service)
+            let runRequest = Task {
+                try await interface.execute(.run(experimentID: id, expectedPlanDigest: plan.digest), owner: owner)
+            }
+            await harness.service.waitForPendingRunApprovalForTesting(experimentID: id)
+
+            try await harness.service.declineRunAndRevise(experimentID: id, displayedDigest: plan.digest)
+            guard case let .record(revision, _) = try await runRequest.value else {
+                return XCTFail("Expected revised record")
+            }
+            XCTAssertEqual(revision.phase, .drafting)
+            XCTAssertEqual(revision.draft?.revision, plan.revision + 1)
+            XCTAssertEqual(revision.draft?.parentPlanID, plan.id)
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+            XCTAssertTrue(harness.runtime.preflightedPlans.isEmpty)
+        }
+
+        func testCancellingSessionRunWhileApprovalPendingLeavesPlanUnapproved() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: sealed.controllerSessionID,
+                sourceTabID: sealed.sourceTabID
+            )
+            let interface = PromptExperimentAgentInterface(service: harness.service)
+            let runRequest = Task {
+                try await interface.execute(.run(experimentID: id, expectedPlanDigest: plan.digest), owner: owner)
+            }
+            await harness.service.waitForPendingRunApprovalForTesting(experimentID: id)
+
+            runRequest.cancel()
+            do {
+                _ = try await runRequest.value
+                XCTFail("Cancelled pending run must not return a started record")
+            } catch is CancellationError {
+                // Expected: cancellation resolves the pending interaction without approving the plan.
+            }
+            XCTAssertEqual(harness.service.record(id: id)?.phase, .awaitingApproval)
+            XCTAssertFalse(harness.service.hasPendingRunApproval(experimentID: id, planDigest: plan.digest))
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+            XCTAssertTrue(harness.service.record(id: id)?.statusMessage.contains("cancelled") == true)
+        }
+
+        func testRunRequestRejectsStaleDigestAndWrongOwner() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: sealed.controllerSessionID,
+                sourceTabID: sealed.sourceTabID
+            )
+            let other = PromptExperimentAgentOwner(controllerSessionID: UUID(), sourceTabID: UUID())
+            let interface = PromptExperimentAgentInterface(service: harness.service)
+
+            do {
+                _ = try await interface.execute(.run(experimentID: id, expectedPlanDigest: plan.digest), owner: other)
+                XCTFail("Wrong owner must not request a run")
+            } catch let error as PromptExperimentAuthorityError {
+                XCTAssertEqual(error, .ownerMismatch)
+            }
+            do {
+                _ = try await interface.execute(.run(experimentID: id, expectedPlanDigest: "stale"), owner: owner)
+                XCTFail("Stale digest must not request a run")
+            } catch let error as PromptExperimentAuthorityError {
+                XCTAssertEqual(error, .digestMismatch)
+            }
+            do {
+                try await harness.service.approveAndRun(experimentID: id, displayedDigest: plan.digest)
+                XCTFail("Native approval without an owner-bound run request must not start")
+            } catch let error as PromptExperimentAuthorityError {
+                guard case .illegalPhase = error else { return XCTFail("Expected illegal phase, got \(error)") }
+            }
+            let runRequest = Task {
+                try await interface.execute(.run(experimentID: id, expectedPlanDigest: plan.digest), owner: owner)
+            }
+            await harness.service.waitForPendingRunApprovalForTesting(experimentID: id)
+            do {
+                try await harness.service.approveAndRun(experimentID: id, displayedDigest: "stale")
+                XCTFail("Stale native approval must not start")
+            } catch let error as PromptExperimentAuthorityError {
+                XCTAssertEqual(error, .digestMismatch)
+            }
+            do {
+                _ = try await runRequest.value
+                XCTFail("The waiting run request must receive the stale approval failure")
+            } catch let error as PromptExperimentAuthorityError {
+                XCTAssertEqual(error, .digestMismatch)
+            }
+            XCTAssertEqual(harness.service.record(id: id)?.phase, .awaitingApproval)
+            XCTAssertFalse(harness.service.hasPendingRunApproval(experimentID: id, planDigest: plan.digest))
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+        }
+
+        func testApprovedRecordResumesAfterServiceRestart() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+
+            let reopenedRuntime = FakeRuntime()
+            let reopened = PromptExperimentService(
+                store: PromptExperimentStore(rootURL: harness.root),
+                runtime: reopenedRuntime,
+                resolveTarget: Self.fakeTarget,
+                now: { Date(timeIntervalSince1970: 1001) }
+            )
+            await reopened.load()
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: sealed.controllerSessionID,
+                sourceTabID: sealed.sourceTabID
+            )
+            let response = try await PromptExperimentAgentInterface(service: reopened).execute(
+                .run(experimentID: id, expectedPlanDigest: plan.digest),
+                owner: owner
+            )
+            guard case let .record(started, _) = response else { return XCTFail("Expected resumed record") }
+            XCTAssertEqual(started.phase, .running)
+            await reopened.waitForExecutionForTesting(experimentID: id)
+            XCTAssertEqual(reopened.record(id: id)?.phase, .completed)
+            XCTAssertEqual(reopenedRuntime.submitted.count, 1)
+        }
+
+        func testOwningSessionCancelsRunningRequestAndWaitReturnsSettlement() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: sealed.controllerSessionID,
+                sourceTabID: sealed.sourceTabID
+            )
+            let interface = PromptExperimentAgentInterface(service: harness.service)
+            let runRequest = Task {
+                try await interface.execute(.run(experimentID: id, expectedPlanDigest: plan.digest), owner: owner)
+            }
+            await harness.service.waitForPendingRunApprovalForTesting(experimentID: id)
+            try await harness.service.approveAndRun(experimentID: id, displayedDigest: plan.digest)
+            _ = try await runRequest.value
+            await harness.runtime.waitUntilWaitingForResult()
+
+            guard case let .record(cancelling, _) = try await interface.execute(
+                .cancel(experimentID: id, expectedPlanDigest: plan.digest),
+                owner: owner
+            ) else { return XCTFail("Expected cancelling record") }
+            XCTAssertEqual(cancelling.phase, .cancelling)
+            XCTAssertEqual(harness.runtime.cancelled.count, 1)
+
+            let waitRequest = Task {
+                try await interface.execute(
+                    .wait(experimentID: id, expectedPlanDigest: plan.digest, timeoutSeconds: 30),
+                    owner: owner
+                )
+            }
+            harness.runtime.settleFirst(disposition: .cancelled)
+            guard case let .record(cancelled, _) = try await waitRequest.value else {
+                return XCTFail("Expected cancelled record")
+            }
+            XCTAssertEqual(cancelled.phase, .cancelled)
+        }
+
+        func testAgentCanProposeRunAgainAsReviewedDraft() async throws {
             let harness = makeHarness()
             defer { try? FileManager.default.removeItem(at: harness.root) }
             let id = try await preparedOptimizationExperiment(harness)
@@ -1238,14 +1519,17 @@ import XCTest
             }
         }
 
-        func testGEPASetupInstructionsRequireCompatiblePythonAndDescribePinScope() {
-            let instructions = PromptExperimentGEPAWorker.setupInstructions
+        func testGEPARuntimeUsesStableBundledSealAndNoManualSetupContract() {
+            let sealed = PromptExperimentGEPAWorker.configuredPythonSealValue()
 
-            XCTAssertTrue(instructions.contains("Python >=3.10,<3.15"))
-            XCTAssertTrue(instructions.contains("python3.11 -c"))
-            XCTAssertTrue(instructions.contains("(3, 10) <= sys.version_info < (3, 15)"))
-            XCTAssertTrue(instructions.contains("transitive dependencies are not hash-locked"))
-            XCTAssertFalse(instructions.contains("/usr/bin/python3 -m venv"))
+            XCTAssertEqual(PromptExperimentGEPAWorker.pythonVersion, "3.11.16")
+            XCTAssertTrue(sealed.hasPrefix("bundle://PromptExperimentPython/"))
+            XCTAssertTrue(sealed.hasSuffix("/python/bin/python3.11"))
+            let status = PromptExperimentGEPAWorker.runtimeStatus.lowercased()
+            XCTAssertTrue(status.contains("bundled") || status.contains("packaged prompt experiment runtime"))
+            XCTAssertTrue(status.contains("no user"))
+            XCTAssertFalse(status.contains("pip install"))
+            XCTAssertFalse(status.contains("homebrew"))
         }
 
         func testCommandEvaluatorDistinguishesCandidateAndInfrastructureFailures() throws {
@@ -1281,8 +1565,16 @@ import XCTest
         }
 
         func testGEPAWorkerEnvironmentDoesNotInheritProviderCredentials() {
-            let environment = PromptExperimentGEPAWorker.workerEnvironment(home: URL(fileURLWithPath: "/tmp/gepa-home"))
-            XCTAssertEqual(Set(environment.keys).subtracting(["HOME", "PATH", "PYTHONUNBUFFERED", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"]), [])
+            let environment = PromptExperimentGEPAWorker.workerEnvironment(
+                home: URL(fileURLWithPath: "/tmp/gepa-home"),
+                temporaryDirectory: URL(fileURLWithPath: "/tmp/gepa-tmp")
+            )
+            XCTAssertEqual(Set(environment.keys), ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"])
+            XCTAssertEqual(environment["PATH"], "/usr/bin:/bin")
+            XCTAssertEqual(environment["TMPDIR"], "/tmp/gepa-tmp")
+            XCTAssertNil(environment["PYTHONHOME"])
+            XCTAssertNil(environment["PYTHONPATH"])
+            XCTAssertNil(environment["PYTHONDONTWRITEBYTECODE"])
             XCTAssertNil(environment["OPENAI_API_KEY"])
             XCTAssertNil(environment["ANTHROPIC_API_KEY"])
             XCTAssertNil(environment["CODEX_HOME"])

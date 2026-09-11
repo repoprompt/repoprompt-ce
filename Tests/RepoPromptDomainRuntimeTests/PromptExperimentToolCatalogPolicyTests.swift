@@ -6,7 +6,7 @@ import XCTest
     final class PromptExperimentToolCatalogPolicyTests: XCTestCase {
         private let toolName = MCPWindowToolName.promptExperiment
 
-        func testDebugCatalogAdvertisesCurrentBoundedDraftOperationsAndFields() throws {
+        func testDebugCatalogAdvertisesSessionLabOperationsAndFields() throws {
             let entry = try XCTUnwrap(MCPDomainToolCatalog.entry(named: toolName))
             XCTAssertEqual(entry.scope, .window)
             XCTAssertEqual(entry.capability, .promptExperimentControl)
@@ -15,18 +15,20 @@ import XCTest
             let properties = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
             let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue))
             XCTAssertEqual(operations, [
-                "capabilities", "list", "create_draft", "update_draft", "propose_seal", "read",
-                "clone_draft", "propose_run_again", "propose_next_revision"
+                "capabilities", "list", "setup", "create_draft", "update_draft", "propose_seal",
+                "status", "run", "wait", "cancel", "read", "clone", "clone_draft", "rerun",
+                "propose_run_again", "continue", "propose_next_revision"
             ])
             XCTAssertEqual(properties["specification_json"]?.objectValue?["type"]?.stringValue, "string")
             XCTAssertEqual(properties["candidate_index"]?.objectValue?["type"]?.stringValue, "integer")
+            XCTAssertEqual(properties["timeout_seconds"]?.objectValue?["type"]?.stringValue, "number")
             for operation in operations {
                 XCTAssertEqual(
                     MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(operation)).normalizedOperation,
                     operation
                 )
             }
-            for forbidden in ["approve", "run", "cancel", "score", "promote"] {
+            for forbidden in ["approve", "score", "promote"] {
                 XCTAssertEqual(
                     MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(forbidden)).normalizedOperation,
                     MCPDomainToolOperationIdentity.unknownOperation

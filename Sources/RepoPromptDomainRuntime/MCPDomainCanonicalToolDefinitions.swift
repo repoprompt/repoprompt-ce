@@ -1128,7 +1128,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             let operations = MCPDomainToolCatalog.promptExperimentOperations
             return MCPDomainToolDefinition(
                 name: MCPWindowToolName.promptExperiment,
-                description: "Create, update, seal, and inspect a DEBUG native Prompt Experiment draft owned by the bound Agent session. This tool cannot approve or start a run.",
+                description: "Set up, request native digest approval for, run, wait for, cancel, inspect, and iterate on a DEBUG Prompt Experiment owned by the bound Agent session. Only an authentic native card action can approve; one approval starts the exact sealed run automatically.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
@@ -1144,6 +1144,10 @@ package enum MCPDomainCanonicalToolDefinitions {
                         "candidate_index": .object([
                             "type": .string("integer"),
                             "description": .string("Optional exact GEPA candidate index to continue; omitted means the recorded best candidate.")
+                        ]),
+                        "timeout_seconds": .object([
+                            "type": .string("number"),
+                            "description": .string("For wait only: 0-3600 seconds before returning current progress. Default 120.")
                         ]),
                         "specification_json": .object([
                             "type": .string("string"),

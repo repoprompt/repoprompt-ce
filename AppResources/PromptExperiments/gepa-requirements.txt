@@ -1,6 +1,0 @@
-# Prompt Experiment worker dependency. Installed only by an explicit developer/user action.
-# This input pins GEPA itself, not the complete transitive dependency graph; dependencies
-# are resolved by pip during the explicit install and are not hash-locked. Native preflight
-# also verifies distribution metadata and direct_url.json against this exact upstream
-# revision before admitting a paid model run.
-gepa @ git+https://github.com/gepa-ai/gepa.git@0632cdb5dcc052e690eab439e1b4a7e3e9cfe407

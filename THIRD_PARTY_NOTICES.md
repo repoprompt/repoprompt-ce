@@ -26,6 +26,20 @@ The complete Codex package also contains Zsh 5.9 at
 `codex-resources/zsh/bin/zsh`; its upstream licence is copied as
 [`ThirdPartyLicenses/codex/ZSH-LICENCE`](ThirdPartyLicenses/codex/ZSH-LICENCE).
 
+## Prompt Experiment Python and GEPA
+
+RepoPrompt CE packages architecture-specific CPython 3.11.16 runtimes from the
+`python-build-standalone` 20260901 full distributions and GEPA 0.1.4 source at
+revision `0632cdb5dcc052e690eab439e1b4a7e3e9cfe407`. Exact source archives,
+sizes, SHA-256 digests, versions, and target architectures are pinned in
+[`Vendor/PromptExperimentPython/manifest.json`](Vendor/PromptExperimentPython/manifest.json).
+The packaged runtime retains upstream `PYTHON.json` plus the complete selected
+CPython and extension-license inventory beside each architecture payload. The
+runtime-license packaging contract is documented under
+[`ThirdPartyLicenses/python-build-standalone/`](ThirdPartyLicenses/python-build-standalone/),
+and GEPA's copied MIT license is included at
+[`ThirdPartyLicenses/gepa/LICENSE`](ThirdPartyLicenses/gepa/LICENSE).
+
 ## UniversalCharsetDetection / uchardet
 
 RepoPrompt CE vendors UniversalCharsetDetection and uchardet source. Their

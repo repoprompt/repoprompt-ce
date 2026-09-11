@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 METADATA_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
 CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"
+PROMPT_EXPERIMENT_RUNTIME_TOOL="$SCRIPT_DIR/prompt_experiment_runtime_artifact.py"
+PROMPT_EXPERIMENT_RUNTIME_MANIFEST="$METADATA_ROOT/Vendor/PromptExperimentPython/manifest.json"
 source "$SCRIPT_DIR/load_release_metadata.sh"
 
 TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -48,6 +50,7 @@ IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
+PROMPT_EXPERIMENT_RUNTIME_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/PromptExperimentPython"
 ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 IDENTITY_MIGRATION_ANCHOR_DESTINATION="$APP_BUNDLE/Contents/Resources/IdentityMigration/RepoPromptIdentityAnchor"
 
@@ -65,6 +68,11 @@ python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --manifest "$CODEX_MANIFEST" verify-bundle \
     --arch all \
     --bundle "$CODEX_BUNDLE"
+python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
+    --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
+    --arch all \
+    --bundle "$PROMPT_EXPERIMENT_RUNTIME_BUNDLE" \
+    --allow-signed-macho
 
 rm -rf "$STAGED_SPARKLE_FRAMEWORK"
 mkdir -p "$(dirname "$STAGED_SPARKLE_FRAMEWORK")"
@@ -191,6 +199,13 @@ while IFS=$'\t' read -r relative_path entitlement_profile; do
         ;;
     esac
 done <<< "$codex_signing_plan"
+prompt_experiment_macho_paths="$(python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
+    --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" mach-o-paths \
+    --arch all \
+    --bundle "$PROMPT_EXPERIMENT_RUNTIME_BUNDLE")"
+while IFS= read -r prompt_experiment_macho; do
+    [[ -z "$prompt_experiment_macho" ]] || sign_path "$prompt_experiment_macho"
+done <<< "$prompt_experiment_macho_paths"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
@@ -203,6 +218,14 @@ python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --arch all \
     --bundle "$CODEX_BUNDLE" \
     --signed-team-identifier "$SIGNING_TEAM_ID"
+while IFS= read -r prompt_experiment_macho; do
+    [[ -z "$prompt_experiment_macho" ]] || codesign --verify --strict --verbose=2 "$prompt_experiment_macho"
+done <<< "$prompt_experiment_macho_paths"
+python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
+    --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
+    --arch all \
+    --bundle "$PROMPT_EXPERIMENT_RUNTIME_BUNDLE" \
+    --allow-signed-macho
 "$SCRIPT_DIR/validate_app_architectures.sh" \
     "$APP_BUNDLE" \
     "arm64,x86_64" \

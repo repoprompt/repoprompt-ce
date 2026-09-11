@@ -51,9 +51,23 @@
         private let resolveTarget: @MainActor (String) throws -> PromptExperimentResolvedTarget?
         private let listAvailableTargets: @MainActor () -> [PromptExperimentResolvedTarget]
         private let now: @MainActor () -> Date
+        private struct PendingRunApproval {
+            let planDigest: String
+            let controllerSessionID: UUID
+            let continuation: CheckedContinuation<PromptExperimentRecord, Error>
+        }
+
+        private struct ExecutionWaiter {
+            let continuation: CheckedContinuation<Void, Never>
+            let timeoutTask: Task<Void, Never>
+        }
+
         private var executionTasks: [UUID: Task<Void, Never>] = [:]
         private var admittedExperimentIDs: Set<UUID> = []
         private var activeHandles: [UUID: PromptExperimentRuntimeHandle] = [:]
+        private var pendingRunApprovals: [UUID: PendingRunApproval] = [:]
+        private var pendingRunApprovalObservers: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+        private var executionWaiters: [UUID: [UUID: ExecutionWaiter]] = [:]
         private var loadTask: Task<Void, Never>?
 
         init(
@@ -175,7 +189,7 @@
             try await requireLoaded()
             let date = now()
             let experimentID = UUID()
-            let python = PromptExperimentGEPAWorker.configuredPythonExecutable() ?? ""
+            let python = PromptExperimentGEPAWorker.configuredPythonSealValue()
             let draft = PromptExperimentDraft(
                 revision: 1,
                 title: "GEPA optimization",
@@ -399,10 +413,12 @@
         func approve(
             experimentID: UUID,
             displayedDigest: String,
-            source: PromptExperimentApprovalActor = .nativeUI
+            source: PromptExperimentApprovalActor = .nativeUI,
+            expectedControllerSessionID: UUID? = nil
         ) async throws {
             try await requireLoaded()
             let index = try index(of: experimentID)
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
             guard records[index].phase == .awaitingApproval else {
                 throw PromptExperimentAuthorityError.illegalPhase("Only a newly sealed plan awaiting approval can be approved.")
             }
@@ -425,13 +441,226 @@
             ))
             records[index].phase = .approved
             records[index].updatedAt = date
-            records[index].statusMessage = "Approved locally. No trial runs until Run is pressed."
+            records[index].statusMessage = "Approved locally; starting the exact sealed run."
             try await persist()
         }
 
-        func run(experimentID: UUID) async throws {
+        func requestRun(
+            experimentID: UUID,
+            expectedPlanDigest: String,
+            expectedControllerSessionID: UUID
+        ) async throws -> PromptExperimentRecord {
             try await requireLoaded()
             let index = try index(of: experimentID)
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
+            guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
+            guard plan.digest == expectedPlanDigest, plan.verifiesIntegrity() else {
+                throw PromptExperimentAuthorityError.digestMismatch
+            }
+
+            switch records[index].phase {
+            case .approved:
+                try await run(
+                    experimentID: experimentID,
+                    expectedPlanDigest: expectedPlanDigest,
+                    expectedControllerSessionID: expectedControllerSessionID
+                )
+                return try records[self.index(of: experimentID)]
+            case .running, .cancelling, .completed, .inconclusive, .cancelled:
+                return records[index]
+            case .awaitingApproval:
+                guard pendingRunApprovals[experimentID] == nil else {
+                    throw PromptExperimentAuthorityError.experimentAlreadyRunning
+                }
+                return try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        if Task.isCancelled {
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        guard let currentIndex = records.firstIndex(where: { $0.id == experimentID }),
+                              records[currentIndex].phase == .awaitingApproval,
+                              records[currentIndex].currentPlan?.digest == expectedPlanDigest
+                        else {
+                            continuation.resume(throwing: PromptExperimentAuthorityError.digestMismatch)
+                            return
+                        }
+                        pendingRunApprovals[experimentID] = PendingRunApproval(
+                            planDigest: expectedPlanDigest,
+                            controllerSessionID: expectedControllerSessionID,
+                            continuation: continuation
+                        )
+                        records[currentIndex].statusMessage = "Run requested by this Agent session. Review the exact sealed digest below; Approve & Run starts automatically."
+                        records[currentIndex].updatedAt = now()
+                        resumePendingRunApprovalObservers(experimentID: experimentID)
+                        Task { @MainActor [weak self] in
+                            do {
+                                try await self?.persist()
+                            } catch {
+                                guard let self,
+                                      pendingRunApprovals[experimentID]?.planDigest == expectedPlanDigest
+                                else { return }
+                                resumePendingRunApproval(experimentID: experimentID, result: .failure(error))
+                            }
+                        }
+                    }
+                } onCancel: {
+                    Task { @MainActor [weak self] in
+                        await self?.cancelPendingRunRequest(
+                            experimentID: experimentID,
+                            expectedPlanDigest: expectedPlanDigest,
+                            statusMessage: "Run approval request was cancelled; the sealed plan remains unapproved."
+                        )
+                    }
+                }
+            case .drafting:
+                throw PromptExperimentAuthorityError.illegalPhase("Seal the reviewed draft before requesting a run.")
+            }
+        }
+
+        func approveAndRun(
+            experimentID: UUID,
+            displayedDigest: String,
+            source: PromptExperimentApprovalActor = .nativeUI
+        ) async throws {
+            guard let pending = pendingRunApprovals[experimentID] else {
+                throw PromptExperimentAuthorityError.illegalPhase("The owning Agent session must request this exact run before native approval.")
+            }
+            guard pending.planDigest == displayedDigest else {
+                let error = PromptExperimentAuthorityError.digestMismatch
+                resumePendingRunApproval(experimentID: experimentID, result: .failure(error))
+                throw error
+            }
+            let expectedOwner = pending.controllerSessionID
+            do {
+                try await approve(
+                    experimentID: experimentID,
+                    displayedDigest: displayedDigest,
+                    source: source,
+                    expectedControllerSessionID: expectedOwner
+                )
+                try await run(
+                    experimentID: experimentID,
+                    expectedPlanDigest: displayedDigest,
+                    expectedControllerSessionID: expectedOwner
+                )
+                try resumePendingRunApproval(
+                    experimentID: experimentID,
+                    result: .success(records[index(of: experimentID)])
+                )
+            } catch {
+                resumePendingRunApproval(experimentID: experimentID, result: .failure(error))
+                throw error
+            }
+        }
+
+        func declineRunAndRevise(
+            experimentID: UUID,
+            displayedDigest: String,
+            source: PromptExperimentApprovalActor = .nativeUI
+        ) async throws {
+            try await requireLoaded()
+            let originalIndex = try index(of: experimentID)
+            guard source == .nativeUI else { throw PromptExperimentAuthorityError.approvalRequiresNativeUI }
+            guard let pending = pendingRunApprovals[experimentID], pending.planDigest == displayedDigest else {
+                throw PromptExperimentAuthorityError.illegalPhase("The owning Agent session must request this exact run before changes can be returned.")
+            }
+            try requireOwner(records[originalIndex], expectedControllerSessionID: pending.controllerSessionID)
+            guard records[originalIndex].phase == .awaitingApproval,
+                  let plan = records[originalIndex].currentPlan,
+                  plan.digest == displayedDigest,
+                  plan.verifiesIntegrity()
+            else { throw PromptExperimentAuthorityError.digestMismatch }
+            let fixture = if plan.optimization == nil {
+                try await store.readSyntheticFixture(environment: plan.environment)
+            } else {
+                ""
+            }
+            let index = try index(of: experimentID)
+            guard records[index].phase == .awaitingApproval,
+                  records[index].currentPlan == plan
+            else { throw PromptExperimentAuthorityError.staleDraft }
+            let date = now()
+            records[index].draft = PromptExperimentDraft(
+                revision: plan.revision + 1,
+                parentPlanID: plan.id,
+                title: plan.title,
+                taskInput: plan.taskInput,
+                syntheticFixture: fixture,
+                originalInstructions: plan.originalInstructions,
+                candidateInstructions: plan.candidateInstructions,
+                targetRole: plan.resolvedTarget.selector,
+                repetitions: plan.repetitions,
+                optimization: plan.optimization,
+                createdAt: date,
+                updatedAt: date
+            )
+            records[index].phase = .drafting
+            records[index].updatedAt = date
+            records[index].statusMessage = "The user declined revision \(plan.revision). Continue this conversation to revise the new versioned draft."
+            try await persist()
+            try resumePendingRunApproval(
+                experimentID: experimentID,
+                result: .success(records[self.index(of: experimentID)])
+            )
+        }
+
+        func hasPendingRunApproval(experimentID: UUID, planDigest: String) -> Bool {
+            pendingRunApprovals[experimentID]?.planDigest == planDigest
+        }
+
+        func waitForPendingRunApprovalForTesting(experimentID: UUID) async {
+            if pendingRunApprovals[experimentID] != nil { return }
+            await withCheckedContinuation { continuation in
+                if pendingRunApprovals[experimentID] != nil {
+                    continuation.resume()
+                } else {
+                    pendingRunApprovalObservers[experimentID, default: []].append(continuation)
+                }
+            }
+        }
+
+        private func resumePendingRunApprovalObservers(experimentID: UUID) {
+            let observers = pendingRunApprovalObservers.removeValue(forKey: experimentID) ?? []
+            observers.forEach { $0.resume() }
+        }
+
+        private func cancelPendingRunRequest(
+            experimentID: UUID,
+            expectedPlanDigest: String,
+            statusMessage: String
+        ) async {
+            guard let pending = pendingRunApprovals[experimentID],
+                  pending.planDigest == expectedPlanDigest
+            else { return }
+            pendingRunApprovals[experimentID] = nil
+            if let index = records.firstIndex(where: { $0.id == experimentID }),
+               records[index].phase == .awaitingApproval,
+               records[index].currentPlan?.digest == expectedPlanDigest
+            {
+                records[index].statusMessage = statusMessage
+                records[index].updatedAt = now()
+                try? await persist()
+            }
+            pending.continuation.resume(throwing: CancellationError())
+        }
+
+        private func resumePendingRunApproval(
+            experimentID: UUID,
+            result: Result<PromptExperimentRecord, Error>
+        ) {
+            guard let pending = pendingRunApprovals.removeValue(forKey: experimentID) else { return }
+            pending.continuation.resume(with: result)
+        }
+
+        func run(
+            experimentID: UUID,
+            expectedPlanDigest: String? = nil,
+            expectedControllerSessionID: UUID? = nil
+        ) async throws {
+            try await requireLoaded()
+            let index = try index(of: experimentID)
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
             guard !admittedExperimentIDs.contains(experimentID) else {
                 throw PromptExperimentAuthorityError.experimentAlreadyRunning
             }
@@ -439,6 +668,9 @@
                 throw PromptExperimentAuthorityError.illegalPhase("Only an approved, not-yet-run plan can start trials.")
             }
             guard let plan = records[index].currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
+            if let expectedPlanDigest, expectedPlanDigest != plan.digest {
+                throw PromptExperimentAuthorityError.digestMismatch
+            }
             guard records[index].approval(for: plan) != nil, plan.verifiesIntegrity() else {
                 throw PromptExperimentAuthorityError.planNotApproved
             }
@@ -475,9 +707,25 @@
             }
         }
 
-        func cancel(experimentID: UUID) async throws {
+        func cancel(
+            experimentID: UUID,
+            expectedPlanDigest: String? = nil,
+            expectedControllerSessionID: UUID? = nil
+        ) async throws {
             try await requireLoaded()
             let index = try index(of: experimentID)
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
+            if let expectedPlanDigest, records[index].currentPlan?.digest != expectedPlanDigest {
+                throw PromptExperimentAuthorityError.digestMismatch
+            }
+            if records[index].phase == .awaitingApproval, let expectedPlanDigest {
+                await cancelPendingRunRequest(
+                    experimentID: experimentID,
+                    expectedPlanDigest: expectedPlanDigest,
+                    statusMessage: "Run approval request cancelled by its owning Agent session; the sealed plan remains unapproved."
+                )
+                return
+            }
             guard records[index].phase == .running || records[index].phase == .cancelling else { return }
             let date = now()
             records[index].phase = .cancelling
@@ -503,6 +751,82 @@
                         record.attempts[attemptIndex].statusText = "Cancellation requested; remote settlement unknown: \(message)"
                     }
                 }
+            }
+        }
+
+        func waitForExecution(
+            experimentID: UUID,
+            expectedPlanDigest: String,
+            expectedControllerSessionID: UUID,
+            timeoutSeconds: TimeInterval
+        ) async throws -> PromptExperimentRecord {
+            try await requireLoaded()
+            guard timeoutSeconds.isFinite, timeoutSeconds >= 0, timeoutSeconds <= 3600 else {
+                throw PromptExperimentAuthorityError.invalidDraft("timeout_seconds must be between 0 and 3600.")
+            }
+            var index = try index(of: experimentID)
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
+            guard records[index].currentPlan?.digest == expectedPlanDigest else {
+                throw PromptExperimentAuthorityError.digestMismatch
+            }
+            guard records[index].phase == .running || records[index].phase == .cancelling,
+                  executionTasks[experimentID] != nil,
+                  timeoutSeconds > 0
+            else { return records[index] }
+
+            let waiterID = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if Task.isCancelled {
+                        continuation.resume()
+                        return
+                    }
+                    guard let currentIndex = records.firstIndex(where: { $0.id == experimentID }),
+                          records[currentIndex].phase == .running || records[currentIndex].phase == .cancelling,
+                          executionTasks[experimentID] != nil
+                    else {
+                        continuation.resume()
+                        return
+                    }
+                    let timeoutTask = Task { @MainActor [weak self] in
+                        do {
+                            try await Task.sleep(for: .seconds(timeoutSeconds))
+                        } catch {
+                            return
+                        }
+                        self?.resumeExecutionWaiter(experimentID: experimentID, waiterID: waiterID)
+                    }
+                    executionWaiters[experimentID, default: [:]][waiterID] = ExecutionWaiter(
+                        continuation: continuation,
+                        timeoutTask: timeoutTask
+                    )
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.resumeExecutionWaiter(experimentID: experimentID, waiterID: waiterID)
+                }
+            }
+            index = try self.index(of: experimentID)
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
+            guard records[index].currentPlan?.digest == expectedPlanDigest else {
+                throw PromptExperimentAuthorityError.digestMismatch
+            }
+            return records[index]
+        }
+
+        private func resumeExecutionWaiter(experimentID: UUID, waiterID: UUID) {
+            guard let waiter = executionWaiters[experimentID]?.removeValue(forKey: waiterID) else { return }
+            waiter.timeoutTask.cancel()
+            waiter.continuation.resume()
+            if executionWaiters[experimentID]?.isEmpty == true {
+                executionWaiters[experimentID] = nil
+            }
+        }
+
+        private func resumeExecutionWaiters(experimentID: UUID) {
+            guard let waiters = executionWaiters[experimentID] else { return }
+            for waiterID in Array(waiters.keys) {
+                resumeExecutionWaiter(experimentID: experimentID, waiterID: waiterID)
             }
         }
 
@@ -961,6 +1285,7 @@
         }
 
         private func finishExperiment(experimentID: UUID) async {
+            defer { resumeExecutionWaiters(experimentID: experimentID) }
             guard loadError == nil else { return }
             try? await mutate(experimentID: experimentID) { record in
                 guard let plan = record.currentPlan else { return }

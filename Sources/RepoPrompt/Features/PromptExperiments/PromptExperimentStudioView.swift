@@ -250,36 +250,56 @@
 
         @ViewBuilder
         private func controls(_ plan: PromptExperimentPlan) -> some View {
+            let hasPendingRequest = service.hasPendingRunApproval(
+                experimentID: record.id,
+                planDigest: plan.digest
+            )
             if record.phase == .awaitingApproval {
                 GroupBox("Native approval") {
                     VStack(alignment: .leading, spacing: 10) {
-                        Toggle("I reviewed the exact digest displayed above", isOn: Binding(
+                        Toggle("I reviewed every sealed field for the exact digest displayed above", isOn: Binding(
                             get: { acknowledgedDigest == plan.digest },
                             set: { acknowledgedDigest = $0 ? plan.digest : nil }
                         ))
-                        Button("Approve sealed plan") {
-                            perform {
-                                try await service.approve(
-                                    experimentID: record.id,
-                                    displayedDigest: plan.digest,
-                                    source: .nativeUI
-                                )
+                        HStack {
+                            Button("Approve & Run exact proposal") {
+                                perform {
+                                    try await service.approveAndRun(
+                                        experimentID: record.id,
+                                        displayedDigest: plan.digest,
+                                        source: .nativeUI
+                                    )
+                                }
                             }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(acknowledgedDigest != plan.digest || !hasPendingRequest)
+
+                            Button("Request changes") {
+                                perform {
+                                    try await service.declineRunAndRevise(
+                                        experimentID: record.id,
+                                        displayedDigest: plan.digest,
+                                        source: .nativeUI
+                                    )
+                                }
+                            }
+                            .disabled(!hasPendingRequest)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(acknowledgedDigest != plan.digest)
-                        Text("Agents cannot invoke this authority. Approval does not start provider work.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            hasPendingRequest
+                                ? "Only this native action can approve. Approval starts the exact sealed run automatically; requesting changes preserves the plan and opens a new draft revision."
+                                : "Return to the owning Agent session and call run with this exact digest to open native approval."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 4)
                 }
             } else if record.phase == .approved {
-                Button(plan.optimization == nil ? "Run \(plan.trials.count) serial trials" : "Run approved GEPA search") {
-                    perform { try await service.run(experimentID: record.id) }
-                }
-                .buttonStyle(.borderedProminent)
+                Text("Approval is recorded. Resume from the owning Agent session with this exact digest.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } else if record.phase == .running || record.phase == .cancelling {
                 Button("Request cancellation", role: .destructive) {
                     perform { try await service.cancel(experimentID: record.id) }
