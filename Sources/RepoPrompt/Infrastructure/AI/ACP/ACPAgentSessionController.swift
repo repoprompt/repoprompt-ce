@@ -224,6 +224,7 @@ actor ACPAgentSessionController {
     private let provider: any ACPAgentProvider
     private let runRequest: ACPRunRequest
     private let launchConfiguration: ACPLaunchConfiguration
+    private let launchedPermissionMode: String?
     private let sessionConfiguration: ACPSessionConfiguration
     private let mcpClientNameHint: String?
     private let logPrefix: String
@@ -356,6 +357,10 @@ actor ACPAgentSessionController {
         try Self.preflightInjectedMCPServers(in: sessionConfiguration)
         self.sessionConfiguration = sessionConfiguration
         launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
+        launchedPermissionMode = Self.normalizedLaunchPermissionMode(
+            runRequest.launchPermissionMode,
+            providerID: provider.providerID
+        )
         autoApproveAllToolPermissions = runRequest.autoApproveAllToolPermissions
         mcpClientNameHint = runRequest.agentKind.mcpClientNameHint
         logPrefix = "[ACP][\(provider.providerID.rawValue)]"
@@ -388,6 +393,15 @@ actor ACPAgentSessionController {
         else {
             return false
         }
+        // A provider-native launch-time permission flag (Devin `--permission-mode`) is baked
+        // into the running process's argv; compare its normalized launched value so later
+        // request-carrier changes cannot drift the reuse key from the process.
+        guard launchedPermissionMode == Self.normalizedLaunchPermissionMode(
+            request.launchPermissionMode,
+            providerID: provider.providerID
+        ) else {
+            return false
+        }
         if provider.providerID == .grokBuild {
             // Grok full access is a launch flag and "default" sends no model RPC, so a live
             // process can never move between permission profiles or back to the provider
@@ -405,6 +419,14 @@ actor ACPAgentSessionController {
         // workspace are the safety boundary; model aliases/defaults/discovered
         // current-model values should not prevent session/cancel from being sent.
         return true
+    }
+
+    private static func normalizedLaunchPermissionMode(
+        _ mode: String?,
+        providerID: ACPProviderID
+    ) -> String? {
+        guard providerID == .devin else { return mode }
+        return DevinAgentToolPreferences.PermissionLevel.from(cliPermissionMode: mode).cliPermissionMode
     }
 
     func normalizeError(_ error: Error) -> Error {
@@ -725,7 +747,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor, .grokBuild, .antigravity:
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -2068,6 +2090,7 @@ actor ACPAgentSessionController {
             taskLabelKind: request.taskLabelKind,
             sessionModeID: request.sessionModeID,
             autoApproveAllToolPermissions: request.autoApproveAllToolPermissions,
+            launchPermissionMode: request.launchPermissionMode,
             modelParameterSelections: request.modelParameterSelections
         )
     }
@@ -3259,7 +3282,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity:
+        case .openCode, .cursor, .antigravity, .devin:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
@@ -3310,9 +3333,10 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode, .grokBuild, .antigravity:
-            // Grok full access is provider-native (`grok agent --always-approve stdio`); the
-            // controller never auto-selects permission options for it.
+        case .openCode, .grokBuild, .antigravity, .devin:
+            // Grok full access is provider-native (`grok agent --always-approve stdio`) and
+            // Devin's is a launch-time `--permission-mode`; the controller never
+            // auto-selects permission options for either.
             return nil
         }
     }
@@ -3343,14 +3367,16 @@ actor ACPAgentSessionController {
         requestPayload: [String: Any],
         options: [PermissionOption]
     ) -> AutoApprovalSelection? {
-        guard let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
-            requestToolName: requestToolName,
-            requestPayload: requestPayload
-        ), isStrictACPRepoPromptPermissionMatch(
-            match,
-            requestToolName: requestToolName,
-            requestPayload: requestPayload
-        ) else {
+        guard provider.providerID != .devin,
+              let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+                  requestToolName: requestToolName,
+                  requestPayload: requestPayload
+              ), isStrictACPRepoPromptPermissionMatch(
+                  match,
+                  requestToolName: requestToolName,
+                  requestPayload: requestPayload
+              )
+        else {
             return nil
         }
 
@@ -3364,6 +3390,8 @@ actor ACPAgentSessionController {
                 .optionID("allow_once"),
                 .kind("allow_once")
             ]
+        case .devin:
+            []
         case .grokBuild:
             // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
             // session-scoped `allow-edits-session` here.
@@ -3569,6 +3597,8 @@ actor ACPAgentSessionController {
                 "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
             case .antigravity:
                 "RP_ANTIGRAVITY_ACP_RAW_CAPTURE_PATH"
+            case .devin:
+                "RP_DEVIN_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -206,6 +206,22 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: "ACP mode: \(level.displayName)",
                 warnings: warnings
             )
+        case .devin:
+            let level = devinPermissionLevel(profile: profile)
+            let warnings = level.isWarning
+                ? ["Devin launches with `--permission-mode dangerous` — its tools run without approval prompts."]
+                : []
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Permission mode: \(level.displayName)",
+                shell: "Handled by Devin CLI",
+                externalMCP: "Third-party MCP: managed by Devin CLI",
+                search: "Managed by Devin CLI",
+                approvalModeDescription: "Permission mode: \(level.displayName)",
+                warnings: warnings
+            )
         }
     }
 
@@ -229,6 +245,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .cursor: availability.cursorAvailable
         case .grokBuild: availability.grokBuildAvailable
         case .antigravity: availability.antigravityAvailable
+        case .devin: availability.devinAvailable
         }
     }
 
@@ -302,6 +319,15 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .providerOverride:
             .managedDefault
         }
+    }
+
+    private func devinPermissionLevel(profile: AgentProviderPermissionProfile) -> DevinAgentToolPreferences.PermissionLevel {
+        profile.devinPermissionLevel(
+            userConfigured: DevinAgentToolPreferences.permissionLevel(
+                defaults: defaults,
+                secureStore: securePermissions
+            )
+        )
     }
 
     private func antigravityPermissionLevel(profile: AgentProviderPermissionProfile) -> AntigravityAgentToolPreferences.PermissionLevel {

@@ -112,9 +112,6 @@ final class AgentModeRunService {
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
         let selectedAgent = session.selectedAgent
-        let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
-            ? nil
-            : session.selectedModelRaw
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
         do {
@@ -140,27 +137,12 @@ final class AgentModeRunService {
             return outcome
         }
 
-        let acpRunRequest: ACPRunRequest? = if selectedAgent.acpProviderID != nil {
-            ACPRunRequest(
-                agentKind: selectedAgent,
-                modelString: selectedModelString,
-                workspacePath: workspacePath,
-                resumeSessionID: session.providerSessionID,
-                attachments: attachments,
-                taskLabelKind: session.mcpControlContext?.taskLabelKind,
-                sessionModeID: runtimePermission.acpSessionModeID,
-                autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-                modelParameterSelections: selectedAgent == .cursor
-                    ? ACPModelParameterResolver.effectiveSelections(
-                        providerID: .cursor,
-                        selectedModelRaw: session.selectedModelRaw,
-                        persistedSelections: session.acpModelParameterSelections
-                    )
-                    : []
-            )
-        } else {
-            nil
-        }
+        let acpRunRequest = Self.makeACPRunRequest(
+            session: session,
+            workspacePath: workspacePath,
+            attachments: attachments,
+            runtimePermission: runtimePermission
+        )
 
         let windowID = dependencies.windowID
         let mcpServerEnabler = dependencies.mcpServerEnabler
@@ -253,9 +235,6 @@ final class AgentModeRunService {
         targetController: ACPAgentSessionController
     ) async -> Bool {
         let selectedAgent = session.selectedAgent
-        let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
-            ? nil
-            : session.selectedModelRaw
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         guard selectedAgent.acpProviderID != nil,
               session.runState == .running,
@@ -275,23 +254,14 @@ final class AgentModeRunService {
             await failBeforeProviderStartup(session: session, message: message)
             return false
         }
-        let runRequest = ACPRunRequest(
-            agentKind: selectedAgent,
-            modelString: selectedModelString,
+        guard let runRequest = Self.makeACPRunRequest(
+            session: session,
             workspacePath: workspacePath,
-            resumeSessionID: session.providerSessionID,
             attachments: attachments,
-            taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            sessionModeID: runtimePermission.acpSessionModeID,
-            autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-            modelParameterSelections: selectedAgent == .cursor
-                ? ACPModelParameterResolver.effectiveSelections(
-                    providerID: .cursor,
-                    selectedModelRaw: session.selectedModelRaw,
-                    persistedSelections: session.acpModelParameterSelections
-                )
-                : []
-        )
+            runtimePermission: runtimePermission
+        ) else {
+            return false
+        }
         let sent = await acpRunner.submitActivePrompt(
             session: session,
             messageForRun: messageForRun,
@@ -301,8 +271,39 @@ final class AgentModeRunService {
             targetRunAttemptID: targetRunAttemptID,
             targetController: targetController
         )
-        steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(selectedModelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
+        steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(runRequest.modelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
         return sent
+    }
+
+    static func makeACPRunRequest(
+        session: AgentTabSession,
+        workspacePath: String?,
+        attachments: [AgentImageAttachment],
+        runtimePermission: AgentProviderRuntimePermissionBinding
+    ) -> ACPRunRequest? {
+        let selectedAgent = session.selectedAgent
+        guard selectedAgent.acpProviderID != nil else { return nil }
+        let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
+            ? nil
+            : session.selectedModelRaw
+        return ACPRunRequest(
+            agentKind: selectedAgent,
+            modelString: selectedModelString,
+            workspacePath: workspacePath,
+            resumeSessionID: session.providerSessionID,
+            attachments: attachments,
+            taskLabelKind: session.mcpControlContext?.taskLabelKind,
+            sessionModeID: runtimePermission.acpSessionModeID,
+            autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
+            launchPermissionMode: runtimePermission.acpLaunchPermissionMode,
+            modelParameterSelections: selectedAgent == .cursor
+                ? ACPModelParameterResolver.effectiveSelections(
+                    providerID: .cursor,
+                    selectedModelRaw: session.selectedModelRaw,
+                    persistedSelections: session.acpModelParameterSelections
+                )
+                : []
+        )
     }
 
     @discardableResult

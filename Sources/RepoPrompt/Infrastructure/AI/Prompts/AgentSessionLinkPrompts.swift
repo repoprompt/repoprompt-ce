@@ -166,7 +166,7 @@ enum AgentSessionLinkPrompts {
         switch agentKind {
         case .codexExec, .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__\(canonical)"
-        case .openCode, .cursor, .grokBuild, .antigravity:
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin:
             return canonical
         }
     }

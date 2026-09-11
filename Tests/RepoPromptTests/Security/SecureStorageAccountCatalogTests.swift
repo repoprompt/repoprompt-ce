@@ -31,10 +31,11 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "rp.agent.permissions.openCode.v1",
                 "rp.agent.permissions.cursor.v1",
                 "rp.agent.permissions.grokBuild.v1",
-                "rp.agent.permissions.antigravity.v1"
+                "rp.agent.permissions.antigravity.v1",
+                "rp.agent.permissions.devin.v1"
             ]
         )
-        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 25)
+        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 26)
     }
 
     func testIdentityMigrationV2CatalogRemainsFrozen() {
