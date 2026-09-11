@@ -17,28 +17,30 @@ final class DevinPermissionLevelTests: XCTestCase {
         )
     }
 
-    func testStoredRawValueParsingFailsClosedToProviderDefault() {
+    func testStoredRawValueParsingKeepsAbsenceDefaultAndFailsUnknownClosedToNormal() {
         XCTAssertEqual(Level.from(rawValue: nil), .providerDefault)
         XCTAssertEqual(Level.from(rawValue: ""), .providerDefault)
         XCTAssertEqual(Level.from(rawValue: "   "), .providerDefault)
-        XCTAssertEqual(Level.from(rawValue: "garbage"), .providerDefault)
+        XCTAssertEqual(Level.from(rawValue: "garbage"), .normal)
         // The pre-ship draft persisted this raw value; it must not resolve to a broader mode.
-        XCTAssertEqual(Level.from(rawValue: "providerManaged"), .providerDefault)
+        XCTAssertEqual(Level.from(rawValue: "providerManaged"), .normal)
         XCTAssertEqual(Level.from(rawValue: "  fullApproval "), .fullApproval)
         for level in Level.allCases {
             XCTAssertEqual(Level.from(rawValue: level.rawValue), level)
         }
     }
 
-    func testCLIPermissionModeRoundTripsAndFailsClosed() {
+    func testCLIPermissionModeRoundTripsAndIdentifiesUnsupportedModes() {
         XCTAssertEqual(Level.from(cliPermissionMode: "auto"), .normal)
         XCTAssertEqual(Level.from(cliPermissionMode: "accept-edits"), .acceptEdits)
         XCTAssertEqual(Level.from(cliPermissionMode: "smart"), .smart)
         XCTAssertEqual(Level.from(cliPermissionMode: "dangerous"), .fullApproval)
         XCTAssertEqual(Level.from(cliPermissionMode: nil), .providerDefault)
-        XCTAssertEqual(Level.from(cliPermissionMode: "bogus"), .providerDefault)
+        XCTAssertTrue(Level.isRecognizedCLIPermissionMode(nil))
+        XCTAssertTrue(Level.isRecognizedCLIPermissionMode("ACCEPT-EDITS"))
+        XCTAssertFalse(Level.isRecognizedCLIPermissionMode("bogus"))
         // `autonomous` requires `--sandbox` and is deliberately not offered.
-        XCTAssertEqual(Level.from(cliPermissionMode: "autonomous"), .providerDefault)
+        XCTAssertFalse(Level.isRecognizedCLIPermissionMode("autonomous"))
     }
 
     func testLaunchArgumentsMatchTheInstalledCLIVocabulary() {
@@ -133,7 +135,7 @@ final class DevinPermissionLevelTests: XCTestCase {
     }
 
     @MainActor
-    func testSecurePermissionReadFailureFailsClosedToProviderDefault() throws {
+    func testSecurePermissionReadFailureFailsClosedToNormal() throws {
         let secureStore = AgentPermissionSecureStore(
             secureStrings: DevinPermissionFailingSecureStringStore(),
             notificationCenter: NotificationCenter()
@@ -143,8 +145,9 @@ final class DevinPermissionLevelTests: XCTestCase {
 
         XCTAssertEqual(
             DevinAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: secureStore),
-            .providerDefault
+            .normal
         )
+        XCTAssertEqual(secureStore.diagnostic(for: .devin)?.kind, .keychainInteractionNotAllowed)
     }
 
     @MainActor
@@ -261,12 +264,15 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual((resolved.command as NSString).lastPathComponent, "devin")
     }
 
-    func testLaunchDropsAnUnrecognizedPermissionMode() throws {
+    func testLaunchRejectsAnUnrecognizedPermissionMode() throws {
         let (provider, directory) = try makeProvider()
-        let launch = try provider.makeLaunchConfiguration(
-            for: makeRequest(workspacePath: directory.path, launchPermissionMode: "bogus")
-        )
-        XCTAssertEqual(launch.arguments, ["acp"], "an unknown carrier value must never reach the CLI")
+        XCTAssertThrowsError(
+            try provider.makeLaunchConfiguration(
+                for: makeRequest(workspacePath: directory.path, launchPermissionMode: "bogus")
+            )
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Unsupported Devin permission mode"))
+        }
     }
 
     func testBareCommandSupportPreflightWarmsTheProductionLaunch() async throws {
@@ -325,7 +331,7 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertFalse(changedMode, "a launch-time permission mode change must build a fresh Devin process")
         XCTAssertTrue(
             unrecognizedMode,
-            "an unrecognized carrier normalizes to the same flagless launch as provider default"
+            "controller compatibility is not the launch-carrier validation boundary"
         )
         XCTAssertTrue(changedModel, "Devin model switching stays live; it must not recycle the controller")
 
@@ -447,7 +453,7 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
             encoding: .utf8
         )
 
-        DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
+        try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
 
         XCTAssertEqual(
             try String(contentsOf: devinSource.appendingPathComponent("config.json"), encoding: .utf8),
@@ -490,6 +496,29 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         )
 
         XCTAssertEqual(try overlayNames(), before)
+    }
+
+    func testCleanupFailureKeepsRecoveryOverlayAndReportsItsPath() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationCleanupFailure")
+        let executable = sourceRoot.appendingPathComponent("repoprompt-mcp")
+        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: executable.path),
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path]
+        )
+        let overlayRoot = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+        try FileManager.default.removeItem(
+            at: overlayRoot.appendingPathComponent(".repoprompt-source-devin-path")
+        )
+
+        XCTAssertThrowsError(try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Recovery data remains at \(overlayRoot.path)"))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot.path))
+        try? FileManager.default.removeItem(at: overlayRoot)
     }
 
     private func overlayNames() throws -> Set<String> {

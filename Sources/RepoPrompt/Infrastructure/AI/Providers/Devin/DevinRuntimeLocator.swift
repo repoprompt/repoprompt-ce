@@ -58,13 +58,4 @@ enum DevinRuntimeLocator {
         cachedAt = now
         return resolved != nil
     }
-
-    #if DEBUG
-        static func test_resetCache() {
-            lock.lock()
-            cachedCommand = nil
-            cachedAt = nil
-            lock.unlock()
-        }
-    #endif
 }

@@ -24,12 +24,16 @@ struct DevinACPAgentProvider: ACPAgentProvider {
     }
 
     /// `--permission-mode` is a TOP-LEVEL `devin` option (3000.10.21); `devin acp --help`
-    /// does not advertise it, so the flag must precede the `acp` subcommand. The mode is
-    /// re-parsed through `PermissionLevel.from(cliPermissionMode:)`, so an unrecognized
-    /// request value degrades to "no flag" instead of reaching the CLI.
+    /// does not advertise it, so the flag must precede the `acp` subcommand. Unknown
+    /// non-empty carrier values are rejected rather than silently degrading to no flag.
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = try standardizedWorkingDirectory(from: request.workspacePath)
         let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
+        guard DevinAgentToolPreferences.PermissionLevel.isRecognizedCLIPermissionMode(request.launchPermissionMode) else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Unsupported Devin permission mode `\(request.launchPermissionMode ?? "")`."
+            )
+        }
         let permissionLevel = DevinAgentToolPreferences.PermissionLevel.from(
             cliPermissionMode: request.launchPermissionMode
         )
@@ -117,16 +121,12 @@ struct DevinACPAgentProvider: ACPAgentProvider {
 
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async {
         guard let artifact = configuration.cleanupArtifact else { return }
-        DevinIntegrationConfiguration.cleanup(artifact: artifact)
-    }
-
-    func shouldEmitStderrLine(_ line: String) -> Bool {
-        // The controller records diagnostics and strips ANSI before this presentation gate.
-        // Only the observed tracing INFO prefix is noise; retain unknown formats and failures.
-        line.range(
-            of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+INFO\s+"#,
-            options: .regularExpression
-        ) == nil
+        do {
+            try DevinIntegrationConfiguration.cleanup(artifact: artifact)
+        } catch {
+            let message = "[ACP][devin] \(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+        }
     }
 
     func normalizeError(_ error: Error) -> Error {

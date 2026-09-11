@@ -100,7 +100,7 @@ enum DevinIntegrationConfiguration {
         )
     }
 
-    static func cleanup(artifact: ACPLaunchCleanupArtifact) {
+    static func cleanup(artifact: ACPLaunchCleanupArtifact) throws {
         guard artifact.providerID == .devin,
               artifact.kind == cleanupArtifactKind
         else {
@@ -111,7 +111,9 @@ enum DevinIntegrationConfiguration {
             try preserveDevinWrites(in: root)
             try FileManager.default.removeItem(at: root)
         } catch {
-            return
+            throw AIProviderError.invalidConfiguration(
+                detail: "Unable to preserve Devin configuration writes. Recovery data remains at \(root.path): \(error.localizedDescription)"
+            )
         }
     }
 

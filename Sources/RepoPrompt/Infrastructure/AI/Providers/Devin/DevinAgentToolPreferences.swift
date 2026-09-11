@@ -87,20 +87,20 @@ enum DevinAgentToolPreferences {
             return [DevinAgentToolPreferences.permissionModeArgumentName, mode]
         }
 
-        /// Fail-closed: an unknown or missing stored raw value resolves to the flagless
-        /// provider default rather than a broader mode.
+        /// Missing/blank values mean the explicit provider default. Unknown stored values
+        /// fail closed to Normal instead of delegating to a potentially broader Devin default.
         static func from(rawValue: String?) -> PermissionLevel {
             guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !raw.isEmpty,
-                  let level = allCases.first(where: { $0.rawValue.lowercased() == raw.lowercased() })
+                  !raw.isEmpty
             else {
                 return .providerDefault
             }
-            return level
+            return allCases.first(where: { $0.rawValue.lowercased() == raw.lowercased() }) ?? .normal
         }
 
-        /// Fail-closed reverse mapping used by the provider so an arbitrary carrier string
-        /// can never be forwarded to the CLI.
+        /// Reverse mapping used by the provider and controller. Missing/blank means the
+        /// explicit provider default; unrecognized non-empty values remain distinguishable
+        /// because callers must reject them before launch/reuse.
         static func from(cliPermissionMode: String?) -> PermissionLevel {
             guard let raw = cliPermissionMode?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty,
@@ -109,6 +109,13 @@ enum DevinAgentToolPreferences {
                 return .providerDefault
             }
             return level
+        }
+
+        static func isRecognizedCLIPermissionMode(_ mode: String?) -> Bool {
+            guard let raw = mode?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+                return true
+            }
+            return allCases.contains { $0.cliPermissionMode?.caseInsensitiveCompare(raw) == .orderedSame }
         }
     }
 
@@ -119,7 +126,11 @@ enum DevinAgentToolPreferences {
         secureStore: AgentPermissionSecureStore? = nil
     ) -> PermissionLevel {
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
-            return secureStore.devinPermissions().permissionLevel()
+            let document = secureStore.devinPermissions()
+            if secureStore.diagnostic(for: .devin) != nil {
+                return .normal
+            }
+            return document.permissionLevel()
         }
         return PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
     }
