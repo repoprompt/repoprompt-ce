@@ -877,8 +877,18 @@ extension OracleViewModel {
         guard let sessionIndex = sessions.firstIndex(where: { $0.id == chatID }) else {
             throw ChatToolError.internalError("Oracle conversation was not created.")
         }
+        let requiresAuthorityPersistence = sessions[sessionIndex].oracleExecutionAuthority == nil
         sessions[sessionIndex].preferredAIModel = selectedModel.rawValue
         sessions[sessionIndex].selectedChatPresetID = resolvedExecution.promptConfiguration.chatPresetID
+        sessions[sessionIndex].oracleExecutionAuthority = .frozen
+        if requiresAuthorityPersistence {
+            let sessionToPersist = sessions[sessionIndex]
+            let savedURL = try await autosaveSession(sessionToPersist)
+            if let refreshedIndex = sessions.firstIndex(where: { $0.id == chatID }) {
+                sessions[refreshedIndex].fileURL = savedURL
+                sessions[refreshedIndex].savedAt = Date()
+            }
+        }
         setMCPSessionUIState(
             MCPSessionUIState(
                 modelInfo: mcpControlledModel,
@@ -1515,7 +1525,8 @@ extension OracleViewModel {
                 ? Array(promptViewModel.selectedPromptIDsForChat)
                 : [],
             preferredAIModel: model.rawValue,
-            selectedChatPresetID: chatPresetID
+            selectedChatPresetID: chatPresetID,
+            oracleExecutionAuthority: .frozen
         )
 
         if setActiveForTab {

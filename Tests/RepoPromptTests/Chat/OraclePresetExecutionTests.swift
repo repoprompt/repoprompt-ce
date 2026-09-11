@@ -213,6 +213,156 @@ final class OraclePresetExecutionTests: XCTestCase {
         XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
     }
 
+    func testUnmarkedLegacySingleSessionUpgradesAndFreezesResolvedExecutionAuthority() async throws {
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9324,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OracleLegacyPresetExecutionTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            composition.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting(nil)
+            composition.workspaceManager.prepareForWindowClose()
+            composition.oracleViewModel.sessions = []
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        var workspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+        let tab = ComposeTabState(id: UUID())
+        workspace.customStoragePath = root
+        workspace.composeTabs = [tab]
+        workspace.activeComposeTabID = tab.id
+        if let index = composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) {
+            composition.workspaceManager.workspaces[index] = workspace
+        }
+        composition.workspaceManager.activeWorkspace = workspace
+        composition.promptManager.loadComposeTabsFromWorkspace(workspace)
+        composition.apiSettingsViewModel.openAIApiKey = "test-key"
+        composition.apiSettingsViewModel.isOpenAIKeyValid = true
+
+        let promptID = UUID()
+        let promptMarker = "LEGACY SINGLE REVIEW MARKER"
+        composition.promptManager.storedPrompts.append(
+            StoredPromptRecord(id: promptID, title: "[Legacy Review]", content: promptMarker)
+        )
+        let reviewPreset = ChatPreset(
+            name: "Legacy Review",
+            mode: .review,
+            fileTreeMode: .auto,
+            codeMapUsage: .auto,
+            gitInclusion: GitInclusion.none,
+            storedPromptIds: [promptID],
+            useStoredPromptsAsSystem: true
+        )
+        let modelPreset = try ModelPreset(
+            name: "Legacy Automatic Review",
+            modelStrings: [AIModel.gpt54Mini.rawValue],
+            chatPresetMappings: ChatPresetMappings(reviewPresetID: reviewPreset.id)
+        )
+        let profile = AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54.rawValue)
+        let legacySnapshot = OracleSelectionSnapshot(
+            origin: .mcp,
+            agentModelsProfile: profile,
+            modelPresets: [modelPreset],
+            modelPresetsExposed: true,
+            modelPresetsTemporarilyDisabled: false,
+            chatPresets: ChatPreset.BuiltIn.all() + [reviewPreset],
+            defaultChatPresets: [
+                .chat: ChatPreset.BuiltIn.chat,
+                .plan: ChatPreset.BuiltIn.plan,
+                .review: ChatPreset.BuiltIn.review
+            ]
+        )
+        let legacySession = ChatSession(
+            workspaceID: workspace.id,
+            composeTabID: tab.id,
+            name: "Legacy single",
+            messages: [
+                StoredMessage(isUser: true, rawText: "Earlier question", timestamp: Date(timeIntervalSince1970: 1)),
+                StoredMessage(isUser: false, rawText: "Earlier answer", timestamp: Date(timeIntervalSince1970: 2))
+            ],
+            preferredAIModel: AIModel.gpt54.rawValue,
+            selectedChatPresetID: ChatPreset.BuiltIn.chat.id
+        )
+        let savedURL = try await composition.oracleViewModel.chatData.saveChatSession(legacySession, for: workspace)
+
+        var capturedMessages: [AIMessage] = []
+        var capturedModels: [AIModel] = []
+        var persistedAtFirstDispatch: ChatSession?
+        composition.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting { message, model in
+            if capturedMessages.isEmpty {
+                persistedAtFirstDispatch = try? await composition.oracleViewModel.chatData.loadChatSession(from: savedURL)
+            }
+            capturedMessages.append(message)
+            capturedModels.append(model)
+            let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                continuation.yield(
+                    ChatStreamOutput(text: "done", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed)
+                )
+                continuation.finish()
+            }
+            return (UUID(), stream)
+        }
+
+        _ = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
+            args: [
+                "message": .string("First upgraded turn"),
+                "mode": .string("review"),
+                "chat_id": .string(legacySession.shortID)
+            ],
+            promptVM: composition.promptManager,
+            tabContext: makeTabContext(workspaceID: workspace.id, tabID: tab.id),
+            capturedProfile: profile,
+            selectionSnapshotOverride: legacySnapshot
+        )
+        XCTAssertEqual(persistedAtFirstDispatch?.preferredAIModel, AIModel.gpt54Mini.rawValue)
+        XCTAssertEqual(persistedAtFirstDispatch?.selectedChatPresetID, reviewPreset.id)
+        XCTAssertEqual(persistedAtFirstDispatch?.oracleExecutionAuthority, .frozen)
+        XCTAssertEqual(capturedModels, [.gpt54Mini])
+        XCTAssertTrue(try XCTUnwrap(capturedMessages.first).systemPrompt.contains(promptMarker))
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+        let upgraded = try await composition.oracleViewModel.chatData.loadChatSession(from: savedURL)
+        XCTAssertEqual(upgraded.preferredAIModel, AIModel.gpt54Mini.rawValue)
+        XCTAssertEqual(upgraded.selectedChatPresetID, reviewPreset.id)
+        XCTAssertEqual(upgraded.oracleExecutionAuthority, .frozen)
+
+        let changedProfile = AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54.rawValue)
+        let changedSnapshot = OracleSelectionSnapshot(
+            origin: .mcp,
+            agentModelsProfile: changedProfile,
+            modelPresets: [],
+            modelPresetsExposed: false,
+            modelPresetsTemporarilyDisabled: false,
+            chatPresets: ChatPreset.BuiltIn.all() + [reviewPreset],
+            defaultChatPresets: [
+                .chat: ChatPreset.BuiltIn.chat,
+                .plan: ChatPreset.BuiltIn.plan,
+                .review: ChatPreset.BuiltIn.review
+            ]
+        )
+        composition.oracleViewModel.purgeSessionStorage(legacySession.id)
+        composition.oracleViewModel.sessions = []
+        composition.oracleViewModel.currentSessionID = nil
+        _ = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
+            args: [
+                "message": .string("Frozen later turn"),
+                "mode": .string("review"),
+                "chat_id": .string(legacySession.id.uuidString)
+            ],
+            promptVM: composition.promptManager,
+            tabContext: makeTabContext(workspaceID: workspace.id, tabID: tab.id),
+            capturedProfile: changedProfile,
+            selectionSnapshotOverride: changedSnapshot
+        )
+        XCTAssertEqual(capturedModels, [.gpt54Mini, .gpt54Mini])
+        XCTAssertEqual(capturedMessages.count, 2)
+        XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+    }
+
     func testTwoLanePresetPreservesRosterPromptAndContinuationAuthority() async throws {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9322,
@@ -261,7 +411,7 @@ final class OraclePresetExecutionTests: XCTestCase {
         )
         let preset = try ModelPreset(
             name: "Review-Group",
-            modelStrings: [AIModel.gpt54Mini.rawValue, AIModel.gpt54Mini.rawValue],
+            modelStrings: [AIModel.gpt54Mini.rawValue, AIModel.gpt54.rawValue],
             chatPresetMappings: ChatPresetMappings(reviewPresetID: chatPreset.id)
         )
         let profile = AgentModelsSettingsProfile(
@@ -282,8 +432,10 @@ final class OraclePresetExecutionTests: XCTestCase {
             ]
         )
         var capturedMessages: [AIMessage] = []
+        var capturedModels: [AIModel] = []
         composition.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting { message, model in
             capturedMessages.append(message)
+            capturedModels.append(model)
             let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
                 continuation.yield(
                     ChatStreamOutput(
@@ -346,6 +498,7 @@ final class OraclePresetExecutionTests: XCTestCase {
         let persistedPrimary = try await composition.oracleViewModel.chatData.loadChatSession(from: primaryURL)
         XCTAssertEqual(persistedPrimary.preferredAIModel, AIModel.gpt54Mini.rawValue)
         XCTAssertEqual(persistedPrimary.selectedChatPresetID, chatPreset.id)
+        XCTAssertEqual(persistedPrimary.oracleExecutionAuthority, .frozen)
 
         let changedProfile = AgentModelsSettingsProfile(
             planningModelRaw: AIModel.gpt54.rawValue,
@@ -366,6 +519,93 @@ final class OraclePresetExecutionTests: XCTestCase {
         XCTAssertEqual(continued["oracle_count"]?.intValue, 2)
         XCTAssertEqual(capturedMessages.count, 4)
         XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
+
+        let groupSessionIDs = composition.oracleViewModel.sessions
+            .filter { $0.oracleGroupID == groupUUID }
+            .map(\.id)
+        for sessionID in groupSessionIDs {
+            let index = try XCTUnwrap(composition.oracleViewModel.sessions.firstIndex(where: { $0.id == sessionID }))
+            var legacyProjection = composition.oracleViewModel.sessions[index]
+            legacyProjection.preferredAIModel = AIModel.gpt54.rawValue
+            legacyProjection.selectedChatPresetID = ChatPreset.BuiltIn.chat.id
+            legacyProjection.oracleExecutionAuthority = nil
+            _ = try await composition.oracleViewModel.chatData.saveChatSession(legacyProjection, for: workspace)
+            composition.oracleViewModel.purgeSessionStorage(sessionID)
+        }
+        composition.oracleViewModel.sessions = []
+        composition.oracleViewModel.currentSessionID = nil
+        await composition.oracleViewModel.loadSessionsFromWorkspace()
+
+        let legacySnapshot = OracleSelectionSnapshot(
+            origin: .mcp,
+            agentModelsProfile: changedProfile,
+            modelPresets: [],
+            modelPresetsExposed: false,
+            modelPresetsTemporarilyDisabled: false,
+            chatPresets: ChatPreset.BuiltIn.all() + [chatPreset],
+            defaultChatPresets: [
+                .chat: ChatPreset.BuiltIn.chat,
+                .plan: ChatPreset.BuiltIn.plan,
+                .review: chatPreset
+            ]
+        )
+        let upgradedLegacyGroup = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
+            args: [
+                "message": .string("Legacy group upgrade"),
+                "mode": .string("review"),
+                "chat_id": .string(chatID)
+            ],
+            promptVM: composition.promptManager,
+            tabContext: context,
+            capturedProfile: changedProfile,
+            selectionSnapshotOverride: legacySnapshot
+        )
+        XCTAssertEqual(upgradedLegacyGroup["oracle_group_id"]?.stringValue, groupID)
+        let upgradedLanes = try XCTUnwrap(upgradedLegacyGroup["oracle_results"]?.arrayValue)
+        XCTAssertEqual(upgradedLanes.compactMap { $0.objectValue?["model_id"]?.stringValue }, preset.modelStrings)
+        XCTAssertEqual(Set(capturedModels.suffix(2).map(\.rawValue)), Set(preset.modelStrings))
+        XCTAssertTrue(capturedMessages.suffix(2).allSatisfy { $0.systemPrompt.contains(promptMarker) })
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+        for sessionID in groupSessionIDs {
+            let session = try XCTUnwrap(composition.oracleViewModel.sessions.first(where: { $0.id == sessionID }))
+            let persisted = try await composition.oracleViewModel.chatData.loadChatSession(from: XCTUnwrap(session.fileURL))
+            let laneIndex = try XCTUnwrap(persisted.oracleLaneIndex)
+            XCTAssertEqual(persisted.preferredAIModel, preset.modelStrings[laneIndex])
+            XCTAssertEqual(persisted.selectedChatPresetID, chatPreset.id)
+            XCTAssertEqual(persisted.oracleExecutionAuthority, .frozen)
+            composition.oracleViewModel.purgeSessionStorage(sessionID)
+        }
+
+        composition.oracleViewModel.sessions = []
+        composition.oracleViewModel.currentSessionID = nil
+        await composition.oracleViewModel.loadSessionsFromWorkspace()
+        let frozenSnapshot = OracleSelectionSnapshot(
+            origin: .mcp,
+            agentModelsProfile: changedProfile,
+            modelPresets: [],
+            modelPresetsExposed: false,
+            modelPresetsTemporarilyDisabled: false,
+            chatPresets: ChatPreset.BuiltIn.all() + [chatPreset],
+            defaultChatPresets: [
+                .chat: ChatPreset.BuiltIn.chat,
+                .plan: ChatPreset.BuiltIn.plan,
+                .review: ChatPreset.BuiltIn.review
+            ]
+        )
+        _ = try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
+            args: [
+                "message": .string("Frozen group continuation"),
+                "mode": .string("review"),
+                "chat_id": .string(chatID)
+            ],
+            promptVM: composition.promptManager,
+            tabContext: context,
+            capturedProfile: changedProfile,
+            selectionSnapshotOverride: frozenSnapshot
+        )
+        XCTAssertEqual(Set(capturedModels.suffix(2).map(\.rawValue)), Set(preset.modelStrings))
+        XCTAssertTrue(capturedMessages.suffix(2).allSatisfy { $0.systemPrompt.contains(promptMarker) })
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
     }
 
     func testFiveLanePresetExecutesMaximumOrderedRosterWithMappedPrompt() async throws {

@@ -31,7 +31,8 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
             oracleLaneIndex: 2,
             oracleGroupSize: 4,
             oracleModelRaw: "model-c",
-            name: "Grouped Oracle"
+            name: "Grouped Oracle",
+            oracleExecutionAuthority: .frozen
         )
 
         let decoded = try JSONDecoder().decode(
@@ -42,6 +43,7 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertEqual(decoded.oracleLaneIndex, 2)
         XCTAssertEqual(decoded.oracleGroupSize, 4)
         XCTAssertEqual(decoded.oracleModelRaw, "model-c")
+        XCTAssertEqual(decoded.oracleExecutionAuthority, .frozen)
 
         let legacy = try JSONDecoder().decode(
             ChatSession.self,
@@ -50,6 +52,7 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertNil(legacy.oracleGroupID)
         XCTAssertNil(legacy.oracleLaneIndex)
         XCTAssertNil(legacy.oracleGroupSize)
+        XCTAssertNil(legacy.oracleExecutionAuthority)
     }
 
     func testStoredMessageOmitsLegacyDelegateAndCombinedTextFields() throws {

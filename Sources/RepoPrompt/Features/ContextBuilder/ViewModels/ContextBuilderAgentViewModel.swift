@@ -4959,6 +4959,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
             oracleViewModel.sessions[createdSessionIndex].preferredAIModel = execution.primaryModel.rawValue
             oracleViewModel.sessions[createdSessionIndex].selectedChatPresetID = execution.promptConfiguration.chatPresetID
+            oracleViewModel.sessions[createdSessionIndex].oracleExecutionAuthority = .frozen
             oracleViewModel.pinSession(createdSession.id)
             defer { oracleViewModel.unpinSession(createdSession.id) }
             session.followUpOracleSessionID = createdSession.id

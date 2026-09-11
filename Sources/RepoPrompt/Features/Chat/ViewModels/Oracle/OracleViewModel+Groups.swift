@@ -189,13 +189,23 @@ extension OracleViewModel {
         } else if let sessionID = selection.singleSessionID,
                   let session = sessions.first(where: { $0.id == sessionID })
         {
-            try resolveOracleConversationExecution(
-                session: session,
-                mode: args["mode"]?.stringValue ?? "chat",
-                profile: profile,
-                promptVM: promptVM,
-                snapshotOverride: selectionSnapshotOverride
-            )
+            if session.oracleExecutionAuthority == .frozen {
+                try resolveOracleConversationExecution(
+                    session: session,
+                    mode: args["mode"]?.stringValue ?? "chat",
+                    profile: profile,
+                    promptVM: promptVM,
+                    snapshotOverride: selectionSnapshotOverride
+                )
+            } else {
+                try resolveOracleStartExecution(
+                    mode: args["mode"]?.stringValue ?? "chat",
+                    modelParam: nil,
+                    profile: profile,
+                    promptVM: promptVM,
+                    snapshotOverride: selectionSnapshotOverride
+                )
+            }
         } else {
             nil
         }
@@ -595,6 +605,9 @@ extension OracleViewModel {
                 throw ChatToolError.internalError("Oracle group projection is unavailable.")
             }
             session.preferredAIModel = member.model.modelID
+            if session.oracleExecutionAuthority == nil {
+                session.selectedChatPresetID = nil
+            }
             let profile = GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: tabContext?.workspaceID)
             laneExecution = try resolveOracleConversationExecution(
                 session: session,

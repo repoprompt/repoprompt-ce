@@ -2274,7 +2274,8 @@ class OracleViewModel: ObservableObject {
                 selectedFilePaths: fullSession.selectedFilePaths,
                 selectedPromptIDs: fullSession.selectedPromptIDs,
                 preferredAIModel: fullSession.preferredAIModel,
-                selectedChatPresetID: fullSession.selectedChatPresetID
+                selectedChatPresetID: fullSession.selectedChatPresetID,
+                oracleExecutionAuthority: fullSession.oracleExecutionAuthority
             )
 
             // Persist the clone and capture the file URL so the stub can resolve it later
@@ -2392,7 +2393,8 @@ class OracleViewModel: ObservableObject {
             selectedFilePaths: originalSession.selectedFilePaths, // Or maybe capture current selection? Decide based on desired UX
             selectedPromptIDs: originalSession.selectedPromptIDs, // Same as above
             preferredAIModel: originalSession.preferredAIModel,
-            selectedChatPresetID: originalSession.selectedChatPresetID
+            selectedChatPresetID: originalSession.selectedChatPresetID,
+            oracleExecutionAuthority: originalSession.oracleExecutionAuthority
         )
 
         // Add the new session to the list and switch to it
@@ -2721,6 +2723,7 @@ class OracleViewModel: ObservableObject {
                 sessionToSave.selectedPromptIDs = session.selectedPromptIDs
                 sessionToSave.preferredAIModel = session.preferredAIModel
                 sessionToSave.selectedChatPresetID = session.selectedChatPresetID
+                sessionToSave.oracleExecutionAuthority = session.oracleExecutionAuthority
             } catch {
                 print("Warning: Failed to load full session for stub-safe save, skipping save: \(error)")
                 throw error
