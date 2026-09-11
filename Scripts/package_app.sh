@@ -358,7 +358,7 @@ run python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" --manifest "$PROMPT_EXPERIMENT_RUN
     --arch "$PROMPT_EXPERIMENT_RUNTIME_ARCH" \
     --cache-root "$PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT" \
     --bundle "$PROMPT_EXPERIMENT_RUNTIME_APP_DIR"
-[[ ! -d AppResources ]] || run rsync -a AppResources/ "$APP_BUNDLE/Contents/Resources/"
+[[ ! -d AppResources ]] || run rsync -a --exclude='__pycache__/' --exclude='*.py[co]' AppResources/ "$APP_BUNDLE/Contents/Resources/"
 shopt -s nullglob
 for bundle in "$BUILD_DIR"/*.bundle; do run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"; done
 shopt -u nullglob

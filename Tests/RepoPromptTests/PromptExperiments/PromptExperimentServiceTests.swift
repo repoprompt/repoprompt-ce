@@ -14,6 +14,18 @@ import XCTest
             )
         }
 
+        func testNamespacedPromptExperimentTracksAndRoutesNativePendingCard() {
+            let liveToolName = "mcp__repopromptce__prompt_experiment"
+            XCTAssertEqual(
+                MCPIntegrationHelper.canonicalRepoPromptToolName(liveToolName),
+                "prompt_experiment"
+            )
+            XCTAssertTrue(AgentToolTrackingSupport.isRepoPromptTool(liveToolName))
+            XCTAssertEqual(normalizedToolCardName(liveToolName), "prompt_experiment")
+            XCTAssertTrue(ToolCardRouter.routesToPromptExperimentCard(toolName: liveToolName))
+            XCTAssertTrue(ToolCardRouter.knownResultTools.contains("prompt_experiment"))
+        }
+
         private final class FakeRuntime: PromptExperimentRuntime {
             var submitted: [PromptExperimentRunRequest] = []
             var cancelled: [PromptExperimentRuntimeHandle] = []
@@ -558,6 +570,8 @@ import XCTest
             XCTAssertEqual(harness.service.record(id: id)?.phase, .awaitingApproval)
             XCTAssertEqual(plan.optimization?.gepa.pythonExecutablePath, PromptExperimentGEPAWorker.configuredPythonSealValue())
             XCTAssertEqual(harness.service.record(id: id)?.controllerSessionID, owner.controllerSessionID)
+            XCTAssertTrue(plan.limitations.contains { $0.contains("bundled CPython runtime") })
+            XCTAssertFalse(plan.limitations.contains { $0.contains("separately configured Python") })
         }
 
         func testHandlerParsesRunWaitAndRevisionAliases() throws {
@@ -833,6 +847,46 @@ import XCTest
             XCTAssertFalse(harness.service.hasPendingRunApproval(experimentID: id, planDigest: plan.digest))
             XCTAssertTrue(harness.runtime.submitted.isEmpty)
             XCTAssertTrue(harness.service.record(id: id)?.statusMessage.contains("cancelled") == true)
+
+            let persisted = try await harness.store.loadRecords()
+            XCTAssertTrue(persisted.first(where: { $0.id == id })?.statusMessage.contains("cancelled") == true)
+            let reopened = PromptExperimentService(
+                store: PromptExperimentStore(rootURL: harness.root),
+                runtime: FakeRuntime(),
+                resolveTarget: Self.fakeTarget,
+                now: { Date(timeIntervalSince1970: 1001) }
+            )
+            await reopened.load()
+            XCTAssertTrue(reopened.record(id: id)?.statusMessage.contains("cancelled") == true)
+        }
+
+        func testReloadClearsStalePendingApprovalStatusWithoutApprovingOrRunning() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            var stale = try XCTUnwrap(harness.service.record(id: id))
+            stale.statusMessage = "Run requested by this Agent session. Review the exact sealed digest below; Approve & Run starts automatically."
+            _ = try await harness.store.saveRecords([stale])
+
+            let reopenedRuntime = FakeRuntime()
+            let reopened = PromptExperimentService(
+                store: PromptExperimentStore(rootURL: harness.root),
+                runtime: reopenedRuntime,
+                resolveTarget: Self.fakeTarget,
+                now: { Date(timeIntervalSince1970: 1001) }
+            )
+            await reopened.load()
+
+            let recovered = try XCTUnwrap(reopened.record(id: id))
+            XCTAssertEqual(recovered.phase, .awaitingApproval)
+            XCTAssertTrue(recovered.approvals.isEmpty)
+            XCTAssertTrue(recovered.attempts.isEmpty)
+            XCTAssertTrue(recovered.statusMessage.contains("no native approval is pending"))
+            XCTAssertTrue(reopenedRuntime.submitted.isEmpty)
+            let persisted = try await harness.store.loadRecords()
+            XCTAssertTrue(
+                persisted.first(where: { $0.id == id })?.statusMessage.contains("no native approval is pending") == true
+            )
         }
 
         func testRunRequestRejectsStaleDigestAndWrongOwner() async throws {

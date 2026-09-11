@@ -164,6 +164,21 @@ package enum MCPToolExecutionContractCatalog {
                 cleanupDisposition: .detachAndSettle
             )
         }
+        #if DEBUG
+            if toolName == MCPWindowToolName.promptExperiment {
+                let operation = arguments["op"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                switch operation {
+                case "run":
+                    return .interactiveCancellable
+                case "wait", "cancel":
+                    return .lifecycleManagedCancellable
+                default:
+                    return baseContract
+                }
+            }
+        #endif
         guard toolName == MCPGlobalToolName.manageWorkspaces else { return baseContract }
         guard let rawAction = arguments["action"]?.stringValue else {
             return baseContract

@@ -145,6 +145,105 @@ import XCTest
             }
         }
 
+        func testPromptExperimentRunDispatchSurvivesFormerBoundedDeadlineUntilResolution() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let manager = fixture.networkManager
+                let endpoint = try fixture.endpointA()
+                let clock = MCPExportWatchdogManualClock()
+                let firstSettlement = MCPExecutionOneShotSignal<Bool>()
+                let release = MCPExecutionOneShotSignal<Void>()
+                var responseTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var didRelease = false
+
+                try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                await manager.debugSetAdditionalTools(
+                    for: endpoint.connectionID,
+                    additionalTools: [MCPWindowToolName.promptExperiment]
+                )
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(
+                    toolName: MCPWindowToolName.promptExperiment
+                ) {
+                    firstSettlement.signalIfEmpty(true)
+                    await release.wait()
+                    return .object(["phase": .string("running")])
+                }
+
+                do {
+                    let activeResponseTask = Task {
+                        do {
+                            let response = try await endpoint.callTool(
+                                name: MCPWindowToolName.promptExperiment,
+                                arguments: [
+                                    "op": "run",
+                                    "experiment_id": UUID().uuidString,
+                                    "expected_plan_digest": "sealed-digest"
+                                ]
+                            )
+                            firstSettlement.signalIfEmpty(false)
+                            return response
+                        } catch {
+                            firstSettlement.signalIfEmpty(false)
+                            throw error
+                        }
+                    }
+                    responseTask = activeResponseTask
+                    let enteredProvider = await firstSettlement.wait()
+                    guard enteredProvider else {
+                        let earlyResponse = try await activeResponseTask.value
+                        responseTask = nil
+                        throw MCPExecutionWatchdogIntegrationFixtureError.promptExperimentSettledBeforeProvider(
+                            earlyResponse.rawJSON
+                        )
+                    }
+
+                    try await clock.advanceWithoutSleepers(
+                        by: .seconds(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds + 1)
+                    )
+                    release.signal(())
+                    didRelease = true
+
+                    let response = try await activeResponseTask.value
+                    responseTask = nil
+                    XCTAssertFalse(response.rawJSON.contains("tool_execution_timeout"), response.rawJSON)
+                    XCTAssertFalse(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.promptExperiment,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await manager.debugSetAdditionalTools(for: endpoint.connectionID, additionalTools: nil)
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: nil
+                    )
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    if !didRelease { release.signal(()) }
+                    responseTask?.cancel()
+                    if let responseTask { _ = try? await responseTask.value }
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.promptExperiment,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await manager.debugSetAdditionalTools(for: endpoint.connectionID, additionalTools: nil)
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: nil
+                    )
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testPromptExportDeadlineRemainsProviderEntryBasedAcrossDelayedWatchdogInstallationForAllTimeoutModes() async throws {
             let timeoutModes: [String?] = [nil, "explicit_finite", "explicit_unbounded"]
             for toolName in ["prompt", "workspace_context"] {
@@ -2532,6 +2631,21 @@ import XCTest
             waiter?.resume(returning: value)
         }
 
+        @discardableResult
+        func signalIfEmpty(_ value: Value) -> Bool {
+            lock.lock()
+            guard self.value == nil else {
+                lock.unlock()
+                return false
+            }
+            self.value = value
+            let waiter = waiter
+            self.waiter = nil
+            lock.unlock()
+            waiter?.resume(returning: value)
+            return true
+        }
+
         func wait() async -> Value {
             await withCheckedContinuation { continuation in
                 lock.lock()
@@ -2612,6 +2726,7 @@ import XCTest
 
     private enum MCPExecutionWatchdogIntegrationFixtureError: Error {
         case cooperativeGateCancellationNotObserved
+        case promptExperimentSettledBeforeProvider(String)
         case cooperativeGateDidNotEnter
         case gateDidNotEnter(expected: Int, actual: Int)
     }

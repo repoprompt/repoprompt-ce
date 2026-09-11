@@ -21,7 +21,7 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             process = subprocess.Popen(
-                [sys.executable, str(WORKER)],
+                [sys.executable, "-I", "-B", str(WORKER)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -144,7 +144,7 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             process = subprocess.Popen(
-                [sys.executable, str(WORKER)],
+                [sys.executable, "-I", "-B", str(WORKER)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

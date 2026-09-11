@@ -437,7 +437,7 @@
                     throw PromptExperimentAuthorityError.invalidDraft("Merge invocations must be between 0 and 20.")
                 }
                 guard !optimization.gepa.pythonExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw PromptExperimentAuthorityError.invalidDraft("Configure the external Python executable containing pinned GEPA before sealing.")
+                    throw PromptExperimentAuthorityError.invalidDraft("The sealed bundled Python runtime reference is required before sealing.")
                 }
                 let ids = optimization.examples.map(\.id)
                 guard Set(ids).count == ids.count, ids.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
@@ -688,7 +688,7 @@
                     sealedAt: date,
                     trials: [trial],
                     limitations: [
-                        "Runs the pinned upstream GEPA optimize_anything engine in a separately configured Python environment; RPCE does not install Python packages.",
+                        "Runs pinned upstream GEPA optimize_anything in the signed, architecture-matched bundled CPython runtime; no user Python or package setup is required.",
                         "Context Builder is the first workflow adapter. Investigate and multi-agent adapters use the same host bridge but are not yet implemented.",
                         "Reviewed examples are copied into an app-owned isolated environment. Direct loaded-workspace execution and hidden source access are not admitted.",
                         "Generated-code commands run only under the sealed macOS Seatbelt profile; unsupported sandbox hosts fail closed.",

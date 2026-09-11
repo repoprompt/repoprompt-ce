@@ -1468,7 +1468,9 @@ actor InteractiveMCPClientSession {
     ) -> TimeInterval? {
         switch effectiveTimeoutPolicy(policy) {
         case .default:
-            if MCPTimeoutPolicy.cliDefaultUnboundedToolNames.contains(toolName) {
+            if MCPTimeoutPolicy.cliDefaultUnboundedToolNames.contains(toolName)
+                || Self.usesDefaultUnboundedTimeout(toolName: toolName, arguments: arguments)
+            {
                 return nil
             }
             if let semanticWaitSeconds = Self.explicitSemanticWaitSeconds(
@@ -1487,6 +1489,16 @@ actor InteractiveMCPClientSession {
         case .none:
             return nil
         }
+    }
+
+    private static func usesDefaultUnboundedTimeout(
+        toolName: String,
+        arguments: [String: Value]
+    ) -> Bool {
+        guard toolName == "prompt_experiment" else { return false }
+        return arguments["op"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "run"
     }
 
     private static func explicitSemanticWaitSeconds(
@@ -1509,6 +1521,12 @@ actor InteractiveMCPClientSession {
                 return nil
             }
         case "ask_user", "wait_for_next_user_instruction":
+            timeoutKey = "timeout_seconds"
+        case "prompt_experiment":
+            guard arguments["op"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == "wait"
+            else { return nil }
             timeoutKey = "timeout_seconds"
         default:
             return nil

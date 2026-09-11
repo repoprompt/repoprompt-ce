@@ -60,6 +60,9 @@
         private let resolveTarget: @MainActor (String) throws -> PromptExperimentResolvedTarget?
         private let listAvailableTargets: @MainActor () -> [PromptExperimentResolvedTarget]
         private let now: @MainActor () -> Date
+        private static let pendingApprovalStatus = "Run requested by this Agent session. Review the exact sealed digest below; Approve & Run starts automatically."
+        private static let restoredAwaitingApprovalStatus = "Sealed plan is awaiting a new owning-session run request; no native approval is pending."
+
         private struct PendingRunApproval {
             let planDigest: String
             let controllerSessionID: UUID
@@ -130,6 +133,13 @@
                 for index in loaded.indices {
                     if loaded[index].migrateLegacyAttemptLineage() {
                         changed = true
+                    }
+                    if loaded[index].phase == .awaitingApproval,
+                       loaded[index].statusMessage == Self.pendingApprovalStatus
+                    {
+                        changed = true
+                        loaded[index].updatedAt = recoveryDate
+                        loaded[index].statusMessage = Self.restoredAwaitingApprovalStatus
                     }
                     guard loaded[index].phase == .running || loaded[index].phase == .cancelling else { continue }
                     changed = true
@@ -510,7 +520,7 @@
                             controllerSessionID: expectedControllerSessionID,
                             continuation: continuation
                         )
-                        records[currentIndex].statusMessage = "Run requested by this Agent session. Review the exact sealed digest below; Approve & Run starts automatically."
+                        records[currentIndex].statusMessage = Self.pendingApprovalStatus
                         records[currentIndex].updatedAt = now()
                         resumePendingRunApprovalObservers(experimentID: experimentID)
                         Task { @MainActor [weak self] in

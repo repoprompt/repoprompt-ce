@@ -107,6 +107,37 @@ import XCTest
             }
         }
 
+        func testPromptExperimentContractsAreOperationSensitive() {
+            let toolName = MCPWindowToolName.promptExperiment
+            XCTAssertEqual(
+                MCPToolExecutionContractCatalog.contract(
+                    for: toolName,
+                    arguments: ["op": .string("  RuN\n")]
+                ),
+                .interactiveCancellable
+            )
+            for operation in ["wait", "cancel"] {
+                XCTAssertEqual(
+                    MCPToolExecutionContractCatalog.contract(
+                        for: toolName,
+                        arguments: ["op": .string(operation)]
+                    ),
+                    .lifecycleManagedCancellable,
+                    operation
+                )
+            }
+            for operation in ["capabilities", "setup", "status", "read"] {
+                XCTAssertEqual(
+                    MCPToolExecutionContractCatalog.contract(
+                        for: toolName,
+                        arguments: ["op": .string(operation)]
+                    ),
+                    MCPToolExecutionContractCatalog.contract(for: toolName),
+                    operation
+                )
+            }
+        }
+
         func testConnectionPermitReleasedWhenDeadlineExpiresImmediatelyAfterHandoff() async throws {
             let limiter = MCPDomainAsyncLimiter(limit: 1)
             let holderGate = AdmissionDeadlineGate()
@@ -571,6 +602,50 @@ import XCTest
                     "Unexpected export timeout for \(testCase.toolName) op=\(testCase.operation.debugDescription)"
                 )
             }
+        }
+
+        func testPromptExperimentClientTimeoutsFollowOperationSemantics() async {
+            let session = makeUnconnectedSession()
+            let runTimeout = await session.test_resolvedToolCallTimeout(
+                toolName: "prompt_experiment",
+                arguments: ["op": .string("run")]
+            )
+            XCTAssertNil(runTimeout, "Native approval must remain pending until user action or caller cancellation")
+
+            let explicitWaitTimeout = await session.test_resolvedToolCallTimeout(
+                toolName: "prompt_experiment",
+                arguments: [
+                    "op": .string("wait"),
+                    "timeout_seconds": .int(3600)
+                ]
+            )
+            XCTAssertEqual(
+                explicitWaitTimeout,
+                3600 + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+            )
+            let defaultWaitTimeout = await session.test_resolvedToolCallTimeout(
+                toolName: "prompt_experiment",
+                arguments: ["op": .string("wait")]
+            )
+            XCTAssertEqual(defaultWaitTimeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds)
+            let cancelTimeout = await session.test_resolvedToolCallTimeout(
+                toolName: "prompt_experiment",
+                arguments: ["op": .string("cancel")]
+            )
+            XCTAssertEqual(cancelTimeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds)
+            let explicitRunTimeout = await session.test_resolvedToolCallTimeout(
+                .seconds(45),
+                toolName: "prompt_experiment",
+                arguments: ["op": .string("run")]
+            )
+            XCTAssertEqual(explicitRunTimeout, 45)
+
+            let deadline = await session.test_resolvedToolCallDeadline(
+                toolName: "prompt_experiment",
+                arguments: ["op": .string("run")]
+            )
+            XCTAssertNil(deadline.wireEnvelope)
+            XCTAssertFalse(deadline.isSharedOrdinaryExportEnvelope)
         }
 
         func testPromptContextExportAliasesResolveToCanonicalDeadlineEnvelopeAndSettlementPath() async {

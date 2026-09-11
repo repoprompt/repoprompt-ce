@@ -94,6 +94,12 @@ struct ContextBuilderCardContext {
 }
 
 enum ToolCardRouter {
+    #if DEBUG
+        static func routesToPromptExperimentCard(toolName: String?) -> Bool {
+            normalizedToolCardName(toolName)?.lowercased() == "prompt_experiment"
+        }
+    #endif
+
     static var knownResultTools: Set<String> {
         var tools: Set = [
             "bash", "read", "read_file", "apply_edits", "apply_patch", "edit",
@@ -118,6 +124,11 @@ enum ToolCardRouter {
     ) -> AnyView {
         let normalized = normalizedToolCardName(item.toolName)
         let key = normalized?.lowercased()
+        #if DEBUG
+            if routesToPromptExperimentCard(toolName: item.toolName) {
+                return AnyView(PromptExperimentResultCard(item: item))
+            }
+        #endif
         let presentation = callPresentation(for: item)
         let subtitle = presentation?.subtitle ?? callSubtitle(for: key, argsJSON: item.toolArgsJSON)
         return AnyView(

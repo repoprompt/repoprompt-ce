@@ -34,36 +34,42 @@ enum MCPIntegrationHelper {
     }
 
     static let repoPromptMCPServerName = RepoPromptMCPServerConfiguration.defaultServerName
-    static let repoPromptToolNames: Set<String> = [
-        "ask_user",
-        "ask_user_question",
-        "get_file_tree",
-        "file_search",
-        "read_file",
-        "get_code_structure",
-        "apply_edits",
-        "file_actions",
+    static let repoPromptToolNames: Set<String> = {
+        var names: Set = [
+            "ask_user",
+            "ask_user_question",
+            "get_file_tree",
+            "file_search",
+            "read_file",
+            "get_code_structure",
+            "apply_edits",
+            "file_actions",
 
-        "manage_selection",
-        "prompt",
-        "workspace_context",
-        "ask_oracle",
-        "oracle_send",
-        "oracle_utils",
-        "oracle_chat_log",
-        "history",
-        "git",
-        "bind_context",
-        "manage_workspaces",
-        "context_builder",
-        "share_thoughts",
-        "wait_for_next_user_instruction",
-        "agent_explore",
-        "agent_run",
-        "agent_manage",
-        "set_status",
-        "app_settings"
-    ]
+            "manage_selection",
+            "prompt",
+            "workspace_context",
+            "ask_oracle",
+            "oracle_send",
+            "oracle_utils",
+            "oracle_chat_log",
+            "history",
+            "git",
+            "bind_context",
+            "manage_workspaces",
+            "context_builder",
+            "share_thoughts",
+            "wait_for_next_user_instruction",
+            "agent_explore",
+            "agent_run",
+            "agent_manage",
+            "set_status",
+            "app_settings"
+        ]
+        #if DEBUG
+            names.insert("prompt_experiment")
+        #endif
+        return names
+    }()
 
     // MARK: - Command Install Mode
 
