@@ -62,6 +62,13 @@ extension Error {
             return apiErr.displayDescription
         }
 
+        if let localizedError = self as? LocalizedError,
+           let description = localizedError.errorDescription,
+           !description.isEmpty
+        {
+            return description
+        }
+
         // 4. Fallback to NSError bridging:
         let nsError = self as NSError
         let domain = nsError.domain

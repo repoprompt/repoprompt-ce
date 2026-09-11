@@ -117,17 +117,18 @@ struct MCPOracleToolService {
     // MARK: - ask_oracle (agent-mode only)
 
     func executeAskOracle(args: [String: Value]) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "export_response"]
+        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "images", "export_response"]
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
+                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, images, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
             )
         }
 
         try validateCommonOracleArgs(args)
+        let imageRequests = try Self.parseOracleImageRequests(args["images"])
 
         guard let connectionID = ServerNetworkManager.currentConnectionID else {
             throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
@@ -185,13 +186,18 @@ struct MCPOracleToolService {
                 from: virtualContext,
                 owner: owner,
                 origin: .askOracle,
-                mode: modeRaw
+                mode: modeRaw,
+                imageRequests: imageRequests
             )
         } else {
             guard let tabSnapshot = targetWindow.workspaceManager.composeTabSnapshot(for: tabID) else {
                 throw MCPError.internalError("Unable to resolve compose tab context for ask_oracle")
             }
             let lookupContext = try await oraclePackagingLookupContext(owner: owner)
+            let transientImages = try await loadOracleImages(
+                imageRequests,
+                lookupContext: lookupContext
+            )
             let reviewGitContext = await promptVM.freezePromptGitReviewContext(
                 workspaceID: targetWindow.workspaceManager.activeWorkspace?.id,
                 tabID: tabID,
@@ -230,7 +236,8 @@ struct MCPOracleToolService {
                 origin: .askOracle,
                 agentModeSessionID: owner.agentSessionID,
                 agentModeRunID: owner.runID,
-                packaging: packaging
+                packaging: packaging,
+                transientImages: transientImages
             )
         }
 
@@ -428,6 +435,52 @@ struct MCPOracleToolService {
             throw MCPError.invalidParams("export_response must be a boolean")
         }
         return boolValue
+    }
+
+    static func parseOracleImageRequests(_ value: Value?) throws -> [OracleImageRequest] {
+        guard let value else { return [] }
+        guard case let .array(items) = value else {
+            throw MCPError.invalidParams("images must be an array of objects.")
+        }
+        guard !items.isEmpty else { return [] }
+        guard items.count <= OracleImageAttachmentLimits.production.maxCount else {
+            throw MCPError.invalidParams(
+                "images supports at most \(OracleImageAttachmentLimits.production.maxCount) items."
+            )
+        }
+        return try items.enumerated().map { index, item in
+            guard case let .object(object) = item else {
+                throw MCPError.invalidParams("images[\(index)] must be an object.")
+            }
+            let unsupported = object.keys
+                .filter { !$0.hasPrefix("_") && !["path", "title"].contains($0) }
+                .sorted()
+            guard unsupported.isEmpty else {
+                throw MCPError.invalidParams(
+                    "images[\(index)] unsupported keys: \(unsupported.joined(separator: ", "))."
+                )
+            }
+            guard let rawPath = object["path"]?.stringValue else {
+                throw MCPError.invalidParams("images[\(index)].path must be a string.")
+            }
+            guard !rawPath.isEmpty else {
+                throw MCPError.invalidParams("images[\(index)].path must be a non-empty local file path.")
+            }
+            let title: String?
+            if let titleValue = object["title"] {
+                guard let rawTitle = titleValue.stringValue else {
+                    throw MCPError.invalidParams("images[\(index)].title must be a string.")
+                }
+                let normalized = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard normalized.count <= 200 else {
+                    throw MCPError.invalidParams("images[\(index)].title exceeds 200 characters.")
+                }
+                title = normalized.isEmpty ? nil : normalized
+            } else {
+                title = nil
+            }
+            return OracleImageRequest(index: index, path: rawPath, title: title)
+        }
     }
 
     private func parseOracleModelOverride(_ value: Value?) throws -> String? {
@@ -674,10 +727,15 @@ struct MCPOracleToolService {
             worktreeBindingState: .notApplicable
         ),
         origin: OracleSendOrigin,
-        mode: String
+        mode: String,
+        imageRequests: [OracleImageRequest] = []
     ) async throws -> OracleViewModel.OracleSendTabContext {
         let stabilizedContext = await stabilizedVirtualContext(context)
         let lookupContext = try await oraclePackagingLookupContext(for: stabilizedContext)
+        let transientImages = try await loadOracleImages(
+            imageRequests,
+            lookupContext: lookupContext
+        )
         let reviewGitContext = await promptVM.freezePromptGitReviewContext(
             workspaceID: stabilizedContext.workspaceID,
             tabID: stabilizedContext.tabID,
@@ -710,8 +768,53 @@ struct MCPOracleToolService {
             origin: origin,
             agentModeSessionID: owner.agentSessionID,
             agentModeRunID: owner.runID,
-            packaging: packaging
+            packaging: packaging,
+            transientImages: transientImages
         )
+    }
+
+    private func loadOracleImages(
+        _ requests: [OracleImageRequest],
+        lookupContext: WorkspaceLookupContext
+    ) async throws -> [AITransientImage] {
+        guard !requests.isEmpty else { return [] }
+        let storeRoots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let representedPhysicalPaths = Set(storeRoots.map(\.standardizedFullPath))
+        let namespace = lookupContext.exactFileNamespace(storeRoots: storeRoots)
+        do {
+            var seen: Set<String> = []
+            var capturesByPhysicalRootPath: [String: OracleImagePhysicalRootCapture] = [:]
+            var projections: [OracleImageRootProjection] = []
+            for binding in namespace.rootBindings
+                where representedPhysicalPaths.contains(binding.lookupRoot.standardizedFullPath)
+            {
+                let physicalRootPath = binding.lookupRoot.standardizedFullPath
+                let capture: OracleImagePhysicalRootCapture
+                if let existing = capturesByPhysicalRootPath[physicalRootPath] {
+                    capture = existing
+                } else {
+                    capture = try OracleImagePhysicalRootCapture.capture(
+                        physicalRootPath: physicalRootPath,
+                        index: requests[0].index
+                    )
+                    capturesByPhysicalRootPath[physicalRootPath] = capture
+                }
+                let logicalRootPaths = [physicalRootPath] + binding.clientRoots.map(\.standardizedFullPath)
+                for logicalRootPath in logicalRootPaths {
+                    let key = "\(logicalRootPath)\u{0}\(physicalRootPath)"
+                    guard seen.insert(key).inserted else { continue }
+                    projections.append(capture.projection(logicalRootPath: logicalRootPath))
+                }
+            }
+            return try await OracleImageAttachmentLoader.loadDetached(
+                requests: requests,
+                authority: OracleImageWorkspaceAuthority(roots: projections)
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
     }
 
     private func reviewPackaging(

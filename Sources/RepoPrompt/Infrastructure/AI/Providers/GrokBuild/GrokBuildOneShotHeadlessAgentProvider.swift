@@ -1,8 +1,8 @@
 import Foundation
 
-/// Prompt-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
+/// Text-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
 /// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented
-/// one-shot JSON CLI and preserves the existing trusted Grok executable preflight.
+/// one-shot prompt-file CLI and rejects images before launch.
 final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     typealias APIKeyProvider = @Sendable () async throws -> String?
 
@@ -26,6 +26,18 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         self.apiKeyProvider = apiKeyProvider
     }
 
+    #if DEBUG
+        static func test_promptArguments(
+            promptFilePath: String = "/tmp/prompt.txt"
+        ) -> [String] {
+            GrokBuildOneShotCLIOptions(
+                promptFilePath: promptFilePath,
+                model: nil,
+                effort: nil
+            ).toTokens()
+        }
+    #endif
+
     func streamAgentMessage(
         _ message: AgentMessage,
         runID: UUID? = nil
@@ -33,6 +45,11 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         guard message.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build one-shot requests cannot resume a previous session."
+            )
+        }
+        guard message.transientImages.isEmpty else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Grok Build one-shot requests do not accept image attachments. Choose an image-capable Oracle model or remove the images and retry."
             )
         }
 
@@ -384,8 +401,8 @@ private struct GrokBuildOneShotCLIOptions {
     var effort: String?
 
     func toTokens() -> [String] {
-        var tokens = [
-            "--prompt-file", promptFilePath,
+        var tokens = ["--prompt-file", promptFilePath]
+        tokens += [
             "--output-format", "json",
             "--verbatim",
             "--max-turns", "1",

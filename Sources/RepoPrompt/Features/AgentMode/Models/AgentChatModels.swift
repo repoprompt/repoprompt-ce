@@ -144,6 +144,136 @@ public struct AgentCrossSessionAttribution: Codable, Sendable, Equatable, Hashab
 
 // MARK: - Agent Chat Item
 
+enum AgentToolArgumentPersistencePolicy {
+    static func sanitizedArgsJSON(toolName: String?, argsJSON: String?) -> String? {
+        guard let argsJSON else { return nil }
+        guard normalizedToolName(toolName) == "ask_oracle" else { return argsJSON }
+        guard let data = argsJSON.data(using: .utf8),
+              var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return partialArgumentsCouldContainImagesKey(argsJSON) ? nil : argsJSON
+        }
+        guard object.removeValue(forKey: "images") != nil else { return argsJSON }
+        guard JSONSerialization.isValidJSONObject(object),
+              let sanitized = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        else {
+            return nil
+        }
+        return String(data: sanitized, encoding: .utf8)
+    }
+
+    private static func partialArgumentsCouldContainImagesKey(_ text: String) -> Bool {
+        let target = "images"
+        let scalars = Array(text.unicodeScalars)
+        var index = 0
+        while index < scalars.count, CharacterSet.whitespacesAndNewlines.contains(scalars[index]) {
+            index += 1
+        }
+        guard index < scalars.count else { return false }
+        guard scalars[index] == "{" else { return true }
+        index += 1
+
+        var depth = 1
+        var expectingTopLevelKey = true
+        var inString = false
+        var stringIsTopLevelKey = false
+        var key = ""
+        var escaped = false
+
+        func appendKeyScalar(_ scalar: UnicodeScalar, to key: inout String) {
+            guard key.count <= target.count else { return }
+            key.unicodeScalars.append(scalar)
+        }
+
+        while index < scalars.count {
+            let scalar = scalars[index]
+            if inString {
+                if escaped {
+                    if scalar == "u" {
+                        guard index + 4 < scalars.count else {
+                            return stringIsTopLevelKey && target.hasPrefix(key)
+                        }
+                        if stringIsTopLevelKey {
+                            let digits = String(String.UnicodeScalarView(scalars[(index + 1) ... (index + 4)]))
+                            guard let value = UInt32(digits, radix: 16), let decoded = UnicodeScalar(value) else {
+                                return true
+                            }
+                            appendKeyScalar(decoded, to: &key)
+                        }
+                        index += 5
+                        escaped = false
+                        continue
+                    }
+                    if stringIsTopLevelKey {
+                        let decoded: UnicodeScalar = switch scalar {
+                        case "\"": "\""
+                        case "\\": "\\"
+                        case "/": "/"
+                        case "b": "\u{08}"
+                        case "f": "\u{0C}"
+                        case "n": "\n"
+                        case "r": "\r"
+                        case "t": "\t"
+                        default: scalar
+                        }
+                        appendKeyScalar(decoded, to: &key)
+                    }
+                    escaped = false
+                    index += 1
+                    continue
+                }
+                if scalar == "\\" {
+                    escaped = true
+                } else if scalar == "\"" {
+                    if stringIsTopLevelKey, key == target {
+                        return true
+                    }
+                    inString = false
+                    if stringIsTopLevelKey {
+                        expectingTopLevelKey = false
+                    }
+                } else if stringIsTopLevelKey {
+                    appendKeyScalar(scalar, to: &key)
+                }
+                index += 1
+                continue
+            }
+
+            switch scalar {
+            case "\"":
+                inString = true
+                stringIsTopLevelKey = depth == 1 && expectingTopLevelKey
+                key = ""
+            case "{", "[":
+                depth += 1
+            case "}", "]":
+                depth -= 1
+                if depth <= 0 { return true }
+            case "," where depth == 1:
+                expectingTopLevelKey = true
+            default:
+                if depth == 1, expectingTopLevelKey,
+                   !CharacterSet.whitespacesAndNewlines.contains(scalar)
+                {
+                    return true
+                }
+            }
+            index += 1
+        }
+
+        guard inString, stringIsTopLevelKey else { return false }
+        return escaped || target.hasPrefix(key)
+    }
+
+    private static func normalizedToolName(_ toolName: String?) -> String? {
+        toolName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .components(separatedBy: "__")
+            .last
+    }
+}
+
 /// A single item in an agent chat transcript (user message, assistant message, tool call, etc.)
 public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public let id: UUID
@@ -163,11 +293,23 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public var toolName: String? {
         didSet {
             toolName = AgentToolNamePolicy.accepted(toolName)
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
         }
     }
 
     public var toolInvocationID: UUID?
-    public var toolArgsJSON: String? // JSON string of tool arguments
+    public var toolArgsJSON: String? {
+        didSet {
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
+        }
+    }
+
     public var toolResultJSON: String? // Tool execution result JSON (for toolResult kind)
     public var toolIsError: Bool?
 
@@ -228,7 +370,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.taggedFileAttachments = taggedFileAttachments
         self.toolName = AgentToolNamePolicy.accepted(toolName)
         self.toolInvocationID = toolInvocationID
-        self.toolArgsJSON = toolArgsJSON
+        self.toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: self.toolName,
+            argsJSON: toolArgsJSON
+        )
         self.toolResultJSON = toolResultJSON
         self.toolIsError = toolIsError
         self.reasoning = reasoning
@@ -266,7 +411,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         taggedFileAttachments = try c.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
         toolName = try AgentToolNamePolicy.accepted(c.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try c.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
-        toolArgsJSON = try c.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        toolArgsJSON = try AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: toolName,
+            argsJSON: c.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        )
         toolResultJSON = try c.decodeIfPresent(String.self, forKey: .toolResultJSON)
         toolIsError = try c.decodeIfPresent(Bool.self, forKey: .toolIsError)
         reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning)
@@ -285,6 +433,34 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             AgentLaneUpdateDisplayAttribution.self,
             forKey: .laneUpdateDisplayAttribution
         )?.validated
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(text, forKey: .text)
+        try container.encode(attachments, forKey: .attachments)
+        try container.encode(taggedFileAttachments, forKey: .taggedFileAttachments)
+        let acceptedToolName = AgentToolNamePolicy.accepted(toolName)
+        try container.encodeIfPresent(acceptedToolName, forKey: .toolName)
+        try container.encodeIfPresent(toolInvocationID, forKey: .toolInvocationID)
+        try container.encodeIfPresent(
+            AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: acceptedToolName,
+                argsJSON: toolArgsJSON
+            ),
+            forKey: .toolArgsJSON
+        )
+        try container.encodeIfPresent(toolResultJSON, forKey: .toolResultJSON)
+        try container.encodeIfPresent(toolIsError, forKey: .toolIsError)
+        try container.encodeIfPresent(reasoning, forKey: .reasoning)
+        try container.encode(sequenceIndex, forKey: .sequenceIndex)
+        try container.encode(isStreaming, forKey: .isStreaming)
+        try container.encodeIfPresent(workflow, forKey: .workflow)
+        try container.encodeIfPresent(codexGoalMode, forKey: .codexGoalMode)
+        try container.encode(isLocalControlPlaneEcho, forKey: .isLocalControlPlaneEcho)
     }
 
     // MARK: - Factory Methods
@@ -401,11 +577,23 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var toolName: String? {
         didSet {
             toolName = AgentToolNamePolicy.accepted(toolName)
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
         }
     }
 
     public var toolInvocationID: UUID?
-    public var toolArgsJSON: String?
+    public var toolArgsJSON: String? {
+        didSet {
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
+        }
+    }
+
     public var toolResultJSON: String?
     public var toolIsError: Bool?
     public var toolResultStatus: String?
@@ -427,7 +615,11 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         taggedFileAttachments = item.taggedFileAttachments
         toolName = AgentToolNamePolicy.accepted(item.toolName)
         toolInvocationID = item.toolInvocationID
-        toolArgsJSON = sanitizeToolResults && (item.kind == .toolCall || item.kind == .toolResult) ? nil : item.toolArgsJSON
+        let copiedToolArgs = sanitizeToolResults && (item.kind == .toolCall || item.kind == .toolResult) ? nil : item.toolArgsJSON
+        toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: toolName,
+            argsJSON: copiedToolArgs
+        )
         reasoning = item.reasoning
         sequenceIndex = item.sequenceIndex
         workflow = item.workflow
@@ -560,6 +752,34 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case laneUpdateDisplayAttribution
     }
 
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(text, forKey: .text)
+        try container.encode(attachments, forKey: .attachments)
+        try container.encode(taggedFileAttachments, forKey: .taggedFileAttachments)
+        let acceptedToolName = AgentToolNamePolicy.accepted(toolName)
+        try container.encodeIfPresent(acceptedToolName, forKey: .toolName)
+        try container.encodeIfPresent(toolInvocationID, forKey: .toolInvocationID)
+        try container.encodeIfPresent(
+            AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: acceptedToolName,
+                argsJSON: toolArgsJSON
+            ),
+            forKey: .toolArgsJSON
+        )
+        try container.encodeIfPresent(toolResultJSON, forKey: .toolResultJSON)
+        try container.encodeIfPresent(toolIsError, forKey: .toolIsError)
+        try container.encodeIfPresent(toolResultStatus, forKey: .toolResultStatus)
+        try container.encodeIfPresent(reasoning, forKey: .reasoning)
+        try container.encode(sequenceIndex, forKey: .sequenceIndex)
+        try container.encodeIfPresent(workflow, forKey: .workflow)
+        try container.encodeIfPresent(codexGoalMode, forKey: .codexGoalMode)
+        try container.encode(isLocalControlPlaneEcho, forKey: .isLocalControlPlaneEcho)
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
@@ -570,7 +790,10 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         taggedFileAttachments = try container.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
         toolName = try AgentToolNamePolicy.accepted(container.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try container.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
-        toolArgsJSON = try container.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        toolArgsJSON = try AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: toolName,
+            argsJSON: container.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        )
         toolResultJSON = try container.decodeIfPresent(String.self, forKey: .toolResultJSON)
         toolIsError = try container.decodeIfPresent(Bool.self, forKey: .toolIsError)
         toolResultStatus = try container.decodeIfPresent(String.self, forKey: .toolResultStatus)
