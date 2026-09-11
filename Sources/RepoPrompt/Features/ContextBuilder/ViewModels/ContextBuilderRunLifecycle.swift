@@ -126,6 +126,20 @@ enum ContextBuilderChildConnectionFinalizer {
     }
 }
 
+enum ContextBuilderGeneratedResponseAuthority {
+    case contextOnly
+    case generate(mode: HeadlessMode, execution: ResolvedOracleExecution)
+
+    var execution: ResolvedOracleExecution? {
+        guard case let .generate(_, execution) = self else { return nil }
+        return execution
+    }
+
+    var planningModelName: String? {
+        execution?.models.map(\.displayName).joined(separator: ", ")
+    }
+}
+
 struct ContextBuilderResolvedRunAuthority {
     let configuration: ContextBuilderMCPRunConfiguration
     let agentKind: AgentProviderKind
@@ -187,8 +201,7 @@ struct ContextBuilderMCPRunConfiguration {
     let providerWorkspacePath: String
     let runBehavior: ContextBuilderRunBehavior
     let responseType: String?
-    let planningModelRaw: String?
-    let agentModelsProfile: AgentModelsSettingsProfile
+    let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
     let isSystemWorkspace: Bool
 
     var effectiveTokenBudget: Int {

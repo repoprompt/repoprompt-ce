@@ -129,6 +129,35 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(context["response"] as? String, "response-0-default")
     }
 
+    func testContextBuilderRejectsOraclePresetBeforeProviderWork() async throws {
+        let fixture = try Fixture(name: "app-only-oracle-preset")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+
+        do {
+            _ = try await invoke(
+                prepared: prepared,
+                backend: backend,
+                toolName: "context_builder",
+                arguments: [
+                    "instructions": .string("raw context instructions"),
+                    "response_type": .string("plan"),
+                    "oracle_preset": .string("Deep Review")
+                ]
+            )
+            XCTFail("Expected app-only oracle_preset rejection")
+        } catch {
+            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .appOnlyOraclePreset)
+        }
+        XCTAssertTrue(try fixture.calls().isEmpty)
+    }
+
     func testNamedDirectContinuationStaysSingleLaneAfterEnablingGroupedSettings() async throws {
         let fixture = try Fixture(name: "named-direct-grouped-settings")
         defer { fixture.cleanup() }

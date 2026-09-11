@@ -1247,7 +1247,7 @@ final class MCPServerViewModel: ObservableObject {
                 _ = authorization
             #endif
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, execution, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
@@ -1257,6 +1257,7 @@ final class MCPServerViewModel: ObservableObject {
                         agentModeSessionID,
                         agentModeRunID,
                         mode,
+                        execution,
                         prompt,
                         selection,
                         lookupContext,
@@ -1273,6 +1274,7 @@ final class MCPServerViewModel: ObservableObject {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
                 mode: mode,
+                execution: execution,
                 prompt: prompt,
                 selection: selection,
                 lookupContext: lookupContext,

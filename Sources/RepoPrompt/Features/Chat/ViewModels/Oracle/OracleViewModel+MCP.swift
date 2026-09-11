@@ -1,5 +1,6 @@
 import Foundation
 import MCP // <- required for `Value`
+import RepoPromptDomainRuntime
 
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 
@@ -9,16 +10,6 @@ extension OracleViewModel {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
-
-    // MARK: - Model Selection
-
-    /// Encapsulates the result of model selection
-    private struct ModelSelectionResult {
-        let model: AIModel
-        let mcpControlInfo: String?
-        let isAutoSelected: Bool
-        let chatPresetID: UUID? // The chat preset to use for this mode (always resolved now)
-    }
 
     enum OracleSendActivationPolicy: Equatable {
         case foregroundWhenActive
@@ -149,380 +140,62 @@ extension OracleViewModel {
         }
     }
 
-    private func oracleModelAvailabilityGuidance(for model: AIModel) -> String {
-        switch model.providerType {
-        case .claudeCode:
-            if let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) {
-                return "Configure and enable \(descriptor.groupDisplayName) in Settings."
-            }
-            return "Connect Claude Code in Settings."
-        default:
-            return "Please check that the \(model.providerType.displayName) API key is configured in Settings."
-        }
-    }
-
-    private func oracleModelAvailabilityGuidance(for presets: [ModelPreset]) -> String {
-        if let claudeFamilyModel = presets.map(\.model).first(where: { $0.providerType == .claudeCode }) {
-            return oracleModelAvailabilityGuidance(for: claudeFamilyModel)
-        }
-        return "Please check that the required API keys are configured in Settings."
-    }
-
-    /// 1) Presets OFF: use the configured MCP Oracle planning model.
-    /// 2) Presets ON & no presets exist: use the configured MCP Oracle planning model.
-    /// 3) A captured planning-model override remains authoritative unless a model was explicitly requested.
-    /// 4) Otherwise, presets ON & presets exist: use a compatible available preset; if none are available, fail loudly.
     @MainActor
-    private func selectModel(
+    func resolveOracleStartExecution(
+        mode: String,
         modelParam: String?,
-        mode rawMode: String,
-        allPresets: [ModelPreset],
+        profile: AgentModelsSettingsProfile,
         promptVM: PromptViewModel,
-        planningModelRawOverride: String? = nil
-    ) async throws -> ModelSelectionResult {
-        /// Resolve a chat preset for the MCP mode even when the selected model preset
-        /// does not map one explicitly. Ensures UI display and prompt building stay in sync.
-        func resolveChatPreset(for mode: String, from mappings: ChatPresetMappings?) -> (id: UUID?, name: String?) {
-            if let id = mappings?.presetID(for: mode),
-               let preset = ChatPresetManager.shared.preset(with: id)
-            {
-                return (id, preset.name)
-            }
-            if let builtIn = findBuiltInPreset(for: mode) {
-                return (builtIn.id, builtIn.name)
-            }
-            return (nil, nil)
-        }
-
-        func norm(_ s: String) -> String {
-            s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
-        let mode = norm(rawMode)
-        guard ["chat", "plan", "review"].contains(mode) else {
-            throw ChatToolError.invalidParams("Invalid mode: \(mode). Valid modes: chat, plan, review")
-        }
-        let modeLabel = mode.capitalized
-
-        func strictPlanningModel() throws -> AIModel {
-            let resolution = if let planningModelRawOverride {
-                PromptViewModel.mcpOraclePlanningModelResolution(
-                    rawValue: planningModelRawOverride,
-                    isModelAvailable: { promptVM.mcpOracleIsProviderConfigured(for: $0) }
-                )
-            } else {
-                promptVM.mcpOraclePlanningModelResolution()
-            }
-            if case let .configured(model) = resolution {
-                return model
-            }
-            let message = PromptViewModel.mcpOraclePlanningModelErrorMessage(
-                for: resolution,
-                availabilityGuidance: { model in self.oracleModelAvailabilityGuidance(for: model) }
-            ) ?? "MCP Oracle model is not configured."
-            throw ChatToolError.invalidParams(message)
-        }
-
-        // Settings toggle: "Use Model Preset for MCP chat"
-        let settingsStore = GlobalSettingsStore.shared
-        let useModelPresets = settingsStore.mcpShowModelPresets()
-        let temporarilyDisabled = settingsStore.mcpTemporarilyDisablePresets()
-
-        // When presets are temporarily hidden by wizard, treat as empty
-        // This ensures hiding presets behaves identically to having no presets
-        let effectivePresets: [ModelPreset] = (useModelPresets && temporarilyDisabled) ? [] : allPresets
-        let hasAnyModelPresets = !effectivePresets.isEmpty
-
-        /// Helpers for consistent info labels
-        func infoLine(reason: String, model: AIModel) -> String {
-            "\(modeLabel) mode • \(reason) (\(model.displayName))"
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // CASE A: Model Presets are DISABLED
-        // Uses planningModel (MCP default model) - same as presets ON but empty.
-        // This ensures consistent MCP behavior regardless of preset toggle state.
-        // ─────────────────────────────────────────────────────────────────
-        if !useModelPresets {
-            // MCP always uses the explicitly configured Oracle planning model when presets are off.
-            let planningModel = try strictPlanningModel()
-            let resolvedPreset = resolveChatPreset(for: mode, from: nil)
-            let info = resolvedPreset.name ?? infoLine(reason: "MCP Oracle Model", model: planningModel)
-
-            // If a model was explicitly requested, only accept planningModel or "current_chat_model"
-            if let mp = modelParam {
-                let mpn = norm(mp)
-                if mpn == "current_chat_model" || mpn == norm(planningModel.displayName) {
-                    return .init(
-                        model: planningModel,
-                        mcpControlInfo: info,
-                        isAutoSelected: false,
-                        chatPresetID: resolvedPreset.id
-                    )
-                }
-
-                throw ChatToolError.invalidParams(
-                    "Model '\(mp)' not allowed when presets are disabled. " +
-                        "Pass 'current_chat_model' or '\(planningModel.displayName)', or enable model presets."
-                )
-            }
-
-            // No explicit model param → return planningModel
-            return .init(
-                model: planningModel,
-                mcpControlInfo: info,
-                isAutoSelected: true,
-                chatPresetID: resolvedPreset.id
-            )
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // CASE B: Model Presets are ENABLED
-        // 1) No presets defined at all → use the configured Oracle planning model.
-        // 2) Presets exist → pick an available preset for the mode; if none available, fail loudly.
-        // ─────────────────────────────────────────────────────────────────
-
-        // B.1: No model presets exist at all → use default MCP model (error if unavailable)
-        if !hasAnyModelPresets {
-            // Default MCP model must be explicitly configured and available when presets are enabled but none are defined.
-            let planningModel = try strictPlanningModel()
-            let resolvedPreset = resolveChatPreset(for: mode, from: nil)
-            let info = resolvedPreset.name ?? infoLine(reason: "MCP Oracle Model", model: planningModel)
-            // Respect explicit model only for the sentinel or configured Oracle model display name
-            if let mp = modelParam {
-                let mpn = norm(mp)
-                if mpn == "current_chat_model" ||
-                    mpn == norm(planningModel.displayName)
-                {
-                    return .init(
-                        model: planningModel,
-                        mcpControlInfo: info,
-                        isAutoSelected: false,
-                        chatPresetID: resolvedPreset.id
-                    )
-                }
-                throw ChatToolError.invalidParams(
-                    "Model '\(mp)' not found. No model presets are defined. Pass 'current_chat_model' or the display name shown by oracle_utils op=models, or create presets and enable them in Settings."
-                )
-            }
-            return .init(
-                model: planningModel,
-                mcpControlInfo: info,
-                isAutoSelected: true,
-                chatPresetID: resolvedPreset.id
-            )
-        }
-
-        // B.2: Model presets exist → preserve a captured Oracle primary unless explicitly overridden.
-        if modelParam == nil, planningModelRawOverride != nil {
-            let planningModel = try strictPlanningModel()
-            let resolvedPreset = resolveChatPreset(for: mode, from: nil)
-            let info = resolvedPreset.name ?? infoLine(reason: "MCP Oracle Model", model: planningModel)
-            return .init(
-                model: planningModel,
-                mcpControlInfo: info,
-                isAutoSelected: true,
-                chatPresetID: resolvedPreset.id
-            )
-        }
-
-        let supporting: [ModelPreset] = effectivePresets.filteredForMode(mode)
-        var available: [ModelPreset] = []
-        for p in supporting {
-            if promptVM.isModelAvailable(p.model) {
-                available.append(p)
-            }
-        }
-
-        // Explicit model request via param
-        if let mp = modelParam {
-            // Try to resolve a user-defined preset by id/name/fuzzy
-            if let preset = try await findPreset(named: mp, in: effectivePresets) {
-                try validateModeCompatibility(preset: preset, mode: mode, allPresets: effectivePresets)
-
-                // Check if the preset's model is available (model presets are sacred)
-                if !promptVM.isModelAvailable(preset.model) {
-                    throw ChatToolError.invalidParams(
-                        "Model preset '\(preset.name)' uses model '\(preset.model.displayName)' which is not available. " +
-                            oracleModelAvailabilityGuidance(for: preset.model)
-                    )
-                }
-
-                let modelName = preset.model.displayName
-                let resolvedPreset = resolveChatPreset(for: mode, from: preset.chatPresetMappings)
-
-                let info = resolvedPreset.name ?? "\(modeLabel) mode • \(preset.name) (\(modelName))"
-
-                return .init(model: preset.model, mcpControlInfo: info, isAutoSelected: false, chatPresetID: resolvedPreset.id)
-            }
-
-            // No preset match: do not allow sentinel fallback here since presets exist.
-            throw buildModelNotFoundError(
-                modelParam: mp,
+        snapshotOverride: OracleSelectionSnapshot? = nil
+    ) throws -> ResolvedOracleExecution {
+        let snapshot = snapshotOverride ?? .mcp(profile: profile)
+        do {
+            return try OracleExecutionResolver(promptViewModel: promptVM).resolve(
+                choice: modelParam.map(OracleStartChoice.oracleSend) ?? .automatic,
                 mode: mode,
-                allPresets: effectivePresets,
-                hasPresets: hasAnyModelPresets
+                snapshot: snapshot
             )
+        } catch {
+            throw ChatToolError.invalidParams(error.localizedDescription)
         }
-
-        // No explicit model → pick first available compatible preset
-        if let first = available.first {
-            let modelName = first.model.displayName
-            let resolvedPreset = resolveChatPreset(for: mode, from: first.chatPresetMappings)
-            let info = resolvedPreset.name ?? "\(modeLabel) mode • Auto: \(first.name) (\(modelName))"
-
-            return .init(model: first.model, mcpControlInfo: info, isAutoSelected: true, chatPresetID: resolvedPreset.id)
-        }
-
-        // Hard line: user disabled this mode across presets
-        if supporting.isEmpty {
-            throw ChatToolError.invalidParams(
-                "Mode '\(mode)' is disabled by your configured model presets. Choose a different mode, edit your presets to enable this mode, or disable 'Use Model Preset for MCP chat' in Settings."
-            )
-        }
-
-        // Presets exist for this mode but none have available models - error instead of silent fallback
-        // (model presets are sacred)
-        let presetNames = supporting.map(\.name).joined(separator: ", ")
-        throw ChatToolError.invalidParams(
-            "None of your model presets for '\(mode)' mode are available. " +
-                "Configured presets: \(presetNames). " +
-                oracleModelAvailabilityGuidance(for: supporting)
-        )
     }
 
     @MainActor
-    func resolveMCPFollowUpModel(
+    func resolveOracleConversationExecution(
+        session: ChatSession,
+        mode: String,
+        profile: AgentModelsSettingsProfile,
+        promptVM: PromptViewModel,
+        snapshotOverride: OracleSelectionSnapshot? = nil
+    ) throws -> ResolvedOracleExecution {
+        guard let modelString = session.preferredAIModel else {
+            throw ChatToolError.invalidParams("Oracle conversation has no persisted model.")
+        }
+        let snapshot = snapshotOverride ?? .mcp(profile: profile)
+        do {
+            return try OracleExecutionResolver(promptViewModel: promptVM).resolveConversation(
+                modelString: modelString,
+                persistedChatPresetID: session.selectedChatPresetID,
+                mode: mode,
+                snapshot: snapshot
+            )
+        } catch {
+            throw ChatToolError.invalidParams(error.localizedDescription)
+        }
+    }
+
+    @MainActor
+    func resolveMCPFollowUpExecution(
         mode: String,
         modelParam: String? = nil,
-        workspaceID: UUID? = nil,
-        planningModelRawOverride: String? = nil,
-        allPresetsOverride: [ModelPreset]? = nil
-    ) async throws -> (model: AIModel, chatPresetID: UUID?, mcpControlInfo: String?) {
-        let allPresets = allPresetsOverride ?? ModelPresetsManager.shared.allPresets()
-        let selection = try await selectModel(
-            modelParam: modelParam,
+        workspaceID: UUID? = nil
+    ) throws -> ResolvedOracleExecution {
+        let profile = GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        return try resolveOracleStartExecution(
             mode: mode,
-            allPresets: allPresets,
-            promptVM: promptViewModel,
-            planningModelRawOverride: planningModelRawOverride ?? workspaceID.flatMap {
-                GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: $0).planningModelRaw
-            }
-        )
-        return (selection.model, selection.chatPresetID, selection.mcpControlInfo)
-    }
-
-    /// Finds a built-in chat preset for the given mode
-    @MainActor
-    private func findBuiltInPreset(for mode: String) -> ChatPreset? {
-        let manager = ChatPresetManager.shared
-        switch mode.lowercased() {
-        case "chat":
-            return manager.defaultPreset(for: .chat)
-                ?? manager.builtInPresets.first { $0.mode == .chat && $0.id != ChatPreset.BuiltIn.manual.id }
-                ?? manager.builtInPresets.first { $0.mode == .chat }
-        case "plan":
-            return manager.defaultPreset(for: .plan)
-                ?? manager.builtInPresets.first { $0.mode == .plan }
-        case "review":
-            return manager.defaultPreset(for: .review)
-                ?? manager.builtInPresets.first { $0.mode == .review }
-        default:
-            return manager.defaultPreset(for: .chat)
-                ?? manager.builtInPresets.first { $0.mode == .chat && $0.id != ChatPreset.BuiltIn.manual.id }
-                ?? manager.builtInPresets.first { $0.mode == .chat }
-        }
-    }
-
-    /// Finds a preset by name using various matching strategies
-    @MainActor
-    private func findPreset(named name: String, in presets: [ModelPreset]) async throws -> ModelPreset? {
-        // Try by ID first
-        if let presetId = UUID(uuidString: name),
-           let preset = presets.first(where: { $0.id == presetId })
-        {
-            return preset
-        }
-
-        // Try exact name match (case-insensitive)
-        if let preset = presets.first(where: { $0.name.lowercased() == name.lowercased() }) {
-            return preset
-        }
-
-        // Try fuzzy matching
-        let availableNames = presets.map(\.name)
-        let closestName = await Task.detached(priority: .userInitiated) {
-            ModelPreset.findBestMatch(name, among: availableNames)
-        }.value
-
-        if let closestName {
-            print("[MCP] Fuzzy matched model '\(name)' to preset '\(closestName)'")
-            return presets.first { $0.name == closestName }
-        }
-
-        return nil
-    }
-
-    /// Validates that a preset supports the requested mode
-    private func validateModeCompatibility(
-        preset: ModelPreset,
-        mode: String,
-        allPresets: [ModelPreset]
-    ) throws {
-        guard let supportedModes = preset.supportedModes else { return }
-
-        let isSupported = switch mode {
-        case "chat": supportedModes.chat
-        case "plan": supportedModes.plan
-        case "review": supportedModes.review
-        default: true
-        }
-
-        guard isSupported else {
-            // Build list of supported modes
-            var supportedModesList: [String] = []
-            if supportedModes.chat { supportedModesList.append("chat") }
-            if supportedModes.plan { supportedModesList.append("plan") }
-            if supportedModes.review { supportedModesList.append("review") }
-
-            let supportedModesStr = supportedModesList.isEmpty ?
-                "no modes" :
-                supportedModesList.joined(separator: ", ")
-
-            // Find alternatives
-            let alternatives = allPresets.filteredForMode(mode).map(\.name)
-            let alternativesNote = if alternatives.isEmpty {
-                " No defined presets support '\(mode)' mode. Use `oracle_utils op=models` to view each preset's supported modes."
-            } else {
-                " Alternative presets for \(mode) mode: \(alternatives.joined(separator: ", "))"
-            }
-
-            throw ChatToolError.invalidParams(
-                "Model preset '\(preset.name)' does not support '\(mode)' mode. " +
-                    "This preset only supports: \(supportedModesStr)." +
-                    alternativesNote +
-                    " To fix: either use a supported mode (\(supportedModesStr)) or choose a different model."
-            )
-        }
-    }
-
-    /// Builds appropriate error message when model is not found
-    private func buildModelNotFoundError(
-        modelParam: String,
-        mode: String,
-        allPresets: [ModelPreset],
-        hasPresets: Bool
-    ) -> ChatToolError {
-        if !hasPresets {
-            return ChatToolError.invalidParams(
-                "Model '\(modelParam)' not found. No model presets are defined. " +
-                    "Pass 'current_chat_model' or the display name of the current/planning model (as shown by oracle_utils op=models), " +
-                    "or create presets and enable them in Settings."
-            )
-        }
-        let available = allPresets.map(\.name).joined(separator: ", ")
-        return ChatToolError.invalidParams(
-            "Model '\(modelParam)' not found. Available presets: \(available). " +
-                "Choose a compatible preset (see oracle_utils op=models), or disable 'Use Model Preset for MCP Oracle' to use the current oracle model."
+            modelParam: modelParam,
+            profile: profile,
+            promptVM: promptViewModel
         )
     }
 
@@ -605,28 +278,44 @@ extension OracleViewModel {
     }
 
     @MainActor
-    private func resolveSessionForExplicitContinuation(
+    func resolveSessionForExplicitContinuation(
         id rawID: String,
-        tabID: UUID?
-    ) async throws -> ChatSession? {
+        tabID: UUID?,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) async throws -> ChatSession {
+        let session: ChatSession
         if let loaded = resolveSession(id: rawID) {
-            return loaded
-        }
-        guard let tabID,
-              let candidate = workspaceManager.storedBindingCandidate(forContextID: tabID),
-              let workspace = workspaceManager.workspaces.first(where: { $0.id == candidate.workspaceID }),
-              let persisted = try await chatData.findSession(for: workspace, id: rawID, composeTabID: tabID)
-        else {
-            return nil
+            session = loaded
+        } else {
+            guard let tabID,
+                  let candidate = workspaceManager.storedBindingCandidate(forContextID: tabID),
+                  let workspace = workspaceManager.workspaces.first(where: { $0.id == candidate.workspaceID }),
+                  let persisted = try await chatData.findSession(for: workspace, id: rawID, composeTabID: tabID)
+            else {
+                throw ChatToolError.invalidParams("Chat with ID '\(rawID)' not found")
+            }
+
+            // Inactive headless generation deliberately avoids publishing into the active
+            // workspace's chat catalog. Load only an explicitly requested continuation;
+            // activation remains disabled for an inactive tab, so currentSession is untouched.
+            if !sessions.contains(where: { $0.id == persisted.id }) {
+                sessions.append(persisted)
+            }
+            session = persisted
         }
 
-        // Inactive headless generation deliberately avoids publishing into the active
-        // workspace's chat catalog. Load only an explicitly requested continuation;
-        // activation remains disabled for an inactive tab, so currentSession is untouched.
-        if !sessions.contains(where: { $0.id == persisted.id }) {
-            sessions.append(persisted)
+        guard Self.sessionBelongsToResolvedTab(session, tabID: tabID) else {
+            throw ChatToolError.invalidParams("Chat with ID '\(rawID)' belongs to a different tab")
         }
-        return persisted
+        guard Self.sessionMatchesOracleOwnerForExplicitContinuation(
+            session,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID
+        ) else {
+            throw ChatToolError.invalidParams("Chat with ID '\(rawID)' belongs to a different Agent Mode owner")
+        }
+        return session
     }
 
     @MainActor
@@ -1032,22 +721,12 @@ extension OracleViewModel {
         }
 
         if let idString = idString?.trimmingCharacters(in: .whitespacesAndNewlines), !idString.isEmpty {
-            guard let existing = try await resolveSessionForExplicitContinuation(
+            let existing = try await resolveSessionForExplicitContinuation(
                 id: idString,
-                tabID: resolvedTabID
-            ) else {
-                throw ChatToolError.invalidParams("Chat with ID '\(idString)' not found")
-            }
-            guard Self.sessionBelongsToResolvedTab(existing, tabID: resolvedTabID) else {
-                throw ChatToolError.invalidParams("Chat with ID '\(idString)' belongs to a different tab")
-            }
-            guard Self.sessionMatchesOracleOwnerForExplicitContinuation(
-                existing,
+                tabID: resolvedTabID,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
-            ) else {
-                throw ChatToolError.invalidParams("Chat with ID '\(idString)' belongs to a different Agent Mode owner")
-            }
+            )
 
             await applyOracleOwnerIfNeeded(
                 sessionID: existing.id,
@@ -1115,7 +794,8 @@ extension OracleViewModel {
         args: [String: Value],
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext? = nil,
-        resolvedModel: AIModel? = nil,
+        resolvedExecution: ResolvedOracleExecution? = nil,
+        resolvedLaneIndex: Int = 0,
         implicitSessionID: UUID? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws
@@ -1154,48 +834,29 @@ extension OracleViewModel {
         let chatName = args["chat_name"]?.stringValue
         let chatIdIn = args["chat_id"]?.stringValue
         let newChat = args["new_chat"]?.boolValue ?? false
-        let modelParam = args["model"]?.stringValue
-        // Deprecated compatibility parameter: Oracle replies are text-only and no longer emit diffs.
         _ = args["include_diffs"]?.boolValue
         let selectionOverride = tabContext?.packaging.selection
         let lookupContextOverride = tabContext?.packaging.lookupContext
         let reviewGitContextOverride = tabContext?.packaging.reviewGitContext
 
-        // ────────── 2. Handle model selection ──────────
-        let presetsManager = ModelPresetsManager.shared
-        let allPresets = presetsManager.allPresets()
-
-        let modelSelection: ModelSelectionResult = if let resolvedModel {
-            ModelSelectionResult(
-                model: resolvedModel,
-                mcpControlInfo: "Oracle group • \(resolvedModel.displayName)",
-                isAutoSelected: false,
-                chatPresetID: findBuiltInPreset(for: mode)?.id
-            )
-        } else {
-            try await selectModel(
-                modelParam: modelParam,
-                mode: mode,
-                allPresets: allPresets,
-                promptVM: promptVM
-            )
+        guard let resolvedExecution else {
+            throw ChatToolError.internalError("Oracle execution was not resolved before dispatch.")
         }
-
-        let selectedModel = modelSelection.model
-        let mcpControlledModel = modelSelection.mcpControlInfo
+        guard resolvedExecution.models.indices.contains(resolvedLaneIndex) else {
+            throw ChatToolError.internalError("Resolved Oracle lane index is invalid.")
+        }
+        let selectedModel = resolvedExecution.models[resolvedLaneIndex]
+        let selectionLabel = switch resolvedExecution.selection {
+        case let .explicitPreset(_, name): "Model Preset \(name)"
+        case let .automaticPreset(_, name): "Automatic Model Preset \(name)"
+        case .agentModels: "Agent Models"
+        case .rawPrimaryOverride: "Raw model override"
+        case .conversation: "Oracle conversation"
+        case .contextBuilderUI: "Context Builder"
+        }
+        let mcpControlledModel = "\(mode.capitalized) mode • \(selectionLabel) (\(selectedModel.displayName))"
         let overrideModelName = selectedModel.displayName
-        let overrideChatPresetName: String? = {
-            if let presetID = modelSelection.chatPresetID,
-               let chatPreset = ChatPresetManager.shared.preset(with: presetID)
-            {
-                return chatPreset.name
-            }
-            // Fallback: map the requested mode to a built-in chat preset so the orange chip matches the active mode
-            if let builtIn = findBuiltInPreset(for: mode) {
-                return builtIn.name
-            }
-            return nil
-        }()
+        let overrideChatPresetName = resolvedExecution.promptConfiguration.chatPreset.name
 
         // ────────── 3. Resolve chat session ──────────
         let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
@@ -1213,19 +874,19 @@ extension OracleViewModel {
         pinSession(chatID)
         defer { unpinSession(chatID) }
 
-        // Set MCP control info for the MCP-triggered session only
-        if let mcpControlledModel {
-            setMCPSessionUIState(
-                MCPSessionUIState(
-                    modelInfo: mcpControlledModel,
-                    overrideModelName: overrideModelName,
-                    overrideChatPresetName: overrideChatPresetName
-                ),
-                for: chatID
-            )
-        } else {
-            clearMCPSessionUIState(for: chatID)
+        guard let sessionIndex = sessions.firstIndex(where: { $0.id == chatID }) else {
+            throw ChatToolError.internalError("Oracle conversation was not created.")
         }
+        sessions[sessionIndex].preferredAIModel = selectedModel.rawValue
+        sessions[sessionIndex].selectedChatPresetID = resolvedExecution.promptConfiguration.chatPresetID
+        setMCPSessionUIState(
+            MCPSessionUIState(
+                modelInfo: mcpControlledModel,
+                overrideModelName: overrideModelName,
+                overrideChatPresetName: overrideChatPresetName
+            ),
+            for: chatID
+        )
 
         // ────────── 4. Determine mode ──────────
         let effectiveMode = PromptViewModel.PlanActMode(rawValue: mode.capitalized) ?? .chat
@@ -1237,7 +898,8 @@ extension OracleViewModel {
                 message,
                 sessionID: chatID,
                 overrideModel: selectedModel,
-                overrideChatPresetID: modelSelection.chatPresetID,
+                overrideChatPresetID: resolvedExecution.promptConfiguration.chatPresetID,
+                oraclePromptConfiguration: resolvedExecution.promptConfiguration,
                 overrideMode: effectiveMode,
                 gitInclusionOverride: nil,
                 gitBaseOverride: nil,
@@ -1625,7 +1287,7 @@ extension OracleViewModel {
         reviewGitContext: FrozenPromptGitReviewContext = .automaticOnly(),
         workspaceID: UUID? = nil,
         lookupContext: WorkspaceLookupContext? = nil,
-        resolvedModel: AIModel? = nil,
+        resolvedExecution: ResolvedOracleExecution? = nil,
         finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
@@ -1677,28 +1339,22 @@ extension OracleViewModel {
         let model: AIModel
         let chatPresetID: UUID?
 
-        if let resolvedModel {
-            model = resolvedModel
-            chatPresetID = nil
+        if let resolvedExecution {
+            model = resolvedExecution.primaryModel
+            chatPresetID = resolvedExecution.promptConfiguration.chatPresetID
         } else if useChatModelDirectly {
             // UI-triggered: use the current chat model directly, bypassing MCP preset logic
             model = promptViewModel.preferredAIModel
             chatPresetID = nil
         } else {
-            // MCP-triggered: use preset resolution logic
-            let presetsManager = ModelPresetsManager.shared
-            let allPresets = presetsManager.allPresets()
-
             try Task.checkCancellation()
-
-            let modelSelection = try await selectModel(
-                modelParam: modelParam,
+            let execution = try resolveMCPFollowUpExecution(
                 mode: mode.mcpModeName,
-                allPresets: allPresets,
-                promptVM: promptViewModel
+                modelParam: modelParam,
+                workspaceID: workspaceID
             )
-            model = modelSelection.model
-            chatPresetID = modelSelection.chatPresetID
+            model = execution.primaryModel
+            chatPresetID = execution.promptConfiguration.chatPresetID
         }
 
         // 2) Build snapshot
@@ -1719,7 +1375,8 @@ extension OracleViewModel {
             from: snapshot,
             model: model,
             mode: mode,
-            gitScopeOverride: gitScopeOverride
+            gitScopeOverride: gitScopeOverride,
+            oraclePromptConfiguration: resolvedExecution?.promptConfiguration
         )
 
         try Task.checkCancellation()

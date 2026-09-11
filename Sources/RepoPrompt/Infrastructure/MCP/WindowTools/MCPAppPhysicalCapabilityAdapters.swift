@@ -127,6 +127,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ agentModeSessionID: UUID?,
         _ agentModeRunID: UUID?,
         _ mode: HeadlessMode,
+        _ execution: ResolvedOracleExecution,
         _ prompt: String,
         _ selection: StoredSelection,
         _ lookupContext: WorkspaceLookupContext?,

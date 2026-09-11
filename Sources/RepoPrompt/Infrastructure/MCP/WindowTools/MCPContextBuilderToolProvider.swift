@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 
 /// Carries existing non-Sendable UI snapshot/DTO values through the provider's @Sendable timeline
 /// wrappers without broadening their conformances. Each operation stores once and is fully awaited
@@ -297,6 +298,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             | `plan` | Generates implementation plan for the task |
             | `review` | Generates code review with git diff context |
 
+            **Oracle preset**: For app-backed `plan`, `question`, or `review` runs, pass `oracle_preset` to select an exposed Model Preset by name or UUID. The preset determines the complete ordered Oracle roster and request prompt; it is separate from the Context Builder discovery `agent` and `model`. Omit it to use automatic Model Preset selection. Direct-headless execution rejects this app-only argument.
+
             **Structuring instructions** (XML tags):
             - `<task>`: Main goal
             - `<context>`: Background, constraints, known file references
@@ -322,6 +325,11 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 properties: [
                     "instructions": .string(description: "Your request, ideally structured with XML tags: <task> for the main goal, <context> for background/constraints/file references, <discovery_agent-guidelines> for optional starting hints. Describe what you need — the agent finds the right files."),
                     "response_type": .string(description: "Optional: 'plan' to generate implementation plan, 'question' to ask a question, or 'review' to generate a code review. Omit or 'clarify' to just return context.", enum: ["plan", "question", "review", "clarify"]),
+                    "oracle_preset": .string(
+                        description: "App-backed only: exposed Model Preset name or UUID for a plan, question, or review response. This selects the Oracle roster and prompt independently of the discovery model.",
+                        minLength: 1,
+                        maxLength: OracleRosterContract.maximumModelIdentifierLength
+                    ),
                     "context_pack_ref": .string(description: "Direct-headless only: canonical oracle-pack:sha256 reference to an already persisted frozen Context Builder package. Mutually exclusive with instructions."),
                     "export_response": .boolean(description: "When true, export the generated response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Requires a response_type that generates a response. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt.")
                 ],
@@ -338,6 +346,31 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         }
     }
 
+    nonisolated static func parseOraclePreset(
+        _ value: Value?,
+        responseType: ContextBuilderResponseType?
+    ) throws -> String? {
+        guard let value else { return nil }
+        guard let stringValue = value.stringValue else {
+            throw MCPError.invalidParams("oracle_preset must be a string")
+        }
+        let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw MCPError.invalidParams("oracle_preset cannot be blank")
+        }
+        guard trimmed.count <= OracleRosterContract.maximumModelIdentifierLength else {
+            throw MCPError.invalidParams(
+                "oracle_preset cannot exceed \(OracleRosterContract.maximumModelIdentifierLength) characters"
+            )
+        }
+        guard responseType?.wantsResponse == true else {
+            throw MCPError.invalidParams(
+                "oracle_preset requires response_type plan, question, or review."
+            )
+        }
+        return trimmed
+    }
+
     private static func executeContextBuilder(
         args: [String: Value],
         connectionID: UUID?,
@@ -351,6 +384,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         let instructions = args["instructions"]?.stringValue ?? ""
         let metadata = await dependencies.context.captureRequestMetadata()
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
+        let oraclePreset = try parseOraclePreset(args["oracle_preset"], responseType: responseType)
         let exportResponse: Bool
         if let value = args["export_response"] {
             guard let boolValue = value.boolValue else {
@@ -428,12 +462,18 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         ) == .completed else {
             throw CancellationError()
         }
-        let runAuthority = try await contextBuilderVM.resolveMCPRunAuthority(
-            identity: resolvedIdentity,
-            nestedTabContext: tabResolution.nestedTabContext,
-            workspaceContext: workspaceContext,
-            responseType: responseType?.rawValue
-        )
+        let runAuthority: ContextBuilderResolvedRunAuthority
+        do {
+            runAuthority = try await contextBuilderVM.resolveMCPRunAuthority(
+                identity: resolvedIdentity,
+                nestedTabContext: tabResolution.nestedTabContext,
+                workspaceContext: workspaceContext,
+                responseType: responseType?.rawValue,
+                oraclePreset: oraclePreset
+            )
+        } catch let error as OracleExecutionResolutionError {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
 
         // swiftformat:disable conditionalAssignment
         let capturedOracleExportDestination: OracleExportDestination?
@@ -469,39 +509,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 )
             }
         }) {
-            let wantsResponse = responseType?.wantsResponse ?? false
             let contextBuilderTokenBudget = runAuthority.configuration.effectiveTokenBudget
-            let promptManager = targetWindow.promptManager
-
-            let planModelName: String? = await wantsResponse ? MainActor.run {
-                let settingsStore = GlobalSettingsStore.shared
-                let useModelPresets = settingsStore.mcpShowModelPresets()
-                let temporarilyDisabled = settingsStore.mcpTemporarilyDisablePresets()
-
-                if !useModelPresets {
-                    return runAuthority.configuration.planningModelRaw
-                        .flatMap(AIModel.fromModelName)?.displayName
-                }
-
-                let allPresets = ModelPresetsManager.shared.presets
-                let effectivePresets = temporarilyDisabled ? [] : allPresets
-
-                if effectivePresets.isEmpty {
-                    return runAuthority.configuration.planningModelRaw
-                        .flatMap(AIModel.fromModelName)?.displayName
-                }
-
-                let modeFiltered = effectivePresets.filter { preset in
-                    responseType?.supportsPresetMode(preset) ?? false
-                }
-                for preset in modeFiltered {
-                    if promptManager.isModelAvailable(preset.model) {
-                        return preset.model.displayName
-                    }
-                }
-                return runAuthority.configuration.planningModelRaw
-                    .flatMap(AIModel.fromModelName)?.displayName
-            } : nil
+            let planModelName = runAuthority.configuration.generatedResponseAuthority.planningModelName
 
             let sendStageProgress = dependencies.execution.sendStageProgress
             let progressTimeline = ContextBuilderMCPProgressTimeline { event in
@@ -544,7 +553,6 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         try await contextBuilderVM.runContextBuilderForMCP(
                             authority: runAuthority,
                             instructionsOverride: instructions.isEmpty ? nil : instructions,
-                            planModelName: planModelName,
                             workspaceContext: workspaceContext,
                             mcpControlToken: mcpControlToken,
                             progressReporter: progressReporter,
@@ -789,6 +797,15 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         )
                     }
 
+                    guard case let .generate(capturedMode, execution) =
+                        runAuthority.configuration.generatedResponseAuthority,
+                        capturedMode == mode
+                    else {
+                        throw MCPError.internalError(
+                            "Context Builder generated-response authority does not match the requested mode"
+                        )
+                    }
+
                     let modeLabel = responseType?.generationLabel ?? "question"
                     await dependencies.execution.sendStageProgress(
                         connectionID,
@@ -811,6 +828,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                                 tabResolution.agentModeSessionID,
                                 tabResolution.agentModeRunID,
                                 mode,
+                                execution,
                                 prompt,
                                 sel,
                                 lookupContext,

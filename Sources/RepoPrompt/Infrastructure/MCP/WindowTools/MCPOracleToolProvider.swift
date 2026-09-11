@@ -104,7 +104,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
             description: """
             Consult a second AI for planning, review, or questions.
 
-            Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode. When `chat_id` and `new_chat` are omitted, the resolved tab resumes its selected eligible conversation, falling back to the most recent eligible conversation. Set `new_chat=true` to force a new conversation; `model` is valid only for that explicit start.
+            Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode. When `chat_id` and `new_chat` are omitted, the resolved tab resumes its selected eligible conversation, falling back to the most recent eligible conversation. Set `new_chat=true` to force a new conversation; `model` is valid only for that explicit start. With Model Presets exposed, an exact preset UUID or name is resolved before raw-model interpretation and supplies the complete roster and mapped Chat Preset. An available raw model replaces only the configured primary and retains configured additional Oracles.
             Use `oracle_utils` for passive helpers like models and sessions.
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
@@ -130,7 +130,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         description: "Set true to force a new conversation. When false or omitted without chat_id, resume the selected or most recent eligible conversation."
                     ),
                     "model": .string(
-                        description: "Optional primary-model override for an explicit new_chat=true start; rejected on continuation.",
+                        description: "Optional exposed Model Preset name/UUID or available raw primary-model override for an explicit new_chat=true start. Exact preset identity wins a collision; a raw model retains configured additional Oracles. Rejected on continuation.",
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
                     "export_response": .boolean(

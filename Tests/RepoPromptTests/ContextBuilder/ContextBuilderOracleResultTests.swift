@@ -33,14 +33,6 @@ final class ContextBuilderOracleResultTests: XCTestCase {
             contextBuilderFollowUpModelLine(dto: dto, fallback: "CLI-GPT"),
             "model-0 + model-1 + model-2"
         )
-        XCTAssertEqual(
-            contextBuilderJoinedFollowUpModelLine(
-                primaryDisplayName: "CLI-GPT-5.6 Sol High",
-                additionalModelRaws: ["second-raw", "  ", "third-raw"]
-            ),
-            "CLI-GPT-5.6 Sol High + second-raw + third-raw"
-        )
-
         let text = ToolOutputFormatter.formatDiscoverContext(value: raw).compactMap { block -> String? in
             guard case let .text(text, _, _) = block else { return nil }
             return text

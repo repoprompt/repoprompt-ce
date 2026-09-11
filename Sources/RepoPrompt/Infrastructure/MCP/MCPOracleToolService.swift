@@ -486,55 +486,49 @@ struct MCPOracleToolService {
     }
 
     private func executeOracleModelsUtility() async throws -> Value {
-        let (showModelPresets, temporarilyDisabled) = await MainActor.run {
-            let store = GlobalSettingsStore.shared
-            return (store.mcpShowModelPresets(), store.mcpTemporarilyDisablePresets())
+        let settingsStore = GlobalSettingsStore.shared
+        let exposesPresets = settingsStore.mcpShowModelPresets()
+            && !settingsStore.mcpTemporarilyDisablePresets()
+        let presets = exposesPresets ? ModelPresetsManager.shared.allPresets() : []
+        guard !presets.isEmpty else {
+            let model = try defaultCurrentChatModelInfo()
+            return .string(
+                "Available models:\n- \(model.id): \(model.name) — modes: [Chat, Plan, Review] — \(model.description ?? "MCP Oracle Model")"
+            )
         }
 
-        var models: [ToolResultDTOs.ModelInfo] = []
-
-        if showModelPresets {
-            let presets = temporarilyDisabled ? [] : await ModelPresetsManager.shared.allPresets()
-            if !presets.isEmpty {
-                for preset in presets {
-                    let supportedModes: ToolResultDTOs.SupportedModesInfo = {
-                        if let modes = preset.supportedModes {
-                            return ToolResultDTOs.SupportedModesInfo(
-                                chat: modes.chat,
-                                plan: modes.plan,
-                                review: modes.review
-                            )
-                        }
-                        return ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
-                    }()
-                    models.append(ToolResultDTOs.ModelInfo(
-                        id: preset.id.uuidString,
-                        name: preset.name,
-                        description: preset.description,
-                        supportedModes: supportedModes
-                    ))
+        let chatPresets = ChatPresetManager.shared.allPresets
+        var lines = ["Available Model Presets (automatic-selection priority order):"]
+        for (priority, preset) in presets.enumerated() {
+            lines.append("- \(priority + 1). \(preset.name) (\(preset.id.uuidString))")
+            for (laneIndex, rawModel) in preset.modelStrings.enumerated() {
+                let label = OracleRosterContract.displayLabel(laneIndex: laneIndex)
+                if let model = AIModel.fromModelName(rawModel) {
+                    let availability = promptVM.mcpOracleIsProviderConfigured(for: model)
+                        ? "available"
+                        : "unavailable"
+                    lines.append("  - \(label): \(model.displayName) — \(availability)")
+                } else {
+                    lines.append("  - \(label): \(rawModel) — unknown model")
                 }
-            } else {
-                try models.append(defaultCurrentChatModelInfo())
             }
-        } else {
-            try models.append(defaultCurrentChatModelInfo())
-        }
+            var modes: [String] = []
+            if preset.supports(mode: "chat") { modes.append("Chat") }
+            if preset.supports(mode: "plan") { modes.append("Plan") }
+            if preset.supports(mode: "review") { modes.append("Review") }
+            lines.append("  - Modes: [\(modes.joined(separator: ", "))]")
 
-        func bracketedModes(_ supportedModes: ToolResultDTOs.SupportedModesInfo?) -> String {
-            let modes = supportedModes ?? ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
-            var items: [String] = []
-            if modes.chat { items.append("Chat") }
-            if modes.plan { items.append("Plan") }
-            if modes.review { items.append("Review") }
-            return "[\(items.joined(separator: ", "))]"
-        }
-
-        var lines = ["Available models:"]
-        for model in models {
-            let modesText = bracketedModes(model.supportedModes)
-            let descText = (model.description?.isEmpty == false) ? " — \(model.description!)" : ""
-            lines.append("- \(model.id): \(model.name) — modes: \(modesText)\(descText)")
+            let mappings: [String] = [("Chat", "chat"), ("Plan", "plan"), ("Review", "review")].compactMap { label, mode in
+                guard let id = preset.chatPresetMappings?.presetID(for: mode) else { return nil }
+                let name = chatPresets.first(where: { $0.id == id })?.name ?? "Missing (\(id.uuidString))"
+                return "\(label) → \(name)"
+            }
+            if !mappings.isEmpty {
+                lines.append("  - Chat Presets: \(mappings.joined(separator: "; "))")
+            }
+            if let description = preset.description, !description.isEmpty {
+                lines.append("  - \(description)")
+            }
         }
         return .string(lines.joined(separator: "\n"))
     }

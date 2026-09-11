@@ -1115,6 +1115,7 @@ class OracleViewModel: ObservableObject {
     private var hasSeenNonReasoningText: Set<UUID> = []
     private var providerStopSeen: Set<UUID> = []
     private var completionPolicies: [UUID: OracleResponseCompletionPolicy] = [:]
+    private var oracleControlledResponseIDs: Set<UUID> = []
     /// Tracks when we last armed the inactivity watchdog per query (for throttling)
     private var lastInactivityWatchdogArmAt: [UUID: Date] = [:]
     /// Minimum interval between watchdog re-arms during streaming (reduces Task churn)
@@ -2796,7 +2797,10 @@ class OracleViewModel: ObservableObject {
         // ------------------------------------------------------------------
         // 1️⃣  Fast‑path: detect "no changes" and bail early
         // ------------------------------------------------------------------
-        let usesPromptSelections = Self.shouldUseLivePromptStateForAutosave(
+        let isOracleControlled = oracleControlledResponseIDs.contains {
+            sessionIDByMessageId[$0] == sessionID
+        }
+        let usesPromptSelections = !isOracleControlled && Self.shouldUseLivePromptStateForAutosave(
             sessionID: sessionID,
             currentSessionID: currentSessionID,
             sessionComposeTabID: session.composeTabID,
@@ -3043,8 +3047,13 @@ class OracleViewModel: ObservableObject {
             print("Warning: Ignoring overrideAIMessage without overrideMode.")
             return nil
         }
+        let packagedUserMessage = """
+        <user_instructions>
+        \(newUserMessage)
+        </user_instructions>
+        """
         guard let lastUserMessage = overrideAIMessage.conversationMessages.last(where: { $0.role == .user })?.content,
-              lastUserMessage == newUserMessage
+              lastUserMessage == newUserMessage || lastUserMessage == packagedUserMessage
         else {
             print("Warning: Ignoring overrideAIMessage because its final user message does not match the current send input.")
             return nil
@@ -3061,6 +3070,7 @@ class OracleViewModel: ObservableObject {
         sessionID: UUID? = nil,
         overrideModel: AIModel? = nil,
         overrideChatPresetID: UUID? = nil,
+        oraclePromptConfiguration: OraclePromptConfiguration? = nil,
         overrideMode: PromptViewModel.PlanActMode? = nil,
         gitInclusionOverride: GitInclusion? = nil,
         gitBaseOverride: String? = nil,
@@ -3161,6 +3171,9 @@ class OracleViewModel: ObservableObject {
         }
         registerMessage(aiResponseId, sessionID: targetSessionID)
         completionPolicies[aiResponseId] = completionPolicy
+        if oraclePromptConfiguration != nil {
+            oracleControlledResponseIDs.insert(aiResponseId)
+        }
         setSessionStreaming(targetSessionID, queryId: aiResponseId, streamId: nil)
 
         if currentSessionID == targetSessionID {
@@ -3191,21 +3204,24 @@ class OracleViewModel: ObservableObject {
                 }) {
                     aiMessage = overrideAIMessage
                 } else {
-                    // Build override context from the specified chat preset or current one
-                    let chatPreset: ChatPreset = if let presetID = overrideChatPresetID,
-                                                    let overridePreset = ChatPresetManager.shared.preset(with: presetID)
+                    let chatPreset: ChatPreset = if let oraclePromptConfiguration {
+                        oraclePromptConfiguration.chatPreset
+                    } else if let presetID = overrideChatPresetID,
+                              let overridePreset = ChatPresetManager.shared.preset(with: presetID)
                     {
                         overridePreset
                     } else {
                         promptViewModel.currentChatPreset()
                     }
-                    let overrideContext = promptViewModel.resolvedPromptContext(from: chatPreset)
+                    let overrideContext = oraclePromptConfiguration?.promptContext
+                        ?? promptViewModel.resolvedPromptContext(from: chatPreset)
 
                     aiMessage = await promptViewModel.packagePrompt(
                         conversation: conversation,
                         overrideModel: model,
                         overridePromptConfig: overrideContext,
                         overrideChatPreset: chatPreset,
+                        oraclePromptConfiguration: oraclePromptConfiguration,
                         overrideMode: overrideMode,
                         gitInclusionOverride: gitInclusionOverride,
                         gitBaseOverride: gitBaseOverride,
@@ -3479,6 +3495,7 @@ class OracleViewModel: ObservableObject {
         outcome: OracleMessageFinalizationOutcome
     ) async {
         completionPolicies.removeValue(forKey: id)
+        oracleControlledResponseIDs.remove(id)
         await finalisationHub.fulfil(id, outcome: outcome)
     }
 
@@ -3511,15 +3528,15 @@ class OracleViewModel: ObservableObject {
 
             let finalContent = messageStore[sessionID]?[index].content ?? ""
             if finalContent.isEmpty {
-                await concludeFinalisation(aiResponseId, outcome: .cancelled)
                 withSessionMessages(sessionID) { msgs in
                     if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
                         msgs.remove(at: idx)
                     }
                 }
+                autosaveChatHistory(for: sessionID)
                 purgeMessageCaches(for: aiResponseId)
                 clearSessionStreaming(sessionID)
-                autosaveChatHistory(for: sessionID)
+                await concludeFinalisation(aiResponseId, outcome: .cancelled)
                 return
             }
 
@@ -3754,14 +3771,14 @@ class OracleViewModel: ObservableObject {
 
         let finalContent = messageStore[sessionID]?[idx].content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if finalContent.isEmpty {
-            await concludeFinalisation(queryId, outcome: .cancelled)
             withSessionMessages(sessionID) { msgs in
                 if let index = msgs.firstIndex(where: { $0.id == queryId && !$0.isUser }) {
                     msgs.remove(at: index)
                 }
             }
-            purgeMessageCaches(for: queryId)
             autosaveChatHistory(for: sessionID)
+            purgeMessageCaches(for: queryId)
+            await concludeFinalisation(queryId, outcome: .cancelled)
             return
         }
 
