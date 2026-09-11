@@ -141,7 +141,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 Start with `op=capabilities`, inspect only authorized context, and ask for genuinely missing goals.
                 `setup` seals a complete reviewed specification in one call. `run` suspends for authentic native
                 digest approval; one Approve & Run action starts automatically. Then use `wait`, `status`, `cancel`,
-                and the revision/clone operations. The agent cannot approve or apply a winner.
+                and the revision/clone operations. New runs use the sealed evaluation count without an experiment-wide
+                deadline; status/read return durable redacted worker and callback diagnostics. The agent cannot approve or apply a winner.
                 """,
                 annotations: .repoPromptLocalEphemeralState,
                 inputSchema: .object(
@@ -498,16 +499,21 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     "maximum_score": .double(optimization.evaluator.maximumScore),
                     "judge_target": plan.optimizationTargets?.judge.map(targetValue) ?? .null
                 ])
-                value["gepa"] = .object([
+                var gepa: [String: Value] = [
                     "reflection_target": plan.optimizationTargets.map { targetValue($0.reflection) } ?? .null,
                     "max_evaluations": .int(optimization.gepa.maxEvaluations),
-                    "max_wall_clock_seconds": .int(optimization.gepa.maxWallClockSeconds),
+                    "experiment_wall_clock_deadline": .string("none"),
                     "reflection_minibatch_size": .int(optimization.gepa.reflectionMinibatchSize ?? 3),
                     "use_merge": .bool(optimization.gepa.useMerge ?? false),
                     "max_merge_invocations": .int(optimization.gepa.maxMergeInvocations ?? 5),
                     "skip_perfect_score": .bool(optimization.gepa.skipPerfectScore ?? true),
                     "random_seed": .int(optimization.gepa.randomSeed)
-                ])
+                ]
+                if let legacyWallClock = optimization.gepa.maxWallClockSeconds {
+                    gepa["legacy_max_wall_clock_seconds"] = .int(legacyWallClock)
+                    gepa["experiment_wall_clock_deadline"] = .string("historic_sealed_limit")
+                }
+                value["gepa"] = .object(gepa)
             }
             return .object(value)
         }
@@ -556,7 +562,49 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 } ?? .null
             ]
             value["legacy_unclassified_evidence"] = attempt.evidence.map(artifactValue) ?? .null
+            value["diagnostics"] = attempt.diagnostics.map(diagnosticValue) ?? .null
             return .object(value)
+        }
+
+        static func diagnosticValue(_ diagnostics: PromptExperimentAttemptDiagnostics) -> Value {
+            let formatter = ISO8601DateFormatter()
+            return .object([
+                "process_observation": .string(diagnostics.processObservation.rawValue),
+                "worker_pid": diagnostics.workerPID.map { .int(Int($0)) } ?? .null,
+                "worker_process_identity": diagnostics.workerProcessIdentity.map(Value.string) ?? .null,
+                "process_started_at": diagnostics.processStartedAt.map { .string(formatter.string(from: $0)) } ?? .null,
+                "process_exited_at": diagnostics.processExitedAt.map { .string(formatter.string(from: $0)) } ?? .null,
+                "process_exit_status": diagnostics.processExitStatus.map { .int(Int($0)) } ?? .null,
+                "last_observed_at": .string(formatter.string(from: diagnostics.lastObservedAt)),
+                "last_observed_event": .string(diagnostics.lastObservedEvent),
+                "active_callback_id": diagnostics.activeCallbackID.map(Value.string) ?? .null,
+                "active_callback_operation": diagnostics.activeCallbackOperation.map(Value.string) ?? .null,
+                "linked_callback_runtime": diagnostics.linkedCallbackRuntime.map(runtimeLinkValue) ?? .null,
+                "stderr_log_relative_path": diagnostics.stderrLogRelativePath.map(Value.string) ?? .null,
+                "stdout_protocol_log_relative_path": diagnostics.stdoutProtocolLogRelativePath.map(Value.string) ?? .null,
+                "stderr_log_byte_count": diagnostics.stderrLogByteCount.map(Value.int) ?? .null,
+                "stderr_log_truncated": .bool(diagnostics.stderrLogTruncated),
+                "protocol_log_byte_count": diagnostics.protocolLogByteCount.map(Value.int) ?? .null,
+                "protocol_log_truncated": .bool(diagnostics.protocolLogTruncated),
+                "pid_liveness_caveat": .string("A persisted PID is a historical observation only; never infer current liveness from it after restart or without a fresh event."),
+                "payload_policy": .string("Protocol request/response bodies are excluded; arbitrary stderr is redacted."),
+                "event_tail": .array(diagnostics.eventTail.map { event in .object([
+                    "observed_at": .string(formatter.string(from: event.observedAt)),
+                    "channel": .string(event.channel),
+                    "event": .string(event.event),
+                    "detail": event.detail.map(Value.string) ?? .null
+                ]) })
+            ])
+        }
+
+        private static func runtimeLinkValue(_ runtime: PromptExperimentRuntimeLink) -> Value {
+            .object([
+                "adapter": .string(runtime.adapter),
+                "tab_id": runtime.tabID.map { .string($0.uuidString) } ?? .null,
+                "run_id": runtime.runID.map { .string($0.uuidString) } ?? .null,
+                "provider": runtime.provider.map(Value.string) ?? .null,
+                "model": runtime.model.map(Value.string) ?? .null
+            ])
         }
 
         private static func optimizationResultValue(

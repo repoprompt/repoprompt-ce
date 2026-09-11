@@ -44,7 +44,10 @@
         }
 
         private let lock = NSLock()
+        private let processLifecycleLock = NSLock()
+        private let cancellationQueue = DispatchQueue(label: "com.repoprompt.prompt-experiment.worker-cancellation")
         private var process: Process?
+        private var cancellationWriteHandle: FileHandle?
         private var didRequestCancellation = false
 
         static func resolveWorkerURL() throws -> URL {
@@ -213,36 +216,65 @@
 
         func cancel() {
             lock.lock()
+            let shouldSignal = !didRequestCancellation
             didRequestCancellation = true
             let process = process
+            let cancellationWriteHandle = shouldSignal ? cancellationWriteHandle : nil
             lock.unlock()
-            process?.interrupt()
+            try? cancellationWriteHandle?.write(contentsOf: Data([1]))
+            if shouldSignal, let process {
+                cancellationQueue.async { [self] in
+                    requestCancellationEscalation(process)
+                }
+            }
         }
 
         func run(
             plan: PromptExperimentPlan,
             attemptID: UUID,
-            host: @escaping @MainActor @Sendable (_ operation: String, _ payload: [String: Any]) async -> PromptExperimentGEPAHostReply,
-            progress: @escaping @MainActor @Sendable (String) async -> Void
+            host: @escaping @MainActor @Sendable (_ callbackID: String, _ operation: String, _ payload: [String: Any]) async -> PromptExperimentGEPAHostReply,
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
         ) async throws -> PromptExperimentOptimizationRuntimeResult {
             guard let specification = plan.optimization else {
                 throw WorkerError.protocolFailure("The GEPA worker received a legacy comparison plan.")
             }
-            let workerURL = try Self.resolveWorkerURL()
             let runRoot = PromptExperimentStore.liveRootURL()
                 .appendingPathComponent("worker-runs", isDirectory: true)
                 .appendingPathComponent(attemptID.uuidString.lowercased(), isDirectory: true)
             let runDirectory = runRoot.appendingPathComponent("gepa-run", isDirectory: true)
             let outputDirectory = runRoot.appendingPathComponent("gepa-output", isDirectory: true)
             let stderrURL = runRoot.appendingPathComponent("worker-stderr.log")
+            let protocolURL = runRoot.appendingPathComponent("stdout-protocol.ndjson")
+            let relativeRunRoot = "worker-runs/\(attemptID.uuidString.lowercased())"
             let workerHome = runRoot.appendingPathComponent("home", isDirectory: true)
             let workerTemporary = runRoot.appendingPathComponent("tmp", isDirectory: true)
-            try FileManager.default.createDirectory(at: runRoot, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: workerHome, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: workerTemporary, withIntermediateDirectories: true)
-            let pythonExecutable = try Self.resolvePythonExecutable(
-                sealedValue: specification.gepa.pythonExecutablePath
-            )
+            let workerURL: URL
+            let pythonExecutable: URL
+            let stderrLog: SafeDiagnosticLog
+            let protocolLog: SafeDiagnosticLog
+            do {
+                try FileManager.default.createDirectory(at: runRoot, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: workerHome, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: workerTemporary, withIntermediateDirectories: true)
+                workerURL = try Self.resolveWorkerURL()
+                pythonExecutable = try Self.resolvePythonExecutable(
+                    sealedValue: specification.gepa.pythonExecutablePath
+                )
+                stderrLog = try SafeDiagnosticLog(url: stderrURL)
+                protocolLog = try SafeDiagnosticLog(url: protocolURL)
+            } catch {
+                await observation(.workerLaunchFailed(error.localizedDescription))
+                throw error
+            }
+            defer {
+                stderrLog.close()
+                protocolLog.close()
+            }
+            await observation(.workerPrepared(
+                stderrLogRelativePath: "\(relativeRunRoot)/worker-stderr.log",
+                stdoutProtocolLogRelativePath: "\(relativeRunRoot)/stdout-protocol.ndjson"
+            ))
 
             // The worker receives only opaque IDs, splits, and current inputs. Expected outputs
             // and reviewer notes remain in the app-owned sealed plan and are looked up by ID.
@@ -286,12 +318,14 @@
                                 pythonExecutable: pythonExecutable,
                                 workerURL: workerURL,
                                 initial: initial,
-                                stderrURL: stderrURL,
+                                stderrLog: stderrLog,
+                                protocolLog: protocolLog,
                                 workerHome: workerHome,
                                 workerTemporary: workerTemporary,
                                 host: host,
                                 progress: progress,
-                                hostCallbackTimeoutSeconds: min(300, specification.gepa.maxWallClockSeconds)
+                                observation: observation,
+                                hostCallbackTimeoutSeconds: 300
                             ))
                         } catch {
                             continuation.resume(throwing: error)
@@ -307,21 +341,20 @@
             pythonExecutable: URL,
             workerURL: URL,
             initial: [String: Any],
-            stderrURL: URL,
+            stderrLog: SafeDiagnosticLog,
+            protocolLog: SafeDiagnosticLog,
             workerHome: URL,
             workerTemporary: URL,
-            host: @escaping @MainActor @Sendable (_ operation: String, _ payload: [String: Any]) async -> PromptExperimentGEPAHostReply,
+            host: @escaping @MainActor @Sendable (_ callbackID: String, _ operation: String, _ payload: [String: Any]) async -> PromptExperimentGEPAHostReply,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
             hostCallbackTimeoutSeconds: Int
         ) throws -> PromptExperimentOptimizationRuntimeResult {
             let child = Process()
             let stdinPipe = Pipe()
             let stdoutPipe = Pipe()
-            guard FileManager.default.createFile(atPath: stderrURL.path, contents: nil) else {
-                throw WorkerError.infrastructureFailure("Could not create the GEPA worker log.")
-            }
-            let stderrHandle = try FileHandle(forWritingTo: stderrURL)
-            defer { try? stderrHandle.close() }
+            let stderrPipe = Pipe()
+            let cancellationPipe = Pipe()
             child.executableURL = pythonExecutable
             child.arguments = ["-I", "-B", "-u", workerURL.path]
             // Deliberately do not inherit the app environment: provider credentials and
@@ -330,21 +363,76 @@
             child.environment = Self.workerEnvironment(home: workerHome, temporaryDirectory: workerTemporary)
             child.standardInput = stdinPipe
             child.standardOutput = stdoutPipe
-            child.standardError = stderrHandle
+            child.standardError = stderrPipe
             lock.lock()
             if didRequestCancellation {
                 lock.unlock()
                 throw CancellationError()
             }
-            process = child
+            cancellationWriteHandle = cancellationPipe.fileHandleForWriting
             lock.unlock()
-            defer {
-                Self.terminateAndReap(child)
+            do {
+                try child.run()
+            } catch {
+                emitObservation(.workerLaunchFailed(error.localizedDescription), using: observation)
                 lock.lock()
                 process = nil
+                cancellationWriteHandle = nil
+                lock.unlock()
+                throw error
+            }
+            lock.lock()
+            process = child
+            lock.unlock()
+            let stderrDrain = DispatchGroup()
+            stderrDrain.enter()
+            DispatchQueue.global(qos: .utility).async {
+                defer { stderrDrain.leave() }
+                var reader = PromptExperimentPipeChunkReader(handle: stderrPipe.fileHandleForReading)
+                var didReportRedactedOutput = false
+                do {
+                    while let chunk = try reader.nextChunk() {
+                        let detail = Self.safeStderrDetail(chunk)
+                        try stderrLog.append(channel: "stderr", event: "worker_output", detail: detail)
+                        let isRedacted = detail.hasPrefix("[redacted ")
+                        if !isRedacted || !didReportRedactedOutput {
+                            self.emitObservation(
+                                .protocolEvent(channel: "stderr", event: "worker_output", detail: detail),
+                                using: observation
+                            )
+                        }
+                        didReportRedactedOutput = didReportRedactedOutput || isRedacted
+                    }
+                } catch {
+                    try? stderrLog.append(channel: "stderr", event: "read_failed", detail: error.localizedDescription)
+                }
+            }
+            try? stderrPipe.fileHandleForWriting.close()
+            emitObservation(
+                .workerStarted(
+                    pid: child.processIdentifier,
+                    processIdentity: "CPython \(Self.pythonVersion) / GEPA \(PromptExperimentGEPAConfiguration.packageVersion) / pid \(child.processIdentifier)"
+                ),
+                using: observation
+            )
+            defer {
+                terminateAndReap(child)
+                stderrDrain.wait()
+                emitObservation(
+                    .workerExited(
+                        status: child.terminationStatus,
+                        stderrLogByteCount: stderrLog.byteCount,
+                        stderrLogTruncated: stderrLog.isTruncated,
+                        protocolLogByteCount: protocolLog.byteCount,
+                        protocolLogTruncated: protocolLog.isTruncated
+                    ),
+                    using: observation
+                )
+                lock.lock()
+                process = nil
+                cancellationWriteHandle = nil
                 lock.unlock()
             }
-            try child.run()
             lock.lock()
             let cancelledAfterLaunch = didRequestCancellation
             lock.unlock()
@@ -353,7 +441,15 @@
                 throw CancellationError()
             }
             try writeJSONLine(initial, to: stdinPipe.fileHandleForWriting)
-            var reader = LineReader(handle: stdoutPipe.fileHandleForReading)
+            try protocolLog.append(channel: "stdin", event: "run_request_written", detail: "payload=excluded")
+            emitObservation(
+                .protocolEvent(channel: "stdin", event: "run_request_written", detail: "payload=excluded"),
+                using: observation
+            )
+            var reader = PromptExperimentNDJSONLineReader(
+                handle: stdoutPipe.fileHandleForReading,
+                cancellationHandle: cancellationPipe.fileHandleForReading
+            )
             var terminal: PromptExperimentOptimizationRuntimeResult?
             var terminalError: Error?
             while let data = try reader.nextLine() {
@@ -361,18 +457,33 @@
                       object["protocol_version"] as? Int == 1,
                       let type = object["type"] as? String
                 else {
+                    try? protocolLog.append(channel: "stdout", event: "invalid_protocol", detail: nil)
                     throw WorkerError.protocolFailure("GEPA worker emitted invalid protocol JSON.")
                 }
+                try protocolLog.append(
+                    channel: "stdout",
+                    event: type,
+                    detail: Self.safeProtocolDetail(type: type, object: object)
+                )
+                emitObservation(
+                    .protocolEvent(
+                        channel: "stdout",
+                        event: type,
+                        detail: Self.safeProtocolDetail(type: type, object: object)
+                    ),
+                    using: observation
+                )
                 switch type {
                 case "host_request":
                     guard let id = object["id"] as? String,
                           let operation = object["operation"] as? String,
                           let payload = object["payload"] as? [String: Any]
                     else { throw WorkerError.protocolFailure("GEPA host request is incomplete.") }
+                    emitObservation(.callbackStarted(id: id, operation: operation), using: observation)
                     let semaphore = DispatchSemaphore(value: 0)
                     let replyBox = PromptExperimentGEPAHostReplyBox()
                     let callback = Task { @MainActor in
-                        let reply = await host(operation, payload)
+                        let reply = await host(id, operation, payload)
                         replyBox.store(reply)
                         semaphore.signal()
                     }
@@ -391,6 +502,7 @@
                         }
                     }
                     guard let reply = replyBox.load() else { throw WorkerError.protocolFailure("The app did not produce a host reply.") }
+                    emitObservation(.callbackFinished(id: id, operation: operation), using: observation)
                     var response = reply.jsonObject
                     response["protocol_version"] = 1
                     response["type"] = "host_response"
@@ -409,7 +521,9 @@
                     }
                     terminal = try decodeResult(result)
                 case "failed":
-                    terminalError = WorkerError.infrastructureFailure(object["error"] as? String ?? "GEPA worker failed.")
+                    terminalError = WorkerError.infrastructureFailure(
+                        "GEPA worker reported a failure; inspect the persisted redacted diagnostics."
+                    )
                 default:
                     throw WorkerError.protocolFailure("Unsupported GEPA worker message type: \(type)")
                 }
@@ -417,18 +531,63 @@
             }
             stdinPipe.fileHandleForWriting.closeFile()
             child.waitUntilExit()
-            try stderrHandle.synchronize()
-            let stderrData = (try? Data(contentsOf: stderrURL, options: [.mappedIfSafe])) ?? Data()
-            let stderr = String(data: stderrData.suffix(4000), encoding: .utf8) ?? ""
+            stderrDrain.wait()
             lock.lock()
             let cancelled = didRequestCancellation
             lock.unlock()
             if cancelled { throw CancellationError() }
             if let terminalError { throw terminalError }
             guard child.terminationStatus == 0, let terminal else {
-                throw WorkerError.infrastructureFailure("GEPA worker terminated without a result (status \(child.terminationStatus)): \(stderr)")
+                throw WorkerError.infrastructureFailure(
+                    "GEPA worker terminated without a result (status \(child.terminationStatus)); inspect the persisted attempt diagnostics and redacted worker logs."
+                )
             }
             return terminal
+        }
+
+        private func emitObservation(
+            _ value: PromptExperimentRuntimeObservation,
+            using observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+        ) {
+            let semaphore = DispatchSemaphore(value: 0)
+            Task { @MainActor in
+                await observation(value)
+                semaphore.signal()
+            }
+            semaphore.wait()
+        }
+
+        private static func safeProtocolDetail(type: String, object: [String: Any]) -> String? {
+            switch type {
+            case "host_request":
+                let id = object["id"] as? String ?? "unknown"
+                let operation = object["operation"] as? String ?? "unknown"
+                return "callback_id=\(id) operation=\(operation) payload=excluded"
+            case "progress":
+                let completed = object["completed_evaluations"] as? Int ?? 0
+                let maximum = object["max_evaluations"] as? Int ?? 0
+                let candidate = object["candidate_index"] as? Int ?? 0
+                return "candidate=\(candidate) completed_evaluations=\(completed) max_evaluations=\(maximum)"
+            case "completed":
+                return "result_payload=excluded"
+            case "failed":
+                return "error_payload=excluded"
+            default:
+                return nil
+            }
+        }
+
+        static func safeStderrDetail(_ data: Data) -> String {
+            let text = String(decoding: data, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let allowlistedMessages = [
+                "Generating initial seed candidate via LLM...",
+                "Traceback (most recent call last):"
+            ]
+            if allowlistedMessages.contains(text) {
+                return text
+            }
+            return "[redacted \(data.count) bytes]"
         }
 
         private func decodeResult(_ result: [String: Any]) throws -> PromptExperimentOptimizationRuntimeResult {
@@ -525,7 +684,13 @@
             try handle.write(contentsOf: data)
         }
 
-        private static func terminateAndReap(_ child: Process) {
+        private func requestCancellationEscalation(_ child: Process) {
+            processLifecycleLock.lock()
+            defer { processLifecycleLock.unlock() }
+            Self.sendCancellationSignals(child)
+        }
+
+        private static func sendCancellationSignals(_ child: Process) {
             guard child.isRunning else { return }
             child.interrupt()
             let interruptDeadline = Date().addingTimeInterval(1)
@@ -541,6 +706,14 @@
             }
             if child.isRunning {
                 kill(child.processIdentifier, SIGKILL)
+            }
+        }
+
+        private func terminateAndReap(_ child: Process) {
+            processLifecycleLock.lock()
+            defer { processLifecycleLock.unlock() }
+            if child.isRunning {
+                Self.sendCancellationSignals(child)
             }
             child.waitUntilExit()
         }
@@ -564,6 +737,71 @@
         }
     }
 
+    private final class SafeDiagnosticLog: @unchecked Sendable {
+        private static let maximumBytes = 4 * 1024 * 1024
+
+        private let lock = NSLock()
+        private let handle: FileHandle
+        private var storedByteCount = 0
+        private var storedTruncated = false
+        private var isClosed = false
+
+        init(url: URL) throws {
+            try Data().write(to: url, options: [.atomic])
+            handle = try FileHandle(forWritingTo: url)
+        }
+
+        deinit {
+            close()
+        }
+
+        var byteCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedByteCount
+        }
+
+        var isTruncated: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedTruncated
+        }
+
+        func append(channel: String, event: String, detail: String?) throws {
+            var object: [String: Any] = [
+                "observed_at": ISO8601DateFormatter().string(from: Date()),
+                "channel": channel,
+                "event": event
+            ]
+            if let detail { object["detail"] = detail }
+            var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            data.append(0x0A)
+
+            lock.lock()
+            defer { lock.unlock() }
+            guard !isClosed else { return }
+            if storedByteCount + data.count > Self.maximumBytes {
+                guard !storedTruncated else { return }
+                storedTruncated = true
+                let marker = Data("{\"event\":\"log_truncated\"}\n".utf8)
+                try handle.write(contentsOf: marker)
+                storedByteCount += marker.count
+                return
+            }
+            try handle.write(contentsOf: data)
+            storedByteCount += data.count
+        }
+
+        func close() {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !isClosed else { return }
+            try? handle.synchronize()
+            try? handle.close()
+            isClosed = true
+        }
+    }
+
     private final class PromptExperimentGEPAHostReplyBox: @unchecked Sendable {
         private let lock = NSLock()
         private var value: PromptExperimentGEPAHostReply?
@@ -581,9 +819,56 @@
         }
     }
 
-    private struct LineReader {
+    enum PromptExperimentPipeReadError: LocalizedError {
+        case lineTooLong(maximumBytes: Int)
+
+        var errorDescription: String? {
+            switch self {
+            case let .lineTooLong(maximumBytes):
+                "Worker protocol line exceeded the \(maximumBytes)-byte safety limit."
+            }
+        }
+    }
+
+    struct PromptExperimentPipeChunkReader {
         let handle: FileHandle
+
+        mutating func nextChunk() throws -> Data? {
+            var bytes = [UInt8](repeating: 0, count: 8192)
+            let count = try Self.readAvailable(handle: handle, bytes: &bytes)
+            return count == 0 ? nil : Data(bytes.prefix(count))
+        }
+
+        fileprivate static func readAvailable(handle: FileHandle, bytes: inout [UInt8]) throws -> Int {
+            try bytes.withUnsafeMutableBytes { storage -> Int in
+                while true {
+                    let result = Darwin.read(handle.fileDescriptor, storage.baseAddress, storage.count)
+                    if result >= 0 { return result }
+                    if errno != EINTR {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                }
+            }
+        }
+    }
+
+    struct PromptExperimentNDJSONLineReader {
+        static let defaultMaximumLineBytes = 16 * 1024 * 1024
+
+        let handle: FileHandle
+        let cancellationHandle: FileHandle?
+        let maximumLineBytes: Int
         var buffer = Data()
+
+        init(
+            handle: FileHandle,
+            cancellationHandle: FileHandle? = nil,
+            maximumLineBytes: Int = Self.defaultMaximumLineBytes
+        ) {
+            self.handle = handle
+            self.cancellationHandle = cancellationHandle
+            self.maximumLineBytes = maximumLineBytes
+        }
 
         mutating func nextLine() throws -> Data? {
             while true {
@@ -592,13 +877,35 @@
                     buffer.removeSubrange(...newline)
                     return Data(line)
                 }
-                let chunk = try handle.read(upToCount: 8192) ?? Data()
-                if chunk.isEmpty {
+                try waitUntilReadableOrCancelled()
+                var bytes = [UInt8](repeating: 0, count: 8192)
+                let count = try PromptExperimentPipeChunkReader.readAvailable(handle: handle, bytes: &bytes)
+                if count == 0 {
                     guard !buffer.isEmpty else { return nil }
                     defer { buffer.removeAll() }
                     return buffer
                 }
-                buffer.append(chunk)
+                guard buffer.count + count <= maximumLineBytes else {
+                    throw PromptExperimentPipeReadError.lineTooLong(maximumBytes: maximumLineBytes)
+                }
+                buffer.append(contentsOf: bytes.prefix(count))
+            }
+        }
+
+        private func waitUntilReadableOrCancelled() throws {
+            guard let cancellationHandle else { return }
+            var descriptors = [
+                pollfd(fd: handle.fileDescriptor, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: cancellationHandle.fileDescriptor, events: Int16(POLLIN), revents: 0)
+            ]
+            while true {
+                let result = Darwin.poll(&descriptors, nfds_t(descriptors.count), -1)
+                if result > 0 {
+                    if descriptors[1].revents != 0 { throw CancellationError() }
+                    if descriptors[0].revents != 0 { return }
+                } else if result < 0, errno != EINTR {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
             }
         }
     }

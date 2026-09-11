@@ -156,7 +156,8 @@
         var pythonExecutablePath: String
         var reflectionTargetSelector: String
         var maxEvaluations: Int
-        var maxWallClockSeconds: Int
+        /// Present only on preserved schema-2/3 plans. New schema-4 runs have no experiment-wide deadline.
+        var maxWallClockSeconds: Int? = nil
         var stopAtScore: Double?
         var randomSeed: Int
         var reflectionMinibatchSize: Int? = nil
@@ -413,8 +414,10 @@
                 guard (2 ... 10000).contains(optimization.gepa.maxEvaluations) else {
                     throw PromptExperimentAuthorityError.invalidDraft("GEPA max evaluations must be between 2 and 10,000.")
                 }
-                guard (30 ... 86400).contains(optimization.gepa.maxWallClockSeconds) else {
-                    throw PromptExperimentAuthorityError.invalidDraft("GEPA wall-clock limit must be between 30 seconds and 24 hours.")
+                guard optimization.gepa.maxWallClockSeconds == nil else {
+                    throw PromptExperimentAuthorityError.invalidDraft(
+                        "max_wall_clock_seconds is preserved only on historic sealed plans; omit it from new experiment drafts."
+                    )
                 }
                 guard optimization.evaluator.minimumScore.isFinite,
                       optimization.evaluator.maximumScore.isFinite,
@@ -612,7 +615,8 @@
 
         static let legacySchemaVersion = 1
         static let legacyOptimizationSchemaVersion = 2
-        static let optimizationSchemaVersion = 3
+        static let legacyWallClockOptimizationSchemaVersion = 3
+        static let optimizationSchemaVersion = 4
         static let schemaVersion = legacySchemaVersion
         static let executionAdapter = "context_builder_native_v1"
         static let comparisonMode = "fixed_serial_interleaved_v1"
@@ -692,6 +696,7 @@
                         "Context Builder is the first workflow adapter. Investigate and multi-agent adapters use the same host bridge but are not yet implemented.",
                         "Reviewed examples are copied into an app-owned isolated environment. Direct loaded-workspace execution and hidden source access are not admitted.",
                         "Generated-code commands run only under the sealed macOS Seatbelt profile; unsupported sandbox hosts fail closed.",
+                        "The evaluation count is the experiment-wide budget. New runs have no experiment-wide wall-clock deadline; cancellation and bounded individual host operations remain available.",
                         "Infrastructure failures remain inconclusive and are never converted to candidate score zero.",
                         "Applying a winning candidate remains a separate user-authorized action and is not implemented by the agent tool."
                     ],
@@ -755,13 +760,23 @@
 
         func verifiesIntegrity() -> Bool {
             if let optimization {
-                guard [Self.legacyOptimizationSchemaVersion, Self.optimizationSchemaVersion].contains(schemaVersion ?? -1),
-                      let optimizationTargets,
-                      trials.count == 1,
-                      trials.first?.condition == .optimization
+                let effectiveSchemaVersion = schemaVersion ?? -1
+                guard [
+                    Self.legacyOptimizationSchemaVersion,
+                    Self.legacyWallClockOptimizationSchemaVersion,
+                    Self.optimizationSchemaVersion
+                ].contains(effectiveSchemaVersion),
+                    let optimizationTargets,
+                    trials.count == 1,
+                    trials.first?.condition == .optimization
                 else { return false }
+                if effectiveSchemaVersion == Self.optimizationSchemaVersion {
+                    guard optimization.gepa.maxWallClockSeconds == nil else { return false }
+                } else {
+                    guard optimization.gepa.maxWallClockSeconds != nil else { return false }
+                }
                 let payload = OptimizationDigestPayload(
-                    schemaVersion: schemaVersion ?? Self.legacyOptimizationSchemaVersion,
+                    schemaVersion: effectiveSchemaVersion,
                     revision: revision,
                     parentPlanID: parentPlanID,
                     title: title,
@@ -840,6 +855,100 @@
         let model: String?
     }
 
+    enum PromptExperimentWorkerProcessObservation: String, Codable, Equatable {
+        case notApplicable = "not_applicable"
+        case preparing
+        case runningObserved = "running_observed"
+        case exitedObserved = "exited_observed"
+        case launchFailed = "launch_failed"
+        case unknownAfterRestart = "unknown_after_restart"
+    }
+
+    struct PromptExperimentDiagnosticEvent: Codable, Equatable {
+        let observedAt: Date
+        let channel: String
+        let event: String
+        let detail: String?
+    }
+
+    struct PromptExperimentAttemptDiagnostics: Codable, Equatable {
+        static let maximumEventTailCount = 40
+
+        var processObservation: PromptExperimentWorkerProcessObservation
+        var workerPID: Int32?
+        var workerProcessIdentity: String?
+        var processStartedAt: Date?
+        var processExitedAt: Date?
+        var processExitStatus: Int32?
+        var lastObservedAt: Date
+        var lastObservedEvent: String
+        var activeCallbackID: String?
+        var activeCallbackOperation: String?
+        var linkedCallbackRuntime: PromptExperimentRuntimeLink?
+        var stderrLogRelativePath: String?
+        var stdoutProtocolLogRelativePath: String?
+        var stderrLogByteCount: Int?
+        var stderrLogTruncated: Bool
+        var protocolLogByteCount: Int?
+        var protocolLogTruncated: Bool
+        var eventTail: [PromptExperimentDiagnosticEvent]
+
+        static func initial(workerExpected: Bool, at date: Date) -> Self {
+            let event = PromptExperimentDiagnosticEvent(
+                observedAt: date,
+                channel: "service",
+                event: "runtime_submission_persisted",
+                detail: workerExpected ? "worker_expected=true" : "worker_expected=false"
+            )
+            return Self(
+                processObservation: workerExpected ? .preparing : .notApplicable,
+                workerPID: nil,
+                workerProcessIdentity: nil,
+                processStartedAt: nil,
+                processExitedAt: nil,
+                processExitStatus: nil,
+                lastObservedAt: date,
+                lastObservedEvent: event.event,
+                activeCallbackID: nil,
+                activeCallbackOperation: nil,
+                linkedCallbackRuntime: nil,
+                stderrLogRelativePath: nil,
+                stdoutProtocolLogRelativePath: nil,
+                stderrLogByteCount: nil,
+                stderrLogTruncated: false,
+                protocolLogByteCount: nil,
+                protocolLogTruncated: false,
+                eventTail: [event]
+            )
+        }
+
+        mutating func append(_ event: PromptExperimentDiagnosticEvent) {
+            lastObservedAt = event.observedAt
+            lastObservedEvent = event.event
+            eventTail.append(event)
+            if eventTail.count > Self.maximumEventTailCount {
+                eventTail.removeFirst(eventTail.count - Self.maximumEventTailCount)
+            }
+        }
+    }
+
+    enum PromptExperimentRuntimeObservation: Equatable {
+        case workerPrepared(stderrLogRelativePath: String, stdoutProtocolLogRelativePath: String)
+        case workerStarted(pid: Int32, processIdentity: String)
+        case workerLaunchFailed(String)
+        case workerExited(
+            status: Int32,
+            stderrLogByteCount: Int,
+            stderrLogTruncated: Bool,
+            protocolLogByteCount: Int,
+            protocolLogTruncated: Bool
+        )
+        case protocolEvent(channel: String, event: String, detail: String?)
+        case callbackStarted(id: String, operation: String)
+        case callbackLinked(id: String, runtime: PromptExperimentRuntimeLink)
+        case callbackFinished(id: String, operation: String)
+    }
+
     /// Raw immutable handoff captured at the Context Builder terminal commit seam.
     struct PromptExperimentRuntimeHandoff: Equatable {
         let prompt: String
@@ -872,6 +981,7 @@
         var cancellationRequestedAt: Date?
         var settledAt: Date?
         var runtimeLink: PromptExperimentRuntimeLink?
+        var diagnostics: PromptExperimentAttemptDiagnostics?
         /// Legacy pilot evidence. New runs store the committed prompt and assistant output separately.
         var evidence: PromptExperimentArtifactReference?
         /// Legacy pilot preview. New runs use `committedHandoff.promptPreview`.
@@ -901,6 +1011,7 @@
             cancellationRequestedAt = nil
             settledAt = nil
             runtimeLink = nil
+            diagnostics = nil
             evidence = nil
             outputPreview = nil
             committedHandoff = nil

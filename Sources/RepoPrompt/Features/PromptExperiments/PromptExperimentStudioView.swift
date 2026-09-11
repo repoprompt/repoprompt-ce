@@ -135,7 +135,12 @@
                                 if let optimization = draft.optimization {
                                     LabeledContent("Objective", value: optimization.objective.isEmpty ? "Not yet proposed" : optimization.objective)
                                     LabeledContent("Reviewed examples", value: "\(optimization.examples.count)")
-                                    LabeledContent("Budget", value: "\(optimization.gepa.maxEvaluations) evaluations · \(optimization.gepa.maxWallClockSeconds)s")
+                                    LabeledContent(
+                                        "Budget",
+                                        value: optimization.gepa.maxWallClockSeconds.map {
+                                            "\(optimization.gepa.maxEvaluations) evaluations · historic \($0)s deadline"
+                                        } ?? "\(optimization.gepa.maxEvaluations) evaluations · no experiment deadline"
+                                    )
                                 }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -183,7 +188,12 @@
                     LabeledContent("Target", value: plan.resolvedTarget.displayName)
                     if let optimization = plan.optimization {
                         LabeledContent("Engine", value: "Upstream GEPA \(PromptExperimentGEPAConfiguration.packageVersion)")
-                        LabeledContent("Budget", value: "\(optimization.gepa.maxEvaluations) evaluations · \(optimization.gepa.maxWallClockSeconds)s")
+                        LabeledContent(
+                            "Budget",
+                            value: optimization.gepa.maxWallClockSeconds.map {
+                                "\(optimization.gepa.maxEvaluations) evaluations · historic \($0)s deadline"
+                            } ?? "\(optimization.gepa.maxEvaluations) evaluations · no experiment deadline"
+                        )
                         LabeledContent("Objective", value: optimization.objective)
                         LabeledContent("Background", value: optimization.background.isEmpty ? "None" : optimization.background)
                         LabeledContent("Seed candidate", value: optimization.seedCandidate ?? "GEPA proposes from objective and evidence")
@@ -368,6 +378,20 @@
                                     Text("tab \(runtime.tabID?.uuidString ?? "pending") · run \(runtime.runID?.uuidString ?? "pending")")
                                         .font(.caption.monospaced())
                                         .foregroundStyle(.secondary)
+                                }
+                                if let diagnostics = attempt.diagnostics {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("Diagnostics · \(diagnostics.processObservation.rawValue)")
+                                            .font(.caption.bold())
+                                        Text("Last event \(diagnostics.lastObservedEvent) · \(diagnostics.lastObservedAt.formatted())")
+                                            .font(.caption)
+                                        Text("PID \(diagnostics.workerPID.map(String.init) ?? "unavailable") is historical observation only; current liveness is not inferred.")
+                                            .font(.caption)
+                                        Text("stderr \(diagnostics.stderrLogRelativePath ?? "unavailable") · protocol \(diagnostics.stdoutProtocolLogRelativePath ?? "unavailable")")
+                                            .font(.caption.monospaced())
+                                            .textSelection(.enabled)
+                                    }
+                                    .foregroundStyle(.secondary)
                                 }
                                 if let handoff = attempt.committedHandoff {
                                     VStack(alignment: .leading, spacing: 4) {

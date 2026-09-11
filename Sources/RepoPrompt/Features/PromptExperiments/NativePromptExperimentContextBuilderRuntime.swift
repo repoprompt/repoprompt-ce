@@ -56,7 +56,8 @@
 
         func submit(
             _ request: PromptExperimentRunRequest,
-            progress: @escaping @MainActor @Sendable (String) async -> Void
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
         ) async throws -> PromptExperimentRuntimeHandle {
             guard let windowState else {
                 throw PromptExperimentSubmissionError.rejected("The bound Agent window is no longer available.")
@@ -69,7 +70,7 @@
                 throw PromptExperimentSubmissionError.rejected("The sealed plan or synthetic environment is invalid.")
             }
             if plan.optimization != nil {
-                return try await submitOptimization(request, progress: progress)
+                return try await submitOptimization(request, progress: progress, observation: observation)
             }
             guard plan.executionAdapter == PromptExperimentPlan.executionAdapter else {
                 throw PromptExperimentSubmissionError.rejected("The legacy Context Builder plan adapter is invalid.")
@@ -274,22 +275,13 @@
             }
         }
 
-        private enum OptimizationTimeoutError: LocalizedError {
-            case exceeded(Int)
-
-            var errorDescription: String? {
-                switch self {
-                case let .exceeded(seconds): "GEPA exceeded the sealed wall-clock limit of \(seconds) seconds."
-                }
-            }
-        }
-
         private func submitOptimization(
             _ request: PromptExperimentRunRequest,
-            progress: @escaping @MainActor @Sendable (String) async -> Void
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
         ) async throws -> PromptExperimentRuntimeHandle {
             guard request.plan.executionAdapter == PromptExperimentPlan.gepaExecutionAdapter,
-                  let optimization = request.plan.optimization,
+                  request.plan.optimization != nil,
                   request.plan.optimizationTargets != nil
             else {
                 throw PromptExperimentSubmissionError.rejected("The sealed GEPA optimization envelope is incomplete.")
@@ -308,44 +300,22 @@
             cancelledOptimizationIDs.remove(request.attempt.id)
             let task = Task { @MainActor [self] in
                 do {
-                    let result = try await withThrowingTaskGroup(of: PromptExperimentOptimizationRuntimeResult.self) { group in
-                        group.addTask {
-                            try await worker.run(
-                                plan: request.plan,
-                                attemptID: request.attempt.id,
-                                host: { operation, payload in
-                                    await self.handleGEPAHostRequest(
-                                        parentRequest: request,
-                                        operation: operation,
-                                        payload: payload,
-                                        progress: progress
-                                    )
-                                },
-                                progress: progress
+                    let result = try await worker.run(
+                        plan: request.plan,
+                        attemptID: request.attempt.id,
+                        host: { callbackID, operation, payload in
+                            await self.handleGEPAHostRequest(
+                                parentRequest: request,
+                                callbackID: callbackID,
+                                operation: operation,
+                                payload: payload,
+                                progress: progress,
+                                observation: observation
                             )
-                        }
-                        group.addTask {
-                            try await Task.sleep(for: .seconds(optimization.gepa.maxWallClockSeconds))
-                            throw OptimizationTimeoutError.exceeded(optimization.gepa.maxWallClockSeconds)
-                        }
-                        guard let first = await group.nextResult() else {
-                            throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA produced no terminal result.")
-                        }
-                        switch first {
-                        case let .success(result):
-                            group.cancelAll()
-                            worker.cancel()
-                            return result
-                        case let .failure(error):
-                            cancelledOptimizationIDs.insert(request.attempt.id)
-                            group.cancelAll()
-                            worker.cancel()
-                            await connectedModelRunner.cancelAll()
-                            await cancelAndDrainOptimizationChildren(parentID: request.attempt.id)
-                            while await group.nextResult() != nil {}
-                            throw error
-                        }
-                    }
+                        },
+                        progress: progress,
+                        observation: observation
+                    )
                     return PromptExperimentRuntimeResult(
                         disposition: .completed,
                         runtimeLink: PromptExperimentRuntimeLink(
@@ -364,6 +334,8 @@
                     )
                 } catch is CancellationError {
                     cancelledOptimizationIDs.insert(request.attempt.id)
+                    worker.cancel()
+                    await connectedModelRunner.cancelAll()
                     await cancelAndDrainOptimizationChildren(parentID: request.attempt.id)
                     return PromptExperimentRuntimeResult(
                         disposition: .cancelled,
@@ -382,8 +354,9 @@
                     )
                 } catch {
                     cancelledOptimizationIDs.insert(request.attempt.id)
-                    await cancelAndDrainOptimizationChildren(parentID: request.attempt.id)
                     worker.cancel()
+                    await connectedModelRunner.cancelAll()
+                    await cancelAndDrainOptimizationChildren(parentID: request.attempt.id)
                     return PromptExperimentRuntimeResult(
                         disposition: .failed(error.localizedDescription),
                         runtimeLink: PromptExperimentRuntimeLink(
@@ -409,9 +382,11 @@
 
         private func handleGEPAHostRequest(
             parentRequest: PromptExperimentRunRequest,
+            callbackID: String,
             operation: String,
             payload: [String: Any],
-            progress: @escaping @MainActor @Sendable (String) async -> Void
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
         ) async -> PromptExperimentGEPAHostReply {
             guard !cancelledOptimizationIDs.contains(parentRequest.attempt.id) else {
                 return infrastructureReply("The GEPA run was cancelled before this host request could start.")
@@ -434,6 +409,16 @@
                         throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA supplied an invalid reflection prompt.")
                     }
                     await progress("GEPA is requesting a reflection proposal from \(targets.reflection.displayName).")
+                    await observation(.callbackLinked(
+                        id: callbackID,
+                        runtime: PromptExperimentRuntimeLink(
+                            adapter: "connected_model_callback_v1",
+                            tabID: nil,
+                            runID: nil,
+                            provider: targets.reflection.agentRaw,
+                            model: targets.reflection.modelRaw
+                        )
+                    ))
                     let completion = try await invokeConnectedModel(
                         parentRequest: parentRequest,
                         target: targets.reflection,
@@ -463,7 +448,9 @@
                         parentRequest: parentRequest,
                         specification: specification,
                         targets: targets,
-                        progress: progress
+                        callbackID: callbackID,
+                        progress: progress,
+                        observation: observation
                     )
                 default:
                     throw PromptExperimentAuthorityError.runtimeUnavailable("Unsupported GEPA host operation: \(operation)")
@@ -479,7 +466,9 @@
             parentRequest: PromptExperimentRunRequest,
             specification: PromptExperimentOptimizationSpecification,
             targets: PromptExperimentOptimizationTargets,
-            progress: @escaping @MainActor @Sendable (String) async -> Void
+            callbackID: String,
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
         ) async throws -> PromptExperimentGEPAHostReply {
             let started = Date()
             guard let exampleID = example["id"] as? String,
@@ -515,6 +504,16 @@
             let execution: (output: String, promptTokens: Int?, completionTokens: Int?) = switch specification.execution.adapter {
             case .connectedModel:
                 try await {
+                    await observation(.callbackLinked(
+                        id: callbackID,
+                        runtime: PromptExperimentRuntimeLink(
+                            adapter: "connected_model_callback_v1",
+                            tabID: nil,
+                            runID: nil,
+                            provider: executionTarget.agentRaw,
+                            model: executionTarget.modelRaw
+                        )
+                    ))
                     let completion = try await invokeConnectedModel(
                         parentRequest: parentRequest,
                         target: executionTarget,
@@ -530,7 +529,9 @@
                         target: executionTarget,
                         taskInput: input,
                         instructions: executionInstructions,
-                        progress: progress
+                        callbackID: callbackID,
+                        progress: progress,
+                        observation: observation
                     ),
                     nil,
                     nil
@@ -573,6 +574,16 @@
                 Reviewed expected output (may be unavailable):\n\(expected)
                 Actual output:\n\(output)
                 """
+                await observation(.callbackLinked(
+                    id: callbackID,
+                    runtime: PromptExperimentRuntimeLink(
+                        adapter: "connected_model_judge_callback_v1",
+                        tabID: nil,
+                        runID: nil,
+                        provider: judge.agentRaw,
+                        model: judge.modelRaw
+                    )
+                ))
                 let judgment = try await invokeConnectedModel(
                     parentRequest: parentRequest,
                     target: judge,
@@ -634,7 +645,9 @@
             target: PromptExperimentResolvedTarget,
             taskInput: String,
             instructions: String,
-            progress: @escaping @MainActor @Sendable (String) async -> Void
+            callbackID: String,
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
         ) async throws -> String {
             let date = Date()
             let childDraft = PromptExperimentDraft(
@@ -665,8 +678,18 @@
                 plan: childPlan,
                 attempt: childAttempt
             )
-            let handle = try await submit(childRequest, progress: progress)
+            let handle = try await submit(childRequest, progress: progress, observation: observation)
             optimizationChildren[parentRequest.attempt.id, default: []].append(handle)
+            await observation(.callbackLinked(
+                id: callbackID,
+                runtime: PromptExperimentRuntimeLink(
+                    adapter: PromptExperimentPlan.executionAdapter,
+                    tabID: handle.tabID,
+                    runID: handle.runID,
+                    provider: target.agentRaw,
+                    model: target.modelRaw
+                )
+            ))
             if cancelledOptimizationIDs.contains(parentRequest.attempt.id) {
                 _ = await cancel(handle)
                 _ = await wait(for: handle)
@@ -755,7 +778,7 @@
                 args: ["-p", profile, "/bin/sh", "-c", command],
                 stdin: nil,
                 outputMode: .none,
-                timeout: min(300, TimeInterval(specification.gepa.maxWallClockSeconds)),
+                timeout: 300,
                 cancelChildOnTaskCancellation: true
             )
             let stdout = String(data: result.stdout, encoding: .utf8) ?? ""

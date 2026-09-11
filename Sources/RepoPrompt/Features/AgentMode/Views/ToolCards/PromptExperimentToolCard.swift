@@ -142,9 +142,13 @@
                     .font(.caption.monospaced())
                     .textSelection(.enabled)
                 if let optimization = plan.optimization {
-                    Text("\(optimization.examples.count) reviewed examples · \(optimization.gepa.maxEvaluations) evaluations · \(optimization.gepa.maxWallClockSeconds)s · reflection \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        optimization.gepa.maxWallClockSeconds.map {
+                            "\(optimization.examples.count) reviewed examples · \(optimization.gepa.maxEvaluations) evaluations · historic \($0)s deadline · reflection \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")"
+                        } ?? "\(optimization.examples.count) reviewed examples · \(optimization.gepa.maxEvaluations) evaluations · no experiment deadline · reflection \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                     DisclosureGroup("Human-readable sealed plan summary") {
                         VStack(alignment: .leading, spacing: 5) {
                             Text("Objective: \(optimization.objective)")

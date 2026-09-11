@@ -35,6 +35,7 @@ import XCTest
             var holdSubmission = false
             var preflightedPlans: [PromptExperimentPlan] = []
             var preflightError: PromptExperimentAuthorityError?
+            var observationsOnSubmit: [PromptExperimentRuntimeObservation] = []
             private var submissionGate: CheckedContinuation<Void, Never>?
             private var blockedSubmissionWaiters: [CheckedContinuation<Void, Never>] = []
             private var resultContinuations: [UUID: CheckedContinuation<PromptExperimentRuntimeResult, Never>] = [:]
@@ -48,7 +49,8 @@ import XCTest
 
             func submit(
                 _ request: PromptExperimentRunRequest,
-                progress: @escaping @MainActor @Sendable (String) async -> Void
+                progress: @escaping @MainActor @Sendable (String) async -> Void,
+                observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
             ) async throws -> PromptExperimentRuntimeHandle {
                 if let error = submissionErrors[request.attempt.ordinal] { throw error }
                 if holdSubmission {
@@ -64,6 +66,9 @@ import XCTest
                 submissionWaiters.removeAll()
                 waiters.forEach { $0.resume() }
                 await progress("controlled fake accepted")
+                for value in observationsOnSubmit {
+                    await observation(value)
+                }
                 return PromptExperimentRuntimeHandle(
                     id: request.attempt.id,
                     tabID: UUID(uuidString: "00000000-0000-0000-0000-0000000000\(String(format: "%02d", request.attempt.ordinal))"),
@@ -1717,6 +1722,258 @@ import XCTest
             }
         }
 
+        func testNewOptimizationPlanHasNoExperimentWallClockDeadline() throws {
+            let date = Date(timeIntervalSince1970: 777)
+            let environment = try PromptExperimentEnvironment(
+                workspaceID: XCTUnwrap(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")),
+                sourceTabID: XCTUnwrap(UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")),
+                capturedAt: date,
+                isolatedRootPath: "/tmp/gepa-schema-4",
+                selection: StoredSelection(selectedPaths: ["reviewed-examples.json"]),
+                fixtureFiles: [],
+                fixtureDigest: "fixture",
+                captureLimitations: []
+            )
+            let reflection = try XCTUnwrap(Self.fakeTarget("reflector"))
+            let execution = try XCTUnwrap(Self.fakeTarget("executor"))
+            let plan = try PromptExperimentPlan.seal(
+                draft: PromptExperimentDraft(
+                    revision: 1,
+                    title: "No wall deadline",
+                    optimization: Self.validOptimization(),
+                    createdAt: date,
+                    updatedAt: date
+                ),
+                target: execution,
+                optimizationTargets: PromptExperimentOptimizationTargets(
+                    reflection: reflection,
+                    execution: execution,
+                    judge: nil
+                ),
+                environment: environment,
+                at: date
+            )
+
+            XCTAssertEqual(plan.schemaVersion, 4)
+            XCTAssertNil(plan.optimization?.gepa.maxWallClockSeconds)
+            XCTAssertTrue(plan.verifiesIntegrity())
+            let encoded = try JSONEncoder().encode(plan)
+            XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("maxWallClockSeconds"))
+            XCTAssertTrue(plan.limitations.contains { $0.contains("no experiment-wide wall-clock deadline") })
+        }
+
+        func testHistoricSchemaThreePlanPreservesWallClockDigestOnRoundTrip() async throws {
+            let date = Date(timeIntervalSince1970: 778)
+            let environment = try PromptExperimentEnvironment(
+                workspaceID: XCTUnwrap(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")),
+                sourceTabID: XCTUnwrap(UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")),
+                capturedAt: date,
+                isolatedRootPath: "/tmp/gepa-schema-3",
+                selection: StoredSelection(selectedPaths: []),
+                fixtureFiles: [],
+                fixtureDigest: "fixture",
+                captureLimitations: []
+            )
+            var optimization = Self.validOptimization()
+            optimization.gepa.maxWallClockSeconds = 180
+            let reflection = try XCTUnwrap(Self.fakeTarget("reflector"))
+            let execution = try XCTUnwrap(Self.fakeTarget("executor"))
+            let targets = PromptExperimentOptimizationTargets(
+                reflection: reflection,
+                execution: execution,
+                judge: nil
+            )
+            let payload = PromptExperimentPlan.OptimizationDigestPayload(
+                schemaVersion: PromptExperimentPlan.legacyWallClockOptimizationSchemaVersion,
+                revision: 1,
+                parentPlanID: nil,
+                title: "Historic sealed plan",
+                optimization: optimization,
+                resolvedTargets: targets,
+                environment: environment,
+                executionAdapter: PromptExperimentPlan.gepaExecutionAdapter,
+                comparisonMode: PromptExperimentPlan.gepaComparisonMode
+            )
+            let digest = try PromptExperimentDigest.canonicalSHA256(payload)
+            let plan = PromptExperimentPlan(
+                schemaVersion: PromptExperimentPlan.legacyWallClockOptimizationSchemaVersion,
+                id: PromptExperimentDigest.deterministicUUID(namespace: "plan", value: digest),
+                revision: 1,
+                parentPlanID: nil,
+                title: "Historic sealed plan",
+                taskInput: "",
+                originalInstructions: "",
+                candidateInstructions: "",
+                resolvedTarget: execution,
+                environment: environment,
+                repetitions: 1,
+                executionAdapter: PromptExperimentPlan.gepaExecutionAdapter,
+                comparisonMode: PromptExperimentPlan.gepaComparisonMode,
+                digest: digest,
+                sealedAt: date,
+                trials: [PromptExperimentTrial(
+                    id: PromptExperimentDigest.deterministicUUID(namespace: "gepa-run", value: digest),
+                    ordinal: 1,
+                    condition: .optimization,
+                    repetition: 1
+                )],
+                limitations: ["historic"],
+                optimization: optimization,
+                optimizationTargets: targets
+            )
+
+            let data = try JSONEncoder().encode(plan)
+            let decoded = try JSONDecoder().decode(PromptExperimentPlan.self, from: data)
+            XCTAssertEqual(decoded, plan)
+            XCTAssertEqual(decoded.digest, digest)
+            XCTAssertEqual(decoded.optimization?.gepa.maxWallClockSeconds, 180)
+            XCTAssertTrue(decoded.verifiesIntegrity())
+
+            let root = temporaryRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let owner = UUID()
+            let sourceID = UUID()
+            let store = PromptExperimentStore(rootURL: root)
+            _ = try await store.saveRecords([PromptExperimentRecord(
+                id: sourceID,
+                controllerSessionID: owner,
+                sourceTabID: UUID(),
+                createdAt: date,
+                updatedAt: date,
+                phase: .inconclusive,
+                draft: nil,
+                plans: [decoded],
+                approvals: [],
+                attempts: [],
+                cancellationRequestedAt: nil,
+                statusMessage: "Historic record"
+            )])
+            let service = PromptExperimentService(
+                store: store,
+                runtime: FakeRuntime(),
+                resolveTarget: Self.fakeTarget
+            )
+            await service.load()
+            let cloneID = try await service.cloneExperiment(
+                experimentID: sourceID,
+                expectedControllerSessionID: owner
+            )
+            XCTAssertEqual(service.record(id: sourceID)?.currentPlan?.digest, digest)
+            XCTAssertEqual(service.record(id: sourceID)?.currentPlan?.optimization?.gepa.maxWallClockSeconds, 180)
+            XCTAssertNil(service.record(id: cloneID)?.draft?.optimization?.gepa.maxWallClockSeconds)
+
+            try await service.startNextRevision(
+                experimentID: sourceID,
+                expectedPlanDigest: digest,
+                expectedControllerSessionID: owner,
+                revisionMode: .repeatCurrentSeed
+            )
+            XCTAssertNil(service.record(id: sourceID)?.draft?.optimization?.gepa.maxWallClockSeconds)
+            XCTAssertEqual(service.record(id: sourceID)?.plans.first?.digest, digest)
+        }
+
+        func testWorkerDiagnosticsPersistBeforeEvaluationAndExposeSafeEvidence() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.observationsOnSubmit = [
+                .workerPrepared(
+                    stderrLogRelativePath: "worker-runs/attempt/worker-stderr.log",
+                    stdoutProtocolLogRelativePath: "worker-runs/attempt/stdout-protocol.ndjson"
+                ),
+                .workerStarted(pid: 4242, processIdentity: "python3.11 pid 4242"),
+                .protocolEvent(channel: "stdin", event: "run_request_written", detail: "payload=excluded"),
+                .callbackStarted(id: "callback-1", operation: "reflect"),
+                .callbackLinked(
+                    id: "callback-1",
+                    runtime: PromptExperimentRuntimeLink(
+                        adapter: "connected_model_callback_v1",
+                        tabID: nil,
+                        runID: nil,
+                        provider: "fake",
+                        model: "fake-model"
+                    )
+                ),
+                .callbackFinished(id: "callback-1", operation: "reflect"),
+                .workerExited(
+                    status: 1,
+                    stderrLogByteCount: 91,
+                    stderrLogTruncated: false,
+                    protocolLogByteCount: 210,
+                    protocolLogTruncated: false
+                )
+            ]
+            let id = try await preparedOptimizationExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+
+            let attempt = try XCTUnwrap(harness.service.record(id: id)?.attempts.first)
+            let diagnostics = try XCTUnwrap(attempt.diagnostics)
+            XCTAssertEqual(diagnostics.processObservation, .exitedObserved)
+            XCTAssertEqual(diagnostics.workerPID, 4242)
+            XCTAssertEqual(diagnostics.processExitStatus, 1)
+            XCTAssertEqual(diagnostics.lastObservedEvent, "runtime_accepted")
+            XCTAssertTrue(diagnostics.eventTail.contains { $0.event == "worker_exited" })
+            XCTAssertNil(diagnostics.activeCallbackID)
+            XCTAssertEqual(diagnostics.linkedCallbackRuntime?.provider, "fake")
+            XCTAssertEqual(diagnostics.stderrLogRelativePath, "worker-runs/attempt/worker-stderr.log")
+            XCTAssertEqual(diagnostics.stdoutProtocolLogRelativePath, "worker-runs/attempt/stdout-protocol.ndjson")
+            XCTAssertTrue(diagnostics.eventTail.contains { $0.event == "runtime_submission_persisted" })
+            XCTAssertTrue(diagnostics.eventTail.contains { $0.detail?.contains("payload=excluded") == true })
+            XCTAssertFalse(diagnostics.eventTail.contains { $0.detail?.contains("expectedOutput") == true })
+            let exposed = try XCTUnwrap(
+                MCPAgentSessionControlToolProvider.diagnosticValue(diagnostics).objectValue
+            )
+            XCTAssertEqual(exposed["worker_pid"]?.intValue, 4242)
+            XCTAssertEqual(exposed["process_observation"]?.stringValue, "exited_observed")
+            XCTAssertEqual(exposed["stderr_log_relative_path"]?.stringValue, "worker-runs/attempt/worker-stderr.log")
+            XCTAssertEqual(exposed["stdout_protocol_log_relative_path"]?.stringValue, "worker-runs/attempt/stdout-protocol.ndjson")
+            XCTAssertTrue(exposed["pid_liveness_caveat"]?.stringValue?.contains("historical observation") == true)
+            XCTAssertEqual(exposed["payload_policy"]?.stringValue, "Protocol request/response bodies are excluded; arbitrary stderr is redacted.")
+
+            let directory = try await harness.service.recordDirectoryURL(experimentID: id)
+            let overview = try String(contentsOf: directory.appendingPathComponent("overview.md"), encoding: .utf8)
+            XCTAssertTrue(overview.contains("Worker process observation: `exited_observed`"))
+            XCTAssertTrue(overview.contains("persisted PID is historical evidence"))
+            XCTAssertTrue(overview.contains("stdout-protocol.ndjson"))
+        }
+
+        func testRestartMarksPersistedWorkerPIDAsUnknownRatherThanAlive() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            harness.runtime.observationsOnSubmit = [
+                .workerPrepared(
+                    stderrLogRelativePath: "worker-runs/attempt/worker-stderr.log",
+                    stdoutProtocolLogRelativePath: "worker-runs/attempt/stdout-protocol.ndjson"
+                ),
+                .workerStarted(pid: 4343, processIdentity: "python3.11 pid 4343")
+            ]
+            let id = try await preparedOptimizationExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.runtime.waitUntilWaitingForResult()
+
+            let reopened = PromptExperimentService(
+                store: PromptExperimentStore(rootURL: harness.root),
+                runtime: FakeRuntime(),
+                resolveTarget: Self.fakeTarget,
+                now: { Date(timeIntervalSince1970: 2000) }
+            )
+            await reopened.load()
+            let recovered = try XCTUnwrap(reopened.record(id: id)?.attempts.first?.diagnostics)
+            XCTAssertEqual(recovered.workerPID, 4343)
+            XCTAssertEqual(recovered.processObservation, .unknownAfterRestart)
+            XCTAssertEqual(recovered.lastObservedEvent, "service_restarted")
+            XCTAssertNil(recovered.activeCallbackID)
+            XCTAssertTrue(recovered.eventTail.last?.detail?.contains("liveness is unknown") == true)
+
+            harness.runtime.settleFirst()
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+        }
+
         func testGEPARuntimeUsesStableBundledSealAndNoManualSetupContract() {
             let sealed = PromptExperimentGEPAWorker.configuredPythonSealValue()
 
@@ -1909,7 +2166,6 @@ import XCTest
                     pythonExecutablePath: "/usr/bin/python3",
                     reflectionTargetSelector: "reflector",
                     maxEvaluations: 20,
-                    maxWallClockSeconds: 120,
                     stopAtScore: 1,
                     randomSeed: 0
                 )

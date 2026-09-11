@@ -7,7 +7,8 @@
         func preflightOptimization(_ plan: PromptExperimentPlan) async throws
         func submit(
             _ request: PromptExperimentRunRequest,
-            progress: @escaping @MainActor @Sendable (String) async -> Void
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
         ) async throws -> PromptExperimentRuntimeHandle
         func wait(for handle: PromptExperimentRuntimeHandle) async -> PromptExperimentRuntimeResult
         func cancel(_ handle: PromptExperimentRuntimeHandle) async -> PromptExperimentCancellationObservation
@@ -144,6 +145,20 @@
                     guard loaded[index].phase == .running || loaded[index].phase == .cancelling else { continue }
                     changed = true
                     for attemptIndex in loaded[index].attempts.indices {
+                        if var diagnostics = loaded[index].attempts[attemptIndex].diagnostics,
+                           [.preparing, .runningObserved].contains(diagnostics.processObservation)
+                        {
+                            diagnostics.processObservation = .unknownAfterRestart
+                            diagnostics.activeCallbackID = nil
+                            diagnostics.activeCallbackOperation = nil
+                            diagnostics.append(PromptExperimentDiagnosticEvent(
+                                observedAt: recoveryDate,
+                                channel: "service",
+                                event: "service_restarted",
+                                detail: "Persisted worker identity is historical only; current liveness is unknown."
+                            ))
+                            loaded[index].attempts[attemptIndex].diagnostics = diagnostics
+                        }
                         switch loaded[index].attempts[attemptIndex].status {
                         case .submitting, .running:
                             loaded[index].attempts[attemptIndex].status = .submissionUncertain
@@ -248,7 +263,6 @@
                         pythonExecutablePath: python,
                         reflectionTargetSelector: "",
                         maxEvaluations: 40,
-                        maxWallClockSeconds: 1800,
                         stopAtScore: 1,
                         randomSeed: 0
                     )
@@ -621,7 +635,11 @@
                 candidateInstructions: plan.candidateInstructions,
                 targetRole: plan.resolvedTarget.selector,
                 repetitions: plan.repetitions,
-                optimization: plan.optimization,
+                optimization: {
+                    var optimization = plan.optimization
+                    optimization?.gepa.maxWallClockSeconds = nil
+                    return optimization
+                }(),
                 createdAt: date,
                 updatedAt: date
             )
@@ -920,6 +938,7 @@
             else { throw PromptExperimentAuthorityError.staleDraft }
             let date = now()
             var nextOptimization = plan.optimization
+            nextOptimization?.gepa.maxWallClockSeconds = nil
             if let chosenCandidate { nextOptimization?.seedCandidate = chosenCandidate }
             records[index].draft = PromptExperimentDraft(
                 revision: plan.revision + 1,
@@ -966,7 +985,11 @@
                 candidateInstructions: plan.candidateInstructions,
                 targetRole: plan.resolvedTarget.selector,
                 repetitions: plan.repetitions,
-                optimization: plan.optimization,
+                optimization: {
+                    var optimization = plan.optimization
+                    optimization?.gepa.maxWallClockSeconds = nil
+                    return optimization
+                }(),
                 createdAt: date,
                 updatedAt: date
             )
@@ -1066,8 +1089,13 @@
                 let attemptID = records[recordIndex].attempts[attemptIndex].id
                 records[recordIndex].attempts[attemptIndex].status = .submitting
                 records[recordIndex].attempts[attemptIndex].statusText = "Persisted as submitting; awaiting runtime acceptance."
-                records[recordIndex].attempts[attemptIndex].submittedAt = now()
-                records[recordIndex].updatedAt = now()
+                let submittedAt = now()
+                records[recordIndex].attempts[attemptIndex].submittedAt = submittedAt
+                records[recordIndex].attempts[attemptIndex].diagnostics = .initial(
+                    workerExpected: plan.optimization != nil,
+                    at: submittedAt
+                )
+                records[recordIndex].updatedAt = submittedAt
                 let request = PromptExperimentRunRequest(
                     experimentID: experimentID,
                     controllerSessionID: records[recordIndex].controllerSessionID,
@@ -1083,10 +1111,21 @@
 
                 let handle: PromptExperimentRuntimeHandle
                 do {
-                    handle = try await runtime.submit(request) { [weak self] message in
-                        guard let self else { return }
-                        await updateProgress(experimentID: experimentID, attemptID: trial.id, message: message)
-                    }
+                    handle = try await runtime.submit(
+                        request,
+                        progress: { [weak self] message in
+                            guard let self else { return }
+                            await updateProgress(experimentID: experimentID, attemptID: attemptID, message: message)
+                        },
+                        observation: { [weak self] observation in
+                            guard let self else { return }
+                            await updateRuntimeObservation(
+                                experimentID: experimentID,
+                                attemptID: attemptID,
+                                observation: observation
+                            )
+                        }
+                    )
                 } catch let error as PromptExperimentSubmissionError {
                     await settleSubmissionFailure(experimentID: experimentID, attemptID: attemptID, error: error)
                     if case .acceptanceUnknown = error { break }
@@ -1121,13 +1160,24 @@
                 {
                     records[currentRecordIndex].attempts[currentAttemptIndex].cancellationRequestedAt = records[currentRecordIndex].cancellationRequestedAt
                 }
-                records[currentRecordIndex].attempts[currentAttemptIndex].runtimeLink = PromptExperimentRuntimeLink(
-                    adapter: PromptExperimentPlan.executionAdapter,
+                let primaryRuntimeTarget = plan.optimizationTargets?.reflection ?? plan.resolvedTarget
+                let acceptedRuntimeLink = PromptExperimentRuntimeLink(
+                    adapter: plan.executionAdapter,
                     tabID: handle.tabID,
                     runID: handle.runID,
-                    provider: plan.resolvedTarget.agentRaw,
-                    model: plan.resolvedTarget.modelRaw
+                    provider: primaryRuntimeTarget.agentRaw,
+                    model: primaryRuntimeTarget.modelRaw
                 )
+                records[currentRecordIndex].attempts[currentAttemptIndex].runtimeLink = acceptedRuntimeLink
+                if var diagnostics = records[currentRecordIndex].attempts[currentAttemptIndex].diagnostics {
+                    diagnostics.append(PromptExperimentDiagnosticEvent(
+                        observedAt: now(),
+                        channel: "service",
+                        event: "runtime_accepted",
+                        detail: "adapter=\(acceptedRuntimeLink.adapter) run_id=\(acceptedRuntimeLink.runID?.uuidString ?? "unavailable")"
+                    ))
+                    records[currentRecordIndex].attempts[currentAttemptIndex].diagnostics = diagnostics
+                }
                 do {
                     try await persist()
                 } catch {
@@ -1341,8 +1391,108 @@
 
         private func updateProgress(experimentID: UUID, attemptID: UUID, message: String) async {
             try? await mutate(experimentID: experimentID) { record in
-                guard let index = record.attempts.firstIndex(where: { $0.trialID == attemptID }) else { return }
+                guard let index = record.attempts.firstIndex(where: { $0.id == attemptID }) else { return }
                 record.attempts[index].statusText = message
+            }
+        }
+
+        private func updateRuntimeObservation(
+            experimentID: UUID,
+            attemptID: UUID,
+            observation: PromptExperimentRuntimeObservation
+        ) async {
+            try? await mutate(experimentID: experimentID) { record in
+                guard let index = record.attempts.firstIndex(where: { $0.id == attemptID }) else { return }
+                let date = now()
+                var diagnostics = record.attempts[index].diagnostics
+                    ?? .initial(workerExpected: record.plan(for: record.attempts[index])?.optimization != nil, at: date)
+                let event: PromptExperimentDiagnosticEvent
+                switch observation {
+                case let .workerPrepared(stderrPath, protocolPath):
+                    diagnostics.processObservation = .preparing
+                    diagnostics.stderrLogRelativePath = stderrPath
+                    diagnostics.stdoutProtocolLogRelativePath = protocolPath
+                    event = PromptExperimentDiagnosticEvent(
+                        observedAt: date,
+                        channel: "worker",
+                        event: "worker_prepared",
+                        detail: "redacted_logs_ready=true"
+                    )
+                case let .workerStarted(pid, identity):
+                    diagnostics.processObservation = .runningObserved
+                    diagnostics.workerPID = pid
+                    diagnostics.workerProcessIdentity = identity
+                    diagnostics.processStartedAt = date
+                    event = PromptExperimentDiagnosticEvent(
+                        observedAt: date,
+                        channel: "worker",
+                        event: "worker_started",
+                        detail: "pid=\(pid); this is an observed launch, not a continuing liveness guarantee"
+                    )
+                case let .workerLaunchFailed(message):
+                    diagnostics.processObservation = .launchFailed
+                    diagnostics.processExitedAt = date
+                    event = PromptExperimentDiagnosticEvent(
+                        observedAt: date,
+                        channel: "worker",
+                        event: "worker_launch_failed",
+                        detail: String(message.prefix(300))
+                    )
+                case let .workerExited(status, stderrBytes, stderrTruncated, protocolBytes, protocolTruncated):
+                    diagnostics.processObservation = .exitedObserved
+                    diagnostics.processExitedAt = date
+                    diagnostics.processExitStatus = status
+                    diagnostics.stderrLogByteCount = stderrBytes
+                    diagnostics.stderrLogTruncated = stderrTruncated
+                    diagnostics.protocolLogByteCount = protocolBytes
+                    diagnostics.protocolLogTruncated = protocolTruncated
+                    diagnostics.activeCallbackID = nil
+                    diagnostics.activeCallbackOperation = nil
+                    event = PromptExperimentDiagnosticEvent(
+                        observedAt: date,
+                        channel: "worker",
+                        event: "worker_exited",
+                        detail: "status=\(status) stderr_bytes=\(stderrBytes) stderr_truncated=\(stderrTruncated) protocol_bytes=\(protocolBytes) protocol_truncated=\(protocolTruncated)"
+                    )
+                case let .protocolEvent(channel, name, detail):
+                    event = PromptExperimentDiagnosticEvent(
+                        observedAt: date,
+                        channel: channel,
+                        event: name,
+                        detail: detail
+                    )
+                case let .callbackStarted(id, operation):
+                    diagnostics.activeCallbackID = id
+                    diagnostics.activeCallbackOperation = operation
+                    diagnostics.linkedCallbackRuntime = nil
+                    event = PromptExperimentDiagnosticEvent(
+                        observedAt: date,
+                        channel: "callback",
+                        event: "callback_started",
+                        detail: "id=\(id) operation=\(operation) payload=excluded"
+                    )
+                case let .callbackLinked(id, runtime):
+                    diagnostics.linkedCallbackRuntime = runtime
+                    event = PromptExperimentDiagnosticEvent(
+                        observedAt: date,
+                        channel: "callback",
+                        event: "callback_linked",
+                        detail: "id=\(id) adapter=\(runtime.adapter) run_id=\(runtime.runID?.uuidString ?? "unavailable") provider=\(runtime.provider ?? "unavailable") model=\(runtime.model ?? "unavailable")"
+                    )
+                case let .callbackFinished(id, operation):
+                    if diagnostics.activeCallbackID == id {
+                        diagnostics.activeCallbackID = nil
+                        diagnostics.activeCallbackOperation = nil
+                    }
+                    event = PromptExperimentDiagnosticEvent(
+                        observedAt: date,
+                        channel: "callback",
+                        event: "callback_finished",
+                        detail: "id=\(id) operation=\(operation)"
+                    )
+                }
+                diagnostics.append(event)
+                record.attempts[index].diagnostics = diagnostics
             }
         }
 

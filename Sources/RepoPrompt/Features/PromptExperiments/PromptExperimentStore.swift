@@ -380,7 +380,8 @@
                         "- Reviewed project root: `\(optimization.projectSnapshot?.sourceRootPath ?? "none")`",
                         "- Reviewed project paths: \(optimization.projectSnapshot?.includedPaths.joined(separator: ", ") ?? "none")",
                         "- Data splits: \(optimization.examples.map { "\($0.id)=\($0.split.rawValue)" }.joined(separator: ", "))",
-                        "- Budget: \(optimization.gepa.maxEvaluations) evaluations / \(optimization.gepa.maxWallClockSeconds) seconds",
+                        "- Evaluation budget: \(optimization.gepa.maxEvaluations)",
+                        "- Experiment wall-clock deadline: \(optimization.gepa.maxWallClockSeconds.map { "historic sealed limit of \($0) seconds" } ?? "none")",
                         "- GEPA options: minibatch \(optimization.gepa.reflectionMinibatchSize ?? 1), merge \((optimization.gepa.useMerge ?? false) ? "on" : "off"), max merge \(optimization.gepa.maxMergeInvocations ?? 0), skip perfect \((optimization.gepa.skipPerfectScore ?? true) ? "yes" : "no"), seed \(optimization.gepa.randomSeed)",
                         "- Python: `\(optimization.gepa.pythonExecutablePath)`",
                         "- Permissions: model callbacks are prompt-only; command evaluation reads only the immutable project copy and writes only app-owned scratch; hidden expected outputs remain native-host-private."
@@ -443,6 +444,23 @@
                             let score = evaluation.score.map { String($0) } ?? "unavailable"
                             let failure = evaluation.failureKind.map { " / \($0.rawValue) failure" } ?? ""
                             lines.append("    - candidate #\(evaluation.candidateIndex), \(evaluation.exampleID) [\(evaluation.split.rawValue)]: \(score)\(failure) — \(Self.markdownInline(evaluation.feedback))")
+                        }
+                    }
+                    if let diagnostics = attempt.diagnostics {
+                        lines.append("  - Worker process observation: `\(diagnostics.processObservation.rawValue)` (persisted PID is historical evidence, not a liveness assertion)")
+                        lines.append("  - Worker PID / identity: \(diagnostics.workerPID.map(String.init) ?? "unavailable") / \(Self.markdownInline(diagnostics.workerProcessIdentity ?? "unavailable"))")
+                        lines.append("  - Worker start / exit / status: \(diagnostics.processStartedAt.map(Self.iso8601.string) ?? "unavailable") / \(diagnostics.processExitedAt.map(Self.iso8601.string) ?? "unavailable") / \(diagnostics.processExitStatus.map(String.init) ?? "unavailable")")
+                        lines.append("  - Last observed event: `\(diagnostics.lastObservedEvent)` at \(Self.iso8601.string(from: diagnostics.lastObservedAt))")
+                        lines.append("  - Active callback: \(diagnostics.activeCallbackID ?? "none") / \(diagnostics.activeCallbackOperation ?? "none")")
+                        if let runtime = diagnostics.linkedCallbackRuntime {
+                            lines.append("  - Linked callback runtime: `\(runtime.adapter)` / tab \(runtime.tabID?.uuidString ?? "unavailable") / run \(runtime.runID?.uuidString ?? "unavailable") / \(runtime.provider ?? "unavailable") / \(runtime.model ?? "unavailable")")
+                        }
+                        lines.append("  - Redacted stderr log: \(diagnostics.stderrLogRelativePath.map { "`../../\($0)`" } ?? "unavailable")")
+                        lines.append("  - Payload-excluding protocol log: \(diagnostics.stdoutProtocolLogRelativePath.map { "`../../\($0)`" } ?? "unavailable")")
+                        lines.append("  - Diagnostic log bytes: stderr \(diagnostics.stderrLogByteCount.map(String.init) ?? "unavailable") / stderr truncated \(diagnostics.stderrLogTruncated ? "yes" : "no") / protocol \(diagnostics.protocolLogByteCount.map(String.init) ?? "unavailable") / protocol truncated \(diagnostics.protocolLogTruncated ? "yes" : "no")")
+                        lines.append("  - Recent diagnostic events:")
+                        for event in diagnostics.eventTail {
+                            lines.append("    - \(Self.iso8601.string(from: event.observedAt)) `\(event.channel)/\(event.event)` \(Self.markdownInline(event.detail ?? ""))")
                         }
                     }
                     if let elapsed = Self.elapsedSeconds(attempt) {
