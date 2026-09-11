@@ -13,7 +13,10 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKER = ROOT / "AppResources" / "PromptExperiments" / "gepa_worker.py"
+WORKER = Path(os.environ.get(
+    "REPOPROMPT_TEST_GEPA_WORKER",
+    ROOT / "AppResources" / "PromptExperiments" / "gepa_worker.py",
+)).resolve()
 
 
 class GEPAPromptExperimentWorkerTests(unittest.TestCase):
@@ -140,7 +143,8 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
             self.assertIn("prompt_tokens=", completed["proposer_usage"])
             self.assertIn("unavailable_callbacks=0", completed["proposer_usage"])
 
-    def test_infrastructure_failure_is_not_reported_as_candidate_score_zero(self) -> None:
+    def test_failure_envelope_exposes_safe_class_and_frame_without_exception_text(self) -> None:
+        secret_canary = "HOST_PRIVATE_INFRASTRUCTURE_SECRET_CANARY"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             process = subprocess.Popen(
@@ -188,7 +192,7 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                         "id": message["id"],
                         "ok": False,
                         "failure_kind": "infrastructure",
-                        "error": "controlled provider transport failure",
+                        "error": f"controlled provider transport failure {secret_canary}",
                     }) + "\n")
                     process.stdin.flush()
                 elif message["type"] in {"completed", "failed"}:
@@ -206,7 +210,15 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
             assert terminal is not None
             self.assertEqual(terminal["type"], "failed")
             self.assertEqual(terminal["failure_kind"], "infrastructure")
-            self.assertIn("controlled provider transport failure", terminal["error"])
+            self.assertEqual(terminal["error"], "worker_failure_detail_excluded")
+            serialized = json.dumps(terminal, sort_keys=True)
+            self.assertNotIn(secret_canary, serialized)
+            diagnostic = terminal["diagnostic"]
+            self.assertEqual(diagnostic["schema_version"], 1)
+            self.assertEqual(diagnostic["exception_type"], "InfrastructureFailure")
+            self.assertEqual(diagnostic["source_frame"]["module"], "__main__")
+            self.assertEqual(diagnostic["source_frame"]["function"], "host_call")
+            self.assertGreater(diagnostic["source_frame"]["line"], 0)
 
 
 if __name__ == "__main__":

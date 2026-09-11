@@ -32,6 +32,56 @@ def emit(payload: dict[str, Any]) -> None:
     PROTOCOL_OUT.flush()
 
 
+def safe_python_identifier(value: Any, *, dotted: bool = False) -> str:
+    if not isinstance(value, str) or not value or len(value) > 256:
+        return "unavailable"
+    components = value.split(".") if dotted else [value]
+    if any(
+        not component
+        or len(component) > 128
+        or not component.isascii()
+        or not component.isidentifier()
+        for component in components
+    ):
+        return "unavailable"
+    return value
+
+
+def safe_failure_diagnostic(error: BaseException) -> dict[str, Any]:
+    traceback_node = error.__traceback__
+    while traceback_node is not None and traceback_node.tb_next is not None:
+        traceback_node = traceback_node.tb_next
+
+    source_frame: dict[str, Any] = {
+        "module": "unavailable",
+        "function": "unavailable",
+        "line": None,
+    }
+    if traceback_node is not None:
+        frame = traceback_node.tb_frame
+        source_frame = {
+            "module": safe_python_identifier(frame.f_globals.get("__name__"), dotted=True),
+            "function": safe_python_identifier(frame.f_code.co_name),
+            "line": traceback_node.tb_lineno if traceback_node.tb_lineno > 0 else None,
+        }
+
+    return {
+        "schema_version": 1,
+        "exception_type": safe_python_identifier(type(error).__name__),
+        "source_frame": source_frame,
+    }
+
+
+def emit_failure(error: BaseException) -> None:
+    emit({
+        "protocol_version": PROTOCOL_VERSION,
+        "type": "failed",
+        "failure_kind": "infrastructure",
+        "error": "worker_failure_detail_excluded",
+        "diagnostic": safe_failure_diagnostic(error),
+    })
+
+
 def receive() -> dict[str, Any]:
     line = sys.stdin.readline()
     if not line:
@@ -301,20 +351,10 @@ def main() -> int:
         emit({"protocol_version": PROTOCOL_VERSION, "type": "completed", "result": payload})
         return 0
     except InfrastructureFailure as error:
-        emit({
-            "protocol_version": PROTOCOL_VERSION,
-            "type": "failed",
-            "failure_kind": "infrastructure",
-            "error": str(error),
-        })
+        emit_failure(error)
         return 2
     except BaseException as error:
-        emit({
-            "protocol_version": PROTOCOL_VERSION,
-            "type": "failed",
-            "failure_kind": "infrastructure",
-            "error": f"{type(error).__name__}: {error}",
-        })
+        emit_failure(error)
         return 2
 
 

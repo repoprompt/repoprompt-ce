@@ -460,16 +460,17 @@
                     try? protocolLog.append(channel: "stdout", event: "invalid_protocol", detail: nil)
                     throw WorkerError.protocolFailure("GEPA worker emitted invalid protocol JSON.")
                 }
+                let protocolDetail = Self.safeProtocolDetail(type: type, object: object)
                 try protocolLog.append(
                     channel: "stdout",
                     event: type,
-                    detail: Self.safeProtocolDetail(type: type, object: object)
+                    detail: protocolDetail
                 )
                 emitObservation(
                     .protocolEvent(
                         channel: "stdout",
                         event: type,
-                        detail: Self.safeProtocolDetail(type: type, object: object)
+                        detail: protocolDetail
                     ),
                     using: observation
                 )
@@ -521,8 +522,10 @@
                     }
                     terminal = try decodeResult(result)
                 case "failed":
+                    let safeFailure = protocolDetail
+                        ?? "exception_type=unavailable source_frame=unavailable envelope=invalid error_payload=excluded"
                     terminalError = WorkerError.infrastructureFailure(
-                        "GEPA worker reported a failure; inspect the persisted redacted diagnostics."
+                        "GEPA worker reported a failure (\(safeFailure)); inspect the persisted redacted diagnostics."
                     )
                 default:
                     throw WorkerError.protocolFailure("Unsupported GEPA worker message type: \(type)")
@@ -557,7 +560,7 @@
             semaphore.wait()
         }
 
-        private static func safeProtocolDetail(type: String, object: [String: Any]) -> String? {
+        static func safeProtocolDetail(type: String, object: [String: Any]) -> String? {
             switch type {
             case "host_request":
                 let id = object["id"] as? String ?? "unknown"
@@ -571,10 +574,44 @@
             case "completed":
                 return "result_payload=excluded"
             case "failed":
-                return "error_payload=excluded"
+                guard let diagnostic = object["diagnostic"] as? [String: Any] else {
+                    return "exception_type=unavailable source_frame=unavailable envelope=legacy error_payload=excluded"
+                }
+                guard diagnostic["schema_version"] as? Int == 1,
+                      let exceptionType = safePythonIdentifier(diagnostic["exception_type"]),
+                      let sourceFrame = diagnostic["source_frame"] as? [String: Any],
+                      let module = safePythonIdentifier(sourceFrame["module"], dotted: true),
+                      let function = safePythonIdentifier(sourceFrame["function"]),
+                      let line = sourceFrame["line"] as? Int,
+                      line > 0
+                else {
+                    return "exception_type=unavailable source_frame=unavailable envelope=invalid error_payload=excluded"
+                }
+                return "exception_type=\(exceptionType) source_frame=\(module).\(function):\(line) error_payload=excluded"
             default:
                 return nil
             }
+        }
+
+        private static func safePythonIdentifier(_ rawValue: Any?, dotted: Bool = false) -> String? {
+            guard let value = rawValue as? String,
+                  !value.isEmpty,
+                  value.utf8.count <= 256
+            else { return nil }
+            let components = dotted
+                ? value.split(separator: ".", omittingEmptySubsequences: false)
+                : [Substring(value)]
+            guard components.allSatisfy({ component in
+                guard !component.isEmpty,
+                      component.utf8.count <= 128,
+                      let first = component.utf8.first,
+                      first == 95 || (65 ... 90).contains(first) || (97 ... 122).contains(first)
+                else { return false }
+                return component.utf8.dropFirst().allSatisfy { byte in
+                    byte == 95 || (48 ... 57).contains(byte) || (65 ... 90).contains(byte) || (97 ... 122).contains(byte)
+                }
+            }) else { return nil }
+            return value
         }
 
         static func safeStderrDetail(_ data: Data) -> String {

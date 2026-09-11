@@ -1894,6 +1894,11 @@ import XCTest
                     )
                 ),
                 .callbackFinished(id: "callback-1", operation: "reflect"),
+                .protocolEvent(
+                    channel: "stdout",
+                    event: "failed",
+                    detail: "exception_type=NameError source_frame=gepa.worker.run:312 error_payload=excluded"
+                ),
                 .workerExited(
                     status: 1,
                     stderrLogByteCount: 91,
@@ -1921,6 +1926,10 @@ import XCTest
             XCTAssertEqual(diagnostics.stdoutProtocolLogRelativePath, "worker-runs/attempt/stdout-protocol.ndjson")
             XCTAssertTrue(diagnostics.eventTail.contains { $0.event == "runtime_submission_persisted" })
             XCTAssertTrue(diagnostics.eventTail.contains { $0.detail?.contains("payload=excluded") == true })
+            XCTAssertTrue(diagnostics.eventTail.contains {
+                $0.event == "failed"
+                    && $0.detail == "exception_type=NameError source_frame=gepa.worker.run:312 error_payload=excluded"
+            })
             XCTAssertFalse(diagnostics.eventTail.contains { $0.detail?.contains("expectedOutput") == true })
             let exposed = try XCTUnwrap(
                 MCPAgentSessionControlToolProvider.diagnosticValue(diagnostics).objectValue
@@ -1931,12 +1940,18 @@ import XCTest
             XCTAssertEqual(exposed["stdout_protocol_log_relative_path"]?.stringValue, "worker-runs/attempt/stdout-protocol.ndjson")
             XCTAssertTrue(exposed["pid_liveness_caveat"]?.stringValue?.contains("historical observation") == true)
             XCTAssertEqual(exposed["payload_policy"]?.stringValue, "Protocol request/response bodies are excluded; arbitrary stderr is redacted.")
+            let exposedEvents = try XCTUnwrap(exposed["event_tail"]?.arrayValue)
+            XCTAssertTrue(exposedEvents.contains {
+                $0.objectValue?["detail"]?.stringValue
+                    == "exception_type=NameError source_frame=gepa.worker.run:312 error_payload=excluded"
+            })
 
             let directory = try await harness.service.recordDirectoryURL(experimentID: id)
             let overview = try String(contentsOf: directory.appendingPathComponent("overview.md"), encoding: .utf8)
             XCTAssertTrue(overview.contains("Worker process observation: `exited_observed`"))
             XCTAssertTrue(overview.contains("persisted PID is historical evidence"))
             XCTAssertTrue(overview.contains("stdout-protocol.ndjson"))
+            XCTAssertTrue(overview.contains("exception_type=NameError source_frame=gepa.worker.run:312 error_payload=excluded"))
         }
 
         func testRestartMarksPersistedWorkerPIDAsUnknownRatherThanAlive() async throws {

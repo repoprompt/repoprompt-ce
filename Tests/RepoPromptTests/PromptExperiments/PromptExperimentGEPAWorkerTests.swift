@@ -21,6 +21,69 @@ import XCTest
             }
         }
 
+        func testFailedProtocolDetailExposesOnlyValidatedExceptionIdentityAndFrame() {
+            let nameError: [String: Any] = [
+                "error": "SECRET_NAME_ERROR_CANARY",
+                "diagnostic": [
+                    "schema_version": 1,
+                    "exception_type": "NameError",
+                    "source_frame": [
+                        "module": "gepa.optimize_anything",
+                        "function": "run_candidate",
+                        "line": 417
+                    ]
+                ]
+            ]
+            let importError: [String: Any] = [
+                "diagnostic": [
+                    "schema_version": 1,
+                    "exception_type": "ImportError",
+                    "source_frame": [
+                        "module": "gepa.adapters.mcp_adapter",
+                        "function": "load_transport",
+                        "line": 83
+                    ]
+                ]
+            ]
+
+            let nameDetail = PromptExperimentGEPAWorker.safeProtocolDetail(type: "failed", object: nameError)
+            let importDetail = PromptExperimentGEPAWorker.safeProtocolDetail(type: "failed", object: importError)
+            XCTAssertEqual(
+                nameDetail,
+                "exception_type=NameError source_frame=gepa.optimize_anything.run_candidate:417 error_payload=excluded"
+            )
+            XCTAssertEqual(
+                importDetail,
+                "exception_type=ImportError source_frame=gepa.adapters.mcp_adapter.load_transport:83 error_payload=excluded"
+            )
+            XCTAssertNotEqual(nameDetail, importDetail)
+            XCTAssertFalse(nameDetail?.contains("SECRET_NAME_ERROR_CANARY") == true)
+        }
+
+        func testFailedProtocolDetailLabelsLegacyAndRejectsUntrustedFields() {
+            XCTAssertEqual(
+                PromptExperimentGEPAWorker.safeProtocolDetail(
+                    type: "failed",
+                    object: ["error": "SECRET_LEGACY_CANARY"]
+                ),
+                "exception_type=unavailable source_frame=unavailable envelope=legacy error_payload=excluded"
+            )
+            XCTAssertEqual(
+                PromptExperimentGEPAWorker.safeProtocolDetail(type: "failed", object: [
+                    "diagnostic": [
+                        "schema_version": 1,
+                        "exception_type": "NameError SECRET_CANARY",
+                        "source_frame": [
+                            "module": "gepa.worker",
+                            "function": "run",
+                            "line": 12
+                        ]
+                    ]
+                ]),
+                "exception_type=unavailable source_frame=unavailable envelope=invalid error_payload=excluded"
+            )
+        }
+
         func testStderrAllowlistRejectsUntrustedSuffixes() {
             XCTAssertEqual(
                 PromptExperimentGEPAWorker.safeStderrDetail(
