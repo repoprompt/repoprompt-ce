@@ -8,6 +8,11 @@ struct AgentModelEffortVariant: Hashable, Codable {
     let reasoningEffort: CodexReasoningEffort
 }
 
+struct AgentModelFamily: Hashable, Codable {
+    let id: String
+    let displayName: String
+}
+
 struct AgentModelOption: Identifiable, Hashable {
     let rawValue: String
     let displayName: String
@@ -17,6 +22,7 @@ struct AgentModelOption: Identifiable, Hashable {
     let supportedReasoningEfforts: [CodexReasoningEffort]
     let defaultReasoningEffort: CodexReasoningEffort?
     let effortVariant: AgentModelEffortVariant?
+    let modelFamily: AgentModelFamily?
 
     init(
         rawValue: String,
@@ -26,7 +32,8 @@ struct AgentModelOption: Identifiable, Hashable {
         isProviderDefault: Bool,
         supportedReasoningEfforts: [CodexReasoningEffort] = [],
         defaultReasoningEffort: CodexReasoningEffort? = nil,
-        effortVariant: AgentModelEffortVariant? = nil
+        effortVariant: AgentModelEffortVariant? = nil,
+        modelFamily: AgentModelFamily? = nil
     ) {
         self.rawValue = rawValue
         self.displayName = displayName
@@ -36,6 +43,7 @@ struct AgentModelOption: Identifiable, Hashable {
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.defaultReasoningEffort = defaultReasoningEffort
         self.effortVariant = effortVariant
+        self.modelFamily = modelFamily
     }
 
     init(
@@ -45,7 +53,8 @@ struct AgentModelOption: Identifiable, Hashable {
         isDefault: Bool,
         supportedReasoningEfforts: [CodexReasoningEffort] = [],
         defaultReasoningEffort: CodexReasoningEffort? = nil,
-        effortVariant: AgentModelEffortVariant? = nil
+        effortVariant: AgentModelEffortVariant? = nil,
+        modelFamily: AgentModelFamily? = nil
     ) {
         let isPlaceholder =
             rawValue.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
@@ -57,6 +66,7 @@ struct AgentModelOption: Identifiable, Hashable {
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.defaultReasoningEffort = defaultReasoningEffort
         self.effortVariant = effortVariant
+        self.modelFamily = modelFamily
     }
 
     var isDefault: Bool {

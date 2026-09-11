@@ -21,14 +21,18 @@ final class AgentModeProviderBindingService {
         selectedModelRaw: String? = nil,
         permissionProfile: AgentProviderPermissionProfile,
         isSubagent: Bool,
-        externallyManagedReason: String?
+        externallyManagedReason: String?,
+        acpModeSnapshot: ACPSessionModeSnapshot? = nil,
+        acpModeIntent: String? = nil
     ) -> AgentProviderControlsBinding {
         preferences.controlsBinding(
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
             permissionProfile: permissionProfile,
             isSubagent: isSubagent,
-            externallyManagedReason: externallyManagedReason
+            externallyManagedReason: externallyManagedReason,
+            acpModeSnapshot: acpModeSnapshot,
+            acpModeIntent: acpModeIntent
         )
     }
 
@@ -239,6 +243,9 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .devin:
+                // Devin owns its internal tool permissions; RepoPrompt exposes no mutable provider preference.
+                break
             case .grokBuild:
                 // Grok full access is a launch-time `--always-approve` flag; it applies to
                 // newly launched processes and never mutates a running controller. The next

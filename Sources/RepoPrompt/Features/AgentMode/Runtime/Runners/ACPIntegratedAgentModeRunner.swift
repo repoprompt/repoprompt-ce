@@ -48,8 +48,18 @@ final class ACPIntegratedAgentModeRunner {
     private let controllerFactory: AgentModeViewModel.ACPControllerFactory
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private var toolTrackingRunIDByTabID: [UUID: UUID] = [:]
-    private var acpProviderInvocationByTrackerInvocationIDByTabID: [UUID: [UUID: UUID]] = [:]
-    private var acpProviderPlaceholderInvocationIDsByTabID: [UUID: Set<UUID>] = [:]
+    private enum ToolSource { case tracker, provider }
+    private struct ToolCorrelation {
+        var providerByTracker: [UUID: UUID] = [:]
+        var sources: [UUID: ToolSource] = [:]
+        var placeholders: Set<UUID> = []
+        // Item IDs survive the tracker-to-provider invocation ID remap.
+        var trackerResults: Set<UUID> = []
+        var providerFailures: Set<UUID> = []
+        var notedFailures: Set<UUID> = []
+    }
+
+    private var toolCorrelation: [UUID: ToolCorrelation] = [:]
 
     private func log(_ message: String, runID: UUID) {
         guard AgentRuntimeProviderService.enableDebugLogging else { return }
@@ -316,6 +326,10 @@ final class ACPIntegratedAgentModeRunner {
 
         await controller.setExpectedMCPRunID(runID)
         session.acpController = controller
+        session.observeACPSessionModes(from: controller) { [weak self, weak session] in
+            guard let self, let session else { return }
+            hooks.bindingObservation.updateBindings(session)
+        }
         let requiresPrePromptMCPRouting = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
             let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
@@ -628,11 +642,11 @@ final class ACPIntegratedAgentModeRunner {
                 hooks.persistence.scheduleSave(session)
                 hooks.bindingObservation.updateBindings(session)
 
-                try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                try await Self.applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
                 try Self.validateModelParameterApplicationReport(parameterReport)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-                try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+                try await Self.applyRequestedSessionModeIfNeeded(runRequest, controller: controller)
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
                 if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
@@ -709,11 +723,11 @@ final class ACPIntegratedAgentModeRunner {
                     return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
                 }
 
-                try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                try await Self.applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
                 let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
                 try Self.validateModelParameterApplicationReport(parameterReport)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-                try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+                try await Self.applyRequestedSessionModeIfNeeded(runRequest, controller: controller)
 
                 if let deferredLease {
                     let acquired = await deferredLease.acquire()
@@ -892,28 +906,34 @@ final class ACPIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
     }
 
-    private func applyRequestedSessionModeIfNeeded(
-        _ requestedMode: String?,
-        controller: ACPAgentSessionController,
-        runID: UUID
+    static func applyRequestedSessionModeIfNeeded(
+        _ request: ACPRunRequest,
+        controller: ACPAgentSessionController
     ) async throws {
-        if let requestedMode = requestedMode?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
-            try await controller.setSessionMode(requestedMode)
+        guard let requested = request.sessionModeID else { return }
+        if request.agentKind == .devin {
+            let snapshot = await controller.currentSessionModeSnapshot()
+            guard snapshot?.availableValues.contains(requested) == true else {
+                throw AIProviderError.invalidConfiguration(detail: "Devin does not advertise the requested session mode.")
+            }
         }
+        try await controller.setSessionMode(requested)
     }
 
-    private func applyExplicitSelectedModelIfNeeded(
+    static func applyExplicitSelectedModelIfNeeded(
         _ runRequest: ACPRunRequest,
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        guard let model = try Self.explicitSelectedModel(
+        guard let model = try explicitSelectedModel(
             agentKind: runRequest.agentKind,
             modelString: runRequest.modelString
         ) else {
             return
         }
-        log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
+        if AgentRuntimeProviderService.enableDebugLogging {
+            print("[ACP-Runner] run=\(runID) applying \(runRequest.agentKind.displayName) selected model=\(model)")
+        }
         try await controller.setSessionModel(model)
     }
 
@@ -921,7 +941,7 @@ final class ACPIntegratedAgentModeRunner {
         agentKind: AgentProviderKind,
         modelString: String?
     ) throws -> String? {
-        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity || agentKind == .omp else { return nil }
+        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity || agentKind == .omp || agentKind == .devin else { return nil }
         guard let model = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
@@ -1239,11 +1259,13 @@ final class ACPIntegratedAgentModeRunner {
         toolTrackingHooks.flushPendingAssistantDelta(session)
         toolTrackingHooks.endActiveAssistantSegment(session)
         toolTrackingHooks.endActiveReasoningSegment(session)
+        toolCorrelation[session.tabID, default: ToolCorrelation()].sources[invocationID] = .tracker
         let argsJSON = AgentToolTrackingController.encodeArgsToJSON(args)
         let storedToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
         if let index = correlatedToolCallItemIndex(
             in: session,
             storedToolName: storedToolName,
+            source: .tracker,
             invocationID: invocationID,
             argsJSON: argsJSON,
             allowNameOnlyFallback: false
@@ -1270,6 +1292,7 @@ final class ACPIntegratedAgentModeRunner {
         } else if let index = correlatedToolResultItemIndex(
             in: session,
             storedToolName: storedToolName,
+            source: .tracker,
             invocationID: invocationID,
             argsJSON: argsJSON,
             allowNameOnlyFallback: false
@@ -1324,12 +1347,14 @@ final class ACPIntegratedAgentModeRunner {
         toolTrackingHooks.flushPendingAssistantDelta(session)
         toolTrackingHooks.endActiveAssistantSegment(session)
         toolTrackingHooks.endActiveReasoningSegment(session)
+        toolCorrelation[session.tabID, default: ToolCorrelation()].sources[invocationID] = .tracker
         let argsJSON = AgentToolTrackingController.encodeArgsToJSON(args)
         let storedToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
-        let resolvedInvocationID = consumeProviderInvocation(forTrackerInvocationID: invocationID, tabID: session.tabID) ?? invocationID
+        let resolvedInvocationID = resolvedProviderInvocation(forTrackerInvocationID: invocationID, tabID: session.tabID) ?? invocationID
         if let index = correlatedToolResultItemIndex(
             in: session,
             storedToolName: storedToolName,
+            source: .tracker,
             invocationID: resolvedInvocationID,
             argsJSON: argsJSON,
             allowNameOnlyFallback: true
@@ -1352,7 +1377,9 @@ final class ACPIntegratedAgentModeRunner {
             if !hadResult, hasNonEmptyPayload(resultJSON) {
                 toolTrackingHooks.addToolOutputTokens(resultJSON, session)
             }
+            toolCorrelation[session.tabID, default: ToolCorrelation()].trackerResults.insert(updated.id)
             session.replaceItem(at: index, with: updated)
+            reportProviderContradiction(for: updated, session: session)
         } else {
             if hasNonEmptyPayload(resultJSON) {
                 toolTrackingHooks.addToolOutputTokens(resultJSON, session)
@@ -1365,6 +1392,7 @@ final class ACPIntegratedAgentModeRunner {
                 sequenceIndex: session.nextSequenceIndex
             )
             toolResultItem.toolArgsJSON = argsJSON
+            toolCorrelation[session.tabID, default: ToolCorrelation()].trackerResults.insert(toolResultItem.id)
             session.appendItem(toolResultItem)
         }
         toolTrackingHooks.requestUIRefresh(session.tabID, false)
@@ -1391,10 +1419,12 @@ final class ACPIntegratedAgentModeRunner {
     private func correlatedToolCallItemIndex(
         in session: AgentTabSession,
         storedToolName: String,
+        source: ToolSource,
         invocationID: UUID?,
         argsJSON: String?,
         allowNameOnlyFallback: Bool
     ) -> Int? {
+        let invocationID = invocationID.map { source == .tracker ? resolvedProviderInvocation(forTrackerInvocationID: $0, tabID: session.tabID) ?? $0 : $0 }
         var inspectedItemCount = 0
         if let invocationID {
             let candidates = indexedThenActiveTurnToolCandidates(
@@ -1403,12 +1433,6 @@ final class ACPIntegratedAgentModeRunner {
                 where: {
                     $0.kind == .toolCall
                         && $0.toolInvocationID == invocationID
-                        && self.shouldUpdateExistingToolCall(
-                            $0,
-                            storedToolName: storedToolName,
-                            argsJSON: argsJSON,
-                            tabID: session.tabID
-                        )
                 }
             )
             inspectedItemCount += candidates.inspectedItemCount
@@ -1430,11 +1454,12 @@ final class ACPIntegratedAgentModeRunner {
                 session: session,
                 where: {
                     $0.kind == .toolCall
+                        && self.canAssociate($0, incoming: invocationID, source: source, tabID: session.tabID)
                         && self.toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
                 }
             )
             inspectedItemCount += candidates.inspectedItemCount
-            if let index = candidates.indices.last {
+            if candidates.indices.count == 1, let index = candidates.indices.first {
                 MCPToolObserverAttributionContext.record(
                     correlationPath: candidates.usedFallbackScan ? "signature_active_turn_scan" : "signature",
                     scannedItemCount: inspectedItemCount
@@ -1448,6 +1473,7 @@ final class ACPIntegratedAgentModeRunner {
             let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let placeholderCandidates = session.activeTurnToolItemIndices(where: { item in
                 item.kind == .toolCall
+                    && self.canAssociate(item, incoming: invocationID, source: source, tabID: session.tabID)
                     && self.isProviderPlaceholderInvocation(item.toolInvocationID, tabID: session.tabID)
                     && self.isPlaceholderToolArgs(item.toolArgsJSON)
                     && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
@@ -1465,6 +1491,7 @@ final class ACPIntegratedAgentModeRunner {
             let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
+                    && self.canAssociate($0, incoming: invocationID, source: source, tabID: session.tabID)
                     && AgentTabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
@@ -1472,7 +1499,7 @@ final class ACPIntegratedAgentModeRunner {
                 correlationPath: fallback.lastIndex == nil ? "none" : "name_active_turn_scan",
                 scannedItemCount: inspectedItemCount
             )
-            return fallback.lastIndex
+            return fallback.indices.count == 1 ? fallback.indices.first : nil
         }
         MCPToolObserverAttributionContext.record(
             correlationPath: "none",
@@ -1484,10 +1511,12 @@ final class ACPIntegratedAgentModeRunner {
     private func correlatedToolResultItemIndex(
         in session: AgentTabSession,
         storedToolName: String,
+        source: ToolSource,
         invocationID: UUID?,
         argsJSON: String?,
         allowNameOnlyFallback: Bool
     ) -> Int? {
+        let invocationID = invocationID.map { source == .tracker ? resolvedProviderInvocation(forTrackerInvocationID: $0, tabID: session.tabID) ?? $0 : $0 }
         var inspectedItemCount = 0
         if let invocationID {
             let callCandidates = indexedThenActiveTurnToolCandidates(
@@ -1496,12 +1525,6 @@ final class ACPIntegratedAgentModeRunner {
                 where: {
                     $0.kind == .toolCall
                         && $0.toolInvocationID == invocationID
-                        && self.shouldUpdateExistingToolCall(
-                            $0,
-                            storedToolName: storedToolName,
-                            argsJSON: argsJSON,
-                            tabID: session.tabID
-                        )
                 }
             )
             inspectedItemCount += callCandidates.inspectedItemCount
@@ -1520,12 +1543,6 @@ final class ACPIntegratedAgentModeRunner {
                 where: {
                     $0.kind == .toolResult
                         && $0.toolInvocationID == invocationID
-                        && self.shouldUpdateExistingToolResult(
-                            $0,
-                            storedToolName: storedToolName,
-                            argsJSON: argsJSON,
-                            tabID: session.tabID
-                        )
                 }
             )
             inspectedItemCount += resultCandidates.inspectedItemCount
@@ -1547,11 +1564,12 @@ final class ACPIntegratedAgentModeRunner {
                 session: session,
                 where: {
                     $0.kind == .toolCall
+                        && self.canAssociate($0, incoming: invocationID, source: source, tabID: session.tabID)
                         && self.toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
                 }
             )
             inspectedItemCount += callCandidates.inspectedItemCount
-            if let index = callCandidates.indices.last {
+            if callCandidates.indices.count == 1, let index = callCandidates.indices.first {
                 MCPToolObserverAttributionContext.record(
                     correlationPath: callCandidates.usedFallbackScan
                         ? "signature_call_active_turn_scan"
@@ -1565,11 +1583,12 @@ final class ACPIntegratedAgentModeRunner {
                 session: session,
                 where: {
                     $0.kind == .toolResult
+                        && self.canAssociate($0, incoming: invocationID, source: source, tabID: session.tabID)
                         && self.toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
                 }
             )
             inspectedItemCount += resultCandidates.inspectedItemCount
-            if let index = resultCandidates.indices.last {
+            if resultCandidates.indices.count == 1, let index = resultCandidates.indices.first {
                 MCPToolObserverAttributionContext.record(
                     correlationPath: resultCandidates.usedFallbackScan
                         ? "signature_result_active_turn_scan"
@@ -1583,6 +1602,7 @@ final class ACPIntegratedAgentModeRunner {
             let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
+                    && self.canAssociate($0, incoming: invocationID, source: source, tabID: session.tabID)
                     && AgentTabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
@@ -1590,7 +1610,7 @@ final class ACPIntegratedAgentModeRunner {
                 correlationPath: fallback.lastIndex == nil ? "none" : "name_active_turn_scan",
                 scannedItemCount: inspectedItemCount
             )
-            return fallback.lastIndex
+            return fallback.indices.count == 1 ? fallback.indices.first : nil
         }
         MCPToolObserverAttributionContext.record(
             correlationPath: "none",
@@ -1599,92 +1619,49 @@ final class ACPIntegratedAgentModeRunner {
         return nil
     }
 
-    private func shouldUpdateExistingToolCall(
-        _ item: AgentChatItem,
-        storedToolName: String,
-        argsJSON: String?,
-        tabID: UUID
-    ) -> Bool {
-        guard item.kind == .toolCall else { return false }
-        return hasExactToolInvocationSignature(item, storedToolName: storedToolName, argsJSON: argsJSON)
-            || hasSameNormalizedToolName(item.toolName, storedToolName)
-            || isKnownProviderPlaceholder(item, tabID: tabID)
-    }
-
-    private func shouldUpdateExistingToolResult(
-        _ item: AgentChatItem,
-        storedToolName: String,
-        argsJSON: String?,
-        tabID: UUID
-    ) -> Bool {
-        guard item.kind == .toolResult else { return false }
-        if hasExactToolInvocationSignature(item, storedToolName: storedToolName, argsJSON: argsJSON) {
-            return true
-        }
-        switch AgentTranscriptToolNormalizer.status(for: item) {
-        case .pending, .running:
-            return hasSameNormalizedToolName(item.toolName, storedToolName)
-                || isKnownProviderPlaceholder(item, tabID: tabID)
-        case .success, .warning, .failed, .cancelled, .unknown:
-            return false
-        }
-    }
-
-    private func hasExactToolInvocationSignature(
-        _ item: AgentChatItem,
-        storedToolName: String,
-        argsJSON: String?
-    ) -> Bool {
-        toolInvocationSignature(toolName: item.toolName, argsJSON: item.toolArgsJSON)
-            == toolInvocationSignature(toolName: storedToolName, argsJSON: argsJSON)
-    }
-
-    private func hasSameNormalizedToolName(_ existingToolName: String?, _ incomingToolName: String) -> Bool {
-        let existing = MCPIntegrationHelper.normalizedRepoPromptToolName(existingToolName ?? "")
-        let incoming = MCPIntegrationHelper.normalizedRepoPromptToolName(incomingToolName)
-        return !existing.isEmpty && existing == incoming
-    }
-
-    private func isKnownProviderPlaceholder(_ item: AgentChatItem, tabID: UUID) -> Bool {
-        isProviderPlaceholderInvocation(item.toolInvocationID, tabID: tabID)
-            && isPlaceholderToolArgs(item.toolArgsJSON)
+    private func canAssociate(_ item: AgentChatItem, incoming: UUID?, source: ToolSource, tabID: UUID) -> Bool {
+        guard let existing = item.toolInvocationID, let incoming else { return true }
+        let state = toolCorrelation[tabID, default: ToolCorrelation()]
+        guard state.sources[existing] != source else { return false }
+        // Once paired, only exact identity/alias lookup may find this execution.
+        return state.providerByTracker[existing] == nil && !state.providerByTracker.values.contains(existing)
+            && state.providerByTracker[incoming] == nil && !state.providerByTracker.values.contains(incoming)
     }
 
     private func recordProviderInvocation(_ providerInvocationID: UUID, forTrackerInvocationID trackerInvocationID: UUID, tabID: UUID) {
-        var mappings = acpProviderInvocationByTrackerInvocationIDByTabID[tabID, default: [:]]
-        mappings[trackerInvocationID] = providerInvocationID
-        acpProviderInvocationByTrackerInvocationIDByTabID[tabID] = mappings
+        toolCorrelation[tabID, default: ToolCorrelation()].providerByTracker[trackerInvocationID] = providerInvocationID
     }
 
     private func recordProviderPlaceholderInvocationIfNeeded(_ invocationID: UUID?, argsJSON: String?, tabID: UUID) {
         guard let invocationID, isPlaceholderToolArgs(argsJSON) else { return }
-        var placeholders = acpProviderPlaceholderInvocationIDsByTabID[tabID, default: []]
-        placeholders.insert(invocationID)
-        acpProviderPlaceholderInvocationIDsByTabID[tabID] = placeholders
+        toolCorrelation[tabID, default: ToolCorrelation()].placeholders.insert(invocationID)
     }
 
     private func removeProviderPlaceholderInvocation(_ invocationID: UUID?, tabID: UUID) {
-        guard let invocationID,
-              var placeholders = acpProviderPlaceholderInvocationIDsByTabID[tabID] else { return }
-        placeholders.remove(invocationID)
-        acpProviderPlaceholderInvocationIDsByTabID[tabID] = placeholders.isEmpty ? nil : placeholders
+        guard let invocationID else { return }
+        toolCorrelation[tabID]?.placeholders.remove(invocationID)
     }
 
     private func isProviderPlaceholderInvocation(_ invocationID: UUID?, tabID: UUID) -> Bool {
         guard let invocationID else { return false }
-        return acpProviderPlaceholderInvocationIDsByTabID[tabID]?.contains(invocationID) == true
+        return toolCorrelation[tabID]?.placeholders.contains(invocationID) == true
     }
 
-    private func consumeProviderInvocation(forTrackerInvocationID trackerInvocationID: UUID, tabID: UUID) -> UUID? {
-        guard var mappings = acpProviderInvocationByTrackerInvocationIDByTabID[tabID] else { return nil }
-        let providerInvocationID = mappings.removeValue(forKey: trackerInvocationID)
-        acpProviderInvocationByTrackerInvocationIDByTabID[tabID] = mappings.isEmpty ? nil : mappings
-        return providerInvocationID
+    private func resolvedProviderInvocation(forTrackerInvocationID trackerInvocationID: UUID, tabID: UUID) -> UUID? {
+        toolCorrelation[tabID]?.providerByTracker[trackerInvocationID]
+    }
+
+    private func reportProviderContradiction(for item: AgentChatItem, session: AgentTabSession) {
+        guard item.toolIsError != true,
+              toolCorrelation[session.tabID]?.trackerResults.contains(item.id) == true,
+              toolCorrelation[session.tabID]?.providerFailures.contains(item.id) == true,
+              toolCorrelation[session.tabID]?.notedFailures.contains(item.id) != true else { return }
+        toolCorrelation[session.tabID, default: ToolCorrelation()].notedFailures.insert(item.id)
+        session.appendItem(.error("The provider reported \(item.toolName ?? "tool") as failed, but RepoPrompt completed it successfully. The actual RepoPrompt result is retained.", sequenceIndex: session.nextSequenceIndex))
     }
 
     private func resetACPToolCorrelation(for tabID: UUID) {
-        acpProviderInvocationByTrackerInvocationIDByTabID[tabID] = nil
-        acpProviderPlaceholderInvocationIDsByTabID[tabID] = nil
+        toolCorrelation[tabID] = nil
     }
 
     private func toolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
@@ -1876,10 +1853,12 @@ final class ACPIntegratedAgentModeRunner {
             toolTrackingHooks.flushPendingAssistantDelta(session)
             toolTrackingHooks.endActiveAssistantSegment(session)
             toolTrackingHooks.endActiveReasoningSegment(session)
+            if let id = call.invocationID { toolCorrelation[session.tabID, default: ToolCorrelation()].sources[id] = .provider }
             let storedToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(call.toolName) ?? call.toolName
             if let index = correlatedToolCallItemIndex(
                 in: session,
                 storedToolName: storedToolName,
+                source: .provider,
                 invocationID: call.invocationID,
                 argsJSON: call.argsJSON,
                 allowNameOnlyFallback: false
@@ -1896,7 +1875,9 @@ final class ACPIntegratedAgentModeRunner {
                     updated.toolInvocationID = updated.toolInvocationID ?? call.invocationID
                 }
                 updated.toolName = storedToolName
-                updated.toolArgsJSON = call.argsJSON ?? updated.toolArgsJSON
+                if toolCorrelation[session.tabID]?.trackerResults.contains(updated.id) != true {
+                    updated.toolArgsJSON = call.argsJSON ?? updated.toolArgsJSON
+                }
                 if updated.kind == .toolCall {
                     updated.text = call.argsJSON ?? ""
                 }
@@ -1907,6 +1888,7 @@ final class ACPIntegratedAgentModeRunner {
             } else if let index = correlatedToolResultItemIndex(
                 in: session,
                 storedToolName: storedToolName,
+                source: .provider,
                 invocationID: call.invocationID,
                 argsJSON: call.argsJSON,
                 allowNameOnlyFallback: false
@@ -1923,7 +1905,9 @@ final class ACPIntegratedAgentModeRunner {
                     updated.toolInvocationID = updated.toolInvocationID ?? call.invocationID
                 }
                 updated.toolName = storedToolName
-                updated.toolArgsJSON = call.argsJSON ?? updated.toolArgsJSON
+                if toolCorrelation[session.tabID]?.trackerResults.contains(updated.id) != true {
+                    updated.toolArgsJSON = call.argsJSON ?? updated.toolArgsJSON
+                }
                 if !hadArgs, hasAccountableToolPayload(call.argsJSON) {
                     toolTrackingHooks.addToolInputTokens(call.argsJSON, session)
                 }
@@ -1957,15 +1941,33 @@ final class ACPIntegratedAgentModeRunner {
             toolTrackingHooks.endActiveAssistantSegment(session)
             toolTrackingHooks.endActiveReasoningSegment(session)
             removeProviderPlaceholderInvocation(result.invocationID, tabID: session.tabID)
+            if let id = result.invocationID { toolCorrelation[session.tabID, default: ToolCorrelation()].sources[id] = .provider }
             let storedToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(result.toolName) ?? result.toolName
             if let index = correlatedToolResultItemIndex(
                 in: session,
                 storedToolName: storedToolName,
+                source: .provider,
                 invocationID: result.invocationID,
                 argsJSON: result.argsJSON,
                 allowNameOnlyFallback: true
             ) {
                 var updated = session.items[index]
+                if let trackerID = updated.toolInvocationID, let providerID = result.invocationID, trackerID != providerID {
+                    recordProviderInvocation(providerID, forTrackerInvocationID: trackerID, tabID: session.tabID)
+                    updated.toolInvocationID = providerID
+                    session.replaceItem(at: index, with: updated)
+                }
+                if result.isError == true {
+                    toolCorrelation[session.tabID, default: ToolCorrelation()].providerFailures.insert(updated.id)
+                } else {
+                    toolCorrelation[session.tabID]?.providerFailures.remove(updated.id)
+                }
+                if toolCorrelation[session.tabID]?.trackerResults.contains(updated.id) == true {
+                    reportProviderContradiction(for: updated, session: session)
+                    toolTrackingHooks.requestUIRefresh(session.tabID, false)
+                    toolTrackingHooks.scheduleSave(session.tabID)
+                    return true
+                }
                 let hadResult = hasNonEmptyPayload(updated.toolResultJSON)
                 updated.kind = .toolResult
                 updated.toolName = storedToolName
@@ -1990,6 +1992,9 @@ final class ACPIntegratedAgentModeRunner {
                     sequenceIndex: session.nextSequenceIndex
                 )
                 toolResultItem.toolArgsJSON = result.argsJSON
+                if result.isError == true {
+                    toolCorrelation[session.tabID, default: ToolCorrelation()].providerFailures.insert(toolResultItem.id)
+                }
                 session.appendItem(toolResultItem)
             }
             toolTrackingHooks.requestUIRefresh(session.tabID, false)

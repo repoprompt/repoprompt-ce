@@ -21,6 +21,9 @@ enum AgentProviderPermissionLevelID: Hashable {
     case cursor(CursorAgentToolPreferences.PermissionLevel)
     case grokBuild(GrokBuildAgentToolPreferences.PermissionLevel)
     case omp(OMPAgentToolPreferences.PermissionLevel)
+    case devin
+    /// Ephemeral live-advertised choice; never a stored provider preference.
+    case devinMode(String)
 
     var providerID: AgentProviderBindingID {
         switch self {
@@ -38,6 +41,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .grokBuild
         case .omp:
             .omp
+        case .devin, .devinMode:
+            .devin
         }
     }
 
@@ -57,6 +62,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .grokBuild(.managedDefault)
         case .omp:
             .omp(.providerManaged)
+        case .devin:
+            .devin
         }
     }
 
@@ -76,6 +83,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             GrokBuildAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grokBuild)
         case .omp:
             OMPAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.omp)
+        case .devin:
+            [.devin]
         }
     }
 
@@ -103,6 +112,9 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .omp:
             guard let level = OMPAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .omp(level)
+        case .devin:
+            guard raw == "providerManaged" else { return nil }
+            self = .devin
         }
     }
 
@@ -122,6 +134,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.rawValue
         case let .omp(level):
             level.rawValue
+        case .devin, .devinMode:
+            "providerManaged"
         }
     }
 
@@ -141,6 +155,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.displayName
         case let .omp(level):
             level.displayName
+        case .devin, .devinMode:
+            "Provider Managed"
         }
     }
 
@@ -160,6 +176,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.iconName
         case let .omp(level):
             level.iconName
+        case .devin, .devinMode:
+            "shield"
         }
     }
 
@@ -179,6 +197,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .omp(level):
             level.detailText
+        case .devin, .devinMode:
+            "Devin controls its internal tools. RepoPrompt policy applies only to RepoPrompt MCP tools."
         }
     }
 
@@ -196,8 +216,10 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.isWarning
         case let .grokBuild(level):
             level.isWarning
-        case .omp:
+        case .omp, .devin:
             false
+        case let .devinMode(raw):
+            raw == "bypass"
         }
     }
 }

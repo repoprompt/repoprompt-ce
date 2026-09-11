@@ -6,6 +6,7 @@ enum ACPProviderID: String, Codable, Hashable {
     case grokBuild
     case antigravity
     case omp
+    case devin
 }
 
 enum ACPSupportResult: Equatable {
@@ -19,6 +20,22 @@ enum ACPSupportResult: Equatable {
         case let .unsupported(reason):
             reason
         }
+    }
+}
+
+/// Complete, confirmed configuration of one live ACP session, never a provider-wide default.
+struct ACPSessionModeSnapshot: Equatable {
+    struct Option: Equatable {
+        let rawValue: String
+        let displayName: String
+        let description: String?
+    }
+
+    let configID: String
+    let currentValue: String
+    let options: [Option]
+    var availableValues: [String] {
+        options.map(\.rawValue)
     }
 }
 
@@ -127,6 +144,7 @@ struct ACPRunRequest {
     let sessionModeID: String?
     let autoApproveAllToolPermissions: Bool
     let modelParameterSelections: [ACPModelParameterSelection]
+    let requiresNonBypassSessionMode: Bool
 
     init(
         agentKind: AgentProviderKind,
@@ -137,7 +155,8 @@ struct ACPRunRequest {
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         sessionModeID: String? = nil,
         autoApproveAllToolPermissions: Bool = false,
-        modelParameterSelections: [ACPModelParameterSelection] = []
+        modelParameterSelections: [ACPModelParameterSelection] = [],
+        requiresNonBypassSessionMode: Bool = false
     ) {
         self.agentKind = agentKind
         self.modelString = modelString
@@ -148,6 +167,7 @@ struct ACPRunRequest {
         self.sessionModeID = sessionModeID
         self.autoApproveAllToolPermissions = autoApproveAllToolPermissions
         self.modelParameterSelections = modelParameterSelections
+        self.requiresNonBypassSessionMode = requiresNonBypassSessionMode
     }
 }
 
@@ -301,6 +321,7 @@ protocol ACPAgentProvider: Sendable {
     ) -> [NormalizedAgentRuntimeEvent]
     func preferredAuthMethodID(context: ACPAuthenticationContext) -> String?
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async
+    func modelFamily(for rawModel: String) -> AgentModelFamily?
     func normalizeError(_ error: Error) -> Error
 
     /// Opts a provider into ACP's parameterized model picker capability and classifies
@@ -320,6 +341,10 @@ extension ACPAgentProvider {
     }
 
     func modelParameterKind(for _: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        nil
+    }
+
+    func modelFamily(for _: String) -> AgentModelFamily? {
         nil
     }
 

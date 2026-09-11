@@ -149,12 +149,6 @@ actor ACPAgentSessionController {
         var timeoutTask: Task<Void, Never>?
     }
 
-    private struct SessionModeSnapshot {
-        let configID: String
-        let currentValue: String
-        let availableValues: [String]
-    }
-
     private struct ParsedSelectConfigOption {
         let id: String
         let currentValue: String
@@ -169,7 +163,7 @@ actor ACPAgentSessionController {
 
     private enum ParsedModernModeSnapshot {
         case absent
-        case valid(SessionModeSnapshot)
+        case valid(ACPSessionModeSnapshot)
         case malformed(String)
     }
 
@@ -285,7 +279,23 @@ actor ACPAgentSessionController {
     /// registry data to live authority — effort-bearing selections require this.
     private var sessionModelSnapshotHasLiveAuthority = false
     private var sessionModelFailureReason: String?
-    private var sessionModeSnapshot: SessionModeSnapshot?
+    private let modeChannel = AsyncStream<ACPSessionModeSnapshot?>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    private var sessionModeSnapshot: ACPSessionModeSnapshot? {
+        didSet {
+            if oldValue != sessionModeSnapshot { modeChannel.continuation.yield(sessionModeSnapshot) }
+        }
+    }
+
+    func currentSessionModeSnapshot() -> ACPSessionModeSnapshot? {
+        sessionModeSnapshot
+    }
+
+    /// Single subscriber owned by the runner, independent of per-prompt event streams.
+    func sessionModeUpdates() -> AsyncStream<ACPSessionModeSnapshot?> {
+        modeChannel.continuation.yield(sessionModeSnapshot)
+        return modeChannel.stream
+    }
+
     private var sessionModeFailureReason: String?
     private var lastAppliedConfigurationSequence: UInt64 = 0
     private var bufferedConfigOptionUpdates: [BufferedConfigOptionUpdate] = []
@@ -603,6 +613,18 @@ actor ACPAgentSessionController {
         let response: [String: Any]
         do {
             let promptRequest = effectivePromptRunRequest(override: overrideRunRequest)
+            if promptRequest.agentKind == .devin {
+                if promptRequest.requiresNonBypassSessionMode {
+                    guard let current = sessionModeSnapshot?.currentValue, current != "bypass" else {
+                        throw ControllerError.requestFailed("Devin session mode is Bypass or unconfirmed. This managed session cannot send a prompt without confirmed non-Bypass authority.")
+                    }
+                }
+                if let requested = promptRequest.sessionModeID {
+                    guard sessionModeSnapshot?.currentValue == requested else {
+                        throw ControllerError.requestFailed("Devin has not confirmed the requested ACP session mode. No prompt was sent.")
+                    }
+                }
+            }
             let promptBlocks = try provider.buildPromptBlocks(for: message, request: promptRequest)
             #if DEBUG
                 if isRawACPCaptureEnabled {
@@ -725,7 +747,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor, .grokBuild, .antigravity, .omp:
+        case .openCode, .cursor, .grokBuild, .antigravity, .omp, .devin:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -1049,19 +1071,28 @@ actor ACPAgentSessionController {
             return
         }
 
-        let response = try await sendRequestResponse(
-            method: "session/set_config_option",
-            params: [
-                "sessionId": sessionID,
-                "configId": snapshot.configID,
-                "value": canonicalModeID
-            ]
-        )
-        try await applyVerifiedConfigOptionsMutationResponse(
-            response,
-            requiredModeValue: canonicalModeID,
-            requiredModelValue: nil
-        )
+        let previousSequence = lastAppliedConfigurationSequence
+        do {
+            let response = try await sendRequestResponse(
+                method: "session/set_config_option",
+                params: [
+                    "sessionId": sessionID,
+                    "configId": snapshot.configID,
+                    "value": canonicalModeID
+                ]
+            )
+            try await applyVerifiedConfigOptionsMutationResponse(
+                response,
+                requiredModeValue: canonicalModeID,
+                requiredModelValue: nil
+            )
+        } catch {
+            if provider.providerID == .devin, lastAppliedConfigurationSequence == previousSequence {
+                sessionModeSnapshot = nil
+                sessionModeFailureReason = "Session mode could not be confirmed after the request."
+            }
+            throw error
+        }
     }
 
     func respondToPermissionRequest(
@@ -1340,6 +1371,7 @@ actor ACPAgentSessionController {
         sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
+        modeChannel.continuation.finish()
         sessionModeFailureReason = nil
         lastAppliedConfigurationSequence = 0
         bufferedConfigOptionUpdates.removeAll()
@@ -2068,7 +2100,8 @@ actor ACPAgentSessionController {
             taskLabelKind: request.taskLabelKind,
             sessionModeID: request.sessionModeID,
             autoApproveAllToolPermissions: request.autoApproveAllToolPermissions,
-            modelParameterSelections: request.modelParameterSelections
+            modelParameterSelections: request.modelParameterSelections,
+            requiresNonBypassSessionMode: request.requiresNonBypassSessionMode
         )
     }
 
@@ -2304,6 +2337,7 @@ actor ACPAgentSessionController {
         }
         if error is CursorACPLaunchResolutionError || error is OpenCodeACPLaunchResolutionError
             || error is OMPACPLaunchResolutionError
+            || error is DevinACPLaunchResolutionError
         {
             return "launch_resolution"
         }
@@ -2401,10 +2435,17 @@ actor ACPAgentSessionController {
             guard let currentValue = canonicalAdvertisedValue(option.currentValue, in: values) else {
                 return .malformed("mode selector '\(option.id)' currentValue is not one of its advertised values")
             }
-            return .valid(SessionModeSnapshot(
+            return .valid(ACPSessionModeSnapshot(
                 configID: option.id,
                 currentValue: currentValue,
-                availableValues: values
+                options: values.map { value in
+                    let choice = option.choices.first { normalizedConfigValue($0["value"] as? String) == value }
+                    return ACPSessionModeSnapshot.Option(
+                        rawValue: value,
+                        displayName: choice?["name"] as? String ?? value,
+                        description: choice?["description"] as? String
+                    )
+                }
             ))
         }
     }
@@ -2513,7 +2554,7 @@ actor ACPAgentSessionController {
 
     private func canonicalSessionModeValue(
         _ requestedValue: String,
-        in snapshot: SessionModeSnapshot
+        in snapshot: ACPSessionModeSnapshot
     ) throws -> String {
         if let exact = snapshot.availableValues.first(where: { $0 == requestedValue }) {
             return exact
@@ -2528,7 +2569,7 @@ actor ACPAgentSessionController {
         throw ControllerError.requestFailed("ACP runtime does not advertise session mode '\(requestedValue)'. Available modes: \(advertisedSessionModeDescription(snapshot)).")
     }
 
-    private func advertisedSessionModeDescription(_ snapshot: SessionModeSnapshot) -> String {
+    private func advertisedSessionModeDescription(_ snapshot: ACPSessionModeSnapshot) -> String {
         snapshot.availableValues.isEmpty ? "none" : snapshot.availableValues.joined(separator: ", ")
     }
 
@@ -2923,7 +2964,8 @@ actor ACPAgentSessionController {
             displayName: displayName,
             description: normalizedACPModelString(rawOption["description"] as? String),
             isPlaceholderDefault: false,
-            isProviderDefault: rawOption["isDefault"] as? Bool ?? false
+            isProviderDefault: rawOption["isDefault"] as? Bool ?? false,
+            modelFamily: provider.modelFamily(for: rawValue)
         )
     }
 
@@ -3261,7 +3303,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity, .omp:
+        case .openCode, .cursor, .antigravity, .omp, .devin:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
@@ -3312,7 +3354,7 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode, .grokBuild, .antigravity, .omp:
+        case .openCode, .grokBuild, .antigravity, .omp, .devin:
             // Grok full access is provider-native (`grok agent --always-approve stdio`); the
             // controller never auto-selects permission options for it.
             return nil
@@ -3366,7 +3408,7 @@ actor ACPAgentSessionController {
                 .optionID("allow_once"),
                 .kind("allow_once")
             ]
-        case .grokBuild, .omp:
+        case .grokBuild, .omp, .devin:
             // Strict RepoPrompt MCP auto-approval is per-request: never select a provider-wide
             // or session-scoped option here.
             [
@@ -3573,6 +3615,8 @@ actor ACPAgentSessionController {
                 "RP_ANTIGRAVITY_ACP_RAW_CAPTURE_PATH"
             case .omp:
                 "RP_OMP_ACP_RAW_CAPTURE_PATH"
+            case .devin:
+                "RP_DEVIN_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)

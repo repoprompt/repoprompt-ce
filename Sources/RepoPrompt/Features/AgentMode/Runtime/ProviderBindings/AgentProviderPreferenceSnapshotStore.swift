@@ -48,10 +48,12 @@ final class AgentProviderPreferenceSnapshotStore {
         selectedModelRaw: String? = nil,
         permissionProfile: AgentProviderPermissionProfile,
         isSubagent _: Bool,
-        externallyManagedReason: String?
+        externallyManagedReason: String?,
+        acpModeSnapshot: ACPSessionModeSnapshot? = nil,
+        acpModeIntent: String? = nil
     ) -> AgentProviderControlsBinding {
         let providerID = selectedAgent.providerBindingID
-        let permission = permissionChromeBinding(
+        let permission = providerID == .devin ? Self.devinModeBinding(snapshot: acpModeSnapshot, intent: acpModeIntent, lockReason: externallyManagedReason) : permissionChromeBinding(
             for: providerID,
             profile: permissionProfile,
             externallyManagedReason: externallyManagedReason
@@ -72,6 +74,43 @@ final class AgentProviderPreferenceSnapshotStore {
                     selectedModelRaw: selectedModelRaw
                 )
                 : nil
+        )
+    }
+
+    static func devinModeBinding(snapshot: ACPSessionModeSnapshot?, intent: String?, lockReason: String?) -> AgentPermissionChromeBinding {
+        guard let snapshot else {
+            return AgentPermissionChromeBinding(
+                providerID: .devin, displayName: "Provider Managed", iconName: "shield", isWarning: false,
+                externallyManagedReason: lockReason,
+                options: [.init(
+                    id: .devin,
+                    title: "Mode unavailable",
+                    iconName: "shield",
+                    detailText: "Live ACP modes appear after Devin opens a session. Selections apply before the next normal turn and are not restored by RepoPrompt after reopening.",
+                    isWarning: false,
+                    isSelected: true,
+                    isEnabled: false
+                )]
+            )
+        }
+        let currentName = snapshot.options.first { $0.rawValue == snapshot.currentValue }?.displayName ?? snapshot.currentValue
+        return AgentPermissionChromeBinding(
+            providerID: .devin, displayName: currentName, iconName: "shield",
+            isWarning: snapshot.currentValue == "bypass", externallyManagedReason: lockReason,
+            options: snapshot.options.map { option in
+                let pending = intent == option.rawValue && intent != snapshot.currentValue
+                let warning = option.rawValue == "bypass"
+                let detail = [
+                    option.description,
+                    warning ? "Eligible Devin tools may run without approval. Organization restrictions and RepoPrompt MCP policy still apply; this is not an OS sandbox setting." : nil,
+                    pending ? "Requested: applies before the next normal turn." : nil
+                ].compactMap(\.self).joined(separator: "\n")
+                return AgentPermissionOptionBinding(
+                    id: .devinMode(option.rawValue), title: option.displayName + (pending ? " (requested)" : ""),
+                    iconName: warning ? "exclamationmark.shield" : "shield", detailText: detail,
+                    isWarning: warning, isSelected: option.rawValue == snapshot.currentValue, isEnabled: lockReason == nil
+                )
+            }
         )
     }
 
@@ -149,6 +188,8 @@ final class AgentProviderPreferenceSnapshotStore {
         case .omp:
             let level = effectiveOMPPermissionLevel(profile: profile)
             return AgentProviderRuntimePermissionBinding(acpSessionModeID: level.sessionModeID)
+        case .devin:
+            return AgentProviderRuntimePermissionBinding()
         case .grokBuild:
             let level = effectiveGrokBuildPermissionLevel(profile: profile)
             // For Grok this flag becomes a launch-time `--always-approve` argument in the
@@ -177,6 +218,8 @@ final class AgentProviderPreferenceSnapshotStore {
             GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .omp(level):
             OMPAgentToolPreferences.setPermissionLevel(level, defaults: defaults)
+        case .devin, .devinMode:
+            break
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -442,6 +485,26 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .devin:
+            let level = AgentProviderPermissionLevelID.devin
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: level.displayName,
+                iconName: level.iconName,
+                isWarning: level.isWarning,
+                externallyManagedReason: level.detailText,
+                options: [
+                    AgentPermissionOptionBinding(
+                        id: level,
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: true,
+                        isEnabled: false
+                    )
+                ]
+            )
         case .grokBuild:
             let effective = effectiveGrokBuildPermissionLevel(profile: profile)
             return AgentPermissionChromeBinding(
@@ -702,6 +765,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .grokBuild: .grokBuild
         case .antigravity: .antigravity
         case .omp: .omp
+        case .devin: .devin
         }
     }
 

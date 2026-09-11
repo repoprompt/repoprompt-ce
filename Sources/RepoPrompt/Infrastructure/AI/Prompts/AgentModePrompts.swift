@@ -104,7 +104,7 @@ enum AgentModePrompts {
         - Providing implementation code when asked for analysis — explain and point, don't write code
         - Continuing to explore after you have enough to answer the question
         """
-        return Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+        return Fragments.providerQualifiedToolReferences(prompt, agentKind: agentKind)
     }
 
     // MARK: - Engineer
@@ -203,7 +203,7 @@ enum AgentModePrompts {
         - Do not continue work after the task is complete
         - If something goes wrong, explain what happened and offer to fix it
         """
-        return Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+        return Fragments.providerQualifiedToolReferences(prompt, agentKind: agentKind)
     }
 
     // MARK: - Shared Fragments
@@ -354,9 +354,14 @@ enum AgentModePrompts {
         /// Qualify RepoPrompt MCP tool references for providers whose model-visible
         /// tool names include the server namespace (Codex exposes them as
         /// `mcp__RepoPrompt__<tool>`). Keep authoring prompts with canonical names
-        /// and qualify the rendered Codex prompt at the boundary.
-        static func codexQualifiedToolReferences(_ prompt: String, agentKind: AgentProviderKind?) -> String {
-            guard agentKind == .codexExec else { return prompt }
+        /// and qualify the rendered host prompt at the provider boundary.
+        static func providerQualifiedToolReferences(_ prompt: String, agentKind: AgentProviderKind?) -> String {
+            let namespace: String
+            switch agentKind {
+            case .codexExec: namespace = MCPIntegrationHelper.repoPromptMCPServerName
+            case .devin: namespace = RepoPromptMCPServerConfiguration.defaultServerName
+            default: return prompt
+            }
             var qualified = prompt
             let toolNames = MCPIntegrationHelper.repoPromptToolNames
                 .union(["RepoPrompt__read_file"])
@@ -365,7 +370,7 @@ enum AgentModePrompts {
                 let canonical = toolName == "RepoPrompt__read_file" ? "read_file" : toolName
                 qualified = qualified.replacingOccurrences(
                     of: "`\(toolName)`",
-                    with: "`mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__\(canonical)`"
+                    with: "`mcp__\(namespace)__\(canonical)`"
                 )
             }
             return qualified

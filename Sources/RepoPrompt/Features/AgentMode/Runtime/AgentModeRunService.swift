@@ -51,6 +51,12 @@ final class AgentModeRunService {
     private let headlessRunner: HeadlessAgentModeRunner
     private let codexRunner: CodexIntegratedAgentModeRunner
     private let claudeRunner: ClaudeIntegratedAgentModeRunner
+    #if DEBUG
+        var testACPRunner: ACPIntegratedAgentModeRunner {
+            acpRunner
+        }
+    #endif
+
     private let acpRunner: ACPIntegratedAgentModeRunner
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
 
@@ -148,7 +154,7 @@ final class AgentModeRunService {
                 resumeSessionID: session.providerSessionID,
                 attachments: attachments,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
-                sessionModeID: runtimePermission.acpSessionModeID,
+                sessionModeID: selectedAgent == .devin && session.permissionProfile == .userConfigured ? session.acpSessionModeIntent : runtimePermission.acpSessionModeID,
                 autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
                 modelParameterSelections: selectedAgent == .cursor
                     ? ACPModelParameterResolver.effectiveSelections(
@@ -156,7 +162,8 @@ final class AgentModeRunService {
                         selectedModelRaw: session.selectedModelRaw,
                         persistedSelections: session.acpModelParameterSelections
                     )
-                    : []
+                    : [],
+                requiresNonBypassSessionMode: selectedAgent == .devin && session.permissionProfile != .userConfigured
             )
         } else {
             nil
@@ -282,6 +289,7 @@ final class AgentModeRunService {
             resumeSessionID: session.providerSessionID,
             attachments: attachments,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
+            // Steering retains the active mode; pending intent belongs to the next normal turn.
             sessionModeID: runtimePermission.acpSessionModeID,
             autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
             modelParameterSelections: selectedAgent == .cursor
@@ -290,7 +298,8 @@ final class AgentModeRunService {
                     selectedModelRaw: session.selectedModelRaw,
                     persistedSelections: session.acpModelParameterSelections
                 )
-                : []
+                : [],
+            requiresNonBypassSessionMode: selectedAgent == .devin && session.permissionProfile != .userConfigured
         )
         let sent = await acpRunner.submitActivePrompt(
             session: session,
