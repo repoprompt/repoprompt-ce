@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -587,6 +588,106 @@ import XCTest
             XCTAssertEqual(parsedID, experimentID)
             XCTAssertEqual(parsedDigest, digest)
             XCTAssertEqual(candidateIndex, 2)
+        }
+
+        func testHandlerParsesNormalizedSetupAndUpdateSpecificationEnvelope() throws {
+            let specification = Self.validOptimization()
+            let specificationJSON = try MCPAgentSessionControlToolProvider.encodeOptimizationSpecification(specification)
+            let envelope = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(specificationJSON.utf8)) as? [String: Any]
+            )
+            XCTAssertEqual(envelope["schema_version"] as? Int, 2)
+            XCTAssertNil(envelope["schemaVersion"])
+
+            let setupArgs = MCPToolArgsNormalizer.normalize(
+                params: [
+                    "op": .string("setup"),
+                    "specification_json": .string(specificationJSON)
+                ],
+                originalToolName: "prompt_experiment",
+                canonicalToolName: "prompt_experiment"
+            ).payload
+            XCTAssertNotNil(setupArgs["specification_json"]?.objectValue)
+            let setup = try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: setupArgs)
+            guard case let .setup(patch) = setup else { return XCTFail("Expected setup command") }
+            XCTAssertEqual(patch.optimization, specification)
+
+            let experimentID = UUID()
+            let draftID = UUID()
+            let updateArgs = MCPToolArgsNormalizer.normalize(
+                params: [
+                    "op": .string("update_draft"),
+                    "experiment_id": .string(experimentID.uuidString),
+                    "expected_draft_id": .string(draftID.uuidString),
+                    "expected_draft_version": .int(3),
+                    "expected_draft_digest": .string("draft-digest"),
+                    "specification_json": .string(specificationJSON)
+                ],
+                originalToolName: "prompt_experiment",
+                canonicalToolName: "prompt_experiment"
+            ).payload
+            XCTAssertNotNil(updateArgs["specification_json"]?.objectValue)
+            let update = try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: updateArgs)
+            guard case let .updateDraft(
+                parsedExperimentID,
+                parsedDraftID,
+                parsedVersion,
+                parsedDigest,
+                patch
+            ) = update else {
+                return XCTFail("Expected update_draft command")
+            }
+            XCTAssertEqual(parsedExperimentID, experimentID)
+            XCTAssertEqual(parsedDraftID, draftID)
+            XCTAssertEqual(parsedVersion, 3)
+            XCTAssertEqual(parsedDigest, "draft-digest")
+            XCTAssertEqual(patch.optimization, specification)
+        }
+
+        func testHandlerRejectsMalformedAndUnsupportedNormalizedSpecificationEnvelopes() throws {
+            let malformedArgs = MCPToolArgsNormalizer.normalize(
+                params: [
+                    "op": .string("setup"),
+                    "specification_json": .string(#"{"schema_version":2}"#)
+                ],
+                originalToolName: "prompt_experiment",
+                canonicalToolName: "prompt_experiment"
+            ).payload
+            XCTAssertNotNil(malformedArgs["specification_json"]?.objectValue)
+            XCTAssertThrowsError(
+                try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: malformedArgs)
+            ) { error in
+                guard case let MCPError.invalidParams(message) = error else {
+                    return XCTFail("Expected invalidParams, got \(error)")
+                }
+                XCTAssertTrue(message?.contains("Invalid specification_json") == true)
+            }
+
+            let specificationJSON = try MCPAgentSessionControlToolProvider.encodeOptimizationSpecification(
+                Self.validOptimization()
+            )
+            var unsupportedEnvelope = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(specificationJSON.utf8)) as? [String: Any]
+            )
+            unsupportedEnvelope["schema_version"] = 99
+            let unsupportedJSON = try String(decoding: JSONSerialization.data(withJSONObject: unsupportedEnvelope), as: UTF8.self)
+            let unsupportedArgs = MCPToolArgsNormalizer.normalize(
+                params: [
+                    "op": .string("setup"),
+                    "specification_json": .string(unsupportedJSON)
+                ],
+                originalToolName: "prompt_experiment",
+                canonicalToolName: "prompt_experiment"
+            ).payload
+            XCTAssertNotNil(unsupportedArgs["specification_json"]?.objectValue)
+            XCTAssertThrowsError(
+                try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: unsupportedArgs)
+            ) { error in
+                guard case let MCPError.invalidParams(message) = error else {
+                    return XCTFail("Expected invalidParams, got \(error)")
+                }
+                XCTAssertEqual(message, "Unsupported optimization specification schema 99")
+            }
         }
 
         func testSessionRunApprovalAutomaticallyStartsWaitsCompletesAndClones() async throws {

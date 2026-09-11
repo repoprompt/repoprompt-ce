@@ -218,7 +218,10 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     candidateInstructions: args["candidate_instructions"]?.stringValue,
                     targetRole: args["target_role"]?.stringValue,
                     repetitions: args["repetitions"]?.intValue,
-                    optimization: decodeOptimizationSpecification(requiredString("specification_json", args: args))
+                    optimization: decodeOptimizationSpecificationArgument(
+                        args["specification_json"],
+                        required: true
+                    )
                 ))
             case .createDraft:
                 .createDraft
@@ -236,7 +239,10 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         candidateInstructions: args["candidate_instructions"]?.stringValue,
                         targetRole: args["target_role"]?.stringValue,
                         repetitions: args["repetitions"]?.intValue,
-                        optimization: args["specification_json"]?.stringValue.map(decodeOptimizationSpecification)
+                        optimization: decodeOptimizationSpecificationArgument(
+                            args["specification_json"],
+                            required: false
+                        )
                     )
                 )
             case .proposeSeal:
@@ -305,17 +311,31 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
         private struct PromptExperimentOptimizationEnvelope: Codable {
             let schemaVersion: Int
             let specification: PromptExperimentOptimizationSpecification
-
-            enum CodingKeys: String, CodingKey {
-                case schemaVersion = "schema_version"
-                case specification
-            }
         }
 
-        private static func decodeOptimizationSpecification(_ raw: String) throws -> PromptExperimentOptimizationSpecification {
-            guard let data = raw.data(using: .utf8) else {
-                throw MCPError.invalidParams("specification_json must be UTF-8")
+        private static func decodeOptimizationSpecificationArgument(
+            _ value: Value?,
+            required: Bool
+        ) throws -> PromptExperimentOptimizationSpecification? {
+            guard let value else {
+                if required { throw MCPError.invalidParams("specification_json is required") }
+                return nil
             }
+
+            let data: Data
+            switch value {
+            case let .string(raw) where !raw.isEmpty:
+                data = Data(raw.utf8)
+            case .object:
+                do {
+                    data = try JSONEncoder().encode(value)
+                } catch {
+                    throw MCPError.invalidParams("Invalid specification_json: \(error.localizedDescription)")
+                }
+            default:
+                throw MCPError.invalidParams("specification_json must be a JSON document string")
+            }
+
             do {
                 let decoder = JSONDecoder()
                 decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -331,7 +351,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             }
         }
 
-        private static func encodeOptimizationSpecification(
+        static func encodeOptimizationSpecification(
             _ specification: PromptExperimentOptimizationSpecification
         ) throws -> String {
             let encoder = JSONEncoder()
