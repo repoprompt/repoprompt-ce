@@ -230,11 +230,8 @@ import XCTest
                 name: name
             )
             let tab = try XCTUnwrap(createdTab)
-            let persistence = await manager.pollAndSaveStateWithOutcomeAsync(
-                workspaceID: fixture.workspace.id,
-                source: WorkspaceSaveSource("contextBuilderMultiRootDiscoveryFixture")
-            )
-            XCTAssertTrue(persistence.acceptedForLifecycleAdmission, "Additional tab was not persisted: \(persistence)")
+            // Tab creation saves through the window manager, not the fixture's manager.
+            await manager.debugDrainScheduledSaves()
             try await fixture.settle()
             XCTAssertNotNil(manager.workspace(withID: fixture.workspace.id)?.composeTabs.first(where: { $0.id == tab.id }))
             let canonicalSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)

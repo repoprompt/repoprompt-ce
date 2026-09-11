@@ -11,11 +11,11 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence, TextIO
+from typing import Callable, Iterable, Mapping, Optional, Sequence, TextIO
 
 XCTEST_BUNDLE_GLOB = "*.xctest"
 SANDBOX_MARKER_NAME = ".issue944-test-sandbox"
-CommandExecutor = Callable[[Sequence[str], Path | None, Mapping[str, str]], int]
+CommandExecutor = Callable[[Sequence[str], Optional[Path], Mapping[str, str]], int]
 
 
 @dataclass(frozen=True)

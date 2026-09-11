@@ -17,6 +17,19 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import ci_app_test_runner as runner  # noqa: E402
 
 
+class InterpreterCompatibilityTests(unittest.TestCase):
+    def test_script_help_runs_with_current_interpreter(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-B", str(SCRIPT_DIR / "ci_app_test_runner.py"), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Run deterministic RepoPrompt CE XCTest suites.", result.stdout)
+
+
 class LocalExecutionTests(unittest.TestCase):
     def test_conductor_routes_root_tests_through_sandbox_runner(self) -> None:
         import conductor
