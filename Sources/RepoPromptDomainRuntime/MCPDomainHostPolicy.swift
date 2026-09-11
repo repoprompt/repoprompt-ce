@@ -95,6 +95,7 @@ extension MCPDomainHost {
 
     /// Capabilities whose role advertisement policy is also enforced at `tools/call` admission.
     package static let executionRoleGatedCapabilities: Set<MCPToolCapability> = [
+        .promptExperimentControl,
         .agentExploreControl,
         .agentExternalControl,
         .agentSessionLinkControl,

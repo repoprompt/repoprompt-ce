@@ -74,6 +74,8 @@ package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
     /// an oversight link.
     case agentSessionLinkControl = "agent_session_link_control"
     case agentReasoningControl = "agent_reasoning_control"
+    /// Native experiment drafting is independent of provider-specific reasoning tools.
+    case promptExperimentControl = "prompt_experiment_control"
     case fileContentEdit = "file_content_edit"
     case fileManagement = "file_management"
     case structuralExplore = "structural_explore"
@@ -329,16 +331,23 @@ package enum MCPDomainToolCatalog {
         ))
     ]
 
+    #if DEBUG
+        package static let promptExperimentOperations = [
+            "capabilities", "list", "create_draft", "update_draft", "propose_seal", "read",
+            "clone_draft", "propose_run_again", "propose_next_revision"
+        ]
+    #endif
+
     package static let entries: [MCPDomainToolCatalogEntry] = {
         var entries = baseEntries
         #if DEBUG
             let promptExperiment = MCPDomainToolCatalogEntry(
                 name: MCPWindowToolName.promptExperiment,
                 scope: .window,
-                capability: .agentReasoningControl,
+                capability: .promptExperimentControl,
                 admissionClass: .control,
                 operationPolicy: .init(
-                    operations: ["capabilities", "list", "create_draft", "update_draft", "propose_seal", "read", "propose_next_revision"],
+                    operations: promptExperimentOperations,
                     normalization: .trimmedLowercased
                 ),
                 supportsStandalone: false

@@ -48,6 +48,7 @@ package enum MCPClientToolPolicyCatalog {
         .agentExploreControl,
         .agentSessionLinkControl,
         .agentReasoningControl,
+        .promptExperimentControl,
         .statusPublication,
     ]
 
@@ -64,6 +65,7 @@ package enum MCPClientToolPolicyCatalog {
     package static let agentModeGenericGrantedCapabilities: Set<MCPToolCapability> = [
         .userInteraction,
         .agentReasoningControl,
+        .promptExperimentControl,
         .statusPublication,
         .agentConversationSend,
         .conversationLog,
@@ -71,6 +73,7 @@ package enum MCPClientToolPolicyCatalog {
 
     package static let agentModeNativeGrantedCapabilities: Set<MCPToolCapability> = [
         .userInteraction,
+        .promptExperimentControl,
         .statusPublication,
         .agentConversationSend,
         .conversationLog,
@@ -87,6 +90,7 @@ package enum MCPClientToolPolicyCatalog {
     package static let policyGatedCapabilities: Set<MCPToolCapability> = [
         .userInteraction,
         .agentReasoningControl,
+        .promptExperimentControl,
         .statusPublication,
         .agentConversationSend,
         .conversationLog,

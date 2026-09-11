@@ -1,10 +1,18 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
     @MainActor
     final class PromptExperimentServiceTests: XCTestCase {
+        func testImplementedOperationsMatchCanonicalAdvertisement() {
+            XCTAssertEqual(
+                PromptExperimentAgentOperation.allCases.map(\.rawValue),
+                MCPDomainToolCatalog.promptExperimentOperations
+            )
+        }
+
         private final class FakeRuntime: PromptExperimentRuntime {
             var submitted: [PromptExperimentRunRequest] = []
             var cancelled: [PromptExperimentRuntimeHandle] = []

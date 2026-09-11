@@ -1125,7 +1125,7 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     #if DEBUG
         private static func promptExperimentDefinition() -> MCPDomainToolDefinition {
-            let operations = ["capabilities", "list", "create_draft", "update_draft", "propose_seal", "read", "propose_next_revision"]
+            let operations = MCPDomainToolCatalog.promptExperimentOperations
             return MCPDomainToolDefinition(
                 name: MCPWindowToolName.promptExperiment,
                 description: "Create, update, seal, and inspect a DEBUG native Prompt Experiment draft owned by the bound Agent session. This tool cannot approve or start a run.",
@@ -1141,6 +1141,14 @@ package enum MCPDomainCanonicalToolDefinitions {
                         "expected_draft_version": .object(["type": .string("integer")]),
                         "expected_draft_digest": .object(["type": .string("string")]),
                         "expected_plan_digest": .object(["type": .string("string")]),
+                        "candidate_index": .object([
+                            "type": .string("integer"),
+                            "description": .string("Optional exact GEPA candidate index to continue; omitted means the recorded best candidate.")
+                        ]),
+                        "specification_json": .object([
+                            "type": .string("string"),
+                            "description": .string("Complete versioned optimization specification JSON returned by create/read. Includes objective, examples, evaluator, execution adapter, optional reviewed project snapshot, and GEPA configuration. Replaces the specification under draft version and digest checks.")
+                        ]),
                         "title": .object(["type": .string("string")]),
                         "task_input": .object(["type": .string("string")]),
                         "synthetic_fixture": .object(["type": .string("string")]),
