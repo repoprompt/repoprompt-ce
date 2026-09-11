@@ -251,12 +251,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Workspace authority for an MCP-controlled run. Nil for ordinary UI sessions.
         var mcpWorkspaceID: UUID?
 
-        /// Frozen workspace-scoped planning model for MCP follow-up generation.
-        var mcpPlanningModelRaw: String?
-
-        /// Frozen workspace-scoped Agent Models profile for MCP follow-up generation.
-        var mcpAgentModelsProfile: AgentModelsSettingsProfile?
-
         /// MCP response_type requested (plan/question/review/clarify) - only set during MCP runs
         var mcpResponseType: String?
 
@@ -400,8 +394,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             backgroundPlanReasoningPreviewText = nil
             mcpControlToken = nil
             mcpWorkspaceID = nil
-            mcpPlanningModelRaw = nil
-            mcpAgentModelsProfile = nil
             followUpOracleSessionID = nil
             followUpOracleGroupTask = nil
             pendingAskUser = nil
@@ -440,11 +432,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     #if DEBUG
         struct RunTestHooks {
-            typealias MCPFollowUpModelSelection = (
-                model: AIModel,
-                chatPresetID: UUID?,
-                mcpControlInfo: String?
-            )
             typealias MCPFollowUpRunner = @MainActor @Sendable (
                 _ mode: HeadlessMode,
                 _ prompt: String,
@@ -455,7 +442,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let providerEventDisposition: ((_ result: AIStreamResult, _ runID: UUID, _ accepted: Bool) -> Void)?
             let teardownCompleted: ((_ runID: UUID) -> Void)?
             let allowSyntheticRoutingWithoutFinalContext: Bool
-            let resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)?
+            let isOracleModelAvailable: ((AIModel) -> Bool)?
             let runMCPFollowUp: MCPFollowUpRunner?
             let validateContextBuilderProviders: (@MainActor @Sendable () async -> Void)?
             /// Captures the exact committed tab snapshot at the commit seam so tests can assert the
@@ -475,7 +462,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 providerEventDisposition: ((_ result: AIStreamResult, _ runID: UUID, _ accepted: Bool) -> Void)?,
                 teardownCompleted: ((_ runID: UUID) -> Void)?,
                 allowSyntheticRoutingWithoutFinalContext: Bool = false,
-                resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)? = nil,
+                isOracleModelAvailable: ((AIModel) -> Bool)? = nil,
                 runMCPFollowUp: MCPFollowUpRunner? = nil,
                 validateContextBuilderProviders: (@MainActor @Sendable () async -> Void)? = nil,
                 committedTabSnapshotCaptured: (
@@ -494,7 +481,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 self.providerEventDisposition = providerEventDisposition
                 self.teardownCompleted = teardownCompleted
                 self.allowSyntheticRoutingWithoutFinalContext = allowSyntheticRoutingWithoutFinalContext
-                self.resolveMCPFollowUpModel = resolveMCPFollowUpModel
+                self.isOracleModelAvailable = isOracleModelAvailable
                 self.runMCPFollowUp = runMCPFollowUp
                 self.validateContextBuilderProviders = validateContextBuilderProviders
                 self.committedTabSnapshotCaptured = committedTabSnapshotCaptured
@@ -524,12 +511,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         func hasFollowUpOracleGroupTaskForTesting(tabID: UUID) -> Bool {
             sessions[tabID]?.followUpOracleGroupTask != nil
-        }
-
-        func setMCPAgentModelsProfileForTesting(tabID: UUID, profile: AgentModelsSettingsProfile) {
-            let session = session(for: tabID)
-            session.mcpAgentModelsProfile = profile
-            session.mcpPlanningModelRaw = profile.planningModelRaw
         }
 
         func retireStaleRunRecordForTesting(
@@ -1747,7 +1728,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         identity: WorkspaceSelectionIdentity,
         nestedTabContext: MCPServerViewModel.TabContextSnapshot,
         workspaceContext: ContextBuilderWorkspaceContext?,
-        responseType: String?
+        responseType: String?,
+        oraclePreset: String?
     ) async throws -> ContextBuilderResolvedRunAuthority {
         guard nestedTabContext.workspaceID == identity.workspaceID,
               nestedTabContext.tabID == identity.tabID,
@@ -1814,12 +1796,28 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "The target workspace provider root is unavailable: \(providerWorkspacePath)"]
             )
         }
-        let wantsResponse = responseType.flatMap {
+        let parsedResponseType = responseType.flatMap {
             ContextBuilderResponseType(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-        }?.wantsResponse ?? false
+        }
+        let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
+        if let mode = parsedResponseType?.headlessMode {
+            let snapshot = OracleSelectionSnapshot.mcp(profile: profile)
+            let resolver = OracleExecutionResolver(promptViewModel: promptManager)
+            let execution = try resolver.resolve(
+                choice: oraclePreset.map(OracleStartChoice.contextBuilderPreset) ?? .automatic,
+                mode: mode.mcpModeName,
+                snapshot: snapshot
+            )
+            generatedResponseAuthority = .generate(mode: mode, execution: execution)
+        } else {
+            guard oraclePreset == nil else {
+                throw OracleExecutionResolutionError.invalidMode("clarify")
+            }
+            generatedResponseAuthority = .contextOnly
+        }
         let runBehavior = ContextBuilderRunBehavior.mcp(
             settings: behaviorSettings,
-            wantsResponse: wantsResponse,
+            wantsResponse: parsedResponseType?.wantsResponse ?? false,
             targetIsActive: manager.activeWorkspaceID == identity.workspaceID
         )
         let configuration = ContextBuilderMCPRunConfiguration(
@@ -1828,8 +1826,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             providerWorkspacePath: StandardizedPath.absolute(providerWorkspacePath),
             runBehavior: runBehavior,
             responseType: responseType,
-            planningModelRaw: profile.planningModelRaw,
-            agentModelsProfile: profile,
+            generatedResponseAuthority: generatedResponseAuthority,
             isSystemWorkspace: workspace.isSystemWorkspace
         )
         return ContextBuilderResolvedRunAuthority(
@@ -1870,7 +1867,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     func runContextBuilderForMCP(
         authority: ContextBuilderResolvedRunAuthority,
         instructionsOverride: String? = nil,
-        planModelName: String? = nil,
         workspaceContext: ContextBuilderWorkspaceContext? = nil,
         mcpControlToken: UUID,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
@@ -1896,13 +1892,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
         }
         session.mcpWorkspaceID = identity.workspaceID
-        session.mcpPlanningModelRaw = configuration.planningModelRaw
-        session.mcpAgentModelsProfile = configuration.agentModelsProfile
         session.mcpResponseType = configuration.responseType
-        session.mcpPlanModel = contextBuilderJoinedFollowUpModelLine(
-            primaryDisplayName: planModelName,
-            additionalModelRaws: configuration.agentModelsProfile.additionalOracleModelRaws
-        )
+        session.mcpPlanModel = configuration.generatedResponseAuthority.planningModelName
         updateRuntimeBindings(from: session)
 
         guard runRegistry.activeRecord(tabID: tabID) == nil,
@@ -2033,7 +2024,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             agentOverride: AgentProviderKind? = nil,
             modelOverrideRaw: String? = nil,
             responseType: String? = nil,
-            planModelName: String? = nil,
             workspaceContext: ContextBuilderWorkspaceContext? = nil,
             mcpControlToken: UUID,
             progressReporter: ContextBuilderMCPProgressReporter? = nil,
@@ -2061,7 +2051,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 identity: identity,
                 nestedTabContext: nested,
                 workspaceContext: workspaceContext,
-                responseType: responseType
+                responseType: responseType,
+                oraclePreset: nil
             )
             let base = resolved.configuration
             let runBehavior = ContextBuilderRunBehavior(
@@ -2077,8 +2068,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 providerWorkspacePath: base.providerWorkspacePath,
                 runBehavior: runBehavior,
                 responseType: responseType,
-                planningModelRaw: base.planningModelRaw,
-                agentModelsProfile: base.agentModelsProfile,
+                generatedResponseAuthority: base.generatedResponseAuthority,
                 isSystemWorkspace: base.isSystemWorkspace
             )
             return try await runContextBuilderForMCP(
@@ -2088,7 +2078,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     modelRaw: modelOverrideRaw ?? resolved.modelRaw
                 ),
                 instructionsOverride: instructionsOverride,
-                planModelName: planModelName,
                 workspaceContext: workspaceContext,
                 mcpControlToken: mcpControlToken,
                 progressReporter: progressReporter,
@@ -2255,8 +2244,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         {
             session.mcpControlToken = nil
             session.mcpWorkspaceID = nil
-            session.mcpPlanningModelRaw = nil
-            session.mcpAgentModelsProfile = nil
             session.mcpResponseType = nil
             session.mcpPlanModel = nil
         }
@@ -4430,8 +4417,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let token = UUID()
         session.mcpControlToken = token
         session.mcpWorkspaceID = workspaceID ?? workspaceManager?.activeWorkspaceID
-        session.mcpPlanningModelRaw = nil
-        session.mcpAgentModelsProfile = nil
         session.mcpResponseType = responseType
         session.mcpPlanModel = planModelName
         updateRuntimeBindings(from: session)
@@ -4444,8 +4429,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         guard let session = sessions[tabID], session.mcpControlToken == controlToken else { return }
         session.mcpControlToken = nil
         session.mcpWorkspaceID = nil
-        session.mcpPlanningModelRaw = nil
-        session.mcpAgentModelsProfile = nil
         session.mcpResponseType = nil
         session.mcpPlanModel = nil
         updateRuntimeBindings(from: session)
@@ -4605,8 +4588,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
         chatName: String,
-        model: AIModel,
-        capturedProfile: AgentModelsSettingsProfile,
+        execution: ResolvedOracleExecution,
         gitScopeOverride: GitInclusion?,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)?,
         progressReporter: ContextBuilderMCPProgressReporter?,
@@ -4647,9 +4629,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     reviewGitContext: reviewGitContext,
                     finalReviewAuthorization: finalReviewAuthorization
                 ),
-                model: model,
+                model: execution.primaryModel,
                 mode: mode,
-                gitScopeOverride: mode == .review ? gitScopeOverride : nil
+                gitScopeOverride: mode == .review ? gitScopeOverride : nil,
+                oraclePromptConfiguration: execution.promptConfiguration
             )
             try requireCurrentOracleRun(session: session, generation: generation)
             let frozenPack = try await ContextBuilderFrozenOraclePack.make(
@@ -4742,7 +4725,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 "mode": .string(mode.mcpModeName),
                 "chat_name": .string(chatName),
                 "new_chat": .bool(true),
-                "model": .string(model.rawValue)
+                "model": .string(execution.primaryModel.rawValue)
             ]
             await progressReporter?(.sessionCreationAndPersist)
             try requireCurrentOracleRun(session: session, generation: generation)
@@ -4753,7 +4736,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     tabContext: tabContext,
                     frozenInput: frozenPack.input,
                     callbacks: callbacks,
-                    capturedProfile: capturedProfile
+                    resolvedStartExecution: execution
                 )
             }
             session.followUpOracleGroupTask = task
@@ -4885,18 +4868,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
         chatName: String,
-        model: AIModel,
-        chatPresetID: UUID?,
+        execution: ResolvedOracleExecution,
         mcpSessionUIState: OracleViewModel.MCPSessionUIState? = nil,
-        capturedProfile: AgentModelsSettingsProfile? = nil,
         gitScopeOverride: GitInclusion? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
         activityReporter: ContextBuilderMCPActivityReporter? = nil
     ) async throws -> ChatSendReply {
         let session = session(for: tabID)
-        let profile = capturedProfile ?? GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: originWorkspaceID)
-        if AppOracleGroupRouting.usesGroup(additionalModelRaws: profile.additionalOracleModelRaws) {
+        if execution.roster.count > 1 {
             return try await runFollowUpOracleGroup(
                 for: tabID,
                 originWorkspaceID: originWorkspaceID,
@@ -4910,8 +4890,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
                 chatName: chatName,
-                model: model,
-                capturedProfile: profile,
+                execution: execution,
                 gitScopeOverride: gitScopeOverride,
                 onProgress: onProgress,
                 progressReporter: progressReporter,
@@ -4928,6 +4907,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.followUpOracleSessionID = nil
         updateRuntimeBindings(from: session)
 
+        let model = execution.primaryModel
         let modeName = mode.mcpModeName
         let promptMode = promptMode(for: mode)
 
@@ -4955,7 +4935,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 ),
                 model: model,
                 mode: mode,
-                gitScopeOverride: mode == .review ? gitScopeOverride : nil
+                gitScopeOverride: mode == .review ? gitScopeOverride : nil,
+                oraclePromptConfiguration: execution.promptConfiguration
             )
 
             try Task.checkCancellation()
@@ -4973,6 +4954,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 agentModeRunID: agentModeRunID
             )
             createdSessionID = createdSession.id
+            guard let createdSessionIndex = oracleViewModel.sessions.firstIndex(where: { $0.id == createdSession.id }) else {
+                throw ChatToolError.internalError("Context Builder Oracle conversation was not created.")
+            }
+            oracleViewModel.sessions[createdSessionIndex].preferredAIModel = execution.primaryModel.rawValue
+            oracleViewModel.sessions[createdSessionIndex].selectedChatPresetID = execution.promptConfiguration.chatPresetID
+            oracleViewModel.sessions[createdSessionIndex].oracleExecutionAuthority = .frozen
             oracleViewModel.pinSession(createdSession.id)
             defer { oracleViewModel.unpinSession(createdSession.id) }
             session.followUpOracleSessionID = createdSession.id
@@ -5004,7 +4991,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 prompt,
                 sessionID: createdSession.id,
                 overrideModel: model,
-                overrideChatPresetID: chatPresetID,
+                overrideChatPresetID: execution.promptConfiguration.chatPresetID,
+                oraclePromptConfiguration: execution.promptConfiguration,
                 overrideMode: promptMode,
                 gitInclusionOverride: mode == .review ? gitScopeOverride : nil,
                 selectionOverride: selection,
@@ -5107,6 +5095,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
         mode: HeadlessMode,
+        execution: ResolvedOracleExecution,
         prompt: String,
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
@@ -5128,46 +5117,26 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         let modeName = mode.mcpModeName
-        guard let capturedProfile = sessions[tabID]?.mcpAgentModelsProfile else {
-            throw ContextBuilderGenerationError.missingMCPAgentModelsProfile
-        }
         await progressReporter?(.modelResolution)
-        let modelSelection: (
-            model: AIModel,
-            chatPresetID: UUID?,
-            mcpControlInfo: String?
-        )
-        #if DEBUG
-            if let resolver = runTestHooks?.resolveMCPFollowUpModel {
-                modelSelection = try await resolver(modeName)
-            } else {
-                modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
-                    mode: modeName,
-                    workspaceID: identity.workspaceID,
-                    planningModelRawOverride: capturedProfile.planningModelRaw
+        do {
+            #if DEBUG
+                try execution.validateAvailability(
+                    using: runTestHooks?.isOracleModelAvailable
+                        ?? promptManager.mcpOracleIsProviderConfigured
                 )
-            }
-        #else
-            modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(
-                mode: modeName,
-                workspaceID: identity.workspaceID,
-                planningModelRawOverride: capturedProfile.planningModelRaw
-            )
-        #endif
-        let mcpSessionUIState: OracleViewModel.MCPSessionUIState? = {
-            guard let mcpModelInfo = modelSelection.mcpControlInfo else { return nil }
-            let overrideChatPresetName = modelSelection.chatPresetID
-                .flatMap { ChatPresetManager.shared.preset(with: $0)?.name }
-            return OracleViewModel.MCPSessionUIState(
-                modelInfo: mcpModelInfo,
-                overrideModelName: modelSelection.model.displayName,
-                overrideChatPresetName: overrideChatPresetName
-            )
-        }()
-
-        let usesOracleGroup = AppOracleGroupRouting.usesGroup(
-            additionalModelRaws: capturedProfile.additionalOracleModelRaws
+            #else
+                try execution.validateAvailability(using: promptManager.mcpOracleIsProviderConfigured)
+            #endif
+        } catch {
+            throw ChatToolError.invalidParams(error.localizedDescription)
+        }
+        let mcpSessionUIState = OracleViewModel.MCPSessionUIState(
+            modelInfo: "\(modeName.capitalized) mode • \(execution.primaryModel.displayName)",
+            overrideModelName: execution.primaryModel.displayName,
+            overrideChatPresetName: execution.promptConfiguration.chatPreset.name
         )
+
+        let usesOracleGroup = execution.roster.count > 1
         if workspaceManager?.activeWorkspaceID != identity.workspaceID, !usesOracleGroup {
             let session = session(for: tabID)
             session.generatedAnswerRoute = nil
@@ -5188,7 +5157,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     reviewGitContext: reviewGitContext,
                     workspaceID: identity.workspaceID,
                     lookupContext: lookupContext,
-                    resolvedModel: modelSelection.model,
+                    resolvedExecution: execution,
                     finalReviewAuthorization: finalReviewAuthorization,
                     agentModeSessionID: agentModeSessionID,
                     agentModeRunID: agentModeRunID,
@@ -5233,10 +5202,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
             chatName: chatNameForTab(tabID),
-            model: modelSelection.model,
-            chatPresetID: modelSelection.chatPresetID,
+            execution: execution,
             mcpSessionUIState: mcpSessionUIState,
-            capturedProfile: capturedProfile,
             gitScopeOverride: gitScopeOverride,
             progressReporter: progressReporter,
             activityReporter: activityReporter
@@ -5251,6 +5218,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil,
             mode: HeadlessMode,
+            execution: ResolvedOracleExecution,
             prompt: String,
             selection: StoredSelection,
             lookupContext: WorkspaceLookupContext? = nil,
@@ -5269,6 +5237,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
                 mode: mode,
+                execution: execution,
                 prompt: prompt,
                 selection: selection,
                 lookupContext: lookupContext,
@@ -5363,23 +5332,41 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let reviewGitContext = mode == .review
             ? await promptManager.freezePromptGitReviewContext(tabID: tabID, base: "HEAD")
             : .automaticOnly()
-        let model: AIModel
-        switch promptManager.mcpOraclePlanningModelResolution() {
-        case let .configured(configuredModel):
-            model = configuredModel
-        case .unconfigured:
+        let profile = settingsManager.effectiveAgentModelsProfile(workspaceID: originWorkspaceID)
+        guard let primaryModelRaw = profile.planningModelRaw else {
             throw ContextBuilderGenerationError.oracleModelUnavailable(
                 "Select an Oracle model in Agent Models before generating a follow-up."
             )
-        case let .invalid(rawValue):
-            throw ContextBuilderGenerationError.oracleModelUnavailable(
-                "The configured Oracle model '\(rawValue)' is invalid. Select a valid model in Agent Models."
-            )
-        case let .unavailable(unavailableModel):
-            throw ContextBuilderGenerationError.oracleModelUnavailable(
-                "The configured Oracle model '\(unavailableModel.displayName)' is unavailable. Check its provider settings."
-            )
         }
+        let chatPresetManager = ChatPresetManager.shared
+        let chatPresetMode: ChatPresetMode = switch mode {
+        case .chat: .chat
+        case .plan: .plan
+        case .review: .review
+        }
+        let builtInChatPreset = switch mode {
+        case .chat: ChatPreset.BuiltIn.chat
+        case .plan: ChatPreset.BuiltIn.plan
+        case .review: ChatPreset.BuiltIn.review
+        }
+        let defaultChatPreset = chatPresetManager.defaultPreset(for: chatPresetMode) ?? builtInChatPreset
+        let snapshot = OracleSelectionSnapshot(
+            origin: .contextBuilderUI,
+            agentModelsProfile: profile,
+            modelPresets: [],
+            modelPresetsExposed: false,
+            modelPresetsTemporarilyDisabled: false,
+            chatPresets: chatPresetManager.allPresets,
+            defaultChatPresets: [chatPresetMode: defaultChatPreset],
+            contextBuilderUIModelStrings: [primaryModelRaw] + profile.additionalOracleModelRaws,
+            contextBuilderUIChatPreset: defaultChatPreset
+        )
+        let resolver = OracleExecutionResolver(promptViewModel: promptManager)
+        let execution = try resolver.resolve(
+            choice: .automatic,
+            mode: mode.mcpModeName,
+            snapshot: snapshot
+        )
 
         return try await runFollowUpOracleStream(
             for: tabID,
@@ -5390,8 +5377,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             selection: selection,
             reviewGitContext: reviewGitContext,
             chatName: chatName ?? defaultChatName,
-            model: model,
-            chatPresetID: nil,
+            execution: execution,
             onProgress: onProgress
         )
     }
@@ -5878,7 +5864,6 @@ enum ContextBuilderGenerationError: LocalizedError {
     case emptyPrompt
     case missingTab
     case missingWorkspace
-    case missingMCPAgentModelsProfile
     case oracleModelUnavailable(String)
     case askUserAlreadyPending
 
@@ -5887,7 +5872,6 @@ enum ContextBuilderGenerationError: LocalizedError {
         case .emptyPrompt: "Context Builder has no prompt to generate from."
         case .missingTab: "Unable to locate the Context Builder tab."
         case .missingWorkspace: "Unable to locate the Context Builder workspace."
-        case .missingMCPAgentModelsProfile: "Context Builder MCP follow-up is missing its captured Agent Models profile."
         case let .oracleModelUnavailable(message): message
         case .askUserAlreadyPending: "ask_user is already waiting for a response in this Context Builder session."
         }

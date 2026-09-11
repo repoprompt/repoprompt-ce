@@ -280,6 +280,7 @@ actor ChatDataService {
         let selectedPromptIDs: [UUID]?
         let preferredAIModel: String?
         let selectedChatPresetID: UUID?
+        let oracleExecutionAuthority: OracleExecutionAuthority?
         let messageCount: Int?
         let messages: [StoredMessageHeader]?
     }
@@ -455,6 +456,7 @@ actor ChatDataService {
                 selectedPromptIDs: header.selectedPromptIDs ?? [],
                 preferredAIModel: header.preferredAIModel,
                 selectedChatPresetID: header.selectedChatPresetID,
+                oracleExecutionAuthority: header.oracleExecutionAuthority,
                 messageCount: count,
                 shortID: shortID
             )

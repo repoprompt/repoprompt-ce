@@ -127,7 +127,7 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: temp) }
         let store = try makeBlockedStore(in: temp)
         let manager = ModelPresetsManager(presetFileStore: store)
-        let preset = ModelPreset(name: "Unsaved model", model: .claude4Sonnet)
+        let preset = try ModelPreset(name: "Unsaved model", model: .claude4Sonnet)
 
         XCTAssertFalse(manager.addPreset(preset))
 
@@ -238,6 +238,226 @@ final class PresetJSONOnlyPersistenceTests: XCTestCase {
 
         XCTAssertEqual(try String(contentsOf: workflowURL, encoding: .utf8), futureJSON)
         XCTAssertEqual(try String(contentsOf: modelURL, encoding: .utf8), futureJSON)
+    }
+
+    @MainActor
+    func testModelPresetConstructorsRoundTripAndRejectedCreationPreservesState() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let modelURL = temp.appendingPathComponent("modelPresets.json")
+        let store = PresetFileStore(
+            workflowFileURL: temp.appendingPathComponent("workflowPresets.json"),
+            modelFileURL: modelURL
+        )
+        let presets = try [
+            ModelPreset(name: "Single", model: .gpt54),
+            ModelPreset(name: "Multiple", models: [.gpt54, .gpt54Mini]),
+            ModelPreset.fromCurrentChatModel(.gpt54Mini)
+        ]
+        try store.saveModelPresets(.init(modelPresets: presets))
+        let savedBytes = try Data(contentsOf: modelURL)
+
+        XCTAssertEqual(try store.loadModelDocument().modelPresets, presets)
+
+        let manager = ModelPresetsManager(presetFileStore: store)
+        let oversizedModel = AIModel.customProvider(
+            name: "Oversized",
+            provider: "custom",
+            model: String(repeating: "x", count: OracleRosterContract.maximumModelIdentifierLength)
+        )
+        XCTAssertThrowsError(try ModelPreset(name: "Rejected", model: oversizedModel))
+        do {
+            _ = try ModelPreset.fromCurrentChatModel(oversizedModel)
+            XCTFail("Expected oversized current model rejection")
+        } catch {
+            manager.reportCreationError(error)
+        }
+
+        XCTAssertEqual(manager.presets, presets)
+        XCTAssertEqual(try Data(contentsOf: modelURL), savedBytes)
+        XCTAssertNotNil(manager.persistenceErrorMessage)
+    }
+
+    func testSchema1ModelPresetsMigrateToSchema2WithoutChangingWorkflowDocument() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let workflowURL = temp.appendingPathComponent("Presets/workflowPresets.json")
+        let modelURL = temp.appendingPathComponent("Presets/modelPresets.json")
+        try FileManager.default.createDirectory(at: modelURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let workflowBytes = Data(#"{"schemaVersion":1,"updatedAt":"2026-09-10T00:00:00Z","copyUserPresets":[],"copyVisibilityByPresetID":{},"copyOverrides":[],"chatUserPresets":[],"chatVisibilityByPresetID":{},"chatOverrides":[]}"#.utf8)
+        try workflowBytes.write(to: workflowURL)
+        let presetID = UUID()
+        let mappingID = UUID()
+        let legacyBytes = legacyModelDocument(
+            presetID: presetID,
+            modelString: "  \(AIModel.gpt54Mini.rawValue)  ",
+            extraFields: "\"description\":\"Keep me\",\"supportedModes\":{\"chat\":false,\"plan\":true,\"review\":true},\"chatPresetMappings\":{\"reviewPresetID\":\"\(mappingID.uuidString)\"}"
+        )
+        try legacyBytes.write(to: modelURL)
+        let store = PresetFileStore(workflowFileURL: workflowURL, modelFileURL: modelURL)
+
+        let document = store.loadModelPresets()
+
+        XCTAssertEqual(document.modelPresets.count, 1)
+        let preset = try XCTUnwrap(document.modelPresets.first)
+        XCTAssertEqual(preset.id, presetID)
+        XCTAssertEqual(preset.modelStrings, [AIModel.gpt54Mini.rawValue])
+        XCTAssertEqual(preset.description, "Keep me")
+        XCTAssertEqual(preset.supportedModes, SupportedModes(chat: false, plan: true, review: true))
+        XCTAssertEqual(preset.chatPresetMappings?.reviewPresetID, mappingID)
+        XCTAssertEqual(try Data(contentsOf: workflowURL), workflowBytes)
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: modelURL)) as? [String: Any]
+        )
+        XCTAssertEqual(object["schemaVersion"] as? Int, PresetFileStore.modelSchemaVersion)
+        let records = try XCTUnwrap(object["modelPresets"] as? [[String: Any]])
+        XCTAssertEqual(records.first?["modelStrings"] as? [String], [AIModel.gpt54Mini.rawValue])
+        XCTAssertNil(records.first?["modelString"])
+    }
+
+    func testSchema2RejectsInvalidRosterDocumentsAsAWhole() throws {
+        let invalidRosterValues = [
+            "[]",
+            "[\"valid\",\"valid\",\"valid\",\"valid\",\"valid\",\"valid\"]",
+            "[\"   \"]",
+            "[\"\(String(repeating: "x", count: 513))\"]",
+            "\"not-an-array\""
+        ]
+        for rosterJSON in invalidRosterValues {
+            let temp = try makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: temp) }
+            let modelURL = temp.appendingPathComponent("modelPresets.json")
+            let json = """
+            {"schemaVersion":2,"updatedAt":"2026-09-10T00:00:00Z","modelPresets":[{"id":"\(UUID().uuidString)","name":"Invalid","modelStrings":\(rosterJSON)}]}
+            """
+            try Data(json.utf8).write(to: modelURL)
+            let store = PresetFileStore(
+                workflowFileURL: temp.appendingPathComponent("workflowPresets.json"),
+                modelFileURL: modelURL
+            )
+            XCTAssertThrowsError(try store.loadModelDocument(), rosterJSON)
+        }
+
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let modelURL = temp.appendingPathComponent("modelPresets.json")
+        let conflicting = """
+        {"schemaVersion":2,"updatedAt":"2026-09-10T00:00:00Z","modelPresets":[{"id":"\(UUID().uuidString)","name":"Conflict","modelString":"old","modelStrings":["new"]}]}
+        """
+        try Data(conflicting.utf8).write(to: modelURL)
+        let store = PresetFileStore(
+            workflowFileURL: temp.appendingPathComponent("workflowPresets.json"),
+            modelFileURL: modelURL
+        )
+        XCTAssertThrowsError(try store.loadModelDocument())
+    }
+
+    func testModelPresetDocumentsRejectUnsupportedPastAndInvalidLegacyRepresentations() throws {
+        let documents = [
+            #"{"schemaVersion":0,"updatedAt":"2026-09-10T00:00:00Z","modelPresets":[]}"#,
+            #"{"schemaVersion":1,"updatedAt":"2026-09-10T00:00:00Z","modelPresets":[{"id":"00000000-0000-0000-0000-000000000001","name":"Wrong type","modelString":7}]}"#,
+            #"{"schemaVersion":1,"updatedAt":"2026-09-10T00:00:00Z","modelPresets":[{"id":"00000000-0000-0000-0000-000000000001","name":"Conflict","modelString":"old","modelStrings":["new"]}]}"#,
+            #"{"schemaVersion":2,"updatedAt":"2026-09-10T00:00:00Z","modelPresets":[{"id":"00000000-0000-0000-0000-000000000001","name":"Valid","modelStrings":["openai/gpt-5.4"]},{"id":"00000000-0000-0000-0000-000000000002","name":"Invalid","modelStrings":[]}]}"#
+        ]
+
+        for document in documents {
+            let temp = try makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: temp) }
+            let modelURL = temp.appendingPathComponent("modelPresets.json")
+            try Data(document.utf8).write(to: modelURL)
+            let store = PresetFileStore(
+                workflowFileURL: temp.appendingPathComponent("workflowPresets.json"),
+                modelFileURL: modelURL
+            )
+            XCTAssertThrowsError(try store.loadModelDocument(), document)
+        }
+    }
+
+    @MainActor
+    func testModelPresetManagerRollsBackUpdateDeleteAndReorderFailures() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let modelURL = temp.appendingPathComponent("modelPresets.json")
+        let original = try [
+            ModelPreset(name: "First", model: .gpt54),
+            ModelPreset(name: "Second", model: .gpt54Mini)
+        ]
+        let seedStore = PresetFileStore(
+            workflowFileURL: temp.appendingPathComponent("workflowPresets.json"),
+            modelFileURL: modelURL
+        )
+        try seedStore.saveModelPresets(.init(modelPresets: original))
+        let originalBytes = try Data(contentsOf: modelURL)
+        let failingStore = PresetFileStore(
+            workflowFileURL: temp.appendingPathComponent("workflowPresets.json"),
+            modelFileURL: modelURL,
+            writeData: { _, _ in throw TestWriteError.blocked }
+        )
+        let manager = ModelPresetsManager(presetFileStore: failingStore)
+
+        let updated = try ModelPreset(
+            id: original[0].id,
+            name: "Updated",
+            modelStrings: [AIModel.gpt54Mini.rawValue]
+        )
+        manager.updatePreset(updated)
+        XCTAssertEqual(manager.presets, original)
+        manager.removePreset(original[0])
+        XCTAssertEqual(manager.presets, original)
+        manager.movePresets(from: IndexSet(integer: 0), to: 2)
+        XCTAssertEqual(manager.presets, original)
+        XCTAssertEqual(try Data(contentsOf: modelURL), originalBytes)
+        XCTAssertNotNil(manager.persistenceErrorMessage)
+    }
+
+    @MainActor
+    func testMigrationWriteFailurePreservesLegacyBytesAndPublishesManagerWarning() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let modelURL = temp.appendingPathComponent("modelPresets.json")
+        let legacyBytes = legacyModelDocument(
+            presetID: UUID(),
+            modelString: AIModel.gpt54Mini.rawValue,
+            extraFields: "\"description\":\"Loaded despite write failure\""
+        )
+        try legacyBytes.write(to: modelURL)
+        var shouldFailWrites = true
+        let store = PresetFileStore(
+            workflowFileURL: temp.appendingPathComponent("workflowPresets.json"),
+            modelFileURL: modelURL,
+            writeData: { data, url in
+                if shouldFailWrites { throw TestWriteError.blocked }
+                try data.write(to: url, options: .atomic)
+            }
+        )
+
+        let manager = ModelPresetsManager(presetFileStore: store)
+
+        XCTAssertEqual(manager.presets.map(\.modelStrings), [[AIModel.gpt54Mini.rawValue]])
+        XCTAssertNotNil(manager.persistenceErrorMessage)
+        XCTAssertEqual(try Data(contentsOf: modelURL), legacyBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temp.appendingPathComponent("Backups").path))
+
+        shouldFailWrites = false
+        XCTAssertTrue(try manager.addPreset(ModelPreset(name: "Second", model: .gpt54)))
+        XCTAssertNil(manager.persistenceErrorMessage)
+        XCTAssertEqual(store.modelLoadWarning, nil)
+    }
+
+    private func legacyModelDocument(
+        presetID: UUID,
+        modelString: String,
+        extraFields: String
+    ) -> Data {
+        let suffix = extraFields.isEmpty ? "" : ",\(extraFields)"
+        return Data("""
+        {"schemaVersion":1,"updatedAt":"2026-09-10T00:00:00Z","modelPresets":[{"id":"\(presetID.uuidString)","name":"Review-2","modelString":"\(modelString)"\(suffix)}]}
+        """.utf8)
+    }
+
+    private enum TestWriteError: Error {
+        case blocked
     }
 
     private func makeTempDirectory() throws -> URL {

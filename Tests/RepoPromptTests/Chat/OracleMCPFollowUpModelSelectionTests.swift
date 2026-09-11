@@ -4,67 +4,59 @@ import XCTest
 
 final class OracleMCPFollowUpModelSelectionTests: XCTestCase {
     @MainActor
-    func testCapturedPlanningModelWinsWithoutChangingExplicitOrOrdinaryPresetSelection() async throws {
-        let settings = GlobalSettingsStore.shared
-        let previousShowPresets = settings.mcpShowModelPresets()
-        let previousTemporarilyDisabled = settings.mcpTemporarilyDisablePresets()
-        settings.setMCPShowModelPresets(true, commit: false)
-        settings.setMCPTemporarilyDisablePresets(false, commit: false)
-        defer {
-            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
-            settings.setMCPTemporarilyDisablePresets(previousTemporarilyDisabled, commit: false)
-        }
-
+    func testCapturedProfileUsesAutomaticPresetAndExplicitRawOverrideRetainsAdditions() throws {
         let fixture = makeFixture()
         fixture.apiSettings.openAIApiKey = "test-key"
         fixture.apiSettings.isOpenAIKeyValid = true
-
-        let capturedPlanningModel = AIModel.gpt54
-        let presetModel = AIModel.gpt54Mini
-        let preset = ModelPreset(name: "review_preset", model: presetModel)
-
-        let capturedSelection = try await fixture.oracle.resolveMCPFollowUpModel(
-            mode: "review",
-            planningModelRawOverride: capturedPlanningModel.rawValue,
-            allPresetsOverride: [preset]
+        let automaticPreset = try ModelPreset(
+            name: "review_preset",
+            modelStrings: [AIModel.gpt54Mini.rawValue]
         )
-        XCTAssertEqual(capturedSelection.model, capturedPlanningModel)
-
-        let explicitSelection = try await fixture.oracle.resolveMCPFollowUpModel(
-            mode: "review",
-            modelParam: preset.name,
-            planningModelRawOverride: capturedPlanningModel.rawValue,
-            allPresetsOverride: [preset]
+        let profile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54.rawValue,
+            additionalOracleModelRaws: [AIModel.gpt54Mini.rawValue]
         )
-        XCTAssertEqual(explicitSelection.model, presetModel)
+        let snapshot = makeSnapshot(profile: profile, presets: [automaticPreset])
 
-        let ordinarySelection = try await fixture.oracle.resolveMCPFollowUpModel(
+        let automatic = try fixture.oracle.resolveOracleStartExecution(
             mode: "review",
-            allPresetsOverride: [preset]
+            modelParam: nil,
+            profile: profile,
+            promptVM: fixture.oracle.promptViewModel,
+            snapshotOverride: snapshot
         )
-        XCTAssertEqual(ordinarySelection.model, presetModel)
+        XCTAssertEqual(automatic.models, [.gpt54Mini])
+        XCTAssertEqual(automatic.selection, .automaticPreset(id: automaticPreset.id, name: automaticPreset.name))
 
-        do {
-            _ = try await fixture.oracle.resolveMCPFollowUpModel(
-                mode: "review",
-                planningModelRawOverride: AIModel.claude4Sonnet.rawValue,
-                allPresetsOverride: [preset]
-            )
-            XCTFail("An unavailable captured primary must not fall back to a preset")
-        } catch let error as ChatToolError {
-            XCTAssertEqual(error.code, .invalidParams)
-        }
+        let rawOverride = try fixture.oracle.resolveOracleStartExecution(
+            mode: "review",
+            modelParam: AIModel.gpt54.rawValue,
+            profile: profile,
+            promptVM: fixture.oracle.promptViewModel,
+            snapshotOverride: snapshot
+        )
+        XCTAssertEqual(rawOverride.models, [.gpt54, .gpt54Mini])
+        XCTAssertEqual(rawOverride.selection, .rawPrimaryOverride(AIModel.gpt54.rawValue))
+    }
 
-        do {
-            _ = try await fixture.oracle.resolveMCPFollowUpModel(
-                mode: "review",
-                planningModelRawOverride: "not_a_real_model",
-                allPresetsOverride: [preset]
-            )
-            XCTFail("An invalid captured primary must not fall back to a preset")
-        } catch let error as ChatToolError {
-            XCTAssertEqual(error.code, .invalidParams)
-        }
+    @MainActor
+    private func makeSnapshot(
+        profile: AgentModelsSettingsProfile,
+        presets: [ModelPreset]
+    ) -> OracleSelectionSnapshot {
+        OracleSelectionSnapshot(
+            origin: .mcp,
+            agentModelsProfile: profile,
+            modelPresets: presets,
+            modelPresetsExposed: true,
+            modelPresetsTemporarilyDisabled: false,
+            chatPresets: ChatPreset.BuiltIn.all(),
+            defaultChatPresets: [
+                .chat: ChatPreset.BuiltIn.chat,
+                .plan: ChatPreset.BuiltIn.plan,
+                .review: ChatPreset.BuiltIn.review
+            ]
+        )
     }
 
     @MainActor

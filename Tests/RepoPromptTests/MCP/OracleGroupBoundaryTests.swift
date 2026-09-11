@@ -419,6 +419,19 @@ import XCTest
             XCTAssertEqual(calls[1].arguments?["context_pack_ref"], .string("oracle-pack:sha256:fixture"))
         }
 
+        func testOraclePresetIsForwardedToAppBackedBoundary() async throws {
+            let fixture = try await makeCommandRunnerFixture()
+            addTeardownBlock { await fixture.cleanup() }
+
+            let result = await fixture.runner.runLine(
+                #"call context_builder {"instructions":"Inspect","response_type":"plan","oracle_preset":"Deep"}"#
+            )
+
+            XCTAssertTrue(result.succeeded)
+            let calls = await fixture.recorder.recordedCalls()
+            XCTAssertEqual(calls.first?.arguments?["oracle_preset"], .string("Deep"))
+        }
+
         func testAliasNormalizesToInstructionsBeforeExclusiveInputValidation() async throws {
             let fixture = try await makeCommandRunnerFixture()
             addTeardownBlock { await fixture.cleanup() }

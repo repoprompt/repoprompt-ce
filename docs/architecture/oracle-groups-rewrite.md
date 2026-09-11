@@ -6,7 +6,9 @@ This document explains the current implementation and its ownership boundaries.
 
 ## Product contract
 
-An Oracle roster contains one primary model and up to four additional models. The order is significant, and duplicate model identifiers are valid. Every lane receives the same user input.
+An Oracle roster contains one primary model and up to four additional models. The order is significant, and duplicate model identifiers are valid. Every lane receives the same frozen input and request-level Chat Preset configuration.
+
+An exposed Model Preset owns its complete ordered roster. Agent Models additions are not appended to a selected preset. Resolution captures the roster, strict lane models, request mode, and one Chat Preset configuration before cardinality chooses the established N=1 path or grouped N>1 runtime.
 
 A grouped result keeps every lane outcome separate and in roster order. The group status is derived from lane outcomes:
 
@@ -44,15 +46,17 @@ The coordinator handles rosters with two to five lanes. Callers bypass it for N=
 
 ## App execution
 
-`OracleViewModel+Groups.swift` is the app adapter. `tool_chatSendWithConfiguredRoster` reads the effective model profile and chooses the route.
+`OracleExecutionResolver` is the app-owned start authority for `oracle_send` and MCP-originated Context Builder responses. It resolves an explicit preset before raw-model interpretation, applies automatic preset priority when no explicit choice is present, captures the mode-specific Chat Preset once, and rejects any unusable lane before session or provider work. `OracleViewModel+Groups.swift` receives that resolved execution and chooses the runtime by roster count.
 
 For N=1, the adapter calls the existing `tool_chatSend` implementation. It does not create a group document, acquire a group claim, or create lane projections.
 
 For N>1, the adapter allocates identities and calls `OracleGroupRuntime.execute`. The runtime owns claim lifetime, post-claim reload, interrupted-turn recovery, durable prepare, lane coordination, cancellation settlement, and exact terminal publication. The adapter's callbacks restore `ChatSession` projections by canonical `memberID`, reject conflicting group metadata, invoke the existing per-lane provider path, and forward coordinator progress. A projection that claims a group ID cannot fall back to N=1 when the canonical document is missing.
 
-A named single-chat continuation is never promoted into a group. A group continuation uses the roster stored in the group document and rejects a configured roster mismatch.
+A named single-chat continuation is never promoted into a group. App continuations use the persisted single-session model and Chat Preset identity or the durable group roster and per-lane session metadata. Editing Model Presets or Agent Models does not change existing app conversations; the runtime still compares the durable roster against the canonical reread around claim acquisition.
 
-`ContextBuilderAgentViewModel` uses the same app adapter for grouped follow-up requests. `ContextBuilderOracleGroupState` fences callbacks by generation, group, turn, lane, and sequence. Bind is one-shot inside a generation, and the prepared callback records that fence before awaiting progress. The plan or review preview shows primary-lane progress, while the final reply retains every lane result.
+`ContextBuilderAgentViewModel` captures MCP generated-response authority before discovery and carries the resulting `ResolvedOracleExecution` through the physical capability adapter and server closure. The discovery agent and discovery model remain independent. After discovery, availability is rechecked against the captured lane models without selecting a replacement. UI-originated generation adapts the existing UI model roster and default Chat Preset into the same execution type without consulting MCP preset exposure gates.
+
+For grouped follow-ups, `ContextBuilderOracleGroupState` fences callbacks by generation, group, turn, lane, and sequence. Bind is one-shot inside a generation, and the prepared callback records that fence before awaiting progress. One provider-visible message is packaged from the captured prompt configuration and frozen evidence, then shared by every lane. The plan or review preview shows primary-lane progress, while the final reply and export retain every lane result.
 
 ## Direct headless execution
 
@@ -74,7 +78,7 @@ A token-verified grouped child connection exposes only repository-read tools: co
 
 ### Frozen Context Builder input
 
-A direct grouped Context Builder request must use a persisted `context_pack_ref` in the canonical `oracle-pack:sha256:<digest>` form. Raw `instructions` remain available for N=1 only.
+A direct grouped Context Builder request must use a persisted `context_pack_ref` in the canonical `oracle-pack:sha256:<digest>` form. Raw `instructions` remain available for N=1 only. The app-only `oracle_preset` argument is rejected before direct roster resolution, pack loading, carrier allocation, or provider validation. Direct starts and continuations use their settings-owned policy.
 
 `MCPCommandRunner` accepts exactly one of `instructions` or `context_pack_ref`. The direct adapter verifies the pack schema, mode, content digest, and stored artifact before launching lanes. Invalid or missing packs fail with `context_pack_required` or the relevant pack validation error.
 
@@ -108,6 +112,8 @@ The app and direct headless runtime use separate settings stores with the same s
 
 `GlobalSettingsStore` owns app settings. `DomainDirectSettingsStore` owns direct settings. `AppSettingsMCPService` and `DirectHeadlessGlobalBackend` adapt MCP values to their owning store. Both adapters use `DomainSettingValue` for string-array conversion and validation.
 
+Model Presets persist their complete one-to-five-model roster in schema 2 `modelStrings`. Schema 1 `modelString` records migrate to one-element rosters after a complete validated decode. Migration-write failure preserves the original bytes, returns the validated in-memory presets with a settings warning, and does not enter corrupt-file recovery. Future schemas remain write-protected.
+
 `GlobalSettingsFileStore` rejects the unshipped experimental Oracle schema versions. Unknown or experimental documents must not become migration authority or silently overwrite user settings.
 
 `MCPDomainCanonicalToolDefinitions.swift` is the canonical MCP schema source. `docs/spec/mcp-domain-canonical-tool-definitions.generated.json` is a generated review copy. Regenerate the JSON with the command recorded in its provenance block. Do not edit it by hand.
@@ -118,7 +124,9 @@ The app and direct headless runtime use separate settings stores with the same s
 
 Context Builder tool cards show the primary preview and ordered lane summaries. The multi-Oracle follow-up hint states that lane results are independent. It does not tell the caller to combine, rank, vote on, or choose a winning lane.
 
-`OracleLaneMarkdownFormatter` and `AgentOracleExport` write one section per lane in roster order. `MCPOracleToolService` decodes the canonical group result for export. The export does not modify lane text.
+`OracleLaneMarkdownFormatter` and `AgentOracleExport` write one section per lane in roster order. `MCPOracleToolService` decodes the canonical group result for export. The export does not modify lane text. Context Builder reports the captured execution's one model or ordered model names as `planning_model`, separately from the discovery `agent` and `model`.
+
+When Model Presets are exposed, `oracle_utils op=models` lists presets in automatic-selection priority order with stable UUIDs, names, primary/additional lane labels, supported modes, effective Chat Preset mapping names, and lane-specific availability. When exposure is disabled or temporarily hidden, it reports the configured current model behavior.
 
 ## Validation
 
@@ -135,7 +143,7 @@ make dev-test FILTER=ContextBuilderOracle
 make dev-test FILTER=OracleGroupBoundaryTests
 make dev-test FILTER=AgentOraclePill
 make dev-test FILTER=SettingsJSONOnly
-make dev-test FILTER=ToolCatalogSnapshotTests
+make dev-test FILTER=DirectHeadlessCompositionTests/testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot
 ```
 
 The focused tests must prove these invariants:

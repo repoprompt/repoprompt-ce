@@ -693,23 +693,6 @@ private func cancelContextBuilderRun(
     }
 }
 
-func contextBuilderJoinedFollowUpModelLine(
-    primaryDisplayName: String?,
-    additionalModelRaws: [String]
-) -> String? {
-    var names: [String] = []
-    if let primary = primaryDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines), !primary.isEmpty {
-        names.append(primary)
-    }
-    for raw in additionalModelRaws {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { continue }
-        names.append(AIModel.fromModelName(trimmed)?.displayName ?? trimmed)
-    }
-    guard !names.isEmpty else { return nil }
-    return names.joined(separator: " + ")
-}
-
 func contextBuilderFollowUpModelLine(
     dto: ToolResultDTOs.ContextBuilderDTO?,
     fallback: String?
