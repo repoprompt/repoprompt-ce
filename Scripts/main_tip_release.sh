@@ -133,11 +133,17 @@ validate_public_app() {
         codex_verification_args+=(--signed-team-identifier "$signed_team_identifier")
     fi
     python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" "${codex_verification_args[@]}"
-    python3 "$CONTROL_PLANE_SCRIPTS_DIR/prompt_experiment_runtime_artifact.py" \
-        --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
-        --arch all \
-        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/PromptExperimentPython" \
+    local prompt_experiment_verification_args=(
+        --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle
+        --arch all
+        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/PromptExperimentPython"
         --allow-signed-macho
+    )
+    if [[ -n "$signed_team_identifier" ]]; then
+        prompt_experiment_verification_args+=(--signed-team-identifier "$signed_team_identifier")
+    fi
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/prompt_experiment_runtime_artifact.py" \
+        "${prompt_experiment_verification_args[@]}"
     "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
         --app "$app_bundle" \
         --manifest "$manifest" \

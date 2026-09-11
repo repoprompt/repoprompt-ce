@@ -441,5 +441,39 @@ class EmbeddedProvisioningProfileTests(unittest.TestCase):
                 )
 
 
+class PromptExperimentRuntimeReleaseAuthorityTests(unittest.TestCase):
+    def test_trusted_signer_reconstructs_pinned_runtime_before_release_signing(self) -> None:
+        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        staged_validation = source.index('"$SCRIPT_DIR/validate_staged_release.sh"')
+        acquire = source.index('"$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" acquire')
+        stage = source.index('"$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" stage-bundle')
+        exact_verify = source.index('"$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle', stage)
+        nested_signing = source.index('prompt_experiment_macho_paths="$(')
+        exact_verification_block = source[exact_verify:nested_signing]
+
+        self.assertLess(staged_validation, acquire)
+        self.assertLess(acquire, stage)
+        self.assertLess(stage, exact_verify)
+        self.assertLess(exact_verify, nested_signing)
+        self.assertNotIn("--allow-signed-macho", exact_verification_block)
+
+    def test_final_runtime_verifiers_require_nested_signing_team(self) -> None:
+        scripts = (
+            "main_tip_release.sh",
+            "package_app.sh",
+            "promote_release.sh",
+            "publish_public_update_test.sh",
+            "release.sh",
+            "sign_staged_release.sh",
+        )
+        for filename in scripts:
+            source = (SCRIPT_DIR / filename).read_text(encoding="utf-8")
+            with self.subTest(script=filename):
+                self.assertIn("--signed-team-identifier", source)
+        verifier = (SCRIPT_DIR / "prompt_experiment_runtime_artifact.py").read_text(encoding="utf-8")
+        self.assertIn('["codesign", "--verify", "--strict", "--verbose=2", str(path)]', verifier)
+        self.assertIn('line.startswith("TeamIdentifier=")', verifier)
+
+
 if __name__ == "__main__":
     unittest.main()

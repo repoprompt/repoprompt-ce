@@ -336,6 +336,35 @@ def write_provenance(root: Path, architecture: str, manifest: dict, python_archi
     )
 
 
+def verify_signed_macho(path: Path, expected_team_identifier: str) -> None:
+    verification = subprocess.run(
+        ["codesign", "--verify", "--strict", "--verbose=2", str(path)],
+        text=True,
+        capture_output=True,
+    )
+    if verification.returncode != 0:
+        raise ContractError(f"{path}: nested Mach-O signature is invalid: {verification.stderr.strip()}")
+    details = subprocess.run(
+        ["codesign", "-dv", "--verbose=4", str(path)],
+        text=True,
+        capture_output=True,
+    )
+    if details.returncode != 0:
+        raise ContractError(f"{path}: could not inspect nested Mach-O signing identity")
+    team = next(
+        (
+            line.partition("=")[2]
+            for line in details.stderr.splitlines()
+            if line.startswith("TeamIdentifier=")
+        ),
+        "",
+    )
+    if team != expected_team_identifier:
+        raise ContractError(
+            f"{path}: signing team mismatch, expected {expected_team_identifier}, got {team or '<missing>'}"
+        )
+
+
 def verify_architectures(root: Path, architecture: str) -> None:
     for path in root.rglob("*"):
         if not is_macho(path):
@@ -388,7 +417,15 @@ def clean_runtime_smoke(root: Path, architecture: str) -> None:
             raise ContractError(f"Relocated clean-environment runtime smoke failed: {completed.stderr or completed.stdout}")
 
 
-def verify_target(root: Path, architecture: str, manifest: dict, allow_signed_macho: bool = False) -> None:
+def verify_target(
+    root: Path,
+    architecture: str,
+    manifest: dict,
+    allow_signed_macho: bool = False,
+    signed_team_identifier: str | None = None,
+) -> None:
+    if signed_team_identifier and not allow_signed_macho:
+        raise ContractError("--signed-team-identifier requires --allow-signed-macho")
     provenance_path = root / "provenance.json"
     if not provenance_path.is_file() or provenance_path.is_symlink():
         raise ContractError(f"Missing target provenance: {provenance_path}")
@@ -423,14 +460,18 @@ def verify_target(root: Path, architecture: str, manifest: dict, allow_signed_ma
         actual = actual_entries[relative]
         if expected_entry["kind"] != actual["kind"]:
             raise ContractError(f"{root / relative}: entry kind changed")
+        if expected_entry.get("mach_o", False) != actual.get("mach_o", False):
+            raise ContractError(f"{root / relative}: Mach-O classification changed")
         if expected_entry["mode"] != actual["mode"]:
             raise ContractError(f"{root / relative}: file mode changed")
         if expected_entry["kind"] == "symlink":
             if expected_entry["target"] != actual["target"]:
                 raise ContractError(f"{root / relative}: symlink target changed")
-        elif not (allow_signed_macho and expected_entry.get("mach_o")):
-            if expected_entry["sha256"] != actual["sha256"] or expected_entry["size"] != actual["size"]:
-                raise ContractError(f"{root / relative}: file digest or size changed")
+        elif allow_signed_macho and expected_entry.get("mach_o"):
+            if signed_team_identifier:
+                verify_signed_macho(root / relative, signed_team_identifier)
+        elif expected_entry["sha256"] != actual["sha256"] or expected_entry["size"] != actual["size"]:
+            raise ContractError(f"{root / relative}: file digest or size changed")
     validate_symlinks(root)
     verify_architectures(root, architecture)
     clean_runtime_smoke(root, architecture)
@@ -510,7 +551,13 @@ def stage_bundle(args: argparse.Namespace, manifest: dict) -> None:
 def verify_bundle(args: argparse.Namespace, manifest: dict) -> None:
     bundle = Path(args.bundle).resolve()
     for target in selected_targets(args.arch):
-        verify_target(bundle / target, target, manifest, allow_signed_macho=args.allow_signed_macho)
+        verify_target(
+            bundle / target,
+            target,
+            manifest,
+            allow_signed_macho=args.allow_signed_macho,
+            signed_team_identifier=args.signed_team_identifier,
+        )
     print(f"OK: verified Prompt Experiment runtime bundle: {bundle}")
 
 
@@ -549,6 +596,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--arch", default="host")
     verify_parser.add_argument("--bundle", required=True)
     verify_parser.add_argument("--allow-signed-macho", action="store_true")
+    verify_parser.add_argument("--signed-team-identifier")
 
     paths_parser = subparsers.add_parser("mach-o-paths")
     paths_parser.add_argument("--arch", default="host")

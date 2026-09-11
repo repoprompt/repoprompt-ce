@@ -222,9 +222,12 @@ release paths require and verify both targets.
 The app never downloads or installs Python packages at runtime. Packaging signs
 every nested Python Mach-O inside-out, verifies each signature explicitly, signs
 the outer app, and then rechecks the manifest-pinned non-code tree and clean
-runtime smoke. Staged Developer ID signing repeats that nested signing plan.
-Release, Tip, promotion, ZIP, DMG, and legal validators reject a missing or
-mutated runtime or license inventory.
+runtime smoke. Before applying the trusted release identity, staged Developer ID
+signing reacquires and reconstructs both runtime targets from the approved
+hash-pinned archives, discarding candidate-signed Mach-O bytes. Final Release,
+Tip, promotion, ZIP, and DMG validation requires every nested Mach-O to carry the
+expected signing team and verifies the full app artifact manifest; legal
+validators also reject a missing or mutated runtime license inventory.
 
 ## Release ownership
 

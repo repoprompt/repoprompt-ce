@@ -28,15 +28,24 @@
             liveInstance
         }
 
-        static func live(windowState: WindowState) -> PromptExperimentService {
+        static func live(windowState: WindowState) throws -> PromptExperimentService {
+            let bindingIdentity = ObjectIdentifier(windowState)
             if let liveInstance {
-                liveInstance.bindRuntime(windowState: windowState)
+                guard liveInstance.bindRuntimeIfIdle(
+                    NativePromptExperimentContextBuilderRuntime(windowState: windowState),
+                    bindingIdentity: bindingIdentity
+                ) else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable(
+                        "Another window owns the pending or running Prompt Experiment runtime. Wait for it to settle before using this window."
+                    )
+                }
                 return liveInstance
             }
             let service = PromptExperimentService(
                 store: PromptExperimentStore(rootURL: PromptExperimentStore.liveRootURL()),
                 runtime: NativePromptExperimentContextBuilderRuntime(windowState: windowState)
             )
+            service.runtimeBindingIdentity = bindingIdentity
             liveInstance = service
             return service
         }
@@ -69,6 +78,7 @@
         private var pendingRunApprovalObservers: [UUID: [CheckedContinuation<Void, Never>]] = [:]
         private var executionWaiters: [UUID: [UUID: ExecutionWaiter]] = [:]
         private var loadTask: Task<Void, Never>?
+        private var runtimeBindingIdentity: ObjectIdentifier?
 
         init(
             store: PromptExperimentStore,
@@ -84,9 +94,19 @@
             self.now = now
         }
 
-        func bindRuntime(windowState: WindowState) {
-            guard admittedExperimentIDs.isEmpty else { return }
-            runtime = NativePromptExperimentContextBuilderRuntime(windowState: windowState)
+        /// A process-global service may serve multiple windows, but an approval request pins the
+        /// originating runtime until it either starts or settles. Same-window lookups preserve the
+        /// pinned instance; a different window fails closed instead of executing against it.
+        @discardableResult
+        func bindRuntimeIfIdle(
+            _ replacement: PromptExperimentRuntime,
+            bindingIdentity: ObjectIdentifier
+        ) -> Bool {
+            if runtimeBindingIdentity == bindingIdentity { return true }
+            guard admittedExperimentIDs.isEmpty, pendingRunApprovals.isEmpty else { return false }
+            runtime = replacement
+            runtimeBindingIdentity = bindingIdentity
+            return true
         }
 
         func load() async {

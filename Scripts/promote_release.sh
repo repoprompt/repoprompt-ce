@@ -464,7 +464,8 @@ validate_app_bundle() {
         --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
         --arch all \
         --bundle "$app_bundle/Contents/Resources/BundledRuntimes/PromptExperimentPython" \
-        --allow-signed-macho
+        --allow-signed-macho \
+        --signed-team-identifier "$SIGNING_TEAM_ID"
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$app_bundle" \
@@ -495,7 +496,8 @@ validate_dmg_matches_zip_app() {
         --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
         --arch all \
         --bundle "$dmg_app/Contents/Resources/BundledRuntimes/PromptExperimentPython" \
-        --allow-signed-macho
+        --allow-signed-macho \
+        --signed-team-identifier "$SIGNING_TEAM_ID"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$dmg_app" \
         "arm64,x86_64" \

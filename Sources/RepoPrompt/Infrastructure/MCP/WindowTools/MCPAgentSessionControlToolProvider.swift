@@ -186,7 +186,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             }
             try targetWindow.agentModeViewModel.validatePromptExperimentTarget(target)
 
-            let service = PromptExperimentService.live(windowState: targetWindow)
+            let service = try PromptExperimentService.live(windowState: targetWindow)
             await service.load()
             try targetWindow.agentModeViewModel.validatePromptExperimentTarget(target)
             let owner = PromptExperimentAgentOwner(

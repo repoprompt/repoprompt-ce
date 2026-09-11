@@ -635,6 +635,49 @@ import XCTest
             XCTAssertEqual(cloneDraft.optimization, plan.optimization)
         }
 
+        func testPendingRunPinsOriginatingRuntimeAcrossWindowRebindAttempt() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(
+                controllerSessionID: sealed.controllerSessionID,
+                sourceTabID: sealed.sourceTabID
+            )
+            let interface = PromptExperimentAgentInterface(service: harness.service)
+            let originatingWindow = NSObject()
+            let otherWindow = NSObject()
+            let otherWindowRuntime = FakeRuntime()
+            XCTAssertTrue(harness.service.bindRuntimeIfIdle(
+                harness.runtime,
+                bindingIdentity: ObjectIdentifier(originatingWindow)
+            ))
+
+            let runRequest = Task {
+                try await interface.execute(.run(experimentID: id, expectedPlanDigest: plan.digest), owner: owner)
+            }
+            await harness.service.waitForPendingRunApprovalForTesting(experimentID: id)
+
+            XCTAssertTrue(harness.service.bindRuntimeIfIdle(
+                otherWindowRuntime,
+                bindingIdentity: ObjectIdentifier(originatingWindow)
+            ))
+            XCTAssertFalse(harness.service.bindRuntimeIfIdle(
+                otherWindowRuntime,
+                bindingIdentity: ObjectIdentifier(otherWindow)
+            ))
+            try await harness.service.approveAndRun(experimentID: id, displayedDigest: plan.digest)
+            _ = try await runRequest.value
+            await harness.runtime.waitUntilWaitingForResult()
+
+            XCTAssertEqual(harness.runtime.submitted.count, 1)
+            XCTAssertTrue(otherWindowRuntime.submitted.isEmpty)
+            harness.runtime.settleFirst()
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+        }
+
         func testNativeDenialReturnsNewDraftToWaitingSession() async throws {
             let harness = makeHarness()
             defer { try? FileManager.default.removeItem(at: harness.root) }

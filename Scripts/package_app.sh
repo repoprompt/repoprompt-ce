@@ -578,10 +578,16 @@ run python3 "$CODEX_ARTIFACT_TOOL" --manifest "$CODEX_MANIFEST" verify-bundle \
 while IFS= read -r prompt_experiment_macho; do
     [[ -z "$prompt_experiment_macho" ]] || run codesign --verify --strict --verbose=2 "$prompt_experiment_macho"
 done <<< "$PROMPT_EXPERIMENT_MACHO_PATHS"
-run python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
-    --arch "$PROMPT_EXPERIMENT_RUNTIME_ARCH" \
-    --bundle "$PROMPT_EXPERIMENT_RUNTIME_APP_DIR" \
+PROMPT_EXPERIMENT_VERIFICATION_ARGS=(
+    --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle
+    --arch "$PROMPT_EXPERIMENT_RUNTIME_ARCH"
+    --bundle "$PROMPT_EXPERIMENT_RUNTIME_APP_DIR"
     --allow-signed-macho
+)
+if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )) && (( ! USE_LOCAL_SELF_SIGNED_RELEASE )); then
+    PROMPT_EXPERIMENT_VERIFICATION_ARGS+=(--signed-team-identifier "$SIGNING_TEAM_ID")
+fi
+run python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" "${PROMPT_EXPERIMENT_VERIFICATION_ARGS[@]}"
 verify_signed_app_identity
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Post-sign packaged app"
 if (( PUBLIC_UNIVERSAL_RELEASE )); then

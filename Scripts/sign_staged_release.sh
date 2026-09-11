@@ -7,6 +7,7 @@ METADATA_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
 CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"
 PROMPT_EXPERIMENT_RUNTIME_TOOL="$SCRIPT_DIR/prompt_experiment_runtime_artifact.py"
 PROMPT_EXPERIMENT_RUNTIME_MANIFEST="$METADATA_ROOT/Vendor/PromptExperimentPython/manifest.json"
+PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT="${REPOPROMPT_PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT:-$ROOT_DIR/.build/prompt-experiment-python-signing}"
 source "$SCRIPT_DIR/load_release_metadata.sh"
 
 TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -68,11 +69,24 @@ python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --manifest "$CODEX_MANIFEST" verify-bundle \
     --arch all \
     --bundle "$CODEX_BUNDLE"
+# The staged candidate can contain ad-hoc-signed Mach-O files whose signatures change their
+# bytes. Never promote those bytes into trusted code: reconstruct the runtime from the exact
+# approved, hash-pinned archives immediately before applying the release identity.
+python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
+    --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" acquire \
+    --arch all \
+    --cache-root "$PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT"
+python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
+    --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" stage-bundle \
+    --arch all \
+    --cache-root "$PROMPT_EXPERIMENT_RUNTIME_CACHE_ROOT" \
+    --bundle "$PROMPT_EXPERIMENT_RUNTIME_BUNDLE"
 python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
     --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
     --arch all \
-    --bundle "$PROMPT_EXPERIMENT_RUNTIME_BUNDLE" \
-    --allow-signed-macho
+    --bundle "$PROMPT_EXPERIMENT_RUNTIME_BUNDLE"
+REPOPROMPT_RELEASE_SOURCE_ROOT="$METADATA_ROOT" \
+    "$SCRIPT_DIR/validate_packaged_legal.sh" "$APP_BUNDLE"
 
 rm -rf "$STAGED_SPARKLE_FRAMEWORK"
 mkdir -p "$(dirname "$STAGED_SPARKLE_FRAMEWORK")"
@@ -225,7 +239,8 @@ python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" \
     --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle \
     --arch all \
     --bundle "$PROMPT_EXPERIMENT_RUNTIME_BUNDLE" \
-    --allow-signed-macho
+    --allow-signed-macho \
+    --signed-team-identifier "$SIGNING_TEAM_ID"
 "$SCRIPT_DIR/validate_app_architectures.sh" \
     "$APP_BUNDLE" \
     "arm64,x86_64" \
