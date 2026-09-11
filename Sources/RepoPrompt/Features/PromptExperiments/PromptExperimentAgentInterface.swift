@@ -125,6 +125,7 @@
                         "DEBUG integration using the packaged CPython and upstream GEPA optimize_anything runtime; no user Python setup or provider credentials are delegated to Python.",
                         "The linked Agent session may draft, seal, request, wait for, and cancel owned runs, but it cannot approve or apply a winner.",
                         "The user approves one exact native digest card; that action automatically starts the sealed run.",
+                        "Specification schema 3 supports stage=preparation with preparation_candidates: a fixed reviewed batch on training examples only, without GEPA proposals or hidden/validation evaluation. Read feedback, revise through new drafts, then continue a selected tested candidate into stage=search with preparation_candidates cleared. Preparation is not held-out optimization evidence.",
                         "New runs are bounded by evaluation count, not an experiment-wide wall-clock deadline. Cancellation and bounded individual host operations remain available, and durable diagnostics identify the latest observed worker/callback state.",
                         "Prompt-only connected-model, Context Builder, and sandboxed-command adapters are supported for catalog targets shown here. ACP, Investigate, and multi-agent adapters remain explicit unsupported capabilities.",
                         "Reviewed project files may be copied from the Agent session's currently loaded root into an app-owned snapshot. Expected outputs, notes, and held-out grading data remain host-private."

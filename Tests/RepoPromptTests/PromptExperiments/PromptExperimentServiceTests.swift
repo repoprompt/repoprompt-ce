@@ -7,6 +7,57 @@ import XCTest
 #if DEBUG
     @MainActor
     final class PromptExperimentServiceTests: XCTestCase {
+        func testLiveServiceAvailabilityPublishesLateInstallationAndReplacement() {
+            let first = makeHarness()
+            let replacement = makeHarness()
+            defer {
+                try? FileManager.default.removeItem(at: first.root)
+                try? FileManager.default.removeItem(at: replacement.root)
+            }
+            let availability = PromptExperimentServiceAvailability()
+            var observed: [ObjectIdentifier?] = []
+            let subscription = availability.$service.sink { service in
+                observed.append(service.map(ObjectIdentifier.init))
+            }
+            XCTAssertNil(availability.service)
+            availability.install(first.service)
+            availability.install(replacement.service)
+            XCTAssertEqual(observed, [nil, ObjectIdentifier(first.service), ObjectIdentifier(replacement.service)])
+            XCTAssertTrue(availability.service === replacement.service)
+            withExtendedLifetime(subscription) {}
+        }
+
+        func testPreparationBoundsAndHostAdmissionExcludeHeldOutExamples() throws {
+            var spec = Self.validOptimization()
+            spec.stage = .preparation
+            spec.preparationCandidates = ["Reference instructions", "Revised instructions"]
+            spec.examples = [
+                PromptExperimentExample(id: "dev-1", split: .training, input: "one", expectedOutput: "1", reviewerNotes: nil),
+                PromptExperimentExample(id: "dev-2", split: .training, input: "two", expectedOutput: "2", reviewerNotes: nil),
+                PromptExperimentExample(id: "validation", split: .validation, input: "three", expectedOutput: "3", reviewerNotes: nil),
+                PromptExperimentExample(id: "hidden", split: .hiddenTest, input: "four", expectedOutput: "4", reviewerNotes: nil)
+            ]
+            spec.gepa.maxEvaluations = 4
+            let date = Date(timeIntervalSince1970: 100)
+            var draft = PromptExperimentDraft(revision: 1, title: "Preparation", optimization: spec, createdAt: date, updatedAt: date)
+            XCTAssertNoThrow(try draft.validated())
+            XCTAssertTrue(spec.admitsPreparationEvaluation(candidate: "Reference instructions", exampleID: "dev-1"))
+            XCTAssertFalse(spec.admitsPreparationEvaluation(candidate: "Unreviewed instructions", exampleID: "dev-1"))
+            XCTAssertFalse(spec.admitsPreparationEvaluation(candidate: "Reference instructions", exampleID: "validation"))
+            XCTAssertFalse(spec.admitsPreparationEvaluation(candidate: "Reference instructions", exampleID: "hidden"))
+            let digest = try draft.contentDigest()
+            draft.optimization?.preparationCandidates?[1] = "Another revision"
+            XCTAssertNotEqual(try draft.contentDigest(), digest)
+            draft.optimization?.gepa.maxEvaluations = 3
+            XCTAssertThrowsError(try draft.validated())
+            draft.optimization?.gepa.maxEvaluations = 4
+            draft.optimization?.stage = .search
+            XCTAssertThrowsError(try draft.validated(), "Search cannot silently retain a preparation candidate batch")
+            draft.optimization?.preparationCandidates = nil
+            draft.optimization?.seedCandidate = "Revised instructions"
+            XCTAssertNoThrow(try draft.validated())
+        }
+
         func testImplementedOperationsMatchCanonicalAdvertisement() {
             XCTAssertEqual(
                 PromptExperimentAgentOperation.allCases.map(\.rawValue),
@@ -615,7 +666,7 @@ import XCTest
             let envelope = try XCTUnwrap(
                 JSONSerialization.jsonObject(with: Data(specificationJSON.utf8)) as? [String: Any]
             )
-            XCTAssertEqual(envelope["schema_version"] as? Int, 2)
+            XCTAssertEqual(envelope["schema_version"] as? Int, 3)
             XCTAssertNil(envelope["schemaVersion"])
 
             let setupArgs = MCPToolArgsNormalizer.normalize(
@@ -814,11 +865,15 @@ import XCTest
             }
             await harness.service.waitForPendingRunApprovalForTesting(experimentID: id)
 
-            try await harness.service.declineRunAndRevise(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.declineRunAndRevise(experimentID: id, displayedDigest: plan.digest, feedback: "Add ambiguous cases; preserve the model.")
             guard case let .record(revision, _) = try await runRequest.value else {
                 return XCTFail("Expected revised record")
             }
             XCTAssertEqual(revision.phase, .drafting)
+            XCTAssertTrue(revision.statusMessage.contains("Add ambiguous cases; preserve the model."))
+            let saved = try await harness.store.loadRecords()
+            XCTAssertEqual(saved.first(where: { $0.id == id })?.statusMessage, revision.statusMessage)
+            XCTAssertEqual(revision.currentPlan, plan)
             XCTAssertEqual(revision.draft?.revision, plan.revision + 1)
             XCTAssertEqual(revision.draft?.parentPlanID, plan.id)
             XCTAssertTrue(harness.runtime.submitted.isEmpty)
@@ -1439,9 +1494,33 @@ import XCTest
         }
 
         func testOptimizationResultPersistsCandidatesEvaluationsAndExactTargets() async throws {
+            try await assertOptimizationResultContinuation(preparation: false)
+            try await assertOptimizationResultContinuation(preparation: true)
+        }
+
+        private func assertOptimizationResultContinuation(preparation: Bool) async throws {
             let harness = makeHarness()
             defer { try? FileManager.default.removeItem(at: harness.root) }
-            let id = try await preparedOptimizationExperiment(harness)
+            let (id, draft) = try await updatedOptimizationDraft(harness)
+            var reviewedDraft = draft
+            if preparation {
+                reviewedDraft.optimization?.stage = .preparation
+                reviewedDraft.optimization?.preparationCandidates = ["baseline instructions", "improved instructions"]
+                reviewedDraft.optimization?.examples[0].split = .training
+                reviewedDraft = try await harness.service.updateDraft(
+                    experimentID: id,
+                    expectedDraftID: draft.id,
+                    expectedDraftVersion: draft.optimisticVersion,
+                    expectedDraftDigest: draft.contentDigest(),
+                    draft: reviewedDraft
+                )
+            }
+            _ = try await harness.service.seal(
+                experimentID: id,
+                expectedDraftID: reviewedDraft.id,
+                expectedDraftVersion: reviewedDraft.optimisticVersion,
+                expectedDraftDigest: reviewedDraft.contentDigest()
+            )
             let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
             XCTAssertEqual(plan.schemaVersion, PromptExperimentPlan.optimizationSchemaVersion)
             XCTAssertEqual(plan.optimizationTargets?.reflection.role, "reflector")
@@ -1456,7 +1535,7 @@ import XCTest
                 assistantOutput: nil
             )
             runtimeResult.optimizationResult = PromptExperimentOptimizationRuntimeResult(
-                engine: "gepa",
+                engine: preparation ? "preparation" : "gepa",
                 upstreamRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
                 baselineScore: 0,
                 bestScore: 1,
@@ -1468,7 +1547,7 @@ import XCTest
                     PromptExperimentOptimizationRuntimeEvaluation(
                         candidateIndex: 1,
                         exampleID: "reviewed-1",
-                        split: .validation,
+                        split: preparation ? .training : .validation,
                         score: 1,
                         feedback: "matched reviewed answer",
                         failureKind: nil,
@@ -1495,6 +1574,8 @@ import XCTest
             await reopened.load()
             let record = try XCTUnwrap(reopened.record(id: id))
             let result = try XCTUnwrap(record.attempts(for: plan).first?.optimizationResult)
+            XCTAssertEqual(result.engine, preparation ? "preparation" : "gepa")
+            XCTAssertTrue(result.assessment.contains(preparation ? "not held-out results" : "retained candidates"))
             XCTAssertEqual(result.bestCandidateIndex, 1)
             XCTAssertEqual(result.candidates.map(\.candidatePreview), ["baseline instructions", "improved instructions"])
             XCTAssertEqual(result.evaluations.first?.feedback, "matched reviewed answer")
@@ -1522,6 +1603,9 @@ import XCTest
             try await reopened.startNextRevision(experimentID: id, expectedPlanDigest: plan.digest)
             let next = try XCTUnwrap(reopened.record(id: id))
             XCTAssertEqual(next.draft?.optimization?.seedCandidate, "improved instructions")
+            XCTAssertEqual(next.draft?.optimization?.stage, .search)
+            XCTAssertNil(next.draft?.optimization?.preparationCandidates)
+            XCTAssertEqual(next.plans.first?.optimization?.isPreparation, preparation)
             XCTAssertEqual(next.attempts(for: plan).first?.optimizationResult?.bestScore, 1)
             XCTAssertTrue(harness.runtime.submitted.count == 1)
         }
@@ -1754,7 +1838,7 @@ import XCTest
                 at: date
             )
 
-            XCTAssertEqual(plan.schemaVersion, 4)
+            XCTAssertEqual(plan.schemaVersion, 5)
             XCTAssertNil(plan.optimization?.gepa.maxWallClockSeconds)
             XCTAssertTrue(plan.verifiesIntegrity())
             let encoded = try JSONEncoder().encode(plan)
@@ -1762,7 +1846,12 @@ import XCTest
             XCTAssertTrue(plan.limitations.contains { $0.contains("no experiment-wide wall-clock deadline") })
         }
 
-        func testHistoricSchemaThreePlanPreservesWallClockDigestOnRoundTrip() async throws {
+        func testHistoricPlansPreserveDigestAndDeadlineOnRoundTrip() async throws {
+            try await assertHistoricPlanRoundTrip(schema: 3, deadline: 180)
+            try await assertHistoricPlanRoundTrip(schema: 4, deadline: nil)
+        }
+
+        private func assertHistoricPlanRoundTrip(schema: Int, deadline: Int?) async throws {
             let date = Date(timeIntervalSince1970: 778)
             let environment = try PromptExperimentEnvironment(
                 workspaceID: XCTUnwrap(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")),
@@ -1775,7 +1864,7 @@ import XCTest
                 captureLimitations: []
             )
             var optimization = Self.validOptimization()
-            optimization.gepa.maxWallClockSeconds = 180
+            optimization.gepa.maxWallClockSeconds = deadline
             let reflection = try XCTUnwrap(Self.fakeTarget("reflector"))
             let execution = try XCTUnwrap(Self.fakeTarget("executor"))
             let targets = PromptExperimentOptimizationTargets(
@@ -1784,7 +1873,7 @@ import XCTest
                 judge: nil
             )
             let payload = PromptExperimentPlan.OptimizationDigestPayload(
-                schemaVersion: PromptExperimentPlan.legacyWallClockOptimizationSchemaVersion,
+                schemaVersion: schema,
                 revision: 1,
                 parentPlanID: nil,
                 title: "Historic sealed plan",
@@ -1796,7 +1885,7 @@ import XCTest
             )
             let digest = try PromptExperimentDigest.canonicalSHA256(payload)
             let plan = PromptExperimentPlan(
-                schemaVersion: PromptExperimentPlan.legacyWallClockOptimizationSchemaVersion,
+                schemaVersion: schema,
                 id: PromptExperimentDigest.deterministicUUID(namespace: "plan", value: digest),
                 revision: 1,
                 parentPlanID: nil,
@@ -1826,7 +1915,7 @@ import XCTest
             let decoded = try JSONDecoder().decode(PromptExperimentPlan.self, from: data)
             XCTAssertEqual(decoded, plan)
             XCTAssertEqual(decoded.digest, digest)
-            XCTAssertEqual(decoded.optimization?.gepa.maxWallClockSeconds, 180)
+            XCTAssertEqual(decoded.optimization?.gepa.maxWallClockSeconds, deadline)
             XCTAssertTrue(decoded.verifiesIntegrity())
 
             let root = temporaryRoot()
@@ -1859,7 +1948,7 @@ import XCTest
                 expectedControllerSessionID: owner
             )
             XCTAssertEqual(service.record(id: sourceID)?.currentPlan?.digest, digest)
-            XCTAssertEqual(service.record(id: sourceID)?.currentPlan?.optimization?.gepa.maxWallClockSeconds, 180)
+            XCTAssertEqual(service.record(id: sourceID)?.currentPlan?.optimization?.gepa.maxWallClockSeconds, deadline)
             XCTAssertNil(service.record(id: cloneID)?.draft?.optimization?.gepa.maxWallClockSeconds)
 
             try await service.startNextRevision(

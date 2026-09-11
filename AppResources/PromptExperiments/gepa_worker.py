@@ -269,6 +269,44 @@ def main() -> int:
         dataset = examples_for("training")
         valset = examples_for("validation")
         test_set = examples_for("hidden_test")
+        stage = body.get("stage", "search")
+        if stage not in ("search", "preparation"):
+            raise InfrastructureFailure("unsupported experiment stage")
+        if stage == "preparation":
+            # A deterministic host-evaluation batch. The conversational agent, not a
+            # second optimizer in Python, authors/revises these approved candidates.
+            candidates = body.get("preparation_candidates")
+            if (not isinstance(candidates, list) or not 1 <= len(candidates) <= 20
+                    or not all(isinstance(c, str) and c.strip() for c in candidates)
+                    or len(set(candidates)) != len(candidates) or not dataset
+                    or len(candidates) * len(dataset) > int(body["max_evaluations"])):
+                raise InfrastructureFailure("invalid preparation candidates or evaluation budget")
+            scores = []
+            for candidate in candidates:
+                values = [evaluate(candidate, example)[0] for example in dataset]
+                scores.append(sum(values) / len(values))
+            best_index = max(range(len(candidates)), key=lambda i: scores[i])
+            for evaluation in evaluations:
+                evaluation.pop("candidate_text", None)
+            payload = {
+                "engine": "preparation",
+                "upstream_revision": EXPECTED_GEPA_REVISION,
+                "baseline_score": scores[0],
+                "best_score": scores[best_index],
+                "best_candidate_index": best_index,
+                "candidates": candidates,
+                "parent_indices": [[] for _ in candidates],
+                "aggregate_scores": scores,
+                "evaluations": evaluations,
+                "total_evaluations": len(evaluations),
+                "wall_time_seconds": time.monotonic() - started,
+                "proposer_usage": f"reflection_calls=0,reported_callbacks={usage['reported']},unavailable_callbacks={usage['unavailable']}",
+                "run_directory_relative_path": body.get("run_directory_relative_path"),
+                "metadata": {"stage": "preparation", "search_performed": False,
+                             "scoring_split": "training", "held_out_evaluated": False},
+            }
+            emit({"protocol_version": PROTOCOL_VERSION, "type": "completed", "result": payload})
+            return 0
         if not dataset and valset:
             dataset, valset = valset, []
 

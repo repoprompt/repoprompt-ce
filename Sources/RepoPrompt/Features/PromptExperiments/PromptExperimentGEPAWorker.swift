@@ -302,6 +302,8 @@
                 "run_directory_relative_path": "worker-runs/\(attemptID.uuidString.lowercased())",
                 "output_dir": outputDirectory.path
             ]
+            request["stage"] = specification.isPreparation ? "preparation" : "search"
+            if specification.isPreparation { request["preparation_candidates"] = specification.preparationCandidates }
             if let seed = specification.seedCandidate { request["seed_candidate"] = seed }
             if let stop = specification.gepa.stopAtScore { request["stop_at_score"] = stop }
             let initial: [String: Any] = [
@@ -514,7 +516,7 @@
                     let maximum = object["max_evaluations"] as? Int ?? 0
                     let candidate = object["candidate_index"] as? Int ?? 0
                     Task { @MainActor in
-                        await progress("GEPA evaluated candidate \(candidate) (\(completed)/\(maximum) budget calls).")
+                        await progress("Evaluated candidate \(candidate + 1) (\(completed)/\(maximum) budget calls).")
                     }
                 case "completed":
                     guard let result = object["result"] as? [String: Any] else {
@@ -629,7 +631,7 @@
 
         private func decodeResult(_ result: [String: Any]) throws -> PromptExperimentOptimizationRuntimeResult {
             let raw = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
-            guard result["engine"] as? String == "gepa",
+            guard let engine = result["engine"] as? String, ["gepa", "preparation"].contains(engine),
                   result["upstream_revision"] as? String == PromptExperimentGEPAConfiguration.pinnedRevision,
                   let candidates = result["candidates"] as? [String], !candidates.isEmpty,
                   let rawParents = result["parent_indices"] as? [[Any]], rawParents.count == candidates.count,
@@ -698,7 +700,7 @@
                 throw WorkerError.protocolFailure("GEPA result artifact path is unsafe.")
             }
             return PromptExperimentOptimizationRuntimeResult(
-                engine: "gepa",
+                engine: engine,
                 upstreamRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
                 baselineScore: baselineScore,
                 bestScore: bestScore,

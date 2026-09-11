@@ -139,7 +139,10 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 Set up, run, observe, and iterate on a native upstream-GEPA Prompt Experiment owned by this Agent session.
 
                 Start with `op=capabilities`, inspect only authorized context, and ask for genuinely missing goals.
-                `setup` seals a complete reviewed specification in one call. `run` suspends for authentic native
+                Cold starts use reviewed preparation rounds before search: schema 3 stage=preparation tests
+                preparation_candidates on training examples only, with no reflection or held-out calls.
+                Read feedback and revise; continue carries the tested candidate into a search draft.
+                `setup` seals an already-discussed specification in one call. `run` suspends for authentic native
                 digest approval; one Approve & Run action starts automatically. Then use `wait`, `status`, `cancel`,
                 and the revision/clone operations. New runs use the sealed evaluation count without an experiment-wide
                 deadline; status/read return durable redacted worker and callback diagnostics. The agent cannot approve or apply a winner.
@@ -341,9 +344,12 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 let decoder = JSONDecoder()
                 decoder.keyDecodingStrategy = .convertFromSnakeCase
                 let envelope = try decoder.decode(PromptExperimentOptimizationEnvelope.self, from: data)
-                guard [1, 2].contains(envelope.schemaVersion) else {
+                guard [1, 2, 3].contains(envelope.schemaVersion) else {
                     throw MCPError.invalidParams("Unsupported optimization specification schema \(envelope.schemaVersion)")
                 }
+                guard envelope.schemaVersion == 3
+                    || (envelope.specification.stage == nil && envelope.specification.preparationCandidates == nil)
+                else { throw MCPError.invalidParams("Preparation fields require specification schema 3.") }
                 return envelope.specification
             } catch let error as MCPError {
                 throw error
@@ -359,7 +365,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
             encoder.keyEncodingStrategy = .convertToSnakeCase
             let data = try encoder.encode(PromptExperimentOptimizationEnvelope(
-                schemaVersion: 2,
+                schemaVersion: 3,
                 specification: specification
             ))
             return String(decoding: data, as: UTF8.self)
@@ -472,6 +478,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 ]) })
             ]
             if let optimization = plan.optimization {
+                value["stage"] = .string(optimization.isPreparation ? "preparation" : "search")
+                value["preparation_candidates"] = optimization.preparationCandidates.map { .array($0.map(Value.string)) } ?? .null
                 value["objective"] = .string(optimization.objective)
                 value["background"] = .string(optimization.background)
                 value["examples"] = .array(optimization.examples.map { example in .object([
@@ -613,6 +621,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
         ) -> Value {
             .object([
                 "engine": .string(result.engine),
+                "assessment": .string(result.assessment),
                 "upstream_revision": .string(result.upstreamRevision),
                 "baseline_score": result.baselineScore.map(Value.double) ?? .null,
                 "best_score": result.bestScore.map(Value.double) ?? .null,

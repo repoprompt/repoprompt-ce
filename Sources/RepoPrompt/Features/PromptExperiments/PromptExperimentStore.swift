@@ -370,6 +370,8 @@
                         "## Sealed optimization authority",
                         "- Objective: \(Self.markdownInline(optimization.objective))",
                         "- Background: \(Self.markdownInline(optimization.background))",
+                        "- Stage: \(optimization.isPreparation ? "Preparation (development evidence only)" : "GEPA search")",
+                        "- Preparation candidates: \(optimization.preparationCandidates?.count ?? 0)",
                         "- Seed candidate: \(Self.markdownInline(optimization.seedCandidate ?? "GEPA bootstrap"))",
                         "- Reflection: \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")",
                         "- Execution: `\(optimization.execution.adapter.rawValue)` / \(plan.optimizationTargets?.execution?.displayName ?? "no model target")",
@@ -419,6 +421,7 @@
                     }
                     if let result = attempt.optimizationResult {
                         lines.append("  - GEPA upstream revision: `\(result.upstreamRevision)`")
+                        lines.append("  - Assessment: \(Self.markdownInline(result.assessment))")
                         lines.append("  - Baseline score: \(result.baselineScore.map { String($0) } ?? "unavailable")")
                         lines.append("  - Best score: \(result.bestScore.map { String($0) } ?? "unavailable")")
                         lines.append("  - Evaluations: \(result.totalEvaluations)")

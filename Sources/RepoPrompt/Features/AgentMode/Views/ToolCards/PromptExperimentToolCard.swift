@@ -1,14 +1,28 @@
 #if DEBUG
-    import Combine
     import SwiftUI
 
     /// In-session native authority and status surface for the `prompt_experiment` tool.
     /// The run request can wait here, but only these native actions can approve its exact digest.
     struct PromptExperimentResultCard: View {
         let item: AgentChatItem
+        @ObservedObject private var availability = PromptExperimentService.liveAvailability
+
+        var body: some View {
+            if let service = availability.service {
+                PromptExperimentLiveResultCard(item: item, service: service)
+            } else {
+                ToolMarkdownExpandedContent(item: item)
+            }
+        }
+    }
+
+    /// Observe the writer itself, not an unread refresh counter.
+    private struct PromptExperimentLiveResultCard: View {
+        let item: AgentChatItem
+        @ObservedObject var service: PromptExperimentService
         @State private var isExpanded = true
         @State private var acknowledgedDigest: String?
-        @State private var serviceRevision = 0
+        @State private var revisionFeedback = ""
         @State private var showsLibrary = false
         @State private var errorMessage: String?
 
@@ -34,18 +48,9 @@
             return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         }
 
-        private var service: PromptExperimentService? {
-            PromptExperimentService.currentLiveInstance
-        }
-
         private var record: PromptExperimentRecord? {
             guard let experimentID else { return nil }
-            return service?.record(id: experimentID)
-        }
-
-        private var serviceChanges: AnyPublisher<Void, Never> {
-            service?.objectWillChange.eraseToAnyPublisher()
-                ?? Empty<Void, Never>().eraseToAnyPublisher()
+            return service.record(id: experimentID)
         }
 
         private var phase: PromptExperimentPhase? {
@@ -87,8 +92,10 @@
                         Text(record.statusMessage)
                             .font(.subheadline)
                         if let plan = record.currentPlan {
-                            planSummary(record: record, plan: plan)
-                            nativeControls(record: record, plan: plan)
+                            if record.phase != .drafting {
+                                planSummary(record: record, plan: plan)
+                                nativeControls(record: record, plan: plan)
+                            }
                         } else if let draft = record.draft {
                             Text("Draft version \(draft.optimisticVersion). Continue this Agent conversation to revise and seal the proposal.")
                                 .font(.caption)
@@ -102,27 +109,23 @@
                     } else {
                         ToolMarkdownExpandedContent(item: item)
                     }
-                    HStack {
-                        Button("Past experiments") { showsLibrary = true }
-                        if service == nil {
-                            Text("Native experiment service unavailable in this window")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                        }
+                    if let draft = record?.draft, let spec = draft.optimization {
+                        proposalField("Draft goal", spec.objective)
+                        proposalField("Next stage", spec.isPreparation ? "Preparation — test and refine" : "GEPA search")
+                        if let seed = spec.seedCandidate { proposalField("Starting candidate", seed) }
+                        Text("Continue the conversation to revise this draft. Prior sealed plans remain unchanged.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
+                    Button("Past experiments") { showsLibrary = true }
                 }
                 .padding(.vertical, 2)
             }
-            .onReceive(serviceChanges) {
-                serviceRevision &+= 1
-            }
             .sheet(isPresented: $showsLibrary) {
-                if let service {
-                    PromptExperimentStudioView(service: service, controllerSessionID: nil, sourceTabID: nil)
-                } else {
-                    ContentUnavailableView("Prompt Experiments Unavailable", systemImage: "exclamationmark.triangle")
-                        .frame(width: 480, height: 320)
-                }
+                PromptExperimentStudioView(service: service, controllerSessionID: nil, sourceTabID: nil)
+            }
+            .onChange(of: record?.currentPlan?.digest) { _, _ in
+                acknowledgedDigest = nil
+                revisionFeedback = ""
             }
             .alert("Prompt Experiment", isPresented: Binding(
                 get: { errorMessage != nil },
@@ -134,65 +137,78 @@
             }
         }
 
-        private func planSummary(record: PromptExperimentRecord, plan: PromptExperimentPlan) -> some View {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Revision \(plan.revision) · \(plan.optimization?.gepa.engine.uppercased() ?? "legacy comparison")")
-                    .font(.caption.bold())
-                Text(plan.digest)
-                    .font(.caption.monospaced())
+        private func proposalField(_ label: String, _ value: String) -> some View {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label).font(.caption.bold()).foregroundStyle(.secondary)
+                Text(value)
+                    .font(.subheadline)
                     .textSelection(.enabled)
-                if let optimization = plan.optimization {
-                    Text(
-                        optimization.gepa.maxWallClockSeconds.map {
-                            "\(optimization.examples.count) reviewed examples · \(optimization.gepa.maxEvaluations) evaluations · historic \($0)s deadline · reflection \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")"
-                        } ?? "\(optimization.examples.count) reviewed examples · \(optimization.gepa.maxEvaluations) evaluations · no experiment deadline · reflection \(plan.optimizationTargets?.reflection.displayName ?? "unavailable")"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    DisclosureGroup("Human-readable sealed plan summary") {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text("Objective: \(optimization.objective)")
-                            Text("Background: \(optimization.background.isEmpty ? "None" : optimization.background)")
-                            Text("Seed candidate: \(optimization.seedCandidate ?? "GEPA will propose from the objective and reviewed evidence")")
-                            Text("Execution: \(optimization.execution.adapter.rawValue) · \(plan.optimizationTargets?.execution?.displayName ?? "no model target")")
-                            Text("Execution instructions: \(optimization.execution.instructions)")
-                            Text("Judge: \(plan.optimizationTargets?.judge?.displayName ?? "not used")")
-                            Text("Evaluator: \(optimization.evaluator.kind.rawValue), range \(optimization.evaluator.minimumScore)...\(optimization.evaluator.maximumScore)")
-                            Text("Rubric: \(optimization.evaluator.rubric)")
-                            Text("Command: \(optimization.evaluator.command ?? "not used")")
-                            Text("Project source: \(optimization.projectSnapshot?.sourceRootPath ?? "none")")
-                            Text("Project paths: \(optimization.projectSnapshot?.includedPaths.joined(separator: ", ") ?? "none")")
-                            Text("Splits: \(optimization.examples.map { "\($0.id)=\($0.split.rawValue)" }.joined(separator: ", "))")
-                            Text("GEPA: minibatch \(optimization.gepa.reflectionMinibatchSize ?? 1), merge \((optimization.gepa.useMerge ?? false) ? "on" : "off"), max merge \(optimization.gepa.maxMergeInvocations ?? 0), skip perfect \((optimization.gepa.skipPerfectScore ?? true) ? "yes" : "no"), seed \(optimization.gepa.randomSeed)")
-                            Text("Python: \(optimization.gepa.pythonExecutablePath)")
-                            Text("Permissions: target/reflection/judge model calls are prompt-only; command reads only the sealed project copy and writes only app-owned scratch; source workspace and hidden expected outputs are unavailable to proposers.")
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        private func planSummary(record: PromptExperimentRecord, plan: PromptExperimentPlan) -> some View {
+            VStack(alignment: .leading, spacing: 12) {
+                if let spec = plan.optimization {
+                    Text(spec.isPreparation ? "Preparation round · revision \(plan.revision)" : "GEPA search · revision \(plan.revision)")
+                        .font(.headline)
+                    proposalField("What we're improving", spec.objective)
+                    if !spec.background.isEmpty { proposalField("Context and constraints", spec.background) }
+                    proposalField("How we'll test", "\(spec.execution.adapter.rawValue) · \(plan.optimizationTargets?.execution?.displayName ?? "reviewed command")\n\(spec.evaluator.rubric)")
+                    let training = spec.examples.count(where: { $0.split == .training })
+                    let validation = spec.examples.count(where: { $0.split == .validation })
+                    let hidden = spec.examples.count(where: { $0.split == .hiddenTest })
+                    proposalField("Examples and budget", "\(training) development · \(validation) validation · \(hidden) hidden test\nUp to \(spec.gepa.maxEvaluations) evaluations · \(spec.gepa.maxWallClockSeconds.map { "historic \($0)s deadline" } ?? "no experiment-wide deadline")")
+                    if spec.isPreparation {
+                        Text("Only development examples run in this round. Inspect feedback and revise; preparation scores are not held-out quality evidence.")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                        ForEach(Array((spec.preparationCandidates ?? []).enumerated()), id: \.offset) { index, candidate in
+                            proposalField(index == 0 ? "Reference candidate" : "Candidate \(index + 1)", candidate)
                         }
-                        .font(.caption)
-                        .textSelection(.enabled)
-                        .padding(.top, 4)
+                    } else {
+                        proposalField("Starting candidate", spec.seedCandidate ?? "No tested seed supplied — GEPA will generate the starting candidate. This is not a comparison against an existing prompt.")
+                        proposalField("Search model", plan.optimizationTargets?.reflection.displayName ?? "unavailable")
                     }
-                    PromptExperimentSealedPlanDisclosure(plan: plan)
+                    if let judge = plan.optimizationTargets?.judge { proposalField("Judge model", judge.displayName) }
+                    proposalField("Fixed execution instructions", spec.execution.instructions)
+                    proposalField("Permissions", "Only the sealed models, examples and project snapshot may be used. Source files are not changed. Applying a candidate is a separate decision.")
+                    if let project = spec.projectSnapshot {
+                        proposalField("Project snapshot", "\(project.sourceRootPath)\n\(project.includedPaths.joined(separator: "\n"))")
+                    }
+                    if let command = spec.evaluator.command { proposalField("Sandboxed evaluator command", command) }
+                    DisclosureGroup("Technical settings and exact authority") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            proposalField("Evaluator", "\(spec.evaluator.kind.rawValue) · range \(spec.evaluator.minimumScore)...\(spec.evaluator.maximumScore)")
+                            proposalField("Search settings", "Minibatch \(spec.gepa.reflectionMinibatchSize ?? 3) · merge \(spec.gepa.useMerge ?? false ? "on" : "off") · max merge \(spec.gepa.maxMergeInvocations ?? 5) · skip perfect \(spec.gepa.skipPerfectScore ?? true ? "yes" : "no") · seed \(String(spec.gepa.randomSeed))")
+                            proposalField("Runtime", spec.gepa.pythonExecutablePath)
+                            proposalField("Sealed digest", plan.digest)
+                            PromptExperimentSealedPlanDisclosure(plan: plan)
+                        }
+                    }
                 }
             }
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         }
 
         @ViewBuilder
         private func nativeControls(record: PromptExperimentRecord, plan: PromptExperimentPlan) -> some View {
-            let hasPendingRequest = service?.hasPendingRunApproval(
+            let hasPendingRequest = service.hasPendingRunApproval(
                 experimentID: record.id,
                 planDigest: plan.digest
             ) == true
             switch record.phase {
             case .awaitingApproval:
-                Toggle("I reviewed every sealed field for this exact digest", isOn: Binding(
+                Toggle("I reviewed this proposal and its complete sealed authority", isOn: Binding(
                     get: { acknowledgedDigest == plan.digest },
                     set: { acknowledgedDigest = $0 ? plan.digest : nil }
                 ))
                 .font(.caption)
-                HStack {
-                    Button("Approve & Run exact proposal") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Button(plan.optimization?.isPreparation == true ? "Approve & test this round" : "Approve & run GEPA") {
                         perform {
-                            try await service?.approveAndRun(
+                            try await service.approveAndRun(
                                 experimentID: record.id,
                                 displayedDigest: plan.digest,
                                 source: .nativeUI
@@ -202,16 +218,21 @@
                     .buttonStyle(.borderedProminent)
                     .disabled(acknowledgedDigest != plan.digest || !hasPendingRequest)
 
-                    Button("Request changes") {
+                    TextField("What would you like to change? Goal, examples, scoring, models…", text: $revisionFeedback, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(2 ... 5)
+                        .accessibilityLabel("Experiment revision feedback")
+                    Button("Revise with this feedback") {
                         perform {
-                            try await service?.declineRunAndRevise(
+                            try await service.declineRunAndRevise(
                                 experimentID: record.id,
                                 displayedDigest: plan.digest,
-                                source: .nativeUI
+                                source: .nativeUI,
+                                feedback: revisionFeedback
                             )
                         }
                     }
-                    .disabled(!hasPendingRequest)
+                    .disabled(!hasPendingRequest || revisionFeedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 if hasPendingRequest {
                     Text("This Agent tool call is waiting. Approval starts automatically and wakes the conversation with running status; requesting changes returns the new draft.")
@@ -228,19 +249,19 @@
                     .foregroundStyle(.secondary)
             case .running, .cancelling:
                 Button("Stop after provider settlement", role: .destructive) {
-                    perform { try await service?.cancel(experimentID: record.id) }
+                    perform { try await service.cancel(experimentID: record.id) }
                 }
                 .disabled(record.phase == .cancelling)
             case .completed, .inconclusive, .cancelled:
                 if plan.optimization == nil {
                     Button("Next revision") {
-                        perform { try await service?.startNextRevision(experimentID: record.id) }
+                        perform { try await service.startNextRevision(experimentID: record.id) }
                     }
                 } else {
                     HStack {
-                        Button("Continue best") {
+                        Button("Build on this result") {
                             perform {
-                                try await service?.startNextRevision(
+                                try await service.startNextRevision(
                                     experimentID: record.id,
                                     revisionMode: .continueBest
                                 )
@@ -248,14 +269,14 @@
                         }
                         Button("Run again") {
                             perform {
-                                try await service?.startNextRevision(
+                                try await service.startNextRevision(
                                     experimentID: record.id,
                                     revisionMode: .repeatCurrentSeed
                                 )
                             }
                         }
                         Button("Clone draft") {
-                            perform { _ = try await service?.cloneExperiment(experimentID: record.id) }
+                            perform { _ = try await service.cloneExperiment(experimentID: record.id) }
                         }
                     }
                 }
@@ -266,8 +287,15 @@
 
         private func resultSummary(_ result: PromptExperimentOptimizationResult) -> some View {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Best \(result.bestScore.map { String($0) } ?? "unavailable") vs baseline \(result.baselineScore.map { String($0) } ?? "unavailable")")
-                    .font(.headline)
+                Text(result.assessment).font(.headline)
+                Text("Best measured score \(result.bestScore.map { String($0) } ?? "unavailable") · starting/reference score \(result.baselineScore.map { String($0) } ?? "unavailable")")
+                    .font(.subheadline)
+                DisclosureGroup("Per-example feedback") {
+                    ForEach(result.evaluations) { evaluation in
+                        let candidateLabel = evaluation.candidateIndex < 0 ? "Unretained proposal" : "Candidate \(evaluation.candidateIndex + 1)"
+                        proposalField("\(candidateLabel) · \(evaluation.exampleID) · \(evaluation.split.rawValue)", "Score \(evaluation.score.map { String($0) } ?? "unavailable"): \(evaluation.feedback)")
+                    }
+                }
                 Text("\(result.totalEvaluations) evaluations · \(gepaWallTime(result)) · usage \(result.proposerUsage)")
                     .font(.caption)
                     .foregroundStyle(.secondary)

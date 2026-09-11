@@ -22,16 +22,27 @@
         }
     }
 
+    /// Publishes late service creation to cards restored before the lab is opened.
+    /// This holder does not create/rebind runtimes or grant any execution authority.
+    @MainActor
+    final class PromptExperimentServiceAvailability: ObservableObject {
+        @Published private(set) var service: PromptExperimentService?
+
+        func install(_ service: PromptExperimentService) {
+            self.service = service
+        }
+    }
+
     @MainActor
     final class PromptExperimentService: ObservableObject {
-        private static var liveInstance: PromptExperimentService?
+        static let liveAvailability = PromptExperimentServiceAvailability()
         static var currentLiveInstance: PromptExperimentService? {
-            liveInstance
+            liveAvailability.service
         }
 
         static func live(windowState: WindowState) throws -> PromptExperimentService {
             let bindingIdentity = ObjectIdentifier(windowState)
-            if let liveInstance {
+            if let liveInstance = currentLiveInstance {
                 guard liveInstance.bindRuntimeIfIdle(
                     NativePromptExperimentContextBuilderRuntime(windowState: windowState),
                     bindingIdentity: bindingIdentity
@@ -47,7 +58,7 @@
                 runtime: NativePromptExperimentContextBuilderRuntime(windowState: windowState)
             )
             service.runtimeBindingIdentity = bindingIdentity
-            liveInstance = service
+            liveAvailability.install(service)
             return service
         }
 
@@ -601,8 +612,12 @@
         func declineRunAndRevise(
             experimentID: UUID,
             displayedDigest: String,
-            source: PromptExperimentApprovalActor = .nativeUI
+            source: PromptExperimentApprovalActor = .nativeUI,
+            feedback: String = ""
         ) async throws {
+            guard feedback.count <= 8000 else {
+                throw PromptExperimentAuthorityError.invalidDraft("Revision feedback is limited to 8,000 characters.")
+            }
             try await requireLoaded()
             let originalIndex = try index(of: experimentID)
             guard source == .nativeUI else { throw PromptExperimentAuthorityError.approvalRequiresNativeUI }
@@ -645,7 +660,8 @@
             )
             records[index].phase = .drafting
             records[index].updatedAt = date
-            records[index].statusMessage = "The user declined revision \(plan.revision). Continue this conversation to revise the new versioned draft."
+            records[index].statusMessage = "The user requested changes to revision \(plan.revision). Continue this conversation to revise the new versioned draft."
+                + (feedback.isEmpty ? "" : "\nUser feedback: \(feedback)")
             try await persist()
             try resumePendingRunApproval(
                 experimentID: experimentID,
@@ -739,7 +755,7 @@
             records[index].updatedAt = now()
             records[index].statusMessage = plan.optimization == nil
                 ? "Running fixed serial comparison (0/\(plan.trials.count))."
-                : "Starting pinned upstream GEPA search (0/\(plan.optimization?.gepa.maxEvaluations ?? 0) evaluations)."
+                : "Starting \(plan.optimization?.isPreparation == true ? "reviewed preparation batch" : "pinned upstream GEPA search") (0/\(plan.optimization?.gepa.maxEvaluations ?? 0) evaluations)."
             do {
                 try await persist()
             } catch {
@@ -939,7 +955,13 @@
             let date = now()
             var nextOptimization = plan.optimization
             nextOptimization?.gepa.maxWallClockSeconds = nil
-            if let chosenCandidate { nextOptimization?.seedCandidate = chosenCandidate }
+            if let chosenCandidate {
+                nextOptimization?.seedCandidate = chosenCandidate
+                // Continue carries tested text forward, not another implicit preparation batch.
+                // The agent may explicitly choose another preparation round in the new draft.
+                nextOptimization?.stage = .search
+                nextOptimization?.preparationCandidates = nil
+            }
             records[index].draft = PromptExperimentDraft(
                 revision: plan.revision + 1,
                 parentPlanID: plan.id,
@@ -1376,9 +1398,7 @@
                 } else if !currentAttempts.isEmpty, currentAttempts.allSatisfy({ $0.status == .completed }) {
                     record.phase = .completed
                     if let result = currentAttempts.last?.optimizationResult {
-                        let best = result.bestScore.map { String($0) } ?? "unavailable"
-                        let baseline = result.baselineScore.map { String($0) } ?? "unavailable"
-                        record.statusMessage = "GEPA complete: \(result.totalEvaluations) evaluations; best \(best) vs baseline \(baseline). Applying a winner requires separate approval."
+                        record.statusMessage = result.assessment + " Applying a candidate requires separate approval."
                     } else {
                         record.statusMessage = "Fixed serial comparison complete. Review outputs; no automatic winner or promotion is computed."
                     }

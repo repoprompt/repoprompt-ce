@@ -143,6 +143,80 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
             self.assertIn("prompt_tokens=", completed["proposer_usage"])
             self.assertIn("unavailable_callbacks=0", completed["proposer_usage"])
 
+    def test_preparation_evaluates_reviewed_candidates_without_search_or_holdout(self) -> None:
+        result, calls = self.run_preparation_batch(4)
+        self.assertEqual(result["type"], "completed")
+        data = result["result"]
+        self.assertEqual(data["engine"], "preparation")
+        self.assertEqual(data["total_evaluations"], 4)
+        self.assertEqual(data["candidates"], ["reference", "revised"])
+        self.assertEqual(data["aggregate_scores"], [0.0, 1.0])
+        self.assertEqual(data["best_candidate_index"], 1)
+        self.assertEqual([e["candidate_index"] for e in data["evaluations"]], [0, 0, 1, 1])
+        self.assertFalse(data["metadata"]["search_performed"])
+        self.assertFalse(data["metadata"]["held_out_evaluated"])
+        self.assertEqual(calls, ["evaluate"] * 4)
+
+    def test_preparation_rejects_insufficient_budget_before_any_host_call(self) -> None:
+        result, calls = self.run_preparation_batch(3)
+        self.assertEqual(result["type"], "failed")
+        self.assertEqual(calls, [])
+
+    def run_preparation_batch(self, budget: int) -> tuple[dict, list[str]]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            process = subprocess.Popen(
+                [sys.executable, "-I", "-B", str(WORKER)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1,
+                env={"HOME": str(root), "PATH": "/usr/bin:/bin", "TMPDIR": str(root)},
+            )
+            assert process.stdin is not None and process.stdout is not None
+            calls = []
+            try:
+                process.stdin.write(json.dumps({
+                    "protocol_version": 1, "type": "run", "request": {
+                        "stage": "preparation", "preparation_candidates": ["reference", "revised"],
+                        "max_evaluations": budget,
+                        "run_dir": str(root / "run"), "output_dir": str(root / "output"),
+                        "examples": [
+                            {"id": "dev1", "split": "training", "input": "one"},
+                            {"id": "dev2", "split": "training", "input": "two"},
+                            {"id": "val", "split": "validation", "input": "VALIDATION_CANARY"},
+                            {"id": "hidden", "split": "hidden_test", "input": "HIDDEN_CANARY"},
+                        ],
+                    },
+                }) + "\n")
+                process.stdin.flush()
+                for _ in range(20):
+                    raw = process.stdout.readline()
+                    self.assertTrue(raw, "worker exited without a terminal result")
+                    message = json.loads(raw)
+                    if message["type"] in ("completed", "failed"):
+                        process.stdin.close()
+                        process.wait(timeout=10)
+                        return message, calls
+                    if message["type"] != "host_request":
+                        continue
+                    self.assertNotIn("CANARY", raw)
+                    calls.append(message["operation"])
+                    self.assertEqual(message["operation"], "evaluate")
+                    self.assertEqual(message["payload"]["example"]["split"], "training")
+                    score = float(message["payload"]["candidate"] == "revised")
+                    process.stdin.write(json.dumps({
+                        "type": "host_response", "id": message["id"], "ok": True,
+                        "score": score, "feedback": "reviewed feedback", "output": "answer",
+                    }) + "\n")
+                    process.stdin.flush()
+                self.fail("preparation did not settle")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
     def test_failure_envelope_exposes_safe_class_and_frame_without_exception_text(self) -> None:
         secret_canary = "HOST_PRIVATE_INFRASTRUCTURE_SECRET_CANARY"
         with tempfile.TemporaryDirectory() as temporary:

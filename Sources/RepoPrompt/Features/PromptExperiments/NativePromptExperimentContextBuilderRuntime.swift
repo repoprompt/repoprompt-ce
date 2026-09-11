@@ -399,6 +399,9 @@
             do {
                 switch operation {
                 case "reflect":
+                    guard !specification.isPreparation else {
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("Preparation authorizes only the reviewed candidate evaluations, not reflection calls.")
+                    }
                     let promptValue = payload["prompt"]
                     let prompt: String
                     if let value = promptValue as? String {
@@ -478,6 +481,9 @@
             else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA requested an example outside the sealed dataset identity.")
             }
+            guard specification.admitsPreparationEvaluation(candidate: candidate, exampleID: exampleID) else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Preparation may evaluate only reviewed candidates on training examples; held-out inputs are not admitted.")
+            }
             if specification.evaluator.kind == .sandboxedCommand {
                 return try await evaluateSandboxedCommand(
                     candidate: candidate,
@@ -494,7 +500,7 @@
                 throw PromptExperimentAuthorityError.runtimeUnavailable("GEPA requested an example outside the sealed dataset identity.")
             }
             let input = sealedExample.input
-            await progress("Evaluating a GEPA candidate through \(specification.execution.adapter.rawValue) on reviewed example \(exampleID).")
+            await progress("Evaluating a candidate through \(specification.execution.adapter.rawValue) on reviewed example \(exampleID).")
             let executionInstructions = """
             \(specification.execution.instructions)
 

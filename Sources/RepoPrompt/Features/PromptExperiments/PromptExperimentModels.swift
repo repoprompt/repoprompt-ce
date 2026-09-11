@@ -174,7 +174,28 @@
         let judge: PromptExperimentResolvedTarget?
     }
 
+    enum PromptExperimentStage: String, Codable {
+        case preparation
+        case search
+    }
+
     struct PromptExperimentOptimizationSpecification: Codable, Equatable {
+        /// Nil preserves historical search-plan digests. Preparation is a fixed, reviewed
+        /// development batch, not GEPA search or held-out quality evidence.
+        var stage: PromptExperimentStage? = nil
+        var preparationCandidates: [String]? = nil
+
+        var isPreparation: Bool {
+            stage == .preparation
+        }
+
+        func admitsPreparationEvaluation(candidate: String, exampleID: String) -> Bool {
+            !isPreparation || (
+                preparationCandidates?.contains(candidate) == true
+                    && examples.contains { $0.id == exampleID && $0.split == .training }
+            )
+        }
+
         var seedCandidate: String?
         var objective: String
         var background: String
@@ -254,6 +275,18 @@
         let proposerUsage: String
         let runDirectoryRelativePath: String?
         let rawResultEvidence: PromptExperimentArtifactReference?
+    }
+
+    extension PromptExperimentOptimizationResult {
+        var assessment: String {
+            if engine == "preparation" {
+                return "Preparation complete: \(candidates.count) reviewed candidates tested in \(totalEvaluations) development evaluations. Inspect feedback and revise before GEPA search; these are not held-out results."
+            }
+            if candidates.count == 1, evaluations.allSatisfy({ $0.candidateIndex == 0 }) {
+                return "Search ended after \(totalEvaluations) evaluations of the starting candidate only. No alternative was evaluated; improvement was not demonstrated."
+            }
+            return "GEPA search complete: \(totalEvaluations) evaluations, \(candidates.count) retained candidates. Compare per-example evidence before claiming improvement."
+        }
     }
 
     struct PromptExperimentDraft: Codable, Equatable, Identifiable {
@@ -372,6 +405,11 @@
                 throw PromptExperimentAuthorityError.invalidDraft("Each instruction, rubric, command, and background field must remain within its documented bound.")
             }
             if let optimization {
+                guard (optimization.preparationCandidates?.count ?? 0) <= 20,
+                      optimization.preparationCandidates?.allSatisfy({ $0.count <= Self.maximumInstructionCharacters }) ?? true
+                else {
+                    throw PromptExperimentAuthorityError.invalidDraft("Preparation admits at most 20 candidates within the instruction field bound.")
+                }
                 guard optimization.examples.count <= Self.maximumExamples else {
                     throw PromptExperimentAuthorityError.invalidDraft("Optimization datasets are limited to \(Self.maximumExamples) examples.")
                 }
@@ -451,6 +489,19 @@
                 }
                 guard optimization.examples.contains(where: { $0.split != .hiddenTest }) else {
                     throw PromptExperimentAuthorityError.invalidDraft("At least one training or validation example must be visible to GEPA.")
+                }
+                if optimization.isPreparation {
+                    let candidates = optimization.preparationCandidates ?? []
+                    let trainingCount = optimization.examples.count(where: { $0.split == .training })
+                    guard !candidates.isEmpty, Set(candidates).count == candidates.count,
+                          candidates.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
+                          trainingCount > 0,
+                          candidates.count * trainingCount <= optimization.gepa.maxEvaluations
+                    else {
+                        throw PromptExperimentAuthorityError.invalidDraft("Preparation requires distinct nonempty candidates, training examples, and enough evaluations for every candidate on every training example. Validation and hidden tests are not executed during preparation.")
+                    }
+                } else if optimization.preparationCandidates != nil {
+                    throw PromptExperimentAuthorityError.invalidDraft("Clear preparation_candidates before GEPA search; select the tested starting prompt as seed_candidate.")
                 }
                 if let project = optimization.projectSnapshot {
                     guard !project.sourceRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -616,7 +667,8 @@
         static let legacySchemaVersion = 1
         static let legacyOptimizationSchemaVersion = 2
         static let legacyWallClockOptimizationSchemaVersion = 3
-        static let optimizationSchemaVersion = 4
+        static let legacyDeadlineFreeSchemaVersion = 4
+        static let optimizationSchemaVersion = 5
         static let schemaVersion = legacySchemaVersion
         static let executionAdapter = "context_builder_native_v1"
         static let comparisonMode = "fixed_serial_interleaved_v1"
@@ -764,13 +816,17 @@
                 guard [
                     Self.legacyOptimizationSchemaVersion,
                     Self.legacyWallClockOptimizationSchemaVersion,
+                    Self.legacyDeadlineFreeSchemaVersion,
                     Self.optimizationSchemaVersion
                 ].contains(effectiveSchemaVersion),
                     let optimizationTargets,
                     trials.count == 1,
                     trials.first?.condition == .optimization
                 else { return false }
-                if effectiveSchemaVersion == Self.optimizationSchemaVersion {
+                if effectiveSchemaVersion < Self.optimizationSchemaVersion {
+                    guard optimization.stage == nil, optimization.preparationCandidates == nil else { return false }
+                }
+                if effectiveSchemaVersion >= Self.legacyDeadlineFreeSchemaVersion {
                     guard optimization.gepa.maxWallClockSeconds == nil else { return false }
                 } else {
                     guard optimization.gepa.maxWallClockSeconds != nil else { return false }
