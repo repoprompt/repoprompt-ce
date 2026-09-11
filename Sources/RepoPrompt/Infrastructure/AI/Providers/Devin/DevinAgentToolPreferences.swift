@@ -87,14 +87,13 @@ enum DevinAgentToolPreferences {
             return [DevinAgentToolPreferences.permissionModeArgumentName, mode]
         }
 
-        /// Stored values are expected to be explicit. Missing, blank, or unknown persisted
-        /// content fails closed to Normal rather than delegating to a potentially broader
-        /// provider default. Fresh preference absence is handled before calling this parser.
+        /// Missing/blank values mean the explicit provider default. Unknown stored values
+        /// fail closed to Normal instead of delegating to a potentially broader Devin default.
         static func from(rawValue: String?) -> PermissionLevel {
             guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty
             else {
-                return .normal
+                return .providerDefault
             }
             return allCases.first(where: { $0.rawValue.lowercased() == raw.lowercased() }) ?? .normal
         }
@@ -133,12 +132,7 @@ enum DevinAgentToolPreferences {
             }
             return document.permissionLevel()
         }
-        guard let raw = defaults.string(forKey: permissionLevelKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty
-        else {
-            return .providerDefault
-        }
-        return PermissionLevel.from(rawValue: raw)
+        return PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
     }
 
     static func setPermissionLevel(
