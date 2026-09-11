@@ -61,14 +61,6 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
     private let lock = NSLock()
     private var cachedLaunchByKey: [String: DevinACPResolvedLaunch] = [:]
 
-    convenience init(
-        environmentProvider: @escaping @Sendable (_ enableDebugLogging: Bool) async -> [String: String]
-    ) {
-        self.init(launchEnvironmentProvider: { enableDebugLogging in
-            await ACPLaunchEnvironment(environment: environmentProvider(enableDebugLogging))
-        })
-    }
-
     init(
         launchEnvironmentProvider: @escaping EnvironmentProvider = { enableDebugLogging in
             let result = await ProcessEnvironmentBuilder.build(
