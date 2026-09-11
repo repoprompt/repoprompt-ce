@@ -921,7 +921,7 @@ final class ACPIntegratedAgentModeRunner {
         agentKind: AgentProviderKind,
         modelString: String?
     ) throws -> String? {
-        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity else { return nil }
+        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity || agentKind == .omp else { return nil }
         guard let model = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
@@ -1828,6 +1828,9 @@ final class ACPIntegratedAgentModeRunner {
         agentKind: AgentProviderKind,
         session: AgentTabSession
     ) -> Bool {
+        // Keep OMP's explicit Default selection sticky instead of replacing it with the
+        // current model reported by the provider.
+        guard agentKind != .omp else { return false }
         guard let providerID = agentKind.acpProviderID,
               providerID != .cursor,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)

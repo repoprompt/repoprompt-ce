@@ -1,23 +1,27 @@
 import Foundation
 
-/// OpenCode CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
-/// Runs a fresh prompt-only-style ACP session per request while preserving OpenCode's raw model IDs.
-final class OpenCodeCLIProvider: AIProvider {
-    private let activeProviders = ActiveACPCLIProviderStore<OpenCodeACPHeadlessAgentProvider>()
+/// Oh My Pi provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
+/// Runs a fresh ACP session per request while preserving OMP's advertised model IDs.
+final class OMPCLIProvider: AIProvider {
+    private let activeProviders = ActiveACPCLIProviderStore<OMPACPHeadlessAgentProvider>()
 
     #if DEBUG
-        static func test_makeHeadlessConfig(modelName: String?) -> OpenCodeAgentConfig {
+        static func test_makeHeadlessConfig(modelName: String?) -> OMPAgentConfig {
             makeHeadlessConfig(modelName: modelName)
         }
 
         static func test_makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
-            OpenCodeCLIProvider().makeAgentMessage(from: aiMessage)
+            OMPCLIProvider().makeAgentMessage(from: aiMessage)
         }
     #endif
 
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let provider = OpenCodeACPHeadlessAgentProvider(
-            config: Self.makeHeadlessConfig(modelName: openCodeModelName(for: model)),
+    func streamMessage(
+        _ aiMessage: AIMessage,
+        model: AIModel,
+        maxTokens _: Int? = nil
+    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        let provider = OMPACPHeadlessAgentProvider(
+            config: Self.makeHeadlessConfig(modelName: ompModelName(for: model)),
             workspacePath: nil
         )
         if let replacedProvider = activeProviders.replace(provider) {
@@ -68,7 +72,11 @@ final class OpenCodeCLIProvider: AIProvider {
         }
     }
 
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AICompletionResult {
+    func completeMessage(
+        _ aiMessage: AIMessage,
+        model: AIModel,
+        maxTokens: Int? = nil
+    ) async throws -> AICompletionResult {
         let stream = try await streamMessage(aiMessage, model: model, maxTokens: maxTokens)
         var textParts: [String] = []
         var finalContent: String?
@@ -93,7 +101,9 @@ final class OpenCodeCLIProvider: AIProvider {
                 if let value = result.completionTokens { completionTokens = value }
                 if let value = result.cost { cost = value }
             case "error":
-                throw AIProviderError.invalidConfiguration(detail: result.text ?? "OpenCode ACP reported an error")
+                throw AIProviderError.invalidConfiguration(
+                    detail: result.text ?? "Oh My Pi ACP reported an error"
+                )
             default:
                 continue
             }
@@ -101,7 +111,7 @@ final class OpenCodeCLIProvider: AIProvider {
 
         let text = textParts.isEmpty ? (finalContent ?? "") : textParts.joined()
         guard sawMessageStop || !text.isEmpty else {
-            throw AIProviderError.invalidResponse(detail: "OpenCode returned no completion")
+            throw AIProviderError.invalidResponse(detail: "Oh My Pi returned no completion")
         }
 
         return AICompletionResult(
@@ -119,14 +129,10 @@ final class OpenCodeCLIProvider: AIProvider {
         }
     }
 
-    private static func makeHeadlessConfig(modelName: String?) -> OpenCodeAgentConfig {
-        OpenCodeAgentConfig(
-            modelString: modelName,
+    private static func makeHeadlessConfig(modelName: String?) -> OMPAgentConfig {
+        OMPAgentConfig(
             enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-            includeRepoPromptMCPServer: false,
-            includeManagedConfigOverlay: true,
-            cleanupLegacyPersistentConfig: true,
-            toolProfile: .noTools
+            modelString: modelName
         )
     }
 
@@ -163,59 +169,9 @@ final class OpenCodeCLIProvider: AIProvider {
         return conversation
     }
 
-    private func openCodeModelName(for model: AIModel) -> String? {
-        guard model.providerType == .openCode else { return nil }
+    private func ompModelName(for model: AIModel) -> String? {
+        guard model.providerType == .omp else { return nil }
         let trimmed = model.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
-final class ActiveACPCLIProviderStore<Provider: AnyObject>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var providers: [ObjectIdentifier: Provider] = [:]
-    private var currentProviderID: ObjectIdentifier?
-
-    func replace(_ provider: Provider) -> Provider? {
-        lock.lock()
-        let providerID = ObjectIdentifier(provider)
-        let previousProvider = currentProviderID.flatMap { providers[$0] }
-        providers[providerID] = provider
-        currentProviderID = providerID
-        lock.unlock()
-        guard let previousProvider,
-              previousProvider !== provider
-        else {
-            return nil
-        }
-        return previousProvider
-    }
-
-    func contains(_ provider: Provider) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
-        return providers[ObjectIdentifier(provider)] != nil
-    }
-
-    @discardableResult
-    func remove(_ provider: Provider) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let providerID = ObjectIdentifier(provider)
-        let removedProvider = providers.removeValue(forKey: providerID)
-        if currentProviderID == providerID {
-            currentProviderID = nil
-        }
-        return removedProvider != nil
-    }
-
-    func removeAll() -> [Provider] {
-        lock.lock()
-        let currentProviders = Array(providers.values)
-        providers.removeAll()
-        currentProviderID = nil
-        lock.unlock()
-        return currentProviders
     }
 }

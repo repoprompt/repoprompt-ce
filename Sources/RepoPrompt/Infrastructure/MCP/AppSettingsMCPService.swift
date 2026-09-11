@@ -1421,6 +1421,8 @@ private enum AppSettingsMCPRegistry {
             .cursor
         case .grokBuild:
             .grokBuild
+        case .omp:
+            nil
         }
     }
 
@@ -1443,6 +1445,7 @@ private enum AppSettingsMCPRegistry {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .omp: "omp"
         }
     }
 

@@ -725,7 +725,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor, .grokBuild, .antigravity:
+        case .openCode, .cursor, .grokBuild, .antigravity, .omp:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -2302,7 +2302,9 @@ actor ACPAgentSessionController {
         if error is ExecutableFileIdentityError {
             return "executable_identity"
         }
-        if error is CursorACPLaunchResolutionError || error is OpenCodeACPLaunchResolutionError {
+        if error is CursorACPLaunchResolutionError || error is OpenCodeACPLaunchResolutionError
+            || error is OMPACPLaunchResolutionError
+        {
             return "launch_resolution"
         }
         if error is CLIProcessRunnerError {
@@ -3259,7 +3261,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor, .antigravity:
+        case .openCode, .cursor, .antigravity, .omp:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         case .grokBuild:
             grokBuildAllowOptionPreferences(sessionScoped: sessionScoped)
@@ -3310,7 +3312,7 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode, .grokBuild, .antigravity:
+        case .openCode, .grokBuild, .antigravity, .omp:
             // Grok full access is provider-native (`grok agent --always-approve stdio`); the
             // controller never auto-selects permission options for it.
             return nil
@@ -3364,9 +3366,9 @@ actor ACPAgentSessionController {
                 .optionID("allow_once"),
                 .kind("allow_once")
             ]
-        case .grokBuild:
-            // Strict RepoPrompt MCP auto-approval is per-request: never select Grok's
-            // session-scoped `allow-edits-session` here.
+        case .grokBuild, .omp:
+            // Strict RepoPrompt MCP auto-approval is per-request: never select a provider-wide
+            // or session-scoped option here.
             [
                 .optionID("allow-once"),
                 .optionID("once"),
@@ -3569,6 +3571,8 @@ actor ACPAgentSessionController {
                 "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
             case .antigravity:
                 "RP_ANTIGRAVITY_ACP_RAW_CAPTURE_PATH"
+            case .omp:
+                "RP_OMP_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -146,6 +146,12 @@ struct AIModelDropdown: View {
                         items: group.models.map(aiModelMenuItem)
                     )
                 }
+            } else if provider == .omp {
+                AIModel.ompMenuGroups(for: models).flatMap { group in
+                    let items = group.models.map(aiModelMenuItem)
+                    guard let displayName = group.displayName else { return items }
+                    return [.submenu(displayName, items: items)]
+                }
             } else if provider == .openCode {
                 AIModel.openCodeMenu(for: models).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
                     let modelItems = providerGroup.groups.map(aiModelOpenCodeMenuItem)

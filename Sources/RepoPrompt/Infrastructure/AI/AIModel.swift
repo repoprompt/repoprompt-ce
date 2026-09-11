@@ -180,6 +180,7 @@ public enum AIModel: Equatable, Hashable {
     case openCodeCustom(name: String)
     case cursorCustom(name: String)
     case grokBuildCustom(name: String)
+    case ompCustom(name: String)
 
     // Custom Provider Models
     case customProvider(name: String, provider: String, model: String)
@@ -539,6 +540,8 @@ public enum AIModel: Equatable, Hashable {
             return "cursor_custom_\(n)"
         case let .grokBuildCustom(n):
             return "grokbuild_custom_\(n)"
+        case let .ompCustom(n):
+            return "omp_custom_\(n)"
         case let .customProvider(_, _, model):
             return "custom_provider_\(model)"
         case let .customProviderUser(name):
@@ -609,6 +612,9 @@ public enum AIModel: Equatable, Hashable {
         if case let .grokBuildCustom(n) = self {
             return ACPAIModelCatalog.grokBuildModelOption(for: n)?.displayName ?? n
         }
+        if case let .ompCustom(n) = self {
+            return ACPAIModelCatalog.ompModelOption(for: n)?.displayName ?? n
+        }
         if case let .customProviderUser(name) = self { return "Custom/\(name)" }
         if case .ollama = self {
             return "local/" + modelName
@@ -638,6 +644,7 @@ public enum AIModel: Equatable, Hashable {
         case .openCode: OpenCodeCLIProvider.self
         case .cursor: CursorCLIProvider.self
         case .grokBuild: GrokBuildCLIProvider.self
+        case .omp: OMPCLIProvider.self
         }
     }
 
@@ -667,6 +674,7 @@ public enum AIModel: Equatable, Hashable {
         case .openCodeCustom: return .openCode
         case .cursorCustom: return .cursor
         case .grokBuildCustom: return .grokBuild
+        case .ompCustom: return .omp
         case .customProviderUser: return .customProvider
         // or, if you prefer the old modelGroups approach:
         default:
@@ -722,7 +730,8 @@ public enum AIModel: Equatable, Hashable {
              let .codexCustom(n),
              let .openCodeCustom(n),
              let .cursorCustom(n),
-             let .grokBuildCustom(n):
+             let .grokBuildCustom(n),
+             let .ompCustom(n):
             return n
         case let .customProviderUser(name):
             return name
@@ -1163,7 +1172,7 @@ public enum AIModel: Equatable, Hashable {
             return SwiftOpenAI.Model.custom(modelName)
         case .anthropic:
             return SwiftAnthropic.Model.other(modelName)
-        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor, .grokBuild:
+        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor, .grokBuild, .omp:
             // For these providers, use the actual model name when available
             if let modelInfo = Self.modelDefinitions.first(where: { $0.model == self }),
                let actualName = modelInfo.actualName
@@ -1257,6 +1266,9 @@ public enum AIModel: Equatable, Hashable {
         }
         if normalizedRawValue.hasPrefix("grokbuild_custom_") {
             return .grokBuildCustom(name: String(normalizedRawValue.dropFirst("grokbuild_custom_".count)))
+        }
+        if normalizedRawValue.hasPrefix("omp_custom_") {
+            return .ompCustom(name: String(normalizedRawValue.dropFirst("omp_custom_".count)))
         }
 
         if normalizedRawValue.hasPrefix("openai_custom_reasoning_") {
@@ -1372,6 +1384,8 @@ public enum AIModel: Equatable, Hashable {
             models = ACPAIModelCatalog.cursorModelsFromStore()
         case .grokBuild:
             models = ACPAIModelCatalog.grokBuildModelsFromStore()
+        case .omp:
+            models = ACPAIModelCatalog.ompModelsFromStore()
         }
 
         // Filter out models that are not yet available based on their release date
@@ -1423,6 +1437,12 @@ public enum AIModel: Equatable, Hashable {
     struct OpenCodePickerMenu: Hashable {
         let providerGroups: [OpenCodePickerProviderMenuGroup]
         let groups: [OpenCodePickerMenuGroup]
+    }
+
+    struct ACPPickerMenuGroup: Identifiable, Hashable {
+        let id: String
+        let displayName: String?
+        let models: [AIModel]
     }
 
     struct ClaudeCodePickerMenuOption: Identifiable, Hashable {
@@ -1559,6 +1579,27 @@ public enum AIModel: Equatable, Hashable {
 
     static func openCodeMenuGroups(for models: [AIModel]) -> [OpenCodePickerMenuGroup] {
         openCodeMenu(for: models).groups
+    }
+
+    static func ompMenuGroups(for models: [AIModel]) -> [ACPPickerMenuGroup] {
+        let modelsByRaw = Dictionary(
+            models
+                .filter { $0.providerType == .omp }
+                .map { ($0.modelName.lowercased(), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let options = ACPAIModelCatalog.ompModelOptionsFromStore().filter {
+            modelsByRaw[$0.rawValue.lowercased()] != nil
+        }
+        return AgentModelCatalog.ompModelGroups(for: options).compactMap { group in
+            let groupedModels = group.options.compactMap { modelsByRaw[$0.rawValue.lowercased()] }
+            guard !groupedModels.isEmpty else { return nil }
+            return ACPPickerMenuGroup(
+                id: group.id,
+                displayName: group.providerID,
+                models: groupedModels
+            )
+        }
     }
 
     static func codexMenuGroups(for models: [AIModel]) -> [CodexPickerMenuGroup] {
@@ -1981,6 +2022,7 @@ public enum AIModel: Equatable, Hashable {
         case openCodeCustom(name: String)
         case cursorCustom(name: String)
         case grokBuildCustom(name: String)
+        case ompCustom(name: String)
         case customProvider(name: String, provider: String, model: String)
         case customProviderUser(name: String)
         case claudeCodeModel(normalizedSpecifier: String)
@@ -2137,6 +2179,8 @@ public enum AIModel: Equatable, Hashable {
             .cursorCustom(name: name)
         case let .grokBuildCustom(name):
             .grokBuildCustom(name: name)
+        case let .ompCustom(name):
+            .ompCustom(name: name)
         case let .customProvider(name, provider, model):
             .customProvider(name: name, provider: provider, model: model)
         case let .customProviderUser(name):

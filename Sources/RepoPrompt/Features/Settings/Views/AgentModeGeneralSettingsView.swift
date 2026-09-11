@@ -530,7 +530,7 @@ struct AgentModeGeneralSettingsView: View {
         let connected = providers.filter(isProviderConnected).count
         let total = providers.count
         if connected == 0 {
-            return "Connect a CLI agent (Claude Code, Codex, OpenCode, Cursor) to run anything in Agent Mode."
+            return "Connect a CLI agent (Claude Code, Codex, OpenCode, Cursor, Oh My Pi) to run anything in Agent Mode."
         }
         return "\(connected) of \(total) CLI providers connected. Manage auth, installs, and models in CLI Providers."
     }
@@ -583,6 +583,7 @@ struct AgentModeGeneralSettingsView: View {
         case .antigravity: AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .cursor: apiSettingsVM.isCursorConnected
         case .grokBuild: apiSettingsVM.isGrokBuildConnected
+        case .omp: apiSettingsVM.isOMPConnected
         }
     }
 

@@ -569,7 +569,7 @@ enum OracleImageRouteAdmission {
              .openCode,
              .cursor:
             true
-        case .grokBuild:
+        case .grokBuild, .omp:
             false
         }
     }

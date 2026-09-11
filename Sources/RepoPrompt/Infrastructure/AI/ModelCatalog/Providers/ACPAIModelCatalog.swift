@@ -377,6 +377,10 @@ enum ACPAIModelCatalog {
         grokBuildModelOptionsFromStore().map { .grokBuildCustom(name: $0.rawValue) }
     }
 
+    static func ompModelsFromStore() -> [AIModel] {
+        ompModelOptionsFromStore().map { .ompCustom(name: $0.rawValue) }
+    }
+
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
@@ -393,6 +397,10 @@ enum ACPAIModelCatalog {
         guard !normalized.isEmpty else { return nil }
         return grokBuildModelOptionsFromStore()
             .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+    }
+
+    static func ompModelOption(for rawValue: String) -> AgentModelOption? {
+        modelOption(for: rawValue, in: ompModelOptionsFromStore())
     }
 
     static func normalizedCursorModelAlias(_ value: String) -> String {
@@ -419,5 +427,19 @@ enum ACPAIModelCatalog {
             for: .grokBuild,
             availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
         )
+    }
+
+    static func ompModelOptionsFromStore() -> [AgentModelOption] {
+        // Keep AIModel's static paths one-way: registry data only, never AgentModelCatalog.
+        AgentACPModelRegistry.shared.resolvedSnapshot(for: .omp)?.options ?? []
+    }
+
+    private static func modelOption(
+        for rawValue: String,
+        in options: [AgentModelOption]
+    ) -> AgentModelOption? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return options.first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
     }
 }
