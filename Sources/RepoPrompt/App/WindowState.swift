@@ -63,7 +63,7 @@ enum WindowTitleFormatter {
             return workspaceTitle
         }
 
-        return "\(trimmedSessionTitle) — \(workspaceTitle)"
+        return "\(workspaceTitle) — \(trimmedSessionTitle)"
     }
 
     static func applyingOverseerPrefix(to baseTitle: String, isOverseer: Bool) -> String {
