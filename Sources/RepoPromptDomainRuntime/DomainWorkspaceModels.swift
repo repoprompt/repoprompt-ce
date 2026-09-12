@@ -1,3 +1,4 @@
+import CoreFoundation
 import CryptoKit
 import Foundation
 
@@ -117,6 +118,8 @@ package struct DomainContextMetadata: Codable, Equatable {
 package struct DomainWorkspaceMetadata: Codable, Equatable {
     package let workspaceID: UUID
     package let schemaVersion: Int
+    package let dateModified: Date
+    package let lastUsed: Date
     package let name: String
     package let repoPaths: [String]
     package let customStoragePath: URL?
@@ -131,6 +134,8 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
     package init(
         workspaceID: UUID,
         schemaVersion: Int,
+        dateModified: Date,
+        lastUsed: Date,
         name: String,
         repoPaths: [String],
         customStoragePath: URL?,
@@ -144,6 +149,8 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
     ) {
         self.workspaceID = workspaceID
         self.schemaVersion = schemaVersion
+        self.dateModified = dateModified
+        self.lastUsed = lastUsed
         self.name = name
         self.repoPaths = repoPaths
         self.customStoragePath = customStoragePath
@@ -201,6 +208,14 @@ package struct DomainWorkspaceActivationSnapshot {
     package let workspace: DomainWorkspaceSnapshot?
     package let publicationSequence: UInt64
     package let catalogRevision: UInt64
+}
+
+/// Recovery-aware canonical selection shared by folder resolution and command admission.
+package enum DomainExactRootSelection: Equatable {
+    case matched(DomainWorkspaceSnapshot)
+    case noMatch
+    case recoveryBlocked
+    case changed
 }
 
 package struct DomainWorkspaceCatalogSnapshot: Equatable {
@@ -276,6 +291,17 @@ package enum DomainContentDigest {
 private enum DomainWorkspaceDocumentDecoder {
     static let maximumSupportedSchemaVersion = 1
 
+    private static func persistedDate(forKey key: String, in object: [String: Any]) -> Date? {
+        guard let value = object[key] as? NSNumber,
+              CFGetTypeID(value) != CFBooleanGetTypeID(),
+              value.doubleValue.isFinite
+        else {
+            return nil
+        }
+        let interval = value.doubleValue
+        return Date(timeIntervalSinceReferenceDate: interval)
+    }
+
     static func decodeMetadata(from data: Data) throws -> DomainWorkspaceMetadata {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw DomainWorkspaceDocumentError.invalidTopLevel
@@ -337,9 +363,14 @@ private enum DomainWorkspaceDocumentDecoder {
         } else {
             nil
         }
+        let persistedDateModified = persistedDate(forKey: "dateModified", in: object)
         return DomainWorkspaceMetadata(
             workspaceID: workspaceID,
             schemaVersion: schemaVersion,
+            dateModified: persistedDateModified ?? .distantPast,
+            lastUsed: persistedDate(forKey: "lastUsed", in: object)
+                ?? persistedDateModified
+                ?? .distantPast,
             name: object["name"] as? String ?? "Untitled Workspace",
             repoPaths: object["repoPaths"] as? [String] ?? [],
             customStoragePath: customStoragePath,

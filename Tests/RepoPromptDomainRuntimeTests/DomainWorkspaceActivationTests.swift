@@ -65,6 +65,42 @@ final class DomainWorkspaceActivationTests: XCTestCase {
         let activation = await authority.activationSnapshot(workspaceID: fixture.workspaceID, fileURL: saved.fileURL)
         XCTAssertEqual(activation.workspace?.document.contentDigest, working.contentDigest)
     }
+
+    func testMetadataDecodeUsesDeterministicLegacyRecencyAndPreservesDocumentBytes() throws {
+        let workspaceID = UUID()
+        let fileURL = URL(fileURLWithPath: "/tmp/legacy-workspace.json")
+        var object: [String: Any] = [
+            "id": workspaceID.uuidString,
+            "name": "Legacy",
+            "repoPaths": [],
+            "dateModified": 0,
+            "unknownFutureField": ["preserve": true]
+        ]
+
+        func decode() throws -> DomainWorkspaceDocument {
+            let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
+            XCTAssertEqual(document.documentBytes, bytes)
+            return document
+        }
+
+        var document = try decode()
+        XCTAssertEqual(document.metadata.lastUsed, Date(timeIntervalSinceReferenceDate: 0))
+
+        object["dateModified"] = 1
+        object["lastUsed"] = true
+        document = try decode()
+        XCTAssertEqual(document.metadata.lastUsed, Date(timeIntervalSinceReferenceDate: 1))
+
+        object["lastUsed"] = 0
+        document = try decode()
+        XCTAssertEqual(document.metadata.lastUsed, Date(timeIntervalSinceReferenceDate: 0))
+
+        object["dateModified"] = "invalid"
+        object["lastUsed"] = "invalid"
+        document = try decode()
+        XCTAssertEqual(document.metadata.lastUsed, .distantPast)
+    }
 }
 
 private struct ActivationFixture {
