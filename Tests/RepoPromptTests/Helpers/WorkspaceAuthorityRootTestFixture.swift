@@ -49,6 +49,7 @@ import XCTest
         @MainActor
         final class RecordingManager: WorkspaceManagerViewModel {
             var dirtyMarkDidFinish: (() -> Void)?
+            var selectionObservationDidFinish: (([FileViewModel]) -> Void)?
             /// Negative control only: omit production request triggers after real setup.
             var omitRootReconciliationRequests = false
 
@@ -60,6 +61,11 @@ import XCTest
             override func markWorkspaceDirty() {
                 super.markWorkspaceDirty()
                 dirtyMarkDidFinish?()
+            }
+
+            override func checkIfActivePresetIsDirty(with newSelection: [FileViewModel]) {
+                super.checkIfActivePresetIsDirty(with: newSelection)
+                selectionObservationDidFinish?(newSelection)
             }
         }
 
@@ -335,16 +341,29 @@ import XCTest
 
         func selectFixtureFiles(_ paths: [String]) async throws {
             let dirty = XCTestExpectation(description: "selected files reached the real dirty observer")
+            let observed = XCTestExpectation(description: "selected files reached the debounced selection observer")
             let expected = Set(paths)
             var fulfilled = false
+            var observationFulfilled = false
+            manager.selectionObservationDidFinish = { selection in
+                guard !observationFulfilled, Set(selection.map(\.fullPath)) == expected else { return }
+                observationFulfilled = true
+                observed.fulfill()
+            }
             manager.dirtyMarkDidFinish = { [weak self] in
                 guard let self, !fulfilled, Set(files.selectedFiles.map(\.fullPath)) == expected else { return }
                 fulfilled = true
                 dirty.fulfill()
             }
-            defer { manager.dirtyMarkDidFinish = nil }
+            defer {
+                manager.dirtyMarkDidFinish = nil
+                manager.selectionObservationDidFinish = nil
+            }
             try await perform("fixture selection applied") { await self.files.selectFiles(withPaths: paths) }
             try await awaitGateEvent(dirty)
+            // The dirty callback and debounced in-memory tab publication are independent.
+            // Join both before saving the baseline, not after the action under test.
+            try await awaitGateEvent(observed)
             try await perform("selected fixture files saved") { await self.manager.pollAndSaveStateAsync() }
             try await settle()
         }
