@@ -10512,6 +10512,15 @@ extension WorkspaceFilesViewModel {
         let issues: [PathResolutionIssue]
     }
 
+    /// Lexical load identity for configured workspace roots; not filesystem or symlink identity.
+    func workspaceRootIdentity(for input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("\0"),
+              !trimmed.lowercased().hasPrefix("file://") else { return nil }
+        let normalized = normalizeUserInputPath(input)
+        return URL(fileURLWithPath: normalized, isDirectory: true).standardizedFileURL.path
+    }
+
     func canonicalURL(for path: String, assumingDirectory: Bool = false) -> URL {
         let normalized = normalizeUserInputPath(path)
         return URL(fileURLWithPath: normalized, isDirectory: assumingDirectory)

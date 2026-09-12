@@ -337,12 +337,16 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             )
         ) { [dependencies] _, args in
             let connectionID = ServerNetworkManager.currentConnectionID
-            let result = try await Self.executeContextBuilder(
-                args: args,
-                connectionID: connectionID,
-                dependencies: dependencies
-            )
-            return result.toMCPValue()
+            do {
+                let result = try await Self.executeContextBuilder(
+                    args: args,
+                    connectionID: connectionID,
+                    dependencies: dependencies
+                )
+                return result.toMCPValue()
+            } catch let error as ContextBuilderWorkspaceContextError {
+                throw MCPError.invalidParams(error.localizedDescription)
+            }
         }
     }
 
@@ -399,6 +403,14 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         }
 
         let targetWindow = try dependencies.execution.requireTargetWindow()
+        #if DEBUG
+            let invokingBinding = connectionID.map { targetWindow.mcpServer.connectionBindingSnapshot(forConnection: $0) }
+            let startupObservation = targetWindow.contextBuilderAgentViewModel.startupObservationForTesting(
+                workspaceID: invokingBinding?.workspaceID, tabID: invokingBinding?.tabID,
+                invokingRunID: invokingBinding?.runID
+            )
+            defer { startupObservation?.recordRequestTerminal() }
+        #endif
         let tabResolution = try await dependencies.execution.resolveContextBuilderTab(
             args,
             targetWindow,
@@ -474,6 +486,9 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         } catch let error as OracleExecutionResolutionError {
             throw MCPError.invalidParams(error.localizedDescription)
         }
+
+        try await workspaceContext?.validateStartupAvailability(workspaceManager: targetWindow.workspaceManager)
+        try Task.checkCancellation()
 
         // swiftformat:disable conditionalAssignment
         let capturedOracleExportDestination: OracleExportDestination?
@@ -654,7 +669,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                         case let .failed(message): "failed: \(message)"
                         }
 
-                        try workspaceContext?.validateAvailability()
+                        try await workspaceContext?.validateStartupAvailability(workspaceManager: targetWindow.workspaceManager)
+                        try Task.checkCancellation()
                         let selection = resultTab.selection
                         let reply = try await dependencies.execution.buildTabSelectionReply(
                             selection,

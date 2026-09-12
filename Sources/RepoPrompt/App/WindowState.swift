@@ -526,6 +526,26 @@ class WindowState: ObservableObject {
     }
 
     #if DEBUG
+        convenience init(
+            contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
+            domainRuntime: MCPDomainRuntime,
+            keyManager: KeyManager,
+            codexModelPollingService: CodexModelPollingService,
+            loadStoredAPISettingsDataOnInit: Bool
+        ) {
+            self.init(
+                contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
+                loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
+                codexModelPollingService: codexModelPollingService,
+                domainRuntimeOverride: domainRuntime,
+                keyManager: keyManager
+            )
+        }
+
+        func joinDomainWorkspaceBridgeForTesting() async {
+            await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
+        }
+
         convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
             self.init(
                 contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
@@ -578,7 +598,8 @@ class WindowState: ObservableObject {
         codexModelPollingService: CodexModelPollingService,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
-        domainRuntimeOverride: MCPDomainRuntime?
+        domainRuntimeOverride: MCPDomainRuntime?,
+        keyManager injectedKeyManager: KeyManager? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -598,6 +619,7 @@ class WindowState: ObservableObject {
             sharedMCPService: Self.sharedMCPService,
             domainRuntime: domainRuntimeOverride,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
+            keyManager: injectedKeyManager,
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
@@ -2434,6 +2456,7 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        await workspaceManager.awaitRootReconciliationShutdown()
         await promptManager.gitViewModel.shutdownForWindowClose()
 
         let isAppTermination = WindowStatesManager.shared.isTerminating

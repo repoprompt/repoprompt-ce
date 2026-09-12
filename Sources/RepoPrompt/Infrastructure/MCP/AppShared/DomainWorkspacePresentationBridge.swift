@@ -38,6 +38,11 @@ struct DomainWorkspaceAuthorityClient {
     let store: DomainWorkspaceStore
     let windowID: Int
 
+    #if DEBUG
+        /// Per-client suspension only: the real envelope and authority execution remain unchanged.
+        var commandWillExecuteForTesting: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)?
+    #endif
+
     func snapshot() async -> DomainWorkspaceCatalogSnapshot {
         await store.snapshot()
     }
@@ -229,6 +234,9 @@ struct DomainWorkspaceAuthorityClient {
     private func executeStable(
         _ envelope: DomainWorkspaceCommandEnvelope
     ) async -> DomainCommandOutcome {
+        #if DEBUG
+            await commandWillExecuteForTesting?(envelope)
+        #endif
         let first = await store.execute(envelope)
         guard first.disposition == .failed,
               first.errorCode == .lockTimedOut || first.errorCode == .cancelled
@@ -275,6 +283,13 @@ final class DomainWorkspacePresentationBridge {
     }
 
     #if DEBUG
+        /// Cancellation alone does not join a suspended projection into a fixture-owned manager.
+        func stopAndJoinForTesting() async {
+            let task = subscriptionTask
+            stop()
+            await task?.value
+        }
+
         var hasActiveSubscriptionForTesting: Bool {
             subscriptionTask != nil
         }
@@ -454,6 +469,9 @@ final class DomainWorkspacePresentationBridge {
         lastPublicationSequence = snapshot.publicationSequence
         workspaceManager?.applyDomainWorkspaceProjection(
             decoded,
+            canonicalRepoPathsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                ($0.document.workspaceID, $0.document.metadata.repoPaths)
+            }),
             fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
                 ($0.document.workspaceID, $0.document.fileURL)
             }),
