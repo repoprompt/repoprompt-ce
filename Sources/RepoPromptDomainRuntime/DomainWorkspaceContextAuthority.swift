@@ -7,6 +7,14 @@ package enum DomainExternalReloadActivity: Equatable {
     case recoveryPending
 }
 
+#if DEBUG
+    /// Read-only evidence from the existing canonical record, not a saved-document API.
+    package struct DomainWorkspaceSavedStateForTesting: Equatable {
+        package let revision: UInt64
+        package let digest: String
+    }
+#endif
+
 package struct DomainWorkspaceStore {
     private let authority: DomainWorkspaceContextAuthority
 
@@ -44,6 +52,10 @@ package struct DomainWorkspaceStore {
             _ hook: (@Sendable (UUID) async -> Void)?
         ) async {
             await authority.testSetAfterExactRootSavedMarkerRead(hook)
+        }
+
+        package func savedStateForTesting(_ workspaceID: UUID) async -> DomainWorkspaceSavedStateForTesting? {
+            await authority.savedStateForTesting(workspaceID)
         }
 
         package func testSetBeforeExternalReconciliation(
@@ -201,6 +213,11 @@ actor DomainWorkspaceContextAuthority {
     private let persistence: DomainPersistenceCoordinator
     private let metrics: DomainRuntimeMetricsSink
     private var records: [UUID: WorkspaceRecord] = [:]
+    #if DEBUG
+        func savedStateForTesting(_ workspaceID: UUID) -> DomainWorkspaceSavedStateForTesting? {
+            records[workspaceID].map { .init(revision: $0.revisions.savedRevision, digest: $0.savedDigest) }
+        }
+    #endif
     /// Awaited in-memory registrations used only by read routing. They are not catalog entries and
     /// never persist ephemeral/test workspaces. A later command invalidates the overlay.
     private var readRegistrations: [UUID: DomainWorkspaceSnapshot] = [:]
