@@ -20,6 +20,7 @@ enum AgentProviderPermissionLevelID: Hashable {
     case antigravity(AntigravityAgentToolPreferences.PermissionLevel)
     case cursor(CursorAgentToolPreferences.PermissionLevel)
     case grokBuild(GrokBuildAgentToolPreferences.PermissionLevel)
+    case devin(DevinAgentToolPreferences.PermissionLevel)
 
     var providerID: AgentProviderBindingID {
         switch self {
@@ -35,6 +36,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .cursor
         case .grokBuild:
             .grokBuild
+        case .devin:
+            .devin
         }
     }
 
@@ -52,6 +55,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .cursor(.managedDefault)
         case .grokBuild:
             .grokBuild(.managedDefault)
+        case .devin:
+            .devin(.normal)
         }
     }
 
@@ -69,6 +74,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             CursorAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.cursor)
         case .grokBuild:
             GrokBuildAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grokBuild)
+        case .devin:
+            DevinAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.devin)
         }
     }
 
@@ -93,6 +100,9 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .grokBuild:
             guard let level = GrokBuildAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .grokBuild(level)
+        case .devin:
+            guard let level = DevinAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            self = .devin(level)
         }
     }
 
@@ -109,6 +119,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .cursor(level):
             level.rawValue
         case let .grokBuild(level):
+            level.rawValue
+        case let .devin(level):
             level.rawValue
         }
     }
@@ -127,6 +139,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.displayName
         case let .grokBuild(level):
             level.displayName
+        case let .devin(level):
+            level.displayName
         }
     }
 
@@ -143,6 +157,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .cursor(level):
             level.iconName
         case let .grokBuild(level):
+            level.iconName
+        case let .devin(level):
             level.iconName
         }
     }
@@ -161,6 +177,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .grokBuild(level):
             level.detailText
+        case let .devin(level):
+            level.detailText
         }
     }
 
@@ -177,6 +195,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .cursor(level):
             level.isWarning
         case let .grokBuild(level):
+            level.isWarning
+        case let .devin(level):
             level.isWarning
         }
     }
@@ -206,6 +226,9 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
     let codexApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy?
     let codexApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer?
     let claudePermissionMode: String?
+    /// Provider-native CLI permission mode for ACP providers that accept it as a LAUNCH
+    /// ARGUMENT (Devin `--permission-mode`). `nil` = pass no flag.
+    let acpLaunchPermissionMode: String?
     let acpSessionModeID: String?
     let autoApproveAllACPToolPermissions: Bool
     let acceptsPendingACPApprovalWhenActivated: Bool
@@ -215,6 +238,7 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         codexApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy? = nil,
         codexApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer? = nil,
         claudePermissionMode: String? = nil,
+        acpLaunchPermissionMode: String? = nil,
         acpSessionModeID: String? = nil,
         autoApproveAllACPToolPermissions: Bool = false,
         acceptsPendingACPApprovalWhenActivated: Bool = false
@@ -223,6 +247,7 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         self.codexApprovalPolicy = codexApprovalPolicy
         self.codexApprovalReviewer = codexApprovalReviewer
         self.claudePermissionMode = claudePermissionMode
+        self.acpLaunchPermissionMode = acpLaunchPermissionMode
         self.acpSessionModeID = acpSessionModeID
         self.autoApproveAllACPToolPermissions = autoApproveAllACPToolPermissions
         self.acceptsPendingACPApprovalWhenActivated = acceptsPendingACPApprovalWhenActivated

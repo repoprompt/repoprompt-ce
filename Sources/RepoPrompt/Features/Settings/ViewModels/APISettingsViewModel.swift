@@ -390,6 +390,7 @@ public class APISettingsViewModel: ObservableObject {
             cursorAvailable: isCursorConnected,
             grokBuildAvailable: isGrokBuildConnected,
             antigravityAvailable: AntigravityRuntimeManager.installedRuntimeSync() != nil,
+            devinAvailable: DevinRuntimeLocator.isInstalledSync(),
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -499,7 +500,7 @@ public class APISettingsViewModel: ObservableObject {
             isGrokBuildConnected
         case .antigravity:
             AntigravityRuntimeManager.installedRuntimeSync() != nil
-        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .devin:
             false
         }
     }
