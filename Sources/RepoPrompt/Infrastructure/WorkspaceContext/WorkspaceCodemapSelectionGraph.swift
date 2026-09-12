@@ -23,7 +23,7 @@ actor WorkspaceCodemapSelectionGraph {
     private let uptimeNanoseconds: @Sendable () -> UInt64
     private let reconciliationWaiter: @Sendable (UInt64) async -> Void
 
-    private var repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken?
+    private var rootAuthority: WorkspaceCodemapRootAuthorityToken?
     private var committedSnapshot: WorkspaceCodemapGraphCommittedSnapshot?
     private var appliedGeneration = WorkspaceCodemapSelectionGraphContributionGeneration(rawValue: 0)
     private var observedGeneration = WorkspaceCodemapSelectionGraphContributionGeneration(rawValue: 0)
@@ -77,7 +77,7 @@ actor WorkspaceCodemapSelectionGraph {
 
     init(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken? = nil,
+        rootAuthority: WorkspaceCodemapRootAuthorityToken? = nil,
         graphPolicy: WorkspaceCodemapGraphPolicy = .initial,
         applyBuildHook: @escaping @Sendable () async -> Void = {},
         uptimeNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
@@ -86,7 +86,7 @@ actor WorkspaceCodemapSelectionGraph {
         }
     ) {
         self.rootEpoch = rootEpoch
-        self.repositoryAuthority = repositoryAuthority
+        self.rootAuthority = rootAuthority
         self.graphPolicy = graphPolicy
         self.applyBuildHook = applyBuildHook
         self.uptimeNanoseconds = uptimeNanoseconds
@@ -155,7 +155,7 @@ actor WorkspaceCodemapSelectionGraph {
                 generation: generation,
                 schemaVersion: base.schemaVersion,
                 policyVersion: base.policyVersion,
-                authority: base.repositoryAuthority,
+                authority: base.rootAuthority,
                 resync: false
             )
         case let .resync(checkpoint, generation):
@@ -172,7 +172,7 @@ actor WorkspaceCodemapSelectionGraph {
                 generation: generation,
                 schemaVersion: checkpoint.schemaVersion,
                 policyVersion: checkpoint.policyVersion,
-                authority: checkpoint.repositoryAuthority,
+                authority: checkpoint.rootAuthority,
                 resync: true
             )
         }
@@ -186,7 +186,7 @@ actor WorkspaceCodemapSelectionGraph {
         generation: WorkspaceCodemapSelectionGraphContributionGeneration,
         schemaVersion: UInt32,
         policyVersion: UInt32,
-        authority: WorkspaceCodemapRepositoryAuthorityToken,
+        authority: WorkspaceCodemapRootAuthorityToken,
         resync: Bool
     ) async -> WorkspaceCodemapGraphApplyDisposition {
         guard coverage.rootEpoch == rootEpoch,
@@ -196,9 +196,9 @@ actor WorkspaceCodemapSelectionGraph {
             rejectedApplyCount &+= 1
             return .rejected(.rootEpochMismatch)
         }
-        if let currentAuthority = repositoryAuthority, currentAuthority != authority {
+        if let currentAuthority = rootAuthority, currentAuthority != authority {
             rejectedApplyCount &+= 1
-            return .rejected(.repositoryAuthorityMismatch)
+            return .rejected(.rootAuthorityMismatch)
         }
         guard schemaVersion == CodeMapSelectionGraphContribution.currentSchemaVersion else {
             rejectedApplyCount &+= 1
@@ -281,7 +281,7 @@ actor WorkspaceCodemapSelectionGraph {
                 fenceIdentities.formUnion(newFenceIdentities)
                 safetyCounter = nextCounter
             }
-            repositoryAuthority = authority
+            rootAuthority = authority
             committedSnapshot = candidate.snapshot
             appliedGeneration = generation
             if observedGeneration < generation { observedGeneration = generation }
@@ -333,7 +333,7 @@ actor WorkspaceCodemapSelectionGraph {
                   snapshotID: snapshot.snapshotID,
                   graphRevision: snapshot.graphRevision,
                   rootEpoch: snapshot.rootEpoch,
-                  repositoryAuthority: snapshot.repositoryAuthority,
+                  rootAuthority: snapshot.rootAuthority,
                   catalogWatermark: snapshot.catalogWatermark,
                   appliedGeneration: snapshot.appliedGeneration,
                   safetyCounter: safetyCounter,
@@ -357,7 +357,7 @@ actor WorkspaceCodemapSelectionGraph {
         _ query: WorkspaceCodemapAutomaticSelectionGraphQuery
     ) -> WorkspaceCodemapAutomaticSelectionGraphDisposition {
         guard query.rootEpoch == rootEpoch else {
-            return .revoked(.repositoryAuthorityChanged)
+            return .revoked(.rootAuthorityChanged)
         }
         if Task.isCancelled { return .cancelled }
         switch latestSnapshot() {
@@ -846,20 +846,20 @@ actor WorkspaceCodemapSelectionGraph {
         fileIDs: Set<UUID>,
         reason: WorkspaceCodemapGraphFenceReason
     ) -> WorkspaceCodemapGraphFenceDisposition {
-        guard let repositoryAuthority else { return .rejected(.repositoryAuthorityMismatch) }
-        return fenceFiles(authority: repositoryAuthority, fileIDs: fileIDs, reason: reason)
+        guard let rootAuthority else { return .rejected(.rootAuthorityMismatch) }
+        return fenceFiles(authority: rootAuthority, fileIDs: fileIDs, reason: reason)
     }
 
     func fenceFiles(
-        authority: WorkspaceCodemapRepositoryAuthorityToken,
+        authority: WorkspaceCodemapRootAuthorityToken,
         fileIDs: Set<UUID>,
         reason _: WorkspaceCodemapGraphFenceReason
     ) -> WorkspaceCodemapGraphFenceDisposition {
         guard !fileIDs.isEmpty else { return .rejected(.emptyFileIDs) }
-        guard let currentAuthority = repositoryAuthority else {
-            return .rejected(.repositoryAuthorityMismatch)
+        guard let currentAuthority = rootAuthority else {
+            return .rejected(.rootAuthorityMismatch)
         }
-        guard currentAuthority == authority else { return .rejected(.repositoryAuthorityMismatch) }
+        guard currentAuthority == authority else { return .rejected(.rootAuthorityMismatch) }
         let requestedIdentities = Set(fileIDs.compactMap { fileID -> WorkspaceCodemapGraphFenceIdentity? in
             let currentSlot = committedSnapshot?.slotsByFileID[fileID]
             if currentSlot == nil, fenceIdentities.contains(where: { $0.fileID == fileID }) {
@@ -898,9 +898,9 @@ actor WorkspaceCodemapSelectionGraph {
             receiptRejectionCount &+= 1
             return .invalid(.rootEpochMismatch)
         }
-        guard receipt.repositoryAuthority == repositoryAuthority else {
+        guard receipt.rootAuthority == rootAuthority else {
             receiptRejectionCount &+= 1
-            return .invalid(.repositoryAuthorityMismatch)
+            return .invalid(.rootAuthorityMismatch)
         }
         guard receipt.schemaVersion == CodeMapSelectionGraphContribution.currentSchemaVersion else {
             receiptRejectionCount &+= 1
@@ -924,17 +924,17 @@ actor WorkspaceCodemapSelectionGraph {
     }
 
     func beginWatcherGapReconciliation() -> WorkspaceCodemapGraphReconciliationDisposition {
-        guard let repositoryAuthority else { return .revoked(.repositoryAuthorityChanged) }
-        return beginWatcherGapReconciliation(authority: repositoryAuthority)
+        guard let rootAuthority else { return .revoked(.rootAuthorityChanged) }
+        return beginWatcherGapReconciliation(authority: rootAuthority)
     }
 
     func beginWatcherGapReconciliation(
-        authority: WorkspaceCodemapRepositoryAuthorityToken
+        authority: WorkspaceCodemapRootAuthorityToken
     ) -> WorkspaceCodemapGraphReconciliationDisposition {
         if let revocationReason { return .revoked(revocationReason) }
-        guard repositoryAuthority == authority else {
-            revoke(.repositoryAuthorityChanged)
-            return .revoked(.repositoryAuthorityChanged)
+        guard rootAuthority == authority else {
+            revoke(.rootAuthorityChanged)
+            return .revoked(.rootAuthorityChanged)
         }
         if reconciling {
             reconciliationNeedsFollowingPass = true
@@ -952,17 +952,17 @@ actor WorkspaceCodemapSelectionGraph {
     }
 
     func recordWatcherGapReconciliationFailure() -> WorkspaceCodemapGraphReconciliationDisposition {
-        guard let repositoryAuthority else { return .revoked(.repositoryAuthorityChanged) }
-        return recordWatcherGapReconciliationFailure(authority: repositoryAuthority)
+        guard let rootAuthority else { return .revoked(.rootAuthorityChanged) }
+        return recordWatcherGapReconciliationFailure(authority: rootAuthority)
     }
 
     func recordWatcherGapReconciliationFailure(
-        authority: WorkspaceCodemapRepositoryAuthorityToken
+        authority: WorkspaceCodemapRootAuthorityToken
     ) -> WorkspaceCodemapGraphReconciliationDisposition {
         if let revocationReason { return .revoked(revocationReason) }
-        guard repositoryAuthority == authority else {
-            revoke(.repositoryAuthorityChanged)
-            return .revoked(.repositoryAuthorityChanged)
+        guard rootAuthority == authority else {
+            revoke(.rootAuthorityChanged)
+            return .revoked(.rootAuthorityChanged)
         }
         if !reconciling {
             reconciling = true
@@ -1157,7 +1157,7 @@ actor WorkspaceCodemapSelectionGraph {
         changedSlots: [WorkspaceCodemapGraphSlot],
         removed: [WorkspaceCodemapGraphRemoval],
         rootEpoch: WorkspaceCodemapRootEpoch,
-        authority: WorkspaceCodemapRepositoryAuthorityToken,
+        authority: WorkspaceCodemapRootAuthorityToken,
         watermark: WorkspaceCodemapGraphIndexCatalogToken,
         coverage: WorkspaceCodemapGraphCatalogCoverage,
         generation: WorkspaceCodemapSelectionGraphContributionGeneration,
@@ -1386,7 +1386,7 @@ actor WorkspaceCodemapSelectionGraph {
             snapshotID: UUID(),
             graphRevision: nextRevision,
             rootEpoch: rootEpoch,
-            repositoryAuthority: authority,
+            rootAuthority: authority,
             catalogWatermark: watermark,
             coverage: coverage,
             appliedGeneration: generation,

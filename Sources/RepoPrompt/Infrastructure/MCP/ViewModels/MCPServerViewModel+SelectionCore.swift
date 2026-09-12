@@ -493,11 +493,11 @@ extension MCPServerViewModel {
             switch reason {
             case .unsupportedFileType:
                 .unmapped(terminal: true)
-            case .gitTerminal:
+            case .rootTerminal:
                 .unmapped(terminal: true)
             case let .demandUnavailable(reason):
                 demandUnavailableDisposition(reason)
-            case .rootNotLoaded, .fileNotCataloged, .gitTransient, .busy,
+            case .rootNotLoaded, .fileNotCataloged, .rootTransient, .busy,
                  .rejected, .routeConflict, .registrationFailed, .runtimeFailure,
                  .staleCurrentness, .cancelled:
                 .pending

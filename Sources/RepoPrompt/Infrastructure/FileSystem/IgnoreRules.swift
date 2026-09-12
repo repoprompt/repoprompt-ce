@@ -276,6 +276,7 @@ final class IgnoreRules {
     private static let secondaryDefaultIgnoreContent = """
     # Other version-control and system files
     .svn
+    .jj
     .DS_Store
     Thumbs.db
     """

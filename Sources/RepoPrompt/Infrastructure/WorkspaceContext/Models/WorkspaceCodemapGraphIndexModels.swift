@@ -202,7 +202,7 @@ enum WorkspaceCodemapGraphIndexLaunchPhase: Hashable {
     case setupJoining
     case engineScheduling
     case handedOff
-    case terminalNonGit
+    case terminalUnavailable
     case transientRetry
     case retryExhausted
     case cancelled
@@ -229,14 +229,14 @@ enum WorkspaceCodemapGraphIndexPhase: Hashable {
 
 struct WorkspaceCodemapGraphIndexGeneration: Hashable {
     let catalogToken: WorkspaceCodemapGraphIndexCatalogToken
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+    let rootAuthority: WorkspaceCodemapRootAuthorityToken
     let contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
     let schemaVersion: UInt32
     let policyVersion: UInt32
 
     init(
         catalogToken: WorkspaceCodemapGraphIndexCatalogToken,
-        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        rootAuthority: WorkspaceCodemapRootAuthorityToken,
         contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
         schemaVersion: UInt32 = CodeMapSelectionGraphContribution.currentSchemaVersion,
         policyVersion: UInt32 = CodeMapSelectionGraphContribution.currentPolicyVersion
@@ -244,7 +244,7 @@ struct WorkspaceCodemapGraphIndexGeneration: Hashable {
         precondition(schemaVersion > 0)
         precondition(policyVersion > 0)
         self.catalogToken = catalogToken
-        self.repositoryAuthority = repositoryAuthority
+        self.rootAuthority = rootAuthority
         self.contributionGeneration = contributionGeneration
         self.schemaVersion = schemaVersion
         self.policyVersion = policyVersion

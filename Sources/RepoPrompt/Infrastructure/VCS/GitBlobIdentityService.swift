@@ -64,6 +64,37 @@ actor GitBlobIdentityService {
         )
     }
 
+    /// Process-free classification for a positively proven non-Git filesystem root.
+    ///
+    /// The capability actor is the only issuer of `evidence`, so this entry cannot be used to skip
+    /// Git for a root that was never proven. A proof that cannot be re-established is a typed
+    /// transient failure — never empty success, never an unsupported-Git batch, and never a
+    /// fallback into Git discovery.
+    func classifyFilesystem(
+        evidence: WorkspaceCodemapFilesystemClassificationEvidence,
+        relativePaths: [String]
+    ) -> GitBlobIdentityBatch {
+        guard Self.isBoundedBatch(relativePaths) else { return oversizedBatch() }
+        guard let proof = evidence.currentProof(),
+              proof.requestedRootPath == evidence.capability.loadedRootURL.path
+        else { return filesystemProofUnavailableBatch() }
+
+        let pathValidity = relativePaths.map(Self.isValidRelativePath)
+        guard pathValidity.contains(true) else {
+            return unsupportedBatch(paths: relativePaths, reason: .invalidPath)
+        }
+        let workspaceRoot = URL(fileURLWithPath: proof.requestedRootPath, isDirectory: true)
+        let attempt = classifyNonGit(
+            workspaceRoot: workspaceRoot,
+            relativePaths: relativePaths,
+            validity: pathValidity
+        )
+        guard !Task.isCancelled, evidence.currentProof() != nil else {
+            return filesystemProofUnavailableBatch()
+        }
+        return attempt.batch
+    }
+
     /// Shadow-only validation. It consumes a caller's single securely validated raw buffer and
     /// never installs a locator or artifact. This deliberately remains disconnected from serving.
     func shadowValidate(
@@ -549,6 +580,15 @@ actor GitBlobIdentityService {
             classifications: [],
             retriedAfterInstability: false,
             failure: .batchTooLarge
+        )
+    }
+
+    private func filesystemProofUnavailableBatch() -> GitBlobIdentityBatch {
+        GitBlobIdentityBatch(
+            objectFormat: nil,
+            classifications: [],
+            retriedAfterInstability: false,
+            failure: .filesystemProofUnavailable
         )
     }
 

@@ -63,6 +63,8 @@ actor WorkspaceCodemapBindingIntegrationRegistry {
             await revalidateGraphIndexCatalogToken(rootEpoch: rootEpoch, token: token)
         } publishMarkerReadiness: { [self] update in
             await publishMarkerReadiness(update)
+        } reportRootAuthorityInvalidated: { [self] registration in
+            await reportRootAuthorityInvalidated(registration: registration)
         }
     }
 
@@ -166,6 +168,18 @@ actor WorkspaceCodemapBindingIntegrationRegistry {
         let accepted = await catalogClient.publishMarkerReadiness(update)
         guard isCurrent(token: token) else { return false }
         return accepted
+    }
+
+    private func reportRootAuthorityInvalidated(
+        registration: WorkspaceCodemapBindingRootRegistration
+    ) async {
+        // A detached route means the session that would act on this notification is already gone,
+        // so the notification is dropped rather than delivered to a replaced session. A route that
+        // was re-registered for the same root epoch still receives it, which is why the report
+        // names its originating registration and the recipient rejects a foreign one.
+        let rootEpoch = registration.capabilityRequest.rootEpoch
+        guard let (_, catalogClient) = currentCatalogRoute(for: rootEpoch) else { return }
+        await catalogClient.reportRootAuthorityInvalidated(registration)
     }
 
     private func currentSourceRoute(

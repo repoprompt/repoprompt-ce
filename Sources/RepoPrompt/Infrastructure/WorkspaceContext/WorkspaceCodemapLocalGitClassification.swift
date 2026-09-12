@@ -6,10 +6,26 @@ enum WorkspaceCodemapLocalGitClassification: Equatable {
     case requiresGitPreflight
 }
 
-enum WorkspaceCodemapNonGitFilesystemProofValidation: Equatable {
-    case current
-    case requiresLocalReclassification
+/// Result of re-observing a retained non-Git filesystem proof.
+///
+/// A freshly produced proof is itself definite non-Git evidence, so the only question left is
+/// whether it still describes the same semantic binding. Ctime or permission churn refreshes the
+/// proof in place; a different device/inode/file type is a real binding change that must revoke
+/// serving rather than quietly continue on the old evidence.
+///
+/// Failing to observe the proof at all is neither of those: `unavailable` reports that the
+/// evidence could not be read (for example a lost search permission on the root or an ancestor),
+/// which must stop serving without claiming the binding changed.
+enum WorkspaceCodemapNonGitFilesystemProofRefresh: Equatable {
+    case current(WorkspaceCodemapNonGitFilesystemProof)
+    case bindingChanged(WorkspaceCodemapNonGitFilesystemProof)
     case requiresGitPreflight
+    case unavailable
+
+    var currentProof: WorkspaceCodemapNonGitFilesystemProof? {
+        guard case let .current(proof) = self else { return nil }
+        return proof
+    }
 }
 
 struct WorkspaceCodemapNonGitFilesystemProof: Equatable {
@@ -49,49 +65,68 @@ struct WorkspaceCodemapNonGitFilesystemProof: Equatable {
 
 struct WorkspaceCodemapLocalGitClassificationProbe {
     let resolve: @Sendable (URL) async -> WorkspaceCodemapLocalGitClassification
-    let validate: @Sendable (
+    let refresh: @Sendable (
         WorkspaceCodemapNonGitFilesystemProof
-    ) -> WorkspaceCodemapNonGitFilesystemProofValidation
+    ) -> WorkspaceCodemapNonGitFilesystemProofRefresh
 
     init(
         _ resolve: @escaping @Sendable (URL) async -> WorkspaceCodemapLocalGitClassification,
-        validate: @escaping @Sendable (
+        refresh: @escaping @Sendable (
             WorkspaceCodemapNonGitFilesystemProof
-        ) -> WorkspaceCodemapNonGitFilesystemProofValidation = {
-            WorkspaceCodemapLocalGitClassificationProbe.validateProof($0)
+        ) -> WorkspaceCodemapNonGitFilesystemProofRefresh = {
+            WorkspaceCodemapLocalGitClassificationProbe.refreshProof($0)
         }
     ) {
         self.resolve = resolve
-        self.validate = validate
+        self.refresh = refresh
     }
 
     static let production = Self { rootURL in
         classify(rootURL)
     }
 
+    /// Why a definite non-Git proof could not be produced.
+    ///
+    /// Admission treats both failures the same way — Git preflight decides — but revalidation must
+    /// not, because only `gitEvidence` establishes that the root stopped being a filesystem root.
+    private enum ProofObservation {
+        case proof(WorkspaceCodemapNonGitFilesystemProof)
+        /// Positive `.git` or bare-repository evidence at the root or an ancestor.
+        case gitEvidence
+        /// The proof itself could not be observed: permission, missing path, or bounded-walk limit.
+        case unobservable
+    }
+
     private static func classify(_ rootURL: URL) -> WorkspaceCodemapLocalGitClassification {
-        guard let proof = makeProof(rootURL) else {
-            return .requiresGitPreflight
+        switch observeProof(rootURL) {
+        case let .proof(proof):
+            .definitelyNonGit(proof)
+        case .gitEvidence, .unobservable:
+            .requiresGitPreflight
         }
-        return .definitelyNonGit(proof)
     }
 
-    private static func validateProof(
+    /// Reclassifies locally before deciding a changed witness needs a Git process: ancestor ctime
+    /// churn does not mean Git exists, and losing read access does not mean the binding moved.
+    private static func refreshProof(
         _ proof: WorkspaceCodemapNonGitFilesystemProof
-    ) -> WorkspaceCodemapNonGitFilesystemProofValidation {
+    ) -> WorkspaceCodemapNonGitFilesystemProofRefresh {
         let rootURL = URL(fileURLWithPath: proof.requestedRootPath, isDirectory: true)
-        guard let currentProof = makeProof(rootURL) else {
+        switch observeProof(rootURL) {
+        case let .proof(currentProof):
+            return proofHasSameTopology(proof, currentProof)
+                ? .current(currentProof)
+                : .bindingChanged(currentProof)
+        case .gitEvidence:
             return .requiresGitPreflight
+        case .unobservable:
+            return .unavailable
         }
-        if currentProof == proof {
-            return .current
-        }
-        return proofHasSameTopology(proof, currentProof)
-            ? .requiresLocalReclassification
-            : .requiresGitPreflight
     }
 
-    private static func proofHasSameTopology(
+    /// Semantic binding identity: requested/resolved loaded paths plus witness device, inode, file
+    /// type and symlink target. Directory ctime and ordinary contents are deliberately excluded.
+    static func proofHasSameTopology(
         _ previous: WorkspaceCodemapNonGitFilesystemProof,
         _ current: WorkspaceCodemapNonGitFilesystemProof
     ) -> Bool {
@@ -117,24 +152,48 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
                     previousWitness.directoryIdentity,
                     currentWitness.directoryIdentity
                 ) &&
-                previousWitness.dotGit == currentWitness.dotGit &&
-                previousWitness.head == currentWitness.head &&
-                previousWitness.objects == currentWitness.objects &&
-                previousWitness.refs == currentWitness.refs
+                entryWitnessesHaveSameTopology(previousWitness.dotGit, currentWitness.dotGit) &&
+                entryWitnessesHaveSameTopology(previousWitness.head, currentWitness.head) &&
+                entryWitnessesHaveSameTopology(previousWitness.objects, currentWitness.objects) &&
+                entryWitnessesHaveSameTopology(previousWitness.refs, currentWitness.refs)
         }
     }
 
+    /// Control entries are individually insufficient repository evidence: bare evidence requires
+    /// `HEAD` plus either `objects` or `refs`, and a fresh proof already refuses `.git` or that
+    /// combination. So their incidental metadata — ctime and permission churn on a legitimate
+    /// non-Git directory of the same name — must not read as a binding change. Positive Git or
+    /// bare evidence in the fresh observation remains the only reason to leave filesystem mode.
+    private static func entryWitnessesHaveSameTopology(
+        _ previous: WorkspaceCodemapNonGitFilesystemProof.EntryWitness,
+        _ current: WorkspaceCodemapNonGitFilesystemProof.EntryWitness
+    ) -> Bool {
+        switch (previous, current) {
+        case (.absent, .absent):
+            true
+        case let (.present(previousIdentity), .present(currentIdentity)):
+            identitiesHaveSameTopology(previousIdentity, currentIdentity)
+        default:
+            false
+        }
+    }
+
+    /// Topology is the file type, not its permission bits. A `chmod` on the root or an ancestor
+    /// leaves the same object at the same place, so it must lead to local reclassification and a
+    /// fresh access proof rather than a Git preflight. Control entries (`.git`, `HEAD`, `objects`,
+    /// `refs`) are compared by presence and the same topology rule; real Git evidence never slips
+    /// through because a fresh proof refuses `.git` or bare-repository evidence outright.
     private static func identitiesHaveSameTopology(
         _ previous: WorkspaceCodemapNonGitFilesystemProof.FileIdentity,
         _ current: WorkspaceCodemapNonGitFilesystemProof.FileIdentity
     ) -> Bool {
         previous.device == current.device &&
             previous.inode == current.inode &&
-            previous.mode == current.mode &&
+            (previous.mode & UInt32(S_IFMT)) == (current.mode & UInt32(S_IFMT)) &&
             previous.symlinkTarget == current.symlinkTarget
     }
 
-    private static func makeProof(_ rootURL: URL) -> WorkspaceCodemapNonGitFilesystemProof? {
+    private static func observeProof(_ rootURL: URL) -> ProofObservation {
         let rootPath = rootURL.standardizedFileURL.path
         guard rootURL.isFileURL,
               rootPath.hasPrefix("/"),
@@ -144,14 +203,14 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
               let rootIdentity = lexicalPathWitnesses.last?.identity,
               (rootIdentity.mode & UInt32(S_IFMT)) == UInt32(S_IFDIR)
         else {
-            return nil
+            return .unobservable
         }
 
         guard let resolvedRootPath = resolvedPath(rootPath),
               resolvedRootPath.hasPrefix("/"),
               resolvedRootPath.utf8.count <= Int(PATH_MAX)
         else {
-            return nil
+            return .unobservable
         }
 
         var ancestorWitnesses: [WorkspaceCodemapNonGitFilesystemProof.AncestorWitness] = []
@@ -166,13 +225,13 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
                   let objects = entryWitness(atPath: candidate.appendingPathComponent("objects")),
                   let refs = entryWitness(atPath: candidate.appendingPathComponent("refs"))
             else {
-                return nil
+                return .unobservable
             }
 
             guard dotGit == .absent,
                   !resemblesBareRepository(head: head, objects: objects, refs: refs)
             else {
-                return nil
+                return .gitEvidence
             }
             ancestorWitnesses.append(.init(
                 path: candidatePath,
@@ -191,12 +250,12 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
             candidatePath = parentPath
         }
 
-        return .init(
+        return .proof(.init(
             requestedRootPath: rootPath,
             resolvedRootPath: resolvedRootPath,
             lexicalPathWitnesses: lexicalPathWitnesses,
             ancestorWitnesses: ancestorWitnesses
-        )
+        ))
     }
 
     private static func resolvedPath(_ path: String) -> String? {

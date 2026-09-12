@@ -322,7 +322,7 @@ enum WorkspaceCodemapGraphCheckpointValidationError: Error, Hashable {
 
 struct WorkspaceCodemapGraphCheckpoint: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+    let rootAuthority: WorkspaceCodemapRootAuthorityToken
     let generation: WorkspaceCodemapSelectionGraphContributionGeneration
     let schemaVersion: UInt32
     let policyVersion: UInt32
@@ -331,7 +331,7 @@ struct WorkspaceCodemapGraphCheckpoint: Hashable {
 
     private init(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        rootAuthority: WorkspaceCodemapRootAuthorityToken,
         generation: WorkspaceCodemapSelectionGraphContributionGeneration,
         schemaVersion: UInt32,
         policyVersion: UInt32,
@@ -339,7 +339,7 @@ struct WorkspaceCodemapGraphCheckpoint: Hashable {
         coverage: WorkspaceCodemapGraphCatalogCoverage
     ) {
         self.rootEpoch = rootEpoch
-        self.repositoryAuthority = repositoryAuthority
+        self.rootAuthority = rootAuthority
         self.generation = generation
         self.schemaVersion = schemaVersion
         self.policyVersion = policyVersion
@@ -349,7 +349,7 @@ struct WorkspaceCodemapGraphCheckpoint: Hashable {
 
     static func validated(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        rootAuthority: WorkspaceCodemapRootAuthorityToken,
         generation: WorkspaceCodemapSelectionGraphContributionGeneration,
         schemaVersion: UInt32,
         policyVersion: UInt32,
@@ -413,7 +413,7 @@ struct WorkspaceCodemapGraphCheckpoint: Hashable {
         let orderedSlots = slots.sorted(by: workspaceCodemapGraphSlotPrecedes)
         return .success(Self(
             rootEpoch: rootEpoch,
-            repositoryAuthority: repositoryAuthority,
+            rootAuthority: rootAuthority,
             generation: generation,
             schemaVersion: schemaVersion,
             policyVersion: policyVersion,
@@ -426,7 +426,7 @@ struct WorkspaceCodemapGraphCheckpoint: Hashable {
 enum WorkspaceCodemapGraphRevocationReason: Hashable {
     case rootUnloaded
     case rootEpochChanged
-    case repositoryAuthorityChanged
+    case rootAuthorityChanged
     case schemaMismatch
     case policyMismatch
     case reconciliationFailed

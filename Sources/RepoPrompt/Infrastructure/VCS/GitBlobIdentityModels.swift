@@ -9,6 +9,9 @@ enum GitBlobIdentityError: LocalizedError, Equatable {
     case malformedGitOutput(String)
     case batchTooLarge
     case unsupportedGit(String)
+    /// A filesystem root's non-Git proof could not be re-established for this batch. Transient by
+    /// construction: it means "classify again later", not "this root is an unsupported Git root".
+    case filesystemProofUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -24,6 +27,8 @@ enum GitBlobIdentityError: LocalizedError, Equatable {
             "Git blob identity batch exceeds the bounded request policy."
         case let .unsupportedGit(detail):
             "Git does not support the required identity operation: \(detail)"
+        case .filesystemProofUnavailable:
+            "The filesystem root proof required for process-free classification is unavailable."
         }
     }
 }

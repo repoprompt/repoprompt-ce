@@ -271,7 +271,7 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
         ).get()
         let checkpoint = try WorkspaceCodemapGraphCheckpoint.validated(
             rootEpoch: rootEpoch,
-            repositoryAuthority: makeRepositoryAuthority(),
+            rootAuthority: makeRootAuthority(),
             generation: .init(rawValue: 11),
             schemaVersion: CodeMapSelectionGraphContribution.currentSchemaVersion,
             policyVersion: CodeMapSelectionGraphContribution.currentPolicyVersion,
@@ -285,7 +285,7 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
 
         let partialCheckpoint = try WorkspaceCodemapGraphCheckpoint.validated(
             rootEpoch: rootEpoch,
-            repositoryAuthority: makeRepositoryAuthority(),
+            rootAuthority: makeRootAuthority(),
             generation: .init(rawValue: 11),
             schemaVersion: CodeMapSelectionGraphContribution.currentSchemaVersion,
             policyVersion: CodeMapSelectionGraphContribution.currentPolicyVersion,
@@ -341,7 +341,7 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             snapshotID: uuid("00000000-0000-0000-0000-000000000040"),
             graphRevision: 3,
             rootEpoch: rootEpoch,
-            repositoryAuthority: makeRepositoryAuthority(),
+            rootAuthority: makeRootAuthority(),
             catalogWatermark: makeCatalogToken(rootEpoch: rootEpoch),
             appliedGeneration: .init(rawValue: 5),
             safetyCounter: 2,
@@ -357,7 +357,7 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             snapshotID: UUID(),
             graphRevision: 3,
             rootEpoch: rootEpoch,
-            repositoryAuthority: makeRepositoryAuthority(),
+            rootAuthority: makeRootAuthority(),
             catalogWatermark: makeCatalogToken(rootEpoch: makeRootEpoch(seed: 9)),
             appliedGeneration: .init(rawValue: 5),
             safetyCounter: 2,
@@ -484,6 +484,10 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
             rawByteCount: UInt64(seed),
             pipelineIdentity: pipeline
         )
+    }
+
+    private func makeRootAuthority() throws -> WorkspaceCodemapRootAuthorityToken {
+        try .git(makeRepositoryAuthority())
     }
 
     private func makeRepositoryAuthority() throws -> WorkspaceCodemapRepositoryAuthorityToken {
