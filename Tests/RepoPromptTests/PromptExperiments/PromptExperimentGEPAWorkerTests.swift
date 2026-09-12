@@ -50,11 +50,11 @@ import XCTest
             let importDetail = PromptExperimentGEPAWorker.safeProtocolDetail(type: "failed", object: importError)
             XCTAssertEqual(
                 nameDetail,
-                "exception_type=NameError source_frame=gepa.optimize_anything.run_candidate:417 error_payload=excluded"
+                "exception_type=NameError source_frame=gepa.optimize_anything.run_candidate:417 failure_code=unavailable error_payload=excluded"
             )
             XCTAssertEqual(
                 importDetail,
-                "exception_type=ImportError source_frame=gepa.adapters.mcp_adapter.load_transport:83 error_payload=excluded"
+                "exception_type=ImportError source_frame=gepa.adapters.mcp_adapter.load_transport:83 failure_code=unavailable error_payload=excluded"
             )
             XCTAssertNotEqual(nameDetail, importDetail)
             XCTAssertFalse(nameDetail?.contains("SECRET_NAME_ERROR_CANARY") == true)

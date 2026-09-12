@@ -277,6 +277,7 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                         "ok": False,
                         "failure_kind": "infrastructure",
                         "error": f"controlled provider transport failure {secret_canary}",
+                        "failure_code": "judge_provider_failed",
                     }) + "\n")
                     process.stdin.flush()
                 elif message["type"] in {"completed", "failed"}:
@@ -298,6 +299,7 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
             serialized = json.dumps(terminal, sort_keys=True)
             self.assertNotIn(secret_canary, serialized)
             diagnostic = terminal["diagnostic"]
+            self.assertEqual(diagnostic["failure_code"], "judge_provider_failed")
             self.assertEqual(diagnostic["schema_version"], 1)
             self.assertEqual(diagnostic["exception_type"], "InfrastructureFailure")
             self.assertEqual(diagnostic["source_frame"]["module"], "__main__")

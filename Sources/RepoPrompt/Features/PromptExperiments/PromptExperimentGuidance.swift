@@ -33,6 +33,11 @@
             let partials = attempts.flatMap { $0.partialEvaluations ?? [] }.map(\.evaluation).filter { $0.split != .hiddenTest }
             let final = attempts.flatMap { $0.optimizationResult?.evaluations ?? [] }.filter { $0.split != .hiddenTest }
             let evidence = attempts.last?.optimizationResult != nil ? final : partials
+            if ![.running, .cancelling].contains(record.phase),
+               let grade = attempts.last?.gradingEvidence?.last(where: { $0.state != .completed })
+            {
+                return .init(action: "review_grading_interruption", explanation: "Execution evidence was preserved before grading. Latest grading state: \(grade.state.rawValue), judge attempts: \(grade.ordinal). Inspect grading_evidence and safe failure codes; do not rerun the target or label this a bad candidate. The bounded format-repair allowance does not authorize model switching, rubric changes or indefinite retries. Exact post-exit GEPA resume is not yet available; preserve this run and its evidence rather than claiming a fresh search is a resume.", evidenceIDs: [grade.id.uuidString])
+            }
             let failures = evidence.compactMap(\.failureKind)
             let ids = evidence.map(\.id.uuidString)
             if runtimeFailed || failures.contains(.infrastructure) {

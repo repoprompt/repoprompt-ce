@@ -68,6 +68,8 @@
 
             Never self-approve or interpret conversational text as an authenticated approval. After approval, use bounded `wait`/`status` for progress and settlement. Cancel at the user's request, established session cancellation, or an agreed stop condition such as a confirmed infrastructure failure that makes further evaluations invalid. Never replace these with a silence deadline. Scope/model/data/budget changes require a new seal and approval. Keep failures and uncertain submissions visible; no silent retries.
 
+            Grading recovery is separate from target execution. Discuss `gepa.max_judge_retries` in the proposal: it permits 0–10 additional judge calls across the entire run, at most one per evaluation. Omitted means zero, including historical approvals. A completed judge response with invalid JSON can receive one visible format repair using the same saved output and rubric. Authentication/transport failures, cancellation and storage errors are not automatically retried. Inspect `grading_evidence` before recommending another run: never call an ungraded output a bad candidate. Exact post-exit GEPA resume is not yet supported; do not describe cloning or starting again as resuming the interrupted optimizer.
+
             ## 5. Explain what was learned, not just that a process exited
             Use `read` to inspect saved candidates, outputs, scores, feedback, diagnostics and lineage. Separate preparation from GEPA search. Report initial seed generation versus feedback-driven revisions, evaluated alternatives versus retained candidates, development versus validation/hidden results, and available versus unavailable usage.
 

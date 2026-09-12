@@ -31,6 +31,15 @@ class WorkerCancelled(BaseException):
 class InfrastructureFailure(BaseException):
     """Escapes GEPA's candidate-error handling so infrastructure is never score zero."""
 
+    def __init__(self, message, *, failure_code=None, operation=None):
+        super().__init__(message)
+        self.failure_code = failure_code if failure_code in (
+            "judge_invalid_response", "judge_provider_failed"
+        ) else None
+        self.operation = operation if operation in (
+            "reflect", "evaluate", "mcp_begin", "mcp_model", "mcp_grade"
+        ) else None
+
 
 def emit(payload: dict[str, Any]) -> None:
     PROTOCOL_OUT.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
@@ -73,6 +82,8 @@ def safe_failure_diagnostic(error: BaseException) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "exception_type": safe_python_identifier(type(error).__name__),
+        "failure_code": error.failure_code if isinstance(error, InfrastructureFailure) else None,
+        "operation": error.operation if isinstance(error, InfrastructureFailure) else None,
         "source_frame": source_frame,
     }
 
@@ -119,7 +130,7 @@ def host_call(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "output": response.get("output"),
                 "elapsed_seconds": response.get("elapsed_seconds"),
             }
-        raise InfrastructureFailure(message)
+        raise InfrastructureFailure(message, failure_code=response.get("failure_code"), operation=operation)
     return response
 
 

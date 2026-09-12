@@ -134,6 +134,7 @@
                     ),
                     limitations: [
                         PromptExperimentConnectedModelRunner.codexIsolationLimitation,
+                        "Grading recovery: max_judge_retries is a sealed run-wide allowance (0...10; absent means zero), with at most one extra judge call per evaluation and only for invalid JSON from a completed judge. Target output is durably saved before grading and never rerun for format repair. Inspect grading_evidence states/history; raw judge responses remain host-private. Transport/auth/storage failures and cancellation are never blindly retried. Post-exit exact GEPA checkpoint resume remains unsupported.",
                         "Partial evaluations and model_calls persist before optimizer advancement, including failed attempts. They are not final candidate rankings; Use candidate_evidence.sha256 as partial candidate identity, not a final optimizer index. Missing token counts remain unavailable.",
                         "DEBUG integration using the packaged CPython and upstream GEPA optimize_anything runtime; no user Python setup or provider credentials are delegated to Python.",
                         "The bound Agent session or external MCP workspace controller may draft, seal, request, wait for, and cancel owned runs. Ownership is not approval: only a native human action or server-originated MCP elicitation may approve; no automatic winner application.",

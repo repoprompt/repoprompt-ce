@@ -516,6 +516,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 var gepa: [String: Value] = [
                     "reflection_target": plan.optimizationTargets.map { targetValue($0.reflection) } ?? .null,
                     "max_evaluations": .int(optimization.gepa.maxEvaluations),
+                    "max_judge_retries": .int(optimization.gepa.maxJudgeRetries ?? 0),
                     "experiment_wall_clock_deadline": .string("none"),
                     "reflection_minibatch_size": .int(optimization.gepa.reflectionMinibatchSize ?? 3),
                     "use_merge": .bool(optimization.gepa.useMerge ?? false),
@@ -586,6 +587,22 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 "prompt_tokens": call.promptTokens.map(Value.int) ?? .null,
                 "completion_tokens": call.completionTokens.map(Value.int) ?? .null
             ]) }) } ?? .null
+            value["grading_evidence"] = attempt.gradingEvidence.map { grades in .array(grades.map { grade in
+                let visible = grade.split != .hiddenTest
+                return .object([
+                    "id": .string(grade.id.uuidString), "example_id": .string(grade.exampleID),
+                    "split": .string(grade.split.rawValue), "state": .string(grade.state.rawValue),
+                    "judge_attempts": .int(grade.ordinal),
+                    "candidate_evidence": visible ? artifactValue(grade.candidateEvidence) : .null,
+                    "candidate": visible ? (artifactTextBySHA256[grade.candidateEvidence.sha256].map(Value.string) ?? .null) : .null,
+                    "output_evidence": visible ? artifactValue(grade.outputEvidence) : .null,
+                    "output": visible ? (artifactTextBySHA256[grade.outputEvidence.sha256].map(Value.string) ?? .null) : .null,
+                    "history": .array(grade.history.map { .object([
+                        "ordinal": .int($0.ordinal), "state": .string($0.state.rawValue)
+                    ]) }),
+                    "judge_response": .string("host_private; never proposer feedback")
+                ])
+            }) } ?? .null
             value["partial_evaluations"] = attempt.partialEvaluations.map { evaluations in .array(evaluations.map { partial in
                 let evaluation = partial.evaluation
                 return .object([

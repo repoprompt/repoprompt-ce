@@ -110,6 +110,10 @@
                             Text("\(partials.count) evaluations saved incrementally. These are trial evidence, not a final winner ranking.")
                                 .font(.caption)
                         }
+                        if let plan = record.currentPlan, let grades = record.attempts(for: plan).last?.gradingEvidence {
+                            Text("\(grades.count) target outputs saved before grading · \(grades.count(where: { $0.ordinal > 1 })) judge repairs · \(grades.count(where: { $0.state != .completed })) awaiting a valid grade. Inspect grading_evidence through lab read.")
+                                .font(.caption)
+                        }
                         if let plan = record.currentPlan, let calls = record.attempts(for: plan).last?.modelCalls {
                             Text("\(calls.count) model invocations recorded; \(calls.count(where: { $0.promptTokens == nil || $0.completionTokens == nil })) have unavailable or incomplete token usage. Inspect through lab read.")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -195,6 +199,7 @@
                     DisclosureGroup("Technical settings and exact authority") {
                         VStack(alignment: .leading, spacing: 8) {
                             proposalField("Evaluator", "\(spec.evaluator.kind.rawValue) · range \(spec.evaluator.minimumScore)...\(spec.evaluator.maximumScore)")
+                            proposalField("Judge recovery", "At most one invalid-JSON repair per evaluation and \(spec.gepa.maxJudgeRetries ?? 0) additional judge calls for the entire run. Saved target output is reused. Authentication, transport, cancellation and storage failures are not automatically retried.")
                             proposalField("Search settings", "Minibatch \(spec.gepa.reflectionMinibatchSize ?? 3) · merge \(spec.gepa.useMerge ?? false ? "on" : "off") · max merge \(spec.gepa.maxMergeInvocations ?? 5) · skip perfect \(spec.gepa.skipPerfectScore ?? true ? "yes" : "no") · seed \(String(spec.gepa.randomSeed))")
                             proposalField("Runtime", spec.gepa.pythonExecutablePath)
                             proposalField("Sealed digest", plan.digest)

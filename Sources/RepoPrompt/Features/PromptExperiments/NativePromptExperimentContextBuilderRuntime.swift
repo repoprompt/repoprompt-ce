@@ -37,6 +37,7 @@
 
         private var mcpEvaluations: [UUID: MCPEvaluation] = [:]
         private var mcpEvaluationCounts: [UUID: Int] = [:]
+        private var judgeRetries: [UUID: Int] = [:]
 
         init(windowState: WindowState) {
             self.windowState = windowState
@@ -318,6 +319,7 @@
                     checkpointSinks.removeValue(forKey: request.attempt.id)
                     mcpEvaluations = mcpEvaluations.filter { $0.value.attemptID != request.attempt.id }
                     mcpEvaluationCounts.removeValue(forKey: request.attempt.id)
+                    judgeRetries.removeValue(forKey: request.attempt.id)
                 }
                 do {
                     let result = try await worker.run(
@@ -434,6 +436,7 @@
                     score: score, feedback: reply.feedback ?? "", failureKind: reply.failureKind,
                     output: reply.output, elapsedSeconds: reply.elapsedSeconds
                 )))
+                if operation == "mcp_grade", let evaluationID { mcpEvaluations.removeValue(forKey: evaluationID) }
                 return reply
             } catch { return infrastructureReply("Evaluation evidence could not be persisted: \(error.localizedDescription)") }
         }
@@ -491,7 +494,16 @@
                         target: targets.reflection,
                         role: "reflection",
                         systemPrompt: "Act as GEPA's reflection language model. Return only the complete proposed replacement candidate. All tools are disabled.",
-                        userPrompt: prompt
+                        userPrompt: prompt + (specification.execution.adapter == .mcpAdapter ? """
+
+                        Fixed MCP adapter contract (not mutable candidate instructions):
+                        This is a two-pass workflow with at most one tool call. First response must be JSON:
+                        {"action":"call_tool","tool":"<allowed tool>","arguments":{...}}
+                        or {"action":"answer","text":"..."}. Never use action=tool_call or tool_name.
+                        After a tool result, return the final answer; do not request another tool.
+                        Mutation component: \(specification.execution.mcp?.component ?? "unavailable")
+                        Fixed execution instructions: \(specification.execution.instructions)
+                        """ : "")
                     )
                     let output = completion.output
                     let wrapped = output.contains("```") ? output : "```\n\(output)\n```"
@@ -523,6 +535,10 @@
                 default:
                     throw PromptExperimentAuthorityError.runtimeUnavailable("Unsupported GEPA host operation: \(operation)")
                 }
+            } catch let failure as PromptExperimentGrading.Failure {
+                var reply = infrastructureReply(failure.rawValue)
+                reply.failureCode = failure.rawValue
+                return reply
             } catch {
                 return infrastructureReply(error.localizedDescription)
             }
@@ -591,7 +607,6 @@
             guard evaluation.modelCalls > 0, let answer = payload["answer"] as? String,
                   let trace = payload["trace"] as? [String: Any]
             else { throw PromptExperimentAuthorityError.runtimeUnavailable("MCP grading requires a completed model trajectory.") }
-            mcpEvaluations.removeValue(forKey: id)
             let evidence = try String(decoding: JSONSerialization.data(withJSONObject: ["final_answer": answer, "mcp_trajectory": trace], options: [.sortedKeys]), as: UTF8.self)
             if payload["candidate_failure"] as? Bool == true {
                 return PromptExperimentGEPAHostReply(
@@ -614,7 +629,8 @@
                 progress: progress,
                 observation: observation,
                 mcpAnswer: answer,
-                mcpEvidence: evidence
+                mcpEvidence: evidence,
+                mcpGradingID: id
             )
         }
 
@@ -627,7 +643,7 @@
             callbackID: String,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
             observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
-            mcpAnswer: String? = nil, mcpEvidence: String? = nil
+            mcpAnswer: String? = nil, mcpEvidence: String? = nil, mcpGradingID: UUID? = nil
         ) async throws -> PromptExperimentGEPAHostReply {
             let started = Date()
             guard let exampleID = example["id"] as? String,
@@ -753,21 +769,38 @@
                         model: judge.modelRaw
                     )
                 ))
-                let judgment = try await invokeConnectedModel(
-                    parentRequest: parentRequest,
-                    target: judge,
-                    role: "judge",
-                    systemPrompt: "Return only the requested evaluator JSON. All tools are disabled; do not propose or reveal held-out examples.",
-                    userPrompt: judgePrompt
-                )
-                let object = try parseJSONObject(judgment.output)
-                guard let score = (object["score"] as? NSNumber)?.doubleValue,
-                      score >= specification.evaluator.minimumScore,
-                      score <= specification.evaluator.maximumScore,
-                      let feedback = object["feedback"] as? String
-                else {
-                    throw PromptExperimentAuthorityError.runtimeUnavailable("The connected-model evaluator returned invalid score JSON.")
+                guard let sink = checkpointSinks[parentRequest.attempt.id], let gradingID = mcpGradingID ?? UUID(uuidString: callbackID) else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("Grading has no durable checkpoint sink.")
                 }
+                let canRepair = judgeRetries[parentRequest.attempt.id, default: 0] < (specification.gepa.maxJudgeRetries ?? 0)
+                var judgmentPromptTokens: Int?
+                var judgmentCompletionTokens: Int?
+                let judgment = try await PromptExperimentGrading.run(
+                    minimum: specification.evaluator.minimumScore, maximum: specification.evaluator.maximumScore,
+                    canRepair: canRepair,
+                    checkpoint: { ordinal, state, response in
+                        try await sink(.grading(.init(
+                            id: gradingID, exampleID: exampleID, split: sealedExample.split,
+                            candidate: candidate, output: mcpEvidence ?? output,
+                            ordinal: ordinal, state: state, response: response
+                        )))
+                        if ordinal == 2, state == .pending {
+                            self.judgeRetries[parentRequest.attempt.id, default: 0] += 1
+                            await progress("Repairing invalid judge JSON (one retry for this evaluation; \(self.judgeRetries[parentRequest.attempt.id, default: 0])/\(specification.gepa.maxJudgeRetries ?? 0) additional judge calls admitted). Saved target output is reused; execution is not repeated.")
+                        }
+                    },
+                    invoke: { repair in
+                        let completion = try await self.invokeConnectedModel(
+                            parentRequest: parentRequest, target: judge, role: "judge",
+                            systemPrompt: "Return only the requested evaluator JSON. All tools are disabled; do not propose or reveal held-out examples.",
+                            userPrompt: judgePrompt + (repair ? "\nYour previous response did not satisfy the evaluator JSON contract. Re-evaluate the SAME saved output with the SAME rubric. Return one JSON object, numeric score and string feedback, no surrounding prose. Do not change the rubric or task." : "")
+                        )
+                        judgmentPromptTokens = Self.sumAvailable(judgmentPromptTokens, completion.promptTokens)
+                        judgmentCompletionTokens = Self.sumAvailable(judgmentCompletionTokens, completion.completionTokens)
+                        return completion.output
+                    }
+                )
+                let (score, feedback) = judgment
                 return PromptExperimentGEPAHostReply(
                     ok: true,
                     output: mcpEvidence ?? output,
@@ -776,8 +809,8 @@
                     failureKind: nil,
                     error: nil,
                     elapsedSeconds: elapsed,
-                    promptTokens: Self.sumAvailable(execution.promptTokens, judgment.promptTokens),
-                    completionTokens: Self.sumAvailable(execution.completionTokens, judgment.completionTokens)
+                    promptTokens: Self.sumAvailable(execution.promptTokens, judgmentPromptTokens),
+                    completionTokens: Self.sumAvailable(execution.completionTokens, judgmentCompletionTokens)
                 )
             case .sandboxedCommand:
                 fatalError("handled above")

@@ -12,6 +12,7 @@
         let elapsedSeconds: Double?
         var promptTokens: Int?
         var completionTokens: Int?
+        var failureCode: String?
 
         var jsonObject: [String: Any] {
             var value: [String: Any] = ["ok": ok]
@@ -20,6 +21,7 @@
             if let feedback { value["feedback"] = feedback }
             if let failureKind { value["failure_kind"] = failureKind.rawValue }
             if let error { value["error"] = error }
+            if let failureCode { value["failure_code"] = failureCode }
             if let elapsedSeconds { value["elapsed_seconds"] = elapsedSeconds }
             if let promptTokens { value["prompt_tokens"] = promptTokens }
             if let completionTokens { value["completion_tokens"] = completionTokens }
@@ -339,7 +341,7 @@
                                 host: host,
                                 progress: progress,
                                 observation: observation,
-                                hostCallbackTimeoutSeconds: 300
+                                hostCallbackTimeoutSeconds: (specification.gepa.maxJudgeRetries ?? 0) > 0 ? 600 : 300
                             ))
                         } catch {
                             continuation.resume(throwing: error)
@@ -611,7 +613,9 @@
                 else {
                     return "exception_type=unavailable source_frame=unavailable envelope=invalid error_payload=excluded"
                 }
-                return "exception_type=\(exceptionType) source_frame=\(module).\(function):\(line) error_payload=excluded"
+                let code = diagnostic["failure_code"] as? String
+                let safeCode = ["judge_invalid_response", "judge_provider_failed"].contains(code ?? "") ? code! : "unavailable"
+                return "exception_type=\(exceptionType) source_frame=\(module).\(function):\(line) failure_code=\(safeCode) error_payload=excluded"
             default:
                 return nil
             }

@@ -127,7 +127,7 @@ permissions, model selection, or the grader. Preparation batches use this same r
   tool-choice JSON and performs at most one real tool call, followed by at most one answer call.
   This is not native provider tool calling or multi-agent execution.
 - Host-issued evaluation IDs bind public examples and candidates to the sealed attempt. Host
-  admission bounds evaluations and two ordered target-model calls; grading is terminal for the ID.
+  admission bounds evaluations and two ordered target-model calls; the evaluation ID remains admitted until grading and scored-evidence persistence succeed.
   Expected answers and reviewer notes are never sent to the task model or tool server. The fixed
   rubric stays with the host grader. Reviewed training/validation feedback may cite reference
   answers to support reflection; hidden-test feedback is withheld and only its score returns.
@@ -205,3 +205,38 @@ could be mistaken for model text, and the upstream one-tool/two-pass MCP adapter
 was a poor fit for some iterative source-reading answers. Neither is evidence
 that a larger GEPA budget is needed. Protocol and provider boundary repairs remain
 separate from choosing or optimizing task instructions.
+
+
+## Bounded grading recovery
+
+`gepa.max_judge_retries` is part of the approved specification/digest. It allows
+0–10 additional judge calls across the entire run, **at most one per evaluation**.
+New native drafts propose 3; omitted values and historical seals authorize zero.
+The allowance repairs only a completed judge response with invalid score JSON.
+It does not retry authentication, transport, cancellation, or storage failures,
+and never changes models, rubric, target output, or evaluation budgets.
+
+Before invoking the judge, the canonical store saves target output and candidate
+artifacts in `gradingEvidence`. Each grading attempt records its state; raw judge
+responses are retained in host-private artifact history, not MCP/proposer text.
+MCP `grading_evidence`, native cards, and the report expose states and retry counts.
+Hidden-test target output is withheld from this development projection.
+Cancellation settlement marks pending grades cancelled without inventing scores.
+Unknown token usage remains unknown; additional judge invocations are in the same
+model-call ledger as original invocations. Storage failures stop spending.
+
+The upstream worker still exits after an unrepaired infrastructure failure.
+**Exact post-exit GEPA resume is not implemented by this change.** `continue` is
+a new approved revision from retained candidate evidence, not restoration of the
+optimizer checkpoint. Do not delete or overwrite interrupted-run artifacts, claim
+a final winner from partial scores, or rerun successful target work merely to
+repair a missing grade. Faithful resume needs upstream-state compatibility,
+durable callback/score reconciliation, remaining-budget accounting, and an
+explicit recovery operation. Arbitrary project-provided pickle checkpoints must
+never be loaded.
+
+The MCP reflection model now receives the pinned adapter's immutable two-pass
+JSON protocol, including seedless generation. Headless `file_search` now honors
+`context_lines` (0–1000), returns numbered context lines, and explicitly reports
+when its additional-context byte budget is truncated rather than silently
+returning only matching lines.

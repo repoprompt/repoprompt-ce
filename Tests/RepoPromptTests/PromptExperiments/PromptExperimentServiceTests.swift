@@ -7,6 +7,79 @@ import XCTest
 #if DEBUG
     @MainActor
     final class PromptExperimentServiceTests: XCTestCase {
+        func testUngradedOutputsAndPrivateJudgeHistorySurviveFailureAndReload() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let (id, initial) = try await updatedOptimizationDraft(harness)
+            var draft = initial
+            draft.optimization?.evaluator.kind = .connectedModelJudge
+            draft.optimization?.evaluator.judgeTargetSelector = "fake"
+            draft.optimization?.evaluator.rubric = "Evaluate grounding in the example."
+            draft.optimization?.gepa.maxJudgeRetries = 1
+            let updated = try await harness.service.updateDraft(
+                experimentID: id, expectedDraftID: initial.id, expectedDraftVersion: initial.optimisticVersion,
+                expectedDraftDigest: initial.contentDigest(), draft: draft
+            )
+            let plan = try await harness.service.seal(
+                experimentID: id,
+                expectedDraftID: updated.id,
+                expectedDraftVersion: updated.optimisticVersion,
+                expectedDraftDigest: updated.contentDigest()
+            )
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.runtime.waitUntilWaitingForResult()
+            let sink = try XCTUnwrap(harness.runtime.reportCheckpoint)
+            let gradeID = UUID()
+            func value(_ ordinal: Int, _ state: PromptExperimentGradingState, id: UUID = gradeID) -> PromptExperimentCheckpoint {
+                .grading(.init(
+                    id: id,
+                    exampleID: "reviewed-1",
+                    split: .validation,
+                    candidate: "Candidate",
+                    output: "Saved target output",
+                    ordinal: ordinal,
+                    state: state,
+                    response: state == .invalidResponse ? "HOST_PRIVATE_JUDGE_RESPONSE" : nil
+                ))
+            }
+            try await sink(value(1, .pending))
+            try await sink(value(1, .invalidResponse))
+            try await sink(value(2, .pending))
+            try await sink(value(2, .invalidResponse))
+            let second = UUID()
+            try await sink(value(1, .pending, id: second))
+            try await sink(value(1, .invalidResponse, id: second))
+            do { try await sink(value(2, .pending, id: second))
+                XCTFail("Run-wide repair budget must not reset for another evaluation")
+            } catch {}
+            harness.runtime.settleFirst(disposition: .failed("judge_invalid_response"))
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+            let saved = try await harness.store.loadRecords()
+            let record = try XCTUnwrap(saved.first)
+            let grade = try XCTUnwrap(record.attempts.last?.gradingEvidence?.first)
+            XCTAssertEqual(grade.history.count, 2)
+            XCTAssertEqual(grade.ordinal, 2)
+            let texts = try await harness.service.readableArtifactText(for: record)
+            XCTAssertTrue(texts.values.contains("Saved target output"))
+            XCTAssertFalse(texts.values.contains("HOST_PRIVATE_JUDGE_RESPONSE"))
+            XCTAssertNotNil(grade.history.first?.responseEvidence)
+            let projection = try MCPAgentSessionControlToolProvider.responseValue(.record(record, artifactTextBySHA256: texts))
+            let serialized = try String(decoding: JSONEncoder().encode(projection), as: UTF8.self)
+            XCTAssertFalse(serialized.contains("HOST_PRIVATE_JUDGE_RESPONSE"))
+            XCTAssertTrue(serialized.contains("invalid_response"))
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "review_grading_interruption")
+        }
+
+        func testJudgeRepairBudgetChangesDigestAndHistoricalAbsenceRemainsZero() throws {
+            var draft = PromptExperimentDraft(revision: 1, title: "Budget", targetRole: "", optimization: Self.validOptimization(), createdAt: Date(), updatedAt: Date())
+            let original = try draft.contentDigest()
+            XCTAssertNil(draft.optimization?.gepa.maxJudgeRetries)
+            draft.optimization?.gepa.maxJudgeRetries = 1
+            XCTAssertNotEqual(try draft.contentDigest(), original)
+        }
+
         func testCheckpointEvidenceAndUsageSurviveLaterFailureAndReload() async throws {
             let harness = makeHarness()
             defer { try? FileManager.default.removeItem(at: harness.root) }

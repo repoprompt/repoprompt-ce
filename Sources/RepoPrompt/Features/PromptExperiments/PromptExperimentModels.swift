@@ -167,6 +167,9 @@
         var useMerge: Bool? = nil
         var maxMergeInvocations: Int? = nil
         var skipPerfectScore: Bool? = nil
+        /// Total additional judge calls across the run, at most one per evaluation.
+        /// Nil means zero: historical approval never implicitly authorizes new spend.
+        var maxJudgeRetries: Int? = nil
     }
 
     /// Sealed input to the external upstream GEPA worker. Every field that can
@@ -470,6 +473,9 @@
                 }
                 guard (2 ... 10000).contains(optimization.gepa.maxEvaluations) else {
                     throw PromptExperimentAuthorityError.invalidDraft("GEPA max evaluations must be between 2 and 10,000.")
+                }
+                guard (0 ... 10).contains(optimization.gepa.maxJudgeRetries ?? 0) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("max_judge_retries must be between 0 and 10 (total additional judge calls, at most one per evaluation).")
                 }
                 guard optimization.gepa.maxWallClockSeconds == nil else {
                     throw PromptExperimentAuthorityError.invalidDraft(
@@ -1053,6 +1059,7 @@
     enum PromptExperimentCheckpoint: Equatable {
         case modelCall(PromptExperimentModelCallEvidence)
         case evaluation(id: UUID, candidate: String, value: PromptExperimentOptimizationRuntimeEvaluation)
+        case grading(PromptExperimentGradingCheckpoint)
     }
 
     typealias PromptExperimentCheckpointSink = @MainActor @Sendable (PromptExperimentCheckpoint) async throws -> Void
@@ -1123,6 +1130,7 @@
         // Optional for backwards decoding. Never backfill or rescore historical attempts.
         var partialEvaluations: [PromptExperimentPartialEvaluation]?
         var modelCalls: [PromptExperimentModelCallEvidence]?
+        var gradingEvidence: [PromptExperimentGradingEvidence]?
 
         init(trial: PromptExperimentTrial, plan: PromptExperimentPlan) {
             id = PromptExperimentDigest.deterministicUUID(namespace: "attempt", value: trial.id.uuidString)

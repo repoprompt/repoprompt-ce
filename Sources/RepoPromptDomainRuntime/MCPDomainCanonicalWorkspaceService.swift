@@ -199,6 +199,11 @@ package struct MCPDomainCanonicalWorkspaceService {
             throw MCPError.invalidParams("pattern cannot be empty")
         }
         let maxResults = max(1, min(args["max_results"]?.intValue ?? 50, 1000))
+        let contextLines = args["context_lines"]?.intValue ?? 0
+        guard (0 ... 1000).contains(contextLines) else { throw MCPError.invalidParams("context_lines must be between 0 and 1000") }
+        // Bound additional context across the response; never silently ignore the request.
+        var contextBudget = 50000
+        var contextTruncated = false
         let regexEnabled = args["regex"]?.boolValue ?? Self.looksLikeRegex(pattern)
         let wholeWord = args["whole_word"]?.boolValue ?? false
         let regexPattern = wholeWord ? "\\b(?:\(pattern))\\b" : pattern
@@ -227,13 +232,23 @@ package struct MCPDomainCanonicalWorkspaceService {
             }
             guard searchesContent else { continue }
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-            for (index, line) in text.components(separatedBy: .newlines).enumerated() {
+            let lines = text.components(separatedBy: .newlines)
+            for (index, line) in lines.enumerated() {
                 if Self.matches(pattern, value: line, regex: regex, wholeWord: wholeWord) {
-                    results.append(.object([
-                        "path": .string(relative),
-                        "line": .int(index + 1),
-                        "text": .string(line)
-                    ]))
+                    var match: [String: Value] = [
+                        "path": .string(relative), "line": .int(index + 1), "text": .string(line)
+                    ]
+                    if contextLines > 0, args["count_only"]?.boolValue != true {
+                        var context: [Value] = []
+                        for contextIndex in max(0, index - contextLines) ... min(lines.count - 1, index + contextLines) where contextIndex != index {
+                            let length = lines[contextIndex].utf8.count + 1
+                            guard length <= contextBudget else { contextTruncated = true; break }
+                            contextBudget -= length
+                            context.append(.object(["line": .int(contextIndex + 1), "text": .string(lines[contextIndex])]))
+                        }
+                        match["context"] = .array(context)
+                    }
+                    results.append(.object(match))
                     if results.count >= maxResults { break }
                 }
             }
@@ -241,7 +256,9 @@ package struct MCPDomainCanonicalWorkspaceService {
         if args["count_only"]?.boolValue == true {
             return try .object(["count": .int(results.count)])
         }
-        return try .object(["matches": .array(results), "count": .int(results.count)])
+        var response: [String: Value] = ["matches": .array(results), "count": .int(results.count)]
+        if contextLines > 0 { response["context_truncated"] = .bool(contextTruncated) }
+        return try .object(response)
     }
 
     private struct SearchFilter {

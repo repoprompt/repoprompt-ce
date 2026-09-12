@@ -283,7 +283,8 @@
                         reflectionTargetSelector: "",
                         maxEvaluations: 40,
                         stopAtScore: 1,
-                        randomSeed: 0
+                        randomSeed: 0,
+                        maxJudgeRetries: 3
                     )
                 ),
                 createdAt: date,
@@ -1221,6 +1222,10 @@
                     references.append(partial.candidateEvidence)
                     if let output = partial.evaluation.outputEvidence { references.append(output) }
                 }
+                for grade in attempt.gradingEvidence ?? [] where grade.split != .hiddenTest {
+                    references.append(grade.candidateEvidence)
+                    references.append(grade.outputEvidence)
+                }
                 if let result = attempt.optimizationResult {
                     references.append(contentsOf: result.candidates.map(\.candidateEvidence))
                     references.append(contentsOf: result.evaluations.compactMap(\.outputEvidence))
@@ -1467,6 +1472,11 @@
                         record.attempts[index].statusText = "Provider confirmed cancellation."
                     }
                 }
+                if record.attempts[index].status == .cancelledSettled {
+                    // A worker cancellation can settle before its callback unwinds. Do not
+                    // leave an admitted but ungraded output pretending grading is still active.
+                    record.attempts[index].gradingEvidence = record.attempts[index].gradingEvidence?.map { $0.settlingCancellation() }
+                }
             }
         }
 
@@ -1622,6 +1632,51 @@
                     if let i = calls.firstIndex(where: { $0.id == call.id }) { calls[i] = call } else { calls.append(call) }
                     attempt.modelCalls = calls
                 }
+            case let .grading(value):
+                guard let example = spec.examples.first(where: { $0.id == value.exampleID }),
+                      example.split == value.split, !value.candidate.isEmpty,
+                      spec.evaluator.kind == .connectedModelJudge,
+                      spec.admitsPreparationEvaluation(candidate: value.candidate, exampleID: value.exampleID),
+                      (1 ... 2).contains(value.ordinal),
+                      [.completed, .invalidResponse].contains(value.state) ? value.response != nil : value.response == nil
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Invalid grading checkpoint identity.") }
+                let old = attempt.gradingEvidence?.first { $0.id == value.id }
+                if let old {
+                    guard old.exampleID == value.exampleID, old.split == value.split,
+                          old.candidateEvidence.sha256 == PromptExperimentDigest.sha256(Data(value.candidate.utf8)),
+                          old.outputEvidence.sha256 == PromptExperimentDigest.sha256(Data(value.output.utf8)),
+                          (old.ordinal == value.ordinal && old.state == .pending && value.state != .pending)
+                          || (value.ordinal == old.ordinal + 1 && old.state == .invalidResponse && value.state == .pending)
+                    else { throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting grading checkpoint.") }
+                } else {
+                    guard value.ordinal == 1, value.state == .pending,
+                          (attempt.gradingEvidence?.count ?? 0) < spec.gepa.maxEvaluations
+                    else { throw PromptExperimentAuthorityError.runtimeUnavailable("Grading requires a new, budgeted evaluation.") }
+                }
+                if value.ordinal == 2, value.state == .pending {
+                    let retries = (attempt.gradingEvidence ?? []).count(where: { $0.ordinal == 2 })
+                    guard attempt.status != .cancellationRequested, retries < (spec.gepa.maxJudgeRetries ?? 0) else {
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed judge-repair allowance is exhausted.")
+                    }
+                }
+                let candidateRef = try await store.installArtifact(Data(value.candidate.utf8), fileExtension: "txt")
+                let outputRef = try await store.installArtifact(Data(value.output.utf8), fileExtension: "txt")
+                // Judge responses can contain reference answers: never project their text to the lab agent/worker.
+                let responseRef: PromptExperimentArtifactReference? = if let response = value.response {
+                    try await store.installArtifact(Data(response.utf8), fileExtension: "txt")
+                } else { nil }
+                var history = old?.history ?? []
+                if value.state != .pending { history.append(.init(ordinal: value.ordinal, state: value.state, responseEvidence: responseRef)) }
+                let evidence = PromptExperimentGradingEvidence(
+                    id: value.id, exampleID: value.exampleID, split: value.split,
+                    candidateEvidence: candidateRef, outputEvidence: outputRef,
+                    ordinal: value.ordinal, state: value.state, history: history
+                )
+                try await saveCheckpointUpdate(experimentID: experimentID, attemptID: attemptID, planID: plan.id) { attempt in
+                    var grades = attempt.gradingEvidence ?? []
+                    if let index = grades.firstIndex(where: { $0.id == value.id }) { grades[index] = evidence } else { grades.append(evidence) }
+                    attempt.gradingEvidence = grades
+                }
             case let .evaluation(id, candidate, evaluation):
                 guard let example = spec.examples.first(where: { $0.id == evaluation.exampleID }),
                       example.split == evaluation.split, !candidate.isEmpty,
@@ -1682,6 +1737,7 @@
             {
                 records[liveI].attempts[liveJ].modelCalls = staged[i].attempts[j].modelCalls
                 records[liveI].attempts[liveJ].partialEvaluations = staged[i].attempts[j].partialEvaluations
+                records[liveI].attempts[liveJ].gradingEvidence = staged[i].attempts[j].gradingEvidence
                 records[liveI].updatedAt = max(records[liveI].updatedAt, staged[i].updatedAt)
             }
             projectionError = report.message

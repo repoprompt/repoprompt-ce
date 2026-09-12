@@ -426,6 +426,12 @@
                             if let output = partial.evaluation.outputEvidence { lines.append("      - Output: `../../\(output.relativePath)`") }
                         }
                     }
+                    if let grades = attempt.gradingEvidence {
+                        lines.append("  - Outputs checkpointed before grading: \(grades.count)")
+                        for grade in grades {
+                            lines.append("    - \(grade.id): \(grade.state.rawValue), judge attempts \(grade.ordinal); raw judge responses host-private")
+                        }
+                    }
                     if let calls = attempt.modelCalls {
                         lines.append("  - Model invocations (missing usage is unavailable, not zero):")
                         for call in calls {
