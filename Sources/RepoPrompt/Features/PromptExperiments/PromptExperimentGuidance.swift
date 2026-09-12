@@ -26,9 +26,17 @@
             // New runs have one attempt per revision; choose the latest if a historical
             // record contains multiple attempts rather than letting old failures dominate.
             let attempts = Array(record.attempts(for: plan).suffix(1))
-            let runtimeFailed = attempts.contains { attempt in
-                [.failed, .submissionUncertain, .localPersistenceFailed, .cancelledRemoteUnknown].contains(attempt.status)
-                    || attempt.modelCalls?.contains(where: { $0.state == .failed }) == true
+            if record.phase == .running,
+               let grade = attempts.last?.gradingEvidence?.last(where: { $0.awaitingRetry == true })
+            {
+                return .init(action: "retry_grading_or_cancel", explanation: "GEPA is paused on a failed judge call, not abandoned. Inspect grading_evidence and model_calls. Fix any provider problem, then call retry_grading with this grading ID and exact plan digest to consume one sealed judge retry on the SAME saved output, or cancel. No target call is repeated, no model/rubric substitution is allowed, and no model calls run while awaiting the decision. Worker/app exit cannot resume this live callback.", evidenceIDs: [grade.id.uuidString])
+            }
+            let attemptFailed = attempts.contains {
+                [.failed, .submissionUncertain, .localPersistenceFailed, .cancelledRemoteUnknown].contains($0.status)
+            }
+            let runtimeFailed = attemptFailed || attempts.contains { attempt in
+                attempt.optimizationResult == nil && attempt.status != .completed
+                    && attempt.modelCalls?.contains(where: { $0.state == .failed }) == true
             }
             let partials = attempts.flatMap { $0.partialEvaluations ?? [] }.map(\.evaluation).filter { $0.split != .hiddenTest }
             let final = attempts.flatMap { $0.optimizationResult?.evaluations ?? [] }.filter { $0.split != .hiddenTest }
@@ -40,11 +48,11 @@
             }
             let failures = evidence.compactMap(\.failureKind)
             let ids = evidence.map(\.id.uuidString)
+            if [.running, .cancelling].contains(record.phase), !attemptFailed, !failures.contains(.infrastructure) {
+                return .init(action: "monitor", explanation: "Execution is active. Inspect incremental model_calls and partial_evaluations; wait or cancel through the existing authority. Silence alone is not failure.", evidenceIDs: ids)
+            }
             if runtimeFailed || failures.contains(.infrastructure) {
                 return .init(action: "repair_runtime", explanation: "Inspect provider status and diagnostics before buying more evaluations. Infrastructure failures are not prompt scores. Do not automatically retry or switch models.", evidenceIDs: ids)
-            }
-            if [.running, .cancelling].contains(record.phase) {
-                return .init(action: "monitor", explanation: "Execution is active. Inspect incremental model_calls and partial_evaluations; wait or cancel through the existing authority. Silence alone is not failure.", evidenceIDs: ids)
             }
             if record.phase == .cancelled {
                 return .init(action: "review_interruption", explanation: "The run was cancelled. Inspect preserved evidence and discuss whether another run is useful; do not auto-resume spending.", evidenceIDs: ids)

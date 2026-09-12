@@ -12,10 +12,15 @@
             checkpoint: @escaping PromptExperimentCheckpointSink
         ) async throws -> PromptExperimentRuntimeHandle
         func wait(for handle: PromptExperimentRuntimeHandle) async -> PromptExperimentRuntimeResult
+        func retryGrading(_ handle: PromptExperimentRuntimeHandle, gradingID: UUID) throws
         func cancel(_ handle: PromptExperimentRuntimeHandle) async -> PromptExperimentCancellationObservation
     }
 
     extension PromptExperimentRuntime {
+        func retryGrading(_: PromptExperimentRuntimeHandle, gradingID _: UUID) throws {
+            throw PromptExperimentAuthorityError.runtimeUnavailable("This runtime has no live grading retry.")
+        }
+
         func preflightOptimization(_ plan: PromptExperimentPlan) async throws {
             guard plan.optimization == nil else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The configured runtime does not support upstream GEPA optimization.")
@@ -163,6 +168,7 @@
                     guard loaded[index].phase == .running || loaded[index].phase == .cancelling else { continue }
                     changed = true
                     for attemptIndex in loaded[index].attempts.indices {
+                        loaded[index].attempts[attemptIndex].gradingEvidence = loaded[index].attempts[attemptIndex].gradingEvidence?.map { $0.settlingInterruption() }
                         if var diagnostics = loaded[index].attempts[attemptIndex].diagnostics,
                            [.preparing, .runningObserved].contains(diagnostics.processObservation)
                         {
@@ -284,7 +290,8 @@
                         maxEvaluations: 40,
                         stopAtScore: 1,
                         randomSeed: 0,
-                        maxJudgeRetries: 3
+                        maxJudgeRetries: 3,
+                        pauseOnGradingFailure: true
                     )
                 ),
                 createdAt: date,
@@ -972,6 +979,11 @@
             }
         }
 
+        private func isAwaitingGradingRetry(_ record: PromptExperimentRecord) -> Bool {
+            guard let plan = record.currentPlan else { return false }
+            return record.attempts(for: plan).last?.gradingEvidence?.contains(where: { $0.awaitingRetry == true }) == true
+        }
+
         func waitForExecution(
             experimentID: UUID,
             expectedPlanDigest: String,
@@ -989,7 +1001,8 @@
             }
             guard records[index].phase == .running || records[index].phase == .cancelling,
                   executionTasks[experimentID] != nil,
-                  timeoutSeconds > 0
+                  timeoutSeconds > 0,
+                  !isAwaitingGradingRetry(records[index])
             else { return records[index] }
 
             let waiterID = UUID()
@@ -1001,7 +1014,8 @@
                     }
                     guard let currentIndex = records.firstIndex(where: { $0.id == experimentID }),
                           records[currentIndex].phase == .running || records[currentIndex].phase == .cancelling,
-                          executionTasks[experimentID] != nil
+                          executionTasks[experimentID] != nil,
+                          !isAwaitingGradingRetry(records[currentIndex])
                     else {
                         continuation.resume()
                         return
@@ -1195,6 +1209,25 @@
 
         func record(id: UUID) -> PromptExperimentRecord? {
             records.first { $0.id == id }
+        }
+
+        func retryGrading(
+            experimentID: UUID, expectedPlanDigest: String, gradingID: UUID,
+            expectedControllerSessionID: UUID? = nil
+        ) async throws {
+            try await requireLoaded()
+            let record = try records[index(of: experimentID)]
+            try requireOwner(record, expectedControllerSessionID: expectedControllerSessionID)
+            guard let plan = record.currentPlan, plan.digest == expectedPlanDigest, plan.verifiesIntegrity() else {
+                throw PromptExperimentAuthorityError.digestMismatch
+            }
+            guard record.phase == .running, record.cancellationRequestedAt == nil,
+                  plan.optimization?.gepa.pauseOnGradingFailure == true,
+                  let attempt = record.attempts(for: plan).last,
+                  attempt.gradingEvidence?.contains(where: { $0.id == gradingID && $0.awaitingRetry == true && $0.ordinal == 1 }) == true,
+                  let handle = activeHandles[attempt.id]
+            else { throw PromptExperimentAuthorityError.runtimeUnavailable("No matching live grading recovery is pending. Inspect status; exited workers cannot resume.") }
+            try runtime.retryGrading(handle, gradingID: gradingID)
         }
 
         func availableTargets() -> [PromptExperimentResolvedTarget] {
@@ -1563,6 +1596,9 @@
             guard loadError == nil else { return }
             try? await mutate(experimentID: experimentID) { record in
                 guard let plan = record.currentPlan else { return }
+                for index in record.attempts.indices where record.attempts[index].planDigest == plan.digest {
+                    record.attempts[index].gradingEvidence = record.attempts[index].gradingEvidence?.map { $0.settlingInterruption() }
+                }
                 let currentAttempts = record.attempts(for: plan)
                 if record.cancellationRequestedAt != nil {
                     record.phase = .cancelled
@@ -1645,15 +1681,24 @@
                     guard old.exampleID == value.exampleID, old.split == value.split,
                           old.candidateEvidence.sha256 == PromptExperimentDigest.sha256(Data(value.candidate.utf8)),
                           old.outputEvidence.sha256 == PromptExperimentDigest.sha256(Data(value.output.utf8)),
-                          (old.ordinal == value.ordinal && old.state == .pending && value.state != .pending)
-                          || (value.ordinal == old.ordinal + 1 && old.state == .invalidResponse && value.state == .pending)
+                          (old.ordinal == value.ordinal && old.state == .pending && value.awaitingRetry != true && [.completed, .invalidResponse, .providerFailed, .cancelled].contains(value.state))
+                          || (old.ordinal == value.ordinal && old.awaitingRetry == true && value.state == .cancelled && value.awaitingRetry != true)
+                          || (
+                              old.ordinal == 1 && value.ordinal == 1 && spec.gepa.pauseOnGradingFailure == true
+                                  && old.awaitingRetry != true && [.invalidResponse, .providerFailed].contains(old.state)
+                                  && value.state == .pending && value.awaitingRetry == true
+                          )
+                          || (
+                              value.ordinal == old.ordinal + 1 && value.state == .pending && value.awaitingRetry != true
+                                  && (spec.gepa.pauseOnGradingFailure == true ? old.awaitingRetry == true : old.state == .invalidResponse)
+                          )
                     else { throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting grading checkpoint.") }
                 } else {
-                    guard value.ordinal == 1, value.state == .pending,
+                    guard value.ordinal == 1, value.state == .pending, value.awaitingRetry != true,
                           (attempt.gradingEvidence?.count ?? 0) < spec.gepa.maxEvaluations
                     else { throw PromptExperimentAuthorityError.runtimeUnavailable("Grading requires a new, budgeted evaluation.") }
                 }
-                if value.ordinal == 2, value.state == .pending {
+                if (value.ordinal == 2 && value.state == .pending) || value.awaitingRetry == true {
                     let retries = (attempt.gradingEvidence ?? []).count(where: { $0.ordinal == 2 })
                     guard attempt.status != .cancellationRequested, retries < (spec.gepa.maxJudgeRetries ?? 0) else {
                         throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed judge-repair allowance is exhausted.")
@@ -1666,17 +1711,21 @@
                     try await store.installArtifact(Data(response.utf8), fileExtension: "txt")
                 } else { nil }
                 var history = old?.history ?? []
-                if value.state != .pending { history.append(.init(ordinal: value.ordinal, state: value.state, responseEvidence: responseRef)) }
+                let recordedState = value.awaitingRetry == true ? (old?.state ?? value.state) : value.state
+                if value.state != .pending || value.awaitingRetry == true {
+                    history.append(.init(ordinal: value.ordinal, state: recordedState, responseEvidence: responseRef, awaitingRetry: value.awaitingRetry))
+                }
                 let evidence = PromptExperimentGradingEvidence(
                     id: value.id, exampleID: value.exampleID, split: value.split,
                     candidateEvidence: candidateRef, outputEvidence: outputRef,
-                    ordinal: value.ordinal, state: value.state, history: history
+                    ordinal: value.ordinal, state: recordedState, history: history, awaitingRetry: value.awaitingRetry
                 )
                 try await saveCheckpointUpdate(experimentID: experimentID, attemptID: attemptID, planID: plan.id) { attempt in
                     var grades = attempt.gradingEvidence ?? []
                     if let index = grades.firstIndex(where: { $0.id == value.id }) { grades[index] = evidence } else { grades.append(evidence) }
                     attempt.gradingEvidence = grades
                 }
+                if value.awaitingRetry == true { resumeExecutionWaiters(experimentID: experimentID) }
             case let .evaluation(id, candidate, evaluation):
                 guard let example = spec.examples.first(where: { $0.id == evaluation.exampleID }),
                       example.split == evaluation.split, !candidate.isEmpty,

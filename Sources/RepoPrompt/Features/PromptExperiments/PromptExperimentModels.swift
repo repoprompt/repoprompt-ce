@@ -170,6 +170,9 @@
         /// Total additional judge calls across the run, at most one per evaluation.
         /// Nil means zero: historical approval never implicitly authorizes new spend.
         var maxJudgeRetries: Int? = nil
+        /// Explicit sealed opt-in. Pause the live callback for an owning-session retry,
+        /// instead of automatic JSON repair. Nil preserves historical fail-fast behavior.
+        var pauseOnGradingFailure: Bool? = nil
     }
 
     /// Sealed input to the external upstream GEPA worker. Every field that can

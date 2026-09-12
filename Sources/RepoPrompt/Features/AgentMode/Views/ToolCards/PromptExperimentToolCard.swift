@@ -199,7 +199,7 @@
                     DisclosureGroup("Technical settings and exact authority") {
                         VStack(alignment: .leading, spacing: 8) {
                             proposalField("Evaluator", "\(spec.evaluator.kind.rawValue) · range \(spec.evaluator.minimumScore)...\(spec.evaluator.maximumScore)")
-                            proposalField("Judge recovery", "At most one invalid-JSON repair per evaluation and \(spec.gepa.maxJudgeRetries ?? 0) additional judge calls for the entire run. Saved target output is reused. Authentication, transport, cancellation and storage failures are not automatically retried.")
+                            proposalField("Judge recovery", "\(spec.gepa.pauseOnGradingFailure == true ? "Pause for an explicit session/UI retry after a judge failure" : "Automatic invalid-JSON repair only"). At most one retry per evaluation and \(spec.gepa.maxJudgeRetries ?? 0) additional judge calls for the entire run. Saved target output and the sealed judge/rubric are reused. Cancellation and storage failures are not retried; exited workers cannot resume.")
                             proposalField("Search settings", "Minibatch \(spec.gepa.reflectionMinibatchSize ?? 3) · merge \(spec.gepa.useMerge ?? false ? "on" : "off") · max merge \(spec.gepa.maxMergeInvocations ?? 5) · skip perfect \(spec.gepa.skipPerfectScore ?? true ? "yes" : "no") · seed \(String(spec.gepa.randomSeed))")
                             proposalField("Runtime", spec.gepa.pythonExecutablePath)
                             proposalField("Sealed digest", plan.digest)
@@ -267,6 +267,15 @@
                     .font(.caption)
                     .foregroundStyle(.secondary)
             case .running, .cancelling:
+                if record.phase == .running,
+                   let grade = record.attempts(for: plan).last?.gradingEvidence?.last(where: { $0.awaitingRetry == true })
+                {
+                    Text("GEPA is paused. Retry uses one approved judge call on the saved output; target execution is not repeated.")
+                        .font(.caption)
+                    Button("Retry grading — 1 judge call") {
+                        perform { try await service.retryGrading(experimentID: record.id, expectedPlanDigest: plan.digest, gradingID: grade.id) }
+                    }
+                }
                 Button("Stop after provider settlement", role: .destructive) {
                     perform { try await service.cancel(experimentID: record.id) }
                 }

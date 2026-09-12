@@ -200,6 +200,7 @@
                         LabeledContent("Reflection", value: plan.optimizationTargets?.reflection.displayName ?? "unavailable")
                         LabeledContent("Execution", value: "\(optimization.execution.adapter.rawValue) · \(plan.optimizationTargets?.execution?.displayName ?? "no model target")")
                         LabeledContent("Judge", value: plan.optimizationTargets?.judge?.displayName ?? "not used")
+                        LabeledContent("Grading recovery", value: "\(optimization.gepa.pauseOnGradingFailure == true ? "Pause for explicit retry" : "Automatic JSON repair only") · \(optimization.gepa.maxJudgeRetries ?? 0) extra judge calls total · at most one per evaluation")
                         LabeledContent("Examples", value: optimization.examples.map { "\($0.id)=\($0.split.rawValue)" }.joined(separator: ", "))
                         LabeledContent("Evaluator", value: "\(optimization.evaluator.kind.rawValue) · \(optimization.evaluator.minimumScore)...\(optimization.evaluator.maximumScore)")
                         LabeledContent("Rubric", value: optimization.evaluator.rubric)
@@ -311,6 +312,14 @@
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if record.phase == .running || record.phase == .cancelling {
+                if record.phase == .running, let plan = record.currentPlan,
+                   let grade = record.attempts(for: plan).last?.gradingEvidence?.last(where: { $0.awaitingRetry == true })
+                {
+                    Text("GEPA paused; saved target output will be reused.")
+                    Button("Retry grading — 1 judge call") {
+                        perform { try await service.retryGrading(experimentID: record.id, expectedPlanDigest: plan.digest, gradingID: grade.id) }
+                    }
+                }
                 Button("Request cancellation", role: .destructive) {
                     perform { try await service.cancel(experimentID: record.id) }
                 }

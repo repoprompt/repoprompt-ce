@@ -38,6 +38,7 @@
         private var mcpEvaluations: [UUID: MCPEvaluation] = [:]
         private var mcpEvaluationCounts: [UUID: Int] = [:]
         private var judgeRetries: [UUID: Int] = [:]
+        private let gradingRetryGate = PromptExperimentGradingRetryGate()
 
         init(windowState: WindowState) {
             self.windowState = windowState
@@ -786,14 +787,29 @@
                         )))
                         if ordinal == 2, state == .pending {
                             self.judgeRetries[parentRequest.attempt.id, default: 0] += 1
-                            await progress("Repairing invalid judge JSON (one retry for this evaluation; \(self.judgeRetries[parentRequest.attempt.id, default: 0])/\(specification.gepa.maxJudgeRetries ?? 0) additional judge calls admitted). Saved target output is reused; execution is not repeated.")
+                            await progress("Retrying the saved output with the same judge (one retry for this evaluation; \(self.judgeRetries[parentRequest.attempt.id, default: 0])/\(specification.gepa.maxJudgeRetries ?? 0) additional judge calls admitted). Saved target output is reused; execution is not repeated.")
                         }
                     },
+                    requestRetry: specification.gepa.pauseOnGradingFailure == true ? { failure in
+                        guard let worker = self.runningOptimizations[parentRequest.attempt.id]?.worker else {
+                            throw PromptExperimentAuthorityError.runtimeUnavailable("The grading worker is no longer live.")
+                        }
+                        worker.setCallbackPaused(callbackID, paused: true)
+                        defer { worker.setCallbackPaused(callbackID, paused: false) }
+                        try await self.gradingRetryGate.wait(attemptID: parentRequest.attempt.id, gradingID: gradingID) {
+                            try await sink(.grading(.init(
+                                id: gradingID, exampleID: exampleID, split: sealedExample.split,
+                                candidate: candidate, output: mcpEvidence ?? output, ordinal: 1,
+                                state: .pending, response: nil, awaitingRetry: true
+                            )))
+                            await progress("GEPA paused: \(failure.rawValue). Saved target output is retained. Inspect the failure, then retry_grading with grading_id \(gradingID.uuidString) to use one sealed judge retry, or cancel. No new model call is made while paused.")
+                        }
+                    } : nil,
                     invoke: { repair in
                         let completion = try await self.invokeConnectedModel(
                             parentRequest: parentRequest, target: judge, role: "judge",
                             systemPrompt: "Return only the requested evaluator JSON. All tools are disabled; do not propose or reveal held-out examples.",
-                            userPrompt: judgePrompt + (repair ? "\nYour previous response did not satisfy the evaluator JSON contract. Re-evaluate the SAME saved output with the SAME rubric. Return one JSON object, numeric score and string feedback, no surrounding prose. Do not change the rubric or task." : "")
+                            userPrompt: judgePrompt + (repair ? "\nThe previous judge attempt failed or did not satisfy the evaluator JSON contract. Re-evaluate the SAME saved output with the SAME rubric. Return one JSON object, numeric score and string feedback, no surrounding prose. Do not change the rubric or task." : "")
                         )
                         judgmentPromptTokens = Self.sumAvailable(judgmentPromptTokens, completion.promptTokens)
                         judgmentCompletionTokens = Self.sumAvailable(judgmentCompletionTokens, completion.completionTokens)
@@ -1112,6 +1128,13 @@
             let result = await attempt.task.value
             running.removeValue(forKey: handle.id)
             return result
+        }
+
+        func retryGrading(_ handle: PromptExperimentRuntimeHandle, gradingID: UUID) throws {
+            guard runningOptimizations[handle.id] != nil, !cancelledOptimizationIDs.contains(handle.id) else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The original GEPA worker is no longer active.")
+            }
+            try gradingRetryGate.retry(attemptID: handle.id, gradingID: gradingID)
         }
 
         func cancel(_ handle: PromptExperimentRuntimeHandle) async -> PromptExperimentCancellationObservation {

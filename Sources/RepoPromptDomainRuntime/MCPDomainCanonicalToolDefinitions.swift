@@ -1149,6 +1149,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                         "expected_draft_version": .object(["type": .string("integer")]),
                         "expected_draft_digest": .object(["type": .string("string")]),
                         "expected_plan_digest": .object(["type": .string("string")]),
+                        "grading_id": .object(["type": .string("string"), "description": .string("Exact pending grading ID for retry_grading; cannot resume an exited worker.")]),
                         "candidate_index": .object([
                             "type": .string("integer"),
                             "description": .string("Optional exact GEPA candidate index to continue; omitted means the recorded best candidate.")

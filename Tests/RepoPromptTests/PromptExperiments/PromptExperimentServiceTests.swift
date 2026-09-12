@@ -147,9 +147,115 @@ import XCTest
             XCTAssertFalse(serialized.contains("HOST_PRIVATE_INVALID_GRADE"))
         }
 
+        func testLiveRetryRequiresOwnedPlanAndPendingGradeAndSurvivesOnlyInLiveRuntime() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let (id, initial) = try await updatedOptimizationDraft(harness)
+            var draft = initial
+            draft.optimization?.evaluator.kind = .connectedModelJudge
+            draft.optimization?.evaluator.judgeTargetSelector = "fake"
+            draft.optimization?.evaluator.rubric = "Evaluate grounding."
+            draft.optimization?.gepa.maxJudgeRetries = 1
+            draft.optimization?.gepa.pauseOnGradingFailure = true
+            let updated = try await harness.service.updateDraft(
+                experimentID: id, expectedDraftID: initial.id, expectedDraftVersion: initial.optimisticVersion,
+                expectedDraftDigest: initial.contentDigest(), draft: draft
+            )
+            let plan = try await harness.service.seal(
+                experimentID: id,
+                expectedDraftID: updated.id,
+                expectedDraftVersion: updated.optimisticVersion,
+                expectedDraftDigest: updated.contentDigest()
+            )
+            let owner = try XCTUnwrap(harness.service.record(id: id)?.controllerSessionID)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.runtime.waitUntilWaitingForResult()
+            let sink = try XCTUnwrap(harness.runtime.reportCheckpoint)
+            let gradeID = UUID()
+            func value(_ ordinal: Int, _ state: PromptExperimentGradingState, awaitingRetry: Bool? = nil) -> PromptExperimentCheckpoint {
+                .grading(.init(
+                    id: gradeID,
+                    exampleID: "reviewed-1",
+                    split: .validation,
+                    candidate: "Read the file",
+                    output: "saved output",
+                    ordinal: ordinal,
+                    state: state,
+                    response: nil,
+                    awaitingRetry: awaitingRetry
+                ))
+            }
+            try await sink(value(1, .pending))
+            try await sink(value(1, .providerFailed))
+            try await sink(value(1, .pending, awaitingRetry: true))
+            let record = try await harness.service.waitForExecution(
+                experimentID: id,
+                expectedPlanDigest: plan.digest,
+                expectedControllerSessionID: owner,
+                timeoutSeconds: 1
+            )
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "retry_grading_or_cancel")
+            struct LegacyGrade: Decodable {
+                struct History: Decodable { let state: PromptExperimentGradingState }
+                let state: PromptExperimentGradingState
+                let history: [History]
+            }
+            let paused = try XCTUnwrap(record.attempts.last?.gradingEvidence?.first)
+            let legacy = try JSONDecoder().decode(LegacyGrade.self, from: JSONEncoder().encode(paused))
+            XCTAssertEqual(legacy.state, .providerFailed)
+            XCTAssertEqual(legacy.history.map(\.state), [.providerFailed, .providerFailed])
+
+            for (digest, ownerID, grade) in [("wrong", owner, gradeID), (plan.digest, UUID(), gradeID), (plan.digest, owner, UUID())] {
+                do {
+                    try await harness.service.retryGrading(
+                        experimentID: id,
+                        expectedPlanDigest: digest,
+                        gradingID: grade,
+                        expectedControllerSessionID: ownerID
+                    )
+                    XCTFail("Mismatched authority must fail")
+                } catch {}
+            }
+            XCTAssertEqual(harness.runtime.retryRequests.count, 0)
+            let reopened = PromptExperimentService(store: PromptExperimentStore(rootURL: harness.root), runtime: FakeRuntime(), resolveTarget: Self.fakeTarget)
+            await reopened.load()
+            let restored = try XCTUnwrap(reopened.record(id: id))
+            XCTAssertNotEqual(restored.phase, .running)
+            XCTAssertEqual(restored.attempts.last?.gradingEvidence?.first?.awaitingRetry, false)
+            XCTAssertNotEqual(PromptExperimentGuidance.evaluate(restored)?.action, "retry_grading_or_cancel")
+            // Separate service is a restart projection probe only; the original test
+            // runtime remains in memory and drives subsequent controlled checkpoints.
+            try await harness.service.retryGrading(
+                experimentID: id,
+                expectedPlanDigest: plan.digest,
+                gradingID: gradeID,
+                expectedControllerSessionID: owner
+            )
+            XCTAssertEqual(harness.runtime.retryRequests, [gradeID])
+            try await sink(value(2, .pending))
+            try await sink(value(2, .providerFailed))
+            harness.runtime.settleFirst(disposition: .failed("judge_provider_failed"))
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+            do {
+                try await harness.service.retryGrading(experimentID: id, expectedPlanDigest: plan.digest, gradingID: gradeID)
+                XCTFail("Exited attempt must not restart")
+            } catch {}
+            let saved = try await harness.store.loadRecords()
+            XCTAssertEqual(saved.first?.attempts.last?.gradingEvidence?.first?.history.map(\.state), [.providerFailed, .providerFailed, .providerFailed])
+            XCTAssertEqual(saved.first?.attempts.last?.gradingEvidence?.first?.ordinal, 2)
+            XCTAssertNil(saved.first?.attempts.last?.optimizationResult)
+        }
+
         func testJudgeRepairBudgetChangesDigestAndHistoricalAbsenceRemainsZero() throws {
             var draft = PromptExperimentDraft(revision: 1, title: "Budget", targetRole: "", optimization: Self.validOptimization(), createdAt: Date(), updatedAt: Date())
             let original = try draft.contentDigest()
+            XCTAssertNil(draft.optimization?.gepa.pauseOnGradingFailure)
+            draft.optimization?.gepa.pauseOnGradingFailure = true
+            XCTAssertNotEqual(try draft.contentDigest(), original)
+            draft.optimization?.gepa.pauseOnGradingFailure = nil
+            XCTAssertEqual(try draft.contentDigest(), original, "Historical omission must preserve the digest")
             XCTAssertNil(draft.optimization?.gepa.maxJudgeRetries)
             draft.optimization?.gepa.maxJudgeRetries = 1
             XCTAssertNotEqual(try draft.contentDigest(), original)
@@ -696,6 +802,11 @@ import XCTest
             var preflightError: PromptExperimentAuthorityError?
             var preflightAction: (@MainActor () async throws -> Void)?
             var observationsOnSubmit: [PromptExperimentRuntimeObservation] = []
+            var retryRequests: [UUID] = []
+            func retryGrading(_: PromptExperimentRuntimeHandle, gradingID: UUID) throws {
+                retryRequests.append(gradingID)
+            }
+
             var reportCheckpoint: PromptExperimentCheckpointSink?
             var reportProgress: (@MainActor @Sendable (String) async -> Void)?
             private var submissionGate: CheckedContinuation<Void, Never>?
@@ -2223,6 +2334,19 @@ import XCTest
             try await reopened.startNextRevision(experimentID: id, expectedPlanDigest: plan.digest)
             let next = try XCTUnwrap(reopened.record(id: id))
             XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "review_measurement")
+            var recoveredRecord = record
+            recoveredRecord.attempts[0].modelCalls = [.init(
+                id: UUID(), target: plan.resolvedTarget, role: "judge", state: .failed,
+                promptTokens: nil, completionTokens: nil
+            )]
+            XCTAssertEqual(
+                PromptExperimentGuidance.evaluate(recoveredRecord)?.action,
+                "review_measurement",
+                "A recovered judge failure must not override the final result"
+            )
+            recoveredRecord.phase = .running
+            recoveredRecord.attempts[0].optimizationResult = nil
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(recoveredRecord)?.action, "monitor")
             var partialRecord = record
             let partialID = UUID()
             partialRecord.attempts[0].partialEvaluations = [.init(

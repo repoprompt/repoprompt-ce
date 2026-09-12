@@ -334,7 +334,7 @@ package enum MCPDomainToolCatalog {
     #if DEBUG
         package static let promptExperimentOperations = [
             "capabilities", "list", "setup", "create_draft", "update_draft", "propose_seal",
-            "status", "run", "wait", "cancel", "read", "clone", "clone_draft", "rerun",
+            "status", "run", "wait", "cancel", "retry_grading", "read", "clone", "clone_draft", "rerun",
             "propose_run_again", "continue", "propose_next_revision"
         ]
     #endif

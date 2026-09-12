@@ -51,6 +51,13 @@
         private var process: Process?
         private var cancellationWriteHandle: FileHandle?
         private var didRequestCancellation = false
+        private var callbackPauses: [String: PromptExperimentCallbackClock] = [:]
+
+        func setCallbackPaused(_ id: String, paused: Bool) {
+            lock.lock()
+            callbackPauses[id]?.setPaused(paused, now: ProcessInfo.processInfo.systemUptime)
+            lock.unlock()
+        }
 
         static func resolveWorkerURL() throws -> URL {
             if let override = ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_WORKER"], !override.isEmpty {
@@ -499,21 +506,33 @@
                     emitObservation(.callbackStarted(id: id, operation: operation), using: observation)
                     let semaphore = DispatchSemaphore(value: 0)
                     let replyBox = PromptExperimentGEPAHostReplyBox()
+                    lock.lock()
+                    callbackPauses[id] = PromptExperimentCallbackClock(startedAt: ProcessInfo.processInfo.systemUptime)
+                    lock.unlock()
+                    defer {
+                        lock.lock()
+                        callbackPauses.removeValue(forKey: id)
+                        lock.unlock()
+                    }
                     let callback = Task { @MainActor in
                         let reply = await host(id, operation, payload)
                         replyBox.store(reply)
                         semaphore.signal()
                     }
-                    let deadline = DispatchTime.now() + .seconds(hostCallbackTimeoutSeconds)
                     while semaphore.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
                         lock.lock()
                         let cancelled = didRequestCancellation
+                        let activeSeconds = callbackPauses[id]?.activeSeconds(at: ProcessInfo.processInfo.systemUptime) ?? 0
                         lock.unlock()
+                        if !child.isRunning {
+                            callback.cancel()
+                            throw WorkerError.infrastructureFailure("GEPA worker exited while its host callback was pending.")
+                        }
                         if cancelled {
                             callback.cancel()
                             throw CancellationError()
                         }
-                        if DispatchTime.now() >= deadline {
+                        if activeSeconds >= Double(hostCallbackTimeoutSeconds) {
                             callback.cancel()
                             throw WorkerError.infrastructureFailure("A RepoPrompt model/evaluator callback exceeded the sealed host timeout.")
                         }

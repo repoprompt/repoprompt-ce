@@ -150,7 +150,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 annotations: .repoPromptLocalEphemeralState,
                 inputSchema: .object(
                     properties: [
-                        "op": .string(description: "capabilities | list | setup | create_draft | update_draft | propose_seal | status | run | wait | cancel | read | clone | clone_draft | rerun | propose_run_again | continue | propose_next_revision"),
+                        "op": .string(description: "capabilities | list | setup | create_draft | update_draft | propose_seal | status | run | wait | cancel | retry_grading | read | clone | clone_draft | rerun | propose_run_again | continue | propose_next_revision"),
                         "workspace_id": .string(description: "Required for external MCP operations except capabilities. Must match the bound workspace ID returned by capabilities."),
                         "approval_mode": .string(description: "mcp requests exact-plan approval via negotiated form elicitation, without native UI. External clients always use mcp; Agent sessions default to native."),
                         "experiment_id": .string(description: "Experiment UUID for record operations."),
@@ -158,6 +158,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "expected_draft_version": .integer(description: "Exact optimistic draft version returned by create/read/update."),
                         "expected_draft_digest": .string(description: "Exact draft digest returned by create/read/update."),
                         "expected_plan_digest": .string(description: "Exact current sealed plan digest for cloning or proposing a next revision."),
+                        "grading_id": .string(description: "Exact awaiting_retry grading_evidence.id for retry_grading. Uses one already approved judge retry on the same saved output; never restarts the target or an exited worker."),
                         "candidate_index": .integer(description: "Optional exact GEPA candidate index to continue; omitted means the recorded best candidate."),
                         "timeout_seconds": .number(description: "For wait only: 0-3600 seconds to await terminal settlement before returning current progress. Default 120."),
                         "title": .string(description: "Optional draft title replacement."),
@@ -251,6 +252,12 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     timeoutSeconds: args["timeout_seconds"]?.doubleValue
                         ?? args["timeout_seconds"]?.intValue.map(TimeInterval.init)
                         ?? 120
+                )
+            case .retryGrading:
+                try .retryGrading(
+                    experimentID: requiredUUID("experiment_id", args: args),
+                    expectedPlanDigest: requiredString("expected_plan_digest", args: args),
+                    gradingID: requiredUUID("grading_id", args: args)
                 )
             case .cancel:
                 try .cancel(
@@ -517,6 +524,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     "reflection_target": plan.optimizationTargets.map { targetValue($0.reflection) } ?? .null,
                     "max_evaluations": .int(optimization.gepa.maxEvaluations),
                     "max_judge_retries": .int(optimization.gepa.maxJudgeRetries ?? 0),
+                    "pause_on_grading_failure": .bool(optimization.gepa.pauseOnGradingFailure ?? false),
                     "experiment_wall_clock_deadline": .string("none"),
                     "reflection_minibatch_size": .int(optimization.gepa.reflectionMinibatchSize ?? 3),
                     "use_merge": .bool(optimization.gepa.useMerge ?? false),
@@ -591,14 +599,14 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 let visible = grade.split != .hiddenTest
                 return .object([
                     "id": .string(grade.id.uuidString), "example_id": .string(grade.exampleID),
-                    "split": .string(grade.split.rawValue), "state": .string(grade.state.rawValue),
+                    "split": .string(grade.split.rawValue), "state": .string(grade.awaitingRetry == true ? "awaiting_retry" : grade.state.rawValue),
                     "judge_attempts": .int(grade.ordinal),
                     "candidate_evidence": visible ? artifactValue(grade.candidateEvidence) : .null,
                     "candidate": visible ? (artifactTextBySHA256[grade.candidateEvidence.sha256].map(Value.string) ?? .null) : .null,
                     "output_evidence": visible ? artifactValue(grade.outputEvidence) : .null,
                     "output": visible ? (artifactTextBySHA256[grade.outputEvidence.sha256].map(Value.string) ?? .null) : .null,
                     "history": .array(grade.history.map { .object([
-                        "ordinal": .int($0.ordinal), "state": .string($0.state.rawValue)
+                        "ordinal": .int($0.ordinal), "state": .string($0.state.rawValue), "awaiting_retry": .bool($0.awaitingRetry ?? false)
                     ]) }),
                     "judge_response": .string("host_private; never proposer feedback")
                 ])

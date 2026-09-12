@@ -12,6 +12,7 @@
         case run
         case wait
         case cancel
+        case retryGrading = "retry_grading"
         case read
         case clone
         case cloneDraft = "clone_draft"
@@ -76,6 +77,7 @@
         case status(experimentID: UUID)
         case run(experimentID: UUID, expectedPlanDigest: String)
         case wait(experimentID: UUID, expectedPlanDigest: String, timeoutSeconds: TimeInterval)
+        case retryGrading(experimentID: UUID, expectedPlanDigest: String, gradingID: UUID)
         case cancel(experimentID: UUID, expectedPlanDigest: String)
         case read(experimentID: UUID)
         case cloneDraft(experimentID: UUID)
@@ -134,7 +136,8 @@
                     ),
                     limitations: [
                         PromptExperimentConnectedModelRunner.codexIsolationLimitation,
-                        "Grading recovery: max_judge_retries is a sealed run-wide allowance (0...10; absent means zero), with at most one extra judge call per evaluation and only for invalid JSON from a completed judge. Target output is durably saved before grading and never rerun for format repair. Inspect grading_evidence states/history; raw judge responses remain host-private. Transport/auth/storage failures and cancellation are never blindly retried. Post-exit exact GEPA checkpoint resume remains unsupported.",
+                        "Opt-in gepa.pause_on_grading_failure=true keeps the live GEPA callback paused on a judge failure while a sealed retry remains. Inspect awaiting_retry grading_evidence, then call retry_grading with exact grading_id and plan digest, or cancel. This consumes one already approved judge retry (at most one per evaluation), without rerunning the target. No model call occurs while paused and no pause deadline is imposed. App/worker exit is not resumable. Old plans retain their existing behavior.",
+                        "Without pause_on_grading_failure, grading recovery: max_judge_retries is a sealed run-wide allowance (0...10; absent means zero), with at most one extra judge call per evaluation and only for invalid JSON from a completed judge. Target output is durably saved before grading and never rerun for format repair. Inspect grading_evidence states/history; raw judge responses remain host-private. Transport/auth/storage failures and cancellation are never blindly retried. Post-exit exact GEPA checkpoint resume remains unsupported.",
                         "Partial evaluations and model_calls persist before optimizer advancement, including failed attempts. They are not final candidate rankings; Use candidate_evidence.sha256 as partial candidate identity, not a final optimizer index. Missing token counts remain unavailable.",
                         "DEBUG integration using the packaged CPython and upstream GEPA optimize_anything runtime; no user Python setup or provider credentials are delegated to Python.",
                         "The bound Agent session or external MCP workspace controller may draft, seal, request, wait for, and cancel owned runs. Ownership is not approval: only a native human action or server-originated MCP elicitation may approve; no automatic winner application.",
@@ -263,6 +266,13 @@
                     record,
                     artifactTextBySHA256: service.readableArtifactText(for: record)
                 )
+            case let .retryGrading(experimentID, expectedPlanDigest, gradingID):
+                try await service.retryGrading(
+                    experimentID: experimentID, expectedPlanDigest: expectedPlanDigest,
+                    gradingID: gradingID, expectedControllerSessionID: owner.controllerSessionID
+                )
+                let record = try await service.ownedRecord(id: experimentID, controllerSessionID: owner.controllerSessionID)
+                return try await .record(record, artifactTextBySHA256: service.readableArtifactText(for: record))
             case let .cancel(experimentID, expectedPlanDigest):
                 try await service.cancel(
                     experimentID: experimentID,

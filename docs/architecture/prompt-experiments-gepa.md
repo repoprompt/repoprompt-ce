@@ -240,3 +240,40 @@ JSON protocol, including seedless generation. Headless `file_search` now honors
 `context_lines` (0–1000), returns numbered context lines, and explicitly reports
 when its additional-context byte budget is truncated rather than silently
 returning only matching lines.
+
+### Opt-in live grading pause and retry
+
+`gepa.pause_on_grading_failure=true` changes the sealed recovery behavior from
+an automatic invalid-JSON repair to an explicit live decision. New native drafts
+propose this flag; omitted/false retains historical behavior. The run-wide
+`max_judge_retries` allowance and at-most-one-extra-call-per-evaluation limit are
+unchanged. A pause is offered only while an extra call remains, after the target
+output and initial judge failure have been committed. It is not offered for
+cancellation or canonical persistence failure.
+
+The live callback stays blocked in the original GEPA worker. `status`/`read`
+show `grading_evidence.state=awaiting_retry`; `wait` returns on that decision.
+The owner calls `retry_grading` with the exact experiment, plan digest and
+`grading_id`, or uses **Retry grading — 1 judge call** in the native card/library.
+The action consumes already approved budget; it grants no new budget, provider,
+rubric, target execution, or promotion authority. Provider failures require
+inspection before an explicit retry; no transport/auth errors are automatically
+retried. The saved output and sealed judge/rubric are reused, with a fixed retry
+instruction requesting valid evaluator JSON.
+
+Duplicate or stale retry requests fail without another model call. Cancellation
+and worker death release the pending callback. The callback watchdog excludes
+only deliberately paused time (not provider execution), using a monotonic clock.
+There is no recovery deadline and no model spend while paused. The worker retains
+the live run slot; cancel it before starting another search.
+
+This is **live callback recovery**, not post-exit checkpoint resume. It never
+loads pickle or relaunches an optimizer. Historical failed runs remain unchanged.
+App restart marks an in-flight run interrupted and does not reconstruct a retry
+lease. If the one allowed retry also fails, evidence remains saved and the normal
+failed-attempt path settles the worker; no winner is manufactured.
+
+Pause metadata is additive (`awaitingRetry`) over the existing persisted judge
+failure state; no new on-disk enum case prevents older debug builds from reading
+the evidence. MCP projects this metadata as `awaiting_retry`. Worker settlement
+and app-start reconciliation clear the live flag while retaining the history.
