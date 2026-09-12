@@ -14,6 +14,7 @@ struct WorkspacePickerMenu<Label: View>: View {
     var query: WorkspaceMenuQuery = .init()
     var includeSaveActions: Bool = false
     var includeExitAction: Bool = false
+    var onCreateWorkspace: (() -> Void)?
     var onManageWorkspaces: () -> Void
     @ViewBuilder var label: () -> Label
 
@@ -89,6 +90,13 @@ struct WorkspacePickerMenu<Label: View>: View {
             workspaceList
 
             divider
+
+            if let onCreateWorkspace {
+                menuRow(title: "Create Workspace…", isSelected: false, isDisabled: false) {
+                    isPresented = false
+                    onCreateWorkspace()
+                }
+            }
 
             menuRow(title: "Manage Workspaces…", isSelected: false, isDisabled: false) {
                 isPresented = false
