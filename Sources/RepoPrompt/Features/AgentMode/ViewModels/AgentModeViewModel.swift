@@ -474,6 +474,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
+            cachedBindingResolutionSnapshot = nil
             syncSidebarUIState(refresh: true, reason: .sessionList)
             // One eager revocation hook covering every live-session removal path (tab close, stash,
             // delete, MCP control teardown) instead of five separate call sites that could drift.
@@ -872,7 +873,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var sidebarSessionRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var agentChatsSidebarRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var sidebarListProjectionCache: (key: SidebarListProjectionCacheKey, projection: SidebarListProjection)?
-    private var lastKnownWorkspaceSnapshot: WorkspaceModel?
+    private var lastKnownWorkspaceSnapshot: WorkspaceModel? {
+        didSet { cachedBindingResolutionSnapshot = nil }
+    }
+
+    /// Cached result of `makePersistentBindingResolutionSnapshot()`. Invalidated whenever
+    /// session bindings or workspace tab claims change so that repeated calls from the
+    /// SwiftUI layout cycle (via `modelRequestIdentity`) do not repeat the O(N) traversal.
+    private var cachedBindingResolutionSnapshot: PersistentBindingResolutionSnapshot?
+
     var sidebarRuntimeWorkspaceID: UUID? {
         lastKnownWorkspaceSnapshot?.id
     }
@@ -4663,6 +4672,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: $0)
         }
         session.installPersistentSessionBinding(binding)
+        cachedBindingResolutionSnapshot = nil
         handleSidebarRefreshBindingMutation(
             tabID: session.tabID,
             sessionID: sessionID
@@ -4758,6 +4768,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func makePersistentBindingResolutionSnapshot() -> PersistentBindingResolutionSnapshot {
+        if let cached = cachedBindingResolutionSnapshot {
+            return cached
+        }
         #if DEBUG
             test_persistentBindingResolutionSnapshotBuildCount &+= 1
         #endif
@@ -4808,7 +4821,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
-        return PersistentBindingResolutionSnapshot(
+        let snapshot = PersistentBindingResolutionSnapshot(
             liveClaimsByTabID: liveClaimsByTabID,
             workspaceClaimsByTabID: workspaceClaimsByTabID,
             claimedTabIDsBySessionID: claimedTabIDsBySessionID,
@@ -4816,6 +4829,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             indexedTabIDBySessionID: ownerValidatedSessionIndex.mapValues(\.tabID),
             composeTabIDs: composeTabIDs
         )
+        cachedBindingResolutionSnapshot = snapshot
+        return snapshot
     }
 
     private func persistentBindingResolution(
