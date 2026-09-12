@@ -72,6 +72,81 @@ import XCTest
             XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "review_grading_interruption")
         }
 
+        func testJudgeFormatRepairUsesDurableOutputAndPublishesOneEvaluation() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let (id, initial) = try await updatedOptimizationDraft(harness)
+            var draft = initial
+            draft.optimization?.evaluator.kind = .connectedModelJudge
+            draft.optimization?.evaluator.judgeTargetSelector = "fake"
+            draft.optimization?.evaluator.rubric = "Evaluate grounding in the example."
+            draft.optimization?.gepa.maxJudgeRetries = 1
+            let updated = try await harness.service.updateDraft(
+                experimentID: id, expectedDraftID: initial.id, expectedDraftVersion: initial.optimisticVersion,
+                expectedDraftDigest: initial.contentDigest(), draft: draft
+            )
+            let plan = try await harness.service.seal(
+                experimentID: id, expectedDraftID: updated.id, expectedDraftVersion: updated.optimisticVersion,
+                expectedDraftDigest: updated.contentDigest()
+            )
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.runtime.waitUntilWaitingForResult()
+            let sink = try XCTUnwrap(harness.runtime.reportCheckpoint)
+            let gradeID = UUID()
+            let candidate = "Read the fixture and report the named value."
+            let output = "cobalt"
+            var judgeCalls = 0
+            let judgment = try await PromptExperimentGrading.run(minimum: 0, maximum: 1, canRepair: true) { ordinal, state, response in
+                try await sink(.grading(.init(
+                    id: gradeID, exampleID: "reviewed-1", split: .validation,
+                    candidate: candidate, output: output, ordinal: ordinal, state: state, response: response
+                )))
+            } invoke: { repair in
+                judgeCalls += 1
+                // Read the canonical store, not the in-memory service projection. Both
+                // invocations must observe the same committed target output before spending.
+                let records = try await harness.store.loadRecords()
+                let record = try XCTUnwrap(records.first)
+                let grade = try XCTUnwrap(record.attempts.last?.gradingEvidence?.first)
+                XCTAssertEqual(grade.id, gradeID)
+                XCTAssertEqual(grade.state, .pending)
+                XCTAssertEqual(grade.ordinal, judgeCalls)
+                XCTAssertEqual(grade.outputEvidence.sha256, PromptExperimentDigest.sha256(Data(output.utf8)))
+                XCTAssertEqual(record.attempts.last?.partialEvaluations?.count ?? 0, 0)
+                XCTAssertEqual(repair, judgeCalls == 2)
+                if repair {
+                    XCTAssertEqual(grade.history.map(\.state), [.invalidResponse])
+                    XCTAssertNotNil(grade.history.first?.responseEvidence)
+                    return #"{"score":0.75,"feedback":"Grounded but missing source citation"}"#
+                }
+                return "HOST_PRIVATE_INVALID_GRADE"
+            }
+            try await sink(.evaluation(id: gradeID, candidate: candidate, value: .init(
+                candidateIndex: -1, exampleID: "reviewed-1", split: .validation, score: judgment.score,
+                feedback: judgment.feedback, failureKind: nil, output: output, elapsedSeconds: 1
+            )))
+            // A later unrelated interruption must not erase the repaired, scored output.
+            harness.runtime.settleFirst(disposition: .failed("later reflection interrupted"))
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+            let records = try await harness.store.loadRecords()
+            let record = try XCTUnwrap(records.first)
+            let attempt = try XCTUnwrap(record.attempts.last)
+            XCTAssertEqual(judgeCalls, 2)
+            XCTAssertEqual(attempt.gradingEvidence?.count, 1)
+            XCTAssertEqual(attempt.gradingEvidence?.first?.state, .completed)
+            XCTAssertEqual(attempt.gradingEvidence?.first?.history.map(\.state), [.invalidResponse, .completed])
+            XCTAssertEqual(attempt.partialEvaluations?.count, 1)
+            XCTAssertEqual(attempt.partialEvaluations?.first?.evaluation.score, 0.75)
+            XCTAssertNil(attempt.optimizationResult, "Partial recovery must not fabricate a final GEPA winner")
+            let texts = try await harness.service.readableArtifactText(for: record)
+            let projection = try MCPAgentSessionControlToolProvider.responseValue(.record(record, artifactTextBySHA256: texts))
+            let serialized = try String(decoding: JSONEncoder().encode(projection), as: UTF8.self)
+            XCTAssertTrue(serialized.contains("cobalt"))
+            XCTAssertFalse(serialized.contains("HOST_PRIVATE_INVALID_GRADE"))
+        }
+
         func testJudgeRepairBudgetChangesDigestAndHistoricalAbsenceRemainsZero() throws {
             var draft = PromptExperimentDraft(revision: 1, title: "Budget", targetRole: "", optimization: Self.validOptimization(), createdAt: Date(), updatedAt: Date())
             let original = try draft.contentDigest()

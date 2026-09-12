@@ -22,6 +22,9 @@ from mcp import StdioServerParameters
 from jsonschema import validate as validate_schema
 from jsonschema.exceptions import ValidationError
 
+# Match the native worker NDJSON reader's explicit bound. asyncio defaults to
+# 64 KiB, below legitimate search results with surrounding source context.
+MAX_MCP_RESPONSE_BYTES = 16 * 1024 * 1024
 ACTIVE_CHILDREN: set[int] = set()
 
 
@@ -72,7 +75,7 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
                 self.process = await asyncio.create_subprocess_exec(
                     self.command, *self.args, stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                    cwd=str(scratch), start_new_session=True)
+                    cwd=str(scratch), start_new_session=True, limit=MAX_MCP_RESPONSE_BYTES)
                 async def drain_stderr():
                     while chunk := await self.process.stderr.read(65536):
                         self.stderr_bytes += len(chunk)

@@ -78,6 +78,37 @@ class MCPExperimentTests(unittest.TestCase):
             self.assertIn(marker,json.dumps(grades[0]['trace']['tool_calls'][0]['result']))
             self.assertEqual(Path(body['mcp_adapter']['project_root'],'README.md').read_text(),marker)
 
+    def test_source_response_above_asyncio_default_limit_reaches_grading_intact(self):
+        with tempfile.TemporaryDirectory(prefix='rpce-mcp-large-response-') as directory:
+            body, marker, example = self.setup_trial(directory)
+            # Valid tool output, not a malformed protocol or bad candidate. The
+            # tail marker proves the boundary does not silently truncate evidence.
+            contents = ('source context ' * 6000) + marker
+            Path(body['mcp_adapter']['project_root'], 'README.md').write_text(contents)
+            result, operations, _, grades = self.run_trial(body, marker, example)
+            self.assertEqual(result['score'], 1.0)
+            self.assertEqual(operations, ['mcp_begin', 'mcp_model', 'mcp_model', 'mcp_grade'])
+            response = grades[0]['trace']['tool_calls'][0]['result']
+            self.assertGreater(len(json.dumps(response).encode()), 65536)
+            self.assertIn(contents, json.dumps(response))
+            self.assertFalse(ACTIVE_CHILDREN)
+
+    def test_response_size_bound_fails_before_models_and_reaps_server(self):
+        with tempfile.TemporaryDirectory(prefix='rpce-mcp-response-bound-') as directory:
+            body, _, example = self.setup_trial(directory)
+            operations = []
+            def host(op, payload):
+                operations.append(op)
+                self.assertEqual(op, 'mcp_begin')
+                return {'output': str(uuid.uuid4())}
+            # The schema listing alone exceeds this deliberately tiny test limit.
+            with patch('mcp_evaluation.MAX_MCP_RESPONSE_BYTES', 1024):
+                with self.assertRaisesRegex(InfrastructureFailure, 'MCP transport failed'):
+                    evaluate_mcp('Read the file.', example, body, host, lambda _: None,
+                                 InfrastructureFailure, lambda _: None)
+            self.assertEqual(operations, ['mcp_begin'])
+            self.assertFalse(ACTIVE_CHILDREN)
+
     def test_control_tool_choice_is_candidate_failure_without_tool_call(self):
         with tempfile.TemporaryDirectory(prefix='rpce-mcp-adapter-') as directory:
             body,marker,example=self.setup_trial(directory)
