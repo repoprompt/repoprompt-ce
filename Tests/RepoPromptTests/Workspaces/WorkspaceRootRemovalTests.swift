@@ -1126,7 +1126,14 @@ import XCTest
                 await assertAdmission(fixture, capture: before)
                 let argument = path(fixture)
                 try await fixture.perform("unmatched removal returned") {
+                    // Bracket UI-only state on its owning actor. Authority/store reads and
+                    // admission yield to independent debounced UI observations, so their
+                    // wider checkpoint interval cannot attribute a version bump to removal.
+                    let model = fixture.manager.workspace(withID: fixture.workspace.id)
+                    let stateVersion = fixture.manager.debugStateVersionForWorkspace(fixture.workspace.id)
                     await fixture.manager.removeActiveWorkspaceRoot(path: argument)
+                    XCTAssertEqual(fixture.manager.workspace(withID: fixture.workspace.id), model, "workspace model", file: file, line: line)
+                    XCTAssertEqual(fixture.manager.debugStateVersionForWorkspace(fixture.workspace.id), stateVersion, "state version", file: file, line: line)
                 }
                 let after = try await fixture.capturePassive()
                 // Membership/admission controls remain useful even when baseline no-write checks fail.
@@ -1134,8 +1141,6 @@ import XCTest
                 await assertAdmission(fixture, capture: after)
                 XCTAssertEqual(after.primaryRoots, before.primaryRoots, "root identities", file: file, line: line)
                 XCTAssertEqual(after.selection, before.selection, "selection", file: file, line: line)
-                XCTAssertEqual(after.model, before.model, "workspace model", file: file, line: line)
-                XCTAssertEqual(after.stateVersion, before.stateVersion, "state version", file: file, line: line)
                 XCTAssertEqual(after.canonical, before.canonical, "canonical content/revisions", file: file, line: line)
                 XCTAssertEqual(after.publicationSequence, before.publicationSequence, "authority publication", file: file, line: line)
                 XCTAssertEqual(after.diskBytes, before.diskBytes, "saved bytes", file: file, line: line)
