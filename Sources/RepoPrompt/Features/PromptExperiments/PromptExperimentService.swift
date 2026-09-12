@@ -258,6 +258,7 @@
                 title: "GEPA optimization",
                 targetRole: "",
                 optimization: PromptExperimentOptimizationSpecification(
+                    startingPoint: .choose,
                     seedCandidate: nil,
                     objective: "",
                     background: "",
@@ -1109,10 +1110,11 @@
             nextOptimization?.gepa.maxWallClockSeconds = nil
             if let chosenCandidate {
                 nextOptimization?.seedCandidate = chosenCandidate
-                // Continue carries tested text forward, not another implicit preparation batch.
-                // The agent may explicitly choose another preparation round in the new draft.
-                nextOptimization?.stage = .search
-                nextOptimization?.preparationCandidates = nil
+                nextOptimization?.startingPoint = .supplied
+                // Continuing a development round must not silently promote it to search.
+                // Keep only the selected text; the agent chooses focused cases and revisions.
+                nextOptimization?.stage = plan.optimization?.isPreparation == true ? .preparation : .search
+                nextOptimization?.preparationCandidates = plan.optimization?.isPreparation == true ? [chosenCandidate] : nil
             }
             records[index].draft = PromptExperimentDraft(
                 revision: plan.revision + 1,

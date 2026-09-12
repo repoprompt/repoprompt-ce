@@ -21,6 +21,12 @@ WORKER = Path(os.environ.get(
 
 class GEPAPromptExperimentWorkerTests(unittest.TestCase):
     def test_real_gepa_uses_host_reflection_and_evaluation(self) -> None:
+        self.run_search("bad candidate")
+
+    def test_seedless_gepa_generates_initial_candidate_through_host(self) -> None:
+        self.run_search(None)
+
+    def run_search(self, seed: str | None) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             process = subprocess.Popen(
@@ -44,7 +50,7 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                 "type": "run",
                 "request": {
                     "run_name": "deterministic-worker-test",
-                    "seed_candidate": "bad candidate",
+                    "seed_candidate": seed,
                     "objective": "Produce the exact words improved candidate.",
                     "background": "This is a deterministic integration test.",
                     "task_preservation": "Do not change the required words.",
@@ -139,6 +145,10 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
             self.assertEqual(completed["run_directory_relative_path"], "worker-runs/test")
             self.assertIn("improved candidate", completed["candidates"])
             self.assertIn("reflect", host_operations)
+            if seed is None:
+                self.assertEqual(host_operations[0], "reflect", "GEPA must generate the initial seed before evaluating")
+            else:
+                self.assertEqual(host_operations[0], "evaluate", "Supplied seed must be evaluated before mutation")
             self.assertGreaterEqual(host_operations.count("evaluate"), 2)
             self.assertIn("prompt_tokens=", completed["proposer_usage"])
             self.assertIn("unavailable_callbacks=0", completed["proposer_usage"])

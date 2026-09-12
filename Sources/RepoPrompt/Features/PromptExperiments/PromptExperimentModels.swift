@@ -182,7 +182,23 @@
         case search
     }
 
+    enum PromptExperimentStartingPoint: String, Codable {
+        case choose
+        case supplied
+        case gepa
+
+        var displayName: String {
+            switch self {
+            case .choose: "Choose: use your prompt or let GEPA create it"
+            case .supplied: "Start from supplied or previously tested instructions"
+            case .gepa: "Start without a seed — GEPA creates the initial candidate"
+            }
+        }
+    }
+
     struct PromptExperimentOptimizationSpecification: Codable, Equatable {
+        /// Optional for historical records; never infer a user's choice from a missing seed.
+        var startingPoint: PromptExperimentStartingPoint? = nil
         /// Nil preserves historical search-plan digests. Preparation is a fixed, reviewed
         /// development batch, not GEPA search or held-out quality evidence.
         var stage: PromptExperimentStage? = nil
@@ -492,6 +508,19 @@
                 }
                 guard optimization.examples.contains(where: { $0.split != .hiddenTest }) else {
                     throw PromptExperimentAuthorityError.invalidDraft("At least one training or validation example must be visible to GEPA.")
+                }
+                switch optimization.startingPoint {
+                case .choose:
+                    throw PromptExperimentAuthorityError.invalidDraft("Ask whether to start from the user's prompt (starting_point=supplied) or let GEPA generate it (starting_point=gepa).")
+                case .gepa:
+                    guard optimization.seedCandidate == nil, !optimization.isPreparation else {
+                        throw PromptExperimentAuthorityError.invalidDraft("GEPA seedless mode requires stage=search and seed_candidate omitted. Do not substitute an agent-authored prompt for the user's seedless choice.")
+                    }
+                case .supplied where !optimization.isPreparation:
+                    guard optimization.seedCandidate?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+                        throw PromptExperimentAuthorityError.invalidDraft("Supplied-prompt search requires a nonempty seed_candidate.")
+                    }
+                default: break
                 }
                 if optimization.isPreparation {
                     let candidates = optimization.preparationCandidates ?? []

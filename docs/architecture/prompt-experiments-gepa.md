@@ -64,11 +64,11 @@ Candidate failures are reviewable feedback and may receive an evaluator-defined 
 
 ## Guided cold starts and preparation rounds
 
-The workflow now separates **preparation** from **GEPA search**. The conversational agent drafts candidate artifacts and representative development examples, tests a reviewed batch, reads feedback, and revises before proposing a search. No existing prompt is required, and a one-shot GEPA-generated seed is not the default novice flow. Direct seedless searches remain an explicit choice.
+The workflow separates **preparation** from **GEPA search** and asks whether to use supplied instructions or let GEPA generate the initial candidate. For supplied instructions, the agent can test focused development probes and revise from evidence. For seedless GEPA, the agent reviews the objective, examples and evaluator before proposing search; it does not silently author a replacement seed. Both paths inspect results and choose the next useful action rather than assuming process completion means improvement.
 
 Specification envelope schema 3 adds `stage` and `preparation_candidates`. In `preparation`, the pinned worker executes a fixed candidate × training-example batch through the existing native evaluator/provider callbacks. It makes no reflection calls and does not execute validation or hidden-test examples. Candidate strings, examples, model, evaluator, permissions and evaluation ceiling are sealed together. Both host and worker reject unreviewed preparation candidates/held-out evaluation; this is not a second search optimizer. Each preparation round is approved as one batch, not per example. Revising a batch still requires a new approval.
 
-`continue` selects saved candidate evidence as `seed_candidate` and clears the preparation list for a search draft. The agent can explicitly set the next draft to preparation for another round. Search still invokes upstream GEPA. Historical plans/results are not rewritten; legacy deadline-free schema 4 plans remain integrity-verifiable but need a new revision to execute under current semantics.
+`continue` selects saved candidate evidence as `seed_candidate`, records `starting_point=supplied`, and preserves the prior stage. Preparation retains only the selected candidate for the next focused probe; moving into search requires an explicit draft change. Search still invokes upstream GEPA. Historical plans/results are not rewritten; legacy deadline-free schema 4 plans remain integrity-verifiable but need a new revision to execute under current semantics.
 
 Cards observe the live service directly, show the readable proposal without an expansion prerequisite, wrap long fields, retain complete JSON disclosure, and return written revision feedback to the waiting owner session. Results distinguish a development batch from a search and explicitly report when only the starting candidate was evaluated. These changes do not constitute live UI or provider-quality proof.
 
@@ -172,3 +172,36 @@ MCP approval-to-execution and optimization quality require separate live runs.
 Connected Codex prompt-only execution, reflection, and judging are currently rejected before worker/provider launch: its public app-server contract does not provide a blanket native-tool deny control. No model is silently substituted. Ordinary Codex Agent and Context Builder execution remain unchanged. Claude-compatible prompt-only profiles explicitly pass an empty built-in tool allowlist in addition to the run-scoped MCP denial policy; a static blacklist is not the isolation boundary.
 
 Each connected-model invocation is checkpointed as started, then completed or failed. Available input/output usage is stored per invocation; null is unavailable, not zero. Each scored evaluation saves its candidate/output artifacts and feedback before the host releases its result to GEPA. `read`/`wait` expose `model_calls` and `partial_evaluations`, including after later infrastructure failure. Partial evaluations are not optimizer rankings or a fabricated final result; candidate artifacts establish their identity. Canonical save failure stops callback progression rather than acknowledging unsaved evidence. Historical records are not backfilled.
+
+
+## Guided starting point and evidence-driven continuation
+
+The workflow first asks whether to use supplied instructions or let upstream GEPA
+create the initial candidate. `starting_point` records `supplied` or `gepa`; new
+interactive drafts use `choose` until that decision is made. Historical records
+omit the optional field and retain their original digests. `gepa` requires search
+with `seed_candidate` omitted; it must not silently receive an agent-authored seed.
+Supplied text may run focused preparation probes (one candidate/case is valid).
+
+`status`/`read` now expose `guidance`: an action, explanation and current-revision
+non-hidden evidence IDs. It distinguishes runtime failures, active execution,
+cancellation, candidate failures, missing evidence, saturated measurements, and
+semantic review. This is deterministic triage, not a quality threshold or an
+execution grant. The agent reads the actual traces, diagnoses the responsible
+layer, records a revision rationale in the next draft background, and proposes the
+smallest useful next probe. It must not treat failure counts as a substitute for
+understanding the task or feed hidden-test outcomes into development.
+
+Continuing preparation retains preparation with the selected candidate; it no
+longer silently advances to search. Moving to search is an explicit draft change.
+Seedless search remains first class and does not require an agent-written baseline.
+Model calls, dataset changes and execution remain inside existing digest-approved
+revision boundaries. **An approval currently covers one reviewed batch, not an
+open-ended multi-revision preparation budget.** New revisions still require approval;
+these changes do not introduce an adaptive spending grant.
+
+The September live repair tests exposed two distinct gaps: authentication errors
+could be mistaken for model text, and the upstream one-tool/two-pass MCP adapter
+was a poor fit for some iterative source-reading answers. Neither is evidence
+that a larger GEPA budget is needed. Protocol and provider boundary repairs remain
+separate from choosing or optimizing task instructions.

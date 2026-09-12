@@ -409,6 +409,84 @@ import XCTest
             withExtendedLifetime(subscription) {}
         }
 
+        func testGuidanceUsesCurrentNonHiddenEvidenceAndDoesNotAuthorizeSearch() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            var record = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(record.currentPlan)
+            record.phase = .completed
+            var attempt = try PromptExperimentAttempt(trial: XCTUnwrap(plan.trials.first), plan: plan)
+            attempt.status = .completed
+            let artifact = PromptExperimentArtifactReference(sha256: "candidate", relativePath: "candidate.txt", byteCount: 1)
+            func partial(split: PromptExperimentDatasetSplit, score: Double, failure: PromptExperimentOptimizationFailureKind? = nil) -> PromptExperimentPartialEvaluation {
+                let id = UUID()
+                return .init(id: id, candidateEvidence: artifact, evaluation: .init(id: id, candidateIndex: 0, exampleID: "example", split: split, score: score, feedback: "Evidence", failureKind: failure, outputEvidence: nil, elapsedSeconds: nil))
+            }
+            attempt.partialEvaluations = [partial(split: .hiddenTest, score: 0, failure: .candidate)]
+            record.attempts = [attempt]
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "establish_evaluable_execution")
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.evidenceIDs, [])
+            let development = partial(split: .training, score: 0, failure: .candidate)
+            record.attempts[0].partialEvaluations?.append(development)
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "diagnose_and_probe")
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.evidenceIDs, [development.id.uuidString])
+            record.attempts[0].partialEvaluations = [partial(split: .training, score: 1)]
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "review_measurement")
+            record.attempts[0].partialEvaluations = [partial(split: .training, score: 0.5)]
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "review_evidence")
+            record.attempts[0].status = .failed
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "repair_runtime")
+            record.phase = .running
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "repair_runtime")
+            record.attempts[0].status = .running
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "monitor")
+            record.phase = .cancelled
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "review_interruption")
+            // Old-revision failures must never determine the current revision's diagnosis.
+            record.phase = .completed
+            record.attempts[0].planDigest = "old-revision"
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "establish_evaluable_execution")
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+        }
+
+        func testStartingPointChoiceIsValidatedAndDigestBoundWithoutChangingLegacyEncoding() throws {
+            let date = Date(timeIntervalSince1970: 100)
+            var draft = PromptExperimentDraft(revision: 1, title: "Seed choice", optimization: Self.validOptimization(), createdAt: date, updatedAt: date)
+            let legacyDigest = try draft.contentDigest()
+            let legacyJSON = try MCPAgentSessionControlToolProvider.encodeOptimizationSpecification(XCTUnwrap(draft.optimization))
+            XCTAssertFalse(legacyJSON.contains("starting_point"))
+            draft.optimization?.startingPoint = .choose
+            XCTAssertThrowsError(try draft.validated())
+            XCTAssertNotEqual(try draft.contentDigest(), legacyDigest)
+            draft.optimization?.startingPoint = .gepa
+            XCTAssertNoThrow(try draft.validated())
+            let seedlessDigest = try draft.contentDigest()
+            draft.optimization?.seedCandidate = "Do the task"
+            XCTAssertThrowsError(try draft.validated(), "Seedless choice must not mask an agent-written seed")
+            draft.optimization?.startingPoint = .supplied
+            XCTAssertNoThrow(try draft.validated())
+            XCTAssertNotEqual(try draft.contentDigest(), seedlessDigest)
+            draft.optimization?.seedCandidate = "   "
+            XCTAssertThrowsError(try draft.validated())
+            draft.optimization?.startingPoint = nil
+            draft.optimization?.seedCandidate = nil
+            XCTAssertEqual(try draft.contentDigest(), legacyDigest)
+        }
+
+        func testNewDraftAsksForStartingPointWithoutExecutingModels() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await harness.service.createOptimizationExperiment(controllerSessionID: UUID(), sourceTabID: UUID())
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            XCTAssertEqual(record.draft?.optimization?.startingPoint, .choose)
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "choose_starting_point")
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+            var legacy = record
+            legacy.draft?.optimization?.startingPoint = nil
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(legacy)?.action, "review_proposal")
+        }
+
         func testPreparationBoundsAndHostAdmissionExcludeHeldOutExamples() throws {
             var spec = Self.validOptimization()
             spec.stage = .preparation
@@ -1996,9 +2074,19 @@ import XCTest
 
             try await reopened.startNextRevision(experimentID: id, expectedPlanDigest: plan.digest)
             let next = try XCTUnwrap(reopened.record(id: id))
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(record)?.action, "review_measurement")
+            var partialRecord = record
+            let partialID = UUID()
+            partialRecord.attempts[0].partialEvaluations = [.init(
+                id: partialID, candidateEvidence: result.candidates[0].candidateEvidence,
+                evaluation: .init(id: partialID, candidateIndex: 0, exampleID: "stale", split: .training, score: 0, feedback: "stale", failureKind: .candidate, outputEvidence: nil, elapsedSeconds: nil)
+            )]
+            XCTAssertEqual(PromptExperimentGuidance.evaluate(partialRecord)?.action, "review_measurement", "Final evidence takes precedence over checkpoints")
+            XCTAssertFalse(PromptExperimentGuidance.evaluate(partialRecord)?.evidenceIDs.contains(partialID.uuidString) ?? true)
             XCTAssertEqual(next.draft?.optimization?.seedCandidate, "improved instructions")
-            XCTAssertEqual(next.draft?.optimization?.stage, .search)
-            XCTAssertNil(next.draft?.optimization?.preparationCandidates)
+            XCTAssertEqual(next.draft?.optimization?.stage, preparation ? .preparation : .search)
+            XCTAssertEqual(next.draft?.optimization?.startingPoint, .supplied)
+            XCTAssertEqual(next.draft?.optimization?.preparationCandidates, preparation ? ["improved instructions"] : nil)
             XCTAssertEqual(next.plans.first?.optimization?.isPreparation, preparation)
             XCTAssertEqual(next.attempts(for: plan).first?.optimizationResult?.bestScore, 1)
             XCTAssertTrue(harness.runtime.submitted.count == 1)

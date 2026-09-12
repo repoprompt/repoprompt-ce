@@ -91,6 +91,9 @@
                     if let record {
                         Text(record.statusMessage)
                             .font(.subheadline)
+                        if let guidance = PromptExperimentGuidance.evaluate(record) {
+                            proposalField("Next decision", guidance.explanation)
+                        }
                         if let plan = record.currentPlan {
                             if record.phase != .drafting {
                                 planSummary(record: record, plan: plan)
@@ -165,6 +168,7 @@
                     Text(spec.isPreparation ? "Preparation round · revision \(plan.revision)" : "GEPA search · revision \(plan.revision)")
                         .font(.headline)
                     proposalField("What we're improving", spec.objective)
+                    proposalField("Starting point", spec.startingPoint?.displayName ?? "Historical plan — starting-point choice not recorded")
                     if !spec.background.isEmpty { proposalField("Context and constraints", spec.background) }
                     proposalField("How we'll test", "\(spec.execution.adapter.rawValue) · \(plan.optimizationTargets?.execution?.displayName ?? "reviewed command")\n\(spec.evaluator.rubric)")
                     let training = spec.examples.count(where: { $0.split == .training })

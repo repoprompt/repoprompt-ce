@@ -373,7 +373,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                     "mcp_adapter": .object([
                         "server": .string("bundled_rpce_headless"), "sdk_version": .string(PromptExperimentMCPConfiguration.sdkVersion),
                         "allowed_tools": .array(PromptExperimentMCPConfiguration.allowedTools.sorted().map(Value.string)),
-                        "configuration": .string("execution.adapter=mcp_adapter; execution.mcp={tool_names:[...],component:system_prompt or tool_description_<selected tool>}; project_snapshot is required. Sealing resolves executable and schema fingerprints. Cold starts use preparation candidates before search."),
+                        "configuration": .string("execution.adapter=mcp_adapter; execution.mcp={tool_names:[...],component:system_prompt or tool_description_<selected tool>}; project_snapshot is required. Sealing resolves executable and schema fingerprints. Choose supplied-prompt preparation or explicit seedless GEPA search; inspect guidance and traces before expanding spend."),
                         "maximum_tool_calls_per_evaluation": .int(1), "maximum_target_model_calls_per_evaluation": .int(2),
                         "network": .string("denied"), "source_workspace_writes": .bool(false)
                     ]),
@@ -444,7 +444,17 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             case .completed, .inconclusive, .cancelled:
                 "Inspect results, then use continue/rerun/clone if the user wants another reviewed iteration."
             }
-            value["next_action"] = .string(nextAction)
+            if let guidance = PromptExperimentGuidance.evaluate(record) {
+                value["guidance"] = .object([
+                    "action": .string(guidance.action),
+                    "explanation": .string(guidance.explanation),
+                    "evidence_ids": .array(guidance.evidenceIDs.map(Value.string)),
+                    "grants_execution_authority": .bool(false)
+                ])
+                value["next_action"] = .string("\(guidance.explanation) \(nextAction)")
+            } else {
+                value["next_action"] = .string(nextAction)
+            }
             if let plan = record.currentPlan {
                 value["current_plan"] = sealedPlanValue(plan, approved: record.approval(for: plan) != nil)
             } else {
@@ -467,6 +477,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 ]) })
             ]
             if let optimization = plan.optimization {
+                value["starting_point"] = optimization.startingPoint.map { .string($0.rawValue) } ?? .null
+                value["seed_candidate"] = optimization.seedCandidate.map(Value.string) ?? .null
                 value["stage"] = .string(optimization.isPreparation ? "preparation" : "search")
                 value["preparation_candidates"] = optimization.preparationCandidates.map { .array($0.map(Value.string)) } ?? .null
                 value["objective"] = .string(optimization.objective)
