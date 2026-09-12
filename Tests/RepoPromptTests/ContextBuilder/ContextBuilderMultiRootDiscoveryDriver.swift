@@ -156,7 +156,7 @@ import XCTest
             let authority = try await vm.resolveMCPRunAuthority(
                 identity: .init(workspaceID: fixture.workspace.id, tabID: context.tabID),
                 nestedTabContext: context.nestedDiscoveryTabContext(runID: context.frozenTabContext.runID!),
-                workspaceContext: context, responseType: nil
+                workspaceContext: context, responseType: nil, oraclePreset: nil
             )
             if let providerValidationError { throw providerValidationError }
             return authority

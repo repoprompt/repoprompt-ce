@@ -14245,12 +14245,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let remainingPaths = current.repoPaths.filter { fileManager.workspaceRootIdentity(for: $0) != target }
         guard remainingPaths.count != current.repoPaths.count else { return }
         if remainingPaths.isEmpty {
-            if activeWorkspaceID == workspace.id,
-               let fallback = await findOrCreatePublishedDefaultWorkspace(),
-               !Task.isCancelled, activeWorkspaceID == workspace.id
-            {
-                await switchWorkspace(to: fallback)
-            }
+            await removeFinalFolder(folderPath, from: workspace)
             return
         }
 
@@ -14264,12 +14259,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let newPaths = workspaces[index].repoPaths.filter { fileManager.workspaceRootIdentity(for: $0) != target }
         guard newPaths.count != workspaces[index].repoPaths.count else { return }
         if newPaths.isEmpty {
-            if activeWorkspaceID == workspace.id,
-               let fallback = await findOrCreatePublishedDefaultWorkspace(),
-               !Task.isCancelled, activeWorkspaceID == workspace.id
-            {
-                await switchWorkspace(to: fallback)
-            }
+            await removeFinalFolder(folderPath, from: workspace)
             return
         }
         do {
@@ -14280,6 +14270,25 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         } catch {
             reportRootEditFailure(error, workspaceID: workspace.id, source: .rootRemove)
+        }
+    }
+
+    private func removeFinalFolder(_ folderPath: String, from workspace: WorkspaceModel) async {
+        guard activeWorkspaceID == workspace.id else { return }
+        let activationGeneration = rootActivationGeneration
+        guard let fallback = await findOrCreatePublishedDefaultWorkspace(),
+              !Task.isCancelled, activeWorkspaceID == workspace.id,
+              rootActivationGeneration == activationGeneration,
+              let current = self.workspace(withID: workspace.id),
+              let target = fileManager.workspaceRootIdentity(for: folderPath) else { return }
+        let remainingPaths = current.repoPaths.filter { fileManager.workspaceRootIdentity(for: $0) != target }
+        guard remainingPaths.count != current.repoPaths.count else { return }
+        if remainingPaths.isEmpty {
+            await switchWorkspace(to: fallback)
+        } else {
+            // Publishing Default can suspend while a root edit changes this workspace.
+            // Re-enter the normal removal path so capture and persistence use that new state.
+            await removeFolder(folderPath, from: current)
         }
     }
 

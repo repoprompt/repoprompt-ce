@@ -1667,6 +1667,14 @@ import XCTest
         }
 
         func testLastRootRemovalPublishesMissingDefaultBeforeActivation() async throws {
+            try await assertLastRootRemovalWhileDefaultPublishes(addRootWhilePublishing: false)
+        }
+
+        func testLastRootRemovalRechecksRootsAfterDefaultPublication() async throws {
+            try await assertLastRootRemovalWhileDefaultPublishes(addRootWhilePublishing: true)
+        }
+
+        private func assertLastRootRemovalWhileDefaultPublishes(addRootWhilePublishing: Bool) async throws {
             let runtime = try await makeDomainRuntime()
             let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1322)
             let manager = makeManager(domainRuntime: runtime)
@@ -1716,8 +1724,32 @@ import XCTest
             await publicationGate.waitUntilPaused()
             XCTAssertEqual(manager.activeWorkspaceID, workspace.id)
 
+            let addedFolder: URL?
+            do {
+                if addRootWhilePublishing {
+                    let additionalRoot = try makeFolder(named: "AddedDuringDefaultPublication")
+                    try await manager.addFolder(additionalRoot, to: projectedWorkspace)
+                    addedFolder = additionalRoot
+                } else {
+                    addedFolder = nil
+                }
+            } catch {
+                await publicationGate.release()
+                await removal.value
+                throw error
+            }
             await publicationGate.release()
             await removal.value
+
+            if let addedFolder {
+                XCTAssertEqual(manager.activeWorkspaceID, workspace.id)
+                XCTAssertEqual(manager.activeWorkspace?.repoPaths, [addedFolder.path])
+                let canonicalSnapshot = await client.canonicalWorkspaceSnapshot(workspace.id)
+                let canonical = try XCTUnwrap(canonicalSnapshot)
+                let persisted = try JSONDecoder().decode(WorkspaceModel.self, from: canonical.document.documentBytes)
+                XCTAssertEqual(persisted.repoPaths, [addedFolder.path])
+                return
+            }
 
             let activatedDefault = try XCTUnwrap(manager.activeWorkspace)
             XCTAssertTrue(activatedDefault.isSystemWorkspace)
