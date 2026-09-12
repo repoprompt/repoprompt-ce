@@ -14,6 +14,15 @@ import XCTest
 /// on the real `claude` binary and is verified as a local capture-proxy diagnostic, not a committed
 /// test, since it requires the binary and live credentials.
 final class ClaudeNativeIdentityPreambleTests: XCTestCase {
+    func testPromptExperimentUsesEmptyNativeToolAllowlistWithoutRestrictingAgentMode() async throws {
+        let controller = ClaudeNativeProcessSessionController(runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil, config: .promptExperiment())
+        let args = await controller.test_buildArguments(existingSessionID: nil, model: nil)
+        let index = try XCTUnwrap(args.firstIndex(of: "--tools"))
+        XCTAssertEqual(args[index + 1], "")
+        let ordinary = await makeController(variant: .standard).test_buildArguments(existingSessionID: nil, model: nil)
+        XCTAssertFalse(ordinary.contains("--tools"))
+    }
+
     private func makeController(variant: ClaudeCodeRuntimeVariant) -> ClaudeNativeProcessSessionController {
         // buildArguments' append logic keys only on `runtimeVariant`; the other fields .agentMode
         // derives from UserDefaults do not affect the assertions below.

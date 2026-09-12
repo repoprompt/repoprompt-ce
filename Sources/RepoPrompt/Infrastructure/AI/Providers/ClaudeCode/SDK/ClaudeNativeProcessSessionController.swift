@@ -2002,6 +2002,9 @@ final actor ClaudeNativeProcessSessionController {
                 args.append("--strict-mcp-config")
             }
         }
+        if config.toolContext == .promptOnly {
+            args.append(contentsOf: ["--tools", ""])
+        }
         if !config.disallowedBuiltInTools.isEmpty {
             args.append(contentsOf: ["--disallowedTools", config.disallowedBuiltInTools.joined(separator: ",")])
         }

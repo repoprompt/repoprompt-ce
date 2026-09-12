@@ -133,6 +133,8 @@
                         runtimeStatus: PromptExperimentGEPAWorker.runtimeStatus
                     ),
                     limitations: [
+                        PromptExperimentConnectedModelRunner.codexIsolationLimitation,
+                        "Partial evaluations and model_calls persist before optimizer advancement, including failed attempts. They are not final candidate rankings; Use candidate_evidence.sha256 as partial candidate identity, not a final optimizer index. Missing token counts remain unavailable.",
                         "DEBUG integration using the packaged CPython and upstream GEPA optimize_anything runtime; no user Python setup or provider credentials are delegated to Python.",
                         "The bound Agent session or external MCP workspace controller may draft, seal, request, wait for, and cancel owned runs. Ownership is not approval: only a native human action or server-originated MCP elicitation may approve; no automatic winner application.",
                         "Run approval can use MCP form elicitation (approval_mode=mcp) without native UI. Agent sessions also support native digest cards. Approval starts exactly one sealed revision; no tool argument grants approval.",

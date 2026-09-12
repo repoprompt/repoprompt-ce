@@ -7,6 +7,159 @@ import XCTest
 #if DEBUG
     @MainActor
     final class PromptExperimentServiceTests: XCTestCase {
+        func testCheckpointEvidenceAndUsageSurviveLaterFailureAndReload() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let id = try await preparedOptimizationExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.runtime.waitUntilWaitingForResult()
+            let checkpoint = try XCTUnwrap(harness.runtime.reportCheckpoint)
+            let target = try XCTUnwrap(plan.optimizationTargets?.reflection)
+            let callID = UUID()
+            try await checkpoint(.modelCall(.init(id: callID, target: target, role: "reflection", state: .started, promptTokens: nil, completionTokens: nil)))
+            let completed = PromptExperimentCheckpoint.modelCall(.init(id: callID, target: target, role: "reflection", state: .completed, promptTokens: 31, completionTokens: 9))
+            try await checkpoint(completed)
+            try await checkpoint(completed)
+            let evaluation = PromptExperimentCheckpoint.evaluation(id: UUID(), candidate: "Find the named value.", value: .init(
+                candidateIndex: 0, exampleID: "reviewed-1", split: .validation, score: 1,
+                feedback: "Exact answer", failureKind: nil, output: "cobalt", elapsedSeconds: 2
+            ))
+            try await checkpoint(evaluation)
+            try await checkpoint(evaluation)
+            let activeRecords = try await harness.store.loadRecords()
+            XCTAssertEqual(activeRecords.first?.attempts.last?.partialEvaluations?.count, 1)
+            XCTAssertEqual(activeRecords.first?.attempts.last?.modelCalls?.count, 1)
+            let texts = try await harness.service.readableArtifactText(for: XCTUnwrap(harness.service.record(id: id)))
+            XCTAssertTrue(texts.values.contains("cobalt"))
+            harness.runtime.settleFirst(disposition: .failed("later callback failed"))
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+            let saved = try await harness.store.loadRecords()
+            let record = try XCTUnwrap(saved.first)
+            XCTAssertEqual(record.phase, .inconclusive)
+            XCTAssertNil(record.attempts.last?.optimizationResult)
+            XCTAssertEqual(record.attempts.last?.partialEvaluations?.count, 1)
+            XCTAssertEqual(record.attempts.last?.modelCalls?.first?.promptTokens, 31)
+            let projected = try MCPAgentSessionControlToolProvider.responseValue(.record(record, artifactTextBySHA256: texts)).objectValue
+            let attempt = projected?["attempts"]?.arrayValue?.first?.objectValue
+            XCTAssertEqual(attempt?["partial_evaluations"]?.arrayValue?.first?.objectValue?["output"]?.stringValue, "cobalt")
+            XCTAssertEqual(attempt?["model_calls"]?.arrayValue?.first?.objectValue?["completion_tokens"], .int(9))
+            do { try await checkpoint(evaluation)
+                XCTFail("Late checkpoint must not mutate settled evidence")
+            } catch {}
+            XCTAssertEqual(harness.service.record(id: id)?.attempts.last?.partialEvaluations?.count, 1)
+        }
+
+        func testCancellationRetainsAdmittedCompletionButRejectsNewModelInvocation() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let id = try await preparedOptimizationExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.runtime.waitUntilWaitingForResult()
+            let checkpoint = try XCTUnwrap(harness.runtime.reportCheckpoint)
+            let target = try XCTUnwrap(plan.optimizationTargets?.reflection)
+            let invocationID = UUID()
+            try await checkpoint(.modelCall(.init(id: invocationID, target: target, role: "reflection", state: .started, promptTokens: nil, completionTokens: nil)))
+            try await harness.service.cancel(experimentID: id)
+            try await checkpoint(.modelCall(.init(id: invocationID, target: target, role: "reflection", state: .completed, promptTokens: 10, completionTokens: 2)))
+            do {
+                try await checkpoint(.modelCall(.init(id: UUID(), target: target, role: "reflection", state: .started, promptTokens: nil, completionTokens: nil)))
+                XCTFail("Cancellation must prevent new invocations")
+            } catch {}
+            harness.runtime.settleFirst(disposition: .cancelled)
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+            let records = try await harness.store.loadRecords()
+            XCTAssertEqual(records.first?.phase, .cancelled)
+            XCTAssertEqual(records.first?.attempts.last?.modelCalls?.count, 1)
+            XCTAssertEqual(records.first?.attempts.last?.modelCalls?.first?.completionTokens, 2)
+        }
+
+        func testCheckpointCanonicalWriteFailureDoesNotAcknowledgeOrDeduplicateUnsavedUsage() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let id = try await preparedOptimizationExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.runtime.waitUntilWaitingForResult()
+            let checkpoint = try XCTUnwrap(harness.runtime.reportCheckpoint)
+            let target = try XCTUnwrap(plan.optimizationTargets?.reflection)
+            let callID = UUID()
+            try await checkpoint(.modelCall(.init(id: callID, target: target, role: "reflection", state: .started, promptTokens: nil, completionTokens: nil)))
+            let canonical = harness.root.appendingPathComponent("experiments.json")
+            let backup = try Data(contentsOf: canonical)
+            try FileManager.default.removeItem(at: canonical)
+            try FileManager.default.createDirectory(at: canonical, withIntermediateDirectories: false)
+            let completed = PromptExperimentCheckpoint.modelCall(.init(id: callID, target: target, role: "reflection", state: .completed, promptTokens: 31, completionTokens: 9))
+            do { try await checkpoint(completed)
+                XCTFail("Save failure must propagate to the runtime")
+            } catch {}
+            XCTAssertEqual(harness.service.record(id: id)?.attempts.last?.modelCalls?.first?.state, .started)
+            try FileManager.default.removeItem(at: canonical)
+            try backup.write(to: canonical)
+            do { try await checkpoint(completed)
+                XCTFail("An unsaved checkpoint must not be acknowledged on retry")
+            } catch {}
+            harness.runtime.settleFirst(disposition: .failed("checkpoint persistence failed"))
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+            let saved = try await harness.store.loadRecords()
+            XCTAssertEqual(saved.first?.attempts.last?.modelCalls?.first?.state, .started)
+            XCTAssertNil(saved.first?.attempts.last?.modelCalls?.first?.promptTokens)
+        }
+
+        func testPromptOnlyPreflightRejectsCodexRolesWithoutChangingExactSelections() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let environment = try XCTUnwrap(harness.service.record(id: id)?.currentPlan?.environment)
+            let claude = PromptExperimentResolvedTarget(role: "reflection", agentRaw: AgentProviderKind.claudeCode.rawValue, modelRaw: "test-model", displayName: "test")
+            let codex = PromptExperimentResolvedTarget(role: "execution", agentRaw: AgentProviderKind.codexExec.rawValue, modelRaw: "exact-test-model", displayName: "test")
+            XCTAssertNoThrow(try PromptExperimentConnectedModelRunner.requirePromptOnlyTarget(claude))
+            XCTAssertThrowsError(try PromptExperimentConnectedModelRunner.requirePromptOnlyTarget(codex))
+            XCTAssertThrowsError(try PromptExperimentConnectedModelRunner.requirePromptOnlyTarget(XCTUnwrap(Self.fakeTarget("unknown"))))
+            for role in ["reflection", "execution", "judge"] {
+                var draft = Self.validDraft(date: Date(), repetitions: 1)
+                var spec = Self.validOptimization()
+                spec.execution.adapter = .connectedModel
+                spec.evaluator.kind = .connectedModelJudge
+                spec.evaluator.rubric = "Judge correctness."
+                spec.evaluator.judgeTargetSelector = "judge"
+                draft.optimization = spec
+                let targets = PromptExperimentOptimizationTargets(
+                    reflection: role == "reflection" ? codex : claude,
+                    execution: role == "execution" ? codex : claude,
+                    judge: role == "judge" ? codex : claude
+                )
+                let plan = try PromptExperimentPlan.seal(draft: draft, target: claude, optimizationTargets: targets, environment: environment, at: Date())
+                XCTAssertThrowsError(try PromptExperimentConnectedModelRunner.preflight(plan)) { error in
+                    XCTAssertTrue(error.localizedDescription.contains(role))
+                    XCTAssertTrue(error.localizedDescription.contains("exact-test-model"))
+                }
+                XCTAssertEqual(plan.optimizationTargets, targets)
+            }
+            var draft = Self.validDraft(date: Date(), repetitions: 1)
+            var spec = Self.validOptimization()
+            spec.stage = .preparation
+            spec.preparationCandidates = ["Find the value."]
+            spec.examples[0].split = .training
+            draft.optimization = spec
+            let plan = try PromptExperimentPlan.seal(
+                draft: draft,
+                target: codex,
+                optimizationTargets: .init(reflection: codex, execution: codex, judge: nil),
+                environment: environment,
+                at: Date()
+            )
+            XCTAssertNoThrow(try PromptExperimentConnectedModelRunner.preflight(plan), "Unused reflection and real Context Builder workflows are not prompt-only callbacks")
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+        }
+
         func testCompletionPreservesMessageBoundariesAndTerminalUsage() throws {
             let provider = CodexExecAgentProvider(config: .init(commandName: "codex", additionalPathHints: []))
             var accumulator = PromptExperimentCompletionAccumulator()
@@ -317,6 +470,7 @@ import XCTest
             var preflightError: PromptExperimentAuthorityError?
             var preflightAction: (@MainActor () async throws -> Void)?
             var observationsOnSubmit: [PromptExperimentRuntimeObservation] = []
+            var reportCheckpoint: PromptExperimentCheckpointSink?
             var reportProgress: (@MainActor @Sendable (String) async -> Void)?
             private var submissionGate: CheckedContinuation<Void, Never>?
             private var blockedSubmissionWaiters: [CheckedContinuation<Void, Never>] = []
@@ -333,7 +487,8 @@ import XCTest
             func submit(
                 _ request: PromptExperimentRunRequest,
                 progress: @escaping @MainActor @Sendable (String) async -> Void,
-                observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+                observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
+                checkpoint: @escaping PromptExperimentCheckpointSink
             ) async throws -> PromptExperimentRuntimeHandle {
                 if let error = submissionErrors[request.attempt.ordinal] { throw error }
                 if holdSubmission {
@@ -344,6 +499,7 @@ import XCTest
                         waiters.forEach { $0.resume() }
                     }
                 }
+                reportCheckpoint = checkpoint
                 reportProgress = progress
                 submitted.append(request)
                 let waiters = submissionWaiters

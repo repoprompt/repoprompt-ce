@@ -41,14 +41,46 @@
     }
 
     /// One-shot model completion over the existing Agent provider/login stack.
-    /// Every native and RepoPrompt tool is disabled by a run-scoped provider profile and policy.
+    /// Built-ins are disabled; RepoPrompt MCP execution is denied by a run-scoped policy.
     @MainActor
     final class PromptExperimentConnectedModelRunner {
         private weak var windowState: WindowState?
         private var activeProviders: [UUID: HeadlessAgentProvider] = [:]
+        private var cancellationGeneration = 0
 
         init(windowState: WindowState) {
             self.windowState = windowState
+        }
+
+        static let codexIsolationLimitation = "Connected Codex cannot currently enforce the tool-free completion contract required by GEPA target/reflection/judge callbacks. Shell and MCP tool flags do not disable every native tool. No model is substituted; ordinary Codex Agent and Context Builder runs are unaffected."
+
+        static func requirePromptOnlyTarget(_ target: PromptExperimentResolvedTarget) throws {
+            guard target.agentRaw != AgentProviderKind.codexExec.rawValue else {
+                throw PromptExperimentAuthorityError.targetUnavailable(codexIsolationLimitation)
+            }
+            guard let agent = AgentProviderKind(rawValue: target.agentRaw),
+                  [.claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible].contains(agent)
+            else {
+                throw PromptExperimentAuthorityError.targetUnavailable("The selected provider has no enforced tool-free completion profile.")
+            }
+        }
+
+        static func preflight(_ plan: PromptExperimentPlan) throws {
+            guard let spec = plan.optimization, let targets = plan.optimizationTargets else { return }
+            var roles: [(String, PromptExperimentResolvedTarget)] = []
+            if !spec.isPreparation { roles.append(("reflection", targets.reflection)) }
+            if [.connectedModel, .mcpAdapter].contains(spec.execution.adapter), let target = targets.execution {
+                roles.append(("execution", target))
+            }
+            if spec.evaluator.kind == .connectedModelJudge, let target = targets.judge { roles.append(("judge", target)) }
+            let unsupported = roles.compactMap { role, target -> String? in
+                do { try requirePromptOnlyTarget(target)
+                    return nil
+                } catch { return "\(role) (\(target.selector); \(target.canonicalSelectionID)): \(error.localizedDescription)" }
+            }
+            guard unsupported.isEmpty else {
+                throw PromptExperimentAuthorityError.targetUnavailable(unsupported.joined(separator: "\n"))
+            }
         }
 
         func complete(
@@ -57,6 +89,9 @@
             userPrompt: String,
             callbackRoot: URL
         ) async throws -> PromptExperimentConnectedModelCompletion {
+            // Before directory creation, policy leases, providers, or any model/process admission.
+            try Self.requirePromptOnlyTarget(target)
+            let generation = cancellationGeneration
             guard let windowState else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The bound Agent window is no longer available.")
             }
@@ -98,6 +133,11 @@
                     ? .promptExperiment(workingDirectory: callbackRoot.path)
                     : nil
             )
+            guard generation == cancellationGeneration, !Task.isCancelled else {
+                await lease.failAndCleanup()
+                await provider.dispose()
+                throw CancellationError()
+            }
             activeProviders[runID] = provider
             defer {
                 activeProviders.removeValue(forKey: runID)
@@ -163,6 +203,7 @@
         }
 
         func cancelAll() async {
+            cancellationGeneration += 1
             let providers = Array(activeProviders.values)
             activeProviders.removeAll()
             for provider in providers {

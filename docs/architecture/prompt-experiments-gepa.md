@@ -166,3 +166,9 @@ After a coordinated MCP build, run `Scripts/test_mcp_prompt_experiment_worker.py
 bundled interpreter. It uses actual upstream MCPAdapter and headless RPCE with deterministic host
 model replies; it is transport/isolation evidence, not model-quality evidence. Provider-backed
 MCP approval-to-execution and optimization quality require separate live runs.
+
+### Prompt-only callback capability and incremental evidence
+
+Connected Codex prompt-only execution, reflection, and judging are currently rejected before worker/provider launch: its public app-server contract does not provide a blanket native-tool deny control. No model is silently substituted. Ordinary Codex Agent and Context Builder execution remain unchanged. Claude-compatible prompt-only profiles explicitly pass an empty built-in tool allowlist in addition to the run-scoped MCP denial policy; a static blacklist is not the isolation boundary.
+
+Each connected-model invocation is checkpointed as started, then completed or failed. Available input/output usage is stored per invocation; null is unavailable, not zero. Each scored evaluation saves its candidate/output artifacts and feedback before the host releases its result to GEPA. `read`/`wait` expose `model_calls` and `partial_evaluations`, including after later infrastructure failure. Partial evaluations are not optimizer rankings or a fabricated final result; candidate artifacts establish their identity. Canonical save failure stops callback progression rather than acknowledging unsaved evidence. Historical records are not backfilled.

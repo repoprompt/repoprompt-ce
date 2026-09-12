@@ -755,6 +755,9 @@ public enum ClaudeCompatibleHeadlessRuntime {
             }
         }
 
+        if request.runtimeConfig.toolContext == .promptOnly {
+            args.append(contentsOf: ["--tools", ""])
+        }
         if !request.runtimeConfig.disallowedBuiltInTools.isEmpty {
             args.append(contentsOf: ["--disallowedTools", request.runtimeConfig.disallowedBuiltInTools.joined(separator: ",")])
         }

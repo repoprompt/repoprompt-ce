@@ -419,6 +419,19 @@
                     if let legacyEvidence = attempt.evidence {
                         lines.append("  - Legacy unclassified evidence: `../../\(legacyEvidence.relativePath)`")
                     }
+                    if let partials = attempt.partialEvaluations {
+                        lines.append("  - Incrementally saved evaluations: \(partials.count) (trial evidence, not final rankings)")
+                        for partial in partials {
+                            lines.append("    - \(Self.markdownInline(partial.evaluation.exampleID)): score \(partial.evaluation.score.map(String.init(describing:)) ?? "unavailable"); candidate `../../\(partial.candidateEvidence.relativePath)`")
+                            if let output = partial.evaluation.outputEvidence { lines.append("      - Output: `../../\(output.relativePath)`") }
+                        }
+                    }
+                    if let calls = attempt.modelCalls {
+                        lines.append("  - Model invocations (missing usage is unavailable, not zero):")
+                        for call in calls {
+                            lines.append("    - \(call.id): \(call.role) / \(Self.markdownInline(call.target.selector)) / \(call.state.rawValue); input \(call.promptTokens.map(String.init) ?? "unavailable"), output \(call.completionTokens.map(String.init) ?? "unavailable")")
+                        }
+                    }
                     if let result = attempt.optimizationResult {
                         lines.append("  - GEPA upstream revision: `\(result.upstreamRevision)`")
                         lines.append("  - Assessment: \(Self.markdownInline(result.assessment))")

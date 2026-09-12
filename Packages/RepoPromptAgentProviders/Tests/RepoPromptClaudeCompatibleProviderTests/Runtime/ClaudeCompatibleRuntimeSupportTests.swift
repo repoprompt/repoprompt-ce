@@ -148,6 +148,21 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         ])
     }
 
+    func testPromptOnlyHeadlessArgumentsExplicitlyDisableBuiltInTools() throws {
+        let config = ClaudeCompatibleRuntimeConfig(
+            pluginID: .claudeCode, mode: .discovery, commandName: "claude", additionalPathHints: [],
+            modelString: "test", enableDebugLogging: false, sdkConnectTimeoutSeconds: 10,
+            sdkRelaunchMaxAttempts: 1, permissionMode: "bypassPermissions", allowNativeBashTool: false,
+            toolContext: .promptOnly, disallowedBuiltInTools: [], mcpStrictMode: true,
+            toolSearchEnabled: false, effortLevel: nil, processEnvironmentOverrides: [:],
+            effortEnvironmentOverrides: [:], backendConfig: nil
+        )
+        let args = ClaudeCompatibleHeadlessRuntime.buildArguments(.init(runtimeConfig: config, mcpConfigPath: "/tmp/mcp.json", launchEnvironment: nil))
+        let index = try XCTUnwrap(args.firstIndex(of: "--tools"))
+        XCTAssertEqual(args[index + 1], "", "An empty blacklist alone does not disable tools")
+        XCTAssertTrue(args.contains("--strict-mcp-config"))
+    }
+
     func testProviderCatalogDefaultsExposeStableRawValues() throws {
         XCTAssertEqual(ClaudeCompatibleProviderPluginID.allCases.map(\.rawValue), [
             "claude-code",

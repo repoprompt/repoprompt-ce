@@ -557,13 +557,37 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 "assistant_output_evidence": attempt.assistantOutputEvidence.map(artifactValue) ?? .null,
                 "handoff_unavailable_reason": attempt.handoffUnavailableReason.map(Value.string) ?? .null,
                 "elapsed_seconds": elapsed.map(Value.double) ?? .null,
-                "provider_token_usage": .string("unavailable_from_context_builder_completion_contract"),
+                "provider_token_usage": .string(
+                    attempt.modelCalls == nil
+                        ? "unavailable_from_context_builder_completion_contract"
+                        : "per_invocation_in_model_calls; null_tokens_are_unavailable_not_zero"
+                ),
                 "legacy_unclassified_output_preview": attempt.outputPreview.map(Value.string) ?? .null,
                 "error": attempt.error.map(Value.string) ?? .null,
                 "optimization_result": attempt.optimizationResult.map {
                     optimizationResultValue($0, artifactTextBySHA256: artifactTextBySHA256)
                 } ?? .null
             ]
+            value["model_calls"] = attempt.modelCalls.map { calls in .array(calls.map { call in .object([
+                "id": .string(call.id.uuidString), "role": .string(call.role),
+                "target": targetValue(call.target), "state": .string(call.state.rawValue),
+                "prompt_tokens": call.promptTokens.map(Value.int) ?? .null,
+                "completion_tokens": call.completionTokens.map(Value.int) ?? .null
+            ]) }) } ?? .null
+            value["partial_evaluations"] = attempt.partialEvaluations.map { evaluations in .array(evaluations.map { partial in
+                let evaluation = partial.evaluation
+                return .object([
+                    "id": .string(partial.id.uuidString),
+                    "candidate_evidence": artifactValue(partial.candidateEvidence),
+                    "candidate": artifactTextBySHA256[partial.candidateEvidence.sha256].map(Value.string) ?? .null,
+                    "example_id": .string(evaluation.exampleID), "split": .string(evaluation.split.rawValue),
+                    "score": evaluation.score.map(Value.double) ?? .null, "feedback": .string(evaluation.feedback),
+                    "failure_kind": evaluation.failureKind.map { .string($0.rawValue) } ?? .null,
+                    "output_evidence": evaluation.outputEvidence.map(artifactValue) ?? .null,
+                    "output": evaluation.outputEvidence.flatMap { artifactTextBySHA256[$0.sha256] }.map(Value.string) ?? .null,
+                    "elapsed_seconds": evaluation.elapsedSeconds.map(Value.double) ?? .null
+                ])
+            }) } ?? .null
             value["legacy_unclassified_evidence"] = attempt.evidence.map(artifactValue) ?? .null
             value["diagnostics"] = attempt.diagnostics.map(diagnosticValue) ?? .null
             return .object(value)

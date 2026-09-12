@@ -101,6 +101,16 @@
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        if let plan = record.currentPlan, let attempt = record.attempts(for: plan).last,
+                           let partials = attempt.partialEvaluations
+                        {
+                            Text("\(partials.count) evaluations saved incrementally. These are trial evidence, not a final winner ranking.")
+                                .font(.caption)
+                        }
+                        if let plan = record.currentPlan, let calls = record.attempts(for: plan).last?.modelCalls {
+                            Text("\(calls.count) model invocations recorded; \(calls.count(where: { $0.promptTokens == nil || $0.completionTokens == nil })) have unavailable or incomplete token usage. Inspect through lab read.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         if let currentPlan = record.currentPlan,
                            let result = record.attempts(for: currentPlan).last?.optimizationResult
                         {

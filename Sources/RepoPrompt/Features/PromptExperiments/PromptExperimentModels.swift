@@ -1004,6 +1004,30 @@
         }
     }
 
+    /// Partial evidence is not a completed optimization result or a winner selection.
+    struct PromptExperimentPartialEvaluation: Codable, Equatable, Identifiable {
+        let id: UUID
+        let candidateEvidence: PromptExperimentArtifactReference
+        let evaluation: PromptExperimentEvaluationEvidence
+    }
+
+    struct PromptExperimentModelCallEvidence: Codable, Equatable, Identifiable {
+        enum State: String, Codable { case started, completed, failed }
+        let id: UUID
+        let target: PromptExperimentResolvedTarget
+        let role: String
+        let state: State
+        let promptTokens: Int?
+        let completionTokens: Int?
+    }
+
+    enum PromptExperimentCheckpoint: Equatable {
+        case modelCall(PromptExperimentModelCallEvidence)
+        case evaluation(id: UUID, candidate: String, value: PromptExperimentOptimizationRuntimeEvaluation)
+    }
+
+    typealias PromptExperimentCheckpointSink = @MainActor @Sendable (PromptExperimentCheckpoint) async throws -> Void
+
     enum PromptExperimentRuntimeObservation: Equatable {
         case workerPrepared(stderrLogRelativePath: String, stdoutProtocolLogRelativePath: String)
         case workerStarted(pid: Int32, processIdentity: String)
@@ -1067,6 +1091,9 @@
         var fixtureDigestBefore: String?
         var fixtureDigestAfter: String?
         var optimizationResult: PromptExperimentOptimizationResult?
+        // Optional for backwards decoding. Never backfill or rescore historical attempts.
+        var partialEvaluations: [PromptExperimentPartialEvaluation]?
+        var modelCalls: [PromptExperimentModelCallEvidence]?
 
         init(trial: PromptExperimentTrial, plan: PromptExperimentPlan) {
             id = PromptExperimentDigest.deterministicUUID(namespace: "attempt", value: trial.id.uuidString)

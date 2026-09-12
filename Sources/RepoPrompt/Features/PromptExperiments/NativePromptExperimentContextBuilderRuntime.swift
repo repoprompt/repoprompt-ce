@@ -27,6 +27,7 @@
         private var runningOptimizations: [UUID: RunningOptimization] = [:]
         private var optimizationChildren: [UUID: [PromptExperimentRuntimeHandle]] = [:]
         private var cancelledOptimizationIDs: Set<UUID> = []
+        private var checkpointSinks: [UUID: PromptExperimentCheckpointSink] = [:]
         private struct MCPEvaluation {
             let attemptID: UUID
             let candidate: String
@@ -58,6 +59,7 @@
             else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator requires macOS sandbox-exec, which is unavailable.")
             }
+            try PromptExperimentConnectedModelRunner.preflight(plan)
             if let mcp = optimization.execution.mcp { try mcp.verifyResolved() }
             try await PromptExperimentGEPAWorker.preflight(
                 pythonExecutable: optimization.gepa.pythonExecutablePath
@@ -67,7 +69,8 @@
         func submit(
             _ request: PromptExperimentRunRequest,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
-            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
+            checkpoint: @escaping PromptExperimentCheckpointSink
         ) async throws -> PromptExperimentRuntimeHandle {
             guard let windowState else {
                 throw PromptExperimentSubmissionError.rejected("The bound Agent window is no longer available.")
@@ -80,7 +83,7 @@
                 throw PromptExperimentSubmissionError.rejected("The sealed plan or synthetic environment is invalid.")
             }
             if plan.optimization != nil {
-                return try await submitOptimization(request, progress: progress, observation: observation)
+                return try await submitOptimization(request, progress: progress, observation: observation, checkpoint: checkpoint)
             }
             guard plan.executionAdapter == PromptExperimentPlan.executionAdapter else {
                 throw PromptExperimentSubmissionError.rejected("The legacy Context Builder plan adapter is invalid.")
@@ -288,7 +291,8 @@
         private func submitOptimization(
             _ request: PromptExperimentRunRequest,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
-            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
+            checkpoint: @escaping PromptExperimentCheckpointSink
         ) async throws -> PromptExperimentRuntimeHandle {
             guard request.plan.executionAdapter == PromptExperimentPlan.gepaExecutionAdapter,
                   request.plan.optimization != nil,
@@ -306,10 +310,12 @@
             } catch {
                 throw PromptExperimentSubmissionError.rejected(error.localizedDescription)
             }
+            checkpointSinks[request.attempt.id] = checkpoint
             let worker = PromptExperimentGEPAWorker()
             cancelledOptimizationIDs.remove(request.attempt.id)
             let task = Task { @MainActor [self] in
                 defer {
+                    checkpointSinks.removeValue(forKey: request.attempt.id)
                     mcpEvaluations = mcpEvaluations.filter { $0.value.attemptID != request.attempt.id }
                     mcpEvaluationCounts.removeValue(forKey: request.attempt.id)
                 }
@@ -402,6 +408,44 @@
             progress: @escaping @MainActor @Sendable (String) async -> Void,
             observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
         ) async -> PromptExperimentGEPAHostReply {
+            let evaluationID = (payload["evaluation_id"] as? String).flatMap(UUID.init(uuidString:))
+            let evaluation = evaluationID.flatMap { mcpEvaluations[$0] }
+            if operation == "mcp_grade", evaluation?.attemptID != parentRequest.attempt.id {
+                return infrastructureReply("MCP grading has no admitted evaluation identity.")
+            }
+            let reply = await performGEPAHostRequest(
+                parentRequest: parentRequest,
+                callbackID: callbackID,
+                operation: operation,
+                payload: payload,
+                progress: progress,
+                observation: observation
+            )
+            guard reply.ok, let score = reply.score, ["evaluate", "mcp_grade"].contains(operation) else { return reply }
+            do {
+                guard let sink = checkpointSinks[parentRequest.attempt.id], let id = operation == "mcp_grade" ? evaluationID : UUID(uuidString: callbackID),
+                      let candidate = evaluation?.candidate ?? payload["candidate"] as? String,
+                      let example = evaluation?.example ?? payload["example"] as? [String: Any],
+                      let exampleID = example["id"] as? String,
+                      let split = (example["split"] as? String).flatMap(PromptExperimentDatasetSplit.init(rawValue:))
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Evaluation checkpoint identity is unavailable.") }
+                try await sink(.evaluation(id: id, candidate: candidate, value: .init(
+                    candidateIndex: payload["candidate_index"] as? Int ?? -1, exampleID: exampleID, split: split,
+                    score: score, feedback: reply.feedback ?? "", failureKind: reply.failureKind,
+                    output: reply.output, elapsedSeconds: reply.elapsedSeconds
+                )))
+                return reply
+            } catch { return infrastructureReply("Evaluation evidence could not be persisted: \(error.localizedDescription)") }
+        }
+
+        private func performGEPAHostRequest(
+            parentRequest: PromptExperimentRunRequest,
+            callbackID: String,
+            operation: String,
+            payload: [String: Any],
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+        ) async -> PromptExperimentGEPAHostReply {
             guard !cancelledOptimizationIDs.contains(parentRequest.attempt.id) else {
                 return infrastructureReply("The GEPA run was cancelled before this host request could start.")
             }
@@ -445,6 +489,7 @@
                     let completion = try await invokeConnectedModel(
                         parentRequest: parentRequest,
                         target: targets.reflection,
+                        role: "reflection",
                         systemPrompt: "Act as GEPA's reflection language model. Return only the complete proposed replacement candidate. All tools are disabled.",
                         userPrompt: prompt
                     )
@@ -527,6 +572,7 @@
                 let completion = try await invokeConnectedModel(
                     parentRequest: parentRequest,
                     target: target,
+                    role: "execution",
                     systemPrompt: system,
                     userPrompt: "Continue this conversation, returning only the next assistant response:\n" + prompt
                 )
@@ -633,6 +679,7 @@
                     let completion = try await invokeConnectedModel(
                         parentRequest: parentRequest,
                         target: executionTarget,
+                        role: "execution",
                         systemPrompt: executionInstructions,
                         userPrompt: input
                     )
@@ -709,6 +756,7 @@
                 let judgment = try await invokeConnectedModel(
                     parentRequest: parentRequest,
                     target: judge,
+                    role: "judge",
                     systemPrompt: "Return only the requested evaluator JSON. All tools are disabled; do not propose or reveal held-out examples.",
                     userPrompt: judgePrompt
                 )
@@ -739,6 +787,7 @@
         private func invokeConnectedModel(
             parentRequest: PromptExperimentRunRequest,
             target: PromptExperimentResolvedTarget,
+            role: String,
             systemPrompt: String,
             userPrompt: String
         ) async throws -> PromptExperimentConnectedModelCompletion {
@@ -749,12 +798,22 @@
                 .appendingPathComponent("callback-roots", isDirectory: true)
                 .appendingPathComponent(parentRequest.attempt.id.uuidString.lowercased(), isDirectory: true)
                 .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
-            return try await connectedModelRunner.complete(
-                target: target,
-                systemPrompt: systemPrompt,
-                userPrompt: userPrompt,
-                callbackRoot: callbackRoot
-            )
+            guard let sink = checkpointSinks[parentRequest.attempt.id] else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Model callback has no durable checkpoint sink.")
+            }
+            let invocationID = UUID()
+            try await sink(.modelCall(.init(id: invocationID, target: target, role: role, state: .started, promptTokens: nil, completionTokens: nil)))
+            let completion: PromptExperimentConnectedModelCompletion
+            do {
+                try Task.checkCancellation()
+                guard !cancelledOptimizationIDs.contains(parentRequest.attempt.id) else { throw CancellationError() }
+                completion = try await connectedModelRunner.complete(target: target, systemPrompt: systemPrompt, userPrompt: userPrompt, callbackRoot: callbackRoot)
+            } catch {
+                try await sink(.modelCall(.init(id: invocationID, target: target, role: role, state: .failed, promptTokens: nil, completionTokens: nil)))
+                throw error
+            }
+            try await sink(.modelCall(.init(id: invocationID, target: target, role: role, state: .completed, promptTokens: completion.promptTokens, completionTokens: completion.completionTokens)))
+            return completion
         }
 
         private nonisolated static func sumAvailable(_ left: Int?, _ right: Int?) -> Int? {
@@ -800,7 +859,9 @@
                 plan: childPlan,
                 attempt: childAttempt
             )
-            let handle = try await submit(childRequest, progress: progress, observation: observation)
+            let handle = try await submit(childRequest, progress: progress, observation: observation, checkpoint: { _ in
+                throw PromptExperimentAuthorityError.runtimeUnavailable("A Context Builder child cannot emit optimizer checkpoints.")
+            })
             optimizationChildren[parentRequest.attempt.id, default: []].append(handle)
             await observation(.callbackLinked(
                 id: callbackID,

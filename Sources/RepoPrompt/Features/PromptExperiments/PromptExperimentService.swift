@@ -8,7 +8,8 @@
         func submit(
             _ request: PromptExperimentRunRequest,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
-            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
+            checkpoint: @escaping PromptExperimentCheckpointSink
         ) async throws -> PromptExperimentRuntimeHandle
         func wait(for handle: PromptExperimentRuntimeHandle) async -> PromptExperimentRuntimeResult
         func cancel(_ handle: PromptExperimentRuntimeHandle) async -> PromptExperimentCancellationObservation
@@ -87,6 +88,10 @@
         }
 
         private var executionTasks: [UUID: Task<Void, Never>] = [:]
+        private var failedCheckpointAttempts: Set<UUID> = []
+        private var checkpointInFlight: Set<UUID> = []
+        private var persistenceBusy = false
+        private var persistenceWaiters: [CheckedContinuation<Void, Never>] = []
         private var admittedExperimentIDs: Set<UUID> = []
         private var activeHandles: [UUID: PromptExperimentRuntimeHandle] = [:]
         private var pendingRunApprovals: [UUID: PendingRunApproval] = [:]
@@ -1210,6 +1215,10 @@
             for attempt in record.attempts {
                 if let prompt = attempt.committedHandoff?.promptEvidence { references.append(prompt) }
                 if let assistant = attempt.assistantOutputEvidence { references.append(assistant) }
+                for partial in attempt.partialEvaluations ?? [] {
+                    references.append(partial.candidateEvidence)
+                    if let output = partial.evaluation.outputEvidence { references.append(output) }
+                }
                 if let result = attempt.optimizationResult {
                     references.append(contentsOf: result.candidates.map(\.candidateEvidence))
                     references.append(contentsOf: result.evaluations.compactMap(\.outputEvidence))
@@ -1293,6 +1302,10 @@
                                 attemptID: attemptID,
                                 observation: observation
                             )
+                        },
+                        checkpoint: { [weak self] value in
+                            guard let self else { throw PromptExperimentAuthorityError.runtimeUnavailable("Experiment store is unavailable.") }
+                            try await persistCheckpoint(experimentID: experimentID, attemptID: attemptID, value: value)
                         }
                     )
                 } catch let error as PromptExperimentSubmissionError {
@@ -1556,6 +1569,134 @@
             }
         }
 
+        private func persistCheckpoint(experimentID: UUID, attemptID: UUID, value: PromptExperimentCheckpoint) async throws {
+            guard !failedCheckpointAttempts.contains(attemptID), checkpointInFlight.insert(attemptID).inserted else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("Checkpoint storage is failed or already busy for this attempt.")
+            }
+            defer { checkpointInFlight.remove(attemptID) }
+            do {
+                try await commitCheckpoint(experimentID: experimentID, attemptID: attemptID, value: value)
+            } catch {
+                // An unsuccessful checkpoint is never published or acknowledged on replay.
+                failedCheckpointAttempts.insert(attemptID)
+                throw error
+            }
+        }
+
+        private func commitCheckpoint(experimentID: UUID, attemptID: UUID, value: PromptExperimentCheckpoint) async throws {
+            let record = try records[index(of: experimentID)]
+            guard let attempt = record.attempts.first(where: { $0.id == attemptID }),
+                  attempt.planID == record.currentPlan?.id,
+                  [.submitting, .running, .cancellationRequested].contains(attempt.status),
+                  let plan = record.currentPlan, let spec = plan.optimization
+            else { throw PromptExperimentAuthorityError.runtimeUnavailable("Checkpoint no longer belongs to an active sealed attempt.") }
+            switch value {
+            case let .modelCall(call):
+                let expected: PromptExperimentResolvedTarget? = switch call.role {
+                case "execution": plan.optimizationTargets?.execution
+                case "reflection": spec.isPreparation ? nil : plan.optimizationTargets?.reflection
+                case "judge": spec.evaluator.kind == .connectedModelJudge ? plan.optimizationTargets?.judge : nil
+                default: nil
+                }
+                guard call.target == expected,
+                      call.state != .started || attempt.status != .cancellationRequested,
+                      call.state == .completed || (call.promptTokens == nil && call.completionTokens == nil),
+                      call.promptTokens.map({ $0 >= 0 }) != false,
+                      call.completionTokens.map({ $0 >= 0 }) != false
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Invalid model usage checkpoint.") }
+                if let old = attempt.modelCalls?.first(where: { $0.id == call.id }) {
+                    if old == call { return }
+                    guard old.state == .started, call.state != .started, old.target == call.target, old.role == call.role else {
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting model usage checkpoint.")
+                    }
+                } else if call.state != .started {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("Model completion has no admitted invocation.")
+                }
+                try await saveCheckpointUpdate(experimentID: experimentID, attemptID: attemptID, planID: plan.id) { attempt in
+                    guard call.state != .started || attempt.status != .cancellationRequested else {
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("Cancellation prevents a new model invocation.")
+                    }
+                    var calls = attempt.modelCalls ?? []
+                    if let i = calls.firstIndex(where: { $0.id == call.id }) { calls[i] = call } else { calls.append(call) }
+                    attempt.modelCalls = calls
+                }
+            case let .evaluation(id, candidate, evaluation):
+                guard let example = spec.examples.first(where: { $0.id == evaluation.exampleID }),
+                      example.split == evaluation.split, !candidate.isEmpty,
+                      spec.admitsPreparationEvaluation(candidate: candidate, exampleID: example.id),
+                      evaluation.score.map({ $0.isFinite && $0 >= spec.evaluator.minimumScore && $0 <= spec.evaluator.maximumScore }) == true,
+                      evaluation.elapsedSeconds.map({ $0.isFinite && $0 >= 0 }) != false,
+                      evaluation.failureKind != .infrastructure
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Evaluation checkpoint is outside the sealed scope.") }
+                let candidateRef = try await store.installArtifact(Data(candidate.utf8), fileExtension: "txt")
+                let outputRef: PromptExperimentArtifactReference? = if let output = evaluation.output {
+                    try await store.installArtifact(Data(output.utf8), fileExtension: "txt")
+                } else { nil }
+                guard let current = records.first(where: { $0.id == experimentID }), current.currentPlan?.id == plan.id,
+                      let active = current.attempts.first(where: { $0.id == attemptID }),
+                      [.submitting, .running, .cancellationRequested].contains(active.status)
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("Attempt settled while checkpoint artifacts were being saved.") }
+                let partial = PromptExperimentPartialEvaluation(id: id, candidateEvidence: candidateRef, evaluation: .init(
+                    id: id, candidateIndex: evaluation.candidateIndex, exampleID: evaluation.exampleID,
+                    split: evaluation.split, score: evaluation.score, feedback: evaluation.feedback,
+                    failureKind: evaluation.failureKind, outputEvidence: outputRef, elapsedSeconds: evaluation.elapsedSeconds
+                ))
+                if let old = attempt.partialEvaluations?.first(where: { $0.id == id }) {
+                    guard old == partial else { throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting evaluation checkpoint.") }
+                    return
+                }
+                guard (attempt.partialEvaluations?.count ?? 0) < spec.gepa.maxEvaluations else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("Evaluation checkpoint exceeds the sealed budget.")
+                }
+                try await saveCheckpointUpdate(experimentID: experimentID, attemptID: attemptID, planID: plan.id) { attempt in
+                    var partials = attempt.partialEvaluations ?? []
+                    partials.append(partial)
+                    attempt.partialEvaluations = partials
+                }
+            }
+        }
+
+        /// Hold the same save gate as ordinary status writes, but publish checkpoint fields only
+        /// after their canonical commit. Status mutations may proceed in memory during the await;
+        /// their saves wait here and snapshot the newly committed ledger after publication.
+        private func saveCheckpointUpdate(
+            experimentID: UUID, attemptID: UUID, planID: UUID,
+            update: (inout PromptExperimentAttempt) throws -> Void
+        ) async throws {
+            await acquirePersistence()
+            defer { releasePersistence() }
+            var staged = records
+            guard let i = staged.firstIndex(where: { $0.id == experimentID }),
+                  staged[i].currentPlan?.id == planID,
+                  let j = staged[i].attempts.firstIndex(where: { $0.id == attemptID }),
+                  [.submitting, .running, .cancellationRequested].contains(staged[i].attempts[j].status)
+            else { throw PromptExperimentAuthorityError.runtimeUnavailable("Checkpoint attempt is no longer active.") }
+            try update(&staged[i].attempts[j])
+            staged[i].updatedAt = now()
+            let report = try await store.saveRecords(staged)
+            // Do not replace status/diagnostics changed during the store actor suspension.
+            if let liveI = records.firstIndex(where: { $0.id == experimentID }),
+               let liveJ = records[liveI].attempts.firstIndex(where: { $0.id == attemptID })
+            {
+                records[liveI].attempts[liveJ].modelCalls = staged[i].attempts[j].modelCalls
+                records[liveI].attempts[liveJ].partialEvaluations = staged[i].attempts[j].partialEvaluations
+                records[liveI].updatedAt = max(records[liveI].updatedAt, staged[i].updatedAt)
+            }
+            projectionError = report.message
+        }
+
+        private func acquirePersistence() async {
+            if !persistenceBusy { persistenceBusy = true
+                return
+            }
+            await withCheckedContinuation { persistenceWaiters.append($0) }
+        }
+
+        private func releasePersistence() {
+            if persistenceWaiters.isEmpty { persistenceBusy = false }
+            else { persistenceWaiters.removeFirst().resume() }
+        }
+
         private func updateProgress(experimentID: UUID, attemptID: UUID, message: String) async {
             try? await mutate(experimentID: experimentID) { record in
                 guard record.phase == .running,
@@ -1705,6 +1846,8 @@
         }
 
         private func persist() async throws {
+            await acquirePersistence()
+            defer { releasePersistence() }
             records.sort { $0.updatedAt > $1.updatedAt }
             let report = try await store.saveRecords(records)
             projectionError = report.message
