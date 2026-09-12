@@ -26,6 +26,17 @@
         let sourceTabID: UUID
         let authorizedSourceRoots: [String]
 
+        /// The legacy controllerSessionID storage field is an owner key. Workspace controllers
+        /// have a separate deterministic namespace and never impersonate an Agent session.
+        static func workspace(_ workspaceID: UUID, tabID: UUID, roots: [String]) -> Self {
+            Self(
+                controllerSessionID: PromptExperimentDigest.deterministicUUID(
+                    namespace: "mcp-workspace-experiment-controller-v1", value: workspaceID.uuidString
+                ),
+                sourceTabID: tabID, authorizedSourceRoots: roots
+            )
+        }
+
         init(controllerSessionID: UUID, sourceTabID: UUID, authorizedSourceRoots: [String] = []) {
             self.controllerSessionID = controllerSessionID
             self.sourceTabID = sourceTabID
@@ -97,7 +108,7 @@
     }
 
     /// Session-facing experiment authority. Agents can request and observe runs, but only the
-    /// native digest card can grant approval; approved work executes through the existing runtime.
+    /// user response through MCP elicitation or a native digest card can grant approval.
     @MainActor
     struct PromptExperimentAgentInterface {
         let service: PromptExperimentService
@@ -123,12 +134,12 @@
                     ),
                     limitations: [
                         "DEBUG integration using the packaged CPython and upstream GEPA optimize_anything runtime; no user Python setup or provider credentials are delegated to Python.",
-                        "The linked Agent session may draft, seal, request, wait for, and cancel owned runs, but it cannot approve or apply a winner.",
-                        "The user approves one exact native digest card; that action automatically starts the sealed run.",
+                        "The bound Agent session or external MCP workspace controller may draft, seal, request, wait for, and cancel owned runs. Ownership is not approval: only a native human action or server-originated MCP elicitation may approve; no automatic winner application.",
+                        "Run approval can use MCP form elicitation (approval_mode=mcp) without native UI. Agent sessions also support native digest cards. Approval starts exactly one sealed revision; no tool argument grants approval.",
                         "Specification schema 3 supports stage=preparation with preparation_candidates: a fixed reviewed batch on training examples only, without GEPA proposals or hidden/validation evaluation. Read feedback, revise through new drafts, then continue a selected tested candidate into stage=search with preparation_candidates cleared. Preparation is not held-out optimization evidence.",
                         "New runs are bounded by evaluation count, not an experiment-wide wall-clock deadline. Cancellation and bounded individual host operations remain available, and durable diagnostics identify the latest observed worker/callback state.",
-                        "Prompt-only connected-model, Context Builder, and sandboxed-command adapters are supported for catalog targets shown here. ACP, Investigate, and multi-agent adapters remain explicit unsupported capabilities.",
-                        "Reviewed project files may be copied from the Agent session's currently loaded root into an app-owned snapshot. Expected outputs, notes, and held-out grading data remain host-private."
+                        "Supported execution adapters: connected_model, context_builder, sandboxed_command, and mcp_adapter. MCP adapter uses the pinned upstream two-pass adapter against an isolated read-only headless RPCE server and reviewed project files. It optimizes system_prompt or tool_description_<selected tool>. Remote/arbitrary MCP servers, ACP, Investigate, and multi-agent execution remain unsupported. Do not describe this one-tool workflow as native multi-turn agent execution.",
+                        "Reviewed project files may be copied from the authorized currently loaded workspace roots into an app-owned snapshot. Expected outputs, notes, and held-out grading data remain host-private."
                     ]
                 )
             case .list:

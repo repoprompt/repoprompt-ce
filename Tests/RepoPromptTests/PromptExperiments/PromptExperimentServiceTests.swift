@@ -7,6 +7,235 @@ import XCTest
 #if DEBUG
     @MainActor
     final class PromptExperimentServiceTests: XCTestCase {
+        func testCompletionPreservesMessageBoundariesAndTerminalUsage() throws {
+            let provider = CodexExecAgentProvider(config: .init(commandName: "codex", additionalPathHints: []))
+            var accumulator = PromptExperimentCompletionAccumulator()
+            let answer = "{\"action\":\"answer\",\"text\":\"same answer\"}"
+            for id in ["commentary-id", "final-id"] {
+                let data = try JSONSerialization.data(withJSONObject: [
+                    "type": "item.completed", "item": ["type": "agent_message", "id": id, "text": answer]
+                ])
+                let event = try XCTUnwrap(provider.parseJSONLEvent(data))
+                XCTAssertEqual(event.contentMessageID, id)
+                accumulator.consume(event)
+            }
+            let terminal = try XCTUnwrap(provider.parseJSONLEvent(Data(
+                #"{"type":"turn.completed","usage":{"input_tokens":31,"output_tokens":9}}"#.utf8
+            )))
+            accumulator.consume(terminal)
+            XCTAssertEqual(accumulator.output, answer)
+            XCTAssertEqual(accumulator.promptTokens, 31)
+            XCTAssertEqual(accumulator.completionTokens, 9)
+            var deltas = PromptExperimentCompletionAccumulator()
+            deltas.consume(AIStreamResult(type: "content", text: "same"))
+            deltas.consume(AIStreamResult(type: "content", text: "same"))
+            XCTAssertEqual(deltas.output, "samesame", "Do not heuristically deduplicate valid token deltas")
+            deltas.consume(AIStreamResult(type: "final_content", text: "authoritative final"))
+            XCTAssertEqual(deltas.output, "authoritative final")
+        }
+
+        func testLiveProgressProjectsThroughMCPAndCannotOverwriteCancellationOrSettlement() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let id = try await preparedOptimizationExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            try await harness.service.run(experimentID: id)
+            await harness.runtime.waitUntilWaitingForResult()
+            let progress = try XCTUnwrap(harness.runtime.reportProgress)
+            await progress("Evaluated candidate 2 (3/6 budget calls).")
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            let projected = try MCPAgentSessionControlToolProvider.responseValue(.record(record, artifactTextBySHA256: [:])).objectValue
+            XCTAssertEqual(projected?["status"]?.stringValue, "Evaluated candidate 2 (3/6 budget calls).")
+            XCTAssertEqual(projected?["attempts"]?.arrayValue?.first?.objectValue?["status_text"]?.stringValue, record.statusMessage)
+            let persisted = try await harness.store.loadRecords()
+            XCTAssertEqual(persisted.first?.statusMessage, record.statusMessage)
+            try await harness.service.cancel(experimentID: id)
+            let cancelling = harness.service.record(id: id)?.statusMessage
+            await progress("late progress after cancellation")
+            XCTAssertEqual(harness.service.record(id: id)?.statusMessage, cancelling)
+            harness.runtime.settleFirst()
+            await harness.service.waitForExecutionForTesting(experimentID: id)
+            let terminal = harness.service.record(id: id)?.statusMessage
+            await progress("late progress after settlement")
+            XCTAssertEqual(harness.service.record(id: id)?.statusMessage, terminal)
+        }
+
+        func testMCPConfigurationAllowsOnlyReadOnlyToolsAndRoundTripsResolvedFields() throws {
+            let valid = PromptExperimentMCPConfiguration(toolNames: ["read_file"], component: "tool_description_read_file", toolDefinitionsJson: "[]", serverSha256: "digest")
+            XCTAssertNoThrow(try valid.validate())
+            let encoder = JSONEncoder()
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            XCTAssertEqual(try decoder.decode(PromptExperimentMCPConfiguration.self, from: encoder.encode(valid)), valid)
+            for invalid in [
+                PromptExperimentMCPConfiguration(toolNames: ["prompt_experiment"], component: "system_prompt"),
+                PromptExperimentMCPConfiguration(toolNames: ["read_file", "read_file"], component: "system_prompt"),
+                PromptExperimentMCPConfiguration(toolNames: ["read_file"], component: "tool_description_file_actions")
+            ] {
+                XCTAssertThrowsError(try invalid.validate())
+            }
+        }
+
+        func testWorkspaceControllerIsStableAcrossClientsButCannotImpersonateAgentOrOtherWorkspace() {
+            let workspaceID = UUID()
+            let first = PromptExperimentAgentOwner.workspace(workspaceID, tabID: UUID(), roots: ["/one"])
+            let resumed = PromptExperimentAgentOwner.workspace(workspaceID, tabID: UUID(), roots: ["/one"])
+            let other = PromptExperimentAgentOwner.workspace(UUID(), tabID: UUID(), roots: ["/one"])
+            XCTAssertEqual(first.controllerSessionID, resumed.controllerSessionID)
+            XCTAssertNotEqual(first.controllerSessionID, workspaceID)
+            XCTAssertNotEqual(first.controllerSessionID, other.controllerSessionID)
+        }
+
+        func testMCPApprovalStartsExactRunAndSurvivesReloadWithoutNativeCard() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            harness.runtime.holdResults = true
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(controllerSessionID: sealed.controllerSessionID, sourceTabID: sealed.sourceTabID)
+            let started = try await harness.service.requestRunUsingMCPApproval(
+                experimentID: id, expectedPlanDigest: plan.digest, owner: owner
+            ) { disclosed in
+                XCTAssertEqual(disclosed, plan)
+                XCTAssertTrue(harness.runtime.submitted.isEmpty)
+                XCTAssertFalse(harness.service.bindRuntimeIfIdle(FakeRuntime(), bindingIdentity: ObjectIdentifier(NSObject())))
+                return true
+            }
+            XCTAssertEqual(started.phase, .running)
+            XCTAssertEqual(started.approval(for: plan)?.source, .mcpElicitation)
+            await harness.runtime.waitUntilWaitingForResult()
+            harness.runtime.settleFirst()
+            let completed = try await harness.service.waitForExecution(
+                experimentID: id, expectedPlanDigest: plan.digest,
+                expectedControllerSessionID: owner.controllerSessionID, timeoutSeconds: 30
+            )
+            XCTAssertEqual(completed.phase, .completed)
+            let repeated = try await harness.service.requestRunUsingMCPApproval(
+                experimentID: id, expectedPlanDigest: plan.digest, owner: owner
+            ) { _ in XCTFail("A retry must not request approval or buy another run")
+                return true
+            }
+            XCTAssertEqual(repeated.attempts.count, 1)
+            let reloaded = try await harness.store.loadRecords()
+            XCTAssertEqual(reloaded.first?.approval(for: plan)?.source, .mcpElicitation)
+        }
+
+        func testMCPDeclineAndLateAcceptAfterCancelDoNotExecute() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(controllerSessionID: sealed.controllerSessionID, sourceTabID: sealed.sourceTabID)
+            let declined = try await harness.service.requestRunUsingMCPApproval(
+                experimentID: id, expectedPlanDigest: plan.digest, owner: owner
+            ) { _ in false }
+            XCTAssertEqual(declined.phase, .awaitingApproval)
+            XCTAssertTrue(declined.approvals.isEmpty)
+            do {
+                _ = try await harness.service.requestRunUsingMCPApproval(
+                    experimentID: id, expectedPlanDigest: plan.digest, owner: owner
+                ) { _ in
+                    try await harness.service.cancel(
+                        experimentID: id, expectedPlanDigest: plan.digest,
+                        expectedControllerSessionID: owner.controllerSessionID
+                    )
+                    return true
+                }
+                XCTFail("Late acceptance must not resurrect a cancelled request")
+            } catch is CancellationError {}
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+            XCTAssertTrue(try XCTUnwrap(harness.service.record(id: id)).approvals.isEmpty)
+        }
+
+        func testMCPApprovalCannotStartAfterCancellationDuringPreflight() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(controllerSessionID: sealed.controllerSessionID, sourceTabID: sealed.sourceTabID)
+            harness.runtime.preflightAction = {
+                try await harness.service.cancel(
+                    experimentID: id, expectedPlanDigest: plan.digest,
+                    expectedControllerSessionID: owner.controllerSessionID
+                )
+            }
+            defer { harness.runtime.preflightAction = nil }
+            do {
+                _ = try await harness.service.requestRunUsingMCPApproval(
+                    experimentID: id, expectedPlanDigest: plan.digest, owner: owner
+                ) { _ in true }
+                XCTFail("Preflight must not overwrite cancellation")
+            } catch let error as PromptExperimentAuthorityError {
+                guard case .illegalPhase = error else { return XCTFail("Unexpected error: \(error)") }
+            }
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+            XCTAssertEqual(harness.service.record(id: id)?.phase, .cancelled)
+            let saved = try await harness.store.loadRecords()
+            XCTAssertEqual(saved.first?.phase, .cancelled)
+        }
+
+        func testMCPWrongOwnerAndDigestNeverPresentApproval() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            for (ownerID, digest, expected) in [
+                (UUID(), plan.digest, PromptExperimentAuthorityError.ownerMismatch),
+                (sealed.controllerSessionID, "stale", .digestMismatch)
+            ] {
+                do {
+                    _ = try await harness.service.requestRunUsingMCPApproval(
+                        experimentID: id, expectedPlanDigest: digest,
+                        owner: .init(controllerSessionID: ownerID, sourceTabID: sealed.sourceTabID)
+                    ) { _ in XCTFail("Invalid authority must not reach elicitation")
+                        return true
+                    }
+                    XCTFail("Invalid authority must fail")
+                } catch let error as PromptExperimentAuthorityError { XCTAssertEqual(error, expected) }
+            }
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+        }
+
+        func testMCPCancelReleasesRunCallerBeforeFormResponds() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let sealed = try XCTUnwrap(harness.service.record(id: id))
+            let plan = try XCTUnwrap(sealed.currentPlan)
+            let owner = PromptExperimentAgentOwner(controllerSessionID: sealed.controllerSessionID, sourceTabID: sealed.sourceTabID)
+            var reply: CheckedContinuation<Bool, Never>?
+            var presentation: CheckedContinuation<Void, Never>?
+            let pending = Task {
+                try await harness.service.requestRunUsingMCPApproval(
+                    experimentID: id, expectedPlanDigest: plan.digest, owner: owner
+                ) { _ in
+                    await withCheckedContinuation { continuation in
+                        reply = continuation
+                        presentation?.resume()
+                    }
+                }
+            }
+            await withCheckedContinuation { presentation = $0 }
+            try await harness.service.cancel(
+                experimentID: id, expectedPlanDigest: plan.digest,
+                expectedControllerSessionID: owner.controllerSessionID
+            )
+            do {
+                _ = try await pending.value
+                XCTFail("The cancelled run call must settle before the form replies")
+            } catch is CancellationError {}
+            reply?.resume(returning: true)
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+            XCTAssertTrue(try XCTUnwrap(harness.service.record(id: id)).approvals.isEmpty)
+        }
+
         func testLiveServiceAvailabilityPublishesLateInstallationAndReplacement() {
             let first = makeHarness()
             let replacement = makeHarness()
@@ -86,7 +315,9 @@ import XCTest
             var holdSubmission = false
             var preflightedPlans: [PromptExperimentPlan] = []
             var preflightError: PromptExperimentAuthorityError?
+            var preflightAction: (@MainActor () async throws -> Void)?
             var observationsOnSubmit: [PromptExperimentRuntimeObservation] = []
+            var reportProgress: (@MainActor @Sendable (String) async -> Void)?
             private var submissionGate: CheckedContinuation<Void, Never>?
             private var blockedSubmissionWaiters: [CheckedContinuation<Void, Never>] = []
             private var resultContinuations: [UUID: CheckedContinuation<PromptExperimentRuntimeResult, Never>] = [:]
@@ -95,6 +326,7 @@ import XCTest
 
             func preflightOptimization(_ plan: PromptExperimentPlan) async throws {
                 preflightedPlans.append(plan)
+                try await preflightAction?()
                 if let preflightError { throw preflightError }
             }
 
@@ -112,6 +344,7 @@ import XCTest
                         waiters.forEach { $0.resume() }
                     }
                 }
+                reportProgress = progress
                 submitted.append(request)
                 let waiters = submissionWaiters
                 submissionWaiters.removeAll()
@@ -541,6 +774,11 @@ import XCTest
             guard case let .capabilities(operations, targets, gepaRuntime, _) = capabilities else {
                 return XCTFail("Expected capabilities")
             }
+            let external = try MCPAgentSessionControlToolProvider.responseValue(capabilities, usesMCPApproval: true).objectValue
+            XCTAssertEqual(external?["native_approval_required"], .bool(false))
+            XCTAssertEqual(external?["user_approval_required"], .bool(true))
+            let native = try MCPAgentSessionControlToolProvider.responseValue(capabilities).objectValue
+            XCTAssertEqual(native?["native_approval_required"], .bool(true))
             XCTAssertFalse(operations.contains("approve"))
             XCTAssertTrue(operations.contains("run"))
             XCTAssertTrue(operations.contains("wait"))
@@ -1838,7 +2076,7 @@ import XCTest
                 at: date
             )
 
-            XCTAssertEqual(plan.schemaVersion, 5)
+            XCTAssertEqual(plan.schemaVersion, PromptExperimentPlan.optimizationSchemaVersion)
             XCTAssertNil(plan.optimization?.gepa.maxWallClockSeconds)
             XCTAssertTrue(plan.verifiesIntegrity())
             let encoded = try JSONEncoder().encode(plan)

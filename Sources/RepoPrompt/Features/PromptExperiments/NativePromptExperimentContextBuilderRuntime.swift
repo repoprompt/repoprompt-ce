@@ -27,6 +27,15 @@
         private var runningOptimizations: [UUID: RunningOptimization] = [:]
         private var optimizationChildren: [UUID: [PromptExperimentRuntimeHandle]] = [:]
         private var cancelledOptimizationIDs: Set<UUID> = []
+        private struct MCPEvaluation {
+            let attemptID: UUID
+            let candidate: String
+            let example: [String: Any]
+            var modelCalls: Int = 0
+        }
+
+        private var mcpEvaluations: [UUID: MCPEvaluation] = [:]
+        private var mcpEvaluationCounts: [UUID: Int] = [:]
 
         init(windowState: WindowState) {
             self.windowState = windowState
@@ -49,6 +58,7 @@
             else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed command evaluator requires macOS sandbox-exec, which is unavailable.")
             }
+            if let mcp = optimization.execution.mcp { try mcp.verifyResolved() }
             try await PromptExperimentGEPAWorker.preflight(
                 pythonExecutable: optimization.gepa.pythonExecutablePath
             )
@@ -299,6 +309,10 @@
             let worker = PromptExperimentGEPAWorker()
             cancelledOptimizationIDs.remove(request.attempt.id)
             let task = Task { @MainActor [self] in
+                defer {
+                    mcpEvaluations = mcpEvaluations.filter { $0.value.attemptID != request.attempt.id }
+                    mcpEvaluationCounts.removeValue(forKey: request.attempt.id)
+                }
                 do {
                     let result = try await worker.run(
                         plan: request.plan,
@@ -398,6 +412,12 @@
             }
             do {
                 switch operation {
+                case "mcp_begin", "mcp_model", "mcp_grade":
+                    return try await handleMCPHostRequest(
+                        parentRequest: parentRequest, callbackID: callbackID, operation: operation,
+                        payload: payload, specification: specification, targets: targets,
+                        progress: progress, observation: observation
+                    )
                 case "reflect":
                     guard !specification.isPreparation else {
                         throw PromptExperimentAuthorityError.runtimeUnavailable("Preparation authorizes only the reviewed candidate evaluations, not reflection calls.")
@@ -463,6 +483,95 @@
             }
         }
 
+        private func handleMCPHostRequest(
+            parentRequest: PromptExperimentRunRequest, callbackID: String, operation: String,
+            payload: [String: Any], specification: PromptExperimentOptimizationSpecification,
+            targets: PromptExperimentOptimizationTargets,
+            progress: @escaping @MainActor @Sendable (String) async -> Void,
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+        ) async throws -> PromptExperimentGEPAHostReply {
+            guard specification.execution.adapter == .mcpAdapter, let target = targets.execution else {
+                throw PromptExperimentAuthorityError.runtimeUnavailable("The sealed plan does not authorize MCP evaluation callbacks.")
+            }
+            if operation == "mcp_begin" {
+                guard let candidate = payload["candidate"] as? String, !candidate.isEmpty,
+                      let example = payload["example"] as? [String: Any],
+                      let exampleID = example["id"] as? String,
+                      let sealed = specification.examples.first(where: { $0.id == exampleID }),
+                      example["input"] as? String == sealed.input,
+                      example["split"] as? String == sealed.split.rawValue,
+                      specification.admitsPreparationEvaluation(candidate: candidate, exampleID: exampleID),
+                      mcpEvaluationCounts[parentRequest.attempt.id, default: 0] < specification.gepa.maxEvaluations
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("MCP evaluation is outside the sealed dataset, preparation candidates, or evaluation budget.") }
+                let id = UUID()
+                mcpEvaluationCounts[parentRequest.attempt.id, default: 0] += 1
+                mcpEvaluations[id] = MCPEvaluation(attemptID: parentRequest.attempt.id, candidate: candidate, example: example)
+                return PromptExperimentGEPAHostReply(ok: true, output: id.uuidString, score: nil, feedback: nil, failureKind: nil, error: nil, elapsedSeconds: nil)
+            }
+            guard let rawID = payload["evaluation_id"] as? String, let id = UUID(uuidString: rawID),
+                  var evaluation = mcpEvaluations[id], evaluation.attemptID == parentRequest.attempt.id
+            else { throw PromptExperimentAuthorityError.runtimeUnavailable("Unknown or already completed MCP evaluation callback.") }
+            if operation == "mcp_model" {
+                guard let phase = payload["phase"] as? Int, phase == evaluation.modelCalls + 1, phase <= 2,
+                      let messages = payload["messages"] as? [[String: Any]],
+                      let system = messages.first?["content"] as? String,
+                      messages.first?["role"] as? String == "system"
+                else { throw PromptExperimentAuthorityError.runtimeUnavailable("MCP model callback violated its two-pass sequence.") }
+                evaluation.modelCalls += 1
+                mcpEvaluations[id] = evaluation
+                await observation(.callbackLinked(id: callbackID, runtime: PromptExperimentRuntimeLink(
+                    adapter: "upstream_mcp_adapter_v1", tabID: nil, runID: id,
+                    provider: target.agentRaw, model: target.modelRaw
+                )))
+                let prompt = try String(decoding: JSONSerialization.data(withJSONObject: Array(messages.dropFirst()), options: [.sortedKeys]), as: UTF8.self)
+                let completion = try await invokeConnectedModel(
+                    parentRequest: parentRequest,
+                    target: target,
+                    systemPrompt: system,
+                    userPrompt: "Continue this conversation, returning only the next assistant response:\n" + prompt
+                )
+                return PromptExperimentGEPAHostReply(
+                    ok: true,
+                    output: completion.output,
+                    score: nil,
+                    feedback: nil,
+                    failureKind: nil,
+                    error: nil,
+                    elapsedSeconds: nil,
+                    promptTokens: completion.promptTokens,
+                    completionTokens: completion.completionTokens
+                )
+            }
+            guard evaluation.modelCalls > 0, let answer = payload["answer"] as? String,
+                  let trace = payload["trace"] as? [String: Any]
+            else { throw PromptExperimentAuthorityError.runtimeUnavailable("MCP grading requires a completed model trajectory.") }
+            mcpEvaluations.removeValue(forKey: id)
+            let evidence = try String(decoding: JSONSerialization.data(withJSONObject: ["final_answer": answer, "mcp_trajectory": trace], options: [.sortedKeys]), as: UTF8.self)
+            if payload["candidate_failure"] as? Bool == true {
+                return PromptExperimentGEPAHostReply(
+                    ok: true,
+                    output: evidence,
+                    score: specification.evaluator.minimumScore,
+                    feedback: "Invalid tool-choice JSON, disallowed tool, invalid arguments, or tool-level error. Inspect the MCP trajectory.",
+                    failureKind: .candidate,
+                    error: nil,
+                    elapsedSeconds: nil
+                )
+            }
+            return try await evaluate(
+                candidate: evaluation.candidate,
+                example: evaluation.example,
+                parentRequest: parentRequest,
+                specification: specification,
+                targets: targets,
+                callbackID: callbackID,
+                progress: progress,
+                observation: observation,
+                mcpAnswer: answer,
+                mcpEvidence: evidence
+            )
+        }
+
         private func evaluate(
             candidate: String,
             example: [String: Any],
@@ -471,7 +580,8 @@
             targets: PromptExperimentOptimizationTargets,
             callbackID: String,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
-            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void
+            observation: @escaping @MainActor @Sendable (PromptExperimentRuntimeObservation) async -> Void,
+            mcpAnswer: String? = nil, mcpEvidence: String? = nil
         ) async throws -> PromptExperimentGEPAHostReply {
             let started = Date()
             guard let exampleID = example["id"] as? String,
@@ -542,6 +652,11 @@
                     nil,
                     nil
                 )
+            case .mcpAdapter:
+                try {
+                    guard let mcpAnswer else { throw PromptExperimentAuthorityError.runtimeUnavailable("MCP evaluations must use the upstream adapter callback sequence.") }
+                    return (mcpAnswer, nil, nil)
+                }()
             case .sandboxedCommand:
                 throw PromptExperimentAuthorityError.runtimeUnavailable("Sandboxed command execution was routed to a connected-model evaluator.")
             }
@@ -558,9 +673,9 @@
                     : "Expected:\n\(expected)\nActual:\n\(output)\nRevise the candidate to close this concrete gap without memorizing the example."
                 return PromptExperimentGEPAHostReply(
                     ok: true,
-                    output: output,
+                    output: mcpEvidence ?? output,
                     score: score,
-                    feedback: feedback,
+                    feedback: sealedExample.split == .hiddenTest ? "Held-out score recorded; reference-derived feedback is withheld." : feedback,
                     failureKind: nil,
                     error: nil,
                     elapsedSeconds: elapsed,
@@ -579,6 +694,7 @@
                 Input:\n\(input)
                 Reviewed expected output (may be unavailable):\n\(expected)
                 Actual output:\n\(output)
+                MCP execution evidence (if any):\n\(mcpEvidence ?? "not applicable")
                 """
                 await observation(.callbackLinked(
                     id: callbackID,
@@ -606,9 +722,9 @@
                 }
                 return PromptExperimentGEPAHostReply(
                     ok: true,
-                    output: output,
+                    output: mcpEvidence ?? output,
                     score: score,
-                    feedback: feedback,
+                    feedback: sealedExample.split == .hiddenTest ? "Held-out score recorded; reference-derived feedback is withheld." : feedback,
                     failureKind: nil,
                     error: nil,
                     elapsedSeconds: elapsed,

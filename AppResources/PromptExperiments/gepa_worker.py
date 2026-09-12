@@ -12,6 +12,7 @@ import importlib.metadata
 import json
 import os
 import pathlib
+import signal
 import sys
 import time
 import uuid
@@ -21,6 +22,10 @@ PROTOCOL_VERSION = 1
 PROTOCOL_OUT = sys.stdout
 EXPECTED_GEPA_VERSION = "0.1.4"
 EXPECTED_GEPA_REVISION = "0632cdb5dcc052e690eab439e1b4a7e3e9cfe407"
+
+
+class WorkerCancelled(BaseException):
+    pass
 
 
 class InfrastructureFailure(BaseException):
@@ -184,6 +189,15 @@ def main() -> int:
         output_dir = pathlib.Path(str(body["output_dir"])).resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
+        if body.get("mcp_adapter") is not None:
+            # -I omits script directories; this is the signed resource directory, never project scratch.
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+            from mcp_evaluation import stop_children
+            def cancel_adapter(signum, frame):
+                stop_children()
+                raise WorkerCancelled(signum)
+            signal.signal(signal.SIGTERM, cancel_adapter)
+            signal.signal(signal.SIGINT, cancel_adapter)
         evaluations: list[dict[str, Any]] = []
         provisional_candidate_indices: dict[str, int] = {}
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "reported": 0, "unavailable": 0}
@@ -214,12 +228,16 @@ def main() -> int:
             candidate_index = provisional_candidate_indices[text]
             example_value = example if isinstance(example, dict) else {"id": "single", "input": example}
             split = str(example_value.get("split", "training"))
-            response = host_call("evaluate", {
-                "candidate": text,
-                "candidate_index": candidate_index,
-                "example": example_value,
-                "split": split,
-            })
+            if body.get("mcp_adapter") is not None:
+                from mcp_evaluation import evaluate_mcp
+                response = evaluate_mcp(text, example_value, body, host_call, emit, InfrastructureFailure, record_usage)
+            else:
+                response = host_call("evaluate", {
+                    "candidate": text,
+                    "candidate_index": candidate_index,
+                    "example": example_value,
+                    "split": split,
+                })
             record_usage(response)
             score_value = response.get("score")
             if score_value is None:
@@ -388,6 +406,9 @@ def main() -> int:
         }
         emit({"protocol_version": PROTOCOL_VERSION, "type": "completed", "result": payload})
         return 0
+    except WorkerCancelled as error:
+        emit({"protocol_version": PROTOCOL_VERSION, "type": "cancelled", "signal": error.args[0]})
+        return 130
     except InfrastructureFailure as error:
         emit_failure(error)
         return 2

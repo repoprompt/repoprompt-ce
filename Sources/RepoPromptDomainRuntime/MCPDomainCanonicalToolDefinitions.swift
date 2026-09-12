@@ -1128,13 +1128,21 @@ package enum MCPDomainCanonicalToolDefinitions {
             let operations = MCPDomainToolCatalog.promptExperimentOperations
             return MCPDomainToolDefinition(
                 name: MCPWindowToolName.promptExperiment,
-                description: "Set up, request native digest approval for, run, wait for, cancel, inspect, and iterate on a DEBUG Prompt Experiment owned by the bound Agent session. Only an authentic native card action can approve; one approval starts the exact sealed run automatically.",
+                description: "Operate the DEBUG GEPA lab through MCP: capabilities, draft/setup, revise, seal, run, wait/status, cancel, read evidence, clone, rerun and continue. External clients use workspace-scoped ownership without an Agent session: capabilities returns workspace_id, required on subsequent calls. Run uses negotiated MCP form elicitation to approve the complete exact plan and starts automatically. Agent sessions retain session ownership and may choose approval_mode=mcp instead of native cards. No tool argument can approve or promote. Cold starts support reviewed stage=preparation batches before GEPA search; no experiment-wide deadline.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
                         "op": .object([
                             "type": .string("string"),
                             "enum": .array(operations.map(Value.string))
+                        ]),
+                        "workspace_id": .object([
+                            "type": .string("string"),
+                            "description": .string("External MCP operations require the workspace ID returned by capabilities, matching the bound workspace.")
+                        ]),
+                        "approval_mode": .object([
+                            "type": .string("string"), "enum": .array([.string("mcp"), .string("native")]),
+                            "description": .string("Agent sessions may select mcp form elicitation. External clients always use mcp; no native UI is required.")
                         ]),
                         "experiment_id": .object(["type": .string("string")]),
                         "expected_draft_id": .object(["type": .string("string")]),

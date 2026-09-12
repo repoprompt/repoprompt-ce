@@ -1996,9 +1996,21 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Create, update, seal, and inspect a DEBUG native Prompt Experiment draft owned by the bound Agent session. This tool cannot approve or start a run.",
+      "description" : "Operate the DEBUG GEPA lab through MCP: capabilities, draft/setup, revise, seal, run, wait/status, cancel, read evidence, clone, rerun and continue. External clients use workspace-scoped ownership without an Agent session: capabilities returns workspace_id, required on subsequent calls. Run uses negotiated MCP form elicitation to approve the complete exact plan and starts automatically. Agent sessions retain session ownership and may choose approval_mode=mcp instead of native cards. No tool argument can approve or promote. Cold starts support reviewed stage=preparation batches before GEPA search; no experiment-wide deadline.",
       "inputSchema" : {
         "properties" : {
+          "approval_mode" : {
+            "description" : "Agent sessions may select mcp form elicitation. External clients always use mcp; no native UI is required.",
+            "enum" : [
+              "mcp",
+              "native"
+            ],
+            "type" : "string"
+          },
+          "candidate_index" : {
+            "description" : "Optional exact GEPA candidate index to continue; omitted means the recorded best candidate.",
+            "type" : "integer"
+          },
           "candidate_instructions" : {
             "type" : "string"
           },
@@ -2021,10 +2033,20 @@
             "enum" : [
               "capabilities",
               "list",
+              "setup",
               "create_draft",
               "update_draft",
               "propose_seal",
+              "status",
+              "run",
+              "wait",
+              "cancel",
               "read",
+              "clone",
+              "clone_draft",
+              "rerun",
+              "propose_run_again",
+              "continue",
               "propose_next_revision"
             ],
             "type" : "string"
@@ -2035,6 +2057,10 @@
           "repetitions" : {
             "type" : "integer"
           },
+          "specification_json" : {
+            "description" : "Complete versioned optimization specification JSON returned by create/read. Includes objective, examples, evaluator, execution adapter, optional reviewed project snapshot, and GEPA configuration. Replaces the specification under draft version and digest checks.",
+            "type" : "string"
+          },
           "synthetic_fixture" : {
             "type" : "string"
           },
@@ -2044,7 +2070,15 @@
           "task_input" : {
             "type" : "string"
           },
+          "timeout_seconds" : {
+            "description" : "For wait only: 0-3600 seconds before returning current progress. Default 120.",
+            "type" : "number"
+          },
           "title" : {
+            "type" : "string"
+          },
+          "workspace_id" : {
+            "description" : "External MCP operations require the workspace ID returned by capabilities, matching the bound workspace.",
             "type" : "string"
           }
         },

@@ -666,7 +666,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                 switch itemType {
                 case "agent_message", "message", "assistant":
                     if let text = item["text"] as? String, !text.isEmpty {
-                        return AIStreamResult(type: "content", text: text, reasoning: nil, promptTokens: nil, completionTokens: nil, cost: nil)
+                        return AIStreamResult(type: "content", text: text, contentMessageID: item["id"] as? String)
                     }
                 case "reasoning":
                     if let text = item["text"] as? String, !text.isEmpty {

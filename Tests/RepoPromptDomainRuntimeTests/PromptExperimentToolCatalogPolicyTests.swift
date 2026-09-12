@@ -40,7 +40,7 @@ import XCTest
         func testFreshEngineerProfilesAdvertiseAndAdmitExperimentWithoutReasoningTools() async throws {
             let runtime = try await makeRuntime()
             let profiles = MCPClientToolPolicyProfile.allCases.filter {
-                ![.direct, .discovery, .agentModeGenericExplore].contains($0)
+                ![.discovery, .agentModeGenericExplore].contains($0)
             }
             for profile in profiles {
                 let policy = snapshot(profile)
@@ -60,13 +60,13 @@ import XCTest
             }
         }
 
-        func testDirectDiscoveryAndPromptOnlyCallbacksRemainDenied() async throws {
+        func testDiscoveryAndPromptOnlyCallbacksRemainDenied() async throws {
             let runtime = try await makeRuntime()
             let promptOnly = MCPDomainClientPolicySnapshot(
                 restrictedToolNames: Set(MCPDomainToolCatalog.orderedToolNames),
                 additionalToolNames: [], role: .engineer, allowsAgentExternalControlTools: false
             )
-            for policy in [snapshot(.direct), snapshot(.discovery), promptOnly] {
+            for policy in [snapshot(.discovery), promptOnly] {
                 let catalog = await runtime.domainHost.advertisedCatalog(.init(
                     isGloballyEnabled: true, disabledToolNames: [], policy: policy
                 ))

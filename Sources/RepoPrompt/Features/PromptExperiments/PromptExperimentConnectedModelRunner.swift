@@ -8,6 +8,38 @@
         let completionTokens: Int?
     }
 
+    /// Completion consumers need one assistant answer, not concatenated commentary + final messages.
+    /// Preserve provider message boundaries; never repair output by guessing at JSON or deduplicating text.
+    struct PromptExperimentCompletionAccumulator {
+        private var streamedOutput = ""
+        private var lastMessageID: String?
+        private var finalOutput: String?
+        private(set) var promptTokens: Int?
+        private(set) var completionTokens: Int?
+
+        var output: String {
+            (finalOutput ?? streamedOutput).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        mutating func consume(_ event: AIStreamResult) {
+            // Codex reports usage on message_stop; other providers may use a separate usage event.
+            promptTokens = event.promptTokens ?? promptTokens
+            completionTokens = event.completionTokens ?? completionTokens
+            switch event.type {
+            case "content":
+                if let messageID = event.contentMessageID, !messageID.isEmpty, messageID != lastMessageID {
+                    streamedOutput = ""
+                    lastMessageID = messageID
+                }
+                streamedOutput += event.text ?? ""
+            case "final_content":
+                finalOutput = event.text
+            default:
+                break
+            }
+        }
+    }
+
     /// One-shot model completion over the existing Agent provider/login stack.
     /// Every native and RepoPrompt tool is disabled by a run-scoped provider profile and policy.
     @MainActor
@@ -79,21 +111,12 @@
                         AgentMessage(systemPrompt: systemPrompt, userMessage: userPrompt),
                         runID: runID
                     )
-                    var output = ""
-                    var finalOutput: String?
-                    var promptTokens: Int?
-                    var completionTokens: Int?
+                    var accumulator = PromptExperimentCompletionAccumulator()
                     var reachedTerminal = false
                     for try await event in stream {
                         try Task.checkCancellation()
+                        accumulator.consume(event)
                         switch event.type {
-                        case "content":
-                            output += event.text ?? ""
-                        case "final_content":
-                            finalOutput = event.text
-                        case "usage":
-                            promptTokens = event.promptTokens ?? promptTokens
-                            completionTokens = event.completionTokens ?? completionTokens
                         case "tool_call", "tool_result":
                             throw PromptExperimentAuthorityError.runtimeUnavailable(
                                 "A prompt-only experiment callback attempted to use a disabled tool."
@@ -117,7 +140,7 @@
                             "The prompt-only provider did not establish its run-scoped no-tool routing policy."
                         )
                     }
-                    let effective = (finalOutput ?? output).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let effective = accumulator.output
                     guard reachedTerminal, !effective.isEmpty else {
                         throw PromptExperimentAuthorityError.runtimeUnavailable(
                             "The connected provider completed without a non-empty terminal response."
@@ -126,8 +149,8 @@
                     await provider.dispose()
                     return PromptExperimentConnectedModelCompletion(
                         output: effective,
-                        promptTokens: promptTokens,
-                        completionTokens: completionTokens
+                        promptTokens: accumulator.promptTokens,
+                        completionTokens: accumulator.completionTokens
                     )
                 } catch {
                     await lease.failAndCleanup()

@@ -2493,13 +2493,20 @@ actor ServerNetworkManager {
 
     private func effectivePolicyState(for connectionID: UUID) -> (restricted: Set<String>, additional: Set<String>, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool) {
         let restricted = restrictedToolsByConnection[connectionID] ?? []
-        let additional = additionalToolsByConnection[connectionID] ?? []
+        var additional = additionalToolsByConnection[connectionID] ?? []
         let preassigned = preassignedConnections.contains(connectionID)
         let purpose = runPurposeByConnection[connectionID] ?? .unknown
         let runState: RunConnectionPolicyState? = {
             guard let runID = runIDByConnectionID[connectionID] else { return nil }
             return runPolicyStateByRunID[runID]
         }()
+        #if DEBUG
+            // Ordinary app-proxy clients can operate the workspace-scoped lab. Run-scoped
+            // discovery/evaluation clients must retain their explicit grants and restrictions.
+            if purpose == .unknown, !preassigned, runIDByConnectionID[connectionID] == nil {
+                additional.insert(MCPWindowToolName.promptExperiment)
+            }
+        #endif
         let taskLabelKind = runState?.taskLabelKind
         let allowsAgentExternalControlTools = runState?.allowsAgentExternalControlTools ?? false
         return (restricted, additional, preassigned, purpose, taskLabelKind, allowsAgentExternalControlTools)
@@ -14805,6 +14812,17 @@ actor ServerNetworkManager {
             .map { String(format: "%02x", $0) }
             .joined()
     }
+
+    #if DEBUG
+        func promptExperimentElicitationConnection(_ connectionID: UUID) async throws -> BootstrapSocketConnectionManager {
+            guard let connection = connections[connectionID] as? BootstrapSocketConnectionManager,
+                  await connection.supportsFormElicitation()
+            else {
+                throw MCPError.invalidRequest("MCP-only experiment approval requires a client that negotiates form elicitation. No run was approved or started. Reconnect with elicitation support; approval cannot be supplied as tool arguments.")
+            }
+            return connection
+        }
+    #endif
 
     /// Returns the verified peer PID for a bootstrap socket connection, if available.
     func peerPID(for connectionID: UUID) async -> Int? {

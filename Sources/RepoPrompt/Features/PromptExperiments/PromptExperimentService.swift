@@ -90,6 +90,8 @@
         private var admittedExperimentIDs: Set<UUID> = []
         private var activeHandles: [UUID: PromptExperimentRuntimeHandle] = [:]
         private var pendingRunApprovals: [UUID: PendingRunApproval] = [:]
+        private var mcpApprovalRequests: [UUID: UUID] = [:]
+        private var mcpApprovalWaiters: [UUID: (requestID: UUID, continuation: CheckedContinuation<Bool, Error>)] = [:]
         private var pendingRunApprovalObservers: [UUID: [CheckedContinuation<Void, Never>]] = [:]
         private var executionWaiters: [UUID: [UUID: ExecutionWaiter]] = [:]
         private var loadTask: Task<Void, Never>?
@@ -118,7 +120,7 @@
             bindingIdentity: ObjectIdentifier
         ) -> Bool {
             if runtimeBindingIdentity == bindingIdentity { return true }
-            guard admittedExperimentIDs.isEmpty, pendingRunApprovals.isEmpty else { return false }
+            guard admittedExperimentIDs.isEmpty, pendingRunApprovals.isEmpty, mcpApprovalRequests.isEmpty else { return false }
             runtime = replacement
             runtimeBindingIdentity = bindingIdentity
             return true
@@ -363,7 +365,11 @@
             guard try draft.contentDigest() == expectedDraftDigest else {
                 throw PromptExperimentAuthorityError.draftDigestMismatch
             }
-            let validated = try draft.validated()
+            var validated = try draft.validated()
+            if validated.optimization?.execution.adapter == .mcpAdapter {
+                let resolvedMCP = try validated.optimization?.execution.mcp?.resolved()
+                validated.optimization?.execution.mcp = resolvedMCP
+            }
             let optimizationTargets: PromptExperimentOptimizationTargets?
             let target: PromptExperimentResolvedTarget
             if let optimization = validated.optimization {
@@ -469,7 +475,9 @@
             experimentID: UUID,
             displayedDigest: String,
             source: PromptExperimentApprovalActor = .nativeUI,
-            expectedControllerSessionID: UUID? = nil
+            expectedControllerSessionID: UUID? = nil,
+            expectedMCPRequestID: UUID? = nil,
+            validateAuthority: @MainActor () throws -> Void = {}
         ) async throws {
             try await requireLoaded()
             let index = try index(of: experimentID)
@@ -481,7 +489,14 @@
             guard records[index].approval(for: plan) == nil else {
                 throw PromptExperimentAuthorityError.illegalPhase("This exact plan is already approved.")
             }
-            guard source == .nativeUI else { throw PromptExperimentAuthorityError.approvalRequiresNativeUI }
+            guard source == .nativeUI || source == .mcpElicitation else { throw PromptExperimentAuthorityError.approvalRequiresNativeUI }
+            if source == .mcpElicitation {
+                guard let expectedMCPRequestID, mcpApprovalRequests[experimentID] == expectedMCPRequestID else {
+                    throw CancellationError()
+                }
+            }
+            try Task.checkCancellation()
+            try validateAuthority()
             guard displayedDigest == plan.digest, plan.verifiesIntegrity() else {
                 throw PromptExperimentAuthorityError.digestMismatch
             }
@@ -524,7 +539,7 @@
             case .running, .cancelling, .completed, .inconclusive, .cancelled:
                 return records[index]
             case .awaitingApproval:
-                guard pendingRunApprovals[experimentID] == nil else {
+                guard pendingRunApprovals[experimentID] == nil, mcpApprovalRequests[experimentID] == nil else {
                     throw PromptExperimentAuthorityError.experimentAlreadyRunning
                 }
                 return try await withTaskCancellationHandler {
@@ -571,6 +586,113 @@
             case .drafting:
                 throw PromptExperimentAuthorityError.illegalPhase("Seal the reviewed draft before requesting a run.")
             }
+        }
+
+        /// Approval arrives from the negotiated MCP transport, never from a tool argument.
+        /// Pin the runtime while awaiting the user, and fence late responses against cancellation
+        /// and replacement requests for the same digest. Existing run/wait/evidence authority is reused.
+        func requestRunUsingMCPApproval(
+            experimentID: UUID,
+            expectedPlanDigest: String,
+            owner: PromptExperimentAgentOwner,
+            validateAuthority: @MainActor () throws -> Void = {},
+            authorize: @escaping @MainActor (PromptExperimentPlan) async throws -> Bool
+        ) async throws -> PromptExperimentRecord {
+            let record = try await ownedRecord(id: experimentID, controllerSessionID: owner.controllerSessionID)
+            guard let plan = record.currentPlan else { throw PromptExperimentAuthorityError.noSealedPlan }
+            guard plan.digest == expectedPlanDigest, plan.verifiesIntegrity() else {
+                throw PromptExperimentAuthorityError.digestMismatch
+            }
+            guard record.phase == .awaitingApproval else {
+                return try await requestRun(
+                    experimentID: experimentID, expectedPlanDigest: expectedPlanDigest,
+                    expectedControllerSessionID: owner.controllerSessionID
+                )
+            }
+            guard pendingRunApprovals[experimentID] == nil, mcpApprovalRequests[experimentID] == nil else {
+                throw PromptExperimentAuthorityError.experimentAlreadyRunning
+            }
+            let requestID = UUID()
+            mcpApprovalRequests[experimentID] = requestID
+            defer {
+                if mcpApprovalRequests[experimentID] == requestID {
+                    mcpApprovalRequests.removeValue(forKey: experimentID)
+                }
+            }
+            let pendingIndex = try index(of: experimentID)
+            records[pendingIndex].statusMessage = "Awaiting MCP user approval for exact plan digest " + plan.digest
+            records[pendingIndex].updatedAt = now()
+            try await persist()
+            try Task.checkCancellation()
+            guard mcpApprovalRequests[experimentID] == requestID else { throw CancellationError() }
+            let accepted: Bool
+            do {
+                accepted = try await awaitMCPApproval(experimentID: experimentID, requestID: requestID) {
+                    try await authorize(plan)
+                }
+            } catch {
+                if mcpApprovalRequests[experimentID] == requestID {
+                    let index = try index(of: experimentID)
+                    records[index].statusMessage = "MCP approval did not complete; the plan remains unapproved. Inspect the client connection and request again."
+                    records[index].updatedAt = now()
+                    try await persist()
+                }
+                throw error
+            }
+            try Task.checkCancellation()
+            guard mcpApprovalRequests[experimentID] == requestID else { throw CancellationError() }
+            if accepted {
+                try await approve(
+                    experimentID: experimentID, displayedDigest: expectedPlanDigest,
+                    source: .mcpElicitation, expectedControllerSessionID: owner.controllerSessionID,
+                    expectedMCPRequestID: requestID, validateAuthority: validateAuthority
+                )
+                try await run(
+                    experimentID: experimentID, expectedPlanDigest: expectedPlanDigest,
+                    expectedControllerSessionID: owner.controllerSessionID
+                )
+            }
+            if !accepted {
+                let index = try index(of: experimentID)
+                records[index].statusMessage = "MCP approval declined. The plan remains unapproved; revise it or request approval again."
+                records[index].updatedAt = now()
+                try await persist()
+            }
+            return try await ownedRecord(id: experimentID, controllerSessionID: owner.controllerSessionID)
+        }
+
+        /// The SDK's elicitation request can outlive task cancellation. Release the lab caller
+        /// immediately; a late transport response is harmless because this exact waiter is gone.
+        private func awaitMCPApproval(
+            experimentID: UUID,
+            requestID: UUID,
+            authorize: @escaping @MainActor () async throws -> Bool
+        ) async throws -> Bool {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    guard !Task.isCancelled, mcpApprovalRequests[experimentID] == requestID else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    mcpApprovalWaiters[experimentID] = (requestID, continuation)
+                    Task { @MainActor [weak self] in
+                        let result: Result<Bool, Error>
+                        do { result = try await .success(authorize()) }
+                        catch { result = .failure(error) }
+                        self?.finishMCPApproval(experimentID: experimentID, requestID: requestID, result: result)
+                    }
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.finishMCPApproval(experimentID: experimentID, requestID: requestID, result: .failure(CancellationError()))
+                }
+            }
+        }
+
+        private func finishMCPApproval(experimentID: UUID, requestID: UUID, result: Result<Bool, Error>) {
+            guard let waiter = mcpApprovalWaiters[experimentID], waiter.requestID == requestID else { return }
+            mcpApprovalWaiters.removeValue(forKey: experimentID)
+            waiter.continuation.resume(with: result)
         }
 
         func approveAndRun(
@@ -723,7 +845,7 @@
             expectedControllerSessionID: UUID? = nil
         ) async throws {
             try await requireLoaded()
-            let index = try index(of: experimentID)
+            var index = try index(of: experimentID)
             try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
             guard !admittedExperimentIDs.contains(experimentID) else {
                 throw PromptExperimentAuthorityError.experimentAlreadyRunning
@@ -744,6 +866,14 @@
                 }
                 try await runtime.preflightOptimization(plan)
             }
+            // Preflight suspends. Re-resolve the record (persist sorts the array), and never
+            // overwrite a cancellation or a new revision with the stale approved snapshot.
+            try Task.checkCancellation()
+            index = try self.index(of: experimentID)
+            try requireOwner(records[index], expectedControllerSessionID: expectedControllerSessionID)
+            guard records[index].phase == .approved, records[index].currentPlan?.digest == plan.digest,
+                  records[index].cancellationRequestedAt == nil
+            else { throw PromptExperimentAuthorityError.illegalPhase("Run was cancelled or superseded during preflight.") }
             guard records[index].attempts(for: plan).isEmpty else {
                 throw PromptExperimentAuthorityError.illegalPhase("This immutable plan already has an execution history and cannot be run again.")
             }
@@ -783,11 +913,28 @@
                 throw PromptExperimentAuthorityError.digestMismatch
             }
             if records[index].phase == .awaitingApproval, let expectedPlanDigest {
+                if let requestID = mcpApprovalRequests.removeValue(forKey: experimentID) {
+                    finishMCPApproval(experimentID: experimentID, requestID: requestID, result: .failure(CancellationError()))
+                    records[index].statusMessage = "MCP approval request cancelled; any late response is invalid. The sealed plan remains unapproved."
+                    records[index].updatedAt = now()
+                    try await persist()
+                    return
+                }
                 await cancelPendingRunRequest(
                     experimentID: experimentID,
                     expectedPlanDigest: expectedPlanDigest,
                     statusMessage: "Run approval request cancelled by its owning Agent session; the sealed plan remains unapproved."
                 )
+                return
+            }
+            if records[index].phase == .approved {
+                mcpApprovalRequests.removeValue(forKey: experimentID)
+                records[index].phase = .cancelled
+                records[index].cancellationRequestedAt = now()
+                records[index].updatedAt = now()
+                records[index].statusMessage = "Cancelled before provider admission; no evaluation was started."
+                try await persist()
+                resumeExecutionWaiters(experimentID: experimentID)
                 return
             }
             guard records[index].phase == .running || records[index].phase == .cancelling else { return }
@@ -1411,8 +1558,13 @@
 
         private func updateProgress(experimentID: UUID, attemptID: UUID, message: String) async {
             try? await mutate(experimentID: experimentID) { record in
-                guard let index = record.attempts.firstIndex(where: { $0.id == attemptID }) else { return }
+                guard record.phase == .running,
+                      let index = record.attempts.firstIndex(where: { $0.id == attemptID }),
+                      record.attempts[index].planID == record.currentPlan?.id,
+                      [.submitting, .running].contains(record.attempts[index].status)
+                else { return }
                 record.attempts[index].statusText = message
+                record.statusMessage = message
             }
         }
 

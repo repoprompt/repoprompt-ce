@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "runtimeVersion": "cpython-3.11.16+20260901-gepa-0.1.4-0632cdb5",
+  "runtimeVersion": "cpython-3.11.16+20260901-gepa-0.1.4-0632cdb5-mcp-1.30.0",
   "python": {
     "distribution": "python-build-standalone",
     "release": "20260901",
@@ -25,14 +25,18 @@
       "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.11.16%2B20260901-aarch64-apple-darwin-pgo%2Blto-full.tar.zst",
       "size": 41154354,
       "sha256": "19b8d2af1719e3fe8cd4edfa2e5030dab776233c05044f4348dbe3c0af7d1b2f",
-      "treeSha256": "1bf88c1e7bcd822d1c7bb3b000d8e67bd731ba520897b6457deb318fee864cd0"
+      "treeSha256": "2f11f69b5ab45e8d8d660539fccd079d841305677d554cb2b99e8cd2045262c9"
     },
     "x86_64": {
       "archive": "cpython-3.11.16+20260901-x86_64-apple-darwin-pgo+lto-full.tar.zst",
       "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.11.16%2B20260901-x86_64-apple-darwin-pgo%2Blto-full.tar.zst",
       "size": 41558805,
       "sha256": "b81cc36535920c15c0f4e2dd055a27b02dc6222ca18966eb8cee9b408f8bc220",
-      "treeSha256": "3ccd7ad74253b74c340c925e63ea46aab8b8647d0a21a63190e33f6d34b60dd4"
+      "treeSha256": "eb5e08420d8d90e051277670708ab74e7aaa3cee0408c9b81d5ae9a2c891fccb"
     }
+  },
+  "mcp": {
+    "version": "1.30.0",
+    "lockSha256": "080fabdbfe19cd404f7783e36d5a504dbf8786cf9caf700fce81a3b821bf48a1"
   }
 }

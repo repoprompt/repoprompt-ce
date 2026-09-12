@@ -47,6 +47,7 @@
 
     enum PromptExperimentApprovalActor: String, Codable {
         case nativeUI
+        case mcpElicitation
         case agent
     }
 
@@ -138,6 +139,7 @@
     enum PromptExperimentWorkflowAdapter: String, Codable, CaseIterable {
         case connectedModel = "connected_model"
         case contextBuilder = "context_builder"
+        case mcpAdapter = "mcp_adapter"
         case sandboxedCommand = "sandboxed_command"
     }
 
@@ -145,6 +147,7 @@
         var adapter: PromptExperimentWorkflowAdapter
         var targetSelector: String?
         var instructions: String
+        var mcp: PromptExperimentMCPConfiguration? = nil
     }
 
     struct PromptExperimentGEPAConfiguration: Codable, Equatable {
@@ -515,8 +518,16 @@
                         throw PromptExperimentAuthorityError.invalidDraft("Project snapshots require an authorized source root and safe relative file paths.")
                     }
                 }
+                if optimization.execution.adapter == .mcpAdapter {
+                    guard let mcp = optimization.execution.mcp, optimization.projectSnapshot != nil else {
+                        throw PromptExperimentAuthorityError.invalidDraft("MCP adapter evaluations require reviewed project files and an MCP tool configuration.")
+                    }
+                    try mcp.validate()
+                } else if optimization.execution.mcp != nil {
+                    throw PromptExperimentAuthorityError.invalidDraft("MCP configuration requires execution adapter mcp_adapter.")
+                }
                 switch optimization.execution.adapter {
-                case .connectedModel, .contextBuilder:
+                case .connectedModel, .contextBuilder, .mcpAdapter:
                     guard optimization.execution.targetSelector?.isEmpty == false else {
                         throw PromptExperimentAuthorityError.invalidDraft("Select an exact connected execution target.")
                     }
@@ -668,7 +679,8 @@
         static let legacyOptimizationSchemaVersion = 2
         static let legacyWallClockOptimizationSchemaVersion = 3
         static let legacyDeadlineFreeSchemaVersion = 4
-        static let optimizationSchemaVersion = 5
+        static let legacyPreparationSchemaVersion = 5
+        static let optimizationSchemaVersion = 6
         static let schemaVersion = legacySchemaVersion
         static let executionAdapter = "context_builder_native_v1"
         static let comparisonMode = "fixed_serial_interleaved_v1"
@@ -817,14 +829,18 @@
                     Self.legacyOptimizationSchemaVersion,
                     Self.legacyWallClockOptimizationSchemaVersion,
                     Self.legacyDeadlineFreeSchemaVersion,
+                    Self.legacyPreparationSchemaVersion,
                     Self.optimizationSchemaVersion
                 ].contains(effectiveSchemaVersion),
                     let optimizationTargets,
                     trials.count == 1,
                     trials.first?.condition == .optimization
                 else { return false }
-                if effectiveSchemaVersion < Self.optimizationSchemaVersion {
+                if effectiveSchemaVersion < Self.legacyPreparationSchemaVersion {
                     guard optimization.stage == nil, optimization.preparationCandidates == nil else { return false }
+                }
+                if effectiveSchemaVersion < Self.optimizationSchemaVersion {
+                    guard optimization.execution.mcp == nil, optimization.execution.adapter != .mcpAdapter else { return false }
                 }
                 if effectiveSchemaVersion >= Self.legacyDeadlineFreeSchemaVersion {
                     guard optimization.gepa.maxWallClockSeconds == nil else { return false }
@@ -1105,7 +1121,7 @@
         }
 
         func approval(for plan: PromptExperimentPlan) -> PromptExperimentApproval? {
-            approvals.last { $0.planID == plan.id && $0.planDigest == plan.digest && $0.source == .nativeUI }
+            approvals.last { $0.planID == plan.id && $0.planDigest == plan.digest && ($0.source == .nativeUI || $0.source == .mcpElicitation) }
         }
 
         func attempts(for plan: PromptExperimentPlan) -> [PromptExperimentAttempt] {

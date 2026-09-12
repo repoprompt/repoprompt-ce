@@ -185,6 +185,8 @@
             assert revision == '\(expectedRevision)', 'GEPA git revision mismatch or unavailable'
             assert requires == [], f'Unexpected GEPA runtime dependencies: {requires}'
             import gepa
+            import gepa.adapters.mcp_adapter
+            assert importlib.metadata.version("mcp") == "1.30.0", "MCP SDK version mismatch"
             """
             try await Task.detached(priority: .utility) {
                 guard FileManager.default.isReadableFile(atPath: workerURL.path) else {
@@ -302,6 +304,16 @@
                 "run_directory_relative_path": "worker-runs/\(attemptID.uuidString.lowercased())",
                 "output_dir": outputDirectory.path
             ]
+            if let mcp = specification.execution.mcp {
+                try mcp.verifyResolved()
+                request["mcp_adapter"] = try [
+                    "tool_names": mcp.toolNames, "component": mcp.component,
+                    "tool_definitions_json": mcp.toolDefinitionsJson ?? "", "server_sha256": mcp.serverSha256 ?? "",
+                    "server_path": PromptExperimentMCPConfiguration.serverURL().path,
+                    "project_root": URL(fileURLWithPath: plan.environment.isolatedRootPath).appendingPathComponent("project").path,
+                    "instructions": specification.execution.instructions
+                ]
+            }
             request["stage"] = specification.isPreparation ? "preparation" : "search"
             if specification.isPreparation { request["preparation_candidates"] = specification.preparationCandidates }
             if let seed = specification.seedCandidate { request["seed_candidate"] = seed }
@@ -511,6 +523,8 @@
                     response["type"] = "host_response"
                     response["id"] = id
                     try writeJSONLine(response, to: stdinPipe.fileHandleForWriting)
+                case "mcp_process":
+                    break // Payload-free PID/phase detail is already persisted above.
                 case "progress":
                     let completed = object["completed_evaluations"] as? Int ?? 0
                     let maximum = object["max_evaluations"] as? Int ?? 0
@@ -523,6 +537,8 @@
                         throw WorkerError.protocolFailure("GEPA completion omitted its result.")
                     }
                     terminal = try decodeResult(result)
+                case "cancelled":
+                    terminalError = CancellationError()
                 case "failed":
                     let safeFailure = protocolDetail
                         ?? "exception_type=unavailable source_frame=unavailable envelope=invalid error_payload=excluded"
@@ -564,6 +580,10 @@
 
         static func safeProtocolDetail(type: String, object: [String: Any]) -> String? {
             switch type {
+            case "mcp_process":
+                let pid = object["pid"] as? Int ?? -1
+                let state = ["started", "closed"].contains(object["state"] as? String ?? "") ? (object["state"] as? String ?? "unknown") : "unknown"
+                return "mcp_server_pid=\(pid) state=\(state) payload=excluded"
             case "host_request":
                 let id = object["id"] as? String ?? "unknown"
                 let operation = object["operation"] as? String ?? "unknown"
@@ -575,6 +595,8 @@
                 return "candidate=\(candidate) completed_evaluations=\(completed) max_evaluations=\(maximum)"
             case "completed":
                 return "result_payload=excluded"
+            case "cancelled":
+                return "signal=\(object["signal"] as? Int ?? -1) payload=excluded"
             case "failed":
                 guard let diagnostic = object["diagnostic"] as? [String: Any] else {
                     return "exception_type=unavailable source_frame=unavailable envelope=legacy error_payload=excluded"
