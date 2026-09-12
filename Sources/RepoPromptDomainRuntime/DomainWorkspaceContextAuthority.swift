@@ -169,6 +169,12 @@ actor DomainWorkspaceContextAuthority {
         private var testBeforeExternalReconciliation: (@Sendable (UUID) async -> Void)?
         private var testBeforeWorkingPersistence: (@Sendable (UUID) async -> Void)?
         private var testBeforeSavedPersistence: (@Sendable (UUID) async -> Void)?
+        private var testAfterUnchangedPersistence: (@Sendable (UUID) async -> Void)?
+
+        func testSetAfterUnchangedPersistence(_ hook: (@Sendable (UUID) async -> Void)?) {
+            testAfterUnchangedPersistence = hook
+        }
+
         private var testAfterWorkspaceMutationGateAcquired: (@Sendable (UUID) async -> Void)?
     #endif
 
@@ -2608,7 +2614,7 @@ actor DomainWorkspaceContextAuthority {
         record original: WorkspaceRecord,
         exactRootResolution: DomainExactRootResolution? = nil
     ) async -> DomainCommandOutcome {
-        var record = original
+        let record = original
         let outcome = DomainCommandOutcome(
             operationID: envelope.operationID,
             disposition: .unchanged,
@@ -2631,12 +2637,36 @@ actor DomainWorkspaceContextAuthority {
                 operation: operation,
                 now: operation.recordedAt
             )
+            #if DEBUG
+                await testAfterUnchangedPersistence?(record.document.workspaceID)
+            #endif
             catalogRevision = max(catalogRevision, persisted.catalogRevision)
-            record.operations = persisted.journal.operations
-            record.operationIndex.replace(with: persisted.journal.operations)
-            records[record.document.workspaceID] = record
+            // Only publish receipt bookkeeping. Save and external reconciliation can
+            // advance the workspace while persistence is suspended, even with the
+            // catalog gate held. Neither the captured record nor the returned journal
+            // is permission to overwrite the current document, revisions, or health.
+            if var current = records[record.document.workspaceID] {
+                let persistedIDs = Set(persisted.journal.operations.map(\.operationID))
+                let concurrentOperations = current.operations.filter { !persistedIDs.contains($0.operationID) }
+                current.operations = Array(
+                    (persisted.journal.operations + concurrentOperations).suffix(Self.maximumWorkspaceOperations)
+                )
+                current.operationIndex.replace(with: current.operations)
+                records[record.document.workspaceID] = current
+            }
             globalOperations.insert(operation)
-            return outcome
+            // Keep the receipt's historical revision fields, as replay does, but
+            // attach the current snapshot so callers cannot re-publish stale state.
+            return DomainCommandOutcome(
+                operationID: outcome.operationID,
+                disposition: outcome.disposition,
+                before: outcome.before,
+                after: outcome.after,
+                catalogRevision: catalogRevision,
+                resultingDigest: outcome.resultingDigest,
+                workspace: records[record.document.workspaceID].map(makeSnapshot),
+                exactRootResolution: exactRootResolution
+            )
         } catch {
             return persistenceFailureOutcome(envelope, record: record, error: error)
         }

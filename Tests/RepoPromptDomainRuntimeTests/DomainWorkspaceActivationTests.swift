@@ -66,6 +66,75 @@ final class DomainWorkspaceActivationTests: XCTestCase {
         XCTAssertEqual(activation.workspace?.document.contentDigest, working.contentDigest)
     }
 
+    #if DEBUG
+        func testExactRootReusePreservesSaveCommittedBeforeReceiptPublication() async throws {
+            let fixture = try ActivationFixture()
+            defer { fixture.remove() }
+            let authority = fixture.authority()
+            let saved = try fixture.document(name: "Saved", repoPaths: [fixture.root.path])
+            let created = await authority.execute(.init(
+                operationID: UUID(),
+                origin: .appPresentation(windowID: 1),
+                command: .createWorkspace(saved)
+            ))
+            XCTAssertEqual(created.disposition, .applied)
+            let working = try fixture.document(name: "Working", repoPaths: [fixture.root.path])
+            let updated = await authority.execute(.init(
+                operationID: UUID(),
+                expectedWorkspaceRevision: created.after?.workingRevision,
+                origin: .appPresentation(windowID: 1),
+                command: .replaceWorkingDocument(working)
+            ))
+            XCTAssertEqual(updated.disposition, .applied)
+            let dirty = try XCTUnwrap(updated.workspace)
+            XCTAssertNotNil(dirty.revisions.dirtyRevision)
+            let save = DomainWorkspaceCommandEnvelope(
+                operationID: UUID(),
+                expectedWorkspaceRevision: dirty.revisions.workingRevision,
+                origin: .appPresentation(windowID: 1),
+                command: .saveWorkspaceDocument(workspaceID: fixture.workspaceID)
+            )
+            // Save does not take the catalog gate. Complete it after the reuse receipt
+            // reaches disk but before the awaiting reuse publishes its in-memory result.
+            await authority.testSetAfterUnchangedPersistence { workspaceID in
+                XCTAssertEqual(workspaceID, fixture.workspaceID)
+                await authority.testSetAfterUnchangedPersistence(nil)
+                let result = await authority.execute(save)
+                XCTAssertEqual(result.disposition, .applied)
+                XCTAssertNil(result.workspace?.revisions.dirtyRevision)
+            }
+            let reuse = DomainWorkspaceCommandEnvelope(
+                operationID: UUID(),
+                origin: .appPresentation(windowID: 1),
+                command: .resolveOrCreateWorkspaceForExactRoot(
+                    document: working,
+                    canonicalRootPath: fixture.root.standardizedFileURL.path.lowercased()
+                )
+            )
+            let result = await authority.execute(reuse)
+            XCTAssertEqual(result.disposition, .unchanged)
+            XCTAssertEqual(result.exactRootResolution, .reused)
+            let returned = try XCTUnwrap(result.workspace)
+            XCTAssertNil(returned.revisions.dirtyRevision)
+            XCTAssertEqual(returned.revisions.savedRevision, dirty.revisions.workingRevision)
+            let current = await authority.canonicalWorkspaceSnapshot(fixture.workspaceID)
+            XCTAssertEqual(current?.revisions, returned.revisions)
+            XCTAssertNil(current?.revisions.dirtyRevision)
+            let cold = await fixture.authority().activationSnapshot(
+                workspaceID: fixture.workspaceID,
+                fileURL: working.fileURL
+            )
+            XCTAssertEqual(current?.revisions, cold.workspace?.revisions)
+            XCTAssertEqual(current?.document.contentDigest, working.contentDigest)
+            let replay = await authority.execute(reuse)
+            XCTAssertEqual(replay.disposition, .deduplicated)
+            XCTAssertEqual(replay.exactRootResolution, .reused)
+            XCTAssertEqual(replay.workspace?.revisions, cold.workspace?.revisions)
+            let saveReplay = await authority.execute(save)
+            XCTAssertEqual(saveReplay.disposition, .deduplicated)
+        }
+    #endif
+
     func testMetadataDecodeUsesDeterministicLegacyRecencyAndPreservesDocumentBytes() throws {
         let workspaceID = UUID()
         let fileURL = URL(fileURLWithPath: "/tmp/legacy-workspace.json")
@@ -127,10 +196,10 @@ private struct ActivationFixture {
         return DomainWorkspaceContextAuthority(identity: identity, persistence: .init(configuration: configuration, identity: identity), metrics: .disabled)
     }
 
-    func document(name: String, retiredInto: UUID? = nil) throws -> DomainWorkspaceDocument {
+    func document(name: String, retiredInto: UUID? = nil, repoPaths: [String] = []) throws -> DomainWorkspaceDocument {
         var object: [String: Any] = [
             "id": workspaceID.uuidString, "name": name, "schemaVersion": 1,
-            "repoPaths": [], "isSystemWorkspace": false,
+            "repoPaths": repoPaths, "isSystemWorkspace": false,
             "composeTabs": [["id": contextID.uuidString, "name": "T1"]],
             "activeComposeTabID": contextID.uuidString
         ]
