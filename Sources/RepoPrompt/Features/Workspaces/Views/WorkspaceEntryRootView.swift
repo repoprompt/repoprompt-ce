@@ -90,7 +90,7 @@ struct WorkspaceEntryRootView: View {
         do {
             try await workspaceManager.pickFolderAndOpenWorkspace(
                 title: "Open Folder",
-                message: "Choose a folder to create a new workspace.",
+                message: "Choose a folder to open. If it matches an existing workspace root, that workspace will reopen.",
                 behavior: .createNewWorkspace
             )
         } catch {

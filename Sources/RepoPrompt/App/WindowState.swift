@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import os
 import RepoPromptDomainRuntime
 import SwiftUI
 
@@ -108,6 +109,75 @@ struct AppCommand {
     }
 }
 
+@MainActor
+enum FolderRouteState: Equatable {
+    case notRequested
+    case unresolved(expectedRoot: WorkspaceRootSetKey)
+    case authorityExactRoot(expectedRoot: WorkspaceRootSetKey)
+    case pendingPersistentPublication(PendingPersistentWorkspacePublication)
+    case ephemeralLiveWindowSupplement(workspaceID: UUID, expectedRoot: WorkspaceRootSetKey)
+
+    var expectedRoot: WorkspaceRootSetKey? {
+        switch self {
+        case .notRequested:
+            nil
+        case let .unresolved(expectedRoot),
+             let .authorityExactRoot(expectedRoot),
+             let .ephemeralLiveWindowSupplement(_, expectedRoot):
+            expectedRoot
+        case let .pendingPersistentPublication(publication):
+            publication.expectedRoot
+        }
+    }
+
+    var routedPersistentResolution: PersistentFolderOpenProvenance? {
+        switch self {
+        case .authorityExactRoot, .pendingPersistentPublication:
+            .reused
+        case .notRequested, .unresolved, .ephemeralLiveWindowSupplement:
+            nil
+        }
+    }
+
+    var logLabel: String {
+        switch self {
+        case .notRequested:
+            "notRequested"
+        case .unresolved:
+            "unresolved"
+        case .authorityExactRoot:
+            "authorityExactRoot"
+        case .pendingPersistentPublication:
+            "pendingPersistentPublication"
+        case .ephemeralLiveWindowSupplement:
+            "ephemeralLiveWindowSupplement"
+        }
+    }
+}
+
+enum AppCommandExecutionFailure: String, Equatable {
+    case invalidFolder
+    case workspaceUnavailable
+    case workspaceSwitchBlocked
+    case authorityFailure
+    case routeChangedAfterRetry
+    case windowClosed
+    case payloadApplicationFailed
+}
+
+enum AppCommandPartialSuccessReason: Equatable {
+    case cancelled
+    case failed(AppCommandExecutionFailure)
+}
+
+enum AppCommandExecutionResult: Equatable {
+    case completed(workspaceID: UUID?)
+    case partialSuccess(workspaceID: UUID, reason: AppCommandPartialSuccessReason)
+    case failed(AppCommandExecutionFailure)
+    case cancelled
+}
+
+typealias AppCommandCompletion = @MainActor (AppCommandExecutionResult) -> Void
 typealias AgentSessionHandoffInstructionsProvider = @MainActor () -> String
 
 enum AgentChatHandoffCopyOutcome: Equatable {
@@ -309,8 +379,85 @@ class WindowState: ObservableObject {
         case unspecified
     }
 
+    private enum CommandHandlingOutcome {
+        case terminal(AppCommandExecutionResult)
+        case retry(expectedRoot: WorkspaceRootSetKey, failure: AppCommandExecutionFailure)
+        case forward(WindowState, FolderRouteState)
+    }
+
+    private enum FolderTargetResolution {
+        case resolved(ResolvedFolderTarget)
+        case retry(expectedRoot: WorkspaceRootSetKey, failure: AppCommandExecutionFailure)
+        case terminal(AppCommandExecutionResult)
+    }
+
+    private struct ResolvedFolderTarget {
+        let workspace: WorkspaceModel
+        let source: FolderTargetSource
+        let activationState: FolderOpenActivationState
+    }
+
+    private struct FolderCandidateRepresentation {
+        let workspace: WorkspaceModel
+        let source: FolderTargetSource
+    }
+
+    @MainActor
+    private enum FolderTargetSource {
+        case authority
+        case pendingPersistentPublication(PendingPersistentWorkspacePublication)
+        case ephemeralLiveWindow(WindowState)
+
+        var permitsLocalEphemeralAdmission: Bool {
+            if case .ephemeralLiveWindow = self {
+                return true
+            }
+            return false
+        }
+
+        func route(
+            workspaceID: UUID,
+            expectedRoot: WorkspaceRootSetKey
+        ) -> FolderRouteState {
+            switch self {
+            case .authority:
+                .authorityExactRoot(expectedRoot: expectedRoot)
+            case let .pendingPersistentPublication(publication):
+                .pendingPersistentPublication(publication)
+            case .ephemeralLiveWindow:
+                .ephemeralLiveWindowSupplement(
+                    workspaceID: workspaceID,
+                    expectedRoot: expectedRoot
+                )
+            }
+        }
+    }
+
     /// Command queue to store all pending commands
-    private var commandQueue: [AppCommand] = []
+    private var commandQueue: [AppCommandLifetime] = []
+    private var isProcessingCommandQueue = false
+    #if DEBUG
+        private var automaticallyProcessesEnqueuedCommands = true
+        private var persistentFolderCreationCommitDidRecordHandlerForTesting: ((UUID) -> Void)?
+
+        func setAutomaticCommandProcessingForTesting(_ enabled: Bool) {
+            automaticallyProcessesEnqueuedCommands = enabled
+        }
+
+        var queuedCommandCountForTesting: Int {
+            commandQueue.count
+        }
+
+        func setPersistentFolderCreationCommitDidRecordHandlerForTesting(
+            _ handler: ((UUID) -> Void)?
+        ) {
+            persistentFolderCreationCommitDidRecordHandlerForTesting = handler
+        }
+
+        func stopDomainWorkspaceProjectionForTesting() {
+            domainWorkspacePresentationBridge?.stop()
+        }
+    #endif
 
     /// Lazily scheduled task to coalesce window title updates outside of mutation scopes.
     private var pendingWindowTitleUpdateTask: Task<Void, Never>?
@@ -327,6 +474,7 @@ class WindowState: ObservableObject {
     func beginClose() {
         guard !isClosing else { return }
         isClosing = true
+        failUnstartedCommandsForWindowClose()
 
         let manager = windowStatesManager ?? WindowStatesManager.shared
         if !manager.isTerminating {
@@ -409,6 +557,19 @@ class WindowState: ObservableObject {
             )
         }
 
+        convenience init(
+            domainRuntime: MCPDomainRuntime?,
+            storedPromptPersistence: any StoredPromptPersistenceServing
+        ) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared,
+                storedPromptPersistence: storedPromptPersistence,
+                domainRuntimeOverride: domainRuntime
+            )
+        }
+
     #endif
 
     private init(
@@ -416,6 +577,7 @@ class WindowState: ObservableObject {
         loadStoredAPISettingsDataOnInit: Bool,
         codexModelPollingService: CodexModelPollingService,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         domainRuntimeOverride: MCPDomainRuntime?
     ) {
         // Assign a unique window ID
@@ -437,6 +599,7 @@ class WindowState: ObservableObject {
             domainRuntime: domainRuntimeOverride,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
+            storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
             codexModelPollingService: codexModelPollingService
         )
@@ -1240,9 +1403,41 @@ class WindowState: ObservableObject {
         return (decoded as NSString).expandingTildeInPath
     }
 
-    func enqueueCommand(_ command: AppCommand) {
-        commandQueue.append(command)
-        // If the workspace manager is already initialized, process now
+    func enqueueCommand(
+        _ command: AppCommand,
+        completion: AppCommandCompletion? = nil
+    ) {
+        let folderRoute: FolderRouteState = if let folderPath = command.folderPath, !folderPath.isEmpty {
+            .unresolved(expectedRoot: WorkspaceRootSetKey(paths: [folderPath]))
+        } else {
+            .notRequested
+        }
+        enqueueCommand(command, folderRoute: folderRoute, completion: completion)
+    }
+
+    func enqueueCommand(
+        _ command: AppCommand,
+        folderRoute: FolderRouteState,
+        completion: AppCommandCompletion? = nil
+    ) {
+        let queuedCommand = AppCommandLifetime(
+            command: command,
+            folderRoute: folderRoute,
+            windowID: windowID,
+            completion: completion
+        )
+        enqueueQueuedCommand(queuedCommand)
+    }
+
+    private func enqueueQueuedCommand(_ queuedCommand: AppCommandLifetime) {
+        guard !isClosing else {
+            queuedCommand.windowClosed(in: windowID)
+            return
+        }
+        commandQueue.append(queuedCommand)
+        #if DEBUG
+            guard automaticallyProcessesEnqueuedCommands else { return }
+        #endif
         if workspaceManager.isInitialized {
             Task { await processCommands() }
         }
@@ -1356,9 +1551,46 @@ class WindowState: ObservableObject {
     // No workspace creation fallback; restoration is best-effort for existing workspaces only.
 
     func processCommands() async {
-        while !commandQueue.isEmpty {
-            let command = commandQueue.removeFirst()
-            await handleCommand(command)
+        guard !isProcessingCommandQueue else { return }
+        isProcessingCommandQueue = true
+        defer { isProcessingCommandQueue = false }
+
+        while let queuedCommand = commandQueue.first {
+            guard queuedCommand.beginExecution(in: windowID) else {
+                commandQueue.removeFirst()
+                continue
+            }
+            let outcome: CommandHandlingOutcome = if Task.isCancelled {
+                .terminal(.cancelled)
+            } else if isClosing {
+                .terminal(.failed(.windowClosed))
+            } else {
+                await handleCommand(queuedCommand)
+            }
+
+            // Close retains the executing entry. Detach it before any transition
+            // can invoke a completion that reenters this window's queue.
+            commandQueue.removeFirst()
+            switch outcome {
+            case let .terminal(result):
+                queuedCommand.finish(result, in: windowID)
+            case let .retry(expectedRoot, failure):
+                if queuedCommand.retry(expectedRoot: expectedRoot, failure: failure, in: windowID) {
+                    commandQueue.insert(queuedCommand, at: 0)
+                }
+            case let .forward(targetWindow, folderRoute):
+                if queuedCommand.transfer(to: targetWindow.windowID, route: folderRoute, from: windowID) {
+                    targetWindow.enqueueQueuedCommand(queuedCommand)
+                }
+            }
+        }
+    }
+
+    private func failUnstartedCommandsForWindowClose() {
+        let closingCommands = commandQueue
+        commandQueue.removeAll { !$0.isExecuting(in: windowID) }
+        for command in closingCommands {
+            command.windowClosed(in: windowID)
         }
     }
 
@@ -1463,6 +1695,15 @@ class WindowState: ObservableObject {
 
     // MARK: - Handling URL commands
 
+    func decodeOpenCommand(from url: URL) -> AppCommand? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              AppDeepLinkURLScheme.isSupported(components.scheme)
+        else {
+            return nil
+        }
+        return decodeOpenCommand(from: components)
+    }
+
     func handleIncomingURL(_ url: URL) {
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
               AppDeepLinkURLScheme.isSupported(comps.scheme)
@@ -1509,232 +1750,662 @@ class WindowState: ObservableObject {
             return // ← we handled the prompt command
         }
 
-        // Require host == "open" to match canonical repoprompt-ce://open/~/MyProject links
-        guard let host = comps.host?.lowercased(), host == "open" else {
+        guard let command = decodeOpenCommand(from: comps) else {
             return
         }
+        enqueueCommand(command)
+    }
 
-        // Strip leading slash from comps.path if present
-        var rawFolderPath = comps.path
+    private func decodeOpenCommand(from components: URLComponents) -> AppCommand? {
+        guard components.host?.lowercased() == "open" else {
+            return nil
+        }
+
+        var rawFolderPath = components.path
         if rawFolderPath.hasPrefix("/") {
             rawFolderPath.removeFirst()
         }
         let folderPath = rawFolderPath.isEmpty ? nil : decodeAndExpandTilde(rawFolderPath)
 
-        // Extract workspaceName from ?workspace= param
-        let workspaceName = comps.queryItems?
+        let workspaceName = components.queryItems?
             .filter { $0.name == "workspace" }
             .compactMap { $0.value?.trimmingCharacters(in: .whitespaces) }
             .last
 
-        // Extract fileList from ?files= param(s)
-        let fileList: [String] = comps.queryItems?
+        let fileList: [String] = components.queryItems?
             .filter { $0.name == "files" }
             .compactMap(\.value)
             .flatMap { $0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) } }
             .map { decodeAndExpandTilde($0) }
             ?? []
 
-        // Concatenate multiple prompt= params with spaces
-        let promptParts = comps.queryItems?
+        let promptParts = components.queryItems?
             .filter { $0.name == "prompt" }
             .compactMap { $0.value?.removingPercentEncoding }
             ?? []
         let promptText = promptParts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         let finalPrompt = promptText.isEmpty ? nil : promptText
 
-        /// Parse focus, ephemeral, persist flags
         func boolFromQuery(_ name: String) -> Bool? {
-            guard let val = comps.queryItems?.first(where: { $0.name == name })?.value else {
+            guard let value = components.queryItems?.first(where: { $0.name == name })?.value else {
                 return nil
             }
-            let lower = val.lowercased()
-            if lower == "true" || lower == "1" { return true }
-            if lower == "false" || lower == "0" { return false }
-            return nil
+            switch value.lowercased() {
+            case "true", "1":
+                return true
+            case "false", "0":
+                return false
+            default:
+                return nil
+            }
         }
-        let focusFlag = boolFromQuery("focus")
-        let ephemeralFlag = boolFromQuery("ephemeral")
-        let persistFlag = boolFromQuery("persist")
 
-        // Build an AppCommand
-        let command = AppCommand(
+        return AppCommand(
             workspaceName: workspaceName,
             fileList: fileList,
             promptText: finalPrompt,
             folderPath: folderPath,
             newPrompt: nil,
-            focus: focusFlag,
-            ephemeral: ephemeralFlag,
-            persist: persistFlag
+            focus: boolFromQuery("focus"),
+            ephemeral: boolFromQuery("ephemeral"),
+            persist: boolFromQuery("persist")
         )
-
-        // If we want to focus an existing window for the same folderPath, do that
-        if focusFlag == true, let folderPath {
-            if let wsManager = windowStatesManager,
-               let existingWindow = wsManager.findWindowState(forFolderPath: folderPath),
-               existingWindow !== self
-            {
-                NSApplication.shared.activate(ignoringOtherApps: true)
-                existingWindow.focusWindowIfPossible()
-                existingWindow.enqueueCommand(command)
-                return
-            }
-        }
-
-        enqueueCommand(command)
     }
 
     @MainActor
-    private func handleCommand(_ command: AppCommand) async {
-        // Determine ephemeral once at the start
-        let shouldBeEphemeral = (command.ephemeral == true || command.persist == false)
-        var requestedWorkspaceSwitch = false
-        var didSwitchWorkspace = false
-
-        // Apply new prompt if provided
-        if let prompt = command.newPrompt {
-            // 1. add to the PromptViewModel's storage
-            let result = promptManager.addStoredPrompt(
-                title: prompt.title,
-                content: prompt.content
+    private func handleCommand(_ queuedCommand: AppCommandLifetime) async -> CommandHandlingOutcome {
+        let command = queuedCommand.command
+        if let folderPath = command.folderPath, !folderPath.isEmpty {
+            return await handleFolderCommand(
+                queuedCommand,
+                folderPath: folderPath,
+                shouldBeEphemeral: command.ephemeral == true || command.persist == false
             )
-            // 2. select it so it appears checked/active
-            switch result {
-            case let .created(stored):
-                promptManager.selectNewPrompt(stored)
-            case .persistenceFailed:
-                presentStoredPromptCommandPersistenceFailure()
-                return
-            }
+        }
+        return await handleNonFolderCommand(queuedCommand)
+    }
 
-            // 3. if this window isn't front-most and focus flag was set, focus us
-            if command.focus == true {
-                NSApplication.shared.activate(ignoringOtherApps: true)
-                focusWindowIfPossible()
-            }
+    private func handleFolderCommand(
+        _ queuedCommand: AppCommandLifetime,
+        folderPath: String,
+        shouldBeEphemeral: Bool
+    ) async -> CommandHandlingOutcome {
+        let folderURL = URL(fileURLWithPath: folderPath).standardizedFileURL
+        let expectedRoot = WorkspaceRootSetKey(paths: [folderURL.path])
+        guard !expectedRoot.isEmpty,
+              queuedCommand.folderRoute.expectedRoot == expectedRoot
+        else {
+            return .terminal(.failed(.invalidFolder))
+        }
 
-            // If we only have a prompt command with no other parameters, we're done
-            if command.folderPath == nil, command.workspaceName == nil,
-               command.fileList.isEmpty, command.promptText == nil
-            {
-                return
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return .terminal(.failed(.invalidFolder))
+        }
+
+        let resolution = await resolveFolderTarget(
+            for: queuedCommand,
+            folderURL: folderURL,
+            expectedRoot: expectedRoot,
+            shouldBeEphemeral: shouldBeEphemeral
+        )
+        let target: ResolvedFolderTarget
+        switch resolution {
+        case let .resolved(resolvedTarget):
+            target = resolvedTarget
+        case let .retry(expectedRoot, failure):
+            return .retry(expectedRoot: expectedRoot, failure: failure)
+        case let .terminal(result):
+            return .terminal(result)
+        }
+
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        if let forwardingOutcome = forwardingOutcome(
+            for: target,
+            expectedRoot: expectedRoot,
+            queuedCommand: queuedCommand
+        ) {
+            return forwardingOutcome
+        }
+
+        let switchResult = await workspaceManager.activateFolderOpenWorkspace(
+            target.workspace,
+            expectedRoot: expectedRoot,
+            activationState: target.activationState,
+            policy: .appCommand
+        )
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+        switch switchResult {
+        case .switched:
+            break
+        case .cancelled:
+            return .terminal(.cancelled)
+        case .blocked:
+            return .terminal(.failed(.workspaceSwitchBlocked))
+        }
+
+        guard let activeWorkspace = workspaceManager.activeWorkspace,
+              activeWorkspace.id == target.workspace.id
+        else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+        let admitsLocalEphemeralTarget = activeWorkspace.isEphemeral
+            && target.source.permitsLocalEphemeralAdmission
+        guard WorkspaceFolderOpenResolver.bestEligibleMatch(
+            forFolderPath: folderURL.path,
+            in: [activeWorkspace],
+            admittingEphemeral: admitsLocalEphemeralTarget
+        )?.id == target.workspace.id else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
+        if !admitsLocalEphemeralTarget {
+            let selection: WorkspaceManagerViewModel.PersistentFolderOpenSelection
+            do {
+                selection = try await workspaceManager.persistentFolderOpenSelection(forFolderPath: folderURL.path)
+            } catch is CancellationError {
+                return .terminal(.cancelled)
+            } catch {
+                return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+            }
+            if let interruption = commandInterruptionResult() {
+                return .terminal(interruption)
+            }
+            if case .recoveryBlocked = selection {
+                return .terminal(.failed(.authorityFailure))
+            }
+            guard case let .matched(authoritativeTarget) = selection,
+                  authoritativeTarget.id == target.workspace.id,
+                  WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeTarget),
+                  WorkspaceFolderOpenResolver.bestEligibleMatch(
+                      forFolderPath: folderURL.path,
+                      in: [authoritativeTarget]
+                  )?.id == target.workspace.id
+            else {
+                return .retry(
+                    expectedRoot: expectedRoot,
+                    failure: .routeChangedAfterRetry
+                )
             }
         }
 
-        // If we have a folder path, try to open or create a workspace for it
-        if let folderPath = command.folderPath, !folderPath.isEmpty {
-            let folderURL = URL(fileURLWithPath: folderPath).standardizedFileURL
-            var isDir: ObjCBool = false
+        guard let payloadAdmissionWorkspace = workspaceManager.activeWorkspace,
+              payloadAdmissionWorkspace.id == target.workspace.id,
+              WorkspaceFolderOpenResolver.bestEligibleMatch(
+                  forFolderPath: folderURL.path,
+                  in: [payloadAdmissionWorkspace],
+                  admittingEphemeral: payloadAdmissionWorkspace.isEphemeral
+                      && target.source.permitsLocalEphemeralAdmission
+              )?.id == target.workspace.id
+        else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
 
-            if !FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDir) || !isDir.boolValue {
-                // Not a valid directory
-                return
-            }
+        guard applyStoredPromptIfNeeded(queuedCommand.command) else {
+            return .terminal(.failed(.payloadApplicationFailed))
+        }
+        return await applyRemainingPayload(queuedCommand.command)
+    }
 
-            // Try to find an existing workspace referencing this folder
-            if let existingWorkspace = workspaceManager.workspaces.first(where: { ws in
-                ws.repoPaths.contains { repoPath in
-                    let repoURL = URL(fileURLWithPath: (repoPath as NSString).expandingTildeInPath)
-                        .standardizedFileURL
-                    return repoURL == folderURL
-                }
-            }) {
-                // If ephemeral == true, mark existing workspace ephemeral (edge case)
-                if shouldBeEphemeral {
-                    if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existingWorkspace.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
-                    }
-                }
+    private func resolveFolderTarget(
+        for queuedCommand: AppCommandLifetime,
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey,
+        shouldBeEphemeral: Bool
+    ) async -> FolderTargetResolution {
+        if case let .pendingPersistentPublication(publication) = queuedCommand.folderRoute {
+            return await resolvePendingPersistentFolderTarget(
+                publication,
+                for: queuedCommand,
+                folderURL: folderURL,
+                expectedRoot: expectedRoot
+            )
+        }
+        if shouldBeEphemeral {
+            return await resolveEphemeralFolderTarget(
+                folderURL: folderURL,
+                expectedRoot: expectedRoot
+            )
+        }
 
-                // If focus == true, attempt to bring up an existing window
-                if command.focus == true {
-                    if let wsManager = windowStatesManager,
-                       let existingWindow = wsManager.findWindowState(showing: existingWorkspace.id)
-                    {
-                        NSApplication.shared.activate(ignoringOtherApps: true)
-                        existingWindow.focusWindowIfPossible()
-                        return
-                    }
-                }
+        switch queuedCommand.folderRoute {
+        case .notRequested:
+            return .terminal(.failed(.invalidFolder))
+        case .unresolved, .authorityExactRoot:
+            return await resolvePersistentFolderTarget(
+                for: queuedCommand,
+                folderURL: folderURL,
+                expectedRoot: expectedRoot
+            )
+        case .pendingPersistentPublication:
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        case .ephemeralLiveWindowSupplement:
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .workspaceUnavailable
+            )
+        }
+    }
 
-                // Switch to the existing workspace in this window
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: existingWorkspace, saveState: true)
-                didSwitchWorkspace = result.didSwitch
-            } else {
-                // Create a brand-new workspace
-                let nameGuess = folderURL.lastPathComponent
-                let workspaceName = workspaceManager.uniqueWorkspaceName(baseName: nameGuess)
+    private func resolvePendingPersistentFolderTarget(
+        _ publication: PendingPersistentWorkspacePublication,
+        for queuedCommand: AppCommandLifetime,
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey
+    ) async -> FolderTargetResolution {
+        let activationState = workspaceManager.captureFolderOpenActivationState()
+        guard publication.expectedRoot == expectedRoot else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
 
-                // Pass ephemeral to createWorkspace
-                let newWS = workspaceManager.createWorkspace(
-                    name: workspaceName,
-                    repoPaths: [folderURL.path],
-                    ephemeral: shouldBeEphemeral
+        do {
+            let outcome = try await publication.join()
+            guard outcome.disposition == .applied
+                || outcome.disposition == .unchanged
+                || outcome.disposition == .deduplicated
+            else {
+                return .retry(
+                    expectedRoot: expectedRoot,
+                    failure: .authorityFailure
                 )
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: newWS, saveState: true)
-                didSwitchWorkspace = result.didSwitch
             }
-        } else if let workspaceName = command.workspaceName, !workspaceName.isEmpty {
-            // Look for an existing workspace by name
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .authorityFailure
+            )
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        let selection: WorkspaceManagerViewModel.PersistentFolderOpenSelection
+        do {
+            selection = try await workspaceManager.persistentFolderOpenSelection(forFolderPath: folderURL.path)
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+        if case .recoveryBlocked = selection {
+            return .terminal(.failed(.authorityFailure))
+        }
+        guard case let .matched(authoritativeWorkspace) = selection,
+              authoritativeWorkspace.id == publication.workspaceID,
+              WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: authoritativeWorkspace),
+              WorkspaceFolderOpenResolver.bestEligibleMatch(
+                  forFolderPath: folderURL.path,
+                  in: [authoritativeWorkspace]
+              )?.id == publication.workspaceID
+        else {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
+        queuedCommand.recordPendingPublicationReuse()
+        return .resolved(ResolvedFolderTarget(
+            workspace: authoritativeWorkspace,
+            source: .pendingPersistentPublication(publication),
+            activationState: activationState
+        ))
+    }
+
+    private func resolvePersistentFolderTarget(
+        for queuedCommand: AppCommandLifetime,
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey
+    ) async -> FolderTargetResolution {
+        do {
+            let resolution = try await queuedCommand.resolvePersistentFolder(expectedRoot: expectedRoot) {
+                try await workspaceManager.resolveOrCreatePersistentWorkspaceWithProvenance(
+                    fromFolderURL: folderURL
+                )
+            }
+            #if DEBUG
+                if resolution.provenance == .created, resolution.creationCommitted {
+                    persistentFolderCreationCommitDidRecordHandlerForTesting?(
+                        resolution.workspace.id
+                    )
+                }
+            #endif
+            if let interruption = commandInterruptionResult() {
+                return .terminal(interruption)
+            }
+            let workspace = resolution.workspace
+            guard WorkspaceFolderOpenResolver.containsExactRoot(expectedRoot, in: workspace) else {
+                return .retry(
+                    expectedRoot: expectedRoot,
+                    failure: .routeChangedAfterRetry
+                )
+            }
+            return .resolved(ResolvedFolderTarget(
+                workspace: workspace,
+                source: .authority,
+                activationState: resolution.activationState
+            ))
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch let error as DomainWorkspaceAuthorityOperationError
+            where error.outcome.diagnostic == "exact_root_selection_changed"
+        {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        } catch let error as DomainWorkspaceAuthorityOperationError
+            where error.outcome.errorCode == .workspaceUnavailable
+        {
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .workspaceUnavailable
+            )
+        } catch {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+        }
+    }
+
+    private func resolveEphemeralFolderTarget(
+        folderURL: URL,
+        expectedRoot: WorkspaceRootSetKey
+    ) async -> FolderTargetResolution {
+        let activationState = workspaceManager.captureFolderOpenActivationState()
+        guard let routingCatalog = await workspaceManager.workspaceRoutingCatalogSnapshot() else {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        let selection: WorkspaceManagerViewModel.PersistentFolderOpenSelection
+        do {
+            selection = try await workspaceManager.persistentFolderOpenSelection(forFolderPath: folderURL.path)
+        } catch is CancellationError {
+            return .terminal(.cancelled)
+        } catch {
+            return .terminal(commandInterruptionResult() ?? .failed(.authorityFailure))
+        }
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+
+        // Reserve excluded catalog IDs too, so stale ephemeral copies cannot replace their owners.
+        let catalogWorkspaceIDs = Set(routingCatalog.map(\.id))
+        var representations: [UUID: FolderCandidateRepresentation] = [:]
+        for workspace in routingCatalog where workspace.isEphemeral {
+            representations[workspace.id] = FolderCandidateRepresentation(
+                workspace: workspace,
+                source: .ephemeralLiveWindow(self)
+            )
+        }
+        let recoveryBlocked: Bool
+        switch selection {
+        case let .matched(workspace):
+            representations[workspace.id] = FolderCandidateRepresentation(
+                workspace: workspace,
+                source: .authority
+            )
+            recoveryBlocked = false
+        case .noMatch:
+            recoveryBlocked = false
+        case .recoveryBlocked:
+            recoveryBlocked = true
+        case .changed:
+            return .retry(
+                expectedRoot: expectedRoot,
+                failure: .routeChangedAfterRetry
+            )
+        }
+
+        for workspace in workspaceManager.workspaces
+            where workspace.isEphemeral
+            && !catalogWorkspaceIDs.contains(workspace.id)
+            && representations[workspace.id] == nil
+        {
+            representations[workspace.id] = FolderCandidateRepresentation(
+                workspace: workspace,
+                source: .ephemeralLiveWindow(self)
+            )
+        }
+        let liveWindows = (windowStatesManager?.allWindows ?? [self]).filter { !$0.isClosing }
+        for window in liveWindows {
+            if let activeWorkspace = window.workspaceManager.activeWorkspace,
+               activeWorkspace.isEphemeral,
+               !catalogWorkspaceIDs.contains(activeWorkspace.id),
+               representations[activeWorkspace.id] == nil
+            {
+                representations[activeWorkspace.id] = FolderCandidateRepresentation(
+                    workspace: activeWorkspace,
+                    source: .ephemeralLiveWindow(window)
+                )
+            }
+        }
+
+        let candidates = representations.values.map(\.workspace)
+        if let winner = WorkspaceFolderOpenResolver.bestEligibleMatch(
+            forFolderPath: folderURL.path,
+            in: candidates,
+            admittingEphemeral: true
+        ), let representation = representations[winner.id] {
+            return .resolved(ResolvedFolderTarget(
+                workspace: winner,
+                source: representation.source,
+                activationState: activationState
+            ))
+        }
+
+        if let interruption = commandInterruptionResult() {
+            return .terminal(interruption)
+        }
+        // Blocked persistent recovery permits ephemeral reuse, but is not a no-match creation path.
+        guard !recoveryBlocked else {
+            return .terminal(.failed(.authorityFailure))
+        }
+
+        let workspace = workspaceManager.createWorkspace(
+            name: workspaceManager.uniqueWorkspaceName(baseName: folderURL.lastPathComponent),
+            repoPaths: [folderURL.path],
+            ephemeral: true
+        )
+        return .resolved(ResolvedFolderTarget(
+            workspace: workspace,
+            source: .ephemeralLiveWindow(self),
+            activationState: activationState
+        ))
+    }
+
+    private func forwardingOutcome(
+        for target: ResolvedFolderTarget,
+        expectedRoot: WorkspaceRootSetKey,
+        queuedCommand: AppCommandLifetime
+    ) -> CommandHandlingOutcome? {
+        if case let .ephemeralLiveWindow(owningWindow) = target.source,
+           owningWindow !== self
+        {
+            guard !owningWindow.isClosing else {
+                return .terminal(.failed(.workspaceUnavailable))
+            }
+            guard queuedCommand.canForward(to: owningWindow.windowID)
+            else {
+                return .terminal(.failed(.routeChangedAfterRetry))
+            }
+            return .forward(
+                owningWindow,
+                target.source.route(
+                    workspaceID: target.workspace.id,
+                    expectedRoot: expectedRoot
+                )
+            )
+        }
+
+        guard queuedCommand.command.focus == true,
+              let windowStatesManager,
+              let activeWindow = windowStatesManager.allWindows.first(where: { window in
+                  guard window !== self,
+                        !window.isClosing,
+                        queuedCommand.canForward(to: window.windowID),
+                        let activeWorkspace = window.workspaceManager.activeWorkspace,
+                        activeWorkspace.id == target.workspace.id
+                  else {
+                      return false
+                  }
+                  return WorkspaceFolderOpenResolver.containsExactRoot(
+                      expectedRoot,
+                      in: activeWorkspace
+                  )
+              })
+        else {
+            return nil
+        }
+        return .forward(
+            activeWindow,
+            target.source.route(
+                workspaceID: target.workspace.id,
+                expectedRoot: expectedRoot
+            )
+        )
+    }
+
+    private func commandInterruptionResult() -> AppCommandExecutionResult? {
+        if Task.isCancelled {
+            return .cancelled
+        }
+        if isClosing {
+            return .failed(.windowClosed)
+        }
+        return nil
+    }
+
+    private func handleNonFolderCommand(
+        _ queuedCommand: AppCommandLifetime
+    ) async -> CommandHandlingOutcome {
+        let command = queuedCommand.command
+        guard applyStoredPromptIfNeeded(command) else {
+            return .terminal(.failed(.payloadApplicationFailed))
+        }
+
+        if command.newPrompt != nil, command.focus == true {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            focusWindowIfPossible()
+        }
+        if command.newPrompt != nil,
+           command.workspaceName == nil,
+           command.fileList.isEmpty,
+           command.promptText == nil
+        {
+            return .terminal(.completed(workspaceID: workspaceManager.activeWorkspaceID))
+        }
+
+        if let workspaceName = command.workspaceName, !workspaceName.isEmpty {
+            let targetWorkspace: WorkspaceModel
             if let existing = workspaceManager.workspaces.first(where: { $0.name == workspaceName }) {
-                // If ephemeral == true, mark that workspace ephemeral
-                if shouldBeEphemeral {
-                    if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existing.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
-                    }
+                if command.ephemeral == true || command.persist == false,
+                   let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existing.id })
+                {
+                    workspaceManager.workspaces[index].isEphemeral = true
                 }
-
-                // If focus == true, attempt to bring up existing window
-                if command.focus == true {
-                    if let wsManager = windowStatesManager,
-                       let existingWindow = wsManager.findWindowState(showing: existing.id)
-                    {
-                        NSApplication.shared.activate(ignoringOtherApps: true)
-                        existingWindow.focusWindowIfPossible()
-                        return
-                    }
+                if command.focus == true,
+                   let windowStatesManager,
+                   let existingWindow = windowStatesManager.findWindowState(showing: existing.id)
+                {
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                    existingWindow.focusWindowIfPossible()
+                    return .terminal(.completed(workspaceID: existing.id))
                 }
-
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: existing, saveState: true)
-                didSwitchWorkspace = result.didSwitch
+                targetWorkspace = existing
             } else {
-                // Create a new workspace by name
-                let newWS = workspaceManager.createWorkspace(
+                targetWorkspace = workspaceManager.createWorkspace(
                     name: workspaceName,
                     repoPaths: [],
-                    ephemeral: shouldBeEphemeral
+                    ephemeral: command.ephemeral == true || command.persist == false
                 )
-                requestedWorkspaceSwitch = true
-                let result = await workspaceManager.requestWorkspaceSwitch(to: newWS, saveState: true)
-                didSwitchWorkspace = result.didSwitch
+            }
+
+            let switchResult = await workspaceManager.requestWorkspaceSwitch(
+                to: targetWorkspace,
+                saveState: true
+            )
+            if let interruption = commandInterruptionResult() {
+                return .terminal(interruption)
+            }
+            switch switchResult {
+            case .switched:
+                break
+            case .cancelled:
+                return .terminal(.cancelled)
+            case .blocked:
+                return .terminal(.failed(.workspaceSwitchBlocked))
             }
         }
 
-        // If we now have an active workspace, apply file selection, prompt text, etc.
-        if requestedWorkspaceSwitch, !didSwitchWorkspace {
-            return
-        }
         guard workspaceManager.activeWorkspace != nil else {
-            return
+            return .terminal(.failed(.workspaceUnavailable))
         }
+        return await applyRemainingPayload(command)
+    }
 
+    private func applyStoredPromptIfNeeded(_ command: AppCommand) -> Bool {
+        guard let prompt = command.newPrompt else { return true }
+        let result = promptManager.addStoredPrompt(
+            title: prompt.title,
+            content: prompt.content
+        )
+        switch result {
+        case let .created(stored):
+            promptManager.selectNewPrompt(stored)
+            return true
+        case .persistenceFailed:
+            presentStoredPromptCommandPersistenceFailure()
+            return false
+        }
+    }
+
+    private func applyRemainingPayload(
+        _ command: AppCommand
+    ) async -> CommandHandlingOutcome {
         if !command.fileList.isEmpty {
             await workspaceFilesViewModel.selectFiles(withPaths: command.fileList)
+            if let interruption = commandInterruptionResult() {
+                return .terminal(interruption)
+            }
         }
 
         if let prompt = command.promptText, !prompt.isEmpty {
             promptManager.promptText = prompt
         }
-
-        // If focus == true and we haven't switched to another window yet, bring ourselves front
         if command.focus == true {
             NSApplication.shared.activate(ignoringOtherApps: true)
             focusWindowIfPossible()
         }
+        return .terminal(.completed(workspaceID: workspaceManager.activeWorkspaceID))
     }
 
     private func presentStoredPromptCommandPersistenceFailure() {
@@ -1823,9 +2494,8 @@ class WindowState: ObservableObject {
 
     /// Attempts to bring this window to the front if possible
     func focusWindowIfPossible() {
-        // Since WindowState is not an NSWindow, we can only activate the app
-        // The window itself will be brought forward by the system
         NSApplication.shared.activate(ignoringOtherApps: true)
+        nsWindow?.makeKeyAndOrderFront(nil)
     }
 
     @discardableResult
