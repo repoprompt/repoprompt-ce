@@ -199,6 +199,12 @@
                         LabeledContent("Seed candidate", value: optimization.seedCandidate ?? "GEPA proposes from objective and evidence")
                         LabeledContent("Reflection", value: plan.optimizationTargets?.reflection.displayName ?? "unavailable")
                         LabeledContent("Execution", value: "\(optimization.execution.adapter.rawValue) · \(plan.optimizationTargets?.execution?.displayName ?? "no model target")")
+                        if let mcp = optimization.execution.mcp {
+                            LabeledContent("Mutable prompt component", value: mcp.component)
+                            Text("Composition: the mutable component is inserted once into the pinned MCPAdapter system prompt. Fixed instructions, tool descriptions, JSON schemas, call/answer protocol, user task, and optional pass-two tool result are composed separately. Results measure the rendered surface and quality/size Pareto frontier.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         LabeledContent("Judge", value: plan.optimizationTargets?.judge?.displayName ?? "not used")
                         LabeledContent("Provider recovery", value: "\(optimization.gepa.maxProviderRetries ?? 0) additional calls per failed reflection or MCP model callback · retryable infrastructure codes only · no tool replay")
                         LabeledContent("Grading recovery", value: "\(optimization.gepa.pauseOnGradingFailure == true ? "Pause for explicit retry" : "Automatic JSON repair only") · \(optimization.gepa.maxJudgeRetries ?? 0) extra judge calls total · at most one per evaluation")
@@ -448,12 +454,17 @@
                                             Text("\(result.totalEvaluations) evaluations")
                                                 .font(.caption.monospaced())
                                         }
-                                        Text("Best \(result.bestScore.map { String($0) } ?? "unavailable") vs baseline \(result.baselineScore.map { String($0) } ?? "unavailable")")
+                                        Text("Highest quality \(result.bestScore.map { String($0) } ?? "unavailable") vs baseline \(result.baselineScore.map { String($0) } ?? "unavailable")")
                                             .font(.headline)
                                         ForEach(result.candidates.sorted { ($0.aggregateScore ?? -.infinity) > ($1.aggregateScore ?? -.infinity) }) { candidate in
                                             VStack(alignment: .leading, spacing: 3) {
-                                                Text("Candidate #\(candidate.index)\(candidate.isBaseline ? " · baseline" : "")\(candidate.isBest ? " · best" : "") · score \(candidate.aggregateScore.map { String($0) } ?? "unavailable")")
+                                                Text("Candidate #\(candidate.index)\(candidate.isBaseline ? " · baseline" : "")\(candidate.isBest ? " · highest quality" : "")\(candidate.isParetoEfficient == true ? " · Pareto frontier" : "") · score \(candidate.aggregateScore.map { String($0) } ?? "unavailable")")
                                                     .font(.subheadline.bold())
+                                                if let surface = candidate.promptSurface {
+                                                    Text("\(surface.candidateUTF8Bytes) candidate bytes + \(surface.fixedScaffoldUTF8Bytes) fixed bytes = \(surface.renderedSystemUTF8Bytes) rendered system bytes · overlap \(surface.candidateFixedScaffoldFourgramOverlap, format: .percent.precision(.fractionLength(1)))")
+                                                        .font(.caption.monospaced())
+                                                        .foregroundStyle(.secondary)
+                                                }
                                                 Text(candidate.candidatePreview)
                                                     .font(.caption)
                                                     .lineLimit(8)
@@ -466,7 +477,7 @@
                                                 }
                                             }
                                             .padding(8)
-                                            .background(candidate.isBest ? Color.green.opacity(0.08) : Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                                            .background(candidate.isParetoEfficient == true ? Color.green.opacity(0.08) : Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
                                         }
                                         Text("Proposer usage: \(result.proposerUsage)")
                                             .font(.caption)

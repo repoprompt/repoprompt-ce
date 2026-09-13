@@ -734,6 +734,28 @@
             if let bestIndex, !(0 ..< candidates.count).contains(bestIndex) {
                 throw WorkerError.protocolFailure("GEPA best candidate index is invalid.")
             }
+            let candidatePromptSurfaces: [PromptExperimentPromptSurfaceMetrics?]?
+            if let rawSurfaces = result["candidate_prompt_surfaces"] as? [Any] {
+                guard rawSurfaces.count == candidates.count else {
+                    throw WorkerError.protocolFailure("GEPA prompt-surface evidence count is invalid.")
+                }
+                candidatePromptSurfaces = try rawSurfaces.map(decodePromptSurface)
+            } else {
+                candidatePromptSurfaces = nil
+            }
+            let paretoFrontierIndices: [Int]?
+            if let rawFrontier = result["pareto_frontier_indices"] as? [Any] {
+                let decoded = rawFrontier.compactMap { ($0 as? NSNumber)?.intValue }
+                guard decoded.count == rawFrontier.count,
+                      decoded == Array(Set(decoded)).sorted(),
+                      decoded.allSatisfy({ candidates.indices.contains($0) })
+                else {
+                    throw WorkerError.protocolFailure("GEPA Pareto frontier indices are invalid.")
+                }
+                paretoFrontierIndices = decoded
+            } else {
+                paretoFrontierIndices = nil
+            }
             let evaluations = try rawEvaluations.map { value -> PromptExperimentOptimizationRuntimeEvaluation in
                 guard let candidate = (value["candidate_index"] as? NSNumber)?.intValue,
                       candidate == -1 || (candidate >= 0 && candidate < candidates.count),
@@ -782,12 +804,62 @@
                 candidates: candidates,
                 parentIndices: parents,
                 aggregateScores: scores,
+                candidatePromptSurfaces: candidatePromptSurfaces,
+                paretoFrontierIndices: paretoFrontierIndices,
                 evaluations: evaluations,
                 totalEvaluations: totalEvaluations,
                 wallTimeSeconds: wallTime,
                 proposerUsage: result["proposer_usage"] as? String ?? "unavailable",
                 runDirectoryRelativePath: relativeRunDirectory,
                 rawResultJSON: raw
+            )
+        }
+
+        private func decodePromptSurface(_ value: Any) throws -> PromptExperimentPromptSurfaceMetrics? {
+            guard !(value is NSNull) else { return nil }
+            guard let object = value as? [String: Any],
+                  (object["schema_version"] as? NSNumber)?.intValue == 1,
+                  let adapter = object["adapter"] as? String, !adapter.isEmpty,
+                  let component = object["component"] as? String, !component.isEmpty,
+                  let candidateUTF8Bytes = (object["candidate_utf8_bytes"] as? NSNumber)?.intValue,
+                  let candidateCharacters = (object["candidate_characters"] as? NSNumber)?.intValue,
+                  let candidateWords = (object["candidate_words"] as? NSNumber)?.intValue,
+                  let candidateLines = (object["candidate_lines"] as? NSNumber)?.intValue,
+                  let fixedScaffoldUTF8Bytes = (object["fixed_scaffold_utf8_bytes"] as? NSNumber)?.intValue,
+                  let renderedSystemUTF8Bytes = (object["rendered_system_utf8_bytes"] as? NSNumber)?.intValue,
+                  let mutableInsertionCount = (object["mutable_insertion_count"] as? NSNumber)?.intValue,
+                  let fixedScaffoldSHA256 = object["fixed_scaffold_sha256"] as? String,
+                  let renderedSystemSHA256 = object["rendered_system_sha256"] as? String,
+                  let overlap = (object["candidate_fixed_scaffold_fourgram_overlap"] as? NSNumber)?.doubleValue,
+                  [
+                      candidateUTF8Bytes,
+                      candidateCharacters,
+                      candidateWords,
+                      fixedScaffoldUTF8Bytes,
+                      renderedSystemUTF8Bytes
+                  ].allSatisfy({ $0 >= 0 }),
+                  candidateLines >= 1,
+                  mutableInsertionCount == 1,
+                  fixedScaffoldSHA256.count == 64,
+                  renderedSystemSHA256.count == 64,
+                  overlap.isFinite, (0 ... 1).contains(overlap)
+            else {
+                throw WorkerError.protocolFailure("GEPA prompt-surface evidence is invalid.")
+            }
+            return PromptExperimentPromptSurfaceMetrics(
+                schemaVersion: 1,
+                adapter: adapter,
+                component: component,
+                candidateUTF8Bytes: candidateUTF8Bytes,
+                candidateCharacters: candidateCharacters,
+                candidateWords: candidateWords,
+                candidateLines: candidateLines,
+                fixedScaffoldUTF8Bytes: fixedScaffoldUTF8Bytes,
+                renderedSystemUTF8Bytes: renderedSystemUTF8Bytes,
+                mutableInsertionCount: mutableInsertionCount,
+                fixedScaffoldSHA256: fixedScaffoldSHA256,
+                renderedSystemSHA256: renderedSystemSHA256,
+                candidateFixedScaffoldFourgramOverlap: overlap
             )
         }
 

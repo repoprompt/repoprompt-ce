@@ -114,15 +114,38 @@ our existing `optimize_anything` search. It does not replace GEPA's optimizer. T
 one selected component (`system_prompt` or `tool_description_<tool>`), not schemas, executable,
 permissions, model selection, or the grader. Preparation batches use this same real tool path.
 
+The mutable component is not treated as a standalone prompt. Before search, the worker renders the
+exact pinned MCPAdapter system-prompt template with a unique mutable-slot marker and adds that
+composition contract to GEPA's background. The fixed scaffold already contains tool descriptions,
+full JSON schemas, examples, and the call/answer JSON protocol. Each evaluation verifies that the
+actual system message equals the deterministic render and records candidate bytes, fixed-scaffold
+bytes, rendered-system bytes, digests, insertion count, pass count, total transmitted prompt bytes,
+and candidate/scaffold four-gram overlap. This makes duplication and marginal prompt cost visible
+without pretending that provider token accounting is available.
+
+The composition contract also discloses both exact message layouts: pass one is the rendered system
+prompt plus the example input; after a tool call, pass two repeats both and appends the upstream
+assistant tool-result wrapper plus final-answer request. This is the behavior under optimization,
+not a claim that the mutable component alone can call tools.
+
+Candidate quality and rendered system size remain separate dimensions. The worker records the
+non-dominated quality/size Pareto frontier; `best_candidate_index` is retained as upstream GEPA's
+highest-quality index for compatibility, not as an automatic product choice. RPCE does not invent a
+hidden scalar weighting or tolerance. Reviewers should inspect regressions and attempt to distill a
+verbose improvement before promotion.
+
 ### Current executable boundary
 
 - A reviewed project snapshot is mandatory; it can come from any authorized loaded project.
 - The server is the packaged `repoprompt-mcp --backend headless`, never the running app's MCP endpoint.
-- Choose a nonempty subset of `read_file`, `file_search`, `get_file_tree`, `get_code_structure`.
+- Choose a nonempty subset of `read_file`, `file_search`, `get_file_tree`, `get_code_structure`,
+  and `apply_edits`.
 - Sealing captures canonical tool definitions and the executable SHA-256; startup rejects drift.
-- Each evaluation has a fresh profile and scratch cwd. Only reviewed project files are readable;
-  project writes and network are denied. The headless server registers the read-only allowlist and
-  starts no child-agent endpoint. Remote and arbitrary custom MCP servers are not supported yet.
+- Each evaluation has a fresh profile, scratch cwd, and copy of the reviewed project snapshot.
+  Reads and optional `apply_edits` mutations are confined to that disposable copy; the reviewed
+  source snapshot is re-hashed after execution and must remain unchanged. Network is denied. The
+  headless server registers only the sealed allowlist and starts no child-agent endpoint. Remote and
+  arbitrary custom MCP servers are not supported yet.
 - Target inference remains text-only through connected RPCE providers. Upstream interprets the
   tool-choice JSON and performs at most one real tool call, followed by at most one answer call.
   This is not native provider tool calling or multi-agent execution.
@@ -132,7 +155,8 @@ permissions, model selection, or the grader. Preparation batches use this same r
   rubric stays with the host grader. Reviewed training/validation feedback may cite reference
   answers to support reflection; hidden-test feedback is withheld and only its score returns.
 - PID start/close events are persisted through existing attempt diagnostics. Successful evidence
-  includes actual MCP arguments/results, model passes, timings, and exit observation. Partial local
+  includes actual MCP arguments/results, model passes, prompt-surface composition, isolated
+  mutations, timings, and exit observation. Partial local
   trajectories live under the attempt's `gepa-output/mcp-eval-*` directory. Stderr is drained and
   counted without including payloads in diagnostics. Infrastructure failures escape upstream's
   exception-to-zero-score fallback; malformed choices and tool-level errors are candidate failures.

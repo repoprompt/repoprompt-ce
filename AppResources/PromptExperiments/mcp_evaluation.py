@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import shutil
 import sys
@@ -28,6 +29,114 @@ from jsonschema.exceptions import ValidationError
 # 64 KiB, below legitimate search results with surrounding source context.
 MAX_MCP_RESPONSE_BYTES = 16 * 1024 * 1024
 ACTIVE_CHILDREN: set[int] = set()
+MUTABLE_COMPONENT_SENTINEL_PREFIX = '__RPCE_GEPA_MUTABLE_COMPONENT_V1_'
+
+
+def _utf8_bytes(value: str) -> int:
+    return len(value.encode('utf-8'))
+
+
+def _word_ngrams(value: str, size: int = 4) -> set[tuple[str, ...]]:
+    words = re.findall(r"[A-Za-z0-9_]+", value.lower())
+    return {tuple(words[index:index + size])
+            for index in range(max(0, len(words) - size + 1))}
+
+
+def component_value(candidate: str, config: dict) -> str:
+    if config['component'] == 'system_prompt':
+        return config['instructions'] + '\n' + candidate
+    return candidate
+
+
+def mutable_component_sentinel(candidate: str, config: dict,
+                               definitions: list[dict]) -> str:
+    occupied = '\n'.join((
+        candidate,
+        str(config.get('instructions', '')),
+        json.dumps(definitions, sort_keys=True, separators=(',', ':')),
+    ))
+    identity = hashlib.sha256(occupied.encode('utf-8')).hexdigest()
+    for ordinal in range(100):
+        digest = hashlib.sha256(f'{identity}:{ordinal}'.encode('ascii')).hexdigest()
+        sentinel = f'{MUTABLE_COMPONENT_SENTINEL_PREFIX}{digest}__'
+        if sentinel not in occupied:
+            return sentinel
+    raise ValueError('could not create a collision-free mutable component marker')
+
+
+def prompt_surface(adapter: MCPAdapter, candidate: str, config: dict,
+                   definitions: list[dict]) -> tuple[dict, str, str]:
+    """Render the exact pinned adapter composition and measure the mutable slot."""
+    mutable_value = component_value(candidate, config)
+    rendered = adapter._build_system_prompt(
+        {config['component']: mutable_value}, definitions)
+    sentinel = mutable_component_sentinel(candidate, config, definitions)
+    sentinel_value = component_value(sentinel, config)
+    template = adapter._build_system_prompt(
+        {config['component']: sentinel_value}, definitions)
+    if template.count(sentinel) != 1:
+        raise ValueError('mutable component is not represented exactly once')
+    fixed_scaffold = template.replace(sentinel, '')
+    candidate_ngrams = _word_ngrams(candidate)
+    overlap = candidate_ngrams & _word_ngrams(fixed_scaffold)
+    metrics = {
+        'schema_version': 1,
+        'adapter': 'upstream_gepa_mcp_adapter_two_pass',
+        'component': config['component'],
+        'candidate_utf8_bytes': _utf8_bytes(candidate),
+        'candidate_characters': len(candidate),
+        'candidate_words': len(re.findall(r"[A-Za-z0-9_]+", candidate)),
+        'candidate_lines': max(1, len(candidate.splitlines())),
+        'fixed_scaffold_utf8_bytes': _utf8_bytes(fixed_scaffold),
+        'rendered_system_utf8_bytes': _utf8_bytes(rendered),
+        'mutable_insertion_count': 1,
+        'fixed_scaffold_sha256': hashlib.sha256(
+            fixed_scaffold.encode('utf-8')).hexdigest(),
+        'rendered_system_sha256': hashlib.sha256(
+            rendered.encode('utf-8')).hexdigest(),
+        'candidate_fixed_scaffold_fourgram_overlap': (
+            len(overlap) / len(candidate_ngrams) if candidate_ngrams else 0.0
+        ),
+    }
+    return metrics, rendered, template
+
+
+def composition_contract(config: dict) -> str:
+    """Return the exact candidate slot inside the pinned adapter's renderer."""
+    _, _, template = prompt_surface_for_config('', config)
+    return f"""RPCE MCP PROMPT COMPOSITION CONTRACT
+The candidate changes only component {config['component']!r} at the marker below.
+Everything else is fixed by the sealed, pinned upstream MCPAdapter. Do not repeat
+the fixed tool descriptions, JSON schemas, tool-call protocol, or two-pass
+instructions inside the candidate. The user task is a separate user message. On
+a successful tool call, pass two reuses this system prompt and adds the tool
+result plus a request for the final answer.
+
+Exact message composition:
+- Pass one: system=<rendered template>; user=<example input>.
+- Pass two after a tool call: system=<same rendered template>;
+  user=<same example input>;
+  assistant="I'll use the tool to help answer this. Tool response: <tool result>";
+  user="Based on the tool response, please provide your final answer."
+
+Exact rendered system-prompt template:
+--- BEGIN RENDERED TEMPLATE ---
+{template}
+--- END RENDERED TEMPLATE ---
+"""
+
+
+def prompt_surface_for_config(candidate: str, config: dict) -> tuple[dict, str, str]:
+    definitions = json.loads(config['tool_definitions_json'])
+    adapter = MCPAdapter(
+        tool_names=config['tool_names'],
+        task_model=lambda _: '',
+        metric_fn=lambda *_: 0.0,
+        server_params=StdioServerParameters(command=config['server_path']),
+        base_system_prompt=config['instructions'],
+        enable_two_pass=True,
+    )
+    return prompt_surface(adapter, candidate, config, definitions)
 
 
 def project_manifest(root: pathlib.Path):
@@ -84,6 +193,8 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
              'evaluation_id': lease, 'events': [], 'tool_calls': [], 'models': []}
     phase = 0
     candidate_failure = False
+    expected_system_prompt = None
+    surface_metrics = None
 
     def event(name, **fields):
         trace['events'].append(dict(event=name, elapsed_seconds=time.monotonic()-started, **fields))
@@ -185,6 +296,13 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
         phase += 1
         if phase > 2:
             raise failure_type('Upstream adapter exceeded two model passes')
+        system_messages = [
+            message.get('content') for message in messages
+            if isinstance(message, dict) and message.get('role') == 'system'
+        ]
+        if (expected_system_prompt is None or len(system_messages) != 1
+                or system_messages[0] != expected_system_prompt):
+            raise failure_type('Upstream adapter rendered an unexpected system prompt')
         event('model_started', phase=phase)
         response = host_call('mcp_model', {'evaluation_id': lease, 'phase': phase, 'messages': messages})
         record_usage(response)
@@ -225,6 +343,8 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
         adapter = MCPAdapter(tool_names=tools, task_model=task_model,
                              metric_fn=lambda *_:0.0, server_params=params,
                              base_system_prompt=config['instructions'], enable_two_pass=True)
+        surface_metrics, expected_system_prompt, _ = prompt_surface(
+            adapter, candidate, config, definitions)
         result = adapter.evaluate([{'user_query':example['input'],'tool_arguments':{},
                                   'reference_answer':None,'additional_context':{}}],
                                   {config['component']:(config['instructions'] + '\n' + candidate if config['component']=='system_prompt' else candidate)},capture_traces=True)
@@ -266,9 +386,27 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
             'before_file_count': len(source_manifest),
             'after_file_count': len(final_manifest),
         }
+        surface_metrics.update({
+            'model_passes': phase,
+            'rendered_system_transmissions': phase,
+            'candidate_transmitted_utf8_bytes': (
+                surface_metrics['candidate_utf8_bytes'] * phase
+            ),
+            'rendered_system_transmitted_utf8_bytes': (
+                surface_metrics['rendered_system_utf8_bytes'] * phase
+            ),
+            'total_message_content_utf8_bytes': sum(
+                _utf8_bytes(str(message.get('content', '')))
+                for model in trace['models']
+                for message in model['messages']
+                if isinstance(message, dict)
+            ),
+        })
+        trace['prompt_surface'] = surface_metrics
         response = host_call('mcp_grade', {'evaluation_id':lease,'answer':answer,
             'trace':trace,'candidate_failure':candidate_failure})
         response['elapsed_seconds'] = time.monotonic()-started
+        response['prompt_surface'] = surface_metrics
         return response
     finally:
         upstream.create_mcp_client = original_factory

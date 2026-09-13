@@ -191,6 +191,12 @@
                     }
                     if let judge = plan.optimizationTargets?.judge { proposalField("Judge model", judge.displayName) }
                     proposalField("Fixed execution instructions", spec.execution.instructions)
+                    if let mcp = spec.execution.mcp {
+                        proposalField(
+                            "Prompt composition",
+                            "Mutable component: \(mcp.component), inserted once. The pinned adapter separately composes fixed instructions, tool descriptions, JSON schemas, call/answer protocol, user task, and optional pass-two tool result. Results measure the full rendered surface and quality/size Pareto frontier."
+                        )
+                    }
                     proposalField("Permissions", "Only the sealed models, examples and project snapshot may be used. Source files are not changed. Applying a candidate is a separate decision.")
                     if let project = spec.projectSnapshot {
                         proposalField("Project snapshot", "\(project.sourceRootPath)\n\(project.includedPaths.joined(separator: "\n"))")
@@ -317,7 +323,7 @@
         private func resultSummary(_ result: PromptExperimentOptimizationResult) -> some View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(result.assessment).font(.headline)
-                Text("Best measured score \(result.bestScore.map { String($0) } ?? "unavailable") · starting/reference score \(result.baselineScore.map { String($0) } ?? "unavailable")")
+                Text("Highest measured quality \(result.bestScore.map { String($0) } ?? "unavailable") · starting/reference quality \(result.baselineScore.map { String($0) } ?? "unavailable")")
                     .font(.subheadline)
                 DisclosureGroup("Per-example feedback") {
                     ForEach(result.evaluations) { evaluation in
@@ -332,13 +338,26 @@
                     .font(.caption.monospaced())
                     .textSelection(.enabled)
                     .foregroundStyle(.secondary)
-                ForEach(result.candidates.filter(\.isBest)) { candidate in
-                    Text(candidate.candidatePreview)
-                        .font(.caption)
-                        .lineLimit(8)
-                        .textSelection(.enabled)
-                        .padding(8)
-                        .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                let highlighted = result.candidates.filter {
+                    $0.isParetoEfficient == true
+                        || ((result.paretoFrontierIndices?.isEmpty ?? true) && $0.isBest)
+                }
+                ForEach(highlighted) { candidate in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Candidate #\(candidate.index) · \(candidate.isParetoEfficient == true ? "Pareto frontier" : "highest quality")")
+                            .font(.caption.bold())
+                        if let surface = candidate.promptSurface {
+                            Text("\(surface.candidateUTF8Bytes) candidate bytes + \(surface.fixedScaffoldUTF8Bytes) fixed bytes = \(surface.renderedSystemUTF8Bytes) rendered system bytes")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(candidate.candidatePreview)
+                            .font(.caption)
+                            .lineLimit(8)
+                            .textSelection(.enabled)
+                    }
+                    .padding(8)
+                    .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
                 }
             }
         }

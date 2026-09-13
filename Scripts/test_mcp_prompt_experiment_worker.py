@@ -7,6 +7,7 @@ No providers, credentials, app session, or live workspace are used.
 import hashlib
 import json
 import os
+import re
 import subprocess
 import select
 from pathlib import Path
@@ -19,7 +20,15 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(os.environ.get('REPOPROMPT_TEST_GEPA_WORKER', ROOT / 'AppResources/PromptExperiments/gepa_worker.py')).resolve()
 sys.path.insert(0, str(WORKER.parent))
-from mcp_evaluation import evaluate_mcp, ACTIVE_CHILDREN, MCPAdapter
+from mcp_evaluation import (
+    ACTIVE_CHILDREN,
+    MCPAdapter,
+    MUTABLE_COMPONENT_SENTINEL_PREFIX,
+    composition_contract,
+    evaluate_mcp,
+    mutable_component_sentinel,
+    prompt_surface_for_config,
+)
 
 
 class InfrastructureFailure(BaseException):
@@ -77,6 +86,59 @@ class MCPExperimentTests(unittest.TestCase):
             self.assertEqual(len(grades[0]['trace']['tool_calls']),1)
             self.assertIn(marker,json.dumps(grades[0]['trace']['tool_calls'][0]['result']))
             self.assertEqual(Path(body['mcp_adapter']['project_root'],'README.md').read_text(),marker)
+            surface = result['prompt_surface']
+            self.assertEqual(surface['mutable_insertion_count'], 1)
+            self.assertEqual(
+                surface['rendered_system_utf8_bytes'],
+                surface['candidate_utf8_bytes'] + surface['fixed_scaffold_utf8_bytes'],
+            )
+            self.assertEqual(surface['model_passes'], 2)
+            self.assertEqual(
+                grades[0]['trace']['prompt_surface'],
+                surface,
+            )
+
+    def test_prompt_surface_uses_exact_composed_renderer_not_naked_candidate(self):
+        with tempfile.TemporaryDirectory(prefix='rpce-mcp-surface-') as directory:
+            body, _, _ = self.setup_trial(directory)
+            candidate = 'You are a helpful assistant with access to tools.'
+            surface, rendered, template = prompt_surface_for_config(
+                candidate, body['mcp_adapter'])
+            self.assertEqual(surface['candidate_utf8_bytes'], 49)
+            self.assertGreater(surface['rendered_system_utf8_bytes'], 49)
+            self.assertGreater(surface['fixed_scaffold_utf8_bytes'], 0)
+            self.assertEqual(
+                surface['rendered_system_utf8_bytes'],
+                len(rendered.encode('utf-8')),
+            )
+            self.assertEqual(template.count(MUTABLE_COMPONENT_SENTINEL_PREFIX), 1)
+            contract = composition_contract(body['mcp_adapter'])
+            marker_pattern = re.escape(MUTABLE_COMPONENT_SENTINEL_PREFIX) + r'[0-9a-f]{64}__'
+            self.assertEqual(
+                re.sub(marker_pattern, '<MUTABLE>', template),
+                re.sub(
+                    marker_pattern,
+                    '<MUTABLE>',
+                    contract.split(
+                        '--- BEGIN RENDERED TEMPLATE ---\n', 1
+                    )[1].split('\n--- END RENDERED TEMPLATE ---', 1)[0],
+                ),
+            )
+            self.assertIn('Do not repeat', contract)
+            self.assertIn(
+                'Based on the tool response, please provide your final answer.',
+                contract,
+            )
+            definitions = json.loads(body['mcp_adapter']['tool_definitions_json'])
+            sentinel = mutable_component_sentinel(
+                candidate, body['mcp_adapter'], definitions)
+            self.assertEqual(
+                sentinel,
+                mutable_component_sentinel(
+                    candidate, body['mcp_adapter'], definitions),
+            )
+            occupied = candidate + body['mcp_adapter']['instructions'] + json.dumps(definitions)
+            self.assertNotIn(sentinel, occupied)
 
     def test_apply_edits_mutates_only_fresh_evaluation_copy_and_records_evidence(self):
         with tempfile.TemporaryDirectory(prefix='rpce-mcp-apply-') as directory:
@@ -295,7 +357,12 @@ class MCPExperimentTests(unittest.TestCase):
                         if event['type']!='host_request':continue
                         op=event['operation'];payload=event['payload'];operations.append(op)
                         reply={'type':'host_response','id':event['id'],'ok':True}
-                        if op=='reflect':reply['output']='```\nRead the requested evidence with read_file.\n```'
+                        if op=='reflect':
+                            serialized_prompt = json.dumps(payload['prompt'])
+                            self.assertIn('RPCE MCP PROMPT COMPOSITION CONTRACT', serialized_prompt)
+                            self.assertIn(MUTABLE_COMPONENT_SENTINEL_PREFIX, serialized_prompt)
+                            self.assertIn('Input Schema:', serialized_prompt)
+                            reply['output']='```\nRead the requested evidence with read_file.\n```'
                         elif op=='mcp_begin':
                             lease=str(uuid.uuid4());leases[lease]=payload['candidate'];reply['output']=lease
                         elif op=='mcp_model':
@@ -325,6 +392,11 @@ class MCPExperimentTests(unittest.TestCase):
                     self.assertEqual(completed['baseline_score'],0.0)
                     self.assertEqual(completed['best_score'],1.0)
                     self.assertGreater(len(completed['candidates']),1)
+                    self.assertTrue(completed['pareto_frontier_indices'])
+                    self.assertEqual(
+                        len(completed['candidate_prompt_surfaces']),
+                        len(completed['candidates']),
+                    )
                     self.assertIn('reflect',operations)
                     self.assertTrue(failed_second_pass)
                     self.assertTrue(retried_second_pass)

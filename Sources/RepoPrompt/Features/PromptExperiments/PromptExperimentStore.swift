@@ -442,7 +442,13 @@
                         lines.append("  - GEPA upstream revision: `\(result.upstreamRevision)`")
                         lines.append("  - Assessment: \(Self.markdownInline(result.assessment))")
                         lines.append("  - Baseline score: \(result.baselineScore.map { String($0) } ?? "unavailable")")
-                        lines.append("  - Best score: \(result.bestScore.map { String($0) } ?? "unavailable")")
+                        lines.append("  - Highest measured quality: \(result.bestScore.map { String($0) } ?? "unavailable")")
+                        lines.append("  - Selection semantics: highest quality is not an automatic winner")
+                        if let frontier = result.paretoFrontierIndices {
+                            lines.append("  - Quality/rendered-size Pareto frontier: \(frontier.map(String.init).joined(separator: ", "))")
+                        } else {
+                            lines.append("  - Quality/rendered-size Pareto frontier: unavailable")
+                        }
                         lines.append("  - Evaluations: \(result.totalEvaluations)")
                         let wallTime = result.wallTimeSeconds.map { String(format: "%.3f", $0) } ?? "unavailable"
                         lines.append("  - GEPA wall time: \(wallTime) seconds")
@@ -457,9 +463,17 @@
                         }
                         lines.append("  - Candidates:")
                         for candidate in result.candidates {
-                            let labels = [candidate.isBaseline ? "baseline" : nil, candidate.isBest ? "best" : nil]
-                                .compactMap(\.self).joined(separator: ", ")
+                            let labels = [
+                                candidate.isBaseline ? "baseline" : nil,
+                                candidate.isBest ? "highest quality" : nil,
+                                candidate.isParetoEfficient == true ? "Pareto frontier" : nil
+                            ]
+                            .compactMap(\.self).joined(separator: ", ")
                             lines.append("    - #\(candidate.index) \(labels) score \(candidate.aggregateScore.map { String($0) } ?? "unavailable"): `../../\(candidate.candidateEvidence.relativePath)`")
+                            if let surface = candidate.promptSurface {
+                                lines.append("      - Prompt surface: candidate \(surface.candidateUTF8Bytes) bytes + fixed scaffold \(surface.fixedScaffoldUTF8Bytes) bytes = rendered system \(surface.renderedSystemUTF8Bytes) bytes; four-gram overlap \(String(format: "%.3f", surface.candidateFixedScaffoldFourgramOverlap))")
+                                lines.append("      - Rendered/fixed digests: `\(surface.renderedSystemSHA256)` / `\(surface.fixedScaffoldSHA256)`")
+                            }
                         }
                         lines.append("  - Evaluation feedback:")
                         for evaluation in result.evaluations {

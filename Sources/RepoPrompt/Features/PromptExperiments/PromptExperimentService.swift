@@ -258,8 +258,33 @@
             try await requireLoaded()
             let date = now()
             let experimentID = UUID()
+            let draft = makeOptimizationDraft(at: date)
+            records.insert(PromptExperimentRecord(
+                id: experimentID,
+                controllerSessionID: controllerSessionID,
+                sourceTabID: sourceTabID,
+                createdAt: date,
+                updatedAt: date,
+                phase: .drafting,
+                draft: draft,
+                plans: [],
+                approvals: [],
+                attempts: [],
+                cancellationRequestedAt: nil,
+                statusMessage: "Draft — the linked Agent session can propose a reviewed dataset, evaluator, targets, and GEPA budget."
+            ), at: 0)
+            try await persist()
+            return experimentID
+        }
+
+        func makeOptimizationDraftForAuthoring() async throws -> PromptExperimentDraft {
+            try await requireLoaded()
+            return makeOptimizationDraft(at: now())
+        }
+
+        private func makeOptimizationDraft(at date: Date) -> PromptExperimentDraft {
             let python = PromptExperimentGEPAWorker.configuredPythonSealValue()
-            let draft = PromptExperimentDraft(
+            return PromptExperimentDraft(
                 revision: 1,
                 title: "GEPA optimization",
                 targetRole: "",
@@ -298,22 +323,6 @@
                 createdAt: date,
                 updatedAt: date
             )
-            records.insert(PromptExperimentRecord(
-                id: experimentID,
-                controllerSessionID: controllerSessionID,
-                sourceTabID: sourceTabID,
-                createdAt: date,
-                updatedAt: date,
-                phase: .drafting,
-                draft: draft,
-                plans: [],
-                approvals: [],
-                attempts: [],
-                cancellationRequestedAt: nil,
-                statusMessage: "Draft — the linked Agent session can propose a reviewed dataset, evaluator, targets, and GEPA budget."
-            ), at: 0)
-            try await persist()
-            return experimentID
         }
 
         @discardableResult
@@ -1548,7 +1557,11 @@
                     candidatePreview: String(candidate.prefix(600)),
                     aggregateScore: index < runtime.aggregateScores.count ? runtime.aggregateScores[index] : nil,
                     isBaseline: index == 0,
-                    isBest: index == runtime.bestCandidateIndex
+                    isBest: index == runtime.bestCandidateIndex,
+                    isParetoEfficient: runtime.paretoFrontierIndices?.contains(index),
+                    promptSurface: runtime.candidatePromptSurfaces.flatMap {
+                        index < $0.count ? $0[index] : nil
+                    }
                 ))
             }
             var evaluations: [PromptExperimentEvaluationEvidence] = []
@@ -1580,6 +1593,7 @@
                 baselineScore: runtime.baselineScore,
                 bestScore: runtime.bestScore,
                 bestCandidateIndex: runtime.bestCandidateIndex,
+                paretoFrontierIndices: runtime.paretoFrontierIndices,
                 candidates: candidates,
                 evaluations: evaluations,
                 totalEvaluations: runtime.totalEvaluations,

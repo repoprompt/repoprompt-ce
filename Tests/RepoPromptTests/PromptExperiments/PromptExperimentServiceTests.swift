@@ -1433,6 +1433,17 @@ import XCTest
 
             let createdResponse = try await interface.execute(.createDraft, owner: owner)
             guard case let .draft(id, created) = createdResponse else { return XCTFail("Expected draft") }
+            let createdValue = try MCPAgentSessionControlToolProvider.responseValue(createdResponse).objectValue
+            let preconditions = createdValue?["update_preconditions"]?.objectValue
+            XCTAssertEqual(preconditions?["experiment_id"], .string(id.uuidString))
+            XCTAssertEqual(preconditions?["expected_draft_id"], .string(created.id.uuidString))
+            XCTAssertEqual(preconditions?["expected_draft_version"], .string("1"))
+            XCTAssertEqual(preconditions?["expected_draft_digest"], try .string(created.contentDigest()))
+            let contract = createdValue?["authoring_contract"]?.objectValue
+            XCTAssertEqual(contract?["schema_version"], .int(3))
+            let exampleTemplate = contract?["examples"]?.objectValue?["template"]?.objectValue
+            XCTAssertEqual(exampleTemplate?["id"], .string("case-id"))
+            XCTAssertEqual(exampleTemplate?["split"], .string("training"))
             let updatedResponse = try await interface.execute(.updateDraft(
                 experimentID: id,
                 expectedDraftID: created.id,
@@ -1511,6 +1522,36 @@ import XCTest
             XCTAssertEqual(harness.service.record(id: id)?.controllerSessionID, owner.controllerSessionID)
             XCTAssertTrue(plan.limitations.contains { $0.contains("bundled CPython runtime") })
             XCTAssertFalse(plan.limitations.contains { $0.contains("separately configured Python") })
+        }
+
+        func testInvalidSetupDoesNotPersistProbeDraft() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            await harness.service.load()
+            let owner = PromptExperimentAgentOwner(controllerSessionID: UUID(), sourceTabID: UUID())
+            let interface = PromptExperimentAgentInterface(service: harness.service)
+            var invalid = Self.validOptimization()
+            invalid.examples = []
+
+            do {
+                _ = try await interface.execute(.setup(patch: PromptExperimentAgentDraftPatch(
+                    title: "Invalid schema probe",
+                    taskInput: nil,
+                    syntheticFixture: nil,
+                    originalInstructions: nil,
+                    candidateInstructions: nil,
+                    targetRole: nil,
+                    repetitions: nil,
+                    optimization: invalid
+                )), owner: owner)
+                XCTFail("Invalid setup must fail before persistence")
+            } catch let error as PromptExperimentAuthorityError {
+                XCTAssertEqual(error, .invalidDraft("Add at least one reviewed evaluation example."))
+            }
+            let ownedRecords = try await harness.service.ownedRecords(
+                controllerSessionID: owner.controllerSessionID
+            )
+            XCTAssertTrue(ownedRecords.isEmpty)
         }
 
         func testHandlerParsesRunWaitAndRevisionAliases() throws {
@@ -1595,6 +1636,47 @@ import XCTest
             XCTAssertEqual(parsedVersion, 3)
             XCTAssertEqual(parsedDigest, "draft-digest")
             XCTAssertEqual(patch.optimization, specification)
+
+            let stringVersionArgs = updateArgs.merging([
+                "expected_draft_version": .string("3")
+            ]) { _, replacement in replacement }
+            let stringVersionUpdate = try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: stringVersionArgs)
+            guard case let .updateDraft(_, _, stringVersion, _, _) = stringVersionUpdate else {
+                return XCTFail("Expected string-version update_draft command")
+            }
+            XCTAssertEqual(stringVersion, 3)
+
+            let doubleVersionArgs = updateArgs.merging([
+                "expected_draft_version": .double(3)
+            ]) { _, replacement in replacement }
+            let doubleVersionUpdate = try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: doubleVersionArgs)
+            guard case let .updateDraft(_, _, doubleVersion, _, _) = doubleVersionUpdate else {
+                return XCTFail("Expected exact-double-version update_draft command")
+            }
+            XCTAssertEqual(doubleVersion, 3)
+
+            let fractionalVersionArgs = updateArgs.merging([
+                "expected_draft_version": .double(3.5)
+            ]) { _, replacement in replacement }
+            XCTAssertThrowsError(
+                try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: fractionalVersionArgs)
+            )
+
+            let booleanVersionArgs = updateArgs.merging([
+                "expected_draft_version": .bool(true)
+            ]) { _, replacement in replacement }
+            let booleanVersionUpdate = try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: booleanVersionArgs)
+            guard case let .updateDraft(_, _, booleanVersion, _, _) = booleanVersionUpdate else {
+                return XCTFail("Expected provider-coerced version update_draft command")
+            }
+            XCTAssertEqual(booleanVersion, 1)
+
+            let falseVersionArgs = updateArgs.merging([
+                "expected_draft_version": .bool(false)
+            ]) { _, replacement in replacement }
+            XCTAssertThrowsError(
+                try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: falseVersionArgs)
+            )
         }
 
         func testHandlerRejectsMalformedAndUnsupportedNormalizedSpecificationEnvelopes() throws {
@@ -1640,6 +1722,33 @@ import XCTest
                     return XCTFail("Expected invalidParams, got \(error)")
                 }
                 XCTAssertEqual(message, "Unsupported optimization specification schema 99")
+            }
+
+            var missingIDEnvelope = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(specificationJSON.utf8)) as? [String: Any]
+            )
+            var missingIDSpecification = try XCTUnwrap(missingIDEnvelope["specification"] as? [String: Any])
+            var missingIDExamples = try XCTUnwrap(missingIDSpecification["examples"] as? [[String: Any]])
+            missingIDExamples[0].removeValue(forKey: "id")
+            missingIDSpecification["examples"] = missingIDExamples
+            missingIDEnvelope["specification"] = missingIDSpecification
+            let missingIDJSON = try String(
+                decoding: JSONSerialization.data(withJSONObject: missingIDEnvelope),
+                as: UTF8.self
+            )
+            XCTAssertThrowsError(
+                try MCPAgentSessionControlToolProvider.promptExperimentCommand(args: [
+                    "op": .string("setup"),
+                    "specification_json": .string(missingIDJSON)
+                ])
+            ) { error in
+                guard case let MCPError.invalidParams(message) = error else {
+                    return XCTFail("Expected invalidParams, got \(error)")
+                }
+                XCTAssertEqual(
+                    message,
+                    "Invalid specification_json: missing required field specification.examples[0].id"
+                )
             }
         }
 
@@ -2426,6 +2535,39 @@ import XCTest
                 candidates: ["baseline instructions", "improved instructions"],
                 parentIndices: [[], [0]],
                 aggregateScores: [0, 1],
+                candidatePromptSurfaces: [
+                    PromptExperimentPromptSurfaceMetrics(
+                        schemaVersion: 1,
+                        adapter: "upstream_gepa_mcp_adapter_two_pass",
+                        component: "system_prompt",
+                        candidateUTF8Bytes: 21,
+                        candidateCharacters: 21,
+                        candidateWords: 2,
+                        candidateLines: 1,
+                        fixedScaffoldUTF8Bytes: 5000,
+                        renderedSystemUTF8Bytes: 5021,
+                        mutableInsertionCount: 1,
+                        fixedScaffoldSHA256: String(repeating: "a", count: 64),
+                        renderedSystemSHA256: String(repeating: "b", count: 64),
+                        candidateFixedScaffoldFourgramOverlap: 0
+                    ),
+                    PromptExperimentPromptSurfaceMetrics(
+                        schemaVersion: 1,
+                        adapter: "upstream_gepa_mcp_adapter_two_pass",
+                        component: "system_prompt",
+                        candidateUTF8Bytes: 21,
+                        candidateCharacters: 21,
+                        candidateWords: 2,
+                        candidateLines: 1,
+                        fixedScaffoldUTF8Bytes: 5000,
+                        renderedSystemUTF8Bytes: 5021,
+                        mutableInsertionCount: 1,
+                        fixedScaffoldSHA256: String(repeating: "a", count: 64),
+                        renderedSystemSHA256: String(repeating: "c", count: 64),
+                        candidateFixedScaffoldFourgramOverlap: 0
+                    )
+                ],
+                paretoFrontierIndices: [0, 1],
                 evaluations: [
                     PromptExperimentOptimizationRuntimeEvaluation(
                         candidateIndex: 1,
@@ -2460,7 +2602,10 @@ import XCTest
             XCTAssertEqual(result.engine, preparation ? "preparation" : "gepa")
             XCTAssertTrue(result.assessment.contains(preparation ? "not held-out results" : "retained candidates"))
             XCTAssertEqual(result.bestCandidateIndex, 1)
+            XCTAssertEqual(result.paretoFrontierIndices, [0, 1])
             XCTAssertEqual(result.candidates.map(\.candidatePreview), ["baseline instructions", "improved instructions"])
+            XCTAssertEqual(result.candidates.map(\.isParetoEfficient), [true, true])
+            XCTAssertEqual(result.candidates.first?.promptSurface?.renderedSystemUTF8Bytes, 5021)
             XCTAssertEqual(result.evaluations.first?.feedback, "matched reviewed answer")
             XCTAssertEqual(result.runDirectoryRelativePath, "worker-runs/attempt/gepa-run")
             XCTAssertEqual(result.proposerUsage, "unavailable_from_connected_model_completion_contract")
@@ -2472,6 +2617,8 @@ import XCTest
             let directory = try await reopened.recordDirectoryURL(experimentID: id)
             let overview = try String(contentsOf: directory.appendingPathComponent("overview.md"), encoding: .utf8)
             XCTAssertTrue(overview.contains("GEPA wall time: 1.500 seconds"))
+            XCTAssertTrue(overview.contains("Quality/rendered-size Pareto frontier: 0, 1"))
+            XCTAssertTrue(overview.contains("candidate 21 bytes + fixed scaffold 5000 bytes"))
             XCTAssertTrue(overview.contains("worker-runs/attempt/gepa-run"))
             XCTAssertTrue(overview.contains("matched reviewed answer"))
             XCTAssertTrue(overview.contains("Sealed optimization authority"))

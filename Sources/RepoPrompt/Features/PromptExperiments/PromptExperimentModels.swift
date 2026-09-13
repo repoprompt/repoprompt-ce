@@ -239,6 +239,22 @@
         case infrastructure
     }
 
+    struct PromptExperimentPromptSurfaceMetrics: Codable, Equatable {
+        let schemaVersion: Int
+        let adapter: String
+        let component: String
+        let candidateUTF8Bytes: Int
+        let candidateCharacters: Int
+        let candidateWords: Int
+        let candidateLines: Int
+        let fixedScaffoldUTF8Bytes: Int
+        let renderedSystemUTF8Bytes: Int
+        let mutableInsertionCount: Int
+        let fixedScaffoldSHA256: String
+        let renderedSystemSHA256: String
+        let candidateFixedScaffoldFourgramOverlap: Double
+    }
+
     struct PromptExperimentEvaluationEvidence: Codable, Equatable, Identifiable {
         let id: UUID
         let candidateIndex: Int
@@ -260,6 +276,32 @@
         let aggregateScore: Double?
         let isBaseline: Bool
         let isBest: Bool
+        let isParetoEfficient: Bool?
+        let promptSurface: PromptExperimentPromptSurfaceMetrics?
+
+        init(
+            id: UUID,
+            index: Int,
+            parentIndices: [Int],
+            candidateEvidence: PromptExperimentArtifactReference,
+            candidatePreview: String,
+            aggregateScore: Double?,
+            isBaseline: Bool,
+            isBest: Bool,
+            isParetoEfficient: Bool? = nil,
+            promptSurface: PromptExperimentPromptSurfaceMetrics? = nil
+        ) {
+            self.id = id
+            self.index = index
+            self.parentIndices = parentIndices
+            self.candidateEvidence = candidateEvidence
+            self.candidatePreview = candidatePreview
+            self.aggregateScore = aggregateScore
+            self.isBaseline = isBaseline
+            self.isBest = isBest
+            self.isParetoEfficient = isParetoEfficient
+            self.promptSurface = promptSurface
+        }
     }
 
     struct PromptExperimentOptimizationRuntimeEvaluation: Codable, Equatable {
@@ -282,12 +324,50 @@
         let candidates: [String]
         let parentIndices: [[Int]]
         let aggregateScores: [Double?]
+        let candidatePromptSurfaces: [PromptExperimentPromptSurfaceMetrics?]?
+        let paretoFrontierIndices: [Int]?
         let evaluations: [PromptExperimentOptimizationRuntimeEvaluation]
         let totalEvaluations: Int
         let wallTimeSeconds: Double?
         let proposerUsage: String
         let runDirectoryRelativePath: String?
         let rawResultJSON: Data
+
+        init(
+            engine: String,
+            upstreamRevision: String,
+            baselineScore: Double?,
+            bestScore: Double?,
+            bestCandidateIndex: Int?,
+            candidates: [String],
+            parentIndices: [[Int]],
+            aggregateScores: [Double?],
+            candidatePromptSurfaces: [PromptExperimentPromptSurfaceMetrics?]? = nil,
+            paretoFrontierIndices: [Int]? = nil,
+            evaluations: [PromptExperimentOptimizationRuntimeEvaluation],
+            totalEvaluations: Int,
+            wallTimeSeconds: Double?,
+            proposerUsage: String,
+            runDirectoryRelativePath: String?,
+            rawResultJSON: Data
+        ) {
+            self.engine = engine
+            self.upstreamRevision = upstreamRevision
+            self.baselineScore = baselineScore
+            self.bestScore = bestScore
+            self.bestCandidateIndex = bestCandidateIndex
+            self.candidates = candidates
+            self.parentIndices = parentIndices
+            self.aggregateScores = aggregateScores
+            self.candidatePromptSurfaces = candidatePromptSurfaces
+            self.paretoFrontierIndices = paretoFrontierIndices
+            self.evaluations = evaluations
+            self.totalEvaluations = totalEvaluations
+            self.wallTimeSeconds = wallTimeSeconds
+            self.proposerUsage = proposerUsage
+            self.runDirectoryRelativePath = runDirectoryRelativePath
+            self.rawResultJSON = rawResultJSON
+        }
     }
 
     struct PromptExperimentOptimizationResult: Codable, Equatable {
@@ -296,6 +376,7 @@
         let baselineScore: Double?
         let bestScore: Double?
         let bestCandidateIndex: Int?
+        let paretoFrontierIndices: [Int]?
         let candidates: [PromptExperimentCandidateEvidence]
         let evaluations: [PromptExperimentEvaluationEvidence]
         let totalEvaluations: Int
@@ -303,12 +384,45 @@
         let proposerUsage: String
         let runDirectoryRelativePath: String?
         let rawResultEvidence: PromptExperimentArtifactReference?
+
+        init(
+            engine: String,
+            upstreamRevision: String,
+            baselineScore: Double?,
+            bestScore: Double?,
+            bestCandidateIndex: Int?,
+            paretoFrontierIndices: [Int]? = nil,
+            candidates: [PromptExperimentCandidateEvidence],
+            evaluations: [PromptExperimentEvaluationEvidence],
+            totalEvaluations: Int,
+            wallTimeSeconds: Double?,
+            proposerUsage: String,
+            runDirectoryRelativePath: String?,
+            rawResultEvidence: PromptExperimentArtifactReference?
+        ) {
+            self.engine = engine
+            self.upstreamRevision = upstreamRevision
+            self.baselineScore = baselineScore
+            self.bestScore = bestScore
+            self.bestCandidateIndex = bestCandidateIndex
+            self.paretoFrontierIndices = paretoFrontierIndices
+            self.candidates = candidates
+            self.evaluations = evaluations
+            self.totalEvaluations = totalEvaluations
+            self.wallTimeSeconds = wallTimeSeconds
+            self.proposerUsage = proposerUsage
+            self.runDirectoryRelativePath = runDirectoryRelativePath
+            self.rawResultEvidence = rawResultEvidence
+        }
     }
 
     extension PromptExperimentOptimizationResult {
         var assessment: String {
             if engine == "preparation" {
-                return "Preparation complete: \(candidates.count) reviewed candidates tested in \(totalEvaluations) development evaluations. Inspect feedback and revise before GEPA search; these are not held-out results."
+                if let paretoFrontierIndices, paretoFrontierIndices.count > 1 {
+                    return "Preparation complete: \(candidates.count) reviewed candidates tested in \(totalEvaluations) development evaluations. Multiple candidates remain Pareto-efficient on measured quality and rendered prompt size; there is no automatic winner. Inspect feedback and tradeoffs before GEPA search. These are not held-out results."
+                }
+                return "Preparation complete: \(candidates.count) reviewed candidates tested in \(totalEvaluations) development evaluations. The highest-quality candidate is not an automatic winner; inspect feedback, prompt surface, and tradeoffs before GEPA search. These are not held-out results."
             }
             if candidates.count == 1, evaluations.allSatisfy({ $0.candidateIndex == 0 }) {
                 return "Search ended after \(totalEvaluations) evaluations of the starting candidate only. No alternative was evaluated; improvement was not demonstrated."

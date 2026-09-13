@@ -155,24 +155,16 @@
                 guard patch.optimization != nil else {
                     throw PromptExperimentAuthorityError.invalidDraft("setup requires a complete specification_json optimization envelope.")
                 }
+                let authoringDraft = try await service.makeOptimizationDraftForAuthoring()
+                let preview = Self.applying(patch, to: authoringDraft)
+                _ = try preview.validated()
                 let id = try await service.createOptimizationExperiment(
                     controllerSessionID: owner.controllerSessionID,
                     sourceTabID: owner.sourceTabID
                 )
                 let createdRecord = try await service.ownedRecord(id: id, controllerSessionID: owner.controllerSessionID)
                 let created = try requireDraft(createdRecord)
-                var draft = created
-                if let title = patch.title { draft.title = title }
-                if let taskInput = patch.taskInput { draft.taskInput = taskInput }
-                if let syntheticFixture = patch.syntheticFixture { draft.syntheticFixture = syntheticFixture }
-                if let originalInstructions = patch.originalInstructions { draft.originalInstructions = originalInstructions }
-                if let candidateInstructions = patch.candidateInstructions { draft.candidateInstructions = candidateInstructions }
-                if let targetRole = patch.targetRole { draft.targetRole = targetRole }
-                if let repetitions = patch.repetitions { draft.repetitions = repetitions }
-                if var optimization = patch.optimization {
-                    optimization.gepa.pythonExecutablePath = PromptExperimentGEPAWorker.configuredPythonSealValue()
-                    draft.optimization = optimization
-                }
+                let draft = Self.applying(patch, to: created)
                 let updated = try await service.updateDraft(
                     experimentID: id,
                     expectedDraftID: created.id,
@@ -206,18 +198,7 @@
                     id: experimentID,
                     controllerSessionID: owner.controllerSessionID
                 )
-                var draft = try requireDraft(record)
-                if let title = patch.title { draft.title = title }
-                if let taskInput = patch.taskInput { draft.taskInput = taskInput }
-                if let syntheticFixture = patch.syntheticFixture { draft.syntheticFixture = syntheticFixture }
-                if let originalInstructions = patch.originalInstructions { draft.originalInstructions = originalInstructions }
-                if let candidateInstructions = patch.candidateInstructions { draft.candidateInstructions = candidateInstructions }
-                if let targetRole = patch.targetRole { draft.targetRole = targetRole }
-                if let repetitions = patch.repetitions { draft.repetitions = repetitions }
-                if var optimization = patch.optimization {
-                    optimization.gepa.pythonExecutablePath = PromptExperimentGEPAWorker.configuredPythonSealValue()
-                    draft.optimization = optimization
-                }
+                let draft = try Self.applying(patch, to: requireDraft(record))
                 let updated = try await service.updateDraft(
                     experimentID: experimentID,
                     expectedDraftID: draftID,
@@ -322,6 +303,25 @@
                     artifactTextBySHA256: service.readableArtifactText(for: record)
                 )
             }
+        }
+
+        private static func applying(
+            _ patch: PromptExperimentAgentDraftPatch,
+            to source: PromptExperimentDraft
+        ) -> PromptExperimentDraft {
+            var draft = source
+            if let title = patch.title { draft.title = title }
+            if let taskInput = patch.taskInput { draft.taskInput = taskInput }
+            if let syntheticFixture = patch.syntheticFixture { draft.syntheticFixture = syntheticFixture }
+            if let originalInstructions = patch.originalInstructions { draft.originalInstructions = originalInstructions }
+            if let candidateInstructions = patch.candidateInstructions { draft.candidateInstructions = candidateInstructions }
+            if let targetRole = patch.targetRole { draft.targetRole = targetRole }
+            if let repetitions = patch.repetitions { draft.repetitions = repetitions }
+            if var optimization = patch.optimization {
+                optimization.gepa.pythonExecutablePath = PromptExperimentGEPAWorker.configuredPythonSealValue()
+                draft.optimization = optimization
+            }
+            return draft
         }
 
         private func requireDraft(_ record: PromptExperimentRecord) throws -> PromptExperimentDraft {

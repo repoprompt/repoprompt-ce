@@ -142,7 +142,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 Cold starts use reviewed preparation rounds before search: schema 3 stage=preparation tests
                 preparation_candidates on training examples only, with no reflection or held-out calls.
                 Read feedback and revise; continue carries the tested candidate into a search draft.
-                `setup` seals an already-discussed specification in one call. `run` requests exact-plan user
+                `setup` seals an already-discussed, externally validated specification in one call; never use it to discover the schema.
+                `create_draft` returns the exact authoring contract and copyable update preconditions. `run` requests exact-plan user
                 approval through MCP form elicitation or the native card; acceptance starts automatically. Then use `wait`, `status`, `cancel`,
                 and the revision/clone operations. New runs use the sealed evaluation count without an experiment-wide
                 deadline; status/read return durable redacted worker and callback diagnostics. The agent cannot approve or apply a winner.
@@ -155,7 +156,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "approval_mode": .string(description: "mcp requests exact-plan approval via negotiated form elicitation, without native UI. External clients always use mcp; Agent sessions default to native."),
                         "experiment_id": .string(description: "Experiment UUID for record operations."),
                         "expected_draft_id": .string(description: "Exact draft UUID returned by create/read/update."),
-                        "expected_draft_version": .integer(description: "Exact optimistic draft version returned by create/read/update."),
+                        "expected_draft_version": .string(description: "Exact decimal optimistic draft version copied verbatim from update_preconditions. The server also accepts exact integral JSON numbers from older clients; Booleans and fractional values are rejected."),
                         "expected_draft_digest": .string(description: "Exact draft digest returned by create/read/update."),
                         "expected_plan_digest": .string(description: "Exact current sealed plan digest for cloning or proposing a next revision."),
                         "grading_id": .string(description: "Exact awaiting_retry grading_evidence.id for retry_grading. Uses one already approved judge retry on the same saved output; never restarts the target or an exited worker."),
@@ -296,8 +297,25 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
         }
 
         private static func requiredInt(_ key: String, args: [String: Value]) throws -> Int {
-            guard let value = args[key]?.intValue else { throw MCPError.invalidParams("\(key) is required") }
-            return value
+            if let value = args[key]?.intValue { return value }
+            // Some connected-model tool bridges coerce the decimal string "1" to Boolean true.
+            // This narrow compatibility case cannot bypass authority: update and seal also require
+            // the exact draft UUID and content digest, and later versions remain unrepresentable as Bool.
+            if args[key]?.boolValue == true { return 1 }
+            if let raw = args[key]?.stringValue,
+               let value = Int(raw),
+               raw == String(value)
+            {
+                return value
+            }
+            if let raw = args[key]?.doubleValue,
+               raw.isFinite,
+               raw.rounded() == raw,
+               let value = Int(exactly: raw)
+            {
+                return value
+            }
+            throw MCPError.invalidParams("\(key) is required as an integer or exact decimal string")
         }
 
         private struct PromptExperimentOptimizationEnvelope: Codable {
@@ -342,7 +360,35 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             } catch let error as MCPError {
                 throw error
             } catch {
-                throw MCPError.invalidParams("Invalid specification_json: \(error.localizedDescription)")
+                throw MCPError.invalidParams("Invalid specification_json: \(safeSpecificationDecodingDescription(error))")
+            }
+        }
+
+        private static func safeSpecificationDecodingDescription(_ error: Error) -> String {
+            func path(_ codingPath: [any CodingKey], appending key: (any CodingKey)? = nil) -> String {
+                var result = ""
+                for component in codingPath + (key.map { [$0] } ?? []) {
+                    if let index = component.intValue {
+                        result += "[\(index)]"
+                    } else {
+                        if !result.isEmpty { result += "." }
+                        result += component.stringValue
+                    }
+                }
+                return result.isEmpty ? "root" : result
+            }
+
+            switch error {
+            case let DecodingError.keyNotFound(key, context):
+                return "missing required field \(path(context.codingPath, appending: key))"
+            case let DecodingError.typeMismatch(type, context):
+                return "expected \(String(describing: type)) at \(path(context.codingPath))"
+            case let DecodingError.valueNotFound(type, context):
+                return "missing \(String(describing: type)) value at \(path(context.codingPath))"
+            case let DecodingError.dataCorrupted(context):
+                return "invalid value at \(path(context.codingPath))"
+            default:
+                return "could not decode the documented schema"
             }
         }
 
@@ -381,6 +427,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "server": .string("bundled_rpce_headless"), "sdk_version": .string(PromptExperimentMCPConfiguration.sdkVersion),
                         "allowed_tools": .array(PromptExperimentMCPConfiguration.allowedTools.sorted().map(Value.string)),
                         "configuration": .string("execution.adapter=mcp_adapter; execution.mcp={tool_names:[...],component:system_prompt or tool_description_<selected tool>}; project_snapshot is required. Sealing resolves executable and schema fingerprints. Choose supplied-prompt preparation or explicit seedless GEPA search; inspect guidance and traces before expanding spend."),
+                        "composition": .string("The candidate is one mutable component inside the pinned upstream renderer. Fixed execution.instructions, tool descriptions, full JSON schemas, call/answer protocol, user task, and optional pass-two tool result are composed separately. Search receives the exact rendered template and must not duplicate fixed scaffold text."),
+                        "prompt_surface_evidence": .string("candidate/fixed/rendered UTF-8 bytes, composition digests, insertion count, model passes, transmitted message bytes, and candidate/scaffold overlap; results expose a quality/rendered-size Pareto frontier"),
                         "maximum_tool_calls_per_evaluation": .int(1), "maximum_target_model_calls_per_evaluation": .int(2),
                         "network": .string("denied"), "source_workspace_writes": .bool(false),
                         "mutation_isolation": .string("apply_edits, when selected, writes only to a fresh per-evaluation copy and records mutation evidence")
@@ -396,7 +444,14 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 try .object([
                     "experiment_id": .string(experimentID.uuidString),
                     "draft": draftValue(draft),
-                    "next_action": .string("Revise with update_draft under the exact ID/version/digest, then propose_seal. For a new complete proposal, setup performs create/update/seal in one call.")
+                    "authoring_contract": authoringContractValue(),
+                    "update_preconditions": .object([
+                        "experiment_id": .string(experimentID.uuidString),
+                        "expected_draft_id": .string(draft.id.uuidString),
+                        "expected_draft_version": .string(String(draft.optimisticVersion)),
+                        "expected_draft_digest": .string(draft.contentDigest())
+                    ]),
+                    "next_action": .string("Revise with update_draft by copying update_preconditions exactly, replacing the complete specification_json envelope, then propose_seal. Never use setup to probe field shapes.")
                 ])
             case let .sealed(experimentID, plan):
                 .object([
@@ -423,6 +478,49 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 "target_selector": .string(draft.targetRole),
                 "repetitions": .int(draft.repetitions),
                 "optimization_specification_json": draft.optimization.map(encodeOptimizationSpecification).map(Value.string) ?? .null
+            ])
+        }
+
+        private static func authoringContractValue() -> Value {
+            .object([
+                "schema_version": .int(3),
+                "editing_rule": .string("Start from optimization_specification_json and preserve every unmodified field. Replace the complete envelope atomically; JSON keys are snake_case."),
+                "examples": .object([
+                    "required_fields": .array(["id", "split", "input"].map(Value.string)),
+                    "optional_fields": .array(["expected_output", "reviewer_notes"].map(Value.string)),
+                    "allowed_splits": .array(["training", "validation", "hidden_test"].map(Value.string)),
+                    "template": .object([
+                        "id": .string("case-id"),
+                        "split": .string("training"),
+                        "input": .string("Reviewed evaluation input"),
+                        "expected_output": .string("Reviewed expected output when required by the evaluator"),
+                        "reviewer_notes": .string("Host-private grading guidance; never put hidden answers in agent-visible project files")
+                    ])
+                ]),
+                "project_snapshot": .object([
+                    "optional_shape": .object([
+                        "source_root_path": .string("/authorized/loaded/root"),
+                        "included_paths": .array([.string("relative/path.ext")])
+                    ]),
+                    "rule": .string("Required for mcp_adapter. Paths must be reviewed, relative, and inside the authorized loaded root.")
+                ]),
+                "execution": .object([
+                    "required_fields": .array(["adapter", "instructions"].map(Value.string)),
+                    "target_selector_rule": .string("Required inside execution for connected_model, context_builder, and mcp_adapter; do not substitute the legacy top-level target_role."),
+                    "template": .object([
+                        "adapter": .string("connected_model"),
+                        "target_selector": .string("exact compound model selector from capabilities"),
+                        "instructions": .string("Fixed task contract composed around the mutable candidate")
+                    ])
+                ]),
+                "mcp": .object([
+                    "optional_shape": .object([
+                        "tool_names": .array([.string("read_file")]),
+                        "component": .string("system_prompt")
+                    ]),
+                    "component_rule": .string("system_prompt or tool_description_<one selected tool>; resolved schema and executable fingerprints are host-owned.")
+                ]),
+                "workflow": .string("Use create_draft -> update_draft -> review -> propose_seal. setup is compatibility-only for a complete externally validated payload and must never be used for schema discovery.")
             ])
         }
 
@@ -680,6 +778,24 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             ])
         }
 
+        private static func promptSurfaceValue(_ surface: PromptExperimentPromptSurfaceMetrics) -> Value {
+            .object([
+                "schema_version": .int(surface.schemaVersion),
+                "adapter": .string(surface.adapter),
+                "component": .string(surface.component),
+                "candidate_utf8_bytes": .int(surface.candidateUTF8Bytes),
+                "candidate_characters": .int(surface.candidateCharacters),
+                "candidate_words": .int(surface.candidateWords),
+                "candidate_lines": .int(surface.candidateLines),
+                "fixed_scaffold_utf8_bytes": .int(surface.fixedScaffoldUTF8Bytes),
+                "rendered_system_utf8_bytes": .int(surface.renderedSystemUTF8Bytes),
+                "mutable_insertion_count": .int(surface.mutableInsertionCount),
+                "fixed_scaffold_sha256": .string(surface.fixedScaffoldSHA256),
+                "rendered_system_sha256": .string(surface.renderedSystemSHA256),
+                "candidate_fixed_scaffold_fourgram_overlap": .double(surface.candidateFixedScaffoldFourgramOverlap)
+            ])
+        }
+
         private static func optimizationResultValue(
             _ result: PromptExperimentOptimizationResult,
             artifactTextBySHA256: [String: String]
@@ -691,6 +807,9 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 "baseline_score": result.baselineScore.map(Value.double) ?? .null,
                 "best_score": result.bestScore.map(Value.double) ?? .null,
                 "best_candidate_index": result.bestCandidateIndex.map(Value.int) ?? .null,
+                "selection_semantics": .string("highest_quality_not_automatic_winner"),
+                "pareto_frontier_indices": result.paretoFrontierIndices
+                    .map { .array($0.map(Value.int)) } ?? .null,
                 "total_evaluations": .int(result.totalEvaluations),
                 "wall_time_seconds": result.wallTimeSeconds.map(Value.double) ?? .null,
                 "proposer_usage": .string(result.proposerUsage),
@@ -703,6 +822,9 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "score": candidate.aggregateScore.map(Value.double) ?? .null,
                         "is_baseline": .bool(candidate.isBaseline),
                         "is_best": .bool(candidate.isBest),
+                        "is_highest_quality": .bool(candidate.isBest),
+                        "is_pareto_efficient": candidate.isParetoEfficient.map(Value.bool) ?? .null,
+                        "prompt_surface": candidate.promptSurface.map(promptSurfaceValue) ?? .null,
                         "candidate": artifactTextBySHA256[candidate.candidateEvidence.sha256].map(Value.string) ?? .null,
                         "preview": .string(candidate.candidatePreview),
                         "evidence": artifactValue(candidate.candidateEvidence)

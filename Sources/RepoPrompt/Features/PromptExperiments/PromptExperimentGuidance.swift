@@ -67,6 +67,11 @@
             if scores.allSatisfy({ $0 == spec.evaluator.maximumScore }) {
                 return .init(action: "review_measurement", explanation: "Observed scores are saturated. Check representative difficult cases, controls and fixed instructions for masking. Do not infer no improvement is needed or weaken correctness to reward brevity.", evidenceIDs: ids)
             }
+            if let result = attempts.last?.optimizationResult,
+               result.paretoFrontierIndices?.count ?? 0 > 1
+            {
+                return .init(action: "review_quality_cost_tradeoff", explanation: "Multiple candidates are Pareto-efficient on measured quality and rendered prompt size. Inspect the full composition, candidate/scaffold overlap, regressions and marginal behavior. Do not call the highest-quality candidate an automatic winner; propose a focused discriminating test or distill the useful change.", evidenceIDs: ids)
+            }
             return .init(action: "review_evidence", explanation: "Inspect representative successes and failures, evaluator agreement, and candidate differences. Decide whether to revise and probe again or start/continue GEPA. Scores alone do not establish readiness or improvement; reserve untouched examples for final verification.", evidenceIDs: ids)
         }
     }

@@ -17,9 +17,55 @@ WORKER = Path(os.environ.get(
     "REPOPROMPT_TEST_GEPA_WORKER",
     ROOT / "AppResources" / "PromptExperiments" / "gepa_worker.py",
 )).resolve()
+sys.path.insert(0, str(WORKER.parent))
+
+from gepa_worker import (
+    InfrastructureFailure,
+    candidate_prompt_surfaces,
+    pareto_frontier_indices,
+    require_unique_candidate_texts,
+)
 
 
 class GEPAPromptExperimentWorkerTests(unittest.TestCase):
+    def test_pareto_frontier_preserves_quality_size_tradeoff(self) -> None:
+        surfaces = [
+            {"rendered_system_utf8_bytes": 5_024},
+            {"rendered_system_utf8_bytes": 11_057},
+            {"rendered_system_utf8_bytes": 12_000},
+        ]
+        self.assertEqual(
+            pareto_frontier_indices([0.9333, 1.0, 0.9], surfaces),
+            [0, 1],
+        )
+
+    def test_candidate_surface_rejects_invariant_drift(self) -> None:
+        surface = {
+            "schema_version": 1,
+            "adapter": "mcp",
+            "component": "system_prompt",
+            "candidate_utf8_bytes": 4,
+            "candidate_characters": 4,
+            "candidate_words": 1,
+            "candidate_lines": 1,
+            "fixed_scaffold_utf8_bytes": 100,
+            "rendered_system_utf8_bytes": 104,
+            "mutable_insertion_count": 1,
+            "fixed_scaffold_sha256": "a" * 64,
+            "rendered_system_sha256": "b" * 64,
+            "candidate_fixed_scaffold_fourgram_overlap": 0.0,
+        }
+        changed = dict(surface, rendered_system_sha256="c" * 64)
+        with self.assertRaisesRegex(InfrastructureFailure, "prompt surface changed"):
+            candidate_prompt_surfaces(1, [
+                {"candidate_index": 0, "prompt_surface": surface},
+                {"candidate_index": 0, "prompt_surface": changed},
+            ])
+
+    def test_duplicate_retained_candidates_are_rejected(self) -> None:
+        with self.assertRaisesRegex(InfrastructureFailure, "identity would be ambiguous"):
+            require_unique_candidate_texts(["same", "same"])
+
     def test_real_gepa_uses_host_reflection_and_evaluation(self) -> None:
         self.run_search("bad candidate")
 

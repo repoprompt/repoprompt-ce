@@ -223,6 +223,96 @@ def candidate_text(value: Any) -> str:
     return str(value)
 
 
+def surface_feedback(surface: Any) -> str:
+    if not isinstance(surface, dict):
+        return ""
+    candidate_bytes = surface.get("candidate_utf8_bytes")
+    rendered_bytes = surface.get("rendered_system_utf8_bytes")
+    fixed_bytes = surface.get("fixed_scaffold_utf8_bytes")
+    overlap = surface.get("candidate_fixed_scaffold_fourgram_overlap")
+    if not all(isinstance(value, (int, float))
+               for value in (candidate_bytes, rendered_bytes, fixed_bytes, overlap)):
+        return ""
+    return (
+        "Deterministic prompt surface: "
+        f"candidate={int(candidate_bytes)} UTF-8 bytes; "
+        f"fixed scaffold={int(fixed_bytes)} bytes; "
+        f"rendered system prompt={int(rendered_bytes)} bytes; "
+        f"candidate/scaffold four-gram overlap={float(overlap):.3f}. "
+        "The fixed scaffold already supplies tool descriptions, JSON schemas, "
+        "and the tool-call protocol; do not duplicate it."
+    )
+
+
+def candidate_prompt_surfaces(
+    candidate_count: int, evaluations: list[dict[str, Any]]
+) -> list[dict[str, Any] | None]:
+    surfaces: list[dict[str, Any] | None] = [None] * candidate_count
+    invariant_keys = (
+        "schema_version",
+        "adapter",
+        "component",
+        "candidate_utf8_bytes",
+        "candidate_characters",
+        "candidate_words",
+        "candidate_lines",
+        "fixed_scaffold_utf8_bytes",
+        "rendered_system_utf8_bytes",
+        "mutable_insertion_count",
+        "fixed_scaffold_sha256",
+        "rendered_system_sha256",
+        "candidate_fixed_scaffold_fourgram_overlap",
+    )
+    for evaluation in evaluations:
+        index = evaluation.get("candidate_index")
+        surface = evaluation.get("prompt_surface")
+        if not (isinstance(index, int) and 0 <= index < candidate_count
+                and isinstance(surface, dict)):
+            continue
+        invariant_surface = {key: surface.get(key) for key in invariant_keys}
+        if surfaces[index] is None:
+            surfaces[index] = invariant_surface
+        elif surfaces[index] != invariant_surface:
+            raise InfrastructureFailure(
+                "prompt surface changed across evaluations of one candidate"
+            )
+    return surfaces
+
+
+def pareto_frontier_indices(
+    scores: list[float | None], surfaces: list[dict[str, Any] | None]
+) -> list[int]:
+    """Return candidates not dominated on quality (high) and rendered bytes (low)."""
+    comparable = []
+    for index, (score, surface) in enumerate(zip(scores, surfaces)):
+        rendered_bytes = (
+            surface.get("rendered_system_utf8_bytes")
+            if isinstance(surface, dict) else None
+        )
+        if isinstance(score, (int, float)) and isinstance(rendered_bytes, int):
+            comparable.append((index, float(score), rendered_bytes))
+    frontier = []
+    for index, score, rendered_bytes in comparable:
+        dominated = any(
+            other_score >= score
+            and other_bytes <= rendered_bytes
+            and (other_score > score or other_bytes < rendered_bytes)
+            for other_index, other_score, other_bytes in comparable
+            if other_index != index
+        )
+        if not dominated:
+            frontier.append(index)
+    return frontier
+
+
+def require_unique_candidate_texts(candidates: list[str]) -> None:
+    if len(set(candidates)) != len(candidates):
+        raise InfrastructureFailure(
+            "GEPA returned duplicate retained candidate text; "
+            "evaluation identity would be ambiguous"
+        )
+
+
 def search_evaluation_budget(body: dict[str, Any]) -> tuple[int, int]:
     """Reserve the held-out calls that upstream GEPA runs outside max_evals.
 
@@ -271,12 +361,15 @@ def main() -> int:
         if body.get("mcp_adapter") is not None:
             # -I omits script directories; this is the signed resource directory, never project scratch.
             sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-            from mcp_evaluation import stop_children
+            from mcp_evaluation import composition_contract, stop_children
+            rendered_composition_contract = composition_contract(body["mcp_adapter"])
             def cancel_adapter(signum, frame):
                 stop_children()
                 raise WorkerCancelled(signum)
             signal.signal(signal.SIGTERM, cancel_adapter)
             signal.signal(signal.SIGINT, cancel_adapter)
+        else:
+            rendered_composition_contract = ""
         evaluations: list[dict[str, Any]] = []
         provisional_candidate_indices: dict[str, int] = {}
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "reported": 0, "unavailable": 0}
@@ -323,6 +416,13 @@ def main() -> int:
                 raise InfrastructureFailure("evaluation host returned no score")
             score = float(score_value)
             feedback = str(response.get("feedback") or "")
+            prompt_surface = response.get("prompt_surface")
+            deterministic_surface_feedback = surface_feedback(prompt_surface)
+            if deterministic_surface_feedback:
+                feedback = (
+                    f"{feedback.rstrip()}\n\n{deterministic_surface_feedback}"
+                    if feedback.strip() else deterministic_surface_feedback
+                )
             evaluation = {
                 "candidate_index": candidate_index,
                 "candidate_text": text,
@@ -333,6 +433,7 @@ def main() -> int:
                 "failure_kind": response.get("failure_kind"),
                 "output": response.get("output"),
                 "elapsed_seconds": response.get("elapsed_seconds"),
+                "prompt_surface": prompt_surface,
             }
             evaluations.append(evaluation)
             emit({
@@ -350,6 +451,7 @@ def main() -> int:
                 "output": response.get("output"),
                 "example_id": evaluation["example_id"],
                 "task_preservation": body.get("task_preservation", ""),
+                "prompt_surface": prompt_surface,
             }
 
         def examples_for(split: str) -> list[dict[str, Any]]:
@@ -385,6 +487,11 @@ def main() -> int:
             best_index = max(range(len(candidates)), key=lambda i: scores[i])
             for evaluation in evaluations:
                 evaluation.pop("candidate_text", None)
+            surfaces = candidate_prompt_surfaces(len(candidates), evaluations)
+            frontier = (
+                pareto_frontier_indices(scores, surfaces)
+                if any(surface is not None for surface in surfaces) else None
+            )
             payload = {
                 "engine": "preparation",
                 "upstream_revision": EXPECTED_GEPA_REVISION,
@@ -394,13 +501,20 @@ def main() -> int:
                 "candidates": candidates,
                 "parent_indices": [[] for _ in candidates],
                 "aggregate_scores": scores,
+                "candidate_prompt_surfaces": surfaces,
+                "pareto_frontier_indices": frontier,
                 "evaluations": evaluations,
                 "total_evaluations": len(evaluations),
                 "wall_time_seconds": time.monotonic() - started,
                 "proposer_usage": f"reflection_calls=0,reported_callbacks={usage['reported']},unavailable_callbacks={usage['unavailable']}",
                 "run_directory_relative_path": body.get("run_directory_relative_path"),
                 "metadata": {"stage": "preparation", "search_performed": False,
-                             "scoring_split": "training", "held_out_evaluated": False},
+                             "scoring_split": "training", "held_out_evaluated": False,
+                             "selection_semantics": "highest_quality_not_automatic_winner",
+                             "comparison_dimensions": (
+                                 ["quality", "rendered_system_utf8_bytes"]
+                                 if frontier is not None else ["quality"]
+                             )},
             }
             emit({"protocol_version": PROTOCOL_VERSION, "type": "completed", "result": payload})
             return 0
@@ -440,6 +554,12 @@ def main() -> int:
             },
         )
         with contextlib.redirect_stdout(sys.stderr):
+            optimization_background = str(body.get("background") or "")
+            if rendered_composition_contract:
+                optimization_background = (
+                    f"{optimization_background.rstrip()}\n\n"
+                    f"{rendered_composition_contract}"
+                )
             result = optimize_anything(
                 seed_candidate=body.get("seed_candidate"),
                 evaluator=evaluate,
@@ -447,10 +567,11 @@ def main() -> int:
                 valset=valset or None,
                 test_set=test_set or None,
                 objective=str(body["objective"]),
-                background=str(body.get("background") or ""),
+                background=optimization_background,
                 config=config,
             )
         candidates = [candidate_text(value) for value in result.candidates]
+        require_unique_candidate_texts(candidates)
         parents = [
             [int(parent) for parent in (values or []) if parent is not None]
             for values in result.parents
@@ -461,6 +582,11 @@ def main() -> int:
         for evaluation in evaluations:
             evaluated_text = str(evaluation.pop("candidate_text", ""))
             evaluation["candidate_index"] = final_indices.get(evaluated_text, -1)
+        surfaces = candidate_prompt_surfaces(len(candidates), evaluations)
+        frontier = (
+            pareto_frontier_indices(scores, surfaces)
+            if any(surface is not None for surface in surfaces) else None
+        )
         proposer_usage = (
             f"prompt_tokens={usage['prompt_tokens']},completion_tokens={usage['completion_tokens']},"
             f"reported_callbacks={usage['reported']},unavailable_callbacks={usage['unavailable']}"
@@ -477,6 +603,11 @@ def main() -> int:
             "held_out_evaluations_recorded": sum(
                 1 for evaluation in evaluations if evaluation["split"] == "hidden_test"
             ),
+            "selection_semantics": "highest_quality_not_automatic_winner",
+            "comparison_dimensions": (
+                ["quality", "rendered_system_utf8_bytes"]
+                if frontier is not None else ["quality"]
+            ),
         })
         payload = {
             "engine": "gepa",
@@ -487,6 +618,8 @@ def main() -> int:
             "candidates": candidates,
             "parent_indices": parents,
             "aggregate_scores": scores,
+            "candidate_prompt_surfaces": surfaces,
+            "pareto_frontier_indices": frontier,
             "evaluations": evaluations,
             "total_evaluations": len(evaluations),
             "wall_time_seconds": float(result.metadata.get("wall_time", time.monotonic() - started)),
