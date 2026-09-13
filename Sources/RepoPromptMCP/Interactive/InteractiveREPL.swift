@@ -19,6 +19,7 @@ struct InteractiveOptions {
     var rawJSON: Bool = false
     var verbose: Bool = false
     var toolCallTimeoutSeconds: Double?
+    var formElicitationEnabled: Bool = false
 
     // Single-shot command options
     var listToolsOnly: Bool = false

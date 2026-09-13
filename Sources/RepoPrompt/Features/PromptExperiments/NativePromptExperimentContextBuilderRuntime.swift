@@ -35,8 +35,15 @@
             var modelCalls: Int = 0
         }
 
+        private struct MCPModelCallbackCompletion {
+            let evaluationID: UUID
+            let phase: Int
+            let reply: PromptExperimentGEPAHostReply
+        }
+
         private var mcpEvaluations: [UUID: MCPEvaluation] = [:]
         private var mcpEvaluationCounts: [UUID: Int] = [:]
+        private var mcpModelCallbackReplies: [UUID: [UUID: MCPModelCallbackCompletion]] = [:]
         private var judgeRetries: [UUID: Int] = [:]
         private let gradingRetryGate = PromptExperimentGradingRetryGate()
 
@@ -320,6 +327,7 @@
                     checkpointSinks.removeValue(forKey: request.attempt.id)
                     mcpEvaluations = mcpEvaluations.filter { $0.value.attemptID != request.attempt.id }
                     mcpEvaluationCounts.removeValue(forKey: request.attempt.id)
+                    mcpModelCallbackReplies.removeValue(forKey: request.attempt.id)
                     judgeRetries.removeValue(forKey: request.attempt.id)
                 }
                 do {
@@ -536,6 +544,8 @@
                 default:
                     throw PromptExperimentAuthorityError.runtimeUnavailable("Unsupported GEPA host operation: \(operation)")
                 }
+            } catch let failure as PromptExperimentProviderFailure {
+                return infrastructureReply(failure.code.safeMessage, failureCode: failure.code.rawValue)
             } catch let failure as PromptExperimentGrading.Failure {
                 var reply = infrastructureReply(failure.rawValue)
                 reply.failureCode = failure.rawValue
@@ -574,13 +584,24 @@
                   var evaluation = mcpEvaluations[id], evaluation.attemptID == parentRequest.attempt.id
             else { throw PromptExperimentAuthorityError.runtimeUnavailable("Unknown or already completed MCP evaluation callback.") }
             if operation == "mcp_model" {
-                guard let phase = payload["phase"] as? Int, phase == evaluation.modelCalls + 1, phase <= 2,
+                guard let phase = payload["phase"] as? Int else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("MCP model callback omitted its phase.")
+                }
+                let logicalCallbackID = (payload["_rpce_logical_callback_id"] as? String)
+                    .flatMap(UUID.init(uuidString:))
+                if let logicalCallbackID,
+                   let completed = mcpModelCallbackReplies[parentRequest.attempt.id]?[logicalCallbackID]
+                {
+                    guard completed.evaluationID == id, completed.phase == phase else {
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("MCP logical callback identity was reused with different state.")
+                    }
+                    return completed.reply
+                }
+                guard phase == evaluation.modelCalls + 1, phase <= 2,
                       let messages = payload["messages"] as? [[String: Any]],
                       let system = messages.first?["content"] as? String,
                       messages.first?["role"] as? String == "system"
                 else { throw PromptExperimentAuthorityError.runtimeUnavailable("MCP model callback violated its two-pass sequence.") }
-                evaluation.modelCalls += 1
-                mcpEvaluations[id] = evaluation
                 await observation(.callbackLinked(id: callbackID, runtime: PromptExperimentRuntimeLink(
                     adapter: "upstream_mcp_adapter_v1", tabID: nil, runID: id,
                     provider: target.agentRaw, model: target.modelRaw
@@ -593,7 +614,11 @@
                     systemPrompt: system,
                     userPrompt: "Continue this conversation, returning only the next assistant response:\n" + prompt
                 )
-                return PromptExperimentGEPAHostReply(
+                // Advance only after a successful provider completion. A sealed retry of this
+                // exact phase can then reuse the evaluation and any already captured tool result.
+                evaluation.modelCalls += 1
+                mcpEvaluations[id] = evaluation
+                let reply = PromptExperimentGEPAHostReply(
                     ok: true,
                     output: completion.output,
                     score: nil,
@@ -604,6 +629,14 @@
                     promptTokens: completion.promptTokens,
                     completionTokens: completion.completionTokens
                 )
+                if let logicalCallbackID {
+                    mcpModelCallbackReplies[parentRequest.attempt.id, default: [:]][logicalCallbackID] = .init(
+                        evaluationID: id,
+                        phase: phase,
+                        reply: reply
+                    )
+                }
+                return reply
             }
             guard evaluation.modelCalls > 0, let answer = payload["answer"] as? String,
                   let trace = payload["trace"] as? [String: Any]
@@ -614,7 +647,7 @@
                     ok: true,
                     output: evidence,
                     score: specification.evaluator.minimumScore,
-                    feedback: "Invalid tool-choice JSON, disallowed tool, invalid arguments, or tool-level error. Inspect the MCP trajectory.",
+                    feedback: "Invalid tool-choice JSON, disallowed tool, or invalid arguments. Inspect the MCP trajectory.",
                     failureKind: .candidate,
                     error: nil,
                     elapsedSeconds: nil
@@ -1088,8 +1121,11 @@
             return object
         }
 
-        private func infrastructureReply(_ message: String) -> PromptExperimentGEPAHostReply {
-            PromptExperimentGEPAHostReply(
+        private func infrastructureReply(
+            _ message: String,
+            failureCode: String? = nil
+        ) -> PromptExperimentGEPAHostReply {
+            var reply = PromptExperimentGEPAHostReply(
                 ok: false,
                 output: nil,
                 score: nil,
@@ -1098,6 +1134,8 @@
                 error: message,
                 elapsedSeconds: nil
             )
+            reply.failureCode = failureCode
+            return reply
         }
 
         func wait(for handle: PromptExperimentRuntimeHandle) async -> PromptExperimentRuntimeResult {

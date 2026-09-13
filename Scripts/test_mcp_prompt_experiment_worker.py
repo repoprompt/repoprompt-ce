@@ -78,6 +78,138 @@ class MCPExperimentTests(unittest.TestCase):
             self.assertIn(marker,json.dumps(grades[0]['trace']['tool_calls'][0]['result']))
             self.assertEqual(Path(body['mcp_adapter']['project_root'],'README.md').read_text(),marker)
 
+    def test_apply_edits_mutates_only_fresh_evaluation_copy_and_records_evidence(self):
+        with tempfile.TemporaryDirectory(prefix='rpce-mcp-apply-') as directory:
+            body, marker, example = self.setup_trial(directory)
+            definitions = json.loads(
+                (ROOT / 'docs/spec/mcp-domain-canonical-tool-definitions.generated.json').read_text()
+            )['tools']
+            tool = next(t for t in definitions if t['name'] == 'apply_edits')
+            body['mcp_adapter'].update(
+                tool_names=['apply_edits'],
+                tool_definitions_json=json.dumps([tool]),
+                component='tool_description_apply_edits',
+            )
+            operations = []
+            grades = []
+
+            def host(operation, payload):
+                operations.append(operation)
+                if operation == 'mcp_begin':
+                    return {'output': str(uuid.uuid4())}
+                if operation == 'mcp_model':
+                    if payload['phase'] == 1:
+                        return {'output': json.dumps({
+                            'action': 'call_tool',
+                            'tool': 'apply_edits',
+                            'arguments': {
+                                'path': 'README.md',
+                                'search': marker,
+                                'replace': 'UPDATED_BY_EXPERIMENT',
+                            },
+                        })}
+                    self.assertIn('edits_applied', json.dumps(payload['messages']))
+                    return {'output': 'edit complete'}
+                if operation == 'mcp_grade':
+                    grades.append(payload)
+                    mutation = payload['trace']['project_mutation']
+                    return {
+                        'ok': True,
+                        'score': float(
+                            mutation['source_snapshot_unchanged']
+                            and mutation['changed_paths'] == ['README.md']
+                        ),
+                        'feedback': 'isolated edit checked',
+                        'output': json.dumps(payload['trace']),
+                    }
+                self.fail(operation)
+
+            result = evaluate_mcp(
+                'Use apply_edits for the requested replacement.',
+                example,
+                body,
+                host,
+                lambda _: None,
+                InfrastructureFailure,
+                lambda _: None,
+            )
+            self.assertEqual(result['score'], 1.0)
+            self.assertEqual(
+                operations,
+                ['mcp_begin', 'mcp_model', 'mcp_model', 'mcp_grade'],
+            )
+            self.assertEqual(
+                Path(body['mcp_adapter']['project_root'], 'README.md').read_text(),
+                marker,
+            )
+            self.assertEqual(
+                grades[0]['trace']['project_mutation']['changed_paths'],
+                ['README.md'],
+            )
+
+    def test_expected_apply_edits_error_reaches_grader_as_evidence(self):
+        with tempfile.TemporaryDirectory(prefix='rpce-mcp-expected-error-') as directory:
+            body, marker, example = self.setup_trial(directory)
+            definitions = json.loads(
+                (ROOT / 'docs/spec/mcp-domain-canonical-tool-definitions.generated.json').read_text()
+            )['tools']
+            tool = next(t for t in definitions if t['name'] == 'apply_edits')
+            body['mcp_adapter'].update(
+                tool_names=['apply_edits'],
+                tool_definitions_json=json.dumps([tool]),
+                component='tool_description_apply_edits',
+            )
+            grades = []
+
+            def host(operation, payload):
+                if operation == 'mcp_begin':
+                    return {'output': str(uuid.uuid4())}
+                if operation == 'mcp_model':
+                    if payload['phase'] == 1:
+                        return {'output': json.dumps({
+                            'action': 'call_tool',
+                            'tool': 'apply_edits',
+                            'arguments': {
+                                'path': 'README.md',
+                                'search': 'INTENTIONALLY_ABSENT_TEXT',
+                                'replace': 'SHOULD_NOT_APPEAR',
+                            },
+                        })}
+                    return {'output': 'No change: the requested search text was absent.'}
+                if operation == 'mcp_grade':
+                    grades.append(payload)
+                    tool_result = payload['trace']['tool_calls'][0]['result']
+                    mutation = payload['trace']['project_mutation']
+                    return {
+                        'ok': True,
+                        'score': float(
+                            not payload['candidate_failure']
+                            and tool_result['isError']
+                            and mutation['changed_paths'] == []
+                            and mutation['source_snapshot_unchanged']
+                        ),
+                        'feedback': 'expected tool error graded from evidence',
+                        'output': json.dumps(payload['trace']),
+                    }
+                self.fail(operation)
+
+            result = evaluate_mcp(
+                'Attempt the exact edit and report an absent search honestly.',
+                example,
+                body,
+                host,
+                lambda _: None,
+                InfrastructureFailure,
+                lambda _: None,
+            )
+            self.assertEqual(result['score'], 1.0)
+            self.assertFalse(grades[0]['candidate_failure'])
+            self.assertTrue(grades[0]['trace']['tool_calls'][0]['result']['isError'])
+            self.assertEqual(
+                Path(body['mcp_adapter']['project_root'], 'README.md').read_text(),
+                marker,
+            )
+
     def test_source_response_above_asyncio_default_limit_reaches_grading_intact(self):
         with tempfile.TemporaryDirectory(prefix='rpce-mcp-large-response-') as directory:
             body, marker, example = self.setup_trial(directory)
@@ -141,8 +273,12 @@ class MCPExperimentTests(unittest.TestCase):
                         background='Deterministic integration test, not quality evidence.',
                         examples=[example],seed_candidate='Guess without reading.',
                         reflection_minibatch_size=1,skip_perfect_score=True,
-                        max_evaluations=12,stop_at_score=1.0,perfect_score=1.0)
+                        max_evaluations=12,max_provider_retries=1,
+                        stop_at_score=1.0,perfect_score=1.0)
             leases={}; operations=[]; events=[]; completed=None
+            failed_second_pass = False
+            failed_second_pass_identity = None
+            retried_second_pass = False
             with tempfile.TemporaryFile(mode='w+') as stderr:
                 process=subprocess.Popen([sys.executable,'-I','-B',str(WORKER)],
                     stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=stderr,text=True,bufsize=1,
@@ -166,7 +302,15 @@ class MCPExperimentTests(unittest.TestCase):
                             candidate=leases[payload['evaluation_id']]
                             if payload['phase']==1:
                                 reply['output']=json.dumps({'action':'call_tool','tool':'read_file','arguments':{'path':'README.md'}}) if candidate.startswith('Read') else json.dumps({'action':'answer','answer':'guess'})
+                            elif not failed_second_pass:
+                                failed_second_pass = True
+                                failed_second_pass_identity = (payload['evaluation_id'], payload['phase'])
+                                reply.update(ok=False, failure_kind='infrastructure',
+                                             failure_code='provider_transport_interrupted',
+                                             error='safe provider failure')
                             else:
+                                if (payload['evaluation_id'], payload['phase']) == failed_second_pass_identity:
+                                    retried_second_pass = True
                                 self.assertIn(marker,json.dumps(payload['messages']));reply['output']=marker
                         elif op=='mcp_grade':
                             score=float(payload['answer']==marker and not payload['candidate_failure'])
@@ -182,7 +326,24 @@ class MCPExperimentTests(unittest.TestCase):
                     self.assertEqual(completed['best_score'],1.0)
                     self.assertGreater(len(completed['candidates']),1)
                     self.assertIn('reflect',operations)
-                    self.assertTrue(any('tool_completed' in e['output'] for e in completed['evaluations']))
+                    self.assertTrue(failed_second_pass)
+                    self.assertTrue(retried_second_pass)
+                    retries = [event for event in events if event['type'] == 'provider_retry']
+                    self.assertEqual(len(retries), 1)
+                    self.assertEqual(retries[0]['operation'], 'mcp_model')
+                    self.assertEqual(retries[0]['failure_code'], 'provider_transport_interrupted')
+                    repeated = [event for event in events
+                                if event['type'] == 'host_request'
+                                and event['operation'] == 'mcp_model'
+                                and (event['payload']['evaluation_id'], event['payload']['phase'])
+                                == failed_second_pass_identity]
+                    self.assertEqual(len(repeated), 2)
+                    self.assertEqual(repeated[0]['logical_callback_id'], repeated[1]['logical_callback_id'])
+                    successful = [e for e in completed['evaluations'] if 'tool_completed' in e['output']]
+                    self.assertTrue(successful)
+                    for evaluation in successful:
+                        trace = json.loads(evaluation['output'])
+                        self.assertEqual(len(trace['tool_calls']), 1, 'provider retry must not repeat the tool')
                     self.assertEqual(sum(e.get('state')=='started' for e in events),sum(e.get('state')=='closed' for e in events))
                 finally:
                     if process.poll() is None:process.kill();process.wait(timeout=5)

@@ -290,6 +290,7 @@
                         maxEvaluations: 40,
                         stopAtScore: 1,
                         randomSeed: 0,
+                        maxProviderRetries: 1,
                         maxJudgeRetries: 3,
                         pauseOnGradingFailure: true
                     )
@@ -410,11 +411,16 @@
                 if optimization.evaluator.kind == .connectedModelJudge, judge == nil {
                     throw PromptExperimentAuthorityError.targetUnavailable("The connected-model judge target is unavailable.")
                 }
-                optimizationTargets = PromptExperimentOptimizationTargets(
+                let resolvedTargets = PromptExperimentOptimizationTargets(
                     reflection: reflection,
                     execution: execution,
                     judge: judge
                 )
+                try PromptExperimentConnectedModelRunner.validateSealingTargets(
+                    specification: optimization,
+                    targets: resolvedTargets
+                )
+                optimizationTargets = resolvedTargets
                 target = execution ?? reflection
             } else {
                 guard let legacyTarget = try resolveTarget(validated.targetRole) else {
@@ -878,7 +884,20 @@
                 guard plan.schemaVersion == PromptExperimentPlan.optimizationSchemaVersion else {
                     throw PromptExperimentAuthorityError.illegalPhase("Earlier optimization schemas are preserved read-only. Clone the result into a current reviewed draft before execution.")
                 }
-                try await runtime.preflightOptimization(plan)
+                do {
+                    try await runtime.preflightOptimization(plan)
+                } catch {
+                    index = try self.index(of: experimentID)
+                    if records[index].phase == .approved,
+                       records[index].currentPlan?.digest == plan.digest,
+                       records[index].cancellationRequestedAt == nil
+                    {
+                        records[index].updatedAt = now()
+                        records[index].statusMessage = "Execution preflight blocked before any attempt: \(error.localizedDescription)"
+                        try? await persist()
+                    }
+                    throw error
+                }
             }
             // Preflight suspends. Re-resolve the record (persist sorts the array), and never
             // overwrite a cancellation or a new revision with the stale approved snapshot.

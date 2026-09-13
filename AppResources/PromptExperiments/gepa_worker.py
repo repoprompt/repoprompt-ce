@@ -22,6 +22,16 @@ PROTOCOL_VERSION = 1
 PROTOCOL_OUT = sys.stdout
 EXPECTED_GEPA_VERSION = "0.1.4"
 EXPECTED_GEPA_REVISION = "0632cdb5dcc052e690eab439e1b4a7e3e9cfe407"
+PROVIDER_RETRY_CODES = frozenset({
+    "provider_rate_limited",
+    "provider_temporarily_unavailable",
+    "provider_transport_interrupted",
+    "provider_incomplete_response",
+    "provider_empty_response",
+    "provider_routing_unavailable",
+})
+PROVIDER_RETRY_OPERATIONS = frozenset({"reflect", "mcp_model"})
+MAX_PROVIDER_RETRIES = 0
 
 
 class WorkerCancelled(BaseException):
@@ -34,7 +44,12 @@ class InfrastructureFailure(BaseException):
     def __init__(self, message, *, failure_code=None, operation=None):
         super().__init__(message)
         self.failure_code = failure_code if failure_code in (
-            "judge_invalid_response", "judge_provider_failed"
+            "judge_invalid_response", "judge_provider_failed",
+            "provider_rate_limited", "provider_temporarily_unavailable",
+            "provider_transport_interrupted", "provider_incomplete_response",
+            "provider_empty_response", "provider_routing_unavailable",
+            "provider_rejected", "provider_invalid_response",
+            "provider_tool_violation", "provider_unknown",
         ) else None
         self.operation = operation if operation in (
             "reflect", "evaluate", "mcp_begin", "mcp_model", "mcp_grade"
@@ -109,18 +124,23 @@ def receive() -> dict[str, Any]:
 
 
 def host_call(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
-    request_id = str(uuid.uuid4())
-    emit({
-        "protocol_version": PROTOCOL_VERSION,
-        "type": "host_request",
-        "id": request_id,
-        "operation": operation,
-        "payload": payload,
-    })
-    response = receive()
-    if response.get("type") != "host_response" or response.get("id") != request_id:
-        raise InfrastructureFailure("host response identity mismatch")
-    if not response.get("ok", False):
+    logical_callback_id = str(uuid.uuid4())
+    for attempt in range(MAX_PROVIDER_RETRIES + 1):
+        request_id = str(uuid.uuid4())
+        emit({
+            "protocol_version": PROTOCOL_VERSION,
+            "type": "host_request",
+            "id": request_id,
+            "logical_callback_id": logical_callback_id,
+            "attempt": attempt + 1,
+            "operation": operation,
+            "payload": payload,
+        })
+        response = receive()
+        if response.get("type") != "host_response" or response.get("id") != request_id:
+            raise InfrastructureFailure("host response identity mismatch")
+        if response.get("ok", False):
+            return response
         message = str(response.get("error") or "host operation failed")
         if response.get("failure_kind") == "candidate":
             return {
@@ -130,8 +150,28 @@ def host_call(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "output": response.get("output"),
                 "elapsed_seconds": response.get("elapsed_seconds"),
             }
-        raise InfrastructureFailure(message, failure_code=response.get("failure_code"), operation=operation)
-    return response
+        failure_code = response.get("failure_code")
+        can_retry = (
+            operation in PROVIDER_RETRY_OPERATIONS
+            and failure_code in PROVIDER_RETRY_CODES
+            and attempt < MAX_PROVIDER_RETRIES
+        )
+        if can_retry:
+            emit({
+                "protocol_version": PROTOCOL_VERSION,
+                "type": "provider_retry",
+                "logical_callback_id": logical_callback_id,
+                "operation": operation,
+                "failure_code": failure_code,
+                "completed_attempts": attempt + 1,
+                "next_attempt": attempt + 2,
+                "max_attempts": MAX_PROVIDER_RETRIES + 1,
+            })
+            continue
+        raise InfrastructureFailure(
+            message, failure_code=failure_code, operation=operation
+        )
+    raise InfrastructureFailure("provider retry loop exhausted", operation=operation)
 
 
 def installed_revision() -> str | None:
@@ -183,7 +223,31 @@ def candidate_text(value: Any) -> str:
     return str(value)
 
 
+def search_evaluation_budget(body: dict[str, Any]) -> tuple[int, int]:
+    """Reserve the held-out calls that upstream GEPA runs outside max_evals.
+
+    RepoPrompt's approved max_evaluations is the ceiling for every target
+    evaluation, including reporting-only hidden examples. Upstream GEPA's
+    max_evals covers search only, then it scores the seed and winner on the
+    test set outside that budget. Reserve the worst-case hidden passes here so
+    the upstream contract and the sealed host ceiling cannot disagree.
+    """
+    total = int(body["max_evaluations"])
+    hidden_count = sum(
+        1 for example in body.get("examples", [])
+        if example.get("split") == "hidden_test"
+    )
+    held_out_reserve = hidden_count * (1 if body.get("seed_candidate") is None else 2)
+    search_budget = total - held_out_reserve
+    if search_budget < 1:
+        raise InfrastructureFailure(
+            "evaluation budget cannot cover search and held-out reporting"
+        )
+    return search_budget, held_out_reserve
+
+
 def main() -> int:
+    global MAX_PROVIDER_RETRIES
     started = time.monotonic()
     try:
         request = receive()
@@ -196,6 +260,10 @@ def main() -> int:
         body = request.get("request")
         if not isinstance(body, dict):
             raise InfrastructureFailure("run request is missing")
+        max_provider_retries = body.get("max_provider_retries", 0)
+        if not isinstance(max_provider_retries, int) or not 0 <= max_provider_retries <= 3:
+            raise InfrastructureFailure("invalid provider callback retry allowance")
+        MAX_PROVIDER_RETRIES = max_provider_retries
         run_dir = pathlib.Path(str(body["run_dir"])).resolve()
         output_dir = pathlib.Path(str(body["output_dir"])).resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -339,10 +407,11 @@ def main() -> int:
         if not dataset and valset:
             dataset, valset = valset, []
 
+        search_budget, held_out_reserve = search_evaluation_budget(body)
         config = OptimizeAnythingConfig(
             engine="gepa",
             name=str(body["run_name"]),
-            max_evals=int(body["max_evaluations"]),
+            max_evals=search_budget,
             max_token_cost=None,
             max_concurrency=1,
             output_dir=str(output_dir),
@@ -398,6 +467,17 @@ def main() -> int:
             if usage["reported"]
             else f"unavailable_callbacks={usage['unavailable']}"
         )
+        metadata = json_safe(result.metadata)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.update({
+            "approved_total_evaluation_ceiling": int(body["max_evaluations"]),
+            "search_evaluation_budget": search_budget,
+            "held_out_evaluation_reserve": held_out_reserve,
+            "held_out_evaluations_recorded": sum(
+                1 for evaluation in evaluations if evaluation["split"] == "hidden_test"
+            ),
+        })
         payload = {
             "engine": "gepa",
             "upstream_revision": EXPECTED_GEPA_REVISION,
@@ -408,12 +488,12 @@ def main() -> int:
             "parent_indices": parents,
             "aggregate_scores": scores,
             "evaluations": evaluations,
-            "total_evaluations": int(result.eval_server_calls or len(evaluations)),
+            "total_evaluations": len(evaluations),
             "wall_time_seconds": float(result.metadata.get("wall_time", time.monotonic() - started)),
             "proposer_usage": proposer_usage,
             "run_directory_relative_path": body.get("run_directory_relative_path"),
             "upstream_result": json_safe(result.to_dict()),
-            "metadata": json_safe(result.metadata),
+            "metadata": metadata,
         }
         emit({"protocol_version": PROTOCOL_VERSION, "type": "completed", "result": payload})
         return 0

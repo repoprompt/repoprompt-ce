@@ -2029,6 +2029,10 @@
           "experiment_id" : {
             "type" : "string"
           },
+          "grading_id" : {
+            "description" : "Exact pending grading ID for retry_grading; cannot resume an exited worker.",
+            "type" : "string"
+          },
           "op" : {
             "enum" : [
               "capabilities",
@@ -2041,6 +2045,7 @@
               "run",
               "wait",
               "cancel",
+              "retry_grading",
               "read",
               "clone",
               "clone_draft",

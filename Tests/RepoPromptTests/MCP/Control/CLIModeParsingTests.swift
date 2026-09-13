@@ -39,6 +39,20 @@ import XCTest
             XCTAssertEqual(options.contextID, "compose-context")
         }
 
+        func testSingleShotCanExplicitlyNegotiateFormElicitation() {
+            let mode = parseCLIMode(arguments: [
+                "rpce-cli",
+                "--form-elicitation",
+                "-c", "prompt_experiment"
+            ])
+
+            guard case let .interactive(options) = mode else {
+                return XCTFail("Expected interactive mode for a single-shot tool call")
+            }
+
+            XCTAssertTrue(options.formElicitationEnabled)
+        }
+
         func testExecModePrecedenceAndSelectorStateRemainUnchanged() {
             let mode = parseCLIMode(arguments: [
                 "rpce-cli",

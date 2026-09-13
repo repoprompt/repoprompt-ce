@@ -15,6 +15,11 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertEqual(try DirectHeadlessMCPService.experimentTools(environment: environment), ["read_file"])
         environment["REPOPROMPT_MCP_EXPERIMENT_TOOLS"] = "read_file,prompt_experiment"
         XCTAssertThrowsError(try DirectHeadlessMCPService.experimentTools(environment: environment))
+        environment["REPOPROMPT_MCP_EXPERIMENT_TOOLS"] = "read_file,apply_edits"
+        XCTAssertEqual(
+            try DirectHeadlessMCPService.experimentTools(environment: environment),
+            ["read_file", "apply_edits"]
+        )
         XCTAssertNil(try DirectHeadlessMCPService.experimentTools(environment: [:]))
     }
 

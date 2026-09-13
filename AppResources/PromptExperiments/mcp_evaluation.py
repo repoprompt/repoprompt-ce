@@ -12,6 +12,8 @@ import json
 import os
 import pathlib
 import signal
+import shutil
+import sys
 import tempfile
 import time
 
@@ -28,6 +30,17 @@ MAX_MCP_RESPONSE_BYTES = 16 * 1024 * 1024
 ACTIVE_CHILDREN: set[int] = set()
 
 
+def project_manifest(root: pathlib.Path):
+    records = []
+    for path in sorted(root.rglob('*')):
+        if path.is_file():
+            relative = path.relative_to(root).as_posix()
+            data = path.read_bytes()
+            records.append({'path': relative, 'sha256': hashlib.sha256(data).hexdigest(),
+                            'bytes': len(data)})
+    return records
+
+
 def stop_children():
     for pid in tuple(ACTIVE_CHILDREN):
         with contextlib.suppress(ProcessLookupError):
@@ -37,13 +50,17 @@ def stop_children():
 def sandbox_profile(project: pathlib.Path, scratch: pathlib.Path, server: pathlib.Path) -> str:
     def q(path):
         return json.dumps(str(path))
-    # No network, live workspace, app storage, credentials, or project writes.
+    parent_executables = {pathlib.Path(sys.executable), pathlib.Path(sys.executable).resolve()}
+    parent_identity_reads = ' '.join(f'(literal {q(path)})' for path in parent_executables)
+    # No network, live workspace, app storage, credentials, or source-project writes.
+    # The server reads only the Python parent's executable identity so the domain
+    # mutation policy can authenticate this run-scoped stdio client.
     return f'''(version 1)
 (deny default)
 (allow process*)
 (allow sysctl-read)
 (allow mach-lookup (global-name "com.apple.cfprefsd.daemon") (global-name "com.apple.cfprefsd.agent"))
-(allow file-read* (literal "/") (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/Library") (subpath {q(project)}) (subpath {q(scratch)}) (subpath {q(server.parent.parent)}))
+(allow file-read* (literal "/") (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/Library") (subpath {q(project)}) (subpath {q(scratch)}) (subpath {q(server.parent.parent)}) {parent_identity_reads})
 (allow file-write* (subpath {q(scratch)}))'''
 
 
@@ -51,7 +68,7 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
     started = time.monotonic()
     config = body['mcp_adapter']
     server = pathlib.Path(config['server_path']).resolve(strict=True)
-    project = pathlib.Path(config['project_root']).resolve(strict=True)
+    source_project = pathlib.Path(config['project_root']).resolve(strict=True)
     if hashlib.sha256(server.read_bytes()).hexdigest() != config['server_sha256']:
         raise failure_type('MCP server identity changed')
     definitions = json.loads(config['tool_definitions_json'])
@@ -60,6 +77,9 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
         raise failure_type('MCP tool definitions do not match the seal')
     lease = host_call('mcp_begin', {'candidate': candidate, 'example': example})['output']
     scratch = pathlib.Path(tempfile.mkdtemp(prefix='mcp-eval-', dir=body['output_dir'])).resolve()
+    project = scratch / 'project'
+    source_manifest = project_manifest(source_project)
+    shutil.copytree(source_project, project)
     trace = {'schema_version': 1, 'adapter': 'upstream_gepa_mcp_adapter_two_pass',
              'evaluation_id': lease, 'events': [], 'tool_calls': [], 'models': []}
     phase = 0
@@ -121,8 +141,12 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
             call['dispatched'] = True
             result = await super().call_tool(name, arguments)
             call['result'] = result
-            candidate_failure = candidate_failure or result.get('isError', False)
-            event('tool_completed')
+            # A valid tool invocation may intentionally return an error (for
+            # example, an expected absent-search edit). Preserve that outcome
+            # as grading evidence instead of converting it into an automatic
+            # candidate failure. Protocol/schema/authority violations above
+            # remain hard candidate failures.
+            event('tool_completed', is_error=bool(result.get('isError', False)))
             return result
 
         async def close(self):
@@ -227,6 +251,21 @@ def evaluate_mcp(candidate, example, body, host_call, emit, failure_type, record
         if not valid:
             raise failure_type('Upstream MCP adapter swallowed an incomplete trajectory')
         answer = result.outputs[0]['final_answer']
+        final_manifest = project_manifest(project)
+        source_after = project_manifest(source_project)
+        if source_after != source_manifest:
+            raise failure_type('Reviewed source snapshot changed during isolated MCP evaluation')
+        before = {entry['path']: entry for entry in source_manifest}
+        after = {entry['path']: entry for entry in final_manifest}
+        changed = sorted(path for path in before.keys() | after.keys()
+                         if before.get(path) != after.get(path))
+        trace['project_mutation'] = {
+            'workspace': 'fresh_per_evaluation_copy',
+            'source_snapshot_unchanged': True,
+            'changed_paths': changed,
+            'before_file_count': len(source_manifest),
+            'after_file_count': len(final_manifest),
+        }
         response = host_call('mcp_grade', {'evaluation_id':lease,'answer':answer,
             'trace':trace,'candidate_failure':candidate_failure})
         response['elapsed_seconds'] = time.monotonic()-started

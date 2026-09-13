@@ -534,6 +534,9 @@ actor InteractiveMCPClientSession {
     /// If true, emit progress notifications to stderr (for exec mode).
     private var progressEnabled: Bool = false
 
+    /// If true, negotiate form elicitation and route server requests to the terminal.
+    private var formElicitationEnabled: Bool = false
+
     init(sessionToken: String, clientName: String, logger: Logger? = nil) {
         self.sessionToken = sessionToken
         self.clientName = clientName
@@ -635,7 +638,10 @@ actor InteractiveMCPClientSession {
         // Create MCP client
         let client = MCP.Client(
             name: clientName,
-            version: "1.0"
+            version: "1.0",
+            capabilities: MCP.Client.Capabilities(
+                elicitation: formElicitationEnabled ? .init(form: .init()) : nil
+            )
         )
         self.transport = transport
         self.requestSendBarrier = requestSendBarrier
@@ -643,6 +649,12 @@ actor InteractiveMCPClientSession {
         logger.debug("Created MCP client '\(clientName)'")
 
         do {
+            if formElicitationEnabled {
+                await client.withElicitationHandler { parameters in
+                    try await CLIFormElicitation.request(parameters)
+                }
+            }
+
             // Register for tool list changed notifications
             await client.onNotification(ToolListChangedNotification.self) { [weak self] _ in
                 await self?.markToolsDirty()
@@ -914,6 +926,11 @@ actor InteractiveMCPClientSession {
     /// Enables/disables progress notifications to stderr (for exec mode).
     func setProgressEnabled(_ enabled: Bool) {
         progressEnabled = enabled
+    }
+
+    /// Enables explicit terminal handling for server-originated MCP forms.
+    func setFormElicitationEnabled(_ enabled: Bool) {
+        formElicitationEnabled = enabled
     }
 
     /// Sets the default timeout for tool calls. Use `.none` to disable the CLI-side timeout.

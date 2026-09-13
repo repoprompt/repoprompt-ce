@@ -5,7 +5,7 @@
 
     /// The candidate changes wording, never executable identity, schemas, or tool authority.
     struct PromptExperimentMCPConfiguration: Codable, Equatable {
-        static let allowedTools: Set<String> = ["read_file", "file_search", "get_file_tree", "get_code_structure"]
+        static let allowedTools: Set<String> = ["read_file", "file_search", "get_file_tree", "get_code_structure", "apply_edits"]
         static let sdkVersion = "1.30.0"
         var toolNames: [String]
         /// system_prompt or tool_description_<allowed tool name>, using upstream component semantics.
@@ -18,7 +18,7 @@
                   Set(toolNames).isSubset(of: Self.allowedTools),
                   component == "system_prompt" || toolNames.contains(where: { component == "tool_description_" + $0 })
             else {
-                throw PromptExperimentAuthorityError.invalidDraft("MCP requires distinct read-only RPCE tool names and system_prompt or tool_description_<selected tool> as its component. Remote servers and control tools are not admitted.")
+                throw PromptExperimentAuthorityError.invalidDraft("MCP requires distinct isolated RPCE tool names and system_prompt or tool_description_<selected tool> as its component. Remote servers and control tools are not admitted.")
             }
         }
 

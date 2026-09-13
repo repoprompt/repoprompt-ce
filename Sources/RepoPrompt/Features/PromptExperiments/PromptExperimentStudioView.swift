@@ -200,6 +200,7 @@
                         LabeledContent("Reflection", value: plan.optimizationTargets?.reflection.displayName ?? "unavailable")
                         LabeledContent("Execution", value: "\(optimization.execution.adapter.rawValue) · \(plan.optimizationTargets?.execution?.displayName ?? "no model target")")
                         LabeledContent("Judge", value: plan.optimizationTargets?.judge?.displayName ?? "not used")
+                        LabeledContent("Provider recovery", value: "\(optimization.gepa.maxProviderRetries ?? 0) additional calls per failed reflection or MCP model callback · retryable infrastructure codes only · no tool replay")
                         LabeledContent("Grading recovery", value: "\(optimization.gepa.pauseOnGradingFailure == true ? "Pause for explicit retry" : "Automatic JSON repair only") · \(optimization.gepa.maxJudgeRetries ?? 0) extra judge calls total · at most one per evaluation")
                         LabeledContent("Examples", value: optimization.examples.map { "\($0.id)=\($0.split.rawValue)" }.joined(separator: ", "))
                         LabeledContent("Evaluator", value: "\(optimization.evaluator.kind.rawValue) · \(optimization.evaluator.minimumScore)...\(optimization.evaluator.maximumScore)")

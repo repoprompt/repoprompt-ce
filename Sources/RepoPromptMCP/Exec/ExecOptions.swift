@@ -51,6 +51,9 @@ struct ExecOptions {
     /// Tool call timeout in seconds. nil = default, 0 = no CLI-side timeout.
     var toolCallTimeoutSeconds: Double?
 
+    /// Negotiate server-originated MCP forms and collect responses from stdin.
+    var formElicitationEnabled: Bool = false
+
     /// Stop on first failure.
     var failFast: Bool = false
 

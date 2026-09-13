@@ -87,7 +87,7 @@ actor DirectHeadlessMCPService {
                 principal: prepared.principal,
                 policyProfile: .direct,
                 restrictedToolNames: experimentTools.map { Set(MCPDomainCanonicalToolDefinitions.definitions.map(\.name)).subtracting($0) } ?? [],
-                additionalToolNames: [],
+                additionalToolNames: experimentTools?.intersection([MCPWindowToolName.applyEdits]) ?? [],
                 ephemeralGrantedOperations: experimentTools == nil ? Self.topLevelDefaultMutationOperations : []
             )
         )
@@ -133,12 +133,12 @@ actor DirectHeadlessMCPService {
     static func experimentTools(environment: [String: String]) throws -> Set<String>? {
         guard let raw = environment["REPOPROMPT_MCP_EXPERIMENT_TOOLS"] else { return nil }
         let names = raw.split(separator: ",").map(String.init)
-        let allowed: Set = ["read_file", "file_search", "get_file_tree", "get_code_structure"]
+        let allowed: Set = ["read_file", "file_search", "get_file_tree", "get_code_structure", "apply_edits"]
         guard !names.isEmpty, names.count == Set(names).count, Set(names).isSubset(of: allowed),
               environment["REPOPROMPT_MCP_HEADLESS_PROFILE_DIR"]?.isEmpty == false,
               environment["REPOPROMPT_MCP_WORKING_DIRS"]?.isEmpty == false
         else {
-            throw MCPError.invalidParams("Experiment MCP requires an isolated profile, explicit project roots and read-only tool allowlist.")
+            throw MCPError.invalidParams("Experiment MCP requires an isolated profile, explicit project roots and an experiment tool allowlist.")
         }
         return Set(names)
     }

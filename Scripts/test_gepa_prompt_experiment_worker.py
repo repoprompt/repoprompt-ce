@@ -26,7 +26,47 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
     def test_seedless_gepa_generates_initial_candidate_through_host(self) -> None:
         self.run_search(None)
 
-    def run_search(self, seed: str | None) -> None:
+    def test_retryable_reflection_failure_retries_within_sealed_allowance(self) -> None:
+        completed, operations = self.run_search(
+            None,
+            max_provider_retries=1,
+            fail_first_reflection_with="provider_temporarily_unavailable",
+        )
+        self.assertEqual(completed["best_score"], 1.0)
+        self.assertGreaterEqual(operations.count("reflect"), 2)
+        self.assertEqual(operations[:2], ["reflect", "reflect"])
+
+    def test_search_reserves_held_out_calls_inside_approved_total_budget(self) -> None:
+        completed, host_operations = self.run_search(
+            "bad candidate",
+            max_evaluations=8,
+            stop_at_score=None,
+            skip_perfect_score=False,
+            enforce_host_ceiling=True,
+        )
+        self.assertEqual(completed["total_evaluations"], 8)
+        self.assertEqual(len(completed["evaluations"]), 8)
+        self.assertEqual(
+            [evaluation["split"] for evaluation in completed["evaluations"]].count("hidden_test"),
+            2,
+        )
+        self.assertEqual(completed["metadata"]["approved_total_evaluation_ceiling"], 8)
+        self.assertEqual(completed["metadata"]["search_evaluation_budget"], 6)
+        self.assertEqual(completed["metadata"]["held_out_evaluation_reserve"], 2)
+        self.assertEqual(completed["metadata"]["held_out_evaluations_recorded"], 2)
+        self.assertEqual(host_operations.count("evaluate"), 8)
+
+    def run_search(
+        self,
+        seed: str | None,
+        *,
+        max_evaluations: int = 20,
+        stop_at_score: float | None = 1.0,
+        skip_perfect_score: bool = True,
+        enforce_host_ceiling: bool = False,
+        max_provider_retries: int = 0,
+        fail_first_reflection_with: str | None = None,
+    ) -> tuple[dict, list[str]]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             process = subprocess.Popen(
@@ -70,10 +110,11 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                     "reflection_minibatch_size": 2,
                     "use_merge": False,
                     "max_merge_invocations": 0,
-                    "skip_perfect_score": True,
+                    "skip_perfect_score": skip_perfect_score,
                     "perfect_score": 1.0,
-                    "max_evaluations": 20,
-                    "stop_at_score": 1.0,
+                    "max_evaluations": max_evaluations,
+                    "max_provider_retries": max_provider_retries,
+                    "stop_at_score": stop_at_score,
                     "random_seed": 0,
                     "run_dir": str(root / "gepa-run"),
                     "run_directory_relative_path": "worker-runs/test",
@@ -97,15 +138,36 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
                     operation = message["operation"]
                     host_operations.append(operation)
                     if operation == "reflect":
-                        response = {
-                            "type": "host_response",
-                            "id": message["id"],
-                            "ok": True,
-                            "output": "```\nimproved candidate\n```",
-                            "prompt_tokens": 11,
-                            "completion_tokens": 5,
-                        }
+                        if fail_first_reflection_with and host_operations.count("reflect") == 1:
+                            response = {
+                                "type": "host_response",
+                                "id": message["id"],
+                                "ok": False,
+                                "failure_kind": "infrastructure",
+                                "failure_code": fail_first_reflection_with,
+                                "error": "safe provider failure",
+                            }
+                        else:
+                            response = {
+                                "type": "host_response",
+                                "id": message["id"],
+                                "ok": True,
+                                "output": "```\nimproved candidate\n```",
+                                "prompt_tokens": 11,
+                                "completion_tokens": 5,
+                            }
                     else:
+                        if enforce_host_ceiling and host_operations.count("evaluate") > max_evaluations:
+                            response = {
+                                "type": "host_response",
+                                "id": message["id"],
+                                "ok": False,
+                                "failure_kind": "infrastructure",
+                                "error": "approved evaluation ceiling exceeded",
+                            }
+                            process.stdin.write(json.dumps(response) + "\n")
+                            process.stdin.flush()
+                            continue
                         self.assertEqual(
                             set(message["payload"]["example"]),
                             {"id", "split", "input"},
@@ -152,6 +214,7 @@ class GEPAPromptExperimentWorkerTests(unittest.TestCase):
             self.assertGreaterEqual(host_operations.count("evaluate"), 2)
             self.assertIn("prompt_tokens=", completed["proposer_usage"])
             self.assertIn("unavailable_callbacks=0", completed["proposer_usage"])
+            return completed, host_operations
 
     def test_preparation_evaluates_reviewed_candidates_without_search_or_holdout(self) -> None:
         result, calls = self.run_preparation_batch(4)

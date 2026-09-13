@@ -256,6 +256,11 @@ import XCTest
             XCTAssertNotEqual(try draft.contentDigest(), original)
             draft.optimization?.gepa.pauseOnGradingFailure = nil
             XCTAssertEqual(try draft.contentDigest(), original, "Historical omission must preserve the digest")
+            XCTAssertNil(draft.optimization?.gepa.maxProviderRetries)
+            draft.optimization?.gepa.maxProviderRetries = 1
+            XCTAssertNotEqual(try draft.contentDigest(), original)
+            draft.optimization?.gepa.maxProviderRetries = nil
+            XCTAssertEqual(try draft.contentDigest(), original, "Historical provider retry omission must preserve the digest")
             XCTAssertNil(draft.optimization?.gepa.maxJudgeRetries)
             draft.optimization?.gepa.maxJudgeRetries = 1
             XCTAssertNotEqual(try draft.contentDigest(), original)
@@ -414,6 +419,115 @@ import XCTest
             XCTAssertTrue(harness.runtime.submitted.isEmpty)
         }
 
+        func testProviderFailureClassificationIsClosedAndRetryabilityIsExplicit() {
+            XCTAssertEqual(
+                PromptExperimentConnectedModelRunner.classifyProviderDescription("HTTP 429 rate limit").code,
+                .rateLimited
+            )
+            XCTAssertTrue(PromptExperimentProviderFailureCode.rateLimited.isRetryable)
+            XCTAssertEqual(
+                PromptExperimentConnectedModelRunner.classifyProviderDescription("OAuth authentication expired").code,
+                .rejected
+            )
+            XCTAssertFalse(PromptExperimentProviderFailureCode.rejected.isRetryable)
+            XCTAssertEqual(
+                PromptExperimentConnectedModelRunner.classifyProviderDescription("surprising opaque failure").code,
+                .unknown
+            )
+            XCTAssertFalse(PromptExperimentProviderFailureCode.unknown.isRetryable)
+            XCTAssertEqual(
+                PromptExperimentGEPAWorker.safeProtocolDetail(type: "provider_retry", object: [
+                    "operation": "mcp_model",
+                    "failure_code": "provider_transport_interrupted",
+                    "next_attempt": 2,
+                    "max_attempts": 2
+                ]),
+                "operation=mcp_model failure_code=provider_transport_interrupted next_attempt=2 max_attempts=2 payload=excluded"
+            )
+        }
+
+        func testSealRejectsKnownIncompatibleCodexCallbackBeforeApprovalOrEnvironmentCapture() async throws {
+            let root = temporaryRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = PromptExperimentStore(rootURL: root)
+            let runtime = FakeRuntime()
+            let claude = PromptExperimentResolvedTarget(
+                role: "reflector",
+                agentRaw: AgentProviderKind.claudeCode.rawValue,
+                modelRaw: "claude-test",
+                displayName: "Claude Test"
+            )
+            let codex = PromptExperimentResolvedTarget(
+                role: "executor",
+                agentRaw: AgentProviderKind.codexExec.rawValue,
+                modelRaw: "gpt-test",
+                displayName: "Codex Test"
+            )
+            let service = PromptExperimentService(
+                store: store,
+                runtime: runtime,
+                resolveTarget: { $0 == "executor" ? codex : claude },
+                now: { Date(timeIntervalSince1970: 1000) }
+            )
+            await service.load()
+            let id = try await service.createOptimizationExperiment(
+                controllerSessionID: UUID(),
+                sourceTabID: UUID()
+            )
+            var draft = try XCTUnwrap(service.record(id: id)?.draft)
+            let digest = try draft.contentDigest()
+            var optimization = Self.validOptimization()
+            optimization.execution.adapter = .connectedModel
+            draft.optimization = optimization
+            let updated = try await service.updateDraft(
+                experimentID: id,
+                expectedDraftID: draft.id,
+                expectedDraftVersion: draft.optimisticVersion,
+                expectedDraftDigest: digest,
+                draft: draft
+            )
+            do {
+                _ = try await service.seal(
+                    experimentID: id,
+                    expectedDraftID: updated.id,
+                    expectedDraftVersion: updated.optimisticVersion,
+                    expectedDraftDigest: updated.contentDigest()
+                )
+                XCTFail("Known-incompatible callback target must fail before sealing")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("cannot be sealed"))
+                XCTAssertTrue(error.localizedDescription.contains("execution"))
+                XCTAssertTrue(error.localizedDescription.contains("gpt-test"))
+            }
+            let record = try XCTUnwrap(service.record(id: id))
+            XCTAssertEqual(record.phase, .drafting)
+            XCTAssertTrue(record.plans.isEmpty)
+            XCTAssertTrue(record.approvals.isEmpty)
+        }
+
+        func testRunPersistsPreflightBlockBeforeAnyAttempt() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedOptimizationExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            harness.runtime.preflightError = .runtimeUnavailable("controlled callback unavailable")
+
+            do {
+                try await harness.service.run(experimentID: id)
+                XCTFail("Preflight failure must propagate")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("controlled callback unavailable"))
+            }
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            XCTAssertEqual(record.phase, .approved)
+            XCTAssertTrue(record.attempts.isEmpty)
+            XCTAssertTrue(record.statusMessage.contains("preflight blocked"))
+            XCTAssertTrue(record.statusMessage.contains("controlled callback unavailable"))
+            let persisted = try await harness.store.loadRecords()
+            XCTAssertEqual(persisted.first?.statusMessage, record.statusMessage)
+        }
+
         func testCompletionPreservesMessageBoundariesAndTerminalUsage() throws {
             let provider = CodexExecAgentProvider(config: .init(commandName: "codex", additionalPathHints: []))
             var accumulator = PromptExperimentCompletionAccumulator()
@@ -469,9 +583,15 @@ import XCTest
             XCTAssertEqual(harness.service.record(id: id)?.statusMessage, terminal)
         }
 
-        func testMCPConfigurationAllowsOnlyReadOnlyToolsAndRoundTripsResolvedFields() throws {
+        func testMCPConfigurationAllowsIsolatedApplyEditsAndRejectsControlTools() throws {
             let valid = PromptExperimentMCPConfiguration(toolNames: ["read_file"], component: "tool_description_read_file", toolDefinitionsJson: "[]", serverSha256: "digest")
             XCTAssertNoThrow(try valid.validate())
+            XCTAssertNoThrow(
+                try PromptExperimentMCPConfiguration(
+                    toolNames: ["apply_edits"],
+                    component: "tool_description_apply_edits"
+                ).validate()
+            )
             let encoder = JSONEncoder()
             encoder.keyEncodingStrategy = .convertToSnakeCase
             let decoder = JSONDecoder()
@@ -769,6 +889,38 @@ import XCTest
             XCTAssertThrowsError(try draft.validated(), "Search cannot silently retain a preparation candidate batch")
             draft.optimization?.preparationCandidates = nil
             draft.optimization?.seedCandidate = "Revised instructions"
+            XCTAssertNoThrow(try draft.validated())
+        }
+
+        func testSearchBudgetMustReserveReportingOnlyHiddenEvaluations() throws {
+            var spec = Self.validOptimization()
+            spec.examples.append(PromptExperimentExample(
+                id: "hidden",
+                split: .hiddenTest,
+                input: "reporting input",
+                expectedOutput: "reporting output",
+                reviewerNotes: nil
+            ))
+            spec.startingPoint = .supplied
+            spec.seedCandidate = "Reviewed seed"
+            spec.gepa.maxEvaluations = 2
+            let date = Date(timeIntervalSince1970: 100)
+            var draft = PromptExperimentDraft(
+                revision: 1,
+                title: "Held-out reserve",
+                optimization: spec,
+                createdAt: date,
+                updatedAt: date
+            )
+            XCTAssertThrowsError(try draft.validated())
+            draft.optimization?.gepa.maxEvaluations = 3
+            XCTAssertNoThrow(try draft.validated())
+
+            draft.optimization?.startingPoint = .gepa
+            draft.optimization?.seedCandidate = nil
+            draft.optimization?.gepa.maxEvaluations = 1
+            XCTAssertThrowsError(try draft.validated())
+            draft.optimization?.gepa.maxEvaluations = 2
             XCTAssertNoThrow(try draft.validated())
         }
 

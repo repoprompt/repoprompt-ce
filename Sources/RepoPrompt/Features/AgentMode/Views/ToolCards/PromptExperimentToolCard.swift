@@ -199,6 +199,7 @@
                     DisclosureGroup("Technical settings and exact authority") {
                         VStack(alignment: .leading, spacing: 8) {
                             proposalField("Evaluator", "\(spec.evaluator.kind.rawValue) · range \(spec.evaluator.minimumScore)...\(spec.evaluator.maximumScore)")
+                            proposalField("Provider recovery", "\(spec.gepa.maxProviderRetries ?? 0) additional calls per failed reflection or MCP model callback. Only closed retryable infrastructure codes qualify; MCP phase and saved tool results are reused, so tool calls are not repeated. Every retry is logged.")
                             proposalField("Judge recovery", "\(spec.gepa.pauseOnGradingFailure == true ? "Pause for an explicit session/UI retry after a judge failure" : "Automatic invalid-JSON repair only"). At most one retry per evaluation and \(spec.gepa.maxJudgeRetries ?? 0) additional judge calls for the entire run. Saved target output and the sealed judge/rubric are reused. Cancellation and storage failures are not retried; exited workers cannot resume.")
                             proposalField("Search settings", "Minibatch \(spec.gepa.reflectionMinibatchSize ?? 3) · merge \(spec.gepa.useMerge ?? false ? "on" : "off") · max merge \(spec.gepa.maxMergeInvocations ?? 5) · skip perfect \(spec.gepa.skipPerfectScore ?? true ? "yes" : "no") · seed \(String(spec.gepa.randomSeed))")
                             proposalField("Runtime", spec.gepa.pythonExecutablePath)

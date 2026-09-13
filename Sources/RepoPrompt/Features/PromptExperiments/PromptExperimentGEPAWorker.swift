@@ -303,6 +303,7 @@
                 "task_preservation": "Evaluator, dataset, permissions, targets, and output requirements are immutable under approved plan digest \(plan.digest).",
                 "examples": examples,
                 "max_evaluations": specification.gepa.maxEvaluations,
+                "max_provider_retries": specification.gepa.maxProviderRetries ?? 0,
                 "random_seed": specification.gepa.randomSeed,
                 "reflection_minibatch_size": specification.gepa.reflectionMinibatchSize ?? 3,
                 "use_merge": specification.gepa.useMerge ?? false,
@@ -503,6 +504,12 @@
                           let operation = object["operation"] as? String,
                           let payload = object["payload"] as? [String: Any]
                     else { throw WorkerError.protocolFailure("GEPA host request is incomplete.") }
+                    var hostPayload = payload
+                    if let logicalID = object["logical_callback_id"] as? String,
+                       UUID(uuidString: logicalID) != nil
+                    {
+                        hostPayload["_rpce_logical_callback_id"] = logicalID
+                    }
                     emitObservation(.callbackStarted(id: id, operation: operation), using: observation)
                     let semaphore = DispatchSemaphore(value: 0)
                     let replyBox = PromptExperimentGEPAHostReplyBox()
@@ -515,7 +522,7 @@
                         lock.unlock()
                     }
                     let callback = Task { @MainActor in
-                        let reply = await host(id, operation, payload)
+                        let reply = await host(id, operation, hostPayload)
                         replyBox.store(reply)
                         semaphore.signal()
                     }
@@ -546,6 +553,13 @@
                     try writeJSONLine(response, to: stdinPipe.fileHandleForWriting)
                 case "mcp_process":
                     break // Payload-free PID/phase detail is already persisted above.
+                case "provider_retry":
+                    let operation = object["operation"] as? String ?? "provider callback"
+                    let next = object["next_attempt"] as? Int ?? 0
+                    let maximum = object["max_attempts"] as? Int ?? 0
+                    Task { @MainActor in
+                        await progress("Retrying \(operation) after a retryable provider failure (attempt \(next)/\(maximum)).")
+                    }
                 case "progress":
                     let completed = object["completed_evaluations"] as? Int ?? 0
                     let maximum = object["max_evaluations"] as? Int ?? 0
@@ -609,6 +623,13 @@
                 let id = object["id"] as? String ?? "unknown"
                 let operation = object["operation"] as? String ?? "unknown"
                 return "callback_id=\(id) operation=\(operation) payload=excluded"
+            case "provider_retry":
+                let operation = ["reflect", "mcp_model"].contains(object["operation"] as? String ?? "")
+                    ? (object["operation"] as? String ?? "unknown") : "unknown"
+                let code = Self.safeProviderFailureCode(object["failure_code"]) ?? "unavailable"
+                let next = object["next_attempt"] as? Int ?? -1
+                let maximum = object["max_attempts"] as? Int ?? -1
+                return "operation=\(operation) failure_code=\(code) next_attempt=\(next) max_attempts=\(maximum) payload=excluded"
             case "progress":
                 let completed = object["completed_evaluations"] as? Int ?? 0
                 let maximum = object["max_evaluations"] as? Int ?? 0
@@ -633,11 +654,19 @@
                     return "exception_type=unavailable source_frame=unavailable envelope=invalid error_payload=excluded"
                 }
                 let code = diagnostic["failure_code"] as? String
-                let safeCode = ["judge_invalid_response", "judge_provider_failed"].contains(code ?? "") ? code! : "unavailable"
+                let safeCode = ["judge_invalid_response", "judge_provider_failed"].contains(code ?? "")
+                    ? code! : (Self.safeProviderFailureCode(code) ?? "unavailable")
                 return "exception_type=\(exceptionType) source_frame=\(module).\(function):\(line) failure_code=\(safeCode) error_payload=excluded"
             default:
                 return nil
             }
+        }
+
+        private static func safeProviderFailureCode(_ rawValue: Any?) -> String? {
+            guard let value = rawValue as? String,
+                  PromptExperimentProviderFailureCode.allCases.map(\.rawValue).contains(value)
+            else { return nil }
+            return value
         }
 
         private static func safePythonIdentifier(_ rawValue: Any?, dotted: Bool = false) -> String? {

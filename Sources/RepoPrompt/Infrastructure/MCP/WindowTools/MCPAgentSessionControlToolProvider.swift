@@ -382,7 +382,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                         "allowed_tools": .array(PromptExperimentMCPConfiguration.allowedTools.sorted().map(Value.string)),
                         "configuration": .string("execution.adapter=mcp_adapter; execution.mcp={tool_names:[...],component:system_prompt or tool_description_<selected tool>}; project_snapshot is required. Sealing resolves executable and schema fingerprints. Choose supplied-prompt preparation or explicit seedless GEPA search; inspect guidance and traces before expanding spend."),
                         "maximum_tool_calls_per_evaluation": .int(1), "maximum_target_model_calls_per_evaluation": .int(2),
-                        "network": .string("denied"), "source_workspace_writes": .bool(false)
+                        "network": .string("denied"), "source_workspace_writes": .bool(false),
+                        "mutation_isolation": .string("apply_edits, when selected, writes only to a fresh per-evaluation copy and records mutation evidence")
                     ]),
                     "user_approval_required": .bool(true),
                     "native_approval_required": .bool(!usesMCPApproval)
@@ -523,6 +524,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 var gepa: [String: Value] = [
                     "reflection_target": plan.optimizationTargets.map { targetValue($0.reflection) } ?? .null,
                     "max_evaluations": .int(optimization.gepa.maxEvaluations),
+                    "max_provider_retries": .int(optimization.gepa.maxProviderRetries ?? 0),
                     "max_judge_retries": .int(optimization.gepa.maxJudgeRetries ?? 0),
                     "pause_on_grading_failure": .bool(optimization.gepa.pauseOnGradingFailure ?? false),
                     "experiment_wall_clock_deadline": .string("none"),
@@ -542,12 +544,19 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
         }
 
         private static func targetValue(_ target: PromptExperimentResolvedTarget) -> Value {
-            .object([
+            let promptOnly = PromptExperimentConnectedModelRunner.supportsPromptOnlyCallbacks(target)
+            return .object([
                 "selector": .string(target.selector),
                 "canonical_model_id": .string(target.canonicalSelectionID),
                 "agent": .string(target.agentRaw),
                 "model": .string(target.modelRaw),
-                "display_name": .string(target.displayName)
+                "display_name": .string(target.displayName),
+                "prompt_only_callback_supported": .bool(promptOnly),
+                "optimization_role_guidance": .string(
+                    promptOnly
+                        ? "Supported for execution, reflection, and judge callbacks."
+                        : "Not supported for connected_model or mcp_adapter callbacks. Context Builder execution may still use this target when no prompt-only callback role resolves to it."
+                )
             ])
         }
 

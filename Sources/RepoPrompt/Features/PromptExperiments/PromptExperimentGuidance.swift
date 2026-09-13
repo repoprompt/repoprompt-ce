@@ -52,7 +52,7 @@
                 return .init(action: "monitor", explanation: "Execution is active. Inspect incremental model_calls and partial_evaluations; wait or cancel through the existing authority. Silence alone is not failure.", evidenceIDs: ids)
             }
             if runtimeFailed || failures.contains(.infrastructure) {
-                return .init(action: "repair_runtime", explanation: "Inspect provider status and diagnostics before buying more evaluations. Infrastructure failures are not prompt scores. Do not automatically retry or switch models.", evidenceIDs: ids)
+                return .init(action: "repair_runtime", explanation: "Inspect provider status, model_calls, and safe protocol diagnostics before buying more evaluations. Infrastructure failures are not prompt scores. The worker may already have consumed the sealed per-callback retry allowance for closed transient provider failures; do not blindly rerun a whole evaluation or switch models. Preserve completed evidence, repair the cause, and create a linked reviewed revision when another run is warranted.", evidenceIDs: ids)
             }
             if record.phase == .cancelled {
                 return .init(action: "review_interruption", explanation: "The run was cancelled. Inspect preserved evidence and discuss whether another run is useful; do not auto-resume spending.", evidenceIDs: ids)

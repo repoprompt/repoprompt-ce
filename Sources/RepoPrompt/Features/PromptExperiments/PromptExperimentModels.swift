@@ -167,6 +167,9 @@
         var useMerge: Bool? = nil
         var maxMergeInvocations: Int? = nil
         var skipPerfectScore: Bool? = nil
+        /// Total additional provider calls for one failed reflection or MCP model callback.
+        /// Nil means zero: historical approval never implicitly authorizes new spend.
+        var maxProviderRetries: Int? = nil
         /// Total additional judge calls across the run, at most one per evaluation.
         /// Nil means zero: historical approval never implicitly authorizes new spend.
         var maxJudgeRetries: Int? = nil
@@ -477,6 +480,9 @@
                 guard (2 ... 10000).contains(optimization.gepa.maxEvaluations) else {
                     throw PromptExperimentAuthorityError.invalidDraft("GEPA max evaluations must be between 2 and 10,000.")
                 }
+                guard (0 ... 3).contains(optimization.gepa.maxProviderRetries ?? 0) else {
+                    throw PromptExperimentAuthorityError.invalidDraft("max_provider_retries must be between 0 and 3 (additional calls per reflection or MCP model callback).")
+                }
                 guard (0 ... 10).contains(optimization.gepa.maxJudgeRetries ?? 0) else {
                     throw PromptExperimentAuthorityError.invalidDraft("max_judge_retries must be between 0 and 10 (total additional judge calls, at most one per evaluation).")
                 }
@@ -543,6 +549,14 @@
                     }
                 } else if optimization.preparationCandidates != nil {
                     throw PromptExperimentAuthorityError.invalidDraft("Clear preparation_candidates before GEPA search; select the tested starting prompt as seed_candidate.")
+                } else {
+                    let hiddenCount = optimization.examples.count(where: { $0.split == .hiddenTest })
+                    let heldOutReserve = hiddenCount * (optimization.startingPoint == .gepa ? 1 : 2)
+                    guard optimization.gepa.maxEvaluations > heldOutReserve else {
+                        throw PromptExperimentAuthorityError.invalidDraft(
+                            "GEPA max evaluations must leave at least one search evaluation after reserving reporting-only hidden checks."
+                        )
+                    }
                 }
                 if let project = optimization.projectSnapshot {
                     guard !project.sourceRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
