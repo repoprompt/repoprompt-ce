@@ -226,7 +226,9 @@ actor GitWorkspaceMetadataMonitor {
     /// Serializes an authority install linearization point with synchronous
     /// event acceptance. If an event was accepted during collection, the body
     /// never runs; an event accepted afterward observes the installed value as
-    /// a prior generation and makes its lease immediately non-current.
+    /// a prior generation and makes its lease immediately non-current. The callback
+    /// runs under the monitor lock and may synchronously acquire the authority mirror, but may not
+    /// synchronously invalidate/query the Store cache or run an admitted Git subprocess.
     nonisolated func withCurrentAcceptedWatermark<T>(
         for repositoryKey: GitWorkspaceAuthorityRepositoryKey,
         expected: UInt64,
@@ -241,7 +243,9 @@ actor GitWorkspaceMetadataMonitor {
 
     /// Validates a complete multi-root watermark cut while holding the monitor
     /// lock exactly once. Duplicate repository keys must already have been
-    /// coalesced to one exact expected value by the caller.
+    /// coalesced to one exact expected value by the caller. The callback runs under
+    /// the monitor lock and may synchronously acquire the authority mirror, but may not synchronously
+    /// invalidate/query the Store cache or run an admitted Git subprocess.
     nonisolated func withCurrentAcceptedWatermarks<T>(
         _ expected: [GitWorkspaceAuthorityRepositoryKey: UInt64],
         _ body: () -> T
@@ -656,7 +660,8 @@ actor GitWorkspaceMetadataMonitor {
 }
 
 private final class GitMetadataAcceptedWatermarks: @unchecked Sendable {
-    private let lock = NSLock()
+    // While held, no synchronous Store cache invalidation/queryability or admitted Git subprocess may run.
+    private let lock = SameThreadReentryCheckedLock()
     private var values: [GitWorkspaceAuthorityRepositoryKey: UInt64] = [:]
     private var activeSourceIDs: [GitWorkspaceAuthorityRepositoryKey: Set<UUID>] = [:]
     private var invalidatedKeys = Set<GitWorkspaceAuthorityRepositoryKey>()
@@ -665,24 +670,24 @@ private final class GitMetadataAcceptedWatermarks: @unchecked Sendable {
         _ key: GitWorkspaceAuthorityRepositoryKey,
         sourceID: UUID
     ) {
-        lock.withLock {
-            if activeSourceIDs[key, default: []].isEmpty {
-                invalidatedKeys.remove(key)
-            }
-            activeSourceIDs[key, default: []].insert(sourceID)
+        lock.lock()
+        defer { lock.unlock() }
+        if activeSourceIDs[key, default: []].isEmpty {
+            invalidatedKeys.remove(key)
         }
+        activeSourceIDs[key, default: []].insert(sourceID)
     }
 
     func remove(
         _ key: GitWorkspaceAuthorityRepositoryKey,
         sourceID: UUID
     ) {
-        lock.withLock {
-            activeSourceIDs[key]?.remove(sourceID)
-            if activeSourceIDs[key]?.isEmpty == true {
-                activeSourceIDs.removeValue(forKey: key)
-                invalidatedKeys.remove(key)
-            }
+        lock.lock()
+        defer { lock.unlock() }
+        activeSourceIDs[key]?.remove(sourceID)
+        if activeSourceIDs[key]?.isEmpty == true {
+            activeSourceIDs.removeValue(forKey: key)
+            invalidatedKeys.remove(key)
         }
     }
 
@@ -690,10 +695,10 @@ private final class GitMetadataAcceptedWatermarks: @unchecked Sendable {
         _ key: GitWorkspaceAuthorityRepositoryKey,
         sourceID: UUID
     ) {
-        lock.withLock {
-            guard activeSourceIDs[key]?.contains(sourceID) == true else { return }
-            invalidatedKeys.insert(key)
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeSourceIDs[key]?.contains(sourceID) == true else { return }
+        invalidatedKeys.insert(key)
     }
 
     @discardableResult
@@ -701,33 +706,37 @@ private final class GitMetadataAcceptedWatermarks: @unchecked Sendable {
         _ key: GitWorkspaceAuthorityRepositoryKey,
         sourceID: UUID
     ) -> Bool {
-        lock.withLock {
-            guard activeSourceIDs[key]?.contains(sourceID) == true,
-                  !invalidatedKeys.contains(key)
-            else { return false }
-            values[key, default: 0] &+= 1
-            return true
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeSourceIDs[key]?.contains(sourceID) == true,
+              !invalidatedKeys.contains(key)
+        else { return false }
+        values[key, default: 0] &+= 1
+        return true
     }
 
     /// Test-equivalent acceptance for an already-active source set.
     @discardableResult
     func accept(_ key: GitWorkspaceAuthorityRepositoryKey) -> Bool {
-        lock.withLock {
-            guard activeSourceIDs[key]?.isEmpty == false,
-                  !invalidatedKeys.contains(key)
-            else { return false }
-            values[key, default: 0] &+= 1
-            return true
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeSourceIDs[key]?.isEmpty == false,
+              !invalidatedKeys.contains(key)
+        else { return false }
+        values[key, default: 0] &+= 1
+        return true
     }
 
     func value(for key: GitWorkspaceAuthorityRepositoryKey) -> UInt64 {
-        lock.withLock { values[key] ?? 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        return values[key] ?? 0
     }
 
     func snapshot() -> [GitWorkspaceAuthorityRepositoryKey: UInt64] {
-        lock.withLock { values }
+        lock.lock()
+        defer { lock.unlock() }
+        return values
     }
 
     func withCurrentValue<T>(
@@ -735,27 +744,31 @@ private final class GitMetadataAcceptedWatermarks: @unchecked Sendable {
         expected: UInt64,
         _ body: () -> T
     ) -> T? {
-        lock.withLock {
-            guard values[key, default: 0] == expected,
-                  activeSourceIDs[key]?.isEmpty == false,
-                  !invalidatedKeys.contains(key)
-            else { return nil }
-            return body()
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard values[key, default: 0] == expected,
+              activeSourceIDs[key]?.isEmpty == false,
+              !invalidatedKeys.contains(key)
+        else { return nil }
+        // `body` may acquire the authority mirror but cannot re-enter this lock or invalidate/query the Store cache.
+        // REENTRANCY-REVIEWED: no admitted Git subprocess may run while it is held.
+        return body()
     }
 
     func withCurrentValues<T>(
         _ expected: [GitWorkspaceAuthorityRepositoryKey: UInt64],
         _ body: () -> T
     ) -> T? {
-        lock.withLock {
-            guard expected.allSatisfy({ entry in
-                values[entry.key, default: 0] == entry.value
-                    && activeSourceIDs[entry.key]?.isEmpty == false
-                    && !invalidatedKeys.contains(entry.key)
-            }) else { return nil }
-            return body()
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard expected.allSatisfy({ entry in
+            values[entry.key, default: 0] == entry.value
+                && activeSourceIDs[entry.key]?.isEmpty == false
+                && !invalidatedKeys.contains(entry.key)
+        }) else { return nil }
+        // `body` may acquire the authority mirror but cannot re-enter this lock or invalidate/query the Store cache.
+        // REENTRANCY-REVIEWED: no admitted Git subprocess may run while it is held.
+        return body()
     }
 }
 

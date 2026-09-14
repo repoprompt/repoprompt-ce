@@ -8060,23 +8060,15 @@ actor GitService {
             )
         }
 
-        let worktreeRecords = aliasResolution.records.map(\.record)
-        let layoutsByPath: [String: GitRepositoryLayout] = Dictionary(
-            uniqueKeysWithValues: aliasResolution.records.compactMap { resolvedRecord in
-                resolvedRecord.layout.map { (resolvedRecord.pathURL.path, $0) }
-            }
-        )
-
         let commonGitDir = currentLayout?.commonDir
-            ?? layoutsByPath.values.first?.commonDir
+            ?? aliasResolution.records.lazy.compactMap(\.layout).first?.commonDir
         guard let commonGitDir else {
             throw GitError(message: "git worktree list succeeded but repository layout could not be resolved")
         }
 
-        let discoveredMainRoot = worktreeRecords.first { record in
-            let path = URL(fileURLWithPath: record.path).standardizedFileURL.path
-            return layoutsByPath[path].map { !$0.isLinkedWorktree } ?? false
-        }.map { URL(fileURLWithPath: $0.path).standardizedFileURL }
+        let discoveredMainRoot = aliasResolution.records.first { resolvedRecord in
+            resolvedRecord.layout.map { !$0.isLinkedWorktree } ?? false
+        }.map(\.pathURL)
         let mainURL = resolvedMainRoot ?? discoveredMainRoot
         let repository = GitWorktreeIdentity.repositoryIdentity(
             commonGitDir: commonGitDir,
@@ -8084,10 +8076,11 @@ actor GitService {
         )
         let currentPath = currentRepoURL.standardizedFileURL.path
 
-        return worktreeRecords.map { record in
-            let pathURL = URL(fileURLWithPath: record.path).standardizedFileURL
+        return aliasResolution.records.map { resolvedRecord in
+            let record = resolvedRecord.record
+            let pathURL = resolvedRecord.pathURL
             let path = pathURL.path
-            let layout = layoutsByPath[path]
+            let layout = resolvedRecord.layout
             let gitDir = layout?.gitDir.standardizedFileURL
             let isMain: Bool = if let layout {
                 !layout.isLinkedWorktree

@@ -162,6 +162,205 @@ private final class MCPTransportIngressGate: @unchecked Sendable {
 
 typealias MCPTransportResponseDeliveryGate = MCPDomainResponseDeliveryTracker
 
+/// Rejects explicit `null` request IDs before they reach the MCP SDK, which
+/// decodes them as empty strings. A genuine empty-string ID remains valid.
+private enum MCPExplicitNullRequestIDIngressValidation {
+    struct Result {
+        let forwardedFrame: Data?
+        let rejectedRequestCount: Int
+    }
+
+    static func validate(_ frame: Data) -> Result {
+        guard let root = try? JSONSerialization.jsonObject(with: frame, options: [.fragmentsAllowed]) else {
+            return .init(forwardedFrame: frame, rejectedRequestCount: 0)
+        }
+
+        func hasExplicitNullRequestID(_ value: Any) -> Bool {
+            guard let message = value as? [String: Any],
+                  message["method"] is String,
+                  message.keys.contains("id")
+            else {
+                return false
+            }
+            return JSONRPCBridgeID.parseJSONValue(message["id"]) == .null
+        }
+
+        if let batch = root as? [Any] {
+            let rejectedRequestCount = batch.count(where: hasExplicitNullRequestID)
+            guard rejectedRequestCount > 0 else {
+                return .init(forwardedFrame: frame, rejectedRequestCount: 0)
+            }
+            let forwardedMessages = batch.filter { !hasExplicitNullRequestID($0) }
+            guard !forwardedMessages.isEmpty else {
+                return .init(forwardedFrame: nil, rejectedRequestCount: rejectedRequestCount)
+            }
+            guard let forwardedFrame = try? JSONSerialization.data(
+                withJSONObject: forwardedMessages,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            ) else {
+                return .init(forwardedFrame: frame, rejectedRequestCount: 0)
+            }
+            return .init(
+                forwardedFrame: forwardedFrame,
+                rejectedRequestCount: rejectedRequestCount
+            )
+        }
+
+        guard hasExplicitNullRequestID(root) else {
+            return .init(forwardedFrame: frame, rejectedRequestCount: 0)
+        }
+        return .init(forwardedFrame: nil, rejectedRequestCount: 1)
+    }
+}
+
+/// Owns the terminal-response claim for an accepted socket. This is separate from
+/// `MCPDomainResponseDeliveryTracker`: that tracker records physical write delivery,
+/// while this one retains exact JSON-RPC number-versus-string identities needed to
+/// decide which logical response the watchdog owns. Requests are recorded before
+/// they are offered to the MCP SDK, so a watchdog can answer every accepted request,
+/// including one that has not reached a handler.
+///
+/// The ledger seals before writing terminal errors. Later SDK completions are then
+/// suppressed, preserving one response per JSON-RPC request ID after the connection
+/// has become terminal.
+private final class MCPExecutionWatchdogResponseLedger: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSealed = false
+    private var pendingRequestIDs: [JSONRPCBridgeID] = []
+    private var pendingRequestIDSet = Set<JSONRPCBridgeID>()
+    private var sealedRequestIDs = Set<JSONRPCBridgeID>()
+
+    /// Returns false when the watchdog has already sealed the connection, preventing
+    /// a frame accepted after the terminal snapshot from reaching the SDK.
+    func recordAcceptedClientFrame(_ frame: Data) -> Bool {
+        let requestIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
+            frame,
+            direction: .clientToServer
+        ).compactMap { metadata -> JSONRPCBridgeID? in
+            guard case .request = metadata.kind,
+                  let id = metadata.id,
+                  id != .null
+            else {
+                return nil
+            }
+            return id
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isSealed else { return false }
+        for requestID in requestIDs where pendingRequestIDSet.insert(requestID).inserted {
+            pendingRequestIDs.append(requestID)
+        }
+        return true
+    }
+
+    /// Atomically freezes ingress and claims the outstanding request IDs for the
+    /// watchdog's terminal JSON-RPC errors. Repeated watchdog aborts are idempotent.
+    func sealAndTakeOutstandingRequestIDs() -> [JSONRPCBridgeID] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isSealed else { return [] }
+        isSealed = true
+        sealedRequestIDs = pendingRequestIDSet
+        pendingRequestIDSet.removeAll()
+        let requestIDs = pendingRequestIDs
+        pendingRequestIDs.removeAll()
+        return requestIDs
+    }
+
+    func reset() {
+        lock.lock()
+        isSealed = false
+        pendingRequestIDs.removeAll()
+        pendingRequestIDSet.removeAll()
+        sealedRequestIDs.removeAll()
+        lock.unlock()
+    }
+
+    /// Claims ordinary SDK responses before their physical write begins. A watchdog
+    /// which arrives afterwards must not emit a second response for that request.
+    /// `UnixSocketMCPTransport.send` cannot interleave a watchdog after this claim:
+    /// its `writeAll` poll loop has no suspension point. If that writer starts a
+    /// partial frame and fails, the connection is closed because a terminal error
+    /// cannot be safely interleaved into the incomplete JSON-RPC stream.
+    /// After terminal sealing, strips every late response while preserving unrelated
+    /// notifications or responses from the same batch.
+    func prepareServerFrameForDelivery(_ frame: Data) -> Data? {
+        let responseMetadata = JSONRPCBridgeFrameInspector.inspectPermissively(
+            frame,
+            direction: .serverToClient
+        )
+        let responseIDs = responseMetadata.compactMap { metadata -> JSONRPCBridgeID? in
+            guard case .response = metadata.kind,
+                  let id = metadata.id,
+                  id != .null
+            else {
+                return nil
+            }
+            return id
+        }
+        let hasExplicitNullResponse = responseMetadata.contains { metadata in
+            guard case .response = metadata.kind else { return false }
+            return metadata.id == .null
+        }
+
+        lock.lock()
+        let sealedIDs = sealedRequestIDs
+        if !isSealed {
+            pendingRequestIDSet.subtract(responseIDs)
+            pendingRequestIDs.removeAll { responseIDs.contains($0) }
+            lock.unlock()
+            return frame
+        }
+        lock.unlock()
+
+        guard hasExplicitNullResponse || responseIDs.contains(where: sealedIDs.contains) else { return frame }
+        return Self.removingResponses(
+            for: sealedIDs,
+            removingExplicitNullResponses: hasExplicitNullResponse,
+            from: frame
+        )
+    }
+
+    private static func removingResponses(
+        for sealedIDs: Set<JSONRPCBridgeID>,
+        removingExplicitNullResponses: Bool = false,
+        from frame: Data
+    ) -> Data? {
+        let hadNewline = frame.last == UInt8(ascii: "\n")
+        let unframed = hadNewline ? Data(frame.dropLast()) : frame
+        guard let root = try? JSONSerialization.jsonObject(with: unframed, options: [.fragmentsAllowed]) else {
+            // The SDK only emits valid JSON-RPC frames. Fail closed here rather than
+            // letting an uninspectable late response violate the terminal claim.
+            return nil
+        }
+
+        func isSealedResponse(_ object: Any) -> Bool {
+            guard let message = object as? [String: Any],
+                  message["result"] != nil || message["error"] != nil,
+                  let id = JSONRPCBridgeID.parseJSONValue(message["id"])
+            else {
+                return false
+            }
+            return (removingExplicitNullResponses && id == .null) || sealedIDs.contains(id)
+        }
+
+        if let message = root as? [String: Any] {
+            return isSealedResponse(message) ? nil : frame
+        }
+        guard let batch = root as? [Any] else { return frame }
+        let retained = batch.filter { !isSealedResponse($0) }
+        guard !retained.isEmpty,
+              var encoded = try? JSONSerialization.data(withJSONObject: retained, options: [.sortedKeys])
+        else {
+            return nil
+        }
+        if hadNewline { encoded.append(UInt8(ascii: "\n")) }
+        return encoded
+    }
+}
+
 final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
     struct Token: Hashable {
         fileprivate let connectionID: String
@@ -479,6 +678,7 @@ public actor UnixSocketMCPTransport: Transport {
 
     private var lastActivityTime: Date?
     private let responseDeliveryGate = MCPDomainResponseDeliveryTracker()
+    private let executionWatchdogResponseLedger = MCPExecutionWatchdogResponseLedger()
 
     /// Connection timeout when waiting for socket to appear and accept connections
     private let connectionTimeout: TimeInterval = 30.0
@@ -671,7 +871,19 @@ public actor UnixSocketMCPTransport: Transport {
             throw MCPError.connectionClosed
         }
 
-        let framed = Self.frameWithNewlineIfNeeded(message)
+        let candidateFrame = Self.frameWithNewlineIfNeeded(message)
+        guard let framed = executionWatchdogResponseLedger.prepareServerFrameForDelivery(candidateFrame) else {
+            MCPResponseDeliveryTracer.emitFrame(
+                layer: "app_uds_transport",
+                phase: "watchdog_late_response_suppressed",
+                frame: candidateFrame,
+                direction: .serverToClient,
+                connectionID: timelineCorrelationConnectionID,
+                connectionGeneration: timelineConnectionGeneration,
+                terminalReason: "tool_execution_watchdog"
+            )
+            return
+        }
         let responseDeadline: MCPExportResponseDeliveryDeadlineRegistry.Deadline? = if let timelineConnectionID {
             MCPExportResponseDeliveryDeadlineRegistry.shared.deadline(
                 forServerFrame: framed,
@@ -750,7 +962,7 @@ public actor UnixSocketMCPTransport: Transport {
             // Encoding proves the SDK produced a response frame; this boundary proves the
             // transport began attempting the write, which distinguishes a later stall or close.
             emitResponseWriteTrace(phase: "transport_write_started")
-            try await writeAll(framed, responseDeadline: responseDeadline)
+            try writeAll(framed, responseDeadline: responseDeadline)
             try enforceResponseDeliveryDeadline(responseDeadline, framedByteCount: framed.count)
         } catch {
             // A cancelled partial frame cannot leave the connection reusable because its
@@ -786,6 +998,169 @@ public actor UnixSocketMCPTransport: Transport {
             }
         #endif
         mcpTransportLog("UnixSocketMCPTransport sent \(framed.count) bytes successfully")
+    }
+
+    private func sendExplicitNullRequestIDErrors(count: Int) async {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": NSNull(),
+            "error": [
+                "code": -32600,
+                "message": "Invalid Request"
+            ]
+        ]
+        guard let frame = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return
+        }
+        for _ in 0 ..< count {
+            do {
+                try await send(frame)
+            } catch {
+                logger.debug("Failed to write explicit-null JSON-RPC invalid-request error: \(error)")
+                return
+            }
+        }
+    }
+
+    /// Emits one standards-compliant server error per request accepted before the
+    /// watchdog sealed this connection. This runs after the watchdog's existing
+    /// cleanup grace expires and before `disconnect()` closes the socket. It makes
+    /// only immediate nonblocking writes: a backpressured or partial stream cannot
+    /// receive a further valid JSON-RPC frame and is closed instead.
+    func sendExecutionWatchdogTerminalErrors(
+        context: MCPExecutionWatchdogTerminalContext,
+        trailingControlFrame: Data? = nil
+    ) -> Int {
+        let requestIDs = executionWatchdogResponseLedger.sealAndTakeOutstandingRequestIDs()
+
+        var deliveredCount = 0
+        for requestID in requestIDs {
+            guard let frame = Self.executionWatchdogTerminalErrorFrame(
+                requestID: requestID,
+                context: context
+            ) else {
+                continue
+            }
+            do {
+                try writeExecutionWatchdogTerminalFrame(
+                    frame,
+                    terminalReason: context.reason,
+                    tracePhase: "watchdog_terminal_error_written"
+                )
+                deliveredCount += 1
+            } catch {
+                // A failed terminal write already transitions the socket to closed.
+                // Do not add another write or poll grace after the watchdog's
+                // completed cleanup window.
+                logger.debug("Failed to write watchdog terminal JSON-RPC error: \(error)")
+                break
+            }
+        }
+        if let trailingControlFrame,
+           isConnected
+        {
+            do {
+                // The CLI uses this existing control notification to retain
+                // watchdog provenance after it forwards the per-request errors.
+                try writeExecutionWatchdogTerminalFrame(
+                    trailingControlFrame,
+                    terminalReason: context.reason,
+                    tracePhase: "watchdog_terminate_notification_written"
+                )
+            } catch {
+                logger.debug("Failed to write watchdog terminate notification: \(error)")
+            }
+        }
+        return deliveredCount
+    }
+
+    private static func executionWatchdogTerminalErrorFrame(
+        requestID: JSONRPCBridgeID,
+        context: MCPExecutionWatchdogTerminalContext
+    ) -> Data? {
+        let id: Any
+        switch requestID {
+        case let .number(value):
+            id = value
+        case let .string(value):
+            id = value
+        case .null:
+            return nil
+        }
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": [
+                "code": MCPExecutionWatchdogTerminalContext.jsonRPCServerErrorCode,
+                "message": MCPExecutionWatchdogTerminalContext.message,
+                "data": [
+                    "reason": context.reason,
+                    "tool_name": context.toolName,
+                    "handler_phase": context.handlerPhase,
+                    "invocation_id": context.invocationID.uuidString
+                ]
+            ]
+        ]
+        guard var data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return nil
+        }
+        data.append(UInt8(ascii: "\n"))
+        return data
+    }
+
+    /// Writes one complete watchdog-terminal frame without waiting for POLLOUT. The
+    /// watchdog has already spent its configured cleanup grace, so a fresh write
+    /// stall allowance here would extend the caller-visible timeout.
+    private func writeExecutionWatchdogTerminalFrame(
+        _ frame: Data,
+        terminalReason: String,
+        tracePhase: String
+    ) throws {
+        guard isConnected, socketFD >= 0 else { throw MCPError.connectionClosed }
+        let fd = socketFD
+        let generation = fdGeneration
+        do {
+            try Self.ensureNonBlocking(fd: fd)
+            guard isConnected, fdGeneration == generation else {
+                throw MCPError.connectionClosed
+            }
+            let written = frame.withUnsafeBytes { bytes -> Int in
+                guard let baseAddress = bytes.baseAddress else { return -1 }
+                return Darwin.write(fd, baseAddress, frame.count)
+            }
+            guard written == frame.count else {
+                let error = MCPError.transportError(UnixSocketWriteStalledError(
+                    stallTimeout: 0,
+                    bytesRemaining: max(0, frame.count - max(0, written)),
+                    totalBytes: frame.count
+                ))
+                closeAfterSendFailure(error, cause: .writeFailure)
+                throw error
+            }
+        } catch {
+            if isConnected {
+                closeAfterSendFailure(error, cause: .writeFailure)
+            }
+            throw error
+        }
+        responseDeliveryGate.recordDeliveredServerFrame(frame)
+        lastActivityTime = Date()
+        if let timelineConnectionID {
+            MCPExportResponseDeliveryDeadlineRegistry.shared.completeServerFrame(
+                frame,
+                connectionID: timelineConnectionID,
+                connectionGeneration: timelineConnectionGeneration
+            )
+        }
+        MCPResponseDeliveryTracer.emitFrame(
+            layer: "app_uds_transport",
+            phase: tracePhase,
+            frame: frame,
+            direction: .serverToClient,
+            connectionID: timelineCorrelationConnectionID,
+            connectionGeneration: timelineConnectionGeneration,
+            terminalReason: terminalReason
+        )
     }
 
     /// Appends a newline delimiter if the message doesn't already end with one.
@@ -837,6 +1212,7 @@ public actor UnixSocketMCPTransport: Transport {
 
     private func prepareForConnectionAttempt() {
         responseDeliveryGate.reset()
+        executionWatchdogResponseLedger.reset()
         isStopping = false
         if streamFinished || closeSignaled {
             inboundChannel = InboundChannel(capacity: receiveBufferCapacity)
@@ -1165,7 +1541,7 @@ public actor UnixSocketMCPTransport: Transport {
     private func writeAll(
         _ data: Data,
         responseDeadline: MCPExportResponseDeliveryDeadlineRegistry.Deadline?
-    ) async throws {
+    ) throws {
         // Fast-fail if we're obviously disconnected
         guard isConnected, socketFD >= 0 else {
             throw MCPError.connectionClosed
@@ -1377,20 +1753,33 @@ public actor UnixSocketMCPTransport: Transport {
             logger: log,
             onFrame: { [weak self] frame in
                 guard let self else { return }
-                responseDeliveryGate.recordAcceptedClientFrame(frame)
+                let ingressValidation = MCPExplicitNullRequestIDIngressValidation.validate(frame)
+                if ingressValidation.rejectedRequestCount > 0 {
+                    Task {
+                        await self.sendExplicitNullRequestIDErrors(
+                            count: ingressValidation.rejectedRequestCount
+                        )
+                    }
+                }
+                guard let forwardedFrame = ingressValidation.forwardedFrame,
+                      executionWatchdogResponseLedger.recordAcceptedClientFrame(forwardedFrame)
+                else {
+                    return
+                }
+                responseDeliveryGate.recordAcceptedClientFrame(forwardedFrame)
                 let dispatchFrame: Data = if let timelineConnectionID {
                     MCPExportResponseDeliveryDeadlineRegistry.shared.recordAcceptedClientFrame(
-                        frame,
+                        forwardedFrame,
                         connectionID: timelineConnectionID,
                         connectionGeneration: timelineConnectionGeneration
                     )
                 } else {
-                    frame
+                    forwardedFrame
                 }
                 #if DEBUG
                     let recordedTimelineRequests: [MCPRequestTimelineRegistry.RecordedMessage] = if let timelineConnectionID {
                         MCPRequestTimelineRegistry.shared.recordAcceptedFrame(
-                            frame,
+                            forwardedFrame,
                             connectionID: timelineConnectionID,
                             correlationConnectionID: timelineCorrelationConnectionID ?? timelineConnectionID,
                             connectionGeneration: timelineConnectionGeneration
@@ -1417,14 +1806,14 @@ public actor UnixSocketMCPTransport: Transport {
                                     method: request.metadata.method,
                                     tool: request.metadata.tool,
                                     requestOrdinal: request.metadata.requestOrdinal,
-                                    framedByteCount: frame.count,
-                                    framedSHA256: MCPResponseDeliveryTracer.sha256Hex(frame),
+                                    framedByteCount: forwardedFrame.count,
+                                    framedSHA256: MCPResponseDeliveryTracer.sha256Hex(forwardedFrame),
                                     requestIdentity: request.identity
                                 ))
                             }
                         }
                     #endif
-                    mcpTransportLog("UnixSocketMCPTransport accepted message of \(frame.count) bytes")
+                    mcpTransportLog("UnixSocketMCPTransport accepted message of \(forwardedFrame.count) bytes")
                 case let .overflow(error):
                     mcpConnectionLog("UnixSocketMCPTransport receive buffer overflow; terminating connection")
                     let transport = self

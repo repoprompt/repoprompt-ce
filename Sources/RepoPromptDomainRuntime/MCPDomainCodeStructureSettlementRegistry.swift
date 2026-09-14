@@ -291,6 +291,19 @@ package final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         }
     }
 
+    /// Reports whether an already-released provider plus current blockers still
+    /// exhaust the bounded zombie capacity. This is observational only; leases
+    /// remain owned and transitioned by the existing admission/completion paths.
+    package func hasReleasedProviderLimitBlockage(windowID: Int) -> Bool {
+        lock.withLock {
+            let entries = entriesByWindowID[windowID, default: [:]]
+            let blockingCount = entries.values.count(where: \.blocksAdmission)
+            let releasedCount = entries.values.count(where: \.isReleased)
+            return blockingCount > 0
+                && releasedCount + blockingCount > Self.releasedProviderLimit
+        }
+    }
+
     package func awaitDrained(windowID: Int) async {
         await withCheckedContinuation { continuation in
             let shouldResume = lock.withLock {

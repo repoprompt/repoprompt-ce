@@ -5916,11 +5916,6 @@ actor WorkspaceFileContextStore {
                     preparation.token,
                     forKey: preparation.token.ownerID
                 )
-                invalidatePathMatchSnapshot(
-                    affectedRootKinds: [.sessionWorktree],
-                    reason: .rootLoad,
-                    affectedRootIDs: newlyPublishedRootIDs
-                )
                 return true
             }
         } ?? false
@@ -5935,6 +5930,15 @@ actor WorkspaceFileContextStore {
                 reason: .authorityUnstable
             )
         }
+
+        // The visibility assignment above is linearized by the recovery and authority
+        // permits. Invalidate the derived path cache synchronously afterward, before any
+        // actor suspension can expose subsequent work.
+        invalidatePathMatchSnapshot(
+            affectedRootKinds: [.sessionWorktree],
+            reason: .rootLoad,
+            affectedRootIDs: newlyPublishedRootIDs
+        )
 
         var previousResources = SessionWorktreeOwnershipRemoval()
         if let previousToken, previousToken != preparation.token {
