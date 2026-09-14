@@ -122,7 +122,7 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
                     let namespaceSalt = try namespaceSaltProvider(rootURL, identity)
                     return WorkspaceCodemapBindingEngine(
                         runtime: runtime,
-                        capabilityService: WorkspaceCodemapGitCapabilityService(
+                        capabilityService: WorkspaceCodemapRootCapabilityService(
                             namespaceSalt: namespaceSalt
                         ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),

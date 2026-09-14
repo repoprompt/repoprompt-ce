@@ -410,6 +410,16 @@ actor CodeMapRootManifestStore {
     }
 
     #if DEBUG
+        /// Writer-session bookkeeping for tests that must prove a root never registered one.
+        ///
+        /// From a fresh store with capacity available, any registration attempt succeeds and
+        /// advances the sequence, so an unchanged sequence together with no active sessions proves
+        /// no registration happened. Observe it before teardown as well: zero active sessions after
+        /// cleanup alone would also hold for a root that registered and then ended a session.
+        func debugWriterSessionState() -> (nextSequence: UInt64?, activeCount: Int) {
+            (nextWriterSessionSequence, activeWriterSessions.count)
+        }
+
         func debugPublicationMetrics(
             namespace: CodeMapRootManifestNamespace
         ) -> CodeMapRootManifestDebugPublicationMetrics {

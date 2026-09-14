@@ -6030,7 +6030,7 @@ final class MCPServerViewModel: ObservableObject {
             return DTO(code: "signature_pending", phase: "render_demand", path: pathByFileID[fileID], retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "Signature generation is still pending.")
         case let .unavailable(fileID, reason):
             let retryable = switch reason {
-            case .busy, .gitTransient, .staleCurrentness: true
+            case .busy, .rootTransient, .staleCurrentness: true
             default: false
             }
             return DTO(code: "signature_unavailable", phase: "render_demand", path: pathByFileID[fileID], retryable: retryable, retryAfterMilliseconds: retryable ? 100 : nil, attempted: nil, limit: nil, message: "A signature artifact is unavailable; graph data remains usable.")

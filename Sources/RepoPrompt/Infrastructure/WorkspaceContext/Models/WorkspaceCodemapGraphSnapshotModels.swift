@@ -10,7 +10,7 @@ struct WorkspaceCodemapGraphSnapshotReceipt: Hashable {
     let snapshotID: UUID
     let graphRevision: UInt64
     let rootEpoch: WorkspaceCodemapRootEpoch
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+    let rootAuthority: WorkspaceCodemapRootAuthorityToken
     let catalogWatermark: WorkspaceCodemapGraphIndexCatalogToken
     let appliedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
     let safetyCounter: UInt64
@@ -21,7 +21,7 @@ struct WorkspaceCodemapGraphSnapshotReceipt: Hashable {
         snapshotID: UUID,
         graphRevision: UInt64,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        rootAuthority: WorkspaceCodemapRootAuthorityToken,
         catalogWatermark: WorkspaceCodemapGraphIndexCatalogToken,
         appliedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
         safetyCounter: UInt64,
@@ -35,7 +35,7 @@ struct WorkspaceCodemapGraphSnapshotReceipt: Hashable {
         self.snapshotID = snapshotID
         self.graphRevision = graphRevision
         self.rootEpoch = rootEpoch
-        self.repositoryAuthority = repositoryAuthority
+        self.rootAuthority = rootAuthority
         self.catalogWatermark = catalogWatermark
         self.appliedGeneration = appliedGeneration
         self.safetyCounter = safetyCounter
@@ -57,7 +57,7 @@ enum WorkspaceCodemapGraphFenceReason: Hashable {
 
 enum WorkspaceCodemapGraphFenceRejection: Hashable {
     case rootEpochMismatch
-    case repositoryAuthorityMismatch
+    case rootAuthorityMismatch
     case emptyFileIDs
 }
 
@@ -69,7 +69,7 @@ enum WorkspaceCodemapGraphFenceDisposition: Hashable {
 
 enum WorkspaceCodemapGraphReceiptInvalidReason: Hashable {
     case rootEpochMismatch
-    case repositoryAuthorityMismatch
+    case rootAuthorityMismatch
     case schemaMismatch
     case policyMismatch
     case fencedFileOverlap

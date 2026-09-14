@@ -59,83 +59,157 @@ struct WorkspaceCodemapPathFingerprintClient {
     }
 }
 
+/// Mode-specific source evidence retained by an issued source-authority token.
+///
+/// Git keeps the repository coordinates and per-candidate attribute proof its locator, manifest and
+/// materialization paths already depend on. Filesystem sources have no Git fields and no attribute
+/// sentinel, so an accidental Git obligation cannot silently pass on a filesystem token.
+enum WorkspaceCodemapSourceAuthorityEvidence: Hashable {
+    case git(
+        repositoryRelativeLoadedRootPrefix: String,
+        standardizedRepositoryRelativePath: String,
+        candidateAttributeGeneration: String
+    )
+    case filesystem
+}
+
 struct WorkspaceCodemapSourceAuthorityToken: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
-    let repositoryRelativeLoadedRootPrefix: String
-    let standardizedRepositoryRelativePath: String
+    let rootAuthority: WorkspaceCodemapRootAuthorityToken
+    let standardizedLoadedRootPath: String
+    let candidateRootRelativePath: String
     let acceptedPrePathFingerprint: GitBlobLStatFingerprint
     let acceptedPostPathFingerprint: GitBlobLStatFingerprint
-    let candidateAttributeGeneration: String
+    let evidence: WorkspaceCodemapSourceAuthorityEvidence
     let pathGeneration: UInt64
     let ingressGeneration: UInt64
 
+    var gitAuthority: WorkspaceCodemapRepositoryAuthorityToken? {
+        rootAuthority.gitAuthority
+    }
+
+    var repositoryRelativeLoadedRootPrefix: String? {
+        guard case let .git(prefix, _, _) = evidence else { return nil }
+        return prefix
+    }
+
+    var standardizedRepositoryRelativePath: String? {
+        guard case let .git(_, path, _) = evidence else { return nil }
+        return path
+    }
+
+    var candidateAttributeGeneration: String? {
+        guard case let .git(_, _, generation) = evidence else { return nil }
+        return generation
+    }
+
     var isFactoryValidated: Bool {
-        acceptedPrePathFingerprint == acceptedPostPathFingerprint &&
-            acceptedPostPathFingerprint.isRegularFile &&
-            !candidateAttributeGeneration.isEmpty
+        guard acceptedPrePathFingerprint == acceptedPostPathFingerprint,
+              acceptedPostPathFingerprint.isRegularFile,
+              Self.standardizedAbsoluteRootPath(standardizedLoadedRootPath) == standardizedLoadedRootPath,
+              Self.standardizedSafeRelativePath(candidateRootRelativePath) == candidateRootRelativePath
+        else { return false }
+        switch (rootAuthority, evidence) {
+        case let (.git, .git(prefix, repositoryRelativePath, attributeGeneration)):
+            return !attributeGeneration.isEmpty &&
+                Self.standardizedPrefix(prefix) == prefix &&
+                Self.repositoryRelativePath(
+                    rootRelativePath: candidateRootRelativePath,
+                    prefix: prefix
+                ) == repositoryRelativePath
+        case (.filesystem, .filesystem):
+            return true
+        case (.git, .filesystem), (.filesystem, .git):
+            return false
+        }
     }
 
     private init(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
-        repositoryRelativeLoadedRootPrefix: String,
-        standardizedRepositoryRelativePath: String,
+        rootAuthority: WorkspaceCodemapRootAuthorityToken,
+        standardizedLoadedRootPath: String,
+        candidateRootRelativePath: String,
         acceptedPrePathFingerprint: GitBlobLStatFingerprint,
         acceptedPostPathFingerprint: GitBlobLStatFingerprint,
-        candidateAttributeGeneration: String,
+        evidence: WorkspaceCodemapSourceAuthorityEvidence,
         pathGeneration: UInt64,
         ingressGeneration: UInt64
     ) {
         self.rootEpoch = rootEpoch
-        self.repositoryAuthority = repositoryAuthority
-        self.repositoryRelativeLoadedRootPrefix = repositoryRelativeLoadedRootPrefix
-        self.standardizedRepositoryRelativePath = standardizedRepositoryRelativePath
+        self.rootAuthority = rootAuthority
+        self.standardizedLoadedRootPath = standardizedLoadedRootPath
+        self.candidateRootRelativePath = candidateRootRelativePath
         self.acceptedPrePathFingerprint = acceptedPrePathFingerprint
         self.acceptedPostPathFingerprint = acceptedPostPathFingerprint
-        self.candidateAttributeGeneration = candidateAttributeGeneration
+        self.evidence = evidence
         self.pathGeneration = pathGeneration
         self.ingressGeneration = ingressGeneration
     }
 
     fileprivate static func issue(
-        capability: GitCodemapRootCapability,
+        capability: WorkspaceCodemapRootCapability,
         observedRootEpoch: WorkspaceCodemapRootEpoch,
-        observedRepositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
-        candidateRepositoryRelativePath: String,
+        observedRootAuthority: WorkspaceCodemapRootAuthorityToken,
+        standardizedLoadedRootPath: String,
+        candidateRootRelativePath: String,
         acceptedPrePathFingerprint: GitBlobLStatFingerprint,
         acceptedPostPathFingerprint: GitBlobLStatFingerprint,
-        candidateAttributeGeneration: String,
+        candidateAttributeGeneration: String?,
         observedPathGeneration: UInt64,
         currentPathGeneration: UInt64,
         observedIngressGeneration: UInt64,
         currentIngressGeneration: UInt64
     ) -> WorkspaceCodemapSourceAuthorityToken? {
         guard capability.rootEpoch == observedRootEpoch,
-              capability.repositoryAuthority == observedRepositoryAuthority,
-              capability.repositoryNamespace == capability.repositoryAuthority.repositoryNamespace,
-              capability.objectFormat == capability.repositoryAuthority.objectFormat,
+              capability.rootAuthority == observedRootAuthority,
               acceptedPrePathFingerprint == acceptedPostPathFingerprint,
               acceptedPostPathFingerprint.isRegularFile,
               observedPathGeneration == currentPathGeneration,
               observedIngressGeneration == currentIngressGeneration,
-              !candidateAttributeGeneration.isEmpty,
-              let path = standardizedSafeRelativePath(candidateRepositoryRelativePath),
-              let prefix = standardizedPrefix(capability.repositoryRelativeLoadedRootPrefix),
-              isCandidate(path, insideLoadedRootPrefix: prefix)
+              let rootPath = standardizedAbsoluteRootPath(standardizedLoadedRootPath),
+              rootPath == capability.loadedRootURL.path,
+              let rootRelativePath = standardizedSafeRelativePath(candidateRootRelativePath)
         else { return nil }
+
+        let evidence: WorkspaceCodemapSourceAuthorityEvidence
+        switch capability {
+        case let .git(gitCapability):
+            guard gitCapability.repositoryNamespace == gitCapability.repositoryAuthority.repositoryNamespace,
+                  gitCapability.objectFormat == gitCapability.repositoryAuthority.objectFormat,
+                  let attributeGeneration = candidateAttributeGeneration,
+                  !attributeGeneration.isEmpty,
+                  let prefix = standardizedPrefix(gitCapability.repositoryRelativeLoadedRootPrefix),
+                  let repositoryRelativePath = repositoryRelativePath(
+                      rootRelativePath: rootRelativePath,
+                      prefix: prefix
+                  )
+            else { return nil }
+            evidence = .git(
+                repositoryRelativeLoadedRootPrefix: prefix,
+                standardizedRepositoryRelativePath: repositoryRelativePath,
+                candidateAttributeGeneration: attributeGeneration
+            )
+        case .filesystem:
+            guard candidateAttributeGeneration == nil else { return nil }
+            evidence = .filesystem
+        }
 
         return WorkspaceCodemapSourceAuthorityToken(
             rootEpoch: observedRootEpoch,
-            repositoryAuthority: observedRepositoryAuthority,
-            repositoryRelativeLoadedRootPrefix: prefix,
-            standardizedRepositoryRelativePath: path,
+            rootAuthority: observedRootAuthority,
+            standardizedLoadedRootPath: rootPath,
+            candidateRootRelativePath: rootRelativePath,
             acceptedPrePathFingerprint: acceptedPrePathFingerprint,
             acceptedPostPathFingerprint: acceptedPostPathFingerprint,
-            candidateAttributeGeneration: candidateAttributeGeneration,
+            evidence: evidence,
             pathGeneration: observedPathGeneration,
             ingressGeneration: observedIngressGeneration
         )
+    }
+
+    private static func standardizedAbsoluteRootPath(_ path: String) -> String? {
+        guard path.hasPrefix("/"), !StandardizedPath.containsNUL(path) else { return nil }
+        return StandardizedPath.absolute(path)
     }
 
     private static func standardizedSafeRelativePath(_ path: String) -> String? {
@@ -150,14 +224,48 @@ struct WorkspaceCodemapSourceAuthorityToken: Hashable {
         return standardizedSafeRelativePath(prefix)
     }
 
-    private static func isCandidate(_ path: String, insideLoadedRootPrefix prefix: String) -> Bool {
-        guard !prefix.isEmpty else { return true }
-        return path.hasPrefix(prefix + "/")
+    /// Git is the only mode with repository coordinates, so translation stays confined here.
+    fileprivate static func repositoryRelativePath(
+        rootRelativePath: String,
+        prefix: String
+    ) -> String? {
+        guard let path = standardizedSafeRelativePath(rootRelativePath) else { return nil }
+        guard !prefix.isEmpty else { return path }
+        guard let standardizedPrefix = standardizedPrefix(prefix) else { return nil }
+        return standardizedSafeRelativePath(standardizedPrefix + "/" + path)
+    }
+}
+
+/// Process-free classification evidence for one filesystem root.
+///
+/// Only `WorkspaceCodemapRootCapabilityService.filesystemClassificationEvidence(for:)` can build
+/// this value: the initializer is file-private, so no caller outside the capability actor can
+/// manufacture permission to classify without a Git process. The classifier re-observes the proof
+/// before and after it works, and fails closed rather than falling back to Git discovery.
+struct WorkspaceCodemapFilesystemClassificationEvidence {
+    let capability: WorkspaceCodemapFilesystemRootCapability
+    let proof: WorkspaceCodemapNonGitFilesystemProof
+    private let classificationProbe: WorkspaceCodemapLocalGitClassificationProbe
+
+    fileprivate init(
+        capability: WorkspaceCodemapFilesystemRootCapability,
+        proof: WorkspaceCodemapNonGitFilesystemProof,
+        classificationProbe: WorkspaceCodemapLocalGitClassificationProbe
+    ) {
+        self.capability = capability
+        self.proof = proof
+        self.classificationProbe = classificationProbe
+    }
+
+    /// Re-observes the retained proof. Returns the fresh proof only while the same semantic
+    /// binding still holds; a changed binding or lost proof yields nil.
+    func currentProof() -> WorkspaceCodemapNonGitFilesystemProof? {
+        classificationProbe.refresh(proof).currentProof
     }
 }
 
 struct WorkspaceCodemapSourceAuthorityRequest: Hashable {
-    let candidateRepositoryRelativePath: String
+    let candidateRootRelativePath: String
     let observedPathGeneration: UInt64
     let currentPathGeneration: UInt64
     let observedIngressGeneration: UInt64
@@ -182,11 +290,11 @@ enum WorkspaceCodemapSourceAuthorityRejection: Equatable {
     case cancelled
     case captureFailed(
         phase: CapturePhase,
-        reason: WorkspaceCodemapGitTransientUnavailableReason
+        reason: WorkspaceCodemapRootTransientUnavailableReason
     )
 }
 
-struct WorkspaceCodemapGitCapabilityServiceHooks {
+struct WorkspaceCodemapRootCapabilityServiceHooks {
     var beforeResolution: @Sendable () async -> Void
     var afterFirstAuthorityCapture: @Sendable () async -> Void
     var afterSourcePathFingerprintCapture: @Sendable () async -> Void
@@ -207,10 +315,10 @@ struct WorkspaceCodemapGitCapabilityServiceHooks {
         self.sourceAuthorityRejected = sourceAuthorityRejected
     }
 
-    static let none = WorkspaceCodemapGitCapabilityServiceHooks()
+    static let none = WorkspaceCodemapRootCapabilityServiceHooks()
 }
 
-actor WorkspaceCodemapGitCapabilityService {
+actor WorkspaceCodemapRootCapabilityService {
     #if DEBUG
         struct Snapshot: Equatable {
             let activeRecordCount: Int
@@ -271,10 +379,13 @@ actor WorkspaceCodemapGitCapabilityService {
     }
 
     private struct RootRecord {
-        var state: WorkspaceCodemapGitCapabilityState = .unresolved
+        var state: WorkspaceCodemapRootCapabilityState = .unresolved
         var resolutionGeneration: UInt64 = 0
         var authorityGeneration: UInt64 = 0
         var stableAuthority: StableAuthority?
+        /// Full filesystem proof behind a filesystem capability. It stays private to the actor and
+        /// never enters capability or token equality; only the compact generation does.
+        var filesystemProof: WorkspaceCodemapNonGitFilesystemProof?
         var binding: RootBinding
         var retainedWorkTreeRoot: URL?
         var retainedGitDirectory: URL?
@@ -283,32 +394,39 @@ actor WorkspaceCodemapGitCapabilityService {
     private struct RootFlight {
         let id: UUID
         let resolutionGeneration: UInt64
-        let priorState: WorkspaceCodemapGitCapabilityState
+        let priorState: WorkspaceCodemapRootCapabilityState
         let task: Task<Resolution, Never>
-        var waiters: [UUID: CheckedContinuation<WorkspaceCodemapGitCapabilityState, Never>]
+        var waiters: [UUID: CheckedContinuation<WorkspaceCodemapRootCapabilityState, Never>]
     }
 
     private struct HistoricalRecord {
         let binding: RootBinding
-        let finalState: WorkspaceCodemapGitCapabilityState
+        let finalState: WorkspaceCodemapRootCapabilityState
         let releaseOrdinal: UInt64
     }
 
+    private struct RetainedReplacementState {
+        var authorityGeneration: UInt64
+        var binding: RootBinding
+    }
+
     private enum Resolution {
-        case eligible(
+        case eligibleGit(
             layout: GitRepositoryLayout,
             prefix: String,
             repositoryIdentity: GitWorktreeRepositoryIdentity,
             worktreeID: String,
             authority: StableAuthority
         )
-        case terminal(WorkspaceCodemapGitTerminalUnavailableReason)
-        case transient(WorkspaceCodemapGitTransientUnavailableReason)
+        case eligibleFilesystem(WorkspaceCodemapNonGitFilesystemProof)
+        case terminal(WorkspaceCodemapRootTerminalUnavailableReason)
+        case transient(WorkspaceCodemapRootTransientUnavailableReason)
     }
 
     private let gitService: GitService
     private let namespaceSalt: Data
-    private let hooks: WorkspaceCodemapGitCapabilityServiceHooks
+    private let hooks: WorkspaceCodemapRootCapabilityServiceHooks
+    private let localClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe
     private let pathFingerprintClient: WorkspaceCodemapPathFingerprintClient
     private let historicalRecordLimit: Int
     private var records: [WorkspaceCodemapRootEpoch: RootRecord] = [:]
@@ -316,6 +434,15 @@ actor WorkspaceCodemapGitCapabilityService {
     private var resolutionObservers: [UUID: Task<Void, Never>] = [:]
     private var rootEpochByWaiterID: [UUID: WorkspaceCodemapRootEpoch] = [:]
     private var historicalRecords: [WorkspaceCodemapRootEpoch: HistoricalRecord] = [:]
+    /// State preserved across non-tombstoning authority replacement, keyed by root epoch.
+    ///
+    /// `invalidateForAuthorityReplacement` deletes the root record, so the record-local counter
+    /// alone would restart at 1 and let a replacement authority collide with a revoked one. This
+    /// keeps generations strictly increasing for one root lifetime, including a filesystem → Git →
+    /// filesystem sequence. It also retains the removed record's binding so a `release` arriving
+    /// inside the replacement gap can still terminalize the epoch. Terminal `release` clears it,
+    /// because that ends the lifetime.
+    private var retainedReplacementStatesByRootEpoch: [WorkspaceCodemapRootEpoch: RetainedReplacementState] = [:]
     private var releaseOrdinal: UInt64 = 0
     #if DEBUG
         private var authorityCaptureCount: UInt64 = 0
@@ -324,7 +451,8 @@ actor WorkspaceCodemapGitCapabilityService {
     init(
         gitService: GitService = GitService(),
         namespaceSalt: Data,
-        hooks: WorkspaceCodemapGitCapabilityServiceHooks = .none,
+        hooks: WorkspaceCodemapRootCapabilityServiceHooks = .none,
+        localClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
         pathFingerprintClient: WorkspaceCodemapPathFingerprintClient = .noFollow,
         historicalRecordLimit: Int = 64
     ) {
@@ -332,6 +460,7 @@ actor WorkspaceCodemapGitCapabilityService {
         self.gitService = gitService
         self.namespaceSalt = namespaceSalt
         self.hooks = hooks
+        self.localClassificationProbe = localClassificationProbe
         self.pathFingerprintClient = pathFingerprintClient
         self.historicalRecordLimit = historicalRecordLimit
     }
@@ -372,7 +501,7 @@ actor WorkspaceCodemapGitCapabilityService {
         }
     }
 
-    func state(for rootEpoch: WorkspaceCodemapRootEpoch) -> WorkspaceCodemapGitCapabilityState {
+    func state(for rootEpoch: WorkspaceCodemapRootEpoch) -> WorkspaceCodemapRootCapabilityState {
         if let state = records[rootEpoch]?.state { return state }
         if historicalRecords[rootEpoch] != nil { return .terminalUnavailable(.releasedRootEpoch) }
         return .unresolved
@@ -380,12 +509,18 @@ actor WorkspaceCodemapGitCapabilityService {
 
     @discardableResult
     func resolve(
-        root request: WorkspaceCodemapGitCapabilityRequest
-    ) async -> WorkspaceCodemapGitCapabilityState {
+        root request: WorkspaceCodemapRootCapabilityRequest,
+        evidence: WorkspaceCodemapRootEligibilityEvidence? = nil
+    ) async -> WorkspaceCodemapRootCapabilityState {
         let waiterID = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                enqueue(waiterID: waiterID, request: request, continuation: continuation)
+                enqueue(
+                    waiterID: waiterID,
+                    request: request,
+                    evidence: evidence,
+                    continuation: continuation
+                )
             }
         } onCancel: {
             Task { await self.cancelWaiter(id: waiterID) }
@@ -394,8 +529,9 @@ actor WorkspaceCodemapGitCapabilityService {
 
     @discardableResult
     func reload(
-        root request: WorkspaceCodemapGitCapabilityRequest
-    ) async -> WorkspaceCodemapGitCapabilityState {
+        root request: WorkspaceCodemapRootCapabilityRequest,
+        evidence: WorkspaceCodemapRootEligibilityEvidence? = nil
+    ) async -> WorkspaceCodemapRootCapabilityState {
         guard historicalRecords[request.rootEpoch] == nil else {
             return .terminalUnavailable(.releasedRootEpoch)
         }
@@ -410,21 +546,29 @@ actor WorkspaceCodemapGitCapabilityService {
                 records[request.rootEpoch] = record
             }
         }
-        return await resolve(root: request)
+        return await resolve(root: request, evidence: evidence)
     }
 
     @discardableResult
     func retarget(
         from oldRootEpoch: WorkspaceCodemapRootEpoch,
-        to request: WorkspaceCodemapGitCapabilityRequest
-    ) async -> WorkspaceCodemapGitCapabilityState {
+        to request: WorkspaceCodemapRootCapabilityRequest,
+        evidence: WorkspaceCodemapRootEligibilityEvidence? = nil
+    ) async -> WorkspaceCodemapRootCapabilityState {
         await release(rootEpoch: oldRootEpoch)
-        return await resolve(root: request)
+        return await resolve(root: request, evidence: evidence)
     }
 
     func invalidateForAuthorityReplacement(rootEpoch: WorkspaceCodemapRootEpoch) async {
         cancelFlight(for: rootEpoch, restoring: .unresolved)
         guard let record = records.removeValue(forKey: rootEpoch) else { return }
+        retainedReplacementStatesByRootEpoch[rootEpoch] = RetainedReplacementState(
+            authorityGeneration: max(
+                retainedReplacementStatesByRootEpoch[rootEpoch]?.authorityGeneration ?? 0,
+                record.authorityGeneration
+            ),
+            binding: record.binding
+        )
         if let workTreeRoot = record.retainedWorkTreeRoot,
            let gitDirectory = record.retainedGitDirectory
         {
@@ -437,7 +581,24 @@ actor WorkspaceCodemapGitCapabilityService {
 
     func release(rootEpoch: WorkspaceCodemapRootEpoch) async {
         cancelFlight(for: rootEpoch, restoring: .unresolved)
-        guard let record = records.removeValue(forKey: rootEpoch) else { return }
+        // A root released after authority replacement may have no record left, but its retained
+        // generation must still be dropped: the next lifetime uses a different root epoch.
+        let retained = retainedReplacementStatesByRootEpoch.removeValue(forKey: rootEpoch)
+        guard let record = records.removeValue(forKey: rootEpoch) else {
+            // Released inside the replacement gap. Dropping the retained generation without
+            // recording the release would leave this epoch with neither a tombstone nor a
+            // high-water mark, so a delayed resolve could reissue an authority that was already
+            // revoked in this same lifetime. Terminalize it here instead.
+            guard let retained, historicalRecords[rootEpoch] == nil else { return }
+            releaseOrdinal &+= 1
+            historicalRecords[rootEpoch] = HistoricalRecord(
+                binding: retained.binding,
+                finalState: .unresolved,
+                releaseOrdinal: releaseOrdinal
+            )
+            evictReleasedHistoryIfNeeded()
+            return
+        }
         releaseOrdinal &+= 1
         historicalRecords[rootEpoch] = HistoricalRecord(
             binding: record.binding,
@@ -479,8 +640,9 @@ actor WorkspaceCodemapGitCapabilityService {
 
     private func enqueue(
         waiterID: UUID,
-        request: WorkspaceCodemapGitCapabilityRequest,
-        continuation: CheckedContinuation<WorkspaceCodemapGitCapabilityState, Never>
+        request: WorkspaceCodemapRootCapabilityRequest,
+        evidence: WorkspaceCodemapRootEligibilityEvidence?,
+        continuation: CheckedContinuation<WorkspaceCodemapRootCapabilityState, Never>
     ) {
         if Task.isCancelled {
             continuation.resume(returning: state(for: request.rootEpoch))
@@ -493,6 +655,8 @@ actor WorkspaceCodemapGitCapabilityService {
 
         let loadedRootPath = request.loadedRootURL.path
         var record = records[request.rootEpoch] ?? RootRecord(
+            authorityGeneration: retainedReplacementStatesByRootEpoch[request.rootEpoch]?
+                .authorityGeneration ?? 0,
             binding: RootBinding(
                 standardizedLoadedRootPath: loadedRootPath,
                 repositoryID: nil,
@@ -526,7 +690,7 @@ actor WorkspaceCodemapGitCapabilityService {
             guard let self else { return Resolution.transient(.runtimeUnavailable) }
             await hooks.beforeResolution()
             if Task.isCancelled { return .transient(.runtimeUnavailable) }
-            return await resolveCandidate(loadedRootURL: loadedRootURL)
+            return await resolveCandidate(loadedRootURL: loadedRootURL, evidence: evidence)
         }
         flights[request.rootEpoch] = RootFlight(
             id: flightID,
@@ -583,7 +747,7 @@ actor WorkspaceCodemapGitCapabilityService {
               case .resolving(generation: flight.resolutionGeneration) = record.state
         else { return }
 
-        if case let .eligible(layout, _, _, _, _) = resolution,
+        if case let .eligibleGit(layout, _, _, _, _) = resolution,
            record.retainedWorkTreeRoot == nil
         {
             await gitService.retainRepositoryLayout(layout)
@@ -607,7 +771,47 @@ actor WorkspaceCodemapGitCapabilityService {
         }
 
         switch resolution {
-        case let .eligible(layout, prefix, repositoryIdentity, worktreeID, authority):
+        case let .eligibleFilesystem(proof):
+            // A filesystem root that previously bound to a Git repository, or to a different
+            // filesystem object, is a binding change: revoke rather than silently continue.
+            if record.binding.repositoryID != nil ||
+                proof.requestedRootPath != record.binding.standardizedLoadedRootPath
+            {
+                record.state = .terminalUnavailable(.rootEpochBindingMismatch)
+                break
+            }
+            let sameSemanticBinding = record.filesystemProof.map {
+                WorkspaceCodemapLocalGitClassificationProbe.proofHasSameTopology($0, proof)
+            } ?? false
+            record.filesystemProof = proof
+            record.stableAuthority = nil
+            if !sameSemanticBinding {
+                let (advanced, overflow) = record.authorityGeneration.addingReportingOverflow(1)
+                guard !overflow else {
+                    record.state = .transientUnavailable(
+                        reason: .runtimeUnavailable,
+                        retryGeneration: flight.resolutionGeneration &+ 1
+                    )
+                    records[rootEpoch] = record
+                    for continuation in flight.waiters.values {
+                        continuation.resume(returning: record.state)
+                    }
+                    return
+                }
+                record.authorityGeneration = advanced
+            }
+            record.state = .eligible(
+                .filesystem(WorkspaceCodemapFilesystemRootCapability(
+                    rootEpoch: rootEpoch,
+                    loadedRootURL: URL(
+                        fileURLWithPath: record.binding.standardizedLoadedRootPath,
+                        isDirectory: true
+                    ),
+                    authorityGeneration: record.authorityGeneration
+                ))
+            )
+        case let .eligibleGit(layout, prefix, repositoryIdentity, worktreeID, authority):
+            record.filesystemProof = nil
             if let repositoryID = record.binding.repositoryID,
                repositoryID != repositoryIdentity.repositoryID ||
                record.binding.worktreeID != worktreeID ||
@@ -619,8 +823,21 @@ actor WorkspaceCodemapGitCapabilityService {
                 record.binding.repositoryID = repositoryIdentity.repositoryID
                 record.binding.worktreeID = worktreeID
                 if record.stableAuthority != authority {
-                    record.authorityGeneration &+= 1
-                    if record.authorityGeneration == 0 { record.authorityGeneration = 1 }
+                    let (advanced, overflow) = record.authorityGeneration.addingReportingOverflow(1)
+                    guard !overflow else {
+                        // Generations must never repeat within one root lifetime; wrapping would
+                        // let a revoked authority be mistaken for a current one.
+                        record.state = .transientUnavailable(
+                            reason: .runtimeUnavailable,
+                            retryGeneration: flight.resolutionGeneration &+ 1
+                        )
+                        records[rootEpoch] = record
+                        for continuation in flight.waiters.values {
+                            continuation.resume(returning: record.state)
+                        }
+                        return
+                    }
+                    record.authorityGeneration = advanced
                     record.stableAuthority = authority
                 }
                 let token = WorkspaceCodemapRepositoryAuthorityToken(
@@ -637,7 +854,7 @@ actor WorkspaceCodemapGitCapabilityService {
                     metadataGeneration: authority.metadataGeneration
                 )
                 record.state = .eligible(
-                    GitCodemapRootCapability(
+                    .git(GitCodemapRootCapability(
                         rootEpoch: rootEpoch,
                         repositoryLayout: layout,
                         repositoryIdentity: repositoryIdentity,
@@ -646,7 +863,7 @@ actor WorkspaceCodemapGitCapabilityService {
                         objectFormat: authority.objectFormat,
                         repositoryRelativeLoadedRootPrefix: prefix,
                         repositoryAuthority: token
-                    )
+                    ))
                 )
             }
         case let .terminal(reason):
@@ -674,7 +891,7 @@ actor WorkspaceCodemapGitCapabilityService {
 
     private func cancelFlight(
         for rootEpoch: WorkspaceCodemapRootEpoch,
-        restoring state: WorkspaceCodemapGitCapabilityState
+        restoring state: WorkspaceCodemapRootCapabilityState
     ) {
         guard let flight = flights.removeValue(forKey: rootEpoch) else { return }
         flight.task.cancel()
@@ -689,21 +906,85 @@ actor WorkspaceCodemapGitCapabilityService {
               let oldest = historicalRecords.min(by: { $0.value.releaseOrdinal < $1.value.releaseOrdinal })
         {
             historicalRecords.removeValue(forKey: oldest.key)
+            retainedReplacementStatesByRootEpoch.removeValue(forKey: oldest.key)
+        }
+        // Replacement generations only matter while a root epoch can still be re-registered.
+        retainedReplacementStatesByRootEpoch = retainedReplacementStatesByRootEpoch.filter {
+            records[$0.key] != nil || historicalRecords[$0.key] == nil
         }
     }
 
     private static func restorableState(
-        _ state: WorkspaceCodemapGitCapabilityState
-    ) -> WorkspaceCodemapGitCapabilityState {
+        _ state: WorkspaceCodemapRootCapabilityState
+    ) -> WorkspaceCodemapRootCapabilityState {
         if case .resolving = state { return .unresolved }
         return state
     }
 
+    /// Re-checks that an issued capability still describes the current root, without reading any
+    /// source bytes. Git keeps its existing per-demand checks and does no new Git discovery here.
+    func revalidateRootAuthority(
+        capability: WorkspaceCodemapRootCapability
+    ) async -> WorkspaceCodemapRootAuthorityValidation {
+        guard let record = records[capability.rootEpoch],
+              case let .eligible(activeCapability) = record.state,
+              activeCapability == capability
+        else { return .changed }
+        switch capability {
+        case .git:
+            return .current
+        case .filesystem:
+            guard let proof = record.filesystemProof else { return .changed }
+            switch localClassificationProbe.refresh(proof) {
+            case let .current(currentProof):
+                guard Self.filesystemRootAccessProof(currentProof) == .valid else {
+                    return .unavailable(.permissionFailure)
+                }
+                // Witness churn with the same semantic binding refreshes the proof only; the
+                // capability, its generation and every graph contribution stay current.
+                records[capability.rootEpoch]?.filesystemProof = currentProof
+                return .current
+            case .bindingChanged:
+                return .changed
+            case .requiresGitPreflight:
+                // Fresh positive Git or bare evidence: leave filesystem mode through the normal
+                // replacement path rather than continuing on the old proof.
+                return .changed
+            case .unavailable:
+                // The proof could not be observed at all — typically a lost search permission on
+                // the root or an ancestor. That is not evidence that the binding or source mode
+                // changed, so serving stops transiently while the authority and its generation
+                // stay put; restoring access refreshes the proof without advancing anything.
+                return .unavailable(.permissionFailure)
+            }
+        }
+    }
+
+    /// Issues process-free classification evidence for an active filesystem root.
+    func filesystemClassificationEvidence(
+        for capability: WorkspaceCodemapRootCapability
+    ) async -> WorkspaceCodemapFilesystemClassificationEvidence? {
+        guard case let .filesystem(filesystemCapability) = capability,
+              let record = records[capability.rootEpoch],
+              case let .eligible(activeCapability) = record.state,
+              activeCapability == capability,
+              let proof = record.filesystemProof,
+              case let .current(currentProof) = localClassificationProbe.refresh(proof),
+              Self.filesystemRootAccessProof(currentProof) == .valid
+        else { return nil }
+        records[capability.rootEpoch]?.filesystemProof = currentProof
+        return WorkspaceCodemapFilesystemClassificationEvidence(
+            capability: filesystemCapability,
+            proof: currentProof,
+            classificationProbe: localClassificationProbe
+        )
+    }
+
     func makeSourceAuthority(
-        capability: GitCodemapRootCapability,
+        capability: WorkspaceCodemapRootCapability,
         observedRootEpoch: WorkspaceCodemapRootEpoch,
-        observedRepositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
-        candidateRepositoryRelativePath: String,
+        observedRootAuthority: WorkspaceCodemapRootAuthorityToken,
+        candidateRootRelativePath: String,
         observedPathGeneration: UInt64,
         currentPathGeneration: UInt64,
         observedIngressGeneration: UInt64,
@@ -712,9 +993,9 @@ actor WorkspaceCodemapGitCapabilityService {
         let authorities = await makeSourceAuthorities(
             capability: capability,
             observedRootEpoch: observedRootEpoch,
-            observedRepositoryAuthority: observedRepositoryAuthority,
+            observedRootAuthority: observedRootAuthority,
             candidates: [WorkspaceCodemapSourceAuthorityRequest(
-                candidateRepositoryRelativePath: candidateRepositoryRelativePath,
+                candidateRootRelativePath: candidateRootRelativePath,
                 observedPathGeneration: observedPathGeneration,
                 currentPathGeneration: currentPathGeneration,
                 observedIngressGeneration: observedIngressGeneration,
@@ -728,9 +1009,9 @@ actor WorkspaceCodemapGitCapabilityService {
     /// repository-authority window. Root evidence is captured exactly twice; no-follow path
     /// fingerprints and nested attribute evidence remain candidate-local and fail closed.
     func makeSourceAuthorities(
-        capability: GitCodemapRootCapability,
+        capability: WorkspaceCodemapRootCapability,
         observedRootEpoch: WorkspaceCodemapRootEpoch,
-        observedRepositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        observedRootAuthority: WorkspaceCodemapRootAuthorityToken,
         candidates: [WorkspaceCodemapSourceAuthorityRequest]
     ) async -> [WorkspaceCodemapSourceAuthorityToken?] {
         guard !candidates.isEmpty else { return [] }
@@ -743,14 +1024,31 @@ actor WorkspaceCodemapGitCapabilityService {
               case let .eligible(activeCapability) = record.state,
               activeCapability == capability,
               capability.rootEpoch == observedRootEpoch,
-              capability.repositoryAuthority == observedRepositoryAuthority,
-              let stableAuthority = record.stableAuthority
+              capability.rootAuthority == observedRootAuthority
         else {
             hooks.sourceAuthorityRejected(Task.isCancelled ? .cancelled : .requestUnavailable)
             return unavailable
         }
+        if case .filesystem = capability {
+            return await makeFilesystemSourceAuthorities(
+                capability: capability,
+                record: record,
+                observedRootEpoch: observedRootEpoch,
+                observedRootAuthority: observedRootAuthority,
+                candidates: candidates,
+                unavailable: unavailable
+            )
+        }
+        guard case let .git(gitCapability) = capability,
+              let stableAuthority = record.stableAuthority
+        else {
+            hooks.sourceAuthorityRejected(.requestUnavailable)
+            return unavailable
+        }
 
-        let loadedRoot = URL(fileURLWithPath: record.binding.standardizedLoadedRootPath)
+        let standardizedLoadedRootPath = record.binding.standardizedLoadedRootPath
+        let loadedRoot = URL(fileURLWithPath: standardizedLoadedRootPath)
+        var candidateRootPaths = [String?](repeating: nil, count: candidates.count)
         var candidatePaths = [String?](repeating: nil, count: candidates.count)
         var prePathFingerprints = [GitBlobLStatFingerprint?](
             repeating: nil,
@@ -764,11 +1062,15 @@ actor WorkspaceCodemapGitCapabilityService {
                 let candidate = candidates[index]
                 guard candidate.observedPathGeneration == candidate.currentPathGeneration,
                       candidate.observedIngressGeneration == candidate.currentIngressGeneration,
-                      let path = Self.safeRepositoryRelativePath(
-                          candidate.candidateRepositoryRelativePath
+                      let rootRelativePath = Self.safeRepositoryRelativePath(
+                          candidate.candidateRootRelativePath
+                      ),
+                      let path = WorkspaceCodemapSourceAuthorityToken.repositoryRelativePath(
+                          rootRelativePath: rootRelativePath,
+                          prefix: gitCapability.repositoryRelativeLoadedRootPrefix
                       ), Self.isCandidate(
                           path,
-                          insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
+                          insideLoadedRootPrefix: gitCapability.repositoryRelativeLoadedRootPrefix
                       )
                 else {
                     hooks.sourceAuthorityRejected(.candidateRequestRejected(index: index))
@@ -776,13 +1078,14 @@ actor WorkspaceCodemapGitCapabilityService {
                 }
                 do {
                     let fingerprint = try pathFingerprintClient.fingerprint(
-                        capability.repositoryLayout.workTreeRoot,
+                        gitCapability.repositoryLayout.workTreeRoot,
                         path
                     )
                     guard fingerprint.isRegularFile else {
                         hooks.sourceAuthorityRejected(.candidateFingerprintUnavailable(index: index))
                         continue
                     }
+                    candidateRootPaths[index] = rootRelativePath
                     candidatePaths[index] = path
                     prePathFingerprints[index] = fingerprint
                     await hooks.afterSourcePathFingerprintCapture()
@@ -795,8 +1098,8 @@ actor WorkspaceCodemapGitCapabilityService {
 
             let preRepository = try await captureAuthority(
                 loadedRoot: loadedRoot,
-                expectedLayout: capability.repositoryLayout,
-                prefix: capability.repositoryRelativeLoadedRootPrefix
+                expectedLayout: gitCapability.repositoryLayout,
+                prefix: gitCapability.repositoryRelativeLoadedRootPrefix
             )
             guard preRepository.stableAuthority.matchesSourceAuthorityStability(of: stableAuthority) else {
                 hooks.sourceAuthorityRejected(.registrationAuthorityChanged)
@@ -810,13 +1113,14 @@ actor WorkspaceCodemapGitCapabilityService {
                 do {
                     preAttributeGenerations[index] = try digestEvidence(
                         urls: Self.candidateAttributeURLs(
-                            layout: capability.repositoryLayout,
+                            layout: gitCapability.repositoryLayout,
                             candidateRepositoryRelativePath: path
                         ),
                         includeBoundedContents: true
                     )
                 } catch {
                     hooks.sourceAuthorityRejected(.candidateAttributesChanged(index: index))
+                    candidateRootPaths[index] = nil
                     candidatePaths[index] = nil
                     prePathFingerprints[index] = nil
                 }
@@ -831,7 +1135,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 do {
                     let postAttributes = try digestEvidence(
                         urls: Self.candidateAttributeURLs(
-                            layout: capability.repositoryLayout,
+                            layout: gitCapability.repositoryLayout,
                             candidateRepositoryRelativePath: path
                         ),
                         includeBoundedContents: true
@@ -858,7 +1162,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 else { continue }
                 do {
                     let postPathFingerprint = try pathFingerprintClient.fingerprint(
-                        capability.repositoryLayout.workTreeRoot,
+                        gitCapability.repositoryLayout.workTreeRoot,
                         path
                     )
                     #if DEBUG
@@ -881,8 +1185,8 @@ actor WorkspaceCodemapGitCapabilityService {
             capturePhase = .postRepository
             let postRepository = try await captureAuthority(
                 loadedRoot: loadedRoot,
-                expectedLayout: capability.repositoryLayout,
-                prefix: capability.repositoryRelativeLoadedRootPrefix
+                expectedLayout: gitCapability.repositoryLayout,
+                prefix: gitCapability.repositoryRelativeLoadedRootPrefix
             )
             // Candidate-local fingerprints and attributes establish source stability. Unrelated
             // index or metadata churn must not reject the entire batch.
@@ -913,7 +1217,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 do {
                     let attributes = try digestEvidence(
                         urls: Self.candidateAttributeURLs(
-                            layout: capability.repositoryLayout,
+                            layout: gitCapability.repositoryLayout,
                             candidateRepositoryRelativePath: path
                         ),
                         includeBoundedContents: true
@@ -930,7 +1234,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 }
                 do {
                     let fingerprint = try pathFingerprintClient.fingerprint(
-                        capability.repositoryLayout.workTreeRoot,
+                        gitCapability.repositoryLayout.workTreeRoot,
                         path
                     )
                     #if DEBUG
@@ -951,7 +1255,8 @@ actor WorkspaceCodemapGitCapabilityService {
 
             var authorities = unavailable
             for index in candidates.indices {
-                guard let path = candidatePaths[index],
+                guard let rootRelativePath = candidateRootPaths[index],
+                      candidatePaths[index] != nil,
                       let prePathFingerprint = prePathFingerprints[index],
                       let postPathFingerprint = postPathFingerprints[index],
                       let attributeGeneration = postAttributeGenerations[index]
@@ -960,8 +1265,9 @@ actor WorkspaceCodemapGitCapabilityService {
                 authorities[index] = WorkspaceCodemapSourceAuthorityToken.issue(
                     capability: capability,
                     observedRootEpoch: observedRootEpoch,
-                    observedRepositoryAuthority: observedRepositoryAuthority,
-                    candidateRepositoryRelativePath: path,
+                    observedRootAuthority: observedRootAuthority,
+                    standardizedLoadedRootPath: standardizedLoadedRootPath,
+                    candidateRootRelativePath: rootRelativePath,
                     acceptedPrePathFingerprint: prePathFingerprint,
                     acceptedPostPathFingerprint: postPathFingerprint,
                     candidateAttributeGeneration: attributeGeneration,
@@ -996,43 +1302,234 @@ actor WorkspaceCodemapGitCapabilityService {
         }
     }
 
+    /// Issues filesystem source-authority tokens for one bounded candidate batch.
+    ///
+    /// Candidate no-follow fingerprints are bracketed by bounded root-proof checks, then rechecked
+    /// once more, so a root rebind or a candidate change during issuance rejects rather than
+    /// producing a token that outlives its evidence. No Git coordinates or attribute sentinel exist.
+    private func makeFilesystemSourceAuthorities(
+        capability: WorkspaceCodemapRootCapability,
+        record: RootRecord,
+        observedRootEpoch: WorkspaceCodemapRootEpoch,
+        observedRootAuthority: WorkspaceCodemapRootAuthorityToken,
+        candidates: [WorkspaceCodemapSourceAuthorityRequest],
+        unavailable: [WorkspaceCodemapSourceAuthorityToken?]
+    ) async -> [WorkspaceCodemapSourceAuthorityToken?] {
+        guard let proof = record.filesystemProof else {
+            hooks.sourceAuthorityRejected(.requestUnavailable)
+            return unavailable
+        }
+        let standardizedLoadedRootPath = record.binding.standardizedLoadedRootPath
+        let loadedRoot = URL(fileURLWithPath: standardizedLoadedRootPath, isDirectory: true)
+
+        switch filesystemRootProofState(proof) {
+        case .current:
+            break
+        case .changed:
+            hooks.sourceAuthorityRejected(.registrationAuthorityChanged)
+            return unavailable
+        case let .unavailable(reason):
+            hooks.sourceAuthorityRejected(.captureFailed(phase: .preRepository, reason: reason))
+            return unavailable
+        }
+
+        var candidatePaths = [String?](repeating: nil, count: candidates.count)
+        var prePathFingerprints = [GitBlobLStatFingerprint?](repeating: nil, count: candidates.count)
+        do {
+            for index in candidates.indices {
+                let candidate = candidates[index]
+                guard candidate.observedPathGeneration == candidate.currentPathGeneration,
+                      candidate.observedIngressGeneration == candidate.currentIngressGeneration,
+                      let rootRelativePath = Self.safeRepositoryRelativePath(
+                          candidate.candidateRootRelativePath
+                      )
+                else {
+                    hooks.sourceAuthorityRejected(.candidateRequestRejected(index: index))
+                    continue
+                }
+                do {
+                    let fingerprint = try pathFingerprintClient.fingerprint(loadedRoot, rootRelativePath)
+                    guard fingerprint.isRegularFile else {
+                        hooks.sourceAuthorityRejected(.candidateFingerprintUnavailable(index: index))
+                        continue
+                    }
+                    candidatePaths[index] = rootRelativePath
+                    prePathFingerprints[index] = fingerprint
+                    await hooks.afterSourcePathFingerprintCapture()
+                } catch {
+                    hooks.sourceAuthorityRejected(.candidateFingerprintUnavailable(index: index))
+                    continue
+                }
+                try Task.checkCancellation()
+            }
+            await hooks.afterFirstAuthorityCapture()
+            try Task.checkCancellation()
+
+            switch filesystemRootProofState(records[capability.rootEpoch]?.filesystemProof ?? proof) {
+            case .current:
+                break
+            case .changed:
+                hooks.sourceAuthorityRejected(.repositoryAuthorityChangedDuringIssuance)
+                return unavailable
+            case let .unavailable(reason):
+                hooks.sourceAuthorityRejected(.captureFailed(phase: .postRepository, reason: reason))
+                return unavailable
+            }
+            guard case let .eligible(currentCapability) = records[capability.rootEpoch]?.state,
+                  currentCapability == capability
+            else {
+                hooks.sourceAuthorityRejected(.capabilityChanged)
+                return unavailable
+            }
+
+            // Final candidate recheck after the root window closes.
+            var postPathFingerprints = [GitBlobLStatFingerprint?](
+                repeating: nil,
+                count: candidates.count
+            )
+            for index in candidates.indices {
+                guard let rootRelativePath = candidatePaths[index],
+                      let prePathFingerprint = prePathFingerprints[index]
+                else { continue }
+                do {
+                    let fingerprint = try pathFingerprintClient.fingerprint(loadedRoot, rootRelativePath)
+                    #if DEBUG
+                        await hooks.afterSourcePathFingerprintCapture()
+                    #endif
+                    guard fingerprint == prePathFingerprint, fingerprint.isRegularFile else {
+                        hooks.sourceAuthorityRejected(.candidatePathChanged(index: index))
+                        continue
+                    }
+                    postPathFingerprints[index] = fingerprint
+                } catch {
+                    hooks.sourceAuthorityRejected(.candidateFingerprintUnavailable(index: index))
+                    continue
+                }
+                try Task.checkCancellation()
+            }
+
+            var authorities = unavailable
+            for index in candidates.indices {
+                guard let rootRelativePath = candidatePaths[index],
+                      let prePathFingerprint = prePathFingerprints[index],
+                      let postPathFingerprint = postPathFingerprints[index]
+                else { continue }
+                let candidate = candidates[index]
+                authorities[index] = WorkspaceCodemapSourceAuthorityToken.issue(
+                    capability: capability,
+                    observedRootEpoch: observedRootEpoch,
+                    observedRootAuthority: observedRootAuthority,
+                    standardizedLoadedRootPath: standardizedLoadedRootPath,
+                    candidateRootRelativePath: rootRelativePath,
+                    acceptedPrePathFingerprint: prePathFingerprint,
+                    acceptedPostPathFingerprint: postPathFingerprint,
+                    candidateAttributeGeneration: nil,
+                    observedPathGeneration: candidate.observedPathGeneration,
+                    currentPathGeneration: candidate.currentPathGeneration,
+                    observedIngressGeneration: candidate.observedIngressGeneration,
+                    currentIngressGeneration: candidate.currentIngressGeneration
+                )
+                if authorities[index] == nil {
+                    hooks.sourceAuthorityRejected(.tokenIssuanceRejected(index: index))
+                }
+                try Task.checkCancellation()
+            }
+            guard !Task.isCancelled,
+                  case let .eligible(finalCapability) = records[capability.rootEpoch]?.state,
+                  finalCapability == capability
+            else {
+                hooks.sourceAuthorityRejected(Task.isCancelled ? .cancelled : .capabilityChanged)
+                return unavailable
+            }
+            return authorities
+        } catch {
+            hooks.sourceAuthorityRejected(
+                error is CancellationError
+                    ? .cancelled
+                    : .captureFailed(
+                        phase: .postRepository,
+                        reason: Self.transientReason(for: error)
+                    )
+            )
+            return unavailable
+        }
+    }
+
+    /// Bounded root-proof check shared by filesystem issuance and revalidation. Witness metadata
+    /// churn with the same semantic binding stays `.current`; a rebind or fresh positive Git
+    /// evidence is `.changed`; evidence that cannot be observed at all is transiently unavailable
+    /// rather than a claim that the binding moved.
+    private func filesystemRootProofState(
+        _ proof: WorkspaceCodemapNonGitFilesystemProof
+    ) -> WorkspaceCodemapRootAuthorityValidation {
+        switch localClassificationProbe.refresh(proof) {
+        case let .current(currentProof):
+            guard Self.filesystemRootAccessProof(currentProof) == .valid else {
+                return .unavailable(.permissionFailure)
+            }
+            return .current
+        case .bindingChanged, .requiresGitPreflight:
+            return .changed
+        case .unavailable:
+            return .unavailable(.permissionFailure)
+        }
+    }
+
     /// Revalidates previously issued source-authority tokens against one stable repository/path window.
     /// This reads Git metadata and no-follow path fingerprints only; it never reads source bytes.
     func revalidateSourceAuthorities(
-        capability: GitCodemapRootCapability,
+        capability: WorkspaceCodemapRootCapability,
         tokens: [WorkspaceCodemapSourceAuthorityToken]
     ) async -> Bool {
         guard let record = records[capability.rootEpoch],
               case let .eligible(activeCapability) = record.state,
-              activeCapability == capability,
+              activeCapability == capability
+        else { return false }
+        if tokens.isEmpty {
+            // Even an empty candidate list validates root currentness.
+            guard case .filesystem = capability else { return true }
+            guard let proof = record.filesystemProof else { return false }
+            return filesystemRootProofState(proof) == .current
+        }
+        if case .filesystem = capability {
+            return revalidateFilesystemSourceAuthorities(
+                capability: capability,
+                record: record,
+                tokens: tokens
+            )
+        }
+        guard case let .git(gitCapability) = capability,
               let stableAuthority = record.stableAuthority
         else { return false }
-        if tokens.isEmpty { return true }
 
         var candidatePaths = Set<String>()
+        var repositoryRelativePathsByToken: [String] = []
+        repositoryRelativePathsByToken.reserveCapacity(tokens.count)
         for token in tokens {
             guard token.isFactoryValidated,
                   token.rootEpoch == capability.rootEpoch,
-                  token.repositoryAuthority == capability.repositoryAuthority,
-                  token.repositoryRelativeLoadedRootPrefix == capability.repositoryRelativeLoadedRootPrefix,
-                  let candidatePath = Self.safeRepositoryRelativePath(token.standardizedRepositoryRelativePath),
-                  candidatePath == token.standardizedRepositoryRelativePath,
+                  token.rootAuthority == capability.rootAuthority,
+                  token.repositoryRelativeLoadedRootPrefix ==
+                  gitCapability.repositoryRelativeLoadedRootPrefix,
+                  let repositoryRelativePath = token.standardizedRepositoryRelativePath,
+                  let candidatePath = Self.safeRepositoryRelativePath(repositoryRelativePath),
+                  candidatePath == repositoryRelativePath,
                   Self.isCandidate(
                       candidatePath,
-                      insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
+                      insideLoadedRootPrefix: gitCapability.repositoryRelativeLoadedRootPrefix
                   ),
                   candidatePaths.insert(candidatePath).inserted
             else { return false }
+            repositoryRelativePathsByToken.append(candidatePath)
         }
 
         let loadedRoot = URL(fileURLWithPath: record.binding.standardizedLoadedRootPath)
         do {
             var prePathFingerprints: [String: GitBlobLStatFingerprint] = [:]
             var preAttributeGenerations: [String: String] = [:]
-            for token in tokens {
-                let path = token.standardizedRepositoryRelativePath
+            for (token, path) in zip(tokens, repositoryRelativePathsByToken) {
                 let fingerprint = try pathFingerprintClient.fingerprint(
-                    capability.repositoryLayout.workTreeRoot,
+                    gitCapability.repositoryLayout.workTreeRoot,
                     path
                 )
                 guard fingerprint == token.acceptedPostPathFingerprint,
@@ -1044,18 +1541,17 @@ actor WorkspaceCodemapGitCapabilityService {
 
             let preRepository = try await captureAuthority(
                 loadedRoot: loadedRoot,
-                expectedLayout: capability.repositoryLayout,
-                prefix: capability.repositoryRelativeLoadedRootPrefix
+                expectedLayout: gitCapability.repositoryLayout,
+                prefix: gitCapability.repositoryRelativeLoadedRootPrefix
             )
             guard preRepository.stableAuthority.matchesSourceAuthorityStability(of: stableAuthority) else {
                 return false
             }
 
-            for token in tokens {
-                let path = token.standardizedRepositoryRelativePath
+            for (token, path) in zip(tokens, repositoryRelativePathsByToken) {
                 let generation = try digestEvidence(
                     urls: Self.candidateAttributeURLs(
-                        layout: capability.repositoryLayout,
+                        layout: gitCapability.repositoryLayout,
                         candidateRepositoryRelativePath: path
                     ),
                     includeBoundedContents: true
@@ -1065,11 +1561,10 @@ actor WorkspaceCodemapGitCapabilityService {
             }
             try Task.checkCancellation()
 
-            for token in tokens {
-                let path = token.standardizedRepositoryRelativePath
+            for (token, path) in zip(tokens, repositoryRelativePathsByToken) {
                 let generation = try digestEvidence(
                     urls: Self.candidateAttributeURLs(
-                        layout: capability.repositoryLayout,
+                        layout: gitCapability.repositoryLayout,
                         candidateRepositoryRelativePath: path
                     ),
                     includeBoundedContents: true
@@ -1081,8 +1576,8 @@ actor WorkspaceCodemapGitCapabilityService {
 
             let postRepository = try await captureAuthority(
                 loadedRoot: loadedRoot,
-                expectedLayout: capability.repositoryLayout,
-                prefix: capability.repositoryRelativeLoadedRootPrefix
+                expectedLayout: gitCapability.repositoryLayout,
+                prefix: gitCapability.repositoryRelativeLoadedRootPrefix
             )
             // Demand-time classification owns current-state correctness. This pre/post window
             // only fences classification-input races while revalidating per-file source authority.
@@ -1091,10 +1586,9 @@ actor WorkspaceCodemapGitCapabilityService {
                   postRepository.stableAuthority.matchesSourceAuthorityStability(of: stableAuthority)
             else { return false }
 
-            for token in tokens {
-                let path = token.standardizedRepositoryRelativePath
+            for (token, path) in zip(tokens, repositoryRelativePathsByToken) {
                 let fingerprint = try pathFingerprintClient.fingerprint(
-                    capability.repositoryLayout.workTreeRoot,
+                    gitCapability.repositoryLayout.workTreeRoot,
                     path
                 )
                 guard fingerprint == prePathFingerprints[path],
@@ -1111,7 +1605,67 @@ actor WorkspaceCodemapGitCapabilityService {
         }
     }
 
-    private func resolveCandidate(loadedRootURL: URL) async -> Resolution {
+    /// Repeats the filesystem issuance obligations for already issued tokens: bounded root proof,
+    /// no-follow candidate fingerprints matching the accepted ones, and a final capability check.
+    private func revalidateFilesystemSourceAuthorities(
+        capability: WorkspaceCodemapRootCapability,
+        record: RootRecord,
+        tokens: [WorkspaceCodemapSourceAuthorityToken]
+    ) -> Bool {
+        guard let proof = record.filesystemProof else { return false }
+        let loadedRoot = URL(
+            fileURLWithPath: record.binding.standardizedLoadedRootPath,
+            isDirectory: true
+        )
+        var candidatePaths = Set<String>()
+        var rootRelativePathsByToken: [String] = []
+        rootRelativePathsByToken.reserveCapacity(tokens.count)
+        for token in tokens {
+            guard token.isFactoryValidated,
+                  token.rootEpoch == capability.rootEpoch,
+                  token.rootAuthority == capability.rootAuthority,
+                  token.standardizedLoadedRootPath == record.binding.standardizedLoadedRootPath,
+                  token.standardizedRepositoryRelativePath == nil,
+                  token.candidateAttributeGeneration == nil,
+                  let candidatePath = Self.safeRepositoryRelativePath(token.candidateRootRelativePath),
+                  candidatePath == token.candidateRootRelativePath,
+                  candidatePaths.insert(candidatePath).inserted
+            else { return false }
+            rootRelativePathsByToken.append(candidatePath)
+        }
+
+        guard filesystemRootProofState(proof) == .current else { return false }
+        do {
+            var prePathFingerprints: [String: GitBlobLStatFingerprint] = [:]
+            for (token, path) in zip(tokens, rootRelativePathsByToken) {
+                let fingerprint = try pathFingerprintClient.fingerprint(loadedRoot, path)
+                guard fingerprint == token.acceptedPostPathFingerprint,
+                      fingerprint.isRegularFile
+                else { return false }
+                prePathFingerprints[path] = fingerprint
+            }
+            try Task.checkCancellation()
+            guard filesystemRootProofState(proof) == .current else { return false }
+            for (token, path) in zip(tokens, rootRelativePathsByToken) {
+                let fingerprint = try pathFingerprintClient.fingerprint(loadedRoot, path)
+                guard fingerprint == prePathFingerprints[path],
+                      fingerprint == token.acceptedPostPathFingerprint,
+                      fingerprint.isRegularFile
+                else { return false }
+            }
+            guard case let .eligible(currentCapability) = records[capability.rootEpoch]?.state,
+                  currentCapability == capability
+            else { return false }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func resolveCandidate(
+        loadedRootURL: URL,
+        evidence: WorkspaceCodemapRootEligibilityEvidence?
+    ) async -> Resolution {
         let loadedRoot = loadedRootURL.standardizedFileURL
         guard loadedRoot.isFileURL, loadedRoot.path.hasPrefix("/") else {
             return .terminal(.invalidLoadedRootContainment)
@@ -1127,11 +1681,23 @@ actor WorkspaceCodemapGitCapabilityService {
             return .terminal(.invalidLoadedRootContainment)
         }
 
+        // Store evidence only routes the attempt. The actor re-observes the proof and proves
+        // readability itself, so a stale or wrong cache can never admit a root on its own.
+        if case .filesystem = evidence,
+           let resolution = await filesystemResolution(loadedRoot: loadedRoot)
+        {
+            return resolution
+        }
+
         let repositoryRoot: URL
         do {
             guard let resolved = try await gitService.findGitRoot(from: loadedRoot) else {
                 return switch try await gitService.gitRepositoryKind(at: loadedRoot) {
-                case .nonGit: .terminal(.nonGit)
+                case .nonGit:
+                    // `nonGit` is a negative Git preflight result, never the final answer for a
+                    // provably safe filesystem root. Without that proof this stays unavailable.
+                    await filesystemResolution(loadedRoot: loadedRoot)
+                        ?? .transient(.repositoryChanging)
                 case .bare: .terminal(.bareRepository)
                 case .worktree: .terminal(.invalidLayout)
                 }
@@ -1192,7 +1758,7 @@ actor WorkspaceCodemapGitCapabilityService {
                     isMain: !layout.isLinkedWorktree,
                     path: layout.workTreeRoot
                 )
-                return .eligible(
+                return .eligibleGit(
                     layout: layout,
                     prefix: prefix,
                     repositoryIdentity: repositoryIdentity,
@@ -1220,6 +1786,54 @@ actor WorkspaceCodemapGitCapabilityService {
         } catch {
             return .transient(Self.transientReason(for: error))
         }
+    }
+
+    /// Establishes a fresh definite non-Git proof plus a scoped readability proof for `loadedRoot`.
+    /// Returns nil when no definite proof is available, so the caller falls through to Git.
+    private func filesystemResolution(loadedRoot: URL) async -> Resolution? {
+        guard case let .definitelyNonGit(proof) = await localClassificationProbe.resolve(loadedRoot),
+              proof.requestedRootPath == loadedRoot.path,
+              case let .current(currentProof) = localClassificationProbe.refresh(proof)
+        else { return nil }
+        switch Self.filesystemRootAccessProof(currentProof) {
+        case .valid:
+            return .eligibleFilesystem(currentProof)
+        case .permissionDenied:
+            return .transient(.permissionFailure)
+        case .missing, .invalid:
+            return .transient(.repositoryChanging)
+        }
+    }
+
+    /// Proves the loaded root is a readable directory that still matches the captured identity.
+    /// `lstat`/`realpath` alone is insufficient, so this opens a scoped no-follow directory
+    /// descriptor and matches `fstat` against the proof's own root witness.
+    private static func filesystemRootAccessProof(
+        _ proof: WorkspaceCodemapNonGitFilesystemProof
+    ) -> DirectoryState {
+        guard let rootIdentity = proof.lexicalPathWitnesses.last?.identity,
+              (rootIdentity.mode & UInt32(S_IFMT)) == UInt32(S_IFDIR),
+              !StandardizedPath.containsNUL(proof.requestedRootPath)
+        else { return .invalid }
+        let descriptor = open(
+            proof.requestedRootPath,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard descriptor >= 0 else {
+            return switch errno {
+            case ENOENT, ENOTDIR: .missing
+            case EACCES, EPERM, ELOOP: .permissionDenied
+            default: .invalid
+            }
+        }
+        defer { close(descriptor) }
+        var value = stat()
+        guard fstat(descriptor, &value) == 0 else { return .invalid }
+        guard safeDeviceID(value.st_dev) == rootIdentity.device,
+              UInt64(value.st_ino) == rootIdentity.inode,
+              (value.st_mode & S_IFMT) == S_IFDIR
+        else { return .invalid }
+        return .valid
     }
 
     private func captureAuthority(
@@ -1359,7 +1973,7 @@ actor WorkspaceCodemapGitCapabilityService {
         case authorityFileTooLarge
     }
 
-    private static func transientReason(for error: Error) -> WorkspaceCodemapGitTransientUnavailableReason {
+    private static func transientReason(for error: Error) -> WorkspaceCodemapRootTransientUnavailableReason {
         if error is CancellationError { return .runtimeUnavailable }
         let nsError = error as NSError
         if nsError.domain == NSPOSIXErrorDomain,
