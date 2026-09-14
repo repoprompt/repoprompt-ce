@@ -881,6 +881,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var cancellables = Set<AnyCancellable>()
     private let listeners = ListenerRegistry()
     private var isAgentModeActive = false
+
+    /// Cached result of `makePersistentBindingResolutionSnapshot()` for the current
+    /// synchronous execution burst (cleared after the current run-loop turn via a
+    /// MainActor Task). This prevents the O(sessions × workspaces) snapshot rebuild
+    /// from being repeated for every caller within the same SwiftUI body evaluation.
+    private var _cachedPersistentBindingSnapshot: PersistentBindingResolutionSnapshot?
+
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
@@ -4758,9 +4765,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func makePersistentBindingResolutionSnapshot() -> PersistentBindingResolutionSnapshot {
+        if let cached = _cachedPersistentBindingSnapshot {
+            return cached
+        }
         #if DEBUG
             test_persistentBindingResolutionSnapshotBuildCount &+= 1
         #endif
+        let snapshot = _buildPersistentBindingResolutionSnapshot()
+        _cachedPersistentBindingSnapshot = snapshot
+        // Invalidate the cache after the current synchronous execution burst so that the
+        // next run-loop turn (e.g. after a state mutation) gets a fresh snapshot.
+        Task { @MainActor [weak self] in
+            self?._cachedPersistentBindingSnapshot = nil
+        }
+        return snapshot
+    }
+
+    private func _buildPersistentBindingResolutionSnapshot() -> PersistentBindingResolutionSnapshot {
         let liveClaimsByTabID = Dictionary(uniqueKeysWithValues: sessions.values.compactMap { session in
             session.activeAgentSessionID.map { (session.tabID, $0) }
         })
