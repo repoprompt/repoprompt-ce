@@ -3110,7 +3110,7 @@ func printUsage() {
           agent_run op=start message="Read the plan at prompt-exports/oracle-plan.md with read_file first. Implement item 1."
           agent_run op=wait session_id="<uuid>"        Block until input/terminal
           agent_run op=wait session_id="<uuid>" timeout=5  Bounded wait (seconds)
-          agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60
+          agent_run op=wait session_ids=["<uuid1>","<uuid2>"]
                                                         Wait for first of multiple sessions
           agent_run op=poll session_id="<uuid>"        Poll current snapshot
           agent_run op=poll session_ids=["<uuid1>","<uuid2>","<uuid3>"]
@@ -3119,8 +3119,10 @@ func printUsage() {
           agent_run op=respond session_id="<uuid>" interaction_id="<id>" response="accept"
           agent_run op=cancel session_id="<uuid>"      Cancel run
           Operations: start, poll, wait, cancel, steer, respond
-          wait accepts optional timeout (seconds, fractional OK). Defaults
-          to 300s (5 min). timeout=0 returns current snapshot immediately.
+          wait accepts optional timeout (seconds, fractional OK). Omit it for
+          the default; use shorter waits for closer supervision or longer waits
+          for well-scoped independent work. timeout=0 returns the current snapshot
+          immediately.
           session_ids is accepted only for wait/poll and is mutually exclusive
           with session_id. Multi-wait returns the winning snapshot plus wait
           metadata (mode, result, winner_session_id, pending_session_ids).

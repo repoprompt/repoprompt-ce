@@ -21,19 +21,25 @@ actor MCPRequestSendBarrier {
         states[requestID] = State()
     }
 
+    /// Cancelling the waiting task abandons the registration, so a caller parked here while the
+    /// transport never reports delivery can still unwind instead of waiting forever.
     func waitUntilSent(requestID: ID) async throws {
-        let completion = await withCheckedContinuation { (continuation: CheckedContinuation<Completion, Never>) in
-            guard var state = states[requestID] else {
-                continuation.resume(returning: .failed("MCP request send barrier was not registered"))
-                return
+        let completion = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Completion, Never>) in
+                guard var state = states[requestID] else {
+                    continuation.resume(returning: .failed("MCP request send barrier was not registered"))
+                    return
+                }
+                if let completion = state.completion {
+                    states.removeValue(forKey: requestID)
+                    continuation.resume(returning: completion)
+                } else {
+                    state.waiters.append(continuation)
+                    states[requestID] = state
+                }
             }
-            if let completion = state.completion {
-                states.removeValue(forKey: requestID)
-                continuation.resume(returning: completion)
-            } else {
-                state.waiters.append(continuation)
-                states[requestID] = state
-            }
+        } onCancel: {
+            Task { await cancel(requestID: requestID) }
         }
 
         switch completion {

@@ -264,6 +264,27 @@ private struct ResolvedToolCallDeadline {
     }
 }
 
+private struct ConnectionSnapshot: Equatable {
+    let clientIdentity: ObjectIdentifier
+    let barrierIdentity: ObjectIdentifier
+    let toolCatalogEpoch: UInt64
+}
+
+/// How one `agent_run` / `agent_explore` request relates to a server-side lifecycle wait.
+/// Single owner of the operation rules used by both settings preflight and deadline math.
+private struct AgentLifecycleWaitIntent: Equatable {
+    let timeoutKey: String
+    /// Omitting the timeout makes the server apply its configured subagent wait.
+    let blocksWhenTimeoutOmitted: Bool
+    /// The server performs setup before its wait begins, so the wait starts later than the request.
+    let performsSetupBeforeWait: Bool
+}
+
+private enum ImplicitLifecycleSettingsPreflightOutcome {
+    case pinned(Int)
+    case compatibilityGuard
+}
+
 private final class ToolCallTaskBox: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
@@ -933,15 +954,42 @@ actor InteractiveMCPClientSession {
             throw InteractiveSessionError.notConnected
         }
 
-        let deadlineStartedAtNanoseconds = timeoutNowNanoseconds()
         var args = arguments ?? [:]
         args.removeValue(forKey: MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey)
+        // Resolve routing and timeout policy before the settings preflight can suspend, so a
+        // concurrent selection change cannot retarget a call that was already under way.
+        let effectivePolicy = effectiveTimeoutPolicy(timeout)
+        let routedWindowID = selectedWindowID
+        let routedContextID = selectedContextID
+        var implicitLifecycleCompatibilityGuard: TimeInterval?
+        if effectivePolicy == .default,
+           let intent = Self.implicitBlockingLifecycleIntent(toolName: name, arguments: args)
+        {
+            let connectionSnapshot = makeConnectionSnapshot(
+                client: client,
+                requestSendBarrier: requestSendBarrier
+            )
+            switch try await performImplicitLifecycleSettingsPreflight(
+                client: client,
+                requestSendBarrier: requestSendBarrier,
+                connectionSnapshot: connectionSnapshot
+            ) {
+            case let .pinned(seconds):
+                args[intent.timeoutKey] = .int(seconds)
+            case .compatibilityGuard:
+                implicitLifecycleCompatibilityGuard = TimeInterval(
+                    MCPTimeoutPolicy.maximumSupportedSubagentDefaultWaitSeconds
+                )
+            }
+        }
+        let deadlineStartedAtNanoseconds = timeoutNowNanoseconds()
         let resolvedDeadline = resolvedToolCallDeadline(
-            timeout,
+            effectivePolicy,
             toolName: name,
             arguments: args,
             startedAtNanoseconds: deadlineStartedAtNanoseconds,
-            wallNowUnixMilliseconds: wallNowUnixMilliseconds()
+            wallNowUnixMilliseconds: wallNowUnixMilliseconds(),
+            implicitLifecycleCompatibilityGuard: implicitLifecycleCompatibilityGuard
         )
         if let rewrittenRequestArguments = resolvedDeadline.rewrittenRequestArguments {
             args = rewrittenRequestArguments
@@ -954,11 +1002,11 @@ actor InteractiveMCPClientSession {
         // Inject hidden parameters if we have window selection
         let suppressWindowInjection = shouldSuppressWindowInjection(toolName: name, args: args)
         let suppressContextInjection = shouldSuppressContextInjection(toolName: name)
-        if let windowID = selectedWindowID, !suppressWindowInjection {
-            args["_windowID"] = .int(windowID)
+        if let routedWindowID, !suppressWindowInjection {
+            args["_windowID"] = .int(routedWindowID)
         }
-        if let selectedContextID, args["context_id"] == nil, !suppressContextInjection {
-            args["context_id"] = .string(selectedContextID)
+        if let routedContextID, args["context_id"] == nil, !suppressContextInjection {
+            args["context_id"] = .string(routedContextID)
         }
 
         // Request raw JSON output from server formatter (skip markdown)
@@ -1311,6 +1359,10 @@ actor InteractiveMCPClientSession {
         return UInt64((clampedSeconds * 1_000_000_000).rounded(.up))
     }
 
+    private static func timeoutSeconds(forElapsedNanoseconds nanoseconds: UInt64) -> TimeInterval {
+        TimeInterval(nanoseconds) / 1_000_000_000
+    }
+
     private static func canonicalPromptContextDeadlineToolName(for toolName: String) -> String? {
         switch toolName {
         case "prompt", "discover_prompt":
@@ -1371,7 +1423,8 @@ actor InteractiveMCPClientSession {
         toolName: String,
         arguments: [String: Value],
         startedAtNanoseconds: UInt64,
-        wallNowUnixMilliseconds: Int64
+        wallNowUnixMilliseconds: Int64,
+        implicitLifecycleCompatibilityGuard: TimeInterval? = nil
     ) -> ResolvedToolCallDeadline {
         let canonicalToolName = Self.canonicalPromptContextDeadlineToolName(for: toolName)
         // Reuse domain normalization so every accepted wrapper shape enters the same
@@ -1397,7 +1450,8 @@ actor InteractiveMCPClientSession {
         let timeoutSeconds = resolvedTimeout(
             policy,
             toolName: requestToolName,
-            arguments: arguments
+            arguments: arguments,
+            implicitLifecycleCompatibilityGuard: implicitLifecycleCompatibilityGuard
         )
         let timeoutNanoseconds = timeoutSeconds.map(Self.nanoseconds(forTimeoutSeconds:))
         let expiresAtNanoseconds = timeoutNanoseconds.map {
@@ -1464,16 +1518,18 @@ actor InteractiveMCPClientSession {
     private func resolvedTimeout(
         _ policy: ToolCallTimeoutPolicy,
         toolName: String,
-        arguments: [String: Value]
+        arguments: [String: Value],
+        implicitLifecycleCompatibilityGuard: TimeInterval? = nil
     ) -> TimeInterval? {
         switch effectiveTimeoutPolicy(policy) {
         case .default:
             if MCPTimeoutPolicy.cliDefaultUnboundedToolNames.contains(toolName) {
                 return nil
             }
-            if let semanticWaitSeconds = Self.explicitSemanticWaitSeconds(
+            if let semanticWaitSeconds = Self.semanticWaitSeconds(
                 toolName: toolName,
-                arguments: arguments
+                arguments: arguments,
+                implicitLifecycleCompatibilityGuard: implicitLifecycleCompatibilityGuard
             ) {
                 guard semanticWaitSeconds > 0 else { return nil }
                 return max(
@@ -1489,32 +1545,56 @@ actor InteractiveMCPClientSession {
         }
     }
 
-    private static func explicitSemanticWaitSeconds(
+    private static func semanticWaitSeconds(
         toolName: String,
-        arguments: [String: Value]
+        arguments: [String: Value],
+        implicitLifecycleCompatibilityGuard: TimeInterval? = nil
     ) -> TimeInterval? {
-        let timeoutKey: String
         switch toolName {
         case "agent_run", "agent_explore":
-            let operation = arguments["op"]?.stringValue?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            switch operation {
-            case "start", "wait":
-                timeoutKey = "timeout"
-            case "steer" where toolName == "agent_run":
-                guard arguments["wait"]?.boolValue != false else { return nil }
-                timeoutKey = "timeout_seconds"
-            default:
-                return nil
-            }
+            agentLifecycleSemanticWaitSeconds(
+                toolName: toolName,
+                arguments: arguments,
+                implicitLifecycleCompatibilityGuard: implicitLifecycleCompatibilityGuard
+            )
         case "ask_user", "wait_for_next_user_instruction":
-            timeoutKey = "timeout_seconds"
+            explicitOnlySemanticWaitSeconds(arguments: arguments, timeoutKey: "timeout_seconds")
         default:
+            nil
+        }
+    }
+
+    private static func agentLifecycleSemanticWaitSeconds(
+        toolName: String,
+        arguments: [String: Value],
+        implicitLifecycleCompatibilityGuard: TimeInterval? = nil
+    ) -> TimeInterval? {
+        guard let intent = agentLifecycleWaitIntent(toolName: toolName, arguments: arguments) else {
             return nil
         }
+        let waitSeconds: TimeInterval?
+        if isImplicitLifecycleTimeout(arguments: arguments, timeoutKey: intent.timeoutKey) {
+            guard intent.blocksWhenTimeoutOmitted else { return nil }
+            waitSeconds = implicitLifecycleCompatibilityGuard
+                ?? MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+        } else {
+            waitSeconds = arguments[intent.timeoutKey].flatMap(parsedNonNegativeFiniteSeconds)
+        }
+        guard let waitSeconds, waitSeconds > 0, intent.performsSetupBeforeWait else {
+            return waitSeconds
+        }
+        return waitSeconds + MCPTimeoutPolicy.agentLifecycleSetupAllowanceSeconds
+    }
 
+    private static func explicitOnlySemanticWaitSeconds(
+        arguments: [String: Value],
+        timeoutKey: String
+    ) -> TimeInterval? {
         guard let value = arguments[timeoutKey] else { return nil }
+        return parsedNonNegativeFiniteSeconds(value)
+    }
+
+    private static func parsedNonNegativeFiniteSeconds(_ value: Value) -> TimeInterval? {
         let seconds: TimeInterval? = switch value {
         case let .int(value):
             TimeInterval(value)
@@ -1529,13 +1609,265 @@ actor InteractiveMCPClientSession {
         return seconds
     }
 
+    private static func parseBool(_ value: Value?) -> Bool? {
+        switch value {
+        case let .bool(boolValue):
+            boolValue
+        case let .string(stringValue):
+            switch stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes":
+                true
+            case "false", "0", "no":
+                false
+            default:
+                nil
+            }
+        case let .int(intValue):
+            intValue != 0
+        case let .double(doubleValue):
+            doubleValue != 0
+        case .null, .array, .object:
+            nil
+        default:
+            nil
+        }
+    }
+
+    private func makeConnectionSnapshot(
+        client: MCP.Client,
+        requestSendBarrier: MCPRequestSendBarrier
+    ) -> ConnectionSnapshot {
+        ConnectionSnapshot(
+            clientIdentity: ObjectIdentifier(client),
+            barrierIdentity: ObjectIdentifier(requestSendBarrier),
+            toolCatalogEpoch: toolCatalogEpoch
+        )
+    }
+
+    private func validateConnectionSnapshot(_ snapshot: ConnectionSnapshot) throws {
+        guard let client, let requestSendBarrier else {
+            throw InteractiveSessionError.notConnected
+        }
+        let current = makeConnectionSnapshot(client: client, requestSendBarrier: requestSendBarrier)
+        guard current == snapshot else {
+            throw InteractiveSessionError.connectionReset
+        }
+    }
+
+    private static func isImplicitLifecycleTimeout(
+        arguments: [String: Value],
+        timeoutKey: String
+    ) -> Bool {
+        guard let value = arguments[timeoutKey] else { return true }
+        if case .null = value { return true }
+        return false
+    }
+
+    /// Server-side operation normalization: `agent_run` treats an absent or blank `op` as `wait`.
+    private static func normalizedLifecycleOperation(_ value: Value?) -> String? {
+        guard let operation = value?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !operation.isEmpty
+        else {
+            return nil
+        }
+        return operation
+    }
+
+    private static func agentLifecycleWaitIntent(
+        toolName: String,
+        arguments: [String: Value]
+    ) -> AgentLifecycleWaitIntent? {
+        guard toolName == "agent_run" || toolName == "agent_explore" else { return nil }
+
+        switch normalizedLifecycleOperation(arguments["op"]) {
+        case nil:
+            // `agent_run` defaults a missing or blank operation to `wait`; `agent_explore` rejects it.
+            guard toolName == "agent_run" else { return nil }
+            return AgentLifecycleWaitIntent(
+                timeoutKey: "timeout",
+                blocksWhenTimeoutOmitted: true,
+                performsSetupBeforeWait: false
+            )
+        case "wait":
+            return AgentLifecycleWaitIntent(
+                timeoutKey: "timeout",
+                blocksWhenTimeoutOmitted: true,
+                performsSetupBeforeWait: false
+            )
+        case "start":
+            // A detached start returns before any wait, so neither the configured wait nor the
+            // setup allowance applies to it.
+            let waitsAfterLaunch = parseBool(arguments["detach"]) != true
+            return AgentLifecycleWaitIntent(
+                timeoutKey: "timeout",
+                blocksWhenTimeoutOmitted: waitsAfterLaunch,
+                performsSetupBeforeWait: waitsAfterLaunch
+            )
+        case "steer":
+            guard toolName == "agent_run" else { return nil }
+            let shouldWait: Bool = if let explicit = parseBool(arguments["wait"]) {
+                explicit
+            } else if arguments["timeout_seconds"] != nil {
+                true
+            } else {
+                false
+            }
+            guard shouldWait else { return nil }
+            return AgentLifecycleWaitIntent(
+                timeoutKey: "timeout_seconds",
+                blocksWhenTimeoutOmitted: true,
+                performsSetupBeforeWait: true
+            )
+        default:
+            return nil
+        }
+    }
+
+    private static func implicitBlockingLifecycleIntent(
+        toolName: String,
+        arguments: [String: Value]
+    ) -> AgentLifecycleWaitIntent? {
+        guard let intent = agentLifecycleWaitIntent(toolName: toolName, arguments: arguments),
+              intent.blocksWhenTimeoutOmitted,
+              isImplicitLifecycleTimeout(arguments: arguments, timeoutKey: intent.timeoutKey)
+        else {
+            return nil
+        }
+        return intent
+    }
+
+    private static func jsonObjectFromToolResult(_ result: CallTool.Result) -> [String: Value]? {
+        for block in result.content {
+            if case let .text(text, _, _) = block,
+               let object = Value.objectFromJSONString(text)
+            {
+                return object
+            }
+        }
+        return nil
+    }
+
+    private static func parseSupportedSubagentDefaultWaitSeconds(from result: CallTool.Result) -> Int? {
+        guard result.isError != true,
+              let object = jsonObjectFromToolResult(result),
+              let values = object["values"]?.objectValue,
+              let raw = values[MCPTimeoutPolicy.subagentDefaultWaitSettingsKey]
+        else {
+            return nil
+        }
+        // Accept the whole-number double a JSON round-trip can produce, matching the
+        // integer rule `app_settings` itself applies when validating this key.
+        let seconds: Int? = switch raw {
+        case let .int(value): value
+        case let .double(value): Int(exactly: value)
+        default: nil
+        }
+        guard let seconds, MCPTimeoutPolicy.isSupportedSubagentDefaultWaitSeconds(seconds) else {
+            return nil
+        }
+        return seconds
+    }
+
+    /// Bounds registration, send, and response as one budget, so a stalled send barrier cannot
+    /// keep an implicit lifecycle wait parked in preflight.
+    private func sendSettingsRequestWithinBudget(
+        _ request: Request<CallTool>,
+        client: MCP.Client,
+        requestSendBarrier: MCPRequestSendBarrier,
+        budgetSeconds: TimeInterval
+    ) async throws -> RegisteredToolCall {
+        try await withThrowingTaskGroup(of: RegisteredToolCall?.self) { group in
+            group.addTask { [self] in
+                try await registerAndSendToolCall(
+                    request,
+                    client: client,
+                    requestSendBarrier: requestSendBarrier
+                )
+            }
+            group.addTask { [timeoutSleep] in
+                try await timeoutSleep(Self.nanoseconds(forTimeoutSeconds: budgetSeconds))
+                return nil
+            }
+            defer { group.cancelAll() }
+            guard let registeredCall = try await group.next() ?? nil else {
+                throw InteractiveSessionError.toolCallTimeout(
+                    toolName: "app_settings",
+                    seconds: budgetSeconds
+                )
+            }
+            return registeredCall
+        }
+    }
+
+    private func performImplicitLifecycleSettingsPreflight(
+        client: MCP.Client,
+        requestSendBarrier: MCPRequestSendBarrier,
+        connectionSnapshot: ConnectionSnapshot
+    ) async throws -> ImplicitLifecycleSettingsPreflightOutcome {
+        try Task.checkCancellation()
+        try validateConnectionSnapshot(connectionSnapshot)
+
+        let settingsRequest = CallTool.request(.init(
+            name: "app_settings",
+            arguments: [
+                "op": .string("get"),
+                "keys": .array([.string(MCPTimeoutPolicy.subagentDefaultWaitSettingsKey)]),
+                "_rawJSON": .bool(true)
+            ]
+        ))
+
+        let budgetSeconds = MCPTimeoutPolicy.subagentDefaultWaitSettingsReadBudgetSeconds
+        let startedAtNanoseconds = timeoutNowNanoseconds()
+        let result: CallTool.Result
+        do {
+            let registeredCall = try await sendSettingsRequestWithinBudget(
+                settingsRequest,
+                client: client,
+                requestSendBarrier: requestSendBarrier,
+                budgetSeconds: budgetSeconds
+            )
+            let elapsedSeconds = Self.timeoutSeconds(
+                forElapsedNanoseconds: timeoutNowNanoseconds() &- startedAtNanoseconds
+            )
+            result = try await awaitRegisteredToolCallResult(
+                registeredCall,
+                client: client,
+                toolName: "app_settings",
+                timeoutSeconds: max(0, budgetSeconds - elapsedSeconds)
+            )
+        } catch {
+            // Caller cancellation and connection loss still abort the lifecycle call; every other
+            // preflight failure — budget expiry, tool errors, servers without this setting — is a
+            // failure to pin a preference, which the compatibility guard already covers.
+            try Task.checkCancellation()
+            try validateConnectionSnapshot(connectionSnapshot)
+            return .compatibilityGuard
+        }
+
+        try Task.checkCancellation()
+        try validateConnectionSnapshot(connectionSnapshot)
+
+        if let seconds = Self.parseSupportedSubagentDefaultWaitSeconds(from: result) {
+            return .pinned(seconds)
+        }
+        return .compatibilityGuard
+    }
+
     #if DEBUG
         func test_resolvedToolCallTimeout(
             _ policy: ToolCallTimeoutPolicy = .default,
             toolName: String,
-            arguments: [String: Value] = [:]
+            arguments: [String: Value] = [:],
+            implicitLifecycleCompatibilityGuard: TimeInterval? = nil
         ) -> TimeInterval? {
-            resolvedTimeout(policy, toolName: toolName, arguments: arguments)
+            resolvedTimeout(
+                policy,
+                toolName: toolName,
+                arguments: arguments,
+                implicitLifecycleCompatibilityGuard: implicitLifecycleCompatibilityGuard
+            )
         }
 
         func test_resolvedToolCallDeadline(
@@ -1543,7 +1875,8 @@ actor InteractiveMCPClientSession {
             toolName: String,
             arguments: [String: Value] = [:],
             startedAtNanoseconds: UInt64 = 0,
-            wallNowUnixMilliseconds: Int64 = 0
+            wallNowUnixMilliseconds: Int64 = 0,
+            implicitLifecycleCompatibilityGuard: TimeInterval? = nil
         ) -> (
             timeoutSeconds: TimeInterval?,
             expiresAtNanoseconds: UInt64?,
@@ -1556,7 +1889,8 @@ actor InteractiveMCPClientSession {
                 toolName: toolName,
                 arguments: arguments,
                 startedAtNanoseconds: startedAtNanoseconds,
-                wallNowUnixMilliseconds: wallNowUnixMilliseconds
+                wallNowUnixMilliseconds: wallNowUnixMilliseconds,
+                implicitLifecycleCompatibilityGuard: implicitLifecycleCompatibilityGuard
             )
             return (
                 resolved.timeoutSeconds,
@@ -1573,6 +1907,13 @@ actor InteractiveMCPClientSession {
 
         func test_markToolsDirty() {
             markToolsDirty()
+        }
+
+        func test_implicitBlockingLifecycleIntent(
+            toolName: String,
+            arguments: [String: Value]
+        ) -> String? {
+            Self.implicitBlockingLifecycleIntent(toolName: toolName, arguments: arguments)?.timeoutKey
         }
 
         func test_replaceConnectedClient(

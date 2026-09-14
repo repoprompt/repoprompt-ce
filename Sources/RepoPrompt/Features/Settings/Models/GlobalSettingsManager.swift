@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 // MARK: - Canonical Settings Keys
 
@@ -1468,6 +1469,29 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         updateAgentModeScalar(commit: commit) { settings in
             settings.providerConversationCleanupAction = action.rawValue
         }
+    }
+
+    func subagentDefaultWaitSeconds() -> Int {
+        MCPTimeoutPolicy.resolvedSubagentDefaultWaitSeconds(
+            scalarPreferences.agentMode?.subagentDefaultWaitSeconds
+        )
+    }
+
+    @discardableResult
+    func setSubagentDefaultWaitSeconds(_ seconds: Int, commit: Bool = true) -> Bool {
+        guard MCPTimeoutPolicy.isSupportedSubagentDefaultWaitSeconds(seconds) else {
+            return false
+        }
+
+        let proposedValue = seconds == Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds) ? nil : seconds
+        guard scalarPreferences.agentMode?.subagentDefaultWaitSeconds != proposedValue else {
+            return true
+        }
+
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.subagentDefaultWaitSeconds = proposedValue
+        }
+        return true
     }
 
     func agentSessionHandoffInstructions() -> String {

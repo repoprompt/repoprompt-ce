@@ -19,6 +19,36 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: snapshotURL), generated)
     }
 
+    func testCanonicalAgentControlWaitDescriptionsUseConfiguredSubagentWaitPhrase() throws {
+        let phrase = MCPTimeoutPolicy.configuredSubagentWaitDiscoveryPhrase
+        for toolName in [MCPWindowToolName.agentRun, MCPWindowToolName.agentExplore] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            XCTAssertTrue(definition.description.contains(phrase), toolName)
+            XCTAssertFalse(definition.description.localizedCaseInsensitiveContains("default 120"), toolName)
+            XCTAssertFalse(definition.description.localizedCaseInsensitiveContains("default 300"), toolName)
+
+            let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+            let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+            let timeoutDescription = try XCTUnwrap(properties["timeout"]?.objectValue?["description"]?.stringValue)
+            XCTAssertEqual(timeoutDescription, MCPTimeoutPolicy.agentControlTimeoutPropertyDescription)
+        }
+
+        let runDefinition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentRun))
+        let runSchema = try XCTUnwrap(runDefinition.inputSchema.objectValue)
+        let runProperties = try XCTUnwrap(runSchema["properties"]?.objectValue)
+        let steerTimeoutDescription = try XCTUnwrap(runProperties["timeout_seconds"]?.objectValue?["description"]?.stringValue)
+        XCTAssertEqual(steerTimeoutDescription, MCPTimeoutPolicy.agentControlSteerTimeoutPropertyDescription)
+    }
+
+    func testCanonicalizeAgentControlWaitSemanticsIsIdempotent() throws {
+        for toolName in [MCPWindowToolName.agentRun, MCPWindowToolName.agentExplore] {
+            let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            let once = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentControlWaitSemantics(current)
+            let twice = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentControlWaitSemantics(once)
+            XCTAssertEqual(once, twice, toolName)
+        }
+    }
+
     func testCanonicalAgentSchemasAdvertiseCursorModelParameterInputs() throws {
         for toolName in ["agent_run", "agent_manage"] {
             let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))

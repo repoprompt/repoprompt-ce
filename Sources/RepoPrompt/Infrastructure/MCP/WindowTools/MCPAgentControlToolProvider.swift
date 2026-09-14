@@ -121,7 +121,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
     }
 
     private func agentExploreTool() -> Tool {
-        let defaultWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds)
+        let configuredWaitPhrase = MCPTimeoutPolicy.configuredSubagentWaitDiscoveryPhrase
         return runtime.tool(
             name: MCPWindowToolName.agentExplore,
             freshnessPolicy: .none,
@@ -134,7 +134,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             - `start`: Launch one or more fresh explore sessions. Provide `message` for one probe or `messages` for multiple probes. Batch starts wait for the first referenced session to finish or need input unless `detach=true`.
             - `poll`: Return current snapshot immediately for `session_id` or `session_ids`.
-            - `wait`: Block until the first referenced explore run finishes or needs input. `timeout=0` behaves like poll.
+            - `wait`: Block until the first referenced explore run finishes or needs input. Omit `timeout` for the \(configuredWaitPhrase); use shorter waits for closer supervision or longer waits for well-scoped independent work. `timeout=0` behaves like poll.
             - `cancel`: Cancel a live explore child session.
 
             Explore children are read-only — no edits, oracle calls, or further sub-agent spawning.
@@ -153,7 +153,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                     "message": .string(description: "[start] Exploration instruction text for one fresh explore child. Mutually exclusive with messages."),
                     "messages": .array(description: "[start] Array of exploration instruction strings. Mutually exclusive with message. Starts one fresh explore child per entry.", items: .string()),
                     "detach": .boolean(description: "[start] Return immediately instead of waiting. Default false."),
-                    "timeout": .number(description: "[start, wait] Max wait seconds. 0 = poll. Default \(defaultWaitSeconds)."),
+                    "timeout": .number(description: MCPTimeoutPolicy.agentControlTimeoutPropertyDescription),
                     "worktree": .string(description: "[start] Existing worktree selector to bind before provider startup: @current, @main, @branch:<name>, name, branch, path, or @id:<worktree_id>. Mutually exclusive with worktree_id and worktree_create."),
                     "worktree_id": .string(description: "[start] Durable worktree ID to bind before provider startup. Mutually exclusive with worktree and worktree_create."),
                     "worktree_create": .boolean(description: "[start] Create an app-managed Git worktree, bind it to the new session, materialize its hidden root, then start the provider. Mutually exclusive with worktree/worktree_id."),
@@ -176,7 +176,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
     }
 
     private func agentRunTool() -> Tool {
-        let defaultWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds)
+        let configuredWaitPhrase = MCPTimeoutPolicy.configuredSubagentWaitDiscoveryPhrase
         let messageDescription = "[start, steer] Instruction text. Required for start and steer. If sharing an exported plan, include the path/instruction directly in this text."
         var properties: OrderedDictionary<String, JSONSchema> = [
             "op": .string(description: "Operation.", enum: ["start", "poll", "wait", "cancel", "steer", "respond"]),
@@ -189,7 +189,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             "workflow_id": .string(description: "[start, steer, respond] Workflow ID. Mutually exclusive with workflow_name."),
             "workflow_name": .string(description: "[start, steer, respond] Workflow name. Mutually exclusive with workflow_id."),
             "detach": .boolean(description: "[start] Return immediately instead of waiting. Default false."),
-            "timeout": .number(description: "[start, wait] Max wait seconds. 0 = poll. Default \(defaultWaitSeconds)."),
+            "timeout": .number(description: MCPTimeoutPolicy.agentControlTimeoutPropertyDescription),
             "worktree": .string(description: "[start] Existing worktree selector to bind before provider startup: @current, @main, @branch:<name>, name, branch, path, or @id:<worktree_id>. Mutually exclusive with worktree_id and worktree_create."),
             "worktree_id": .string(description: "[start] Durable worktree ID to bind before provider startup. Mutually exclusive with worktree and worktree_create."),
             "worktree_create": .boolean(description: "[start] Create an app-managed Git worktree, bind it to the new session, materialize its hidden root, then start the provider. Mutually exclusive with worktree/worktree_id."),
@@ -202,7 +202,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             "worktree_color": .string(description: "[start] Optional visual color to persist for the bound worktree as #RRGGBB."),
             "allow_external_worktree_path": .boolean(description: "[start + worktree_create] Allow explicit worktree_path outside RepoPrompt's app-managed worktree container."),
             "wait": .boolean(description: "[steer] Wait for an interesting/terminal state after steering. Implied when timeout_seconds is provided."),
-            "timeout_seconds": .number(description: "[steer] Max wait seconds when wait=true. 0 = immediate post-steer snapshot. Default \(defaultWaitSeconds)."),
+            "timeout_seconds": .number(description: MCPTimeoutPolicy.agentControlSteerTimeoutPropertyDescription),
             "interaction_id": .string(description: "[respond] Pending interaction UUID from the snapshot. Returned as a top-level field in poll/wait responses when the run is waiting_for_input."),
             "response": .string(description: "[respond] Canonical top-level scalar string. For approvals, pass one advertised response option, for example response=\"accept\"; decision and nested response objects are unsupported. For instructions and questions, pass response text. For MCP elicitation, pass accept, decline, or cancel; a non-action string is sent as content.response."),
             "answers": .object(description: "[respond] Structured answers keyed by question ID."),
@@ -229,9 +229,9 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             **Operations**: start | poll | wait | cancel | steer | respond
 
-            - `start`: Launch an agent run in a **new** session/tab. Do NOT pass `session_id` — use `steer` to continue an existing session. Omit `model_id` to use the `pair` role, or pass `model_id` with a role label (resolved via the global role-default mapping in `agent_manage.list_agents` `task_labels`) or an explicit compound `model_id` from `agents[].models[].model_id`. Cursor models may also pass `model_parameters` using exact `config_id` and `value` pairs advertised for that model by `agent_manage.list_agents`. These selections are applied before the first prompt and are returned in session snapshots. When started from an Agent Mode run, the new child session inherits the source session's worktree bindings by default; pass `inherit_worktree=false` to keep parent session threading but skip worktree inheritance. Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. Returns a `session_id` — save it for all follow-up calls. Waits up to `timeout` seconds (default \(defaultWaitSeconds)). Pass `detach: true` to return immediately.
+            - `start`: Launch an agent run in a **new** session/tab. Do NOT pass `session_id` — use `steer` to continue an existing session. Omit `model_id` to use the `pair` role, or pass `model_id` with a role label (resolved via the global role-default mapping in `agent_manage.list_agents` `task_labels`) or an explicit compound `model_id` from `agents[].models[].model_id`. Cursor models may also pass `model_parameters` using exact `config_id` and `value` pairs advertised for that model by `agent_manage.list_agents`. These selections are applied before the first prompt and are returned in session snapshots. When started from an Agent Mode run, the new child session inherits the source session's worktree bindings by default; pass `inherit_worktree=false` to keep parent session threading but skip worktree inheritance. Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. Returns a `session_id` — save it for all follow-up calls. Waits up to `timeout` seconds when present. Omitted `timeout` uses the \(configuredWaitPhrase). Pass `detach: true` to return immediately.
             - `poll`: Return current snapshot immediately. Accepts `session_id` (single) or `session_ids` (array — returns all current snapshots).
-            - `wait`: Block until the run finishes or needs input. Default \(defaultWaitSeconds)s. `timeout: 0` = poll. Accepts `session_id` (single) or `session_ids` (array — returns when first session reaches interesting state). Returns `interaction_id` when input is pending. A steering interruption may include `wait.steering_message` as caller context; it does not acknowledge provider delivery or instruct the caller to resend.
+            - `wait`: Block until the run finishes or needs input. Omit `timeout` for the \(configuredWaitPhrase); use shorter waits for closer supervision or longer waits for well-scoped independent work. `timeout: 0` = poll. Accepts `session_id` (single) or `session_ids` (array — returns when first session reaches interesting state). Returns `interaction_id` when input is pending. Completion, questions, and parent steering can end the wait early. A steering interruption may include `wait.steering_message` as caller context; it does not acknowledge provider delivery or instruct the caller to resend.
             - `cancel`: Stop an active agent run. Only valid when the run is `running` or `waiting_for_input`. Requires `session_id`.
             - `steer`: Continue an existing agent session by sending a follow-up instruction to the `session_id` returned by `start`. If the run is still active, the instruction is steered into that run; if the last run already finished or the MCP wait/control handle expired, RepoPrompt reactivates the existing Agent session and starts the next run in the same session when it still exists. Pass `wait: true` (or `timeout_seconds`) to block until the steered run finishes or needs input. Do NOT use `steer` when status is `waiting_for_input` — use `respond` instead.
             - `respond`: Resolve the current pending interaction. Requires `session_id` and the exact `interaction_id` from the latest snapshot. For approvals, send the advertised choice in the top-level scalar `response` field, for example `response="accept"`. For MCP elicitation, use `response` (`accept`, `decline`, or `cancel`) plus optional object `content` and `meta`.
@@ -240,7 +240,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             **Sub-agent spawning**: MCP-started `orchestrate` runs can dispatch sub-agents. Sub-agents cannot recursively start additional agent runs.
 
-            **Parallel agents**: When launching multiple agents in parallel, always use `detach: true` so each `start` returns immediately without blocking. You can then `wait` or `poll` each `session_id` independently.
+            **Parallel agents**: When launching multiple agents in parallel, always use `detach: true` so each `start` returns immediately without blocking. You can then `wait` or `poll` each `session_id` independently. Do useful independent work before blocking, and prefer `wait` over repetitive status-only polling.
 
             **IMPORTANT — never end your turn with active agents**: Sub-agents may need approval for tool calls or ask questions via `waiting_for_input`. Always `wait`/`poll` on every started session and `respond` to any pending interactions before finishing your turn. An unattended agent will stall indefinitely.
             """,

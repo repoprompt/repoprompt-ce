@@ -130,7 +130,60 @@ public enum MCPTimeoutPolicy {
     /// and transport delivery before the CLI cancels the request.
     public static let cliSemanticWaitResponseMarginSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
 
-    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 120
+    /// Factory default for otherwise-quiet RP-managed subagent lifecycle waits
+    /// (start post-launch, wait, steer-and-wait). Not a startup, execution, or notification interval.
+    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 300
+
+    /// Session setup (worktree binding, provider startup, steer reactivation) runs before a
+    /// lifecycle wait begins, and the server starts the caller's full wait only afterwards.
+    /// Client deadlines add this allowance so setup cannot consume the requested wait.
+    public static let agentLifecycleSetupAllowanceSeconds: TimeInterval = 180
+
+    /// Discovery/help phrase for an omitted agent-control wait timeout.
+    public static let configuredSubagentWaitDiscoveryPhrase =
+        "configured subagent wait (factory default: five minutes)"
+
+    public static let agentControlTimeoutPropertyDescription =
+        "[start, wait] Max wait seconds. 0 = poll. Omitted timeout uses the \(configuredSubagentWaitDiscoveryPhrase)."
+
+    public static let agentControlSteerTimeoutPropertyDescription =
+        "[steer] Max wait seconds when wait=true. 0 = immediate post-steer snapshot. Omitted timeout uses the \(configuredSubagentWaitDiscoveryPhrase)."
+
+    /// App-wide subagent wait choices exposed in Settings and `app_settings`.
+    public static let supportedSubagentDefaultWaitSeconds: [Int] = [120, 300, 600, 1200, 1800, 3600]
+
+    /// Upper bound of `supportedSubagentDefaultWaitSeconds` for compatibility guards.
+    public static var maximumSupportedSubagentDefaultWaitSeconds: Int {
+        supportedSubagentDefaultWaitSeconds.max() ?? Int(agentLifecycleDefaultWaitSeconds)
+    }
+
+    /// `app_settings` key for the app-wide subagent wait preference.
+    public static let subagentDefaultWaitSettingsKey = "agent_mode.subagent_default_wait_seconds"
+
+    /// Budget for the CLI implicit-wait settings preflight, covering registration, send, and the
+    /// response. Cancellation delivery may add its usual drain grace on top before the caller's
+    /// lifecycle request proceeds under the compatibility guard.
+    public static let subagentDefaultWaitSettingsReadBudgetSeconds: TimeInterval = 5
+
+    /// CLI-side guard when implicit lifecycle preflight cannot pin a supported preference.
+    public static var cliImplicitLifecycleCompatibilityGuardSeconds: TimeInterval {
+        max(
+            cliDefaultToolCallTimeoutSeconds,
+            TimeInterval(maximumSupportedSubagentDefaultWaitSeconds) + cliSemanticWaitResponseMarginSeconds
+        )
+    }
+
+    public static func isSupportedSubagentDefaultWaitSeconds(_ seconds: Int) -> Bool {
+        supportedSubagentDefaultWaitSeconds.contains(seconds)
+    }
+
+    public static func resolvedSubagentDefaultWaitSeconds(_ stored: Int?) -> Int {
+        guard let stored, isSupportedSubagentDefaultWaitSeconds(stored) else {
+            return Int(agentLifecycleDefaultWaitSeconds)
+        }
+        return stored
+    }
+
     public static let askUserDefaultTimeoutSeconds: TimeInterval = 300
     public static let nextUserInstructionDefaultWaitSeconds: TimeInterval = 600
     public static let applyEditsApprovalTimeoutSeconds: TimeInterval = 300

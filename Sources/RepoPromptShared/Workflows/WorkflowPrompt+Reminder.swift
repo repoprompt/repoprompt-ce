@@ -78,7 +78,7 @@ Dispatch a sub-agent when a side investigation or delegated chunk of work would 
 
 // Delegate · Fan-out · Steer · Cleanup
 {"tool":"agent_run","args":{"op":"start","model_id":"explore","session_name":"Probe: X","message":"<question>","detach":true}}
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<uuid1>","<uuid2>"],"timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<uuid1>","<uuid2>"]}}
 {"tool":"agent_run","args":{"op":"steer","session_id":"<uuid>","message":"now do Y","wait":true}}
 {"tool":"agent_manage","args":{"op":"cleanup_sessions","session_ids":["<uuid>"]}}
 ```
@@ -98,7 +98,7 @@ rpce-cli -w <window_id> -e 'chat "..." --mode plan'
 
 # Delegate · Fan-out · Steer · Cleanup
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="Probe: X" message="<question>" detach=true'
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"]'
 rpce-cli -w <window_id> -e 'agent_run op=steer session_id="<uuid>" message="now do Y" wait=true'
 rpce-cli -w <window_id> -e 'agent_manage op=cleanup_sessions session_ids=["<uuid>"]'
 ```

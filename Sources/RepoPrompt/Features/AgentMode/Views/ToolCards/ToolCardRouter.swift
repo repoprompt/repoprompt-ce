@@ -635,8 +635,10 @@ private enum ToolCardSubtitleBuilder {
         if detach == true {
             return "detach"
         }
-        let resolvedTimeout = timeout ?? MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
-        return resolvedTimeout <= 0 ? "poll" : "wait ≤\(formatSeconds(resolvedTimeout))"
+        guard let timeout else {
+            return "wait (default)"
+        }
+        return timeout <= 0 ? "poll" : "wait ≤\(formatSeconds(timeout))"
     }
 
     private static func formatSeconds(_ seconds: Double) -> String {

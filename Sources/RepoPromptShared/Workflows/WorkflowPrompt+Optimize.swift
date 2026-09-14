@@ -117,7 +117,7 @@ Use `detach:true` so they run concurrently:
 // (Target & call graph, Prior perf work, Scope), each with detach:true.
 
 // Then wait on all of them at once
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<id1>","<id2>","<id3>","<id4>","<id5>"],"timeout":180}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<id1>","<id2>","<id3>","<id4>","<id5>"]}}
 ```
 """,
 	cli: """
@@ -126,11 +126,11 @@ Use `detach:true` so they run concurrently:
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="Bottleneck candidates: <area>" message="Scout for performance bottlenecks around <translated target>. Look at the target AND surrounding context: callers, data dependencies, adjacent operations, shared infrastructure. Hunt for tight loops with per-iteration allocations, redundant computation, locking, expensive transformations, sync I/O on hot paths, O(n²), unbatched updates. Report 2–3 ranked candidates with file:line and one-sentence rationale per candidate. No fixes yet." detach=true'
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="Conventions: AGENTS.md" message="Read AGENTS.md. Report how to run unit tests, benchmarks, debug harness, sanctioned measurement commands. Quote exact commands." detach=true'
 # Repeat the same shape for the remaining 3 explores in the table above (Target & call graph, Prior perf work, Scope), each with detach=true.
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>","<id3>","<id4>","<id5>"] timeout=180'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>","<id3>","<id4>","<id5>"]'
 ```
 """))
 
-> ⚠️ **Detached agents may block on permission approvals.** Poll periodically or use `op=wait` so you can approve and keep them unblocked.
+> ⚠️ **Detached agents may block on permission approvals.** Use `op=wait` with the configured subagent wait when there is no useful independent work; it returns when approval is needed so you can keep them unblocked.
 
 If the bottleneck-candidates explore returns thin or generic results ("nothing obviously expensive"), that's a signal — either the area is genuinely well-tuned and the user's complaint is elsewhere, or the explore needed broader radius. Either way, **re-dispatch one targeted explore** with a wider radius (e.g., "look two call levels up") rather than reading the code yourself.
 

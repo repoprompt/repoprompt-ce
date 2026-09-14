@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 /// Global, non-window-scoped MCP service for allowlisted RepoPrompt app settings.
 ///
@@ -894,6 +895,22 @@ private enum AppSettingsMCPRegistry {
                 store.setProviderConversationCleanupAction(action)
             }
         ),
+        integerEnumSetting(
+            key: "agent_mode.subagent_default_wait_seconds",
+            group: "agent_mode",
+            label: "Default Subagent Wait",
+            description: "Maximum otherwise-quiet wait for MCP subagent start, wait, and steer-and-wait operations when timeout is omitted. Shorter waits allow more frequent progress checks; longer waits reduce routine model calls.",
+            allowedValues: MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds,
+            read: { .int($0.subagentDefaultWaitSeconds()) },
+            write: { store, value in
+                let seconds = try requiredInt(from: value)
+                guard store.setSubagentDefaultWaitSeconds(seconds) else {
+                    throw MCPError.invalidParams(
+                        "Invalid value for 'agent_mode.subagent_default_wait_seconds'. Allowed values: \(MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds.map(String.init).joined(separator: ", "))."
+                    )
+                }
+            }
+        ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
         // repository content; this group exposes app-wide scalar behavior only.
@@ -1069,6 +1086,31 @@ private enum AppSettingsMCPRegistry {
         )
     }
 
+    private static func integerEnumSetting(
+        key: String,
+        group: String,
+        label: String? = nil,
+        description: String,
+        allowedValues: [Int],
+        read: @escaping @MainActor (GlobalSettingsStore) -> Value,
+        write: @escaping @MainActor (GlobalSettingsStore, Value) throws -> Void,
+        afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)? = nil
+    ) -> AppSettingDefinition {
+        let allowedValueStrings = allowedValues.map(String.init)
+        return AppSettingDefinition(
+            key: key,
+            group: group,
+            valueType: .number,
+            label: label,
+            description: description,
+            allowedValues: allowedValueStrings,
+            read: read,
+            validate: { value in try validateEnumInteger(value, key: key, allowedValues: allowedValues) },
+            write: write,
+            afterWrite: afterWrite
+        )
+    }
+
     private static func freeformStringSetting(
         key: String,
         group: String,
@@ -1227,6 +1269,27 @@ private enum AppSettingsMCPRegistry {
         return .string(raw)
     }
 
+    private static func validateEnumInteger(_ value: Value, key: String, allowedValues: [Int]) throws -> Value {
+        let number: Int
+        switch value {
+        case let .int(int):
+            number = int
+        case let .double(double):
+            guard let exact = Int(exactly: double) else {
+                throw MCPError.invalidParams("Setting '\(key)' requires an integer second value.")
+            }
+            number = exact
+        default:
+            throw MCPError.invalidParams("Setting '\(key)' requires an integer second value.")
+        }
+        guard allowedValues.contains(number) else {
+            throw MCPError.invalidParams(
+                "Invalid value for '\(key)'. Allowed values: \(allowedValues.map(String.init).joined(separator: ", "))."
+            )
+        }
+        return .int(number)
+    }
+
     private static func validateTrimmedString(_ value: Value, key: String, maxLength: Int, allowEmpty: Bool) throws -> Value {
         guard case let .string(raw) = value else {
             throw MCPError.invalidParams("Setting '\(key)' requires a string value.")
@@ -1381,6 +1444,13 @@ private enum AppSettingsMCPRegistry {
             throw MCPError.invalidParams("Expected normalized numeric value.")
         }
         return double
+    }
+
+    private static func requiredInt(from value: Value) throws -> Int {
+        guard case let .int(int) = value else {
+            throw MCPError.invalidParams("Expected normalized integer value.")
+        }
+        return int
     }
 
     private static func stringOrNull(_ value: String?) -> Value {

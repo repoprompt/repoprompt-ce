@@ -13,7 +13,7 @@ struct AgentExploreMCPToolService {
     let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
-    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
+    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
     let startRun: StartRun
     #if DEBUG
@@ -40,8 +40,14 @@ struct AgentExploreMCPToolService {
         )
     }
 
-    static func resolvedStartTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try AgentRunMCPToolService.resolvedStartTimeoutSeconds(value)
+    static func resolvedStartTimeoutSeconds(
+        _ value: Value?,
+        capturedDefaultWaitSeconds: TimeInterval
+    ) throws -> TimeInterval {
+        try AgentRunMCPToolService.resolvedStartTimeoutSeconds(
+            value,
+            capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+        )
     }
 
     func execute(args: [String: Value]) async throws -> Value {
@@ -69,7 +75,11 @@ struct AgentExploreMCPToolService {
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
         try validateBatchWorktreeRequest(worktreeStartRequest, messageCount: messages.count)
         let detach = AgentMCPToolHelpers.parseBool(args["detach"]) ?? false
-        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(args["timeout"])
+        let capturedDefaultWaitSeconds = AgentRunMCPToolService.capturedDefaultWaitTimeoutSeconds()
+        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(
+            args["timeout"],
+            capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+        )
 
         let metadata = await captureRequestMetadata()
         let context = try await resolveStartContext(metadata: metadata)

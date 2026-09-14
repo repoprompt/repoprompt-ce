@@ -131,7 +131,7 @@ If dispatching independent items as fresh agents concurrently, **each agent's br
 
 **Use `detach: true`** when dispatching concurrent items — otherwise the orchestrator blocks on the first agent and can't start the second.
 
-Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending.
+Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending. Omit `timeout` for the configured subagent wait (factory default: five minutes); shorten it for closer supervision or lengthen it for well-scoped independent work. Completion, questions, and parent steering can end the wait early. Avoid repetitive status-only polling.
 
 \(example(variant,
 	mcp: """
@@ -141,7 +141,7 @@ Then pass `session_ids` (array) to `agent_run op=wait` to block until the **firs
 {"tool":"agent_run","args":{"op":"start","model_id":"\(defaultRole)","session_name":"2/N: <goal B>","message":"<brief B>","detach":true}}
 
 // Then wait for the first session that needs attention
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<session_id_A>","<session_id_B>"],"timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<session_id_A>","<session_id_B>"]}}
 
 // Or poll all current snapshots without blocking
 {"tool":"agent_run","args":{"op":"poll","session_ids":["<session_id_A>","<session_id_B>"]}}
@@ -154,14 +154,14 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=\(defaultRole) session_n
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=\(defaultRole) session_name="2/N: <goal B>" message="<brief B>" detach=true'
 
 # Then wait for the first session that needs attention
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"]'
 
 # Or poll all current snapshots without blocking
 rpce-cli -w <window_id> -e 'agent_run op=poll session_ids=["<uuid1>","<uuid2>"]'
 ```
 """))
 
-Handle the finished agent, then wait again on the remaining `pending_session_ids`. While waiting, summarize completed work or prepare the next brief — be a pipeline, not a sequential loop.
+Handle the finished agent and summarize completed work. Do useful independent work, such as preparing the next brief, before blocking again on the remaining `pending_session_ids` — be a pipeline, not a sequential loop.
 """
 	}
 

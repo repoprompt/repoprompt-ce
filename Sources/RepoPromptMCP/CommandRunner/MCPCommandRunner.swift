@@ -694,14 +694,14 @@ actor MCPCommandRunner {
             op=poll session_ids=["<uuid1>","<uuid2>"]
                                           Poll multiple snapshots immediately
             op=wait session_id="..." [timeout=N]
-                                          Block until input needed or terminal (default \(Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds))s)
+                                          Block until input needed or terminal (omitted timeout uses configured subagent wait; factory default five minutes)
             op=wait session_ids=["<uuid1>","<uuid2>"] [timeout=N]
                                           Wait until first session needs input or terminates
             op=cancel session_id="..."    Request run cancellation
             op=steer session_id="..." message="..."
                                           Inject follow-up instruction mid-run
             op=steer session_id="..." message="..." wait=true [timeout_seconds=N]
-                                          Steer and wait for result (default \(Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds))s)
+                                          Steer and wait for result (omitted timeout uses configured subagent wait; factory default five minutes)
             op=respond session_id="..." interaction_id="..." response="..."
                                           Resolve a pending interaction (approval, question, etc)
             session_id lifecycle: start returns it; all other ops require it.
@@ -823,8 +823,8 @@ actor MCPCommandRunner {
           agent_run op=start message="Investigate the auth flow" model_id=engineer
           builder "Implement the plan" --response-type plan --export
           agent_run op=start message="Read the plan at prompt-exports/oracle-plan.md with read_file first. Implement item 1." workflow_name=orchestrate detach=true
-          agent_run op=wait session_id="<session-uuid>" timeout=30
-          agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60
+          agent_run op=wait session_id="<session-uuid>"
+          agent_run op=wait session_ids=["<uuid1>","<uuid2>"]
           agent_run op=poll session_ids=["<uuid1>","<uuid2>","<uuid3>"]
           agent_run op=steer session_id="<uuid>" message="Now fix it" wait=true
           agent_run op=respond session_id="<session-uuid>" interaction_id="<id>" response="accept"

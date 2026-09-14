@@ -282,20 +282,36 @@ struct AgentRunMCPToolService {
     static let defaultWaitTimeoutSeconds = MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
     static let defaultStartTaskLabelKind: AgentModelCatalog.TaskLabelKind = .pair
 
-    static func resolvedStartTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try resolvedLifecycleWaitTimeoutSeconds(value)
+    static func capturedDefaultWaitTimeoutSeconds(from store: GlobalSettingsStore = .shared) -> TimeInterval {
+        TimeInterval(store.subagentDefaultWaitSeconds())
     }
 
-    static func resolvedWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try resolvedLifecycleWaitTimeoutSeconds(value)
+    static func resolvedStartTimeoutSeconds(
+        _ value: Value?,
+        capturedDefaultWaitSeconds: TimeInterval
+    ) throws -> TimeInterval {
+        try resolvedLifecycleWaitTimeoutSeconds(value, capturedDefaultWaitSeconds: capturedDefaultWaitSeconds)
     }
 
-    static func resolvedSteerTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try resolvedLifecycleWaitTimeoutSeconds(value)
+    static func resolvedWaitTimeoutSeconds(
+        _ value: Value?,
+        capturedDefaultWaitSeconds: TimeInterval
+    ) throws -> TimeInterval {
+        try resolvedLifecycleWaitTimeoutSeconds(value, capturedDefaultWaitSeconds: capturedDefaultWaitSeconds)
     }
 
-    private static func resolvedLifecycleWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try AgentMCPToolHelpers.parseTimeoutSeconds(value) ?? defaultWaitTimeoutSeconds
+    static func resolvedSteerTimeoutSeconds(
+        _ value: Value?,
+        capturedDefaultWaitSeconds: TimeInterval
+    ) throws -> TimeInterval {
+        try resolvedLifecycleWaitTimeoutSeconds(value, capturedDefaultWaitSeconds: capturedDefaultWaitSeconds)
+    }
+
+    private static func resolvedLifecycleWaitTimeoutSeconds(
+        _ value: Value?,
+        capturedDefaultWaitSeconds: TimeInterval
+    ) throws -> TimeInterval {
+        try AgentMCPToolHelpers.parseTimeoutSeconds(value) ?? capturedDefaultWaitSeconds
     }
 
     private nonisolated static func agentRunExpiredSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {
@@ -329,7 +345,7 @@ struct AgentRunMCPToolService {
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     var resolveSpawnParentSessionIDFromSourceTabID: ((_ sourceTabID: UUID, _ targetWindow: WindowState) async -> UUID?)?
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
-    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
+    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
     let startRun: StartRun
 
@@ -413,7 +429,11 @@ struct AgentRunMCPToolService {
             throw MCPError.invalidParams("agent_run.start always creates a new session. Use agent_run op=steer with session_id to continue an existing session.")
         }
         let detach = parseBool(args["detach"]) ?? false
-        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(args["timeout"])
+        let capturedDefaultWaitSeconds = Self.capturedDefaultWaitTimeoutSeconds()
+        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(
+            args["timeout"],
+            capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+        )
 
         let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
@@ -911,7 +931,13 @@ struct AgentRunMCPToolService {
             agentModeVM: agentModeVM,
             metadata: metadata
         )
-        let timeoutSeconds = try forcePoll ? 0 : Self.resolvedWaitTimeoutSeconds(args["timeout"])
+        let capturedDefaultWaitSeconds = Self.capturedDefaultWaitTimeoutSeconds()
+        let timeoutSeconds = try forcePoll
+            ? 0
+            : Self.resolvedWaitTimeoutSeconds(
+                args["timeout"],
+                capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+            )
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         if initialSnapshot.isActionableForMCPWait || timeoutSeconds <= 0 {
             return decoratedRunValue(snapshot: initialSnapshot)
@@ -951,7 +977,11 @@ struct AgentRunMCPToolService {
             return try await executeWait(args: singleArgs)
         }
 
-        let timeoutSeconds = try Self.resolvedWaitTimeoutSeconds(args["timeout"])
+        let capturedDefaultWaitSeconds = Self.capturedDefaultWaitTimeoutSeconds()
+        let timeoutSeconds = try Self.resolvedWaitTimeoutSeconds(
+            args["timeout"],
+            capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+        )
         let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
 
         if let ready = initialSnapshots.first(where: { isInterestingSnapshot($0) }) {
@@ -1208,12 +1238,16 @@ struct AgentRunMCPToolService {
             if args["timeout_seconds"] != nil { return true }
             return false
         }()
+        let capturedDefaultWaitSeconds = Self.capturedDefaultWaitTimeoutSeconds()
         let rawSteerTimeoutSeconds = args["timeout_seconds"]
         let ignoredTimeoutWarning: String?
         let steerTimeoutSeconds: TimeInterval?
         if shouldWait {
             ignoredTimeoutWarning = nil
-            steerTimeoutSeconds = try Self.resolvedSteerTimeoutSeconds(rawSteerTimeoutSeconds)
+            steerTimeoutSeconds = try Self.resolvedSteerTimeoutSeconds(
+                rawSteerTimeoutSeconds,
+                capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+            )
         } else if rawSteerTimeoutSeconds != nil {
             ignoredTimeoutWarning = "Ignoring timeout_seconds because wait=false; the steering instruction was accepted without waiting."
             steerTimeoutSeconds = nil
@@ -1225,7 +1259,7 @@ struct AgentRunMCPToolService {
             ? snapshot.interaction == nil
             : (!snapshot.status.isTerminal && snapshot.interaction == nil)
         if shouldWait, shouldBlockForSteeredOutput {
-            let timeout = steerTimeoutSeconds ?? Self.defaultWaitTimeoutSeconds
+            let timeout = steerTimeoutSeconds ?? capturedDefaultWaitSeconds
             if timeout > 0 {
                 return try await waitForInterestingState(
                     sessionID: sessionID,

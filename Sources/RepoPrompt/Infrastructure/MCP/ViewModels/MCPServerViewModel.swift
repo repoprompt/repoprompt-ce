@@ -2028,7 +2028,7 @@ final class MCPServerViewModel: ObservableObject {
         let parentRunID: UUID
         let childSessionIDs: Set<UUID>
         let startedAt: Date
-        let timeoutSeconds: TimeInterval?
+        let timeoutSeconds: TimeInterval
         let metadata: RequestMetadata
     }
 
@@ -2354,7 +2354,7 @@ final class MCPServerViewModel: ObservableObject {
     private func beginAgentRunWaitScope(
         metadata: RequestMetadata,
         sessionIDs: Set<UUID>,
-        timeoutSeconds: TimeInterval?
+        timeoutSeconds: TimeInterval
     ) async -> AgentRunWaitScopeRegistration? {
         guard !sessionIDs.isEmpty else { return nil }
         purgeStaleAgentRunWaitScopes(source: "begin")
@@ -2367,6 +2367,8 @@ final class MCPServerViewModel: ObservableObject {
             return nil
         }
         let token = UUID()
+        // The caller already froze its resolved wait; stale-scope purging must age against that
+        // same value rather than a preference that can change mid-wait.
         let scope = AgentRunWaitScope(
             token: token,
             parentRunID: parentRunID,
@@ -2379,7 +2381,7 @@ final class MCPServerViewModel: ObservableObject {
         for sessionID in sessionIDs {
             childAgentRunWaitCountsByParentRunID[parentRunID, default: [:]][sessionID, default: 0] += 1
         }
-        steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope begin parentRunID=\(parentRunID) token=\(token) timeout=\(timeoutSeconds.map { String($0) } ?? "none") childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) counts=\(debugChildAgentRunWaits(for: parentRunID))")
+        steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope begin parentRunID=\(parentRunID) token=\(token) timeout=\(timeoutSeconds) childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) counts=\(debugChildAgentRunWaits(for: parentRunID))")
         return AgentRunWaitScopeRegistration(token: token, parentRunID: parentRunID)
     }
 
@@ -2412,15 +2414,14 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private func purgeStaleAgentRunWaitScopes(now: Date = Date(), source: String) {
         let staleTokens = agentRunWaitScopesByToken.compactMap { token, scope -> UUID? in
-            let timeout = scope.timeoutSeconds ?? AgentRunMCPToolService.defaultWaitTimeoutSeconds
-            let maxAge = timeout + agentRunWaitScopeStaleGraceSeconds
+            let maxAge = scope.timeoutSeconds + agentRunWaitScopeStaleGraceSeconds
             return now.timeIntervalSince(scope.startedAt) > maxAge ? token : nil
         }
         for token in staleTokens {
             guard let scope = agentRunWaitScopesByToken.removeValue(forKey: token) else { continue }
             decrementAgentRunWaitScope(scope)
             let elapsed = now.timeIntervalSince(scope.startedAt)
-            steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope stale purge source=\(source) parentRunID=\(scope.parentRunID) token=\(token) elapsed=\(elapsed) timeout=\(scope.timeoutSeconds.map { String($0) } ?? "default") childSessions=\(scope.childSessionIDs.map(\.uuidString).sorted().joined(separator: ","))")
+            steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope stale purge source=\(source) parentRunID=\(scope.parentRunID) token=\(token) elapsed=\(elapsed) timeout=\(scope.timeoutSeconds) childSessions=\(scope.childSessionIDs.map(\.uuidString).sorted().joined(separator: ","))")
         }
     }
 
@@ -2615,7 +2616,7 @@ final class MCPServerViewModel: ObservableObject {
         func test_beginAgentRunWaitScope(
             metadata: RequestMetadata,
             sessionIDs: Set<UUID>,
-            timeoutSeconds: TimeInterval?
+            timeoutSeconds: TimeInterval
         ) async -> AgentRunWaitScopeRegistration? {
             await beginAgentRunWaitScope(
                 metadata: metadata,

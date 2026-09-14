@@ -15,6 +15,7 @@ import XCTest
             XCTAssertEqual(MCPTimeoutPolicy.promptExportResponseDeliveryAllowanceSeconds, 30)
             XCTAssertEqual(MCPTimeoutPolicy.promptExportTotalEnvelopeSeconds, 300)
             XCTAssertEqual(MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds, 300)
+            XCTAssertEqual(MCPTimeoutPolicy.cliImplicitLifecycleCompatibilityGuardSeconds, 3630)
             XCTAssertEqual(
                 MCPTimeoutPolicy.promptExportAdmissionHeadroomSeconds
                     + MCPTimeoutPolicy.promptExportExecutionDeadlineSeconds
@@ -547,6 +548,662 @@ import XCTest
                 ], scenario.toolName)
 
                 await operationGate.release()
+            }
+        }
+
+        func testAgentLifecycleImplicitClientDeadlinesMatchBlockingIntent() async {
+            let session = makeUnconnectedSession()
+            let implicitWaitDeadline = max(
+                MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds,
+                MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+                    + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+            )
+            // `start` and `steer` run session setup before the server begins the requested wait,
+            // so their client deadline must also cover that setup.
+            let implicitSetupDeadline = max(
+                MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds,
+                MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+                    + MCPTimeoutPolicy.agentLifecycleSetupAllowanceSeconds
+                    + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+            )
+            let ordinaryDeadline = MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+            let cases: [(label: String, toolName: String, arguments: [String: Value], expected: TimeInterval?)] = [
+                ("agent_run wait absent timeout", "agent_run", ["op": .string("wait")], implicitWaitDeadline),
+                ("agent_run wait null timeout", "agent_run", ["op": .string("wait"), "timeout": .null], implicitWaitDeadline),
+                ("agent_run omitted op", "agent_run", [:], implicitWaitDeadline),
+                ("agent_run empty op", "agent_run", ["op": .string("")], implicitWaitDeadline),
+                ("agent_run blank op", "agent_run", ["op": .string("   ")], implicitWaitDeadline),
+                ("agent_explore wait", "agent_explore", ["op": .string("wait")], implicitWaitDeadline),
+                ("agent_run start", "agent_run", ["op": .string("start"), "message": .string("x")], implicitSetupDeadline),
+                ("agent_run start detach false", "agent_run", ["op": .string("start"), "detach": .bool(false), "message": .string("x")], implicitSetupDeadline),
+                ("agent_run start detach true", "agent_run", ["op": .string("start"), "detach": .bool(true), "message": .string("x")], ordinaryDeadline),
+                ("agent_run poll", "agent_run", ["op": .string("poll"), "session_id": .string("x")], ordinaryDeadline),
+                ("agent_run cancel", "agent_run", ["op": .string("cancel"), "session_id": .string("x")], ordinaryDeadline),
+                ("agent_run respond", "agent_run", ["op": .string("respond"), "session_id": .string("x")], ordinaryDeadline),
+                ("agent_run steer wait true", "agent_run", ["op": .string("steer"), "session_id": .string("x"), "message": .string("x"), "wait": .bool(true)], implicitSetupDeadline),
+                ("agent_run steer timeout_seconds null", "agent_run", ["op": .string("steer"), "session_id": .string("x"), "message": .string("x"), "timeout_seconds": .null], implicitSetupDeadline),
+                ("agent_run steer wait false", "agent_run", ["op": .string("steer"), "session_id": .string("x"), "message": .string("x"), "wait": .bool(false), "timeout_seconds": .int(60)], ordinaryDeadline),
+                ("agent_run steer wait string false", "agent_run", ["op": .string("steer"), "session_id": .string("x"), "message": .string("x"), "wait": .string("false"), "timeout_seconds": .int(60)], ordinaryDeadline),
+                ("agent_explore missing op", "agent_explore", [:], ordinaryDeadline),
+                ("agent_explore blank op", "agent_explore", ["op": .string("  ")], ordinaryDeadline)
+            ]
+
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                )
+                XCTAssertEqual(timeout, testCase.expected, testCase.label)
+            }
+        }
+
+        func testAgentLifecycleImplicitCompatibilityGuardUsesMaximumSupportedPreference() async {
+            let session = makeUnconnectedSession()
+            let timeout = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: ["op": .string("wait")],
+                implicitLifecycleCompatibilityGuard: TimeInterval(
+                    MCPTimeoutPolicy.maximumSupportedSubagentDefaultWaitSeconds
+                )
+            )
+            XCTAssertEqual(timeout, MCPTimeoutPolicy.cliImplicitLifecycleCompatibilityGuardSeconds)
+        }
+
+        func testImplicitLifecyclePreflightPinsTimeoutAndMatchesDeadline() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let server = Server(
+                name: "CLI implicit lifecycle preflight server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                switch params.name {
+                case "app_settings":
+                    let text = """
+                    {"op":"get","status":"ok","values":{"\(MCPTimeoutPolicy.subagentDefaultWaitSettingsKey)":600}}
+                    """
+                    return .init(content: [.text(text: text, annotations: nil, _meta: nil)], isError: false)
+                default:
+                    return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+                }
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle preflight client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier
+            )
+
+            _ = try await session.callTool(
+                name: "agent_run",
+                arguments: [
+                    "op": .string("wait"),
+                    "session_id": .string("session-a")
+                ]
+            )
+
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.count, 2)
+            XCTAssertEqual(calls[0].name, "app_settings")
+            XCTAssertEqual(calls[0].arguments["op"]?.stringValue, "get")
+            XCTAssertEqual(
+                calls[0].arguments["keys"]?.arrayValue?.first?.stringValue,
+                MCPTimeoutPolicy.subagentDefaultWaitSettingsKey
+            )
+            XCTAssertEqual(calls[0].arguments["_rawJSON"]?.boolValue, true)
+            XCTAssertNil(calls[0].arguments["_windowID"])
+            XCTAssertNil(calls[0].arguments["context_id"])
+            XCTAssertEqual(calls[1].name, "agent_run")
+            XCTAssertEqual(calls[1].arguments["timeout"]?.intValue, 600)
+
+            let deadline = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: calls[1].arguments
+            )
+            XCTAssertEqual(deadline, 630)
+        }
+
+        func testImplicitLifecyclePreflightSkipsLookupForExplicitAndNonblockingCalls() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let server = Server(
+                name: "CLI implicit lifecycle skip server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle skip client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier
+            )
+
+            _ = try await session.callTool(
+                name: "agent_run",
+                arguments: [
+                    "op": .string("poll"),
+                    "session_id": .string("session-a")
+                ]
+            )
+            _ = try await session.callTool(
+                name: "agent_run",
+                arguments: [
+                    "op": .string("wait"),
+                    "session_id": .string("session-a"),
+                    "timeout": .int(120)
+                ]
+            )
+            _ = try await session.callTool(
+                name: "agent_run",
+                arguments: [
+                    "op": .string("start"),
+                    "detach": .bool(true),
+                    "message": .string("x")
+                ]
+            )
+            _ = try await session.callTool(
+                name: "agent_run",
+                arguments: [
+                    "op": .string("wait"),
+                    "session_id": .string("session-a")
+                ],
+                timeout: .seconds(90)
+            )
+            _ = try await session.callTool(
+                name: "agent_run",
+                arguments: [
+                    "op": .string("wait"),
+                    "session_id": .string("session-a")
+                ],
+                timeout: .none
+            )
+
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.map(\.name), ["agent_run", "agent_run", "agent_run", "agent_run", "agent_run"])
+            XCTAssertFalse(calls.contains { $0.name == "app_settings" })
+            XCTAssertEqual(calls[1].arguments["timeout"]?.intValue, 120)
+        }
+
+        func testImplicitLifecyclePreflightUsesCompatibilityGuardOnUnsupportedSetting() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let server = Server(
+                name: "CLI implicit lifecycle fallback server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                switch params.name {
+                case "app_settings":
+                    let text = """
+                    {"op":"get","status":"ok","values":{"\(MCPTimeoutPolicy.subagentDefaultWaitSettingsKey)":999}}
+                    """
+                    return .init(content: [.text(text: text, annotations: nil, _meta: nil)], isError: false)
+                default:
+                    return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+                }
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle fallback client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier
+            )
+
+            _ = try await session.callTool(
+                name: "agent_run",
+                arguments: [
+                    "op": .string("wait"),
+                    "session_id": .string("session-a")
+                ]
+            )
+
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.count, 2)
+            XCTAssertEqual(calls[0].name, "app_settings")
+            XCTAssertEqual(calls[1].name, "agent_run")
+            XCTAssertNil(calls[1].arguments["timeout"])
+
+            let deadline = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: calls[1].arguments,
+                implicitLifecycleCompatibilityGuard: TimeInterval(
+                    MCPTimeoutPolicy.maximumSupportedSubagentDefaultWaitSeconds
+                )
+            )
+            XCTAssertEqual(deadline, MCPTimeoutPolicy.cliImplicitLifecycleCompatibilityGuardSeconds)
+        }
+
+        func testImplicitLifecyclePreflightUsesCompatibilityGuardOnSettingsTimeout() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let settingsGate = ExportContractUncooperativeGate()
+            let settingsStarted = ExportCLIAsyncSignal()
+            let timeoutGate = ExportCLIAsyncGate()
+            let monotonicClock = ExportCLIMonotonicClock()
+            let server = Server(
+                name: "CLI implicit lifecycle settings timeout server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                if params.name == "app_settings" {
+                    await settingsStarted.signal()
+                    await settingsGate.wait()
+                }
+                return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle settings timeout client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let budgetSleeps = ExportCLIBudgetOnlySleepGate(budgetGate: timeoutGate)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier,
+                timeoutSleep: { nanoseconds in
+                    monotonicClock.advance(by: nanoseconds)
+                    try await budgetSleeps.sleep(nanoseconds: nanoseconds)
+                },
+                timeoutNowNanoseconds: { monotonicClock.value() }
+            )
+
+            let lifecycleArgs: [String: Value] = [
+                "op": .string("wait"),
+                "session_id": .string("session-a")
+            ]
+            let task = Task<Void, Error> {
+                try await session.callTool(name: "agent_run", arguments: lifecycleArgs)
+            }
+
+            await settingsStarted.wait()
+            await timeoutGate.waitUntilArrived()
+            await timeoutGate.release()
+
+            _ = try await task.value
+
+            // Failing to pin a preference is not a reason to abandon the caller's wait: the
+            // lifecycle call still goes out, uncapped, under the compatibility guard.
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.map(\.name), ["app_settings", "agent_run"])
+            XCTAssertNil(calls[1].arguments["timeout"])
+
+            let deadline = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: calls[1].arguments,
+                implicitLifecycleCompatibilityGuard: TimeInterval(
+                    MCPTimeoutPolicy.maximumSupportedSubagentDefaultWaitSeconds
+                )
+            )
+            XCTAssertEqual(deadline, MCPTimeoutPolicy.cliImplicitLifecycleCompatibilityGuardSeconds)
+            await settingsGate.release()
+        }
+
+        /// A request registered but never reported as delivered must unwind on cancellation;
+        /// otherwise the preflight budget cannot end a wait parked in the send barrier.
+        func testSendBarrierWaitUnwindsOnCancellation() async throws {
+            let barrier = MCPRequestSendBarrier()
+            let requestID: ID = .string("stalled-request")
+            await barrier.register(requestID: requestID)
+
+            let waiting = Task<Void, Error> {
+                try await barrier.waitUntilSent(requestID: requestID)
+            }
+            // The transport never reports delivery for this request.
+            waiting.cancel()
+
+            do {
+                try await waiting.value
+                XCTFail("Expected the abandoned send barrier wait to throw")
+            } catch is MCPRequestSendBarrierError {
+                // Expected: the registration is abandoned rather than parked forever.
+            }
+        }
+
+        /// The documented preflight budget covers registration and send, not only the response,
+        /// so a stalled send barrier cannot park an implicit lifecycle wait indefinitely.
+        func testImplicitLifecyclePreflightBudgetCoversStalledSend() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let sendStall = ExportCLIFirstSendStall()
+            let timeoutGate = ExportCLIAsyncGate()
+            let monotonicClock = ExportCLIMonotonicClock()
+            let server = Server(
+                name: "CLI implicit lifecycle stalled send server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle stalled send client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let budgetSleeps = ExportCLIBudgetOnlySleepGate(budgetGate: timeoutGate)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier,
+                requestSendWillStart: { await sendStall.stallFirstSend() },
+                timeoutSleep: { nanoseconds in
+                    monotonicClock.advance(by: nanoseconds)
+                    try await budgetSleeps.sleep(nanoseconds: nanoseconds)
+                },
+                timeoutNowNanoseconds: { monotonicClock.value() }
+            )
+
+            let task = Task<Void, Error> {
+                try await session.callTool(
+                    name: "agent_run",
+                    arguments: ["op": .string("wait"), "session_id": .string("session-a")]
+                )
+            }
+
+            // The budget timer runs while the settings request is still inside its send phase.
+            await sendStall.stalled.wait()
+            await timeoutGate.waitUntilArrived()
+            await timeoutGate.release()
+
+            _ = try await task.value
+
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.map(\.name), ["agent_run"], "stalled settings send must not reach the server")
+            XCTAssertNil(calls[0].arguments["timeout"])
+        }
+
+        /// A server that rejects the unknown settings key with a JSON-RPC error is an older
+        /// server, not a reason to fail the caller's lifecycle call.
+        func testImplicitLifecyclePreflightUsesCompatibilityGuardWhenSettingsToolErrors() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let server = Server(
+                name: "CLI implicit lifecycle settings error server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                if params.name == "app_settings" {
+                    throw MCPError.invalidParams("Unknown setting key")
+                }
+                return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle settings error client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier
+            )
+
+            _ = try await session.callTool(
+                name: "agent_run",
+                arguments: ["op": .string("wait"), "session_id": .string("session-a")]
+            )
+
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.map(\.name), ["app_settings", "agent_run"])
+            XCTAssertNil(calls[1].arguments["timeout"])
+        }
+
+        /// The preflight suspends before routing is injected, so a concurrent selection change
+        /// must not retarget a lifecycle call that was already under way.
+        func testImplicitLifecyclePreflightFreezesWindowAndContextRouting() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let settingsGate = ExportContractUncooperativeGate()
+            let settingsStarted = ExportCLIAsyncSignal()
+            let server = Server(
+                name: "CLI implicit lifecycle routing server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                if params.name == "app_settings" {
+                    await settingsStarted.signal()
+                    await settingsGate.wait()
+                    let text = """
+                    {"op":"get","status":"ok","values":{"\(MCPTimeoutPolicy.subagentDefaultWaitSettingsKey)":600}}
+                    """
+                    return .init(content: [.text(text: text, annotations: nil, _meta: nil)], isError: false)
+                }
+                return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle routing client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier
+            )
+            await session.setSelectedWindowID(1)
+            await session.setSelectedContextID("context-a")
+
+            let task = Task<Void, Error> {
+                try await session.callTool(
+                    name: "agent_run",
+                    arguments: ["op": .string("wait"), "session_id": .string("session-a")]
+                )
+            }
+
+            await settingsStarted.wait()
+            await session.setSelectedWindowID(2)
+            await session.setSelectedContextID("context-b")
+            await settingsGate.release()
+
+            _ = try await task.value
+
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.map(\.name), ["app_settings", "agent_run"])
+            XCTAssertEqual(calls[1].arguments["_windowID"]?.intValue, 1)
+            XCTAssertEqual(calls[1].arguments["context_id"]?.stringValue, "context-a")
+        }
+
+        func testImplicitLifecyclePreflightAbortsOnCallerCancellation() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let settingsSuspension = ExportCLICancellationSuspension()
+            let settingsStarted = ExportCLIAsyncSignal()
+            let server = Server(
+                name: "CLI implicit lifecycle cancellation server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                if params.name == "app_settings" {
+                    await settingsStarted.signal()
+                    do {
+                        try await settingsSuspension.wait()
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    }
+                }
+                return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle cancellation client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier
+            )
+
+            let lifecycleArgs: [String: Value] = [
+                "op": .string("wait"),
+                "session_id": .string("session-a")
+            ]
+            let task = Task<Void, Error> {
+                try await session.callTool(name: "agent_run", arguments: lifecycleArgs)
+            }
+            await settingsStarted.wait()
+            task.cancel()
+
+            do {
+                _ = try await task.value
+                XCTFail("Expected caller cancellation")
+            } catch is CancellationError {
+                // Expected.
+            }
+
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.map(\.name), ["app_settings"])
+        }
+
+        func testImplicitLifecyclePreflightAbortsOnConnectionReplacement() async throws {
+            let transports = await InMemoryTransport.createConnectedPair()
+            let recorder = ExportCLIToolArgumentsRecorder()
+            let settingsGate = ExportContractUncooperativeGate()
+            let settingsStarted = ExportCLIAsyncSignal()
+            let server = Server(
+                name: "CLI implicit lifecycle replacement server",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            await server.withMethodHandler(CallTool.self) { params in
+                await recorder.record(name: params.name, arguments: params.arguments ?? [:])
+                if params.name == "app_settings" {
+                    await settingsStarted.signal()
+                    await settingsGate.wait()
+                }
+                return .init(content: [.text(text: "ok", annotations: nil, _meta: nil)], isError: false)
+            }
+            try await server.start(transport: transports.server)
+            let requestSendBarrier = MCPRequestSendBarrier()
+            let clientTransport = OrderedMCPTransport(
+                underlying: transports.client,
+                requestSendBarrier: requestSendBarrier,
+                logger: transports.client.logger
+            )
+            let client = Client(name: "CLI implicit lifecycle replacement client", version: "1.0")
+            _ = try await client.connect(transport: clientTransport)
+            let session = InteractiveMCPClientSession(
+                connectedClientForTesting: client,
+                requestSendBarrier: requestSendBarrier
+            )
+
+            let lifecycleArgs: [String: Value] = [
+                "op": .string("wait"),
+                "session_id": .string("session-a")
+            ]
+            let task = Task<Void, Error> {
+                try await session.callTool(name: "agent_run", arguments: lifecycleArgs)
+            }
+            await settingsStarted.wait()
+
+            let replacementTransports = await InMemoryTransport.createConnectedPair()
+            let replacementServer = Server(
+                name: "CLI implicit lifecycle replacement server 2",
+                version: "1.0",
+                capabilities: .init(tools: .init())
+            )
+            try await replacementServer.start(transport: replacementTransports.server)
+            let replacementBarrier = MCPRequestSendBarrier()
+            let replacementTransport = OrderedMCPTransport(
+                underlying: replacementTransports.client,
+                requestSendBarrier: replacementBarrier,
+                logger: replacementTransports.client.logger
+            )
+            let replacementClient = Client(name: "CLI implicit lifecycle replacement client 2", version: "1.0")
+            _ = try await replacementClient.connect(transport: replacementTransport)
+            await session.test_replaceConnectedClient(replacementClient, requestSendBarrier: replacementBarrier)
+            await settingsGate.release()
+
+            do {
+                _ = try await task.value
+                XCTFail("Expected connection replacement failure")
+            } catch let error as InteractiveSessionError {
+                guard case .connectionReset = error else {
+                    XCTFail("Expected connection reset, got \(error)")
+                    return
+                }
+            }
+
+            let calls = await recorder.snapshot()
+            XCTAssertEqual(calls.map(\.name), ["app_settings"])
+        }
+
+        func testAgentLifecycleExplicitClientDeadlinesPreserveOverrides() async {
+            let session = makeUnconnectedSession()
+            let ordinaryDeadline = MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+            let cases: [(label: String, policy: ToolCallTimeoutPolicy, toolName: String, arguments: [String: Value], expected: TimeInterval?)] = [
+                ("short explicit wait", .default, "agent_run", ["op": .string("wait"), "timeout": .int(30)], ordinaryDeadline),
+                ("longer explicit wait", .default, "agent_run", ["op": .string("wait"), "timeout": .int(600)], 630),
+                ("explicit zero wait", .default, "agent_run", ["op": .string("wait"), "timeout": .int(0)], nil),
+                ("detached start explicit timeout", .default, "agent_run", ["op": .string("start"), "detach": .bool(true), "timeout": .int(600), "message": .string("x")], 630),
+                ("invalid explicit wait", .default, "agent_run", ["op": .string("wait"), "timeout": .string("nope")], ordinaryDeadline),
+                ("explicit client finite policy", .seconds(90), "agent_run", ["op": .string("wait")], 90),
+                ("explicit client unbounded policy", .none, "agent_run", ["op": .string("wait")], nil),
+                ("ask_user explicit timeout", .default, "ask_user", ["timeout_seconds": .int(120)], ordinaryDeadline),
+                ("ordinary export tool", .default, "prompt", ["op": .string("export")], ordinaryDeadline)
+            ]
+
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    testCase.policy,
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                )
+                XCTAssertEqual(timeout, testCase.expected, testCase.label)
             }
         }
 
@@ -1508,6 +2165,46 @@ import XCTest
             await ignoredCancellationRelease.signal()
             await client.disconnect()
             await server.stop()
+        }
+    }
+
+    /// Drives only the settings-preflight budget from a test gate; every later deadline in the
+    /// same call sleeps for real so it can be cancelled normally instead of firing immediately.
+    private actor ExportCLIBudgetOnlySleepGate {
+        private let budgetGate: ExportCLIAsyncGate
+        private var sleeps = 0
+
+        init(budgetGate: ExportCLIAsyncGate) {
+            self.budgetGate = budgetGate
+        }
+
+        func sleep(nanoseconds: UInt64) async throws {
+            sleeps += 1
+            guard sleeps == 1 else {
+                try await Task.sleep(nanoseconds: nanoseconds)
+                return
+            }
+            await budgetGate.arriveAndWait()
+        }
+    }
+
+    /// Stalls the first request send only, so a test can hold the settings preflight inside its
+    /// send phase while the lifecycle request that follows proceeds normally. The stall is a
+    /// cancellable sleep, so preflight budget expiry unwinds it deterministically.
+    private final class ExportCLIFirstSendStall: @unchecked Sendable {
+        private let lock = NSLock()
+        private var didStall = false
+        let stalled = ExportCLIAsyncSignal()
+
+        func stallFirstSend() async {
+            let shouldStall = lock.withLock {
+                guard !didStall else { return false }
+                didStall = true
+                return true
+            }
+            guard shouldStall else { return }
+            await stalled.signal()
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
         }
     }
 
