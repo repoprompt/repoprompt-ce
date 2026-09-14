@@ -16,19 +16,11 @@ struct ContentViewSheetPresenter: ViewModifier {
                     onClose: { showWorkspaceSetup = false },
                     onWorkspaceCreated: { newWs in
                         Task {
-                            await viewModel.workspaceManager.createAndActivateWorkspace(
-                                name: newWs.name,
-                                repoPaths: newWs.repoPaths
-                            ) {
-                                // Do any UI steps before switching
-                                showWorkspaceSetup = false
-                            }
-                            // Auto-apply recommendations for the newly created workspace
-                            // Use activeWorkspaceID since createAndActivateWorkspace generates a new UUID
-                            if let wizardVM = recommendationWizardViewModel,
-                               let actualWorkspaceID = viewModel.workspaceManager.activeWorkspaceID
-                            {
-                                wizardVM.autoApplyForNewWorkspace(workspaceID: actualWorkspaceID)
+                            showWorkspaceSetup = false
+                            let result = await viewModel.workspaceManager.requestWorkspaceSwitch(to: newWs, saveState: false)
+
+                            if result.didSwitch, let wizardVM = recommendationWizardViewModel {
+                                wizardVM.autoApplyForNewWorkspace(workspaceID: newWs.id)
                             }
                         }
                     }

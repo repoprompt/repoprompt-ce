@@ -6,6 +6,45 @@ import XCTest
 
 @MainActor
 final class AgentChatTitlebarSafetyTests: XCTestCase {
+    func testActiveWorkspaceToolbarPresentationKeepsWorkspaceIdentityAcrossZeroOneAndSwitchStates() {
+        let zeroWorkspace = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: nil,
+            workspaceCount: 0,
+            instanceNumber: nil,
+            chatTitle: "RepoPrompt CE"
+        )
+        XCTAssertEqual(zeroWorkspace.workspaceTitle, "No Workspace")
+        XCTAssertEqual(zeroWorkspace.workspaceTooltip, "No saved workspaces")
+        XCTAssertEqual(zeroWorkspace.accessibilityLabel, "Active workspace: No Workspace. Chat: RepoPrompt CE")
+
+        let alpha = WorkspaceModel(name: "Alpha", repoPaths: [])
+        let oneWorkspace = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: alpha,
+            workspaceCount: 1,
+            instanceNumber: nil,
+            chatTitle: "T1 — Alpha chat"
+        )
+        XCTAssertEqual(oneWorkspace.workspaceTitle, "Alpha")
+        XCTAssertEqual(oneWorkspace.chatTitle, "T1 — Alpha chat")
+        XCTAssertEqual(oneWorkspace.workspaceTooltip, "Switch workspace")
+        XCTAssertTrue(oneWorkspace.showsDistinctChatTitle)
+
+        let beta = WorkspaceModel(name: "Beta", repoPaths: [])
+        let switchedWorkspace = ActiveWorkspaceToolbarPresentation(
+            activeWorkspace: beta,
+            workspaceCount: 2,
+            instanceNumber: nil,
+            chatTitle: "T2 — Continued task"
+        )
+        XCTAssertEqual(switchedWorkspace.workspaceTitle, "Beta")
+        XCTAssertEqual(switchedWorkspace.chatTitle, "T2 — Continued task")
+        XCTAssertEqual(
+            switchedWorkspace.accessibilityLabel,
+            "Active workspace: Beta. Chat: T2 — Continued task"
+        )
+        XCTAssertNotEqual(switchedWorkspace.workspaceTitle, oneWorkspace.workspaceTitle)
+    }
+
     func testButtonPointerStandardAndAccessibilityActivationUseTargetAction() throws {
         let probe = ButtonActionProbe()
         let button = AgentChatOptionsButton()
