@@ -117,10 +117,7 @@ enum AgentModelCatalog {
             case .general:
                 true
             case .headless:
-                // Antigravity and Devin are interactive-only; their headless factories
-                // return `UnsupportedHeadlessAgentProvider`, so they must never be offered
-                // to Context Builder or delegated runs.
-                agentKind != .antigravity && agentKind != .devin
+                agentKind != .antigravity
             }
         }
     }
@@ -270,8 +267,8 @@ enum AgentModelCatalog {
             // Grok's default follows its own configuration.
             return AgentModel.defaultModel.rawValue
         }
-        if agentKind == .antigravity {
-            return resolvedACPDiscoveredModels(for: .antigravity)?.preferredModelRaw ?? ""
+        if agentKind == .antigravity || agentKind == .devin {
+            return resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw ?? ""
         }
         if isAgentAvailable(agentKind, availability: availability),
            let preferredModelRaw = resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw
@@ -284,9 +281,9 @@ enum AgentModelCatalog {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
-        case .codexExec, .openCode, .grokBuild, .devin:
+        case .codexExec, .openCode, .grokBuild:
             return AgentModel.defaultModel.rawValue
-        case .antigravity:
+        case .antigravity, .devin:
             return ""
         }
     }
@@ -364,8 +361,8 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return CursorAIModelCatalog.options
         }
-        if agentKind == .antigravity {
-            return resolvedACPDiscoveredModels(for: .antigravity)?.options ?? []
+        if agentKind == .antigravity || agentKind == .devin {
+            return resolvedACPDiscoveredModels(for: agentKind)?.options ?? []
         }
         if agentKind == .grokBuild {
             let fallback = staticOption(.defaultModel, for: .grokBuild)
@@ -397,11 +394,11 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
-        case .openCode, .cursor, .grokBuild, .devin:
+        case .openCode, .cursor, .grokBuild:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
-        case .antigravity:
+        case .antigravity, .devin:
             return []
         }
     }
@@ -424,8 +421,8 @@ enum AgentModelCatalog {
         {
             return true
         }
-        if agentKind == .antigravity {
-            return resolvedACPDiscoveredModels(for: .antigravity)?.contains(rawModel: normalized) == true
+        if agentKind == .antigravity || agentKind == .devin {
+            return resolvedACPDiscoveredModels(for: agentKind)?.contains(rawModel: normalized) == true
         }
         if let discoveredModels = resolvedACPDiscoveredModels(for: agentKind) {
             return discoveredModels.contains(rawModel: normalized)

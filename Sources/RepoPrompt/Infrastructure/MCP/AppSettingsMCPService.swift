@@ -1415,8 +1415,10 @@ private enum AppSettingsMCPRegistry {
             .codex
         case .openCode:
             .openCode
-        case .antigravity, .devin:
+        case .antigravity:
             nil
+        case .devin:
+            .devin
         case .cursor:
             .cursor
         case .grokBuild:
@@ -1443,6 +1445,7 @@ private enum AppSettingsMCPRegistry {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .devin: "devin"
         }
     }
 

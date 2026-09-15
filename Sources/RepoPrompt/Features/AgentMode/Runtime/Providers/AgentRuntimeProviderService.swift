@@ -185,7 +185,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         case .grokBuild:
             return "xAI Grok Build ACP agent. Uses Grok Build's ACP runtime (`grok agent stdio`) and injects RepoPrompt MCP tools through ACP session configuration."
         case .devin:
-            return "Installed Devin ACP agent for interactive Agent Mode. Devin owns authentication, model selection, and internal tools; RepoPrompt injects its MCP tools."
+            return "Installed Devin ACP agent for Agent Mode, Context Builder, and delegated runs. RepoPrompt injects its MCP tools through an isolated configuration overlay."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -343,8 +343,13 @@ final class AgentRuntimeProviderService {
                 reason: "Google Antigravity is currently supported only in interactive Agent Mode. Choose another provider for Context Builder or delegated headless runs."
             )
         case .devin:
-            return UnsupportedHeadlessAgentProvider(
-                reason: "Devin CLI is currently supported only in interactive Agent Mode. Choose another provider for Context Builder or delegated headless runs."
+            return DevinACPHeadlessAgentProvider(
+                config: DevinAgentConfig(
+                    enableDebugLogging: Self.enableDebugLogging,
+                    includeRepoPromptMCPServer: true,
+                    modelString: modelString
+                ),
+                workspacePath: workspacePath
             )
         }
     }

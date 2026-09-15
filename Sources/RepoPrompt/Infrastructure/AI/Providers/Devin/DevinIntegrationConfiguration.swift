@@ -10,12 +10,35 @@ enum DevinIntegrationConfiguration {
         let cleanupArtifact: ACPLaunchCleanupArtifact
     }
 
+    enum MCPServersPolicy {
+        case mergeRepoPrompt(RepoPromptMCPServerConfiguration)
+        case disableAll
+    }
+
     static func prepare(
         workingDirectory: String,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration,
         sourceEnvironment: [String: String]
     ) throws -> PreparedConfiguration {
-        try repoPromptMCPConfiguration.validateACPLaunchCommand(workingDirectory: workingDirectory)
+        try prepare(
+            workingDirectory: workingDirectory,
+            mcpServers: .mergeRepoPrompt(repoPromptMCPConfiguration),
+            sourceEnvironment: sourceEnvironment
+        )
+    }
+
+    static func prepare(
+        workingDirectory: String,
+        mcpServers policy: MCPServersPolicy,
+        sourceEnvironment: [String: String]
+    ) throws -> PreparedConfiguration {
+        let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration? = switch policy {
+        case let .mergeRepoPrompt(configuration):
+            configuration
+        case .disableAll:
+            nil
+        }
+        try repoPromptMCPConfiguration?.validateACPLaunchCommand(workingDirectory: workingDirectory)
 
         let id = UUID()
         let root = configurationRoot(id: id)
@@ -47,31 +70,34 @@ enum DevinIntegrationConfiguration {
 
             let sourceMCPURL = sourceDevinDirectory.appendingPathComponent("mcp_config.json")
             var rootObject = try existingMCPRootObject(at: sourceMCPURL)
-            var servers = rootObject["mcpServers"] as? [String: Any] ?? [:]
-            var server: [String: Any] = [
-                "transport": "stdio",
-                "command": repoPromptMCPConfiguration.command,
-                "args": repoPromptMCPConfiguration.args
-            ]
-            if !repoPromptMCPConfiguration.env.isEmpty {
-                server["env"] = repoPromptMCPConfiguration.environmentDictionary
-            }
-            servers[repoPromptMCPConfiguration.name] = server
-            // The overlay is for Devin, not for its MCP children. Preserve the native
-            // config root for known stdio entries without overriding explicit server env.
-            for (name, value) in servers {
-                guard var child = value as? [String: Any],
-                      child["transport"] as? String == "stdio",
-                      child["env"] == nil || child["env"] is [String: String]
-                else { continue }
-                var environment = child["env"] as? [String: String] ?? [:]
-                if environment["XDG_CONFIG_HOME"] == nil {
-                    // A child HOME override owns the fallback when native XDG is unset.
-                    let nativeEnvironment = sourceEnvironment.merging(environment) { _, child in child }
-                    environment["XDG_CONFIG_HOME"] = sourceConfigurationRoot(environment: nativeEnvironment).path
+            var servers: [String: Any] = [:]
+            if let repoPromptMCPConfiguration {
+                servers = rootObject["mcpServers"] as? [String: Any] ?? [:]
+                var server: [String: Any] = [
+                    "transport": "stdio",
+                    "command": repoPromptMCPConfiguration.command,
+                    "args": repoPromptMCPConfiguration.args
+                ]
+                if !repoPromptMCPConfiguration.env.isEmpty {
+                    server["env"] = repoPromptMCPConfiguration.environmentDictionary
                 }
-                child["env"] = environment
-                servers[name] = child
+                servers[repoPromptMCPConfiguration.name] = server
+                // The overlay is for Devin, not for its MCP children. Preserve the native
+                // config root for known stdio entries without overriding explicit server env.
+                for (name, value) in servers {
+                    guard var child = value as? [String: Any],
+                          child["transport"] as? String == "stdio",
+                          child["env"] == nil || child["env"] is [String: String]
+                    else { continue }
+                    var environment = child["env"] as? [String: String] ?? [:]
+                    if environment["XDG_CONFIG_HOME"] == nil {
+                        // A child HOME override owns the fallback when native XDG is unset.
+                        let nativeEnvironment = sourceEnvironment.merging(environment) { _, child in child }
+                        environment["XDG_CONFIG_HOME"] = sourceConfigurationRoot(environment: nativeEnvironment).path
+                    }
+                    child["env"] = environment
+                    servers[name] = child
+                }
             }
             rootObject["mcpServers"] = servers
             let data = try JSONSerialization.data(

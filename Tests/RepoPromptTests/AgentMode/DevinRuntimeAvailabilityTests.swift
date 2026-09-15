@@ -90,15 +90,15 @@ final class DevinRuntimeAvailabilityTests: XCTestCase {
         XCTAssertFalse(agents.contains(.devin))
     }
 
-    func testInstalledDevinIsStillExcludedFromTheHeadlessSurface() {
-        // Headless/Context Builder runs get `UnsupportedHeadlessAgentProvider` for Devin,
-        // so installation must not make it offerable there.
+    func testInstalledDevinIsSelectableInTheHeadlessSurface() {
+        // Headless Context Builder and delegated runs use the isolated RepoPrompt MCP overlay,
+        // so an installed Devin runtime is offerable on both selection surfaces.
         let agents = AgentModelCatalog.selectableAgents(
             availability: availability(devinInstalled: true),
             surface: .headless
         )
-        XCTAssertFalse(agents.contains(.devin))
-        XCTAssertFalse(AgentModelCatalog.AgentSelectionSurface.headless.allows(.devin))
+        XCTAssertTrue(agents.contains(.devin))
+        XCTAssertTrue(AgentModelCatalog.AgentSelectionSurface.headless.allows(.devin))
         XCTAssertTrue(AgentModelCatalog.AgentSelectionSurface.general.allows(.devin))
     }
 

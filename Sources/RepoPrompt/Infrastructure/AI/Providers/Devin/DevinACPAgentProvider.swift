@@ -129,6 +129,13 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         }
     }
 
+    func shouldEmitStderrLine(_ line: String) -> Bool {
+        line.range(
+            of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+INFO\s+"#,
+            options: .regularExpression
+        ) == nil
+    }
+
     func normalizeError(_ error: Error) -> Error {
         if error is AIProviderError { return error }
         if let runnerError = error as? CLIProcessRunnerError,

@@ -304,6 +304,104 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(launch.arguments, ["--permission-mode", "auto", "acp"])
     }
 
+    func testRoutineInfoStderrIsHiddenWhileActionableOutputRemainsVisible() throws {
+        let (provider, _) = try makeProvider()
+
+        XCTAssertFalse(provider.shouldEmitStderrLine(
+            "2026-09-14T09:52:20.134260Z  INFO chisel: elapsed_since_main_ms=4 logging initialized"
+        ))
+        XCTAssertFalse(provider.shouldEmitStderrLine(
+            "2026-09-14T09:52:20Z INFO chisel: logging initialized"
+        ))
+        XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z ERROR chisel: startup failed"))
+        XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z  WARN chisel: retrying"))
+        XCTAssertTrue(provider.shouldEmitStderrLine("permission denied while reading config"))
+    }
+
+    func testOracleOneShotArgumentsUseSelectedModelAndPromptFile() {
+        XCTAssertEqual(
+            DevinCLIProvider.test_arguments(
+                modelName: "claude-opus-4-6",
+                promptFilePath: "/tmp/prompt.md"
+            ),
+            [
+                "--model", "claude-opus-4-6",
+                "--respect-workspace-trust", "false",
+                "--permission-mode", "auto",
+                "--prompt-file", "/tmp/prompt.md",
+                "-p"
+            ]
+        )
+    }
+
+    func testOracleOneShotPromptRequestsOnePlainAnswerWithoutTools() {
+        let prompt = DevinCLIProvider.test_promptText(from: AIMessage(
+            systemPrompt: "Return Markdown.",
+            userMessage: "Summarize this."
+        ))
+
+        XCTAssertTrue(prompt.contains("Return Markdown."))
+        XCTAssertTrue(prompt.contains("Summarize this."))
+        XCTAssertTrue(prompt.contains("Do not use any tools"))
+    }
+
+    func testOracleModelIdentityPreservesRawDevinModelID() {
+        let model = AIModel.devinCustom(name: "anthropic/claude-opus-4.6")
+
+        XCTAssertEqual(model.rawValue, "devin_custom_anthropic/claude-opus-4.6")
+        XCTAssertEqual(model.modelName, "anthropic/claude-opus-4.6")
+        XCTAssertEqual(model.providerType, .devin)
+        XCTAssertEqual(AIModel.fromModelName(model.rawValue), model)
+    }
+
+    func testDevinPickersExposeOnlyAdvertisedModels() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .devin)
+        addTeardownBlock { AgentACPModelRegistry.shared.test_reset(providerID: .devin) }
+        let availability = AgentModelCatalog.AvailabilityContext(devinAvailable: true)
+
+        XCTAssertTrue(AgentModelCatalog.options(for: .devin, availability: availability).isEmpty)
+        XCTAssertFalse(AgentModelCatalog.isValid(rawModel: "default", for: .devin, availability: availability))
+
+        let options = [
+            AgentModelOption(rawValue: "swe-2-high", displayName: "SWE-2 High", description: nil, isDefault: true),
+            AgentModelOption(rawValue: "gpt-5-6-sol-medium", displayName: "GPT-5.6 Sol Medium Thinking", description: nil, isDefault: false)
+        ]
+        AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(options: options, currentModelRaw: "swe-2-high"),
+            for: .devin
+        )
+
+        XCTAssertEqual(Set(AgentModelCatalog.options(for: .devin, availability: availability)), Set(options))
+        XCTAssertEqual(AgentModelCatalog.defaultModelRaw(for: .devin, availability: availability), "swe-2-high")
+        XCTAssertEqual(Set(ACPAIModelCatalog.devinModelsFromStore().map(\.modelName)), Set(options.map(\.rawValue)))
+        XCTAssertFalse(ACPAIModelCatalog.devinModelsFromStore().contains(.devinCustom(name: "default")))
+    }
+
+    func testHeadlessMCPRunPinsAutoWhileOracleKeepsProviderDefault() {
+        let message = AgentMessage(systemPrompt: "system", userMessage: "prompt")
+        let headless = DevinACPHeadlessAgentProvider.makeRunRequest(
+            config: DevinAgentConfig(includeRepoPromptMCPServer: true),
+            workspacePath: "/tmp/workspace",
+            message: message
+        )
+        let oracle = DevinACPHeadlessAgentProvider.makeRunRequest(
+            config: DevinAgentConfig(includeRepoPromptMCPServer: false),
+            workspacePath: nil,
+            message: message
+        )
+
+        XCTAssertEqual(headless.launchPermissionMode, "auto")
+        XCTAssertNil(oracle.launchPermissionMode)
+        XCTAssertTrue(AgentModelCatalog.AgentSelectionSurface.headless.allows(.devin))
+        XCTAssertTrue(
+            AgentRuntimeProviderService.shared.makeProvider(
+                for: .devin,
+                modelString: "swe-2-high",
+                workspacePath: "/tmp/workspace"
+            ) is DevinACPHeadlessAgentProvider
+        )
+    }
+
     // MARK: - Controller reuse key
 
     func testControllerReuseKeysOnTheLaunchPermissionMode() async throws {
@@ -471,6 +569,46 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
             try JSONSerialization.data(withJSONObject: sourceMCP)
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: overlayRoot.path))
+    }
+
+    func testDisableAllMCPOverlayPreservesConfigWithoutNativeServers() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationNoMCP")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        try "native config".write(
+            to: devinSource.appendingPathComponent("config.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let sourceMCP: [String: Any] = [
+            "mcpServers": ["Existing": ["transport": "stdio", "command": "existing"]]
+        ]
+        let sourceMCPURL = devinSource.appendingPathComponent("mcp_config.json")
+        try JSONSerialization.data(withJSONObject: sourceMCP).write(to: sourceMCPURL)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            mcpServers: .disableAll,
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayRoot = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+        let overlayDevin = overlayRoot.appendingPathComponent("devin", isDirectory: true)
+        let overlayMCP = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: overlayDevin.appendingPathComponent("mcp_config.json"))
+            ) as? [String: Any]
+        )
+
+        XCTAssertEqual((overlayMCP["mcpServers"] as? [String: Any])?.count, 0)
+        XCTAssertNotNil(try? FileManager.default.destinationOfSymbolicLink(
+            atPath: overlayDevin.appendingPathComponent("config.json").path
+        ))
+
+        try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
+        XCTAssertEqual(
+            try Data(contentsOf: sourceMCPURL),
+            try JSONSerialization.data(withJSONObject: sourceMCP)
+        )
     }
 
     func testMalformedSourceMCPDoesNotLeaveAnOverlay() throws {

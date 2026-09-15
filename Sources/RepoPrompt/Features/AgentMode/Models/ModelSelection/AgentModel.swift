@@ -306,11 +306,7 @@ enum AgentModel: String, CaseIterable, Codable {
             [.defaultModel]
         case .grokBuild:
             [.defaultModel]
-        case .devin:
-            // Devin owns model selection; RepoPrompt offers only the provider default here
-            // and surfaces ACP-discovered models when the session advertises them.
-            [.defaultModel]
-        case .antigravity:
+        case .antigravity, .devin:
             []
         case .cursor:
             [.cursorAuto, .cursorComposer2]
