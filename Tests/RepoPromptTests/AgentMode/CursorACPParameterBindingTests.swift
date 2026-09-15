@@ -193,8 +193,100 @@ final class CursorACPParameterBindingTests: XCTestCase {
         XCTAssertEqual(recordedMutationRequests(at: fixture.recordURL).first?.params["value"] as? String, "High")
     }
 
-    func testOpenCodeDoesNotAdvertiseParameterizedModelPickerCapability() async throws {
-        let fixture = try makeFixture(shape: "modern", providerID: .openCode)
+    func testUntouchedCursorCatalogFallbackPreservesLiveEffortThroughPromptDispatch() async throws {
+        XCTAssertEqual(
+            ACPModelParameterResolver.resolve(
+                providerID: .cursor,
+                selectedModelRaw: "grok-4.6",
+                persistedSelections: []
+            ).first(where: { $0.definition.kind == .thinking })?.selectedChoice.rawValue,
+            "high"
+        )
+
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_PARAMETERS": "1",
+                "ACP_OBSERVED_EFFORT_SELECTOR": "1"
+            ],
+            providerID: .cursor
+        )
+        _ = try await fixture.controller.bootstrap()
+
+        let discoveredSnapshot = await fixture.controller.currentDiscoveredSessionModels()
+        let liveEffort = try XCTUnwrap(
+            discoveredSnapshot?.modelParameterSets
+                .first(where: { $0.baseModelRaw == "model-a" })?
+                .parameters.first(where: { $0.kind == .thinking })?
+                .currentValueRaw
+        )
+        XCTAssertEqual(liveEffort, "medium")
+
+        let modelParameterSelections = ACPModelParameterResolver.effectiveSelections(
+            providerID: .cursor,
+            selectedModelRaw: "grok-4.6",
+            persistedSelections: []
+        )
+        XCTAssertTrue(modelParameterSelections.isEmpty)
+
+        let report = try await fixture.controller.applySessionModelParameterSelections(modelParameterSelections)
+        XCTAssertTrue(report.applied.isEmpty)
+        XCTAssertTrue(report.skipped.isEmpty)
+
+        try await fixture.controller.setSessionMode("plan")
+        try await fixture.controller.prompt(
+            AgentMessage(userMessage: "Preserve live effort"),
+            request: ACPRunRequest(
+                agentKind: .cursor,
+                modelString: "grok-4.6",
+                workspacePath: nil,
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil,
+                sessionModeID: "plan",
+                modelParameterSelections: modelParameterSelections
+            )
+        )
+        await fixture.controller.shutdown()
+
+        let effortMutations = recordedMutationRequests(at: fixture.recordURL).filter {
+            ($0.params["configId"] as? String) == "effort"
+        }
+        XCTAssertTrue(effortMutations.isEmpty)
+        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/prompt").count, 1)
+    }
+
+    func testOpenCodeApplyMatchesParameterSetUsingProviderCanonicalIdentity() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: ["ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1"],
+            providerID: .openCode,
+            supportsParameterizedModelPicker: true
+        )
+        _ = try await fixture.controller.bootstrap()
+
+        let report = try await fixture.controller.applySessionModelParameterSelections([.init(
+            providerID: .openCode,
+            baseModelRaw: "MODEL-A",
+            kind: .thinking,
+            configID: "Cursor.Thought-Level",
+            valueRaw: "High"
+        )])
+
+        XCTAssertEqual(report.applied.map(\.valueRaw), ["High"])
+        XCTAssertTrue(report.skipped.isEmpty)
+        let mutation = try XCTUnwrap(recordedMutationRequests(at: fixture.recordURL).first)
+        XCTAssertEqual(mutation.params["configId"] as? String, "Cursor.Thought-Level")
+        XCTAssertEqual(mutation.params["value"] as? String, "High")
+    }
+
+    func testACPInitializeOmitsParameterizedPickerWhenCapabilityDisabled() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            providerID: .openCode,
+            supportsParameterizedModelPicker: false
+        )
         _ = try await fixture.controller.bootstrap()
         await fixture.controller.shutdown()
 
@@ -340,7 +432,8 @@ final class CursorACPParameterBindingTests: XCTestCase {
         shape _: String,
         extraEnvironment: [String: String] = [:],
         providerID: ACPProviderID = .openCode,
-        resumeSessionID: String? = nil
+        resumeSessionID: String? = nil,
+        supportsParameterizedModelPicker: Bool? = nil
     ) throws -> Fixture {
         let workspace = try makeTestDirectory(name: "CursorACPParameterBindingTests")
         let recordURL = workspace.appendingPathComponent("requests.jsonl")
@@ -352,7 +445,8 @@ final class CursorACPParameterBindingTests: XCTestCase {
         let provider = CursorParameterBindingProvider(
             commandPath: scriptURL.path,
             environment: environment,
-            providerID: providerID
+            providerID: providerID,
+            supportsParameterizedModelPicker: supportsParameterizedModelPicker
         )
         let controller = try ACPAgentSessionController(
             provider: provider,
@@ -456,12 +550,25 @@ private struct CursorParameterBindingProvider: ACPAgentProvider {
     var environment: [String: String] = [:]
 
     let providerID: ACPProviderID
+    var supportsParameterizedModelPickerOverride: Bool?
     var supportsParameterizedModelPicker: Bool {
-        providerID == .cursor
+        supportsParameterizedModelPickerOverride ?? (providerID == .cursor)
+    }
+
+    init(
+        commandPath: String,
+        environment: [String: String] = [:],
+        providerID: ACPProviderID,
+        supportsParameterizedModelPicker: Bool? = nil
+    ) {
+        self.commandPath = commandPath
+        self.environment = environment
+        self.providerID = providerID
+        supportsParameterizedModelPickerOverride = supportsParameterizedModelPicker
     }
 
     func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
-        guard providerID == .cursor else { return nil }
+        guard supportsParameterizedModelPicker else { return nil }
         return CursorACPAgentProvider(config: CursorAgentConfig()).modelParameterKind(for: input)
     }
 

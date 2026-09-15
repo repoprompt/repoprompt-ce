@@ -150,13 +150,13 @@ final class AgentModeRunService {
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
                 sessionModeID: runtimePermission.acpSessionModeID,
                 autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-                modelParameterSelections: selectedAgent == .cursor
-                    ? ACPModelParameterResolver.effectiveSelections(
-                        providerID: .cursor,
+                modelParameterSelections: selectedAgent.acpProviderID.map { providerID in
+                    ACPModelParameterResolver.effectiveSelections(
+                        providerID: providerID,
                         selectedModelRaw: session.selectedModelRaw,
                         persistedSelections: session.acpModelParameterSelections
                     )
-                    : []
+                } ?? []
             )
         } else {
             nil
@@ -284,13 +284,13 @@ final class AgentModeRunService {
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             sessionModeID: runtimePermission.acpSessionModeID,
             autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-            modelParameterSelections: selectedAgent == .cursor
-                ? ACPModelParameterResolver.effectiveSelections(
-                    providerID: .cursor,
+            modelParameterSelections: selectedAgent.acpProviderID.map { providerID in
+                ACPModelParameterResolver.effectiveSelections(
+                    providerID: providerID,
                     selectedModelRaw: session.selectedModelRaw,
                     persistedSelections: session.acpModelParameterSelections
                 )
-                : []
+            } ?? []
         )
         let sent = await acpRunner.submitActivePrompt(
             session: session,

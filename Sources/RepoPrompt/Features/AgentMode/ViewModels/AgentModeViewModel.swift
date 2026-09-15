@@ -330,6 +330,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             persistLastUsedModelIfNeeded(agent: selectedAgent, modelRaw: selectedModelRaw)
             refreshAutoEditPermissionGuidanceForActiveSession()
             updateDynamicModelPolling()
+            resyncOpenCodeModelParameterObservation()
             syncAllActiveUIState()
         }
     }
@@ -366,6 +367,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     reason: "selected_model_changed"
                 )
             }
+            resyncOpenCodeModelParameterObservation()
             syncComposerUIState()
             syncRuntimeMetricsUIState()
             syncRunInteractionUIState()
@@ -681,7 +683,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
-    private let workspacePathProvider: () -> String?
+    let workspacePathProvider: () -> String?
+    /// Source of demand-scoped OpenCode model-parameter observations for the composer. Defaults
+    /// to the shared polling service; the DEBUG test init can inject a scripted provider so
+    /// picker tests never touch a live ACP process.
+    private let openCodeModelParameterStreamProvider: (String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>
     private let skillCatalog: AgentSkillCatalog
     private let headlessProviderFactory: HeadlessProviderFactory
     private let acpProviderFactory: ACPProviderFactory
@@ -722,6 +728,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var pendingAssistantPresentationByTabID: [UUID: AssistantPresentationRequest] = [:]
     private var uiRefreshTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
+    /// Latest demand-scoped OpenCode model-parameter observation for the composer's current
+    /// target. Owned by the view model (not the polling actor); accepted deliveries are gated
+    /// on a captured tab/workspace/model target plus a monotonic generation so a stale stream
+    /// can never overwrite a newer target's state.
+    var openCodeModelParameterObservation: OpenCodeACPModelParameterSnapshot?
+    private var openCodeModelParameterObservationTask: Task<Void, Never>?
+    private var openCodeModelParameterObservationGeneration: UInt64 = 0
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private var antigravityModelsSubscriptionTask: Task<Void, Never>?
@@ -1517,19 +1530,59 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedModelRaw = rawModel
     }
 
-    func selectCursorModelParameter(configID: String, valueRaw: String) {
-        guard selectedAgent == .cursor,
+    func selectACPModelParameter(
+        _ target: ACPModelParameterSelection,
+        openCodeDiscoveryKey: OpenCodeACPModelParameterKey? = nil
+    ) {
+        guard let providerID = selectedAgent.acpProviderID,
+              providerID == target.providerID,
               let session = activeSession,
               !session.runState.isActive,
-              !isMCPControlled(tabID: session.tabID),
-              let parameterSet = ACPModelParameterResolver.cursorParameterSet(selectedModelRaw: selectedModelRaw)
+              !isMCPControlled(tabID: session.tabID)
         else { return }
-        guard let definition = parameterSet.definition(configID: configID),
-              let choice = definition.choice(matching: valueRaw)
+
+        // OpenCode selections must carry a live demand-scoped observation: the click is valid
+        // only against the exact (workspace, model) the displayed metadata came from. A missing
+        // or mismatched key rejects (never retargets). Cursor uses its static catalogue and
+        // needs no such authority.
+        let openCodeParameters: OpenCodeACPModelParameterSnapshot?
+        let openCodeAuthorityWorkspace: String?
+        if providerID == .openCode {
+            let observation = openCodeModelParameterObservation
+            guard let openCodeDiscoveryKey,
+                  let currentObservation = observation,
+                  openCodeDiscoveryKey == currentObservation.key,
+                  // The click is valid only against the authority derived by the SAME single
+                  // operation the projection used. A resolution that now fails returns nil and
+                  // rejects; a resolved key (which may legitimately hold workspacePath: nil)
+                  // must match the observation's key exactly.
+                  openCodeDiscoveryKey == openCodeParameterDiscoveryKey(session: session, modelRaw: selectedModelRaw)
+            else { return }
+            openCodeParameters = currentObservation
+            openCodeAuthorityWorkspace = currentObservation.key.workspacePath
+        } else {
+            openCodeParameters = nil
+            openCodeAuthorityWorkspace = nil
+        }
+
+        guard let parameterSet = ACPModelParameterResolver.parameterSet(
+            providerID: providerID,
+            selectedModelRaw: selectedModelRaw,
+            workspacePath: providerID == .openCode
+                ? openCodeAuthorityWorkspace
+                : (try? effectiveWorkspacePath(for: session)) ?? workspacePathProvider(),
+            openCodeParameters: openCodeParameters
+        )
+        else { return }
+        guard ACPModelParameterIdentity.canonicalBaseModelRaw(target.baseModelRaw, providerID: providerID)
+            == ACPModelParameterIdentity.canonicalBaseModelRaw(selectedModelRaw, providerID: providerID)
+        else { return }
+        guard let definition = parameterSet.definition(configID: target.configID),
+              let choice = definition.choice(matching: target.valueRaw)
         else { return }
 
         let selection = ACPModelParameterSelection(
-            providerID: .cursor,
+            providerID: providerID,
             baseModelRaw: parameterSet.baseModelRaw,
             kind: definition.kind,
             configID: definition.configID,
@@ -1823,7 +1876,120 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func stopOpenCodeModelsSubscription() {
         openCodeModelsSubscriptionTask?.cancel()
         openCodeModelsSubscriptionTask = nil
+        cancelOpenCodeModelParameterObservation()
     }
+
+    // MARK: - Demand-scoped OpenCode model-parameter observation
+
+    //
+    // The view model (not the polling actor) owns interest in the composer's displayed target.
+    // Resync on provider/model/tab/workspace change: cancel + clear synchronously, capture tab /
+    // workspace / model / generation, then subscribe immediately (including before any ACP
+    // session exists). Deliveries are accepted only while the captured target and generation
+    // still match, so a stale stream can never overwrite a newer target's state.
+    //
+    // The workspace key uses the same source that builds that tab's run request
+    // (`effectiveWorkspacePath(for:)` — worktree bindings with the workspace fallback), not the
+    // polling service's preferred workspace.
+    //
+    // Acquisition, the projection, and the setter all derive their authority through ONE
+    // operation (`openCodeParameterDiscoveryKey`), so they can never disagree: a resolution
+    // failure returns no key and every consumer withholds authority identically, while a
+    // resolved key may legitimately carry `workspacePath: nil` (no binding, no fallback)
+    // without being confused with "resolution failed".
+
+    /// The single authority derivation for OpenCode model-parameter acquisition, rendering, and
+    /// selection. Returns `nil` when the session's effective workspace fails to resolve —
+    /// withholding authority rather than discovering from a fallback root — so a failed
+    /// resolution is never collapsed into the (legitimate) nil-workspace key. A non-nil key is a
+    /// successful resolution that may still hold `workspacePath: nil` as a distinct context.
+    /// Internal (not `private`) so the `+ComposerUI` extension can project the same key.
+    func openCodeParameterDiscoveryKey(session: TabSession?, modelRaw: String) -> OpenCodeACPModelParameterKey? {
+        let workspacePath: String?
+        if let session {
+            do {
+                workspacePath = try effectiveWorkspacePath(for: session)
+            } catch {
+                return nil
+            }
+        } else {
+            workspacePath = workspacePathProvider()
+        }
+        return OpenCodeACPModelParameterKey(workspacePath: workspacePath, modelRaw: modelRaw)
+    }
+
+    private func resyncOpenCodeModelParameterObservation() {
+        openCodeModelParameterObservationTask?.cancel()
+        openCodeModelParameterObservationTask = nil
+        openCodeModelParameterObservation = nil
+        openCodeModelParameterObservationGeneration &+= 1
+        let generation = openCodeModelParameterObservationGeneration
+
+        guard usesProductionAgentDefaultsAndModelPolling,
+              selectedAgent == .openCode,
+              let tabID = currentTabID,
+              !selectedModelRaw.isEmpty
+        else { return }
+
+        let modelRaw = selectedModelRaw
+        let session = sessions[tabID]
+        // No key = the effective workspace failed to resolve: withhold authority (no
+        // subscription) rather than discover in a fallback directory.
+        guard let key = openCodeParameterDiscoveryKey(session: session, modelRaw: modelRaw) else { return }
+        let workspacePath = key.workspacePath
+        let streamProvider = openCodeModelParameterStreamProvider
+        openCodeModelParameterObservationTask = Task { [weak self, workspacePath, modelRaw] in
+            let stream = await streamProvider(workspacePath, modelRaw)
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                let matches = await MainActor.run { [weak self] () -> Bool in
+                    guard let self,
+                          openCodeModelParameterObservationGeneration == generation,
+                          currentTabID == tabID,
+                          selectedAgent == .openCode,
+                          selectedModelRaw == modelRaw
+                    else { return false }
+                    // Same construction as acquisition: a resolved key (possibly nil-workspace)
+                    // matches; a resolution that would now fail yields no key and rejects.
+                    guard snapshot.key == openCodeParameterDiscoveryKey(session: sessions[tabID], modelRaw: modelRaw)
+                    else { return false }
+                    openCodeModelParameterObservation = snapshot
+                    return true
+                }
+                // A rejected delivery rejects only this snapshot, never the subscription. The
+                // loop's exit conditions are cancellation and stream termination (checked
+                // above); a stale task exits via `guard !Task.isCancelled` on the next event, so
+                // `continue` leaks nothing. Using `return` here would let one stray or late
+                // foreign snapshot permanently kill a live subscription — and since resync only
+                // runs on agent/model/tab change, the effort control would then stay missing
+                // (silently) until the user happened to change one of those.
+                guard matches else { continue }
+                await MainActor.run { [weak self] in
+                    self?.syncComposerUIState()
+                }
+            }
+        }
+    }
+
+    private func cancelOpenCodeModelParameterObservation() {
+        openCodeModelParameterObservationTask?.cancel()
+        openCodeModelParameterObservationTask = nil
+        openCodeModelParameterObservation = nil
+        openCodeModelParameterObservationGeneration &+= 1
+    }
+
+    #if DEBUG
+        /// Test support: install a demand-scoped OpenCode model-parameter observation directly,
+        /// synchronously, bypassing the async subscription stream. Picker/selection tests use
+        /// this to drive `acpModelParameterControls` and the setter without a live ACP process.
+        /// `nil` clears any observation.
+        func test_setOpenCodeModelParameterObservation(_ observation: OpenCodeACPModelParameterSnapshot?) {
+            openCodeModelParameterObservationTask?.cancel()
+            openCodeModelParameterObservationTask = nil
+            openCodeModelParameterObservation = observation
+            openCodeModelParameterObservationGeneration &+= 1
+        }
+    #endif
 
     private func updateCursorModelPolling(startPolling: Bool = true) {
         guard selectedAgent == .cursor else {
@@ -2101,6 +2267,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
             Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
         workspacePathProvider = codexWorkspacePathProvider
+        openCodeModelParameterStreamProvider = { workspacePath, modelRaw in
+            await OpenCodeACPModelPollingService.shared.subscribeModelParameters(
+                workspacePath: workspacePath,
+                modelRaw: modelRaw
+            )
+        }
         attachmentWorkspaceDirectoryProvider = { [weak workspaceManager] in
             guard let workspaceManager, workspaceManager.activeWorkspace != nil else {
                 return nil
@@ -2331,7 +2503,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexStallWatchdogRecoveryThreshold: TimeInterval? = nil,
             testCodexStallWatchdogInactivityThreshold: TimeInterval? = nil,
             testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
-            testUsesProductionAgentDefaultsAndModelPolling: Bool = false
+            testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
+            testOpenCodeModelParameterStreamProvider: ((String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>)? = nil
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -2350,6 +2523,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
                 Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
             workspacePathProvider = codexWorkspacePathProvider
+            openCodeModelParameterStreamProvider = testOpenCodeModelParameterStreamProvider ?? { workspacePath, modelRaw in
+                await OpenCodeACPModelPollingService.shared.subscribeModelParameters(
+                    workspacePath: workspacePath,
+                    modelRaw: modelRaw
+                )
+            }
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
                 ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
@@ -4013,12 +4192,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workspaceSwitchInFlight = false
             activeSessionLoadInProgressTabID = nil
             applySessionToBindings(session)
+            resyncOpenCodeModelParameterObservation()
             return
         }
 
         activeSessionLoadInProgressTabID = tabID
         publishLoadingTranscriptPresentation(tabID: tabID)
         applySessionToBindings(session)
+        resyncOpenCodeModelParameterObservation()
         Task { [weak self] in
             guard let self else { return }
             await loadSessionFromDisk(for: session)

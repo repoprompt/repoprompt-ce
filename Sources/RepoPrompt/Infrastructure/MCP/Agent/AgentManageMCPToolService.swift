@@ -61,6 +61,11 @@ struct AgentManageMCPToolService {
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
     let cleanupDependencies: CleanupDependencies
+    /// One-shot demand-scoped OpenCode observation source for explicit model-parameter
+    /// resolution. Defaults to the live polling service; tests inject a scripted provider via the
+    /// initializer to capture the resolved workspace directly (no live ACP process, no mutable
+    /// global).
+    let openCodeOneShotObservationProvider: AgentMCPModelParameterSupport.OneShotObservationProvider
     #if DEBUG
         var test_resumeSetupBoundary: (@MainActor (_ afterActivation: Bool) async -> Void)?
         var testAfterTargetResolution: ((AgentModeViewModel.MCPSessionTarget) async -> Void)?
@@ -76,7 +81,8 @@ struct AgentManageMCPToolService {
         restrictDiscoveryToRoleLabels: @escaping @MainActor (_ workspaceID: UUID?) -> Bool = { workspaceID in
             GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
         },
-        cleanupDependencies: CleanupDependencies = .live
+        cleanupDependencies: CleanupDependencies = .live,
+        openCodeOneShotObservationProvider: @escaping AgentMCPModelParameterSupport.OneShotObservationProvider = AgentMCPModelParameterSupport.liveOneShotObservationProvider
     ) {
         self.toolName = toolName
         self.captureRequestMetadata = captureRequestMetadata
@@ -86,6 +92,7 @@ struct AgentManageMCPToolService {
         self.bindCurrentRequestToTab = bindCurrentRequestToTab
         self.restrictDiscoveryToRoleLabels = restrictDiscoveryToRoleLabels
         self.cleanupDependencies = cleanupDependencies
+        self.openCodeOneShotObservationProvider = openCodeOneShotObservationProvider
     }
 
     private struct HandoffSessionInfo {
@@ -209,9 +216,33 @@ struct AgentManageMCPToolService {
         let targetWindow = try requireTargetWindow()
         let availability = targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
         let workspaceID = targetWindow.workspaceManager.activeWorkspace?.id
+        let openCodeWorkspacePath = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first
         let rolesOnly = try parseBool(args["roles_only"], name: "roles_only", defaultValue: false)
         let restrictedDiscovery = restrictDiscoveryToRoleLabels(workspaceID)
         let omitAgentCatalog = rolesOnly || restrictedDiscovery
+        // Demand-scoped OpenCode enrichment is expensive: each uncached entry can drive a
+        // serialized disposable-controller probe. Restrict OpenCode enrichment to the
+        // advertised current/default model and dedupe canonical models so one enumeration
+        // performs at most one probe. Cursor is synchronous and cheap.
+        var probedOpenCodeCanonicals = Set<String>()
+        let openCodeCurrentModelRaw: String? = await OpenCodeACPModelPollingService.shared
+            .latestSnapshot()?.models.currentModelRaw
+        let openCodeEnrichmentTargetRaw = openCodeCurrentModelRaw
+            ?? AgentModelCatalog.discoveryAgents(availability: availability)
+            .first(where: { $0.agent.acpProviderID == .openCode })?.defaults.modelRaw
+        /// Returns whether an OpenCode enumeration for `agent`/`modelRaw` should acquire
+        /// metadata now: deduped per canonical model, and targeted at the advertised
+        /// current/default model only so list_agents never starts N serialized controllers.
+        func shouldEnrichOpenCodeModel(agent: AgentProviderKind, modelRaw: String) -> Bool {
+            guard agent.acpProviderID == .openCode else { return true }
+            let canonical = ACPModelParameterIdentity.canonicalBaseModelRaw(modelRaw, providerID: .openCode)
+            guard !probedOpenCodeCanonicals.contains(canonical) else { return false }
+            guard let openCodeEnrichmentTargetRaw,
+                  ACPModelParameterIdentity.canonicalBaseModelRaw(openCodeEnrichmentTargetRaw, providerID: .openCode) == canonical
+            else { return false }
+            probedOpenCodeCanonicals.insert(canonical)
+            return true
+        }
         var agents: [Value] = []
         for entry in omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability) {
             // Flatten all models — each start target becomes its own entry.
@@ -232,8 +263,18 @@ struct AgentManageMCPToolService {
                         if let effort = target.reasoningEffort {
                             obj["reasoning_effort"] = .string(effort.rawValue)
                         }
-                        if entry.agent == .cursor {
-                            let parameters = AgentMCPModelParameterSupport.definitionValues(modelRaw: target.modelRaw)
+                        if entry.agent.acpProviderID != nil,
+                           shouldEnrichOpenCodeModel(agent: entry.agent, modelRaw: target.modelRaw)
+                        {
+                            // Discovery failure is already reduced to empty inside
+                            // `definitions`; a throwing `try await` here preserves the
+                            // cancellation the support layer now correctly rethrows.
+                            let parameters = try await AgentMCPModelParameterSupport.definitionValues(
+                                agent: entry.agent,
+                                modelRaw: target.modelRaw,
+                                workspacePath: openCodeWorkspacePath,
+                                oneShot: openCodeOneShotObservationProvider
+                            )
                             if !parameters.isEmpty {
                                 obj["model_parameters"] = .array(parameters)
                             }
@@ -247,8 +288,15 @@ struct AgentManageMCPToolService {
                     if let modelID = model.modelID {
                         obj["model_id"] = .string(modelID)
                     }
-                    if entry.agent == .cursor {
-                        let parameters = AgentMCPModelParameterSupport.definitionValues(modelRaw: model.id)
+                    if entry.agent.acpProviderID != nil,
+                       shouldEnrichOpenCodeModel(agent: entry.agent, modelRaw: model.id)
+                    {
+                        let parameters = try await AgentMCPModelParameterSupport.definitionValues(
+                            agent: entry.agent,
+                            modelRaw: model.id,
+                            workspacePath: openCodeWorkspacePath,
+                            oneShot: openCodeOneShotObservationProvider
+                        )
                         if !parameters.isEmpty {
                             obj["model_parameters"] = .array(parameters)
                         }
@@ -609,11 +657,6 @@ struct AgentManageMCPToolService {
             workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
-        let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
-            value: args["model_parameters"],
-            agent: resolved.agent.flatMap { AgentProviderKind(rawValue: $0) },
-            modelRaw: resolved.model
-        )
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: nil,
@@ -627,6 +670,34 @@ struct AgentManageMCPToolService {
             #if DEBUG
                 await testAfterTargetResolution?(target)
             #endif
+            // Validate explicit model parameters inside the discard-on-failure scope. A throw
+            // during parsing/acquisition/validation/cancellation must not leak the allocated
+            // target; for the Cursor path the parameters are parsed after target allocation and
+            // rejected before configuration is applied. The effective workspace is resolved
+            // from the same source the composer uses (`effectiveWorkspacePath(for:)`), so a
+            // worktree-bound session validates against its real OpenCode config. A genuine
+            // resolution failure (worktree unavailable/mismatched) or cancellation propagates
+            // rather than silently acquiring from the repo root; only an explicitly absent
+            // binding falls back.
+            let createParameterWorkspacePath: String?
+            do {
+                createParameterWorkspacePath = try agentModeVM.session(for: target.tabID, createIfNeeded: false)
+                    .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
+                    ?? workspace.repoPaths.first
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams(
+                    "Failed to resolve the session workspace for model parameter validation: \(error.localizedDescription)"
+                )
+            }
+            let modelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+                value: args["model_parameters"],
+                agent: resolved.agent.flatMap { AgentProviderKind(rawValue: $0) },
+                modelRaw: resolved.model,
+                workspacePath: createParameterWorkspacePath,
+                oneShot: openCodeOneShotObservationProvider
+            )
             try agentModeVM.requireCurrentMCPWorkspaceTarget(
                 target,
                 expectedWorkspaceID: workspace.id
@@ -754,10 +825,28 @@ struct AgentManageMCPToolService {
             }
             let parameterAgentRaw = resolved.agent ?? hydratedSession.selectedAgent.rawValue
             let parameterModelRaw = resolved.model ?? hydratedSession.selectedModelRaw
-            let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
+            // Acquire metadata for the session's effective workspace (the composer's source),
+            // not the repo root — a worktree-bound session may resolve a different OpenCode
+            // config. A genuine resolution failure or cancellation propagates: silently falling
+            // back to the repo root reintroduces the original mis-scope. Only an explicitly
+            // absent binding falls back.
+            let parameterWorkspacePath: String?
+            do {
+                parameterWorkspacePath = try agentModeVM.effectiveWorkspacePath(for: hydratedSession)
+                    ?? workspace.repoPaths.first
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams(
+                    "Failed to resolve the session workspace for model parameter validation: \(error.localizedDescription)"
+                )
+            }
+            let modelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
                 value: args["model_parameters"],
                 agent: AgentProviderKind(rawValue: parameterAgentRaw),
-                modelRaw: parameterModelRaw
+                modelRaw: parameterModelRaw,
+                workspacePath: parameterWorkspacePath,
+                oneShot: openCodeOneShotObservationProvider
             )
             // Resume adopts the live session's existing control registration. Re-registering the
             // same persistent session expires in-flight waiters and splits poll state from the UI.

@@ -214,6 +214,7 @@ struct AgentComposerSubmissionLatch {
 }
 
 struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
+    let providerID: ACPProviderID
     let kind: ACPModelParameterKind
     let baseModelRaw: String
     let configID: String
@@ -221,6 +222,11 @@ struct AgentComposerModelParameterControlProps: Equatable, Identifiable {
     let selectedValueRaw: String
     let selectedDisplayName: String
     let choices: [ACPModelParameterChoice]
+    /// OpenCode only: the demand-scoped discovery key this control's metadata came from. The
+    /// setter rejects a click whose key is missing or no longer matches the current target, so a
+    /// stale menu can never retarget a selection to a different workspace/model. Cursor leaves
+    /// this nil (its catalogue is static and needs no demand-scoped authority).
+    let openCodeDiscoveryKey: OpenCodeACPModelParameterKey?
 
     var id: String {
         "\(kind.rawValue):\(configID)"
@@ -256,7 +262,7 @@ struct AgentComposerProps: Equatable {
     let selectedModelDisplayName: String
     let selectedReasoningEffortRaw: String?
     let selectedReasoningEffortDisplayName: String
-    let cursorModelParameterControls: [AgentComposerModelParameterControlProps]
+    let acpModelParameterControls: [AgentComposerModelParameterControlProps]
     let availableAgents: [AgentProviderKind]
     let isProviderPickerLockedForCurrentTab: Bool
     let lockedAgentSelectionMessage: String?
@@ -289,7 +295,7 @@ struct AgentComposerProps: Equatable {
         selectedModelDisplayName: AgentModel.defaultModel.displayName,
         selectedReasoningEffortRaw: nil,
         selectedReasoningEffortDisplayName: "",
-        cursorModelParameterControls: [],
+        acpModelParameterControls: [],
         availableAgents: [],
         isProviderPickerLockedForCurrentTab: false,
         lockedAgentSelectionMessage: nil,

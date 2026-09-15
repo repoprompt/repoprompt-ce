@@ -566,8 +566,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
                 selectedAgent: resolution.effective.agent,
                 selectedModelRaw: resolution.effective.modelRaw,
                 includePlaceholderDefault: false,
-                flattenSingleCodexGroups: true,
-                groupOpenCode: false
+                flattenSingleCodexGroups: true
             ) { [weak self] selectedAgent, selectedOption in
                 guard let self else { return }
                 let selection = AgentModelCatalog.NormalizedAgentSelection(

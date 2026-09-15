@@ -424,8 +424,7 @@ struct AgentModelsPopoverView: View {
                 selectedAgent: resolution.effective.agent,
                 selectedModelRaw: resolution.effective.modelRaw,
                 includePlaceholderDefault: false,
-                flattenSingleCodexGroups: true,
-                groupOpenCode: false
+                flattenSingleCodexGroups: true
             ) { selectedAgent, selectedOption in
                 let selection = AgentModelCatalog.NormalizedAgentSelection(
                     agent: selectedAgent,

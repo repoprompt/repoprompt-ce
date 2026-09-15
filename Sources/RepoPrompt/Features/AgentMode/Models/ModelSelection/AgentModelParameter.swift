@@ -137,11 +137,16 @@ enum ACPModelParameterResolver {
     static func resolve(
         providerID: ACPProviderID,
         selectedModelRaw: String,
-        persistedSelections: [ACPModelParameterSelection]
+        persistedSelections: [ACPModelParameterSelection],
+        workspacePath: String? = nil,
+        openCodeParameters: OpenCodeACPModelParameterSnapshot? = nil
     ) -> [ACPResolvedModelParameter] {
-        guard providerID == .cursor,
-              let parameterSet = cursorParameterSet(selectedModelRaw: selectedModelRaw)
-        else { return [] }
+        guard let parameterSet = parameterSet(
+            providerID: providerID,
+            selectedModelRaw: selectedModelRaw,
+            workspacePath: workspacePath,
+            openCodeParameters: openCodeParameters
+        ) else { return [] }
         return resolve(
             parameterSet: parameterSet,
             providerID: providerID,
@@ -174,8 +179,53 @@ enum ACPModelParameterResolver {
         }
     }
 
-    static func cursorParameterSet(selectedModelRaw: String) -> ACPModelParameterSet? {
-        CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+    static func parameterSet(
+        providerID: ACPProviderID,
+        selectedModelRaw: String,
+        workspacePath: String? = nil,
+        openCodeParameters: OpenCodeACPModelParameterSnapshot? = nil
+    ) -> ACPModelParameterSet? {
+        switch providerID {
+        case .cursor:
+            CursorAIModelCatalog.parameterSet(for: selectedModelRaw)
+        case .openCode:
+            openCodeParameterSet(
+                selectedModelRaw: selectedModelRaw,
+                workspacePath: workspacePath,
+                observation: openCodeParameters
+            )
+        default:
+            nil
+        }
+    }
+
+    /// Accept OpenCode metadata only when the observation is `.available`, its key matches the
+    /// requested normalized workspace+model exactly, and the advertised set matches that model
+    /// unambiguously. Missing or mismatched context yields no parameter set — never a fall back
+    /// to the provider-global registry, whose per-provider snapshot cannot represent the
+    /// demand-scoped `(workspace, model)` authority.
+    private static func openCodeParameterSet(
+        selectedModelRaw: String,
+        workspacePath: String?,
+        observation: OpenCodeACPModelParameterSnapshot?
+    ) -> ACPModelParameterSet? {
+        guard let observation,
+              case let .available(parameterSet) = observation.state
+        else { return nil }
+        let targetIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
+            selectedModelRaw,
+            providerID: .openCode
+        )
+        // Compare the constructed expected key directly; `observation.key`'s fields are already
+        // canonical at construction, so re-canonicalizing them would be a no-op. Key equality
+        // covers both the canonical model identity and the normalized workspace.
+        let expectedKey = OpenCodeACPModelParameterKey(workspacePath: workspacePath, modelRaw: selectedModelRaw)
+        guard observation.key == expectedKey else { return nil }
+        guard ACPModelParameterIdentity.canonicalBaseModelRaw(
+            parameterSet.baseModelRaw,
+            providerID: .openCode
+        ) == targetIdentity else { return nil }
+        return parameterSet
     }
 
     static func effectiveSelections(
@@ -183,18 +233,10 @@ enum ACPModelParameterResolver {
         selectedModelRaw: String,
         persistedSelections: [ACPModelParameterSelection]
     ) -> [ACPModelParameterSelection] {
-        resolve(
-            providerID: providerID,
-            selectedModelRaw: selectedModelRaw,
-            persistedSelections: persistedSelections
-        ).map { resolved in
-            ACPModelParameterSelection(
-                providerID: providerID,
-                baseModelRaw: resolved.baseModelRaw,
-                kind: resolved.definition.kind,
-                configID: resolved.definition.configID,
-                valueRaw: resolved.selectedChoice.rawValue
-            )
-        }
+        ACPModelParameterSelection.selections(
+            for: providerID,
+            activeBaseModelRaw: selectedModelRaw,
+            from: persistedSelections
+        )
     }
 }

@@ -491,11 +491,6 @@ struct AgentRunMCPToolService {
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
             workspaceID: workspace.id
         )
-        let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
-            value: args["model_parameters"],
-            agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
-            modelRaw: selection.modelRaw
-        )
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -545,6 +540,31 @@ struct AgentRunMCPToolService {
         guard let targetSessionID = target.sessionID else {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
+        }
+        // Resolve the parameter-validation workspace and acquire/validate parameters inside
+        // the discard-on-failure scope: a throw during parsing/acquisition/validation/
+        // cancellation must not leak the allocated target, and (for Cursor) the parameters are
+        // parsed after target allocation and rejected before configuration is applied. The
+        // effective workspace is resolved from the same source the composer uses
+        // (`effectiveWorkspacePath(for:)`), so a worktree-bound session validates against its
+        // real OpenCode config. A genuine resolution failure (worktree unavailable/mismatched)
+        // propagates rather than silently acquiring from the repo root; only an explicitly
+        // absent binding falls back.
+        let runParameterWorkspacePath: String?
+        let modelParameterSelections: [ACPModelParameterSelection]
+        do {
+            runParameterWorkspacePath = try agentModeVM.session(for: target.tabID, createIfNeeded: false)
+                .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
+                ?? workspace.repoPaths.first
+            modelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+                value: args["model_parameters"],
+                agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
+                modelRaw: selection.modelRaw,
+                workspacePath: runParameterWorkspacePath
+            )
+        } catch {
+            await agentModeVM.mcpDiscardSessionTarget(target)
+            throw error
         }
         #if DEBUG
             if worktreeStartupBenchmarkToken != nil {
