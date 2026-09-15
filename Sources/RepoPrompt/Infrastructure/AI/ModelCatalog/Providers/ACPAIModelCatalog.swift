@@ -377,6 +377,14 @@ enum ACPAIModelCatalog {
         grokBuildModelOptionsFromStore().map { .grokBuildCustom(name: $0.rawValue) }
     }
 
+    static func devinModelOptionsFromStore() -> [AgentModelOption] {
+        AgentACPModelRegistry.shared.resolvedSnapshot(for: .devin)?.options ?? []
+    }
+
+    static func devinModelsFromStore() -> [AIModel] {
+        devinModelOptionsFromStore().map { .devinCustom(name: $0.rawValue) }
+    }
+
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
@@ -392,6 +400,13 @@ enum ACPAIModelCatalog {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
         return grokBuildModelOptionsFromStore()
+            .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+    }
+
+    static func devinModelOption(for rawValue: String) -> AgentModelOption? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return devinModelOptionsFromStore()
             .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
     }
 

@@ -180,6 +180,7 @@ public enum AIModel: Equatable, Hashable {
     case openCodeCustom(name: String)
     case cursorCustom(name: String)
     case grokBuildCustom(name: String)
+    case devinCustom(name: String)
 
     // Custom Provider Models
     case customProvider(name: String, provider: String, model: String)
@@ -539,6 +540,8 @@ public enum AIModel: Equatable, Hashable {
             return "cursor_custom_\(n)"
         case let .grokBuildCustom(n):
             return "grokbuild_custom_\(n)"
+        case let .devinCustom(n):
+            return "devin_custom_\(n)"
         case let .customProvider(_, _, model):
             return "custom_provider_\(model)"
         case let .customProviderUser(name):
@@ -609,6 +612,9 @@ public enum AIModel: Equatable, Hashable {
         if case let .grokBuildCustom(n) = self {
             return ACPAIModelCatalog.grokBuildModelOption(for: n)?.displayName ?? n
         }
+        if case let .devinCustom(n) = self {
+            return ACPAIModelCatalog.devinModelOption(for: n)?.displayName ?? n
+        }
         if case let .customProviderUser(name) = self { return "Custom/\(name)" }
         if case .ollama = self {
             return "local/" + modelName
@@ -638,6 +644,7 @@ public enum AIModel: Equatable, Hashable {
         case .openCode: OpenCodeCLIProvider.self
         case .cursor: CursorCLIProvider.self
         case .grokBuild: GrokBuildCLIProvider.self
+        case .devin: DevinCLIProvider.self
         }
     }
 
@@ -667,6 +674,7 @@ public enum AIModel: Equatable, Hashable {
         case .openCodeCustom: return .openCode
         case .cursorCustom: return .cursor
         case .grokBuildCustom: return .grokBuild
+        case .devinCustom: return .devin
         case .customProviderUser: return .customProvider
         // or, if you prefer the old modelGroups approach:
         default:
@@ -722,7 +730,8 @@ public enum AIModel: Equatable, Hashable {
              let .codexCustom(n),
              let .openCodeCustom(n),
              let .cursorCustom(n),
-             let .grokBuildCustom(n):
+             let .grokBuildCustom(n),
+             let .devinCustom(n):
             return n
         case let .customProviderUser(name):
             return name
@@ -1163,7 +1172,7 @@ public enum AIModel: Equatable, Hashable {
             return SwiftOpenAI.Model.custom(modelName)
         case .anthropic:
             return SwiftAnthropic.Model.other(modelName)
-        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor, .grokBuild:
+        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor, .grokBuild, .devin:
             // For these providers, use the actual model name when available
             if let modelInfo = Self.modelDefinitions.first(where: { $0.model == self }),
                let actualName = modelInfo.actualName
@@ -1257,6 +1266,9 @@ public enum AIModel: Equatable, Hashable {
         }
         if normalizedRawValue.hasPrefix("grokbuild_custom_") {
             return .grokBuildCustom(name: String(normalizedRawValue.dropFirst("grokbuild_custom_".count)))
+        }
+        if normalizedRawValue.hasPrefix("devin_custom_") {
+            return .devinCustom(name: String(normalizedRawValue.dropFirst("devin_custom_".count)))
         }
 
         if normalizedRawValue.hasPrefix("openai_custom_reasoning_") {
@@ -1372,6 +1384,8 @@ public enum AIModel: Equatable, Hashable {
             models = ACPAIModelCatalog.cursorModelsFromStore()
         case .grokBuild:
             models = ACPAIModelCatalog.grokBuildModelsFromStore()
+        case .devin:
+            models = ACPAIModelCatalog.devinModelsFromStore()
         }
 
         // Filter out models that are not yet available based on their release date
@@ -1958,6 +1972,7 @@ public enum AIModel: Equatable, Hashable {
                 models.append(contentsOf: group)
             }
         }
+        models.append(contentsOf: ACPAIModelCatalog.devinModelsFromStore())
         models.append(.ollama)
         // Filter out models that are not yet available based on their release date
         return models.filter(\.isAvailable)
@@ -1981,6 +1996,7 @@ public enum AIModel: Equatable, Hashable {
         case openCodeCustom(name: String)
         case cursorCustom(name: String)
         case grokBuildCustom(name: String)
+        case devinCustom(name: String)
         case customProvider(name: String, provider: String, model: String)
         case customProviderUser(name: String)
         case claudeCodeModel(normalizedSpecifier: String)
@@ -2137,6 +2153,8 @@ public enum AIModel: Equatable, Hashable {
             .cursorCustom(name: name)
         case let .grokBuildCustom(name):
             .grokBuildCustom(name: name)
+        case let .devinCustom(name):
+            .devinCustom(name: name)
         case let .customProvider(name, provider, model):
             .customProvider(name: name, provider: provider, model: model)
         case let .customProviderUser(name):

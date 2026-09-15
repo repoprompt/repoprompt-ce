@@ -72,6 +72,7 @@ enum AppOracleGroupRouting {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .devin: "devin"
         }
     }
 }

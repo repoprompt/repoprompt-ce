@@ -306,7 +306,7 @@ enum AgentModel: String, CaseIterable, Codable {
             [.defaultModel]
         case .grokBuild:
             [.defaultModel]
-        case .antigravity:
+        case .antigravity, .devin:
             []
         case .cursor:
             [.cursorAuto, .cursorComposer2]

@@ -1002,7 +1002,7 @@ final class MCPGitToolProvider {
 
         case .show:
             guard let ref = args["ref"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !ref.isEmpty else {
-                throw MCPError.invalidParams("ref is required for op: show")
+                throw MCPError.invalidParams("show requires ref; for branch review use op=\"diff\", compare=\"main\"")
             }
             let rawShowDetail = args["detail"]?.stringValue?.lowercased() ?? "summary"
             // For show, "patches" behaves the same as "full" (single commit, no truncation needed)
