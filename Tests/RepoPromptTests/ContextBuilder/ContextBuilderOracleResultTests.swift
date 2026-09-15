@@ -89,7 +89,7 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         XCTAssertFalse(text.contains("- Status: Failed"), text)
     }
 
-    func testFailedOrCancelledPrimaryIsNotPublishable() throws {
+    func testFailedOrCancelledPrimaryHasNoCompletedPrimaryResponse() throws {
         for status in [OracleLaneResultStatus.failed, .cancelled] {
             let reply = try ContextBuilderOracleGroupReply(result: groupResult(
                 status: .failed,
@@ -107,16 +107,10 @@ final class ContextBuilderOracleResultTests: XCTestCase {
                 ]
             ))
 
-            XCTAssertThrowsError(try reply.requiredCompletedPrimaryResponse()) { error in
-                XCTAssertEqual(
-                    error as? ContextBuilderOraclePrimaryCompletionError,
-                    .notCompleted(
-                        status: status,
-                        code: "primary_stopped",
-                        message: "primary stopped"
-                    )
-                )
-            }
+            XCTAssertNil(try reply.requiredCompletedPrimaryResponse())
+            XCTAssertEqual(reply.orderedResults[0].status, status)
+            XCTAssertEqual(reply.orderedResults[0].error?.message, "primary stopped")
+            XCTAssertEqual(reply.orderedResults[1].response, "auxiliary answer")
         }
     }
 
