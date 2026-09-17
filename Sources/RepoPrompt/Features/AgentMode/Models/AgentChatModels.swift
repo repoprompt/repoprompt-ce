@@ -461,6 +461,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         try container.encodeIfPresent(workflow, forKey: .workflow)
         try container.encodeIfPresent(codexGoalMode, forKey: .codexGoalMode)
         try container.encode(isLocalControlPlaneEcho, forKey: .isLocalControlPlaneEcho)
+        try container.encodeIfPresent(crossSessionAttribution, forKey: .crossSessionAttribution)
+        try container.encodeIfPresent(laneUpdateDisplayAttribution, forKey: .laneUpdateDisplayAttribution)
     }
 
     // MARK: - Factory Methods
@@ -778,6 +780,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         try container.encodeIfPresent(workflow, forKey: .workflow)
         try container.encodeIfPresent(codexGoalMode, forKey: .codexGoalMode)
         try container.encode(isLocalControlPlaneEcho, forKey: .isLocalControlPlaneEcho)
+        try container.encodeIfPresent(crossSessionAttribution, forKey: .crossSessionAttribution)
+        try container.encodeIfPresent(laneUpdateDisplayAttribution, forKey: .laneUpdateDisplayAttribution)
     }
 
     public init(from decoder: Decoder) throws {
