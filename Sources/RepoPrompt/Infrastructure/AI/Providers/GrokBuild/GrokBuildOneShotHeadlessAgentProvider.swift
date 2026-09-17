@@ -401,8 +401,8 @@ private struct GrokBuildOneShotCLIOptions {
     var effort: String?
 
     func toTokens() -> [String] {
-        var tokens = ["--prompt-file", promptFilePath]
-        tokens += [
+        var tokens = [
+            "--prompt-file", promptFilePath,
             "--output-format", "json",
             "--verbatim",
             "--max-turns", "1",

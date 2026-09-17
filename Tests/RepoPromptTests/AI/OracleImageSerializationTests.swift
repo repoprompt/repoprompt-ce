@@ -239,6 +239,32 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertTrue(options.toTokens().contains("stream-json"))
     }
 
+    func testClaudeStreamJSONParsesTerminalResultAndUsage() throws {
+        let output = """
+        {"type":"system","subtype":"init"}
+        {"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}
+        {"type":"result","subtype":"success","is_error":false,"result":"Done","usage":{"input_tokens":11,"output_tokens":7},"total_cost_usd":0.12}
+        """
+
+        let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+
+        XCTAssertEqual(completion.text, "Done")
+        XCTAssertEqual(completion.promptTokens, 11)
+        XCTAssertEqual(completion.completionTokens, 7)
+        XCTAssertEqual(completion.cost, 0.12)
+    }
+
+    func testClaudeStreamJSONExtractsTerminalError() {
+        let output = """
+        {"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Request was aborted by user"],"usage":{"input_tokens":11,"output_tokens":0},"total_cost_usd":0.12}
+        """
+
+        XCTAssertEqual(
+            ClaudeCodeProvider.test_extractStreamJSONErrorDetail(from: Data(output.utf8)),
+            "Request was aborted by user"
+        )
+    }
+
     private func makeMessage() -> AIMessage {
         AIMessage(
             systemPrompt: "system",

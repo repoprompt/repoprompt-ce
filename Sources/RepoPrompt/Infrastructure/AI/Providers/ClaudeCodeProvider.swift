@@ -154,6 +154,7 @@ final class ClaudeCodeProvider: AIProvider {
         if options.timeout == nil {
             options.timeout = defaultRequestTimeout
         }
+        let usesStreamJSONOutput = !aiMessage.transientImages.isEmpty
         let stdin: String
         if aiMessage.transientImages.isEmpty {
             stdin = prompt
@@ -161,6 +162,7 @@ final class ClaudeCodeProvider: AIProvider {
             options.inputFormat = "stream-json"
             stdin = try Self.makeStreamJSONInput(prompt: prompt, images: aiMessage.transientImages)
         }
+        let outputFormat: CLIOutputFormat = usesStreamJSONOutput ? .streamJson : .json
         let args = options.toTokens()
 
         var attempt = 0
@@ -172,7 +174,7 @@ final class ClaudeCodeProvider: AIProvider {
                 result = try await runner.run(
                     args: args,
                     stdin: stdin,
-                    outputMode: .auto(.json),
+                    outputMode: .auto(outputFormat),
                     timeout: options.timeout,
                     additionalEnvironment: options.additionalEnvironment,
                     additionalRemovedKeys: options.removedEnvironmentKeys
@@ -186,13 +188,16 @@ final class ClaudeCodeProvider: AIProvider {
                     throw AIProviderError.invalidResponse(detail: "Claude CLI returned no output")
                 }
                 do {
-                    return try parseCompletionPayload(result.stdout)
+                    return try parseCompletionPayload(result.stdout, isStreamJSON: usesStreamJSONOutput)
                 } catch {
                     throw AIProviderError.apiError(source: error)
                 }
             }
 
-            if let humanMessage = extractCLIErrorDetail(fromStdout: result.stdout) {
+            if let humanMessage = extractCLIErrorDetail(
+                fromStdout: result.stdout,
+                isStreamJSON: usesStreamJSONOutput
+            ) {
                 // Check for credit balance error and provide helpful guidance
                 let lowerMessage = humanMessage.lowercased()
                 if lowerMessage.contains("credit balance") || lowerMessage.contains("balance too low") || lowerMessage.contains("api balance") {
@@ -221,6 +226,18 @@ final class ClaudeCodeProvider: AIProvider {
     func dispose() async {
         await runner.cancelAll()
     }
+
+    #if DEBUG
+        static func test_parseStreamJSONCompletionPayload(_ data: Data) throws -> AICompletionResult {
+            let provider = ClaudeCodeProvider()
+            return try provider.parseCompletionPayload(data, isStreamJSON: true)
+        }
+
+        static func test_extractStreamJSONErrorDetail(from data: Data) -> String? {
+            let provider = ClaudeCodeProvider()
+            return provider.extractCLIErrorDetail(fromStdout: data, isStreamJSON: true)
+        }
+    #endif
 
     // MARK: - Private Helpers
 
@@ -379,7 +396,10 @@ final class ClaudeCodeProvider: AIProvider {
         return prompt
     }
 
-    private func parseCompletionPayload(_ data: Data) throws -> AICompletionResult {
+    private func parseCompletionPayload(_ data: Data, isStreamJSON: Bool = false) throws -> AICompletionResult {
+        if isStreamJSON {
+            return try parseStreamJSONCompletionPayload(data)
+        }
         if let message = try? decoder.decode(ClaudeResultMessage.self, from: data) {
             return AICompletionResult(
                 text: message.result ?? "",
@@ -404,6 +424,71 @@ final class ClaudeCodeProvider: AIProvider {
         } else {
             throw AIProviderError.invalidResponse(detail: "Claude CLI returned unsupported JSON payload")
         }
+    }
+
+    private func parseStreamJSONCompletionPayload(_ data: Data) throws -> AICompletionResult {
+        guard let terminal = streamJSONTerminalEvent(from: data) else {
+            throw AIProviderError.invalidResponse(detail: "Claude CLI returned stream JSON without completion payload")
+        }
+        if terminal.type == "error" || streamJSONIndicatesError(terminal.payload) {
+            let detail = streamJSONErrorMessage(from: terminal.payload) ?? "Claude CLI returned an error"
+            throw AIProviderError.invalidResponse(detail: detail)
+        }
+        return parseCompletionDictionary(terminal.payload)
+    }
+
+    private func streamJSONTerminalEvent(from data: Data) -> (type: String, payload: [String: Any])? {
+        for slice in data.split(separator: 0x0A, omittingEmptySubsequences: true).reversed() {
+            let candidate = Data(slice)
+            guard let trimmed = trimmedASCIIWhitespace(candidate),
+                  let json = try? JSONSerialization.jsonObject(with: trimmed) as? [String: Any],
+                  let type = json["type"] as? String
+            else {
+                continue
+            }
+            let normalizedType = type.lowercased()
+            guard normalizedType == "result" || normalizedType == "error" else {
+                continue
+            }
+            return (type: normalizedType, payload: json)
+        }
+        return nil
+    }
+
+    private func streamJSONIndicatesError(_ dict: [String: Any]) -> Bool {
+        let type = (dict["type"] as? String)?.lowercased()
+        let subtype = (dict["subtype"] as? String)?.lowercased()
+        let isError = (dict["is_error"] as? Bool) == true
+        let hasErrors = (dict["errors"] as? [Any])?.isEmpty == false
+        return type == "error" || isError || subtype?.contains("error") == true || hasErrors
+    }
+
+    private func streamJSONErrorMessage(from dict: [String: Any]) -> String? {
+        guard streamJSONIndicatesError(dict) else { return nil }
+        if let errors = dict["errors"] as? [Any] {
+            for error in errors {
+                if let text = (error as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !text.isEmpty
+                {
+                    return text
+                }
+                if let object = error as? [String: Any],
+                   let text = ((object["message"] as? String) ?? (object["error"] as? String))?
+                   .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !text.isEmpty
+                {
+                    return text
+                }
+            }
+        }
+        for key in ["error", "message", "result"] {
+            if let text = (dict[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !text.isEmpty
+            {
+                return text
+            }
+        }
+        return nil
     }
 
     private func parseCompletionDictionary(_ dict: [String: Any]) -> AICompletionResult {
@@ -601,8 +686,11 @@ final class ClaudeCodeProvider: AIProvider {
 
     /// Attempts to decode a human-readable error exposed by the Claude CLI when it exits non-zero.
     /// Returns nil if stdout is empty or decoding fails.
-    private func extractCLIErrorDetail(fromStdout data: Data) -> String? {
+    private func extractCLIErrorDetail(fromStdout data: Data, isStreamJSON: Bool = false) -> String? {
         guard !data.isEmpty else { return nil }
+        if isStreamJSON {
+            return extractStreamJSONErrorDetail(fromStdout: data)
+        }
 
         // First pass: look for structured JSON errors
         if let message = try? decoder.decode(ClaudeResultMessage.self, from: data),
@@ -627,6 +715,27 @@ final class ClaudeCodeProvider: AIProvider {
         if let plainText = String(data: data, encoding: .utf8) {
             let cleaned = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
             // Skip empty strings and JSON noise
+            if !cleaned.isEmpty, !cleaned.hasPrefix("{"), !cleaned.hasPrefix("[") {
+                return cleaned
+            }
+        }
+        return nil
+    }
+
+    private func extractStreamJSONErrorDetail(fromStdout data: Data) -> String? {
+        if let terminal = streamJSONTerminalEvent(from: data) {
+            return streamJSONErrorMessage(from: terminal.payload)
+        }
+
+        // Return plain-text diagnostics when the CLI fails before emitting stream JSON.
+        for slice in data.split(separator: 0x0A, omittingEmptySubsequences: true).reversed() {
+            let candidate = Data(slice)
+            guard let trimmed = trimmedASCIIWhitespace(candidate),
+                  let plainText = String(data: trimmed, encoding: .utf8)
+            else {
+                continue
+            }
+            let cleaned = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !cleaned.isEmpty, !cleaned.hasPrefix("{"), !cleaned.hasPrefix("[") {
                 return cleaned
             }
