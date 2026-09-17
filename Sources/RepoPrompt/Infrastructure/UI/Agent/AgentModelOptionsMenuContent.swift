@@ -90,6 +90,20 @@ struct AgentModelOptionsMenuContent: View {
                     modelOptionButton(option)
                 }
             }
+        } else if agentKind == .omp {
+            ForEach(AgentModelCatalog.ompModelGroups(for: options)) { group in
+                if let provider = group.providerID {
+                    Menu(provider) {
+                        ForEach(group.options, id: \.rawValue) { option in
+                            modelOptionButton(option)
+                        }
+                    }
+                } else {
+                    ForEach(group.options, id: \.rawValue) { option in
+                        modelOptionButton(option)
+                    }
+                }
+            }
         } else if agentKind == .openCode {
             ForEach(AgentModelCatalog.openCodeMenu(for: options).providerGroups) { providerGroup in
                 if providerGroup.rendersAsSubmenu {
@@ -224,6 +238,21 @@ enum AgentModelStableMenuItems {
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
             )
+        }
+        if agentKind == .omp {
+            return AgentModelCatalog.ompModelGroups(for: visibleOptions).flatMap { group -> [StableMenuItem] in
+                let items = group.options.map { option in
+                    modelItem(
+                        option,
+                        agentKind: agentKind,
+                        selectedAgent: selectedAgent,
+                        selectedModelRaw: selectedModelRaw,
+                        onSelect: onSelect
+                    )
+                }
+                guard let provider = group.providerID else { return items }
+                return [.submenu(provider, items: items)]
+            }
         }
         if agentKind == .openCode, groupOpenCode {
             return AgentModelCatalog.openCodeMenu(for: visibleOptions).providerGroups.flatMap { providerGroup -> [StableMenuItem] in

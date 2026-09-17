@@ -21,6 +21,7 @@ enum AgentProviderPermissionLevelID: Hashable {
     case cursor(CursorAgentToolPreferences.PermissionLevel)
     case grokBuild(GrokBuildAgentToolPreferences.PermissionLevel)
     case devin(DevinAgentToolPreferences.PermissionLevel)
+    case omp(OMPAgentToolPreferences.PermissionLevel)
 
     var providerID: AgentProviderBindingID {
         switch self {
@@ -38,6 +39,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .grokBuild
         case .devin:
             .devin
+        case .omp:
+            .omp
         }
     }
 
@@ -57,6 +60,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .grokBuild(.managedDefault)
         case .devin:
             .devin(.normal)
+        case .omp:
+            .omp(.providerManaged)
         }
     }
 
@@ -76,6 +81,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             GrokBuildAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grokBuild)
         case .devin:
             DevinAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.devin)
+        case .omp:
+            OMPAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.omp)
         }
     }
 
@@ -103,6 +110,9 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .devin:
             guard let level = DevinAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .devin(level)
+        case .omp:
+            guard let level = OMPAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            self = .omp(level)
         }
     }
 
@@ -121,6 +131,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .grokBuild(level):
             level.rawValue
         case let .devin(level):
+            level.rawValue
+        case let .omp(level):
             level.rawValue
         }
     }
@@ -141,6 +153,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.displayName
         case let .devin(level):
             level.displayName
+        case let .omp(level):
+            level.displayName
         }
     }
 
@@ -159,6 +173,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .grokBuild(level):
             level.iconName
         case let .devin(level):
+            level.iconName
+        case let .omp(level):
             level.iconName
         }
     }
@@ -179,6 +195,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .devin(level):
             level.detailText
+        case let .omp(level):
+            level.detailText
         }
     }
 
@@ -198,6 +216,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.isWarning
         case let .devin(level):
             level.isWarning
+        case .omp:
+            false
         }
     }
 }

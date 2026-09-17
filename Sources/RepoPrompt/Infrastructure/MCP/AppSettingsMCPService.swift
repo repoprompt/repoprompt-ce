@@ -1423,6 +1423,8 @@ private enum AppSettingsMCPRegistry {
             .cursor
         case .grokBuild:
             .grokBuild
+        case .omp:
+            nil
         }
     }
 

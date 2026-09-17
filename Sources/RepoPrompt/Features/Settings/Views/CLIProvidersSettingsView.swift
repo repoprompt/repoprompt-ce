@@ -53,12 +53,14 @@ struct CLIProvidersSettingsView: View {
     @State private var isTestingAntigravity = false
     @State private var isAntigravityInstalled = false
     @State private var isAntigravityExpanded = false
+    @State private var isLoadingOMP = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
     @State private var showOpenCodeTraceDump = false
     @State private var showCursorTraceDump = false
     @State private var showGrokBuildTraceDump = false
+    @State private var showOMPTraceDump = false
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
 
@@ -77,6 +79,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCursorExpanded: Bool = false
     @State private var isGrokBuildExpanded: Bool = false
     @State private var isDevinExpanded: Bool = false
+    @State private var isOMPExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -97,6 +100,7 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isCursorConnected
             || viewModel.isGrokBuildConnected
             || DevinRuntimeLocator.isInstalledSync()
+            || viewModel.isOMPConnected
     }
 
     private var codexStatusText: String? {
@@ -129,7 +133,7 @@ struct CLIProvidersSettingsView: View {
                         .font(.title2)
                         .fontWeight(.semibold)
 
-                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Devin to leverage your existing subscriptions — OpenCode can also proxy any API key.")
+                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, Devin, or Oh My Pi to leverage your existing subscriptions — OpenCode can also proxy any API key.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -159,6 +163,7 @@ struct CLIProvidersSettingsView: View {
                 grokBuildCard
                 antigravityCard
                 devinCard
+                ompCard
             }
             .padding(16)
         }
@@ -210,6 +215,13 @@ struct CLIProvidersSettingsView: View {
                     primaryButton: .default(Text("Save Trace to Downloads"), action: dumpCursorTrace),
                     secondaryButton: .cancel(Text("OK"), action: { showCursorTraceDump = false })
                 )
+            } else if showOMPTraceDump, viewModel.hasOMPTrace() {
+                Alert(
+                    title: Text("CLI Provider Management"),
+                    message: Text(alertMessage),
+                    primaryButton: .default(Text("Save Trace to Downloads"), action: dumpOMPTrace),
+                    secondaryButton: .cancel(Text("OK"), action: { showOMPTraceDump = false })
+                )
             } else {
                 Alert(
                     title: Text("CLI Provider Management"),
@@ -224,6 +236,7 @@ struct CLIProvidersSettingsView: View {
                 showCodexTraceDump = false
                 showOpenCodeTraceDump = false
                 showCursorTraceDump = false
+                showOMPTraceDump = false
                 showCodexSignOutConfirmation = false
             }
         }
@@ -2296,6 +2309,73 @@ struct CLIProvidersSettingsView: View {
         return count == 1 ? "1 model available." : "\(count) models available (including Default)."
     }
 
+    // MARK: - Oh My Pi CLI / ACP card
+
+    private var ompCard: some View {
+        providerCard(
+            title: "Oh My Pi",
+            subtitle: "Uses the installed `omp acp` runtime for Agent Mode and headless tasks. OMP keeps authority over authentication, models, fallbacks, memory, compaction, and its built-in tools.",
+            infoURL: "https://github.com/can1357/oh-my-pi",
+            isConnected: viewModel.isOMPConnected,
+            isExpanded: $isOMPExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isOMPConnected {
+                    HStack(spacing: 8) {
+                        Button(action: testOMPConnection) {
+                            if isLoadingOMP {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingOMP)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: disconnectOMP) {
+                            Text("Disconnect")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text("Uses OMP's configured provider, model, and fallback behavior.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: testOMPConnection) {
+                            if isLoadingOMP {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingOMP)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.ompError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Install and authenticate OMP separately, then ensure `omp acp` is available.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Cursor CLI / ACP card
 
     private var cursorCard: some View {
@@ -2854,6 +2934,57 @@ struct CLIProvidersSettingsView: View {
         viewModel.disconnectCursor()
         alertMessage = "Signed out from Cursor CLI"
         showCursorTraceDump = false
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testOMPConnection() {
+        isLoadingOMP = true
+        Task {
+            do {
+                let ok = try await viewModel.testOMPConnection()
+                await MainActor.run {
+                    isLoadingOMP = false
+                    if ok {
+                        alertMessage = "Oh My Pi connected. OMP will use its configured provider and model."
+                        showOMPTraceDump = false
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingOMP = false
+                    alertMessage = viewModel.ompError ?? error.asFriendlyString()
+                    showOMPTraceDump = viewModel.hasOMPTrace()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func dumpOMPTrace() {
+        do {
+            let url = try viewModel.dumpOMPTrace()
+            alertMessage = "Trace saved to Downloads/\(url.lastPathComponent)."
+        } catch let error as CLIProcessLogCollectorError {
+            switch error {
+            case .noEntries:
+                alertMessage = "No trace data is available to export yet."
+            case .downloadsDirectoryUnavailable:
+                alertMessage = "Unable to locate the Downloads folder."
+            }
+        } catch {
+            alertMessage = "Failed to export trace: \(error.localizedDescription)"
+        }
+        showOMPTraceDump = false
+        showAlert = true
+    }
+
+    private func disconnectOMP() {
+        viewModel.disconnectOMP()
+        alertMessage = "Disconnected Oh My Pi"
+        showOMPTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
     }
