@@ -211,8 +211,7 @@ struct ContextBuilderMCPRunConfiguration {
         providerWorkspacePath: String,
         runBehavior: ContextBuilderRunBehavior,
         responseType: String?,
-        planningModelRaw: String?,
-        agentModelsProfile: AgentModelsSettingsProfile,
+        generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority,
         isSystemWorkspace: Bool,
         codexRunConstraints: CodexExecRunConstraints? = nil
     ) {
@@ -221,8 +220,7 @@ struct ContextBuilderMCPRunConfiguration {
         self.providerWorkspacePath = providerWorkspacePath
         self.runBehavior = runBehavior
         self.responseType = responseType
-        self.planningModelRaw = planningModelRaw
-        self.agentModelsProfile = agentModelsProfile
+        self.generatedResponseAuthority = generatedResponseAuthority
         self.isSystemWorkspace = isSystemWorkspace
         self.codexRunConstraints = codexRunConstraints
     }

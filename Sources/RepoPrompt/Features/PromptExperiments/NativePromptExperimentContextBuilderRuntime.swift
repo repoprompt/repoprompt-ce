@@ -184,7 +184,8 @@
                     identity: identity,
                     nestedTabContext: snapshot,
                     workspaceContext: nil,
-                    responseType: nil
+                    responseType: nil,
+                    oraclePreset: nil
                 )
                 guard let agent = AgentProviderKind(rawValue: plan.resolvedTarget.agentRaw) else {
                     throw PromptExperimentSubmissionError.rejected("The sealed provider is no longer recognized.")
@@ -204,8 +205,7 @@
                     providerWorkspacePath: rootURL.path,
                     runBehavior: baseConfiguration.runBehavior,
                     responseType: baseConfiguration.responseType,
-                    planningModelRaw: baseConfiguration.planningModelRaw,
-                    agentModelsProfile: baseConfiguration.agentModelsProfile,
+                    generatedResponseAuthority: baseConfiguration.generatedResponseAuthority,
                     isSystemWorkspace: baseConfiguration.isSystemWorkspace,
                     codexRunConstraints: agent == .codexExec
                         ? .promptExperiment(workingDirectory: rootURL.path)
