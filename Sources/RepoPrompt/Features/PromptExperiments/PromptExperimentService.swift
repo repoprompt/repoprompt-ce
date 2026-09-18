@@ -249,7 +249,12 @@
                 cancellationRequestedAt: nil,
                 statusMessage: "Draft — edit and seal a fixed synthetic-fixture comparison."
             ), at: 0)
-            try await persist()
+            do {
+                try await persist()
+            } catch {
+                records.removeAll { $0.id == experimentID }
+                throw error
+            }
             return experimentID
         }
 
@@ -273,7 +278,12 @@
                 cancellationRequestedAt: nil,
                 statusMessage: "Draft — the linked Agent session can propose a reviewed dataset, evaluator, targets, and GEPA budget."
             ), at: 0)
-            try await persist()
+            do {
+                try await persist()
+            } catch {
+                records.removeAll { $0.id == experimentID }
+                throw error
+            }
             return experimentID
         }
 
@@ -490,13 +500,14 @@
                 environment: environment,
                 at: date
             )
+            let previousRecord = records[currentIndex]
             records[currentIndex].plans.append(plan)
             records[currentIndex].draft = nil
             records[currentIndex].cancellationRequestedAt = nil
             records[currentIndex].phase = .awaitingApproval
             records[currentIndex].updatedAt = date
             records[currentIndex].statusMessage = "Sealed revision \(plan.revision). Review digest \(plan.digest.prefix(12))… and approve in this native view."
-            try await persist()
+            try await persist(restoring: previousRecord)
             return plan
         }
 
@@ -529,6 +540,7 @@
             guard displayedDigest == plan.digest, plan.verifiesIntegrity() else {
                 throw PromptExperimentAuthorityError.digestMismatch
             }
+            let previousRecord = records[index]
             let date = now()
             records[index].approvals.append(PromptExperimentApproval(
                 id: UUID(),
@@ -541,7 +553,7 @@
             records[index].phase = .approved
             records[index].updatedAt = date
             records[index].statusMessage = "Approved locally; starting the exact sealed run."
-            try await persist()
+            try await persist(restoring: previousRecord)
         }
 
         func requestRun(
@@ -790,6 +802,7 @@
             guard records[index].phase == .awaitingApproval,
                   records[index].currentPlan == plan
             else { throw PromptExperimentAuthorityError.staleDraft }
+            let previousRecord = records[index]
             let date = now()
             records[index].draft = PromptExperimentDraft(
                 revision: plan.revision + 1,
@@ -813,7 +826,7 @@
             records[index].updatedAt = date
             records[index].statusMessage = "The user requested changes to revision \(plan.revision). Continue this conversation to revise the new versioned draft."
                 + (feedback.isEmpty ? "" : "\nUser feedback: \(feedback)")
-            try await persist()
+            try await persist(restoring: previousRecord)
             try resumePendingRunApproval(
                 experimentID: experimentID,
                 result: .success(records[self.index(of: experimentID)])
@@ -922,6 +935,7 @@
             guard admittedExperimentIDs.insert(experimentID).inserted else {
                 throw PromptExperimentAuthorityError.experimentAlreadyRunning
             }
+            let previousRecord = records[index]
             records[index].attempts.append(contentsOf: plan.trials.map { PromptExperimentAttempt(trial: $0, plan: plan) })
             records[index].phase = .running
             records[index].updatedAt = now()
@@ -932,10 +946,7 @@
                 try await persist()
             } catch {
                 admittedExperimentIDs.remove(experimentID)
-                if let currentIndex = records.firstIndex(where: { $0.id == experimentID }) {
-                    records[currentIndex].attempts.removeAll { $0.planID == plan.id }
-                    records[currentIndex].phase = .approved
-                }
+                restoreRecord(previousRecord)
                 throw error
             }
             executionTasks[experimentID] = Task { @MainActor [weak self] in
@@ -1176,7 +1187,7 @@
             records[index].phase = .drafting
             records[index].updatedAt = date
             records[index].statusMessage = "Revision \(plan.revision + 1) draft created; prior plans and evidence remain immutable."
-            try await persist()
+            try await persist(restoring: recordSnapshot)
         }
 
         @discardableResult
@@ -1966,6 +1977,15 @@
                 records.append(record)
             }
             records.sort { $0.updatedAt > $1.updatedAt }
+        }
+
+        private func persist(restoring previousRecord: PromptExperimentRecord) async throws {
+            do {
+                try await persist()
+            } catch {
+                restoreRecord(previousRecord)
+                throw error
+            }
         }
 
         private func index(of experimentID: UUID) throws -> Int {

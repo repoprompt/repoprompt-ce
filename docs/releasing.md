@@ -201,34 +201,6 @@ floor as an explicit policy decision and requires schema-gate review (including
 license/NOTICE review, focused validation, rollback confirmation, maintainer
 approval, and soak before any stable rotation.
 
-## Bundled Prompt Experiment runtime
-
-Debug and release packaging also include the Prompt Experiment runtime under
-`Contents/Resources/BundledRuntimes/PromptExperimentPython/<arch>/`. The
-repository manifest at `Vendor/PromptExperimentPython/manifest.json` pins
-CPython 3.11.16 `python-build-standalone` 20260901 full archives for arm64 and
-x86_64 plus GEPA 0.1.4 source revision
-`0632cdb5dcc052e690eab439e1b4a7e3e9cfe407`, including archive sizes, SHA-256
-digests, and canonical assembled-tree digests.
-
-`Scripts/prompt_experiment_runtime_artifact.py` is the only acquisition and
-assembly boundary. It validates cached downloads, extracts the upstream runtime
-and complete license inventory, installs the dependency-free GEPA source without
-PyPI resolution, records verifiable metadata, rejects escaping symlinks, checks
-architectures, and runs the host target from a relocated clean environment with
-`-I -B`. Host-native packages contain only the host target; public universal
-release paths require and verify both targets.
-
-The app never downloads or installs Python packages at runtime. Packaging signs
-every nested Python Mach-O inside-out, verifies each signature explicitly, signs
-the outer app, and then rechecks the manifest-pinned non-code tree and clean
-runtime smoke. Before applying the trusted release identity, staged Developer ID
-signing reacquires and reconstructs both runtime targets from the approved
-hash-pinned archives, discarding candidate-signed Mach-O bytes. Final Release,
-Tip, promotion, ZIP, and DMG validation requires every nested Mach-O to carry the
-expected signing team and verifies the full app artifact manifest; legal
-validators also reject a missing or mutated runtime license inventory.
-
 ## Release ownership
 
 Ordinary contributors prepare release candidates. They do not need Apple

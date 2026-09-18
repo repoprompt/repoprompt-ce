@@ -8,7 +8,6 @@ CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$ROOT_DIR/Scr
 TRUSTED_ROOT="$(cd "$CONTROL_PLANE_SCRIPTS_DIR/.." && pwd)"
 APPROVED_SOURCE_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
 CODEX_MANIFEST="$APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json"
-PROMPT_EXPERIMENT_RUNTIME_MANIFEST="$APPROVED_SOURCE_ROOT/Vendor/PromptExperimentPython/manifest.json"
 cd "$ROOT_DIR"
 
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
@@ -142,10 +141,6 @@ run_preflight() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py"
     require_file "$CODEX_MANIFEST"
-    require_file "$CONTROL_PLANE_SCRIPTS_DIR/prompt_experiment_runtime_artifact.py"
-    require_file "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST"
-    require_file "$ROOT_DIR/ThirdPartyLicenses/gepa/LICENSE"
-    require_file "$ROOT_DIR/ThirdPartyLicenses/python-build-standalone/README.md"
     require_file "$ROOT_DIR/ThirdPartyLicenses/codex/LICENSE"
     require_file "$ROOT_DIR/ThirdPartyLicenses/codex/NOTICE"
     require_file "$ROOT_DIR/ThirdPartyLicenses/codex/ZSH-LICENCE"
@@ -217,17 +212,6 @@ validate_public_app() {
         codex_verification_args+=(--signed-team-identifier "$signed_team_identifier")
     fi
     python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" "${codex_verification_args[@]}"
-    local prompt_experiment_verification_args=(
-        --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle
-        --arch all
-        --bundle "$app_bundle/Contents/Resources/BundledRuntimes/PromptExperimentPython"
-        --allow-signed-macho
-    )
-    if [[ -n "$signed_team_identifier" ]]; then
-        prompt_experiment_verification_args+=(--signed-team-identifier "$signed_team_identifier")
-    fi
-    python3 "$CONTROL_PLANE_SCRIPTS_DIR/prompt_experiment_runtime_artifact.py" \
-        "${prompt_experiment_verification_args[@]}"
     "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
         --app "$app_bundle" \
         --manifest "$manifest" \

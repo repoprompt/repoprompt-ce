@@ -441,38 +441,35 @@ class EmbeddedProvisioningProfileTests(unittest.TestCase):
                 )
 
 
-class PromptExperimentRuntimeReleaseAuthorityTests(unittest.TestCase):
-    def test_trusted_signer_reconstructs_pinned_runtime_before_release_signing(self) -> None:
-        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
-        staged_validation = source.index('"$SCRIPT_DIR/validate_staged_release.sh"')
-        acquire = source.index('"$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" acquire')
-        stage = source.index('"$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" stage-bundle')
-        exact_verify = source.index('"$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-bundle', stage)
-        nested_signing = source.index('prompt_experiment_macho_paths="$(')
-        exact_verification_block = source[exact_verify:nested_signing]
+class PromptExperimentDebugPackagingTests(unittest.TestCase):
+    def test_prompt_experiment_runtime_and_workers_stay_out_of_release_packages(self) -> None:
+        package_source = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
 
-        self.assertLess(staged_validation, acquire)
-        self.assertLess(acquire, stage)
-        self.assertLess(stage, exact_verify)
-        self.assertLess(exact_verify, nested_signing)
-        self.assertNotIn("--allow-signed-macho", exact_verification_block)
+        self.assertIn(
+            'if (( ! IS_RELEASE )); then\n'
+            '    PROMPT_EXPERIMENT_RUNTIME_TOOL="$ROOT_DIR/Scripts/prompt_experiment_runtime_artifact.py"',
+            package_source,
+        )
+        self.assertIn(
+            'if (( ! IS_RELEASE )); then\n'
+            '    phase "Embedding verified Prompt Experiment runtime $PROMPT_EXPERIMENT_RUNTIME_VERSION"',
+            package_source,
+        )
+        self.assertIn("--exclude='PromptExperiments/'", package_source)
 
-    def test_final_runtime_verifiers_require_nested_signing_team(self) -> None:
-        scripts = (
+        release_scripts = (
             "main_tip_release.sh",
-            "package_app.sh",
             "promote_release.sh",
             "publish_public_update_test.sh",
             "release.sh",
             "sign_staged_release.sh",
+            "validate_packaged_legal.sh",
+            "validate_staged_release.sh",
         )
-        for filename in scripts:
+        for filename in release_scripts:
             source = (SCRIPT_DIR / filename).read_text(encoding="utf-8")
             with self.subTest(script=filename):
-                self.assertIn("--signed-team-identifier", source)
-        verifier = (SCRIPT_DIR / "prompt_experiment_runtime_artifact.py").read_text(encoding="utf-8")
-        self.assertIn('["codesign", "--verify", "--strict", "--verbose=2", str(path)]', verifier)
-        self.assertIn('line.startswith("TeamIdentifier=")', verifier)
+                self.assertNotIn("PromptExperimentPython", source)
 
 
 if __name__ == "__main__":

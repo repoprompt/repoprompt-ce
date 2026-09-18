@@ -77,12 +77,6 @@ python3 "$ROOT_DIR/Scripts/codex_runtime_artifact.py" \
     --arch all \
     --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex" \
     --signed-team-identifier "$SIGNING_TEAM_ID"
-python3 "$ROOT_DIR/Scripts/prompt_experiment_runtime_artifact.py" \
-    --manifest "$ROOT_DIR/Vendor/PromptExperimentPython/manifest.json" verify-bundle \
-    --arch all \
-    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/PromptExperimentPython" \
-    --allow-signed-macho \
-    --signed-team-identifier "$SIGNING_TEAM_ID"
 "$ROOT_DIR/Scripts/write_app_artifact_manifest.py" verify \
     --app "$APP_BUNDLE" \
     --manifest "$ARTIFACT_MANIFEST" \

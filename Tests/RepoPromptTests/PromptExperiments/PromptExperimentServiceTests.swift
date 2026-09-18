@@ -1160,6 +1160,64 @@ import XCTest
             XCTAssertEqual(harness.service.record(id: id)?.approvals.last?.planDigest, plan.digest)
         }
 
+        func testApprovalPersistenceFailureRestoresUnapprovedAuthority() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try blockCanonicalPersistence(at: harness.root)
+
+            do {
+                try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+                XCTFail("Approval must fail when canonical persistence fails")
+            } catch {}
+
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            XCTAssertEqual(record.phase, .awaitingApproval)
+            XCTAssertTrue(record.approvals.isEmpty)
+        }
+
+        func testSealPersistenceFailureRestoresDraftAuthority() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let (id, draft) = try await updatedOptimizationDraft(harness)
+            try blockCanonicalPersistence(at: harness.root)
+
+            do {
+                _ = try await harness.service.seal(
+                    experimentID: id,
+                    expectedDraftID: draft.id,
+                    expectedDraftVersion: draft.optimisticVersion,
+                    expectedDraftDigest: draft.contentDigest()
+                )
+                XCTFail("Seal must fail when canonical persistence fails")
+            } catch {}
+
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            XCTAssertEqual(record.phase, .drafting)
+            XCTAssertEqual(record.draft, draft)
+            XCTAssertTrue(record.plans.isEmpty)
+        }
+
+        func testRunPersistenceFailureRestoresExactApprovedAuthority() async throws {
+            let harness = makeHarness()
+            defer { try? FileManager.default.removeItem(at: harness.root) }
+            let id = try await preparedExperiment(harness)
+            let plan = try XCTUnwrap(harness.service.record(id: id)?.currentPlan)
+            try await harness.service.approve(experimentID: id, displayedDigest: plan.digest)
+            let approved = try XCTUnwrap(harness.service.record(id: id))
+            try blockCanonicalPersistence(at: harness.root)
+
+            do {
+                try await harness.service.run(experimentID: id)
+                XCTFail("Run admission must fail when its canonical state cannot be persisted")
+            } catch {}
+
+            let record = try XCTUnwrap(harness.service.record(id: id))
+            XCTAssertEqual(record, approved)
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+        }
+
         func testPersistenceReopenAndReadableViews() async throws {
             let harness = makeHarness()
             defer { try? FileManager.default.removeItem(at: harness.root) }
@@ -3279,6 +3337,12 @@ import XCTest
         private func temporaryRoot() -> URL {
             FileManager.default.temporaryDirectory
                 .appendingPathComponent("PromptExperimentServiceTests-\(UUID().uuidString)", isDirectory: true)
+        }
+
+        private func blockCanonicalPersistence(at root: URL) throws {
+            let canonicalURL = root.appendingPathComponent("experiments.json", isDirectory: false)
+            try FileManager.default.removeItem(at: canonicalURL)
+            try FileManager.default.createDirectory(at: canonicalURL, withIntermediateDirectories: false)
         }
 
         private static func fakeTarget(_ role: String) -> PromptExperimentResolvedTarget? {

@@ -141,7 +141,6 @@ for path in [
     app / "Contents" / "MacOS",
     app / "Contents" / "Resources",
     app / "Contents" / "Resources" / "Legal",
-    app / "Contents" / "Resources" / "BundledRuntimes" / "PromptExperimentPython",
 ]:
     require_real_directory(path)
 
@@ -171,9 +170,7 @@ cli_links = {
     app / "Contents" / "Resources" / "bin" / "repoprompt-mcp": "../../MacOS/repoprompt-mcp",
 }
 sparkle = app / "Contents" / "Frameworks" / "Sparkle.framework"
-prompt_experiment_runtime = app / "Contents" / "Resources" / "BundledRuntimes" / "PromptExperimentPython"
 resolved_sparkle = sparkle.resolve(strict=False)
-resolved_prompt_experiment_runtime = prompt_experiment_runtime.resolve(strict=False)
 for path in root.rglob("*"):
     mode = path.lstat().st_mode
     if stat.S_ISLNK(mode):
@@ -182,9 +179,6 @@ for path in root.rglob("*"):
             path in cli_links and os.readlink(path) == cli_links[path]
         ) or (
             sparkle in path.parents and resolved.is_relative_to(resolved_sparkle)
-        ) or (
-            prompt_experiment_runtime in path.parents
-            and resolved.is_relative_to(resolved_prompt_experiment_runtime)
         )
         if not allowed:
             fail(f"unexpected or escaping staged symlink: {path} -> {os.readlink(path)}")
@@ -206,11 +200,6 @@ python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
     --manifest "$APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json" verify-bundle \
     --arch all \
     --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
-python3 "$SCRIPT_DIR/prompt_experiment_runtime_artifact.py" \
-    --manifest "$APPROVED_SOURCE_ROOT/Vendor/PromptExperimentPython/manifest.json" verify-bundle \
-    --arch all \
-    --bundle "$APP_BUNDLE/Contents/Resources/BundledRuntimes/PromptExperimentPython" \
-    --allow-signed-macho
 "$SCRIPT_DIR/write_app_artifact_manifest.py" verify \
     --app "$APP_BUNDLE" \
     --manifest "$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json" \
