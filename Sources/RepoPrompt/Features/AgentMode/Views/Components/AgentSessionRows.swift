@@ -615,8 +615,11 @@ struct AgentSessionRow: View {
                 Button(action: toggleSelection) {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        .padding(6)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .padding(-6) // Keep the row layout unchanged around the larger hit target.
                 .disabled(!isInteractionEnabled)
                 .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(title)")
                 .accessibilityValue(isSelected ? "Selected" : "Not selected")
@@ -1393,8 +1396,11 @@ struct AgentStashedSessionRow: View {
                 Button(action: toggleSelection) {
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        .padding(6)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .padding(-6) // Keep the row layout unchanged around the larger hit target.
                 .disabled(!isInteractionEnabled)
                 .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(stashed.tab.name)")
                 .accessibilityValue(isSelected ? "Selected" : "Not selected")
@@ -1546,6 +1552,7 @@ extension AgentProviderKind {
         case .openCode, .antigravity: "curlybraces.square"
         case .cursor: "cursorarrow"
         case .grokBuild: "bolt.circle.fill"
+        case .devin: "terminal.fill"
         }
     }
 }

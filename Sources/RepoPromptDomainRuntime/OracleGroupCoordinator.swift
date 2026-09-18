@@ -32,9 +32,14 @@ package struct OracleLaneFailure: Error, LocalizedError, Equatable, Sendable {
 }
 
 package struct OracleLaneCancellation: Error, Equatable, Sendable {
+    package let partialResponse: String?
     package let executionProfile: OracleExecutionProfile?
 
-    package init(executionProfile: OracleExecutionProfile? = nil) {
+    package init(
+        partialResponse: String? = nil,
+        executionProfile: OracleExecutionProfile? = nil
+    ) {
+        self.partialResponse = partialResponse
         self.executionProfile = executionProfile
     }
 }
@@ -213,7 +218,11 @@ package struct OracleGroupCoordinator: Sendable {
                 modelID: plan.lane.model.modelID,
                 status: .cancelled,
                 executionProfile: cancellation.executionProfile,
-                error: OracleLaneError(code: "cancelled", message: "Oracle lane was cancelled.")
+                error: OracleLaneError(
+                    code: "cancelled",
+                    message: "Oracle lane was cancelled.",
+                    partialResponse: cancellation.partialResponse
+                )
             )
         } catch is CancellationError {
             return try OracleLaneResult(

@@ -215,7 +215,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
         func stop() async {}
-        func abortForExecutionWatchdog() async {}
+        func abortForExecutionWatchdog(context _: MCPExecutionWatchdogTerminalContext) async {}
         func notifyToolListChanged() async {}
         func connectionState() -> ConnectionStateSnapshot {
             .ready

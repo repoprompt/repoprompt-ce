@@ -52,6 +52,57 @@ final class OracleGroupRuntimeTests: XCTestCase {
         XCTAssertEqual(completion.terminalDocument.revision, 2)
     }
 
+    func testCancelledPrimaryPersistsStreamedPartialAfterAuxiliarySettles() async throws {
+        let fixture = try makeRuntime()
+        defer { fixture.cleanup() }
+        let start = try makeStart(count: 2, seed: "cancelled-primary-partial")
+        let milestones = ClaimHoldGate()
+
+        let completion = try await fixture.runtime.execute(
+            Request(
+                invocationID: UUID(),
+                runID: UUID(),
+                claimID: UUID(),
+                input: try OracleInput(mode: .chat, userMessage: "ask"),
+                intent: .start(start)
+            ),
+            callbacks: .init(
+                executeLane: { invocation in
+                    switch invocation.member.laneID.index {
+                    case 0:
+                        await invocation.context.emitDelta("primary partial")
+                        await milestones.waitForRelease()
+                        throw OracleLaneCancellation(partialResponse: "primary partial")
+                    case 1:
+                        await milestones.waitUntilHeld()
+                        return OracleLaneExecutionResponse(response: "auxiliary answer")
+                    default:
+                        throw RuntimeFixtureError.execution
+                    }
+                },
+                progress: { event in
+                    if event.laneID?.index == 0, event.kind == .laneDelta {
+                        await milestones.markHeld()
+                    }
+                    if event.laneID?.index == 1, event.kind == .laneSettled {
+                        await milestones.releaseHold()
+                    }
+                }
+            )
+        )
+
+        XCTAssertEqual(completion.result.status, .failed)
+        XCTAssertEqual(completion.result.oracleResults.map(\.laneIndex), [0, 1])
+        XCTAssertEqual(completion.result.primary.status, .cancelled)
+        XCTAssertNil(completion.result.primary.response)
+        XCTAssertEqual(completion.result.primary.error?.code, "cancelled")
+        XCTAssertEqual(completion.result.primary.error?.partialResponse, "primary partial")
+        XCTAssertEqual(completion.result.oracleResults[1].status, .completed)
+        XCTAssertEqual(completion.result.oracleResults[1].response, "auxiliary answer")
+        XCTAssertTrue(completion.result.warnings.isEmpty)
+        XCTAssertEqual(completion.terminalDocument.turns.last?.results, completion.result.oracleResults)
+    }
+
     func testContinuationRecoversInterruptedTurn() async throws {
         let fixture = try makeRuntime()
         defer { fixture.cleanup() }

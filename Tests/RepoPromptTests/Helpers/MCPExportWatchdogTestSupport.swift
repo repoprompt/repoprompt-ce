@@ -69,6 +69,21 @@ actor MCPExportWatchdogManualClock {
         }
     }
 
+    func waitForSleeper(
+        expected duration: Duration,
+        timeout: Duration = synchronizationTimeout
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !sleeperState.contains(duration: duration) {
+            try Task.checkCancellation()
+            guard clock.now < deadline else {
+                throw ClockError.sleeperDidNotRegister(expected: 1, actual: sleeperState.count)
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     func advanceWithoutSleepers(by duration: Duration) throws {
         guard duration > .zero else {
             throw ClockError.nonPositiveAdvance(duration)
@@ -149,6 +164,10 @@ actor MCPExportWatchdogManualClock {
 
         var count: Int {
             lock.withLock { sleepers.count }
+        }
+
+        func contains(duration: Duration) -> Bool {
+            lock.withLock { sleepers.values.contains { $0.duration == duration } }
         }
 
         func register(

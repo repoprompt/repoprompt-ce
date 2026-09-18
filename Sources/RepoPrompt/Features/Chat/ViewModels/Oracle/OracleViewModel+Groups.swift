@@ -72,6 +72,7 @@ enum AppOracleGroupRouting {
         case .openCode: "openCode"
         case .cursor: "cursor"
         case .grokBuild: "grokBuild"
+        case .devin: "devin"
         }
     }
 }
@@ -649,7 +650,10 @@ extension OracleViewModel {
             }
             if Task.isCancelled {
                 await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
-                throw OracleLaneCancellation(executionProfile: executionProfile)
+                throw OracleLaneCancellation(
+                    partialResponse: partialResponse,
+                    executionProfile: executionProfile
+                )
             }
             guard let response = reply["response"]?.stringValue else {
                 throw OracleLaneFailure(code: "empty_response", message: "Oracle lane returned no response.")
@@ -657,7 +661,10 @@ extension OracleViewModel {
             await executionContext.emitDelta(response)
             if Task.isCancelled {
                 await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
-                throw OracleLaneCancellation(executionProfile: executionProfile)
+                throw OracleLaneCancellation(
+                    partialResponse: partialResponse,
+                    executionProfile: executionProfile
+                )
             }
             return OracleLaneExecutionResponse(
                 response: response,
@@ -666,7 +673,10 @@ extension OracleViewModel {
         } catch {
             if Task.isCancelled || error is CancellationError {
                 await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
-                throw OracleLaneCancellation(executionProfile: executionProfile)
+                throw OracleLaneCancellation(
+                    partialResponse: partialResponse,
+                    executionProfile: executionProfile
+                )
             }
             if let failure = error as? OracleLaneFailure {
                 throw OracleLaneFailure(

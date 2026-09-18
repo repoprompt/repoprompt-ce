@@ -850,8 +850,15 @@ import XCTest
                         try await clock.advanceNext(expected: MCPTimeoutPolicy.promptExportExecutionDeadline)
                         try await clock.waitForSleeperCount(1)
                         try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
-                        await Self.assertSocketClosed(activeResponseTask)
+                        let terminalResponse = try await activeResponseTask.value
                         responseTask = nil
+                        let terminalError = try Self.watchdogTerminalError(from: terminalResponse)
+                        XCTAssertEqual((terminalError["code"] as? NSNumber)?.intValue, -32000)
+                        let terminalData = try XCTUnwrap(terminalError["data"] as? [String: Any])
+                        XCTAssertEqual(terminalData["reason"] as? String, "tool_execution_watchdog")
+                        XCTAssertEqual(terminalData["tool_name"] as? String, toolName)
+                        XCTAssertFalse((terminalData["handler_phase"] as? String ?? "").isEmpty)
+                        XCTAssertNotNil((terminalData["invocation_id"] as? String).flatMap(UUID.init(uuidString:)))
                         let isTerminal = await manager.debugIsExecutionWatchdogTerminal(
                             connectionID: endpoint.connectionID
                         )
@@ -890,6 +897,125 @@ import XCTest
                         await fixture.cleanup()
                         throw error
                     }
+                }
+            }
+        }
+
+        func testWatchdogForceDisconnectWritesTerminalJSONRPCErrorsForEveryPipelinedRequest() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let manager = fixture.networkManager
+                let endpoint = try fixture.endpointA()
+                let clock = MCPExportWatchdogManualClock()
+                let providerGate = MCPExecutionIgnoringCancellationGate()
+                var firstTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var secondTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.prompt) {
+                    await providerGate.enterAndWait()
+                    return .object(["ok": .bool(true)])
+                }
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    let firstRequestID = endpoint.client.nextRequestIDForTesting()
+                    let activeFirstTask = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.prompt,
+                            arguments: ["op": "export", "_rawJSON": true]
+                        )
+                    }
+                    firstTask = activeFirstTask
+                    try await providerGate.waitUntilEntered(count: 1)
+                    try await clock.waitForSleeper(
+                        expected: MCPTimeoutPolicy.promptExportExecutionDeadline
+                    )
+                    let initialIngress = await endpoint.connectionManager.transportIngressSnapshot()
+                    let initialAcceptedFrameCount = try XCTUnwrap(initialIngress?.acceptedFrameCount)
+
+                    let secondRequestID = endpoint.client.nextRequestIDForTesting()
+                    let activeSecondTask = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.prompt,
+                            arguments: ["op": "export", "_rawJSON": true]
+                        )
+                    }
+                    secondTask = activeSecondTask
+                    let secondFrameAccepted = await Self.waitUntil {
+                        guard let ingress = await endpoint.connectionManager.transportIngressSnapshot() else {
+                            return false
+                        }
+                        return ingress.acceptedFrameCount >= initialAcceptedFrameCount + 1
+                    }
+                    XCTAssertTrue(secondFrameAccepted)
+
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.promptExportExecutionDeadline)
+                    try await clock.waitForSleeper(
+                        expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace
+                    )
+                    try await clock.advanceSleeper(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+
+                    let firstResponse = try await activeFirstTask.value
+                    firstTask = nil
+                    let secondResponse = try await activeSecondTask.value
+                    secondTask = nil
+                    XCTAssertEqual(
+                        Set([firstResponse.id, secondResponse.id]),
+                        Set([firstRequestID, secondRequestID])
+                    )
+                    for response in [firstResponse, secondResponse] {
+                        let terminalError = try Self.watchdogTerminalError(from: response)
+                        XCTAssertEqual((terminalError["code"] as? NSNumber)?.intValue, -32000)
+                        let terminalData = try XCTUnwrap(terminalError["data"] as? [String: Any])
+                        XCTAssertEqual(terminalData["reason"] as? String, "tool_execution_watchdog")
+                        XCTAssertEqual(terminalData["tool_name"] as? String, MCPWindowToolName.prompt)
+                        XCTAssertFalse((terminalData["handler_phase"] as? String ?? "").isEmpty)
+                        XCTAssertNotNil((terminalData["invocation_id"] as? String).flatMap(UUID.init(uuidString:)))
+                    }
+                    let isTerminal = await manager.debugIsExecutionWatchdogTerminal(
+                        connectionID: endpoint.connectionID
+                    )
+                    XCTAssertTrue(isTerminal)
+
+                    do {
+                        _ = try await endpoint.client.request(method: "tools/list", params: [:])
+                        XCTFail("watchdog-terminal socket unexpectedly accepted a request")
+                    } catch PersistentMCPTestSocketClient.ClientError.closed {
+                        // The two terminal errors were delivered before the connection closed.
+                    }
+
+                    await providerGate.release()
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.prompt,
+                        operation: nil
+                    )
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await providerGate.release()
+                    firstTask?.cancel()
+                    secondTask?.cancel()
+                    if let firstTask { _ = try? await firstTask.value }
+                    if let secondTask { _ = try? await secondTask.value }
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.prompt,
+                        operation: nil
+                    )
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
                 }
             }
         }
@@ -2011,6 +2137,543 @@ import XCTest
             }
         }
 
+        func testUnixSocketRejectsExplicitNullIDAndPreservesEmptyStringIDForWatchdog() async throws {
+            var descriptors = [Int32](repeating: -1, count: 2)
+            guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ENFILE)
+            }
+            let transportFD = descriptors[0]
+            let peerFD = descriptors[1]
+            defer { Darwin.close(peerFD) }
+
+            let stringRequestID = ""
+            let pingRequestID = 79
+            let accepted = MCPExecutionOneShotSignal<Void>()
+            let transport = try UnixSocketMCPTransport(
+                connectedFD: transportFD,
+                connectionID: UUID(),
+                connectionGeneration: 1
+            )
+            await transport.debugSetBeforeInboundFrameOfferForTesting {
+                accepted.signal(())
+            }
+            try await transport.connect()
+
+            let requestFrame = Data(
+                "[{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"tools/call\",\"params\":{\"name\":\"prompt\",\"arguments\":{\"op\":\"get\"}}},{\"jsonrpc\":\"2.0\",\"id\":\"\(stringRequestID)\",\"method\":\"tools/call\",\"params\":{\"name\":\"prompt\",\"arguments\":{\"op\":\"get\"}}},{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}},{\"jsonrpc\":\"2.0\",\"id\":\(pingRequestID),\"method\":\"ping\",\"params\":{}}]\n".utf8
+            )
+            let written = requestFrame.withUnsafeBytes { bytes in
+                Darwin.write(peerFD, bytes.baseAddress, bytes.count)
+            }
+            XCTAssertEqual(written, requestFrame.count)
+            await accepted.wait()
+
+            let inbound = await transport.receive()
+            var inboundIterator = inbound.makeAsyncIterator()
+            let receivedFrame = try await inboundIterator.next()
+            let forwardedFrame = try XCTUnwrap(receivedFrame)
+            let forwardedBatch = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: forwardedFrame) as? [[String: Any]]
+            )
+            XCTAssertEqual(forwardedBatch.count, 3)
+            XCTAssertFalse(forwardedBatch.contains { $0["id"] is NSNull })
+            XCTAssertTrue(forwardedBatch.contains {
+                $0["id"] as? String == stringRequestID && $0["method"] as? String == "tools/call"
+            })
+            XCTAssertTrue(forwardedBatch.contains {
+                ($0["id"] as? NSNumber)?.intValue == pingRequestID && $0["method"] as? String == "ping"
+            })
+            XCTAssertTrue(forwardedBatch.contains {
+                $0["id"] == nil && $0["method"] as? String == "notifications/initialized"
+            })
+
+            let invalidRequestObject = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Self.readJSONLines(from: peerFD, expectedCount: 1)[0]) as? [String: Any]
+            )
+            XCTAssertTrue(invalidRequestObject["id"] is NSNull)
+            let invalidRequestError = try XCTUnwrap(invalidRequestObject["error"] as? [String: Any])
+            XCTAssertEqual((invalidRequestError["code"] as? NSNumber)?.intValue, -32600)
+            XCTAssertEqual(invalidRequestError["message"] as? String, "Invalid Request")
+
+            let invocationID = UUID()
+            let terminateControlFrame = try XCTUnwrap(
+                RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
+                    reason: .toolExecutionWatchdog,
+                    message: MCPExecutionWatchdogTerminalContext.message
+                ).encodedJSONLine()
+            )
+            MCPResponseDeliveryTracer.resetDebugEvents()
+            let terminalCount = await transport.sendExecutionWatchdogTerminalErrors(context: .init(
+                reason: "tool_execution_watchdog",
+                toolName: MCPWindowToolName.prompt,
+                handlerPhase: "provider_execution",
+                invocationID: invocationID
+            ), trailingControlFrame: terminateControlFrame)
+            XCTAssertEqual(terminalCount, 2)
+
+            let terminalFrames = try Self.readJSONLines(from: peerFD, expectedCount: 3)
+            let terminalObjects = try terminalFrames.map {
+                try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any])
+            }
+            XCTAssertEqual(terminalObjects[0]["id"] as? String, stringRequestID)
+            XCTAssertEqual((terminalObjects[1]["id"] as? NSNumber)?.intValue, pingRequestID)
+            for terminalFrame in terminalObjects.prefix(2) {
+                let terminalError = try XCTUnwrap(terminalFrame["error"] as? [String: Any])
+                XCTAssertEqual((terminalError["code"] as? NSNumber)?.intValue, -32000)
+                let terminalData = try XCTUnwrap(terminalError["data"] as? [String: Any])
+                XCTAssertEqual(terminalData["reason"] as? String, "tool_execution_watchdog")
+                XCTAssertEqual(terminalData["tool_name"] as? String, MCPWindowToolName.prompt)
+                XCTAssertEqual(terminalData["handler_phase"] as? String, "provider_execution")
+                XCTAssertEqual(terminalData["invocation_id"] as? String, invocationID.uuidString)
+            }
+            XCTAssertEqual(terminalObjects[2]["method"] as? String, RepoPromptControlMethod.terminate)
+            let terminateParams = try XCTUnwrap(terminalObjects[2]["params"] as? [String: Any])
+            XCTAssertEqual(terminateParams["reason"] as? String, TerminationReason.toolExecutionWatchdog.rawValue)
+
+            let deliveredSnapshot = await transport.responseDeliverySnapshot()
+            XCTAssertEqual(deliveredSnapshot.pendingRequestCount, 0)
+            try await transport.send(Data(
+                "[{\"jsonrpc\":\"2.0\",\"id\":\"\(stringRequestID)\",\"result\":{\"content\":[]}},{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}},{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}},{\"jsonrpc\":\"2.0\",\"id\":\(pingRequestID),\"result\":{}},{\"jsonrpc\":\"2.0\",\"id\":900,\"result\":{\"kept\":true}}]\n".utf8
+            ))
+            let lateResponseSnapshot = await transport.responseDeliverySnapshot()
+            XCTAssertEqual(lateResponseSnapshot, deliveredSnapshot)
+            let retainedFrame = try Self.readJSONLines(from: peerFD, expectedCount: 1)[0]
+            let retainedBatch = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: retainedFrame) as? [[String: Any]]
+            )
+            XCTAssertEqual(retainedBatch.count, 2)
+            XCTAssertEqual(retainedBatch[0]["method"] as? String, "notifications/progress")
+            XCTAssertEqual((retainedBatch[1]["id"] as? NSNumber)?.intValue, 900)
+
+            try await transport.send(Data(
+                "{\"jsonrpc\":\"2.0\",\"id\":\"\(stringRequestID)\",\"result\":{\"content\":[]}}\n".utf8
+            ))
+            XCTAssertTrue(MCPResponseDeliveryTracer.debugEventSnapshot().contains {
+                $0.phase == "watchdog_late_response_suppressed" && $0.id == .string(stringRequestID)
+            })
+
+            await transport.disconnect()
+            MCPResponseDeliveryTracer.resetDebugEvents()
+        }
+
+        func testUnixSocketWatchdogSealsWhileOrdinaryResponseWriteIsBackpressured() async throws {
+            var descriptors = [Int32](repeating: -1, count: 2)
+            guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ENFILE)
+            }
+            let transportFD = descriptors[0]
+            let peerFD = descriptors[1]
+            defer { Darwin.close(peerFD) }
+
+            var sendBufferBytes: Int32 = 1024
+            guard Darwin.setsockopt(
+                transportFD,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &sendBufferBytes,
+                socklen_t(MemoryLayout<Int32>.size)
+            ) == 0 else {
+                Darwin.close(transportFD)
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL)
+            }
+
+            let accepted = MCPExecutionOneShotSignal<Void>()
+            let ordinaryWriteWouldBlock = MCPExecutionOneShotSignal<Void>()
+            let ordinaryWriterWasReleased = MCPExecutionOneShotSignal<Bool>()
+            let watchdogDidSeal = MCPExecutionOneShotSignal<Void>()
+            let releaseOrdinaryWriter = DispatchSemaphore(value: 0)
+            let transport = try UnixSocketMCPTransport(
+                connectedFD: transportFD,
+                connectionID: UUID(),
+                connectionGeneration: 1,
+                writeStallTimeout: 1,
+                writePollIntervalMilliseconds: 1
+            )
+            await transport.debugSetBeforeInboundFrameOfferForTesting {
+                accepted.signal(())
+            }
+            await transport.debugSetOrdinaryWriteWouldBlockForTesting {
+                ordinaryWriteWouldBlock.signal(())
+                let result = releaseOrdinaryWriter.wait(timeout: .now() + 10)
+                ordinaryWriterWasReleased.signal(result == .success)
+            }
+            await transport.debugSetExecutionWatchdogDidSealForTesting {
+                watchdogDidSeal.signal(())
+            }
+            try await transport.connect()
+
+            var ordinaryResponseTask: Task<Void, Error>?
+            var terminalTask: Task<Int, Never>?
+            do {
+                let requestFrame = Data(
+                    "[{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"ping\",\"params\":{}},{\"jsonrpc\":\"2.0\",\"id\":\"77\",\"method\":\"ping\",\"params\":{}}]\n".utf8
+                )
+                let requestWriteCount = requestFrame.withUnsafeBytes { bytes in
+                    Darwin.write(peerFD, bytes.baseAddress, bytes.count)
+                }
+                XCTAssertEqual(requestWriteCount, requestFrame.count)
+                await accepted.wait()
+                var inboundIterator = await transport.receive().makeAsyncIterator()
+                _ = try await inboundIterator.next()
+
+                let fillerByteCount = try Self.fillSocketSendBuffer(fd: transportFD)
+                XCTAssertGreaterThan(fillerByteCount, 0)
+
+                let activeOrdinaryResponseTask = Task {
+                    try await transport.send(Data(
+                        "{\"jsonrpc\":\"2.0\",\"id\":77,\"result\":{}}\n".utf8
+                    ))
+                }
+                ordinaryResponseTask = activeOrdinaryResponseTask
+                await ordinaryWriteWouldBlock.wait()
+
+                let invocationID = UUID()
+                let activeTerminalTask = Task {
+                    await transport.sendExecutionWatchdogTerminalErrors(context: .init(
+                        reason: "tool_execution_watchdog",
+                        toolName: MCPWindowToolName.prompt,
+                        handlerPhase: "provider_execution",
+                        invocationID: invocationID
+                    ))
+                }
+                terminalTask = activeTerminalTask
+                await watchdogDidSeal.wait()
+
+                try Self.drainBytes(count: fillerByteCount, from: peerFD)
+                releaseOrdinaryWriter.signal()
+                let ordinaryWriterReleased = await ordinaryWriterWasReleased.wait()
+                XCTAssertTrue(ordinaryWriterReleased)
+                try await activeOrdinaryResponseTask.value
+                ordinaryResponseTask = nil
+                let deliveredTerminalCount = await activeTerminalTask.value
+                XCTAssertEqual(deliveredTerminalCount, 2)
+                terminalTask = nil
+
+                let terminalFrames = try Self.readJSONLines(from: peerFD, expectedCount: 2)
+                let terminalObjects = try terminalFrames.map {
+                    try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any])
+                }
+                XCTAssertEqual((terminalObjects[0]["id"] as? NSNumber)?.intValue, 77)
+                XCTAssertEqual(terminalObjects[1]["id"] as? String, "77")
+                for terminalObject in terminalObjects {
+                    let terminalError = try XCTUnwrap(terminalObject["error"] as? [String: Any])
+                    XCTAssertEqual((terminalError["code"] as? NSNumber)?.intValue, -32000)
+                    let terminalData = try XCTUnwrap(terminalError["data"] as? [String: Any])
+                    XCTAssertEqual(terminalData["reason"] as? String, "tool_execution_watchdog")
+                    XCTAssertEqual(terminalData["tool_name"] as? String, MCPWindowToolName.prompt)
+                    XCTAssertEqual(terminalData["handler_phase"] as? String, "provider_execution")
+                    XCTAssertEqual(terminalData["invocation_id"] as? String, invocationID.uuidString)
+                }
+                let deliveredSnapshot = await transport.responseDeliverySnapshot()
+                XCTAssertEqual(deliveredSnapshot.pendingRequestCount, 0)
+                let closeSnapshot = await transport.closeSnapshot()
+                XCTAssertNil(closeSnapshot)
+
+                await transport.debugSetOrdinaryWriteWouldBlockForTesting(nil)
+                await transport.debugSetExecutionWatchdogDidSealForTesting(nil)
+                await transport.disconnect()
+            } catch {
+                releaseOrdinaryWriter.signal()
+                ordinaryResponseTask?.cancel()
+                if let ordinaryResponseTask { _ = try? await ordinaryResponseTask.value }
+                terminalTask?.cancel()
+                if let terminalTask { _ = await terminalTask.value }
+                await transport.debugSetOrdinaryWriteWouldBlockForTesting(nil)
+                await transport.debugSetExecutionWatchdogDidSealForTesting(nil)
+                await transport.disconnect()
+                throw error
+            }
+        }
+
+        func testUnixSocketWatchdogPreemptsQueuedUnrelatedFrameUntilTerminalDeliveryCompletes() async throws {
+            var descriptors = [Int32](repeating: -1, count: 2)
+            guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ENFILE)
+            }
+            let transportFD = descriptors[0]
+            let peerFD = descriptors[1]
+            defer { Darwin.close(peerFD) }
+
+            var sendBufferBytes: Int32 = 1024
+            guard Darwin.setsockopt(
+                transportFD,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &sendBufferBytes,
+                socklen_t(MemoryLayout<Int32>.size)
+            ) == 0 else {
+                Darwin.close(transportFD)
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL)
+            }
+
+            let accepted = MCPExecutionOneShotSignal<Void>()
+            let watchdogDidSeal = MCPExecutionOneShotSignal<Void>()
+            let watchdogSealHookWasReleased = MCPExecutionOneShotSignal<Bool>()
+            let unrelatedWriterEntered = MCPExecutionOneShotSignal<Void>()
+            let unrelatedWriterWasReleased = MCPExecutionOneShotSignal<Bool>()
+            let releaseWatchdogAfterSeal = DispatchSemaphore(value: 0)
+            let releaseUnrelatedWriter = DispatchSemaphore(value: 0)
+            let transport = try UnixSocketMCPTransport(
+                connectedFD: transportFD,
+                connectionID: UUID(),
+                connectionGeneration: 1,
+                writeStallTimeout: 1,
+                writePollIntervalMilliseconds: 1
+            )
+            await transport.debugSetBeforeInboundFrameOfferForTesting {
+                accepted.signal(())
+            }
+            await transport.debugSetExecutionWatchdogDidSealForTesting {
+                watchdogDidSeal.signal(())
+                let result = releaseWatchdogAfterSeal.wait(timeout: .now() + 10)
+                watchdogSealHookWasReleased.signal(result == .success)
+            }
+            await transport.debugSetBeforeOrdinaryWriteForTesting {
+                unrelatedWriterEntered.signal(())
+                let result = releaseUnrelatedWriter.wait(timeout: .now() + 10)
+                unrelatedWriterWasReleased.signal(result == .success)
+            }
+            try await transport.connect()
+
+            var unrelatedTask: Task<Void, Error>?
+            var terminalTask: Task<Int, Never>?
+            do {
+                let requestFrame = Data(
+                    "{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"ping\",\"params\":{}}\n".utf8
+                )
+                let requestWriteCount = requestFrame.withUnsafeBytes { bytes in
+                    Darwin.write(peerFD, bytes.baseAddress, bytes.count)
+                }
+                XCTAssertEqual(requestWriteCount, requestFrame.count)
+                await accepted.wait()
+                var inboundIterator = await transport.receive().makeAsyncIterator()
+                _ = try await inboundIterator.next()
+
+                let fillerByteCount = try Self.fillSocketSendBuffer(fd: transportFD)
+                XCTAssertGreaterThan(fillerByteCount, 0)
+
+                let terminateControlFrame = try XCTUnwrap(
+                    RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
+                        reason: .toolExecutionWatchdog,
+                        message: MCPExecutionWatchdogTerminalContext.message
+                    ).encodedJSONLine()
+                )
+                let invocationID = UUID()
+                let activeTerminalTask = Task {
+                    await transport.sendExecutionWatchdogTerminalErrors(context: .init(
+                        reason: "tool_execution_watchdog",
+                        toolName: MCPWindowToolName.prompt,
+                        handlerPhase: "provider_execution",
+                        invocationID: invocationID
+                    ), trailingControlFrame: terminateControlFrame)
+                }
+                terminalTask = activeTerminalTask
+                await watchdogDidSeal.wait()
+
+                let activeUnrelatedTask = Task {
+                    try await transport.send(Data(
+                        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"queued\":true}}\n".utf8
+                    ))
+                }
+                unrelatedTask = activeUnrelatedTask
+                await unrelatedWriterEntered.wait()
+
+                // The unrelated post-seal send owns the actor while the watchdog is
+                // released to queue its terminal writer behind it.
+                releaseWatchdogAfterSeal.signal()
+                let watchdogHookReleased = await watchdogSealHookWasReleased.wait()
+                XCTAssertTrue(watchdogHookReleased)
+                try Self.drainBytes(count: fillerByteCount, from: peerFD)
+                releaseUnrelatedWriter.signal()
+                let unrelatedHookReleased = await unrelatedWriterWasReleased.wait()
+                XCTAssertTrue(unrelatedHookReleased)
+
+                try await activeUnrelatedTask.value
+                unrelatedTask = nil
+                let deliveredTerminalCount = await activeTerminalTask.value
+                terminalTask = nil
+                XCTAssertEqual(deliveredTerminalCount, 1)
+
+                let terminalFrames = try Self.readJSONLines(from: peerFD, expectedCount: 2)
+                let terminalErrorObject = try XCTUnwrap(
+                    JSONSerialization.jsonObject(with: terminalFrames[0]) as? [String: Any]
+                )
+                XCTAssertEqual((terminalErrorObject["id"] as? NSNumber)?.intValue, 83)
+                let terminalError = try XCTUnwrap(terminalErrorObject["error"] as? [String: Any])
+                XCTAssertEqual((terminalError["code"] as? NSNumber)?.intValue, -32000)
+                let terminalData = try XCTUnwrap(terminalError["data"] as? [String: Any])
+                XCTAssertEqual(terminalData["invocation_id"] as? String, invocationID.uuidString)
+
+                let controlObject = try XCTUnwrap(
+                    JSONSerialization.jsonObject(with: terminalFrames[1]) as? [String: Any]
+                )
+                XCTAssertEqual(controlObject["method"] as? String, RepoPromptControlMethod.terminate)
+                XCTAssertFalse(terminalFrames.contains { frame in
+                    String(decoding: frame, as: UTF8.self).contains("notifications/progress")
+                })
+                let closeSnapshot = await transport.closeSnapshot()
+                XCTAssertNil(closeSnapshot)
+
+                await transport.debugSetBeforeOrdinaryWriteForTesting(nil)
+                await transport.debugSetExecutionWatchdogDidSealForTesting(nil)
+                await transport.disconnect()
+            } catch {
+                releaseWatchdogAfterSeal.signal()
+                releaseUnrelatedWriter.signal()
+                unrelatedTask?.cancel()
+                if let unrelatedTask {
+                    _ = try? await unrelatedTask.value
+                }
+                terminalTask?.cancel()
+                if let terminalTask {
+                    _ = await terminalTask.value
+                }
+                await transport.debugSetBeforeOrdinaryWriteForTesting(nil)
+                await transport.debugSetExecutionWatchdogDidSealForTesting(nil)
+                await transport.disconnect()
+                throw error
+            }
+        }
+
+        func testUnixSocketWatchdogFailsClosedAfterPartialOrdinaryFrameWithoutAppendingTerminalBytes() async throws {
+            var descriptors = [Int32](repeating: -1, count: 2)
+            guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ENFILE)
+            }
+            let transportFD = descriptors[0]
+            let peerFD = descriptors[1]
+            defer { Darwin.close(peerFD) }
+
+            var sendBufferBytes: Int32 = 1024
+            guard Darwin.setsockopt(
+                transportFD,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &sendBufferBytes,
+                socklen_t(MemoryLayout<Int32>.size)
+            ) == 0 else {
+                Darwin.close(transportFD)
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL)
+            }
+
+            let accepted = MCPExecutionOneShotSignal<Void>()
+            let writeMadeProgress = MCPExecutionOneShotSignal<Int>()
+            let partialWriterWasReleased = MCPExecutionOneShotSignal<Bool>()
+            let watchdogDidSeal = MCPExecutionOneShotSignal<Void>()
+            let releasePartialWriter = DispatchSemaphore(value: 0)
+            let transport = try UnixSocketMCPTransport(
+                connectedFD: transportFD,
+                connectionID: UUID(),
+                connectionGeneration: 1,
+                writeStallTimeout: 1,
+                writePollIntervalMilliseconds: 1
+            )
+            await transport.debugSetBeforeInboundFrameOfferForTesting {
+                accepted.signal(())
+            }
+            await transport.debugSetAfterWriteProgressForTesting { bytesWritten in
+                writeMadeProgress.signal(bytesWritten)
+                let result = releasePartialWriter.wait(timeout: .now() + 10)
+                partialWriterWasReleased.signal(result == .success)
+            }
+            await transport.debugSetExecutionWatchdogDidSealForTesting {
+                watchdogDidSeal.signal(())
+            }
+            try await transport.connect()
+
+            var ordinaryTask: Task<Void, Error>?
+            var terminalTask: Task<Int, Never>?
+            do {
+                let requestFrame = Data(
+                    "{\"jsonrpc\":\"2.0\",\"id\":89,\"method\":\"ping\",\"params\":{}}\n".utf8
+                )
+                let requestWriteCount = requestFrame.withUnsafeBytes { bytes in
+                    Darwin.write(peerFD, bytes.baseAddress, bytes.count)
+                }
+                XCTAssertEqual(requestWriteCount, requestFrame.count)
+                await accepted.wait()
+                var inboundIterator = await transport.receive().makeAsyncIterator()
+                _ = try await inboundIterator.next()
+
+                let padding = String(repeating: "x", count: 1024 * 1024)
+                let ordinaryJSON = "{\"jsonrpc\":\"2.0\",\"id\":89,\"result\":{\"padding\":\"\(padding)\"}}\n"
+                let ordinaryFrame = Data(ordinaryJSON.utf8)
+                let activeOrdinaryTask = Task {
+                    try await transport.send(ordinaryFrame)
+                }
+                ordinaryTask = activeOrdinaryTask
+                let progressedByteCount = await writeMadeProgress.wait()
+                XCTAssertGreaterThan(progressedByteCount, 0)
+                guard progressedByteCount < ordinaryFrame.count else {
+                    throw NSError(
+                        domain: "MCPExportWatchdogIntegrationTests",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Expected a partial first write, wrote \(progressedByteCount)/\(ordinaryFrame.count) bytes."]
+                    )
+                }
+
+                let terminateControlFrame = try XCTUnwrap(
+                    RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
+                        reason: .toolExecutionWatchdog,
+                        message: MCPExecutionWatchdogTerminalContext.message
+                    ).encodedJSONLine()
+                )
+                let activeTerminalTask = Task {
+                    await transport.sendExecutionWatchdogTerminalErrors(context: .init(
+                        reason: "tool_execution_watchdog",
+                        toolName: MCPWindowToolName.prompt,
+                        handlerPhase: "provider_execution",
+                        invocationID: UUID()
+                    ), trailingControlFrame: terminateControlFrame)
+                }
+                terminalTask = activeTerminalTask
+                await watchdogDidSeal.wait()
+                releasePartialWriter.signal()
+                let partialWriterReleased = await partialWriterWasReleased.wait()
+                XCTAssertTrue(partialWriterReleased)
+
+                do {
+                    try await activeOrdinaryTask.value
+                    XCTFail("Expected sealing after partial progress to fail the transport closed")
+                } catch {
+                    XCTAssertTrue(String(describing: error).contains("partial socket frame"), String(describing: error))
+                }
+                ordinaryTask = nil
+                let deliveredTerminalCount = await activeTerminalTask.value
+                XCTAssertEqual(deliveredTerminalCount, 0)
+                terminalTask = nil
+
+                let transportCloseSnapshot = await transport.closeSnapshot()
+                let closeSnapshot = try XCTUnwrap(transportCloseSnapshot)
+                XCTAssertEqual(closeSnapshot.cause, .writeFailure)
+                XCTAssertTrue(closeSnapshot.errorDescription?.contains("partial socket frame") == true)
+
+                let wireBytes = try Self.readBytesUntilEOF(from: peerFD)
+                XCTAssertEqual(wireBytes.count, progressedByteCount)
+                XCTAssertEqual(wireBytes, Data(ordinaryFrame.prefix(progressedByteCount)))
+                XCTAssertNil(wireBytes.range(of: Data("\"code\":-32000".utf8)))
+                XCTAssertNil(wireBytes.range(of: Data(RepoPromptControlMethod.terminate.utf8)))
+
+                await transport.debugSetAfterWriteProgressForTesting(nil)
+                await transport.debugSetExecutionWatchdogDidSealForTesting(nil)
+                await transport.disconnect()
+            } catch {
+                releasePartialWriter.signal()
+                ordinaryTask?.cancel()
+                if let ordinaryTask {
+                    _ = try? await ordinaryTask.value
+                }
+                terminalTask?.cancel()
+                if let terminalTask {
+                    _ = await terminalTask.value
+                }
+                await transport.debugSetAfterWriteProgressForTesting(nil)
+                await transport.debugSetExecutionWatchdogDidSealForTesting(nil)
+                await transport.disconnect()
+                throw error
+            }
+        }
+
         func testUnixSocketPublishesDistinctCorrelationIdentityBeforeImmediateDispatch() async throws {
             var descriptors = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
@@ -2546,6 +3209,125 @@ import XCTest
             } catch {
                 XCTFail("Expected socket closure for \(request), got \(error)")
             }
+        }
+
+        private static func watchdogTerminalError(
+            from response: PersistentMCPTestRPCResponse
+        ) throws -> [String: Any] {
+            let data = try XCTUnwrap(response.rawJSON.data(using: .utf8))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual((object["id"] as? NSNumber)?.intValue, response.id)
+            return try XCTUnwrap(object["error"] as? [String: Any])
+        }
+
+        private static func fillSocketSendBuffer(fd: Int32) throws -> Int {
+            let filler = [UInt8](repeating: UInt8(ascii: "x"), count: 4 * 1024)
+            var totalWritten = 0
+            while true {
+                let written = filler.withUnsafeBytes { bytes in
+                    Darwin.write(fd, bytes.baseAddress, bytes.count)
+                }
+                if written > 0 {
+                    totalWritten += written
+                    continue
+                }
+                if written < 0, errno == EINTR {
+                    continue
+                }
+                if written < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                    return totalWritten
+                }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+
+        private static func drainBytes(count: Int, from fd: Int32) throws {
+            var remaining = count
+            var buffer = [UInt8](repeating: 0, count: 4 * 1024)
+            while remaining > 0 {
+                let byteCount = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.read(fd, bytes.baseAddress, min(bytes.count, remaining))
+                }
+                if byteCount < 0, errno == EINTR {
+                    continue
+                }
+                guard byteCount > 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                remaining -= byteCount
+            }
+        }
+
+        private static func readBytesUntilEOF(from fd: Int32) throws -> Data {
+            var received = Data()
+            for _ in 0 ..< 10 {
+                var descriptor = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP), revents: 0)
+                let pollResult = Darwin.poll(&descriptor, 1, 100)
+                if pollResult < 0 {
+                    if errno == EINTR {
+                        continue
+                    }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                guard pollResult > 0 else { continue }
+
+                var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+                let byteCount = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.read(fd, bytes.baseAddress, bytes.count)
+                }
+                if byteCount < 0 {
+                    if errno == EINTR {
+                        continue
+                    }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                if byteCount == 0 {
+                    return received
+                }
+                received.append(contentsOf: buffer.prefix(byteCount))
+            }
+            throw NSError(
+                domain: "MCPExportWatchdogIntegrationTests",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Expected socket EOF after fail-closed partial write."]
+            )
+        }
+
+        private static func readJSONLines(from fd: Int32, expectedCount: Int) throws -> [Data] {
+            var pending = Data()
+            var frames: [Data] = []
+            for _ in 0 ..< 10 where frames.count < expectedCount {
+                var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let pollResult = Darwin.poll(&descriptor, 1, 100)
+                if pollResult < 0 {
+                    if errno == EINTR { continue }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                guard pollResult > 0 else { continue }
+
+                var buffer = [UInt8](repeating: 0, count: 4 * 1024)
+                let byteCount = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.read(fd, bytes.baseAddress, bytes.count)
+                }
+                if byteCount < 0 {
+                    if errno == EINTR { continue }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                guard byteCount > 0 else { break }
+                pending.append(contentsOf: buffer.prefix(byteCount))
+                while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
+                    frames.append(Data(pending[..<newline]))
+                    pending.removeSubrange(...newline)
+                }
+            }
+            guard frames.count == expectedCount else {
+                throw NSError(
+                    domain: "MCPExportWatchdogIntegrationTests",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Expected \(expectedCount) JSON line(s), received \(frames.count)."]
+                )
+            }
+            return frames
         }
 
         nonisolated static func responseObject(from response: PersistentMCPTestRPCResponse) throws -> [String: Any] {

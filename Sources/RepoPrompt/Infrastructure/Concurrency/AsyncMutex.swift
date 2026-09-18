@@ -12,6 +12,9 @@ actor AsyncMutex {
             throw CancellationError()
         }
         defer { if acquired { unlock() } }
+        // Cancellation removal can lose to unlock's queued handoff. We own the
+        // grant here, so release it through defer without entering cancelled work.
+        try Task.checkCancellation()
         return try await body()
     }
 
@@ -68,12 +71,31 @@ actor AsyncMutex {
         }
     }
 
+    #if DEBUG
+        private var willResumeNextWaiterForTesting: (@Sendable () -> Void)?
+
+        var queuedWaiterCountForTesting: Int {
+            waiters.count
+        }
+
+        func setWillResumeNextWaiterForTesting(_ action: @escaping @Sendable () -> Void) {
+            willResumeNextWaiterForTesting = action
+        }
+    #endif
+
     private func unlock() {
         if waiters.isEmpty {
             isLocked = false
             return
         }
         let next = waiters.removeFirst()
+        #if DEBUG
+            // One-shot synchronous seam: cancel after dequeue, before the grant
+            // resumes, while cancellation removal cannot re-enter this actor.
+            let willResume = willResumeNextWaiterForTesting
+            willResumeNextWaiterForTesting = nil
+            willResume?()
+        #endif
         // Resume with true — caller IS granted the lock.
         next.continuation.resume(returning: true)
     }

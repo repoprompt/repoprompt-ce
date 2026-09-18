@@ -33,6 +33,27 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertNil(store.diagnostic(for: .codex))
     }
 
+    func testMissingDevinDocumentCreatesAndSavesProviderDefault() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.devin.storageKey
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.devinPermissions().permissionLevel(), .providerDefault)
+
+        let saved = try decode(SecureDevinPermissionDocument.self, from: secureStrings.plainValues[key])
+        XCTAssertEqual(saved.permissionLevel(), .providerDefault)
+        XCTAssertNil(store.diagnostic(for: .devin))
+    }
+
+    func testMalformedDevinDocumentFailsClosedToNormal() {
+        let secureStrings = FakeSecurePlainStringStore()
+        secureStrings.plainValues[AgentPermissionSecureDomain.devin.storageKey] = "{"
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.devinPermissions().permissionLevel(), .normal)
+        XCTAssertEqual(store.diagnostic(for: .devin)?.kind, .decodeFailed)
+    }
+
     func testMissingSubagentDocumentCreatesAndSavesSafeManagedPolicy() throws {
         let secureStrings = FakeSecurePlainStringStore()
         let key = AgentPermissionSecureDomain.subagent.storageKey
@@ -377,6 +398,26 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .autoEdit)
         XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
         XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+    }
+
+    func testResetIncludesDevinAndPersistsNormalSafeDefault() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let store = makeStore(secureStrings: secureStrings)
+        XCTAssertTrue(store.setDevinPermissionLevel(.fullApproval))
+
+        let result = store.resetAgentPermissionsToSafeDefaults()
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(result.succeededDomains.contains(.devin))
+        XCTAssertEqual(store.devinPermissions().permissionLevel(), .normal)
+
+        let restartedStore = makeStore(secureStrings: secureStrings)
+        XCTAssertEqual(restartedStore.devinPermissions().permissionLevel(), .normal)
+        let saved = try decode(
+            SecureDevinPermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.devin.storageKey]
+        )
+        XCTAssertEqual(saved.permissionLevel(), .normal)
     }
 
     func testResetIncludesAntigravityAndPersistsSafeDefault() throws {

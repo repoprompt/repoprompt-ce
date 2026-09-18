@@ -199,6 +199,7 @@ extension SentryTelemetryBootstrap {
         case openCode = "opencode"
         case grokBuild = "grok_build"
         case antigravity
+        case devin
 
         init(agentKind: AgentProviderKind) {
             switch agentKind {
@@ -214,6 +215,8 @@ extension SentryTelemetryBootstrap {
                 self = .grokBuild
             case .antigravity:
                 self = .antigravity
+            case .devin:
+                self = .devin
             case .claudeCodeGLM:
                 self = .claudeCodeGLM
             case .kimiCode:

@@ -4,8 +4,12 @@ import Foundation
 final class ReviewGitRepositoryFixture {
     let sandbox: URL
 
-    init(name: String = "ReviewGitRepositoryFixture") throws {
-        sandbox = FileManager.default.temporaryDirectory
+    init(
+        name: String = "ReviewGitRepositoryFixture",
+        parentDirectory: URL? = nil
+    ) throws {
+        let parent = (parentDirectory ?? FileManager.default.temporaryDirectory).standardizedFileURL
+        sandbox = parent
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
             .standardizedFileURL
         try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)

@@ -5,6 +5,7 @@ enum ACPProviderID: String, Codable, Hashable {
     case cursor
     case grokBuild
     case antigravity
+    case devin
 }
 
 enum ACPSupportResult: Equatable {
@@ -125,6 +126,10 @@ struct ACPRunRequest {
     let taskLabelKind: AgentModelCatalog.TaskLabelKind?
     let sessionModeID: String?
     let autoApproveAllToolPermissions: Bool
+    /// Provider-native CLI permission mode applied by the provider at PROCESS LAUNCH
+    /// (Devin `--permission-mode`). Never sent over ACP and never passed to
+    /// `setSessionMode`; `nil` means "pass no flag".
+    let launchPermissionMode: String?
     let modelParameterSelections: [ACPModelParameterSelection]
 
     init(
@@ -136,6 +141,7 @@ struct ACPRunRequest {
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         sessionModeID: String? = nil,
         autoApproveAllToolPermissions: Bool = false,
+        launchPermissionMode: String? = nil,
         modelParameterSelections: [ACPModelParameterSelection] = []
     ) {
         self.agentKind = agentKind
@@ -146,6 +152,7 @@ struct ACPRunRequest {
         self.taskLabelKind = taskLabelKind
         self.sessionModeID = sessionModeID
         self.autoApproveAllToolPermissions = autoApproveAllToolPermissions
+        self.launchPermissionMode = launchPermissionMode
         self.modelParameterSelections = modelParameterSelections
     }
 }
