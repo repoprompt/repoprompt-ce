@@ -1,3 +1,4 @@
+import RepoPromptDomainRuntime
 import SwiftUI
 
 struct ModelPresetsSheet: View {
@@ -93,10 +94,13 @@ struct ModelPresetsSheet: View {
                 .frame(maxWidth: 300)
 
             Button(action: {
-                // Create default preset from current chat model
-                let defaultPreset = ModelPreset.fromCurrentChatModel(modelRawString: promptViewModel.preferredModel)
-                if presetsManager.addPreset(defaultPreset) {
-                    editingPreset = defaultPreset
+                do {
+                    let defaultPreset = try ModelPreset.fromCurrentChatModel(promptViewModel.preferredAIModel)
+                    if presetsManager.addPreset(defaultPreset) {
+                        editingPreset = defaultPreset
+                    }
+                } catch {
+                    presetsManager.reportCreationError(error)
                 }
             }) {
                 Label("Create Default Preset", systemImage: "plus.circle")
@@ -142,6 +146,62 @@ struct ModelPresetsSheet: View {
     }
 }
 
+// MARK: - ModelPresetRosterDraft
+
+struct ModelPresetRosterDraft: Equatable {
+    struct Row: Identifiable, Equatable {
+        let id: UUID
+        var modelString: String
+
+        init(id: UUID = UUID(), modelString: String) {
+            self.id = id
+            self.modelString = modelString
+        }
+    }
+
+    private(set) var rows: [Row]
+
+    init(modelStrings: [String]) {
+        precondition(!modelStrings.isEmpty)
+        rows = modelStrings.map { Row(modelString: $0) }
+    }
+
+    var canAdd: Bool {
+        rows.count < OracleRosterContract.maximumCount
+    }
+
+    var canRemove: Bool {
+        rows.count > OracleRosterContract.minimumCount
+    }
+
+    @discardableResult
+    mutating func append(modelString: String) -> Bool {
+        guard canAdd else { return false }
+        rows.append(Row(modelString: modelString))
+        return true
+    }
+
+    @discardableResult
+    mutating func remove(id: UUID) -> Bool {
+        guard canRemove, let index = rows.firstIndex(where: { $0.id == id }) else { return false }
+        rows.remove(at: index)
+        return true
+    }
+
+    mutating func move(from sourceIndex: Int, to destinationIndex: Int) {
+        guard rows.indices.contains(sourceIndex), rows.indices.contains(destinationIndex), sourceIndex != destinationIndex else {
+            return
+        }
+        let row = rows.remove(at: sourceIndex)
+        rows.insert(row, at: destinationIndex)
+    }
+
+    mutating func setModelString(_ modelString: String, for id: UUID) {
+        guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
+        rows[index].modelString = modelString
+    }
+}
+
 // MARK: - ModelPresetRow
 
 struct ModelPresetRow: View {
@@ -172,10 +232,15 @@ struct ModelPresetRow: View {
                     Text("•")
                         .foregroundColor(.secondary)
 
-                    Text(preset.model.displayName)
+                    Text("\(preset.modelStrings.count) Oracle\(preset.modelStrings.count == 1 ? "" : "s")")
                         .font(FontScalePreset.current.font)
                         .foregroundColor(.secondary)
                 }
+
+                Text(preset.modelStrings.map { AIModel.fromModelName($0)?.displayName ?? $0 }.joined(separator: " → "))
+                    .font(FontScalePreset.current.captionFont)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
 
                 if let description = preset.description, !description.isEmpty {
                     Text(description)
@@ -256,7 +321,7 @@ struct ModelPresetEditView: View {
     let onSave: (ModelPreset) -> Void
 
     @State private var name: String = ""
-    @State private var selectedModel: AIModel = .claude4Sonnet
+    @State private var rosterDraft = ModelPresetRosterDraft(modelStrings: [AIModel.claude4Sonnet.rawValue])
     @State private var description: String = ""
     @State private var chatEnabled = true
     @State private var planEnabled = true
@@ -264,6 +329,7 @@ struct ModelPresetEditView: View {
     @State private var reviewEnabled = true
     @State private var hasRestrictions = false
     @State private var nameValidationError: String? = nil
+    @State private var rosterValidationError: String? = nil
 
     // Chat preset mappings
     @State private var chatPresetID: UUID? = nil
@@ -279,14 +345,10 @@ struct ModelPresetEditView: View {
         promptViewModel.availableModels
     }
 
-    private var modelSelectionBinding: Binding<String> {
+    private func modelSelectionBinding(for rowID: UUID) -> Binding<String> {
         Binding(
-            get: { selectedModel.rawValue },
-            set: { newValue in
-                if let model = AIModel.fromModelName(newValue) {
-                    selectedModel = model
-                }
-            }
+            get: { rosterDraft.rows.first(where: { $0.id == rowID })?.modelString ?? "" },
+            set: { rosterDraft.setModelString($0, for: rowID) }
         )
     }
 
@@ -334,15 +396,51 @@ struct ModelPresetEditView: View {
                         }
                     }
 
-                    HStack {
-                        Text("Model")
-                        Spacer()
-                        OptimizedModelPicker(
-                            selection: modelSelectionBinding,
-                            availableModels: availableModels,
-                            font: FontScalePreset.current.font
-                        )
-                        .frame(width: 250)
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(rosterDraft.rows.enumerated()), id: \.element.id) { index, row in
+                            HStack {
+                                Text(index == 0 ? "Primary Oracle" : OracleRosterContract.displayLabel(laneIndex: index))
+                                    .frame(width: 100, alignment: .leading)
+                                OptimizedModelPicker(
+                                    selection: modelSelectionBinding(for: row.id),
+                                    availableModels: availableModels,
+                                    font: FontScalePreset.current.font
+                                )
+                                .frame(width: 220)
+                                Button("Move up", systemImage: "chevron.up") {
+                                    rosterDraft.move(from: index, to: index - 1)
+                                }
+                                .labelStyle(.iconOnly)
+                                .disabled(index == 0)
+                                .accessibilityIdentifier("modelPresetRoster.moveUp.\(index)")
+                                Button("Move down", systemImage: "chevron.down") {
+                                    rosterDraft.move(from: index, to: index + 1)
+                                }
+                                .labelStyle(.iconOnly)
+                                .disabled(index == rosterDraft.rows.count - 1)
+                                .accessibilityIdentifier("modelPresetRoster.moveDown.\(index)")
+                                Button("Remove Oracle", systemImage: "minus.circle") {
+                                    rosterDraft.remove(id: row.id)
+                                }
+                                .labelStyle(.iconOnly)
+                                .disabled(!rosterDraft.canRemove)
+                                .accessibilityIdentifier("modelPresetRoster.remove.\(index)")
+                            }
+                            .accessibilityElement(children: .contain)
+                            .accessibilityLabel("\(OracleRosterContract.displayLabel(laneIndex: index)), \(row.modelString)")
+                        }
+
+                        Button("Add Oracle", systemImage: "plus") {
+                            rosterDraft.append(modelString: promptViewModel.preferredAIModel.rawValue)
+                        }
+                        .disabled(!rosterDraft.canAdd)
+                        .accessibilityIdentifier("modelPresetRoster.add")
+
+                        if let rosterValidationError {
+                            Text(rosterValidationError)
+                                .font(FontScalePreset.current.captionFont)
+                                .foregroundColor(.orange)
+                        }
                     }
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -462,7 +560,7 @@ struct ModelPresetEditView: View {
         .onAppear {
             if let preset {
                 name = preset.name
-                selectedModel = preset.model
+                rosterDraft = ModelPresetRosterDraft(modelStrings: preset.modelStrings)
                 description = preset.description ?? ""
 
                 // Initialize modes from preset.supportedModes if present; default to true
@@ -491,8 +589,7 @@ struct ModelPresetEditView: View {
                     reviewPresetID = ChatPreset.BuiltIn.review.id
                 }
             } else {
-                // Default to current chat model for new presets
-                selectedModel = promptViewModel.preferredAIModel
+                rosterDraft = ModelPresetRosterDraft(modelStrings: [promptViewModel.preferredAIModel.rawValue])
 
                 // Set default chat preset mappings to built-in presets
                 chatPresetID = ChatPreset.BuiltIn.chat.id
@@ -524,17 +621,21 @@ struct ModelPresetEditView: View {
             reviewPresetID: reviewPresetID
         )
 
-        let newPreset = ModelPreset(
-            id: preset?.id ?? UUID(),
-            name: name,
-            model: selectedModel,
-            description: description.isEmpty ? nil : description,
-            supportedModes: supportedModesFinal,
-            chatPresetMappings: chatPresetMappingsFinal
-        )
-
-        onSave(newPreset)
-        dismiss()
+        do {
+            let newPreset = try ModelPreset(
+                id: preset?.id ?? UUID(),
+                name: name,
+                modelStrings: rosterDraft.rows.map(\.modelString),
+                description: description.isEmpty ? nil : description,
+                supportedModes: supportedModesFinal,
+                chatPresetMappings: chatPresetMappingsFinal
+            )
+            rosterValidationError = nil
+            onSave(newPreset)
+            dismiss()
+        } catch {
+            rosterValidationError = error.localizedDescription
+        }
     }
 }
 

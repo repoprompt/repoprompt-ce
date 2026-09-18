@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 // MARK: - ModelPreset
 
@@ -13,66 +14,117 @@ enum ProEditingOverride: String, Codable {
 struct ModelPreset: Codable, Identifiable, Equatable {
     let id: UUID
     let name: String
-    let modelString: String // Store as string for Codable
+    let modelStrings: [String]
     let description: String?
     let supportedModes: SupportedModes?
-    let proEditingOverride: ProEditingOverride // Legacy decode-only field
-    let chatPresetMappings: ChatPresetMappings? // Maps modes to chat preset IDs
+    let proEditingOverride: ProEditingOverride
+    let chatPresetMappings: ChatPresetMappings?
 
-    /// Returns the resolved AIModel, or `.claude4Sonnet` as a fallback if the stored rawValue can't be parsed.
-    /// For cases where you need to handle missing models differently, use `optionalModel` instead.
-    var model: AIModel {
-        AIModel.fromModelName(modelString) ?? .claude4Sonnet
+    var primaryModelString: String {
+        modelStrings[0]
     }
 
-    /// Returns the resolved AIModel, or `nil` if the stored rawValue can't be parsed.
-    /// Use this when you want to handle missing/renamed models explicitly rather than falling back silently.
-    var optionalModel: AIModel? {
-        AIModel.fromModelName(modelString)
+    var optionalPrimaryModel: AIModel? {
+        AIModel.fromModelName(primaryModelString)
     }
 
-    /// Returns `true` if the stored modelString can be resolved to a valid AIModel.
-    /// Use this to check if the preset's model is still valid after model definitions may have changed.
     var isModelResolvable: Bool {
-        AIModel.fromModelName(modelString) != nil
+        optionalPrimaryModel != nil
     }
 
-    init(id: UUID = UUID(), name: String, model: AIModel, description: String? = nil, supportedModes: SupportedModes? = nil, proEditingOverride: ProEditingOverride = .useDefault, chatPresetMappings: ChatPresetMappings? = nil) {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        model: AIModel,
+        description: String? = nil,
+        supportedModes: SupportedModes? = nil,
+        proEditingOverride: ProEditingOverride = .useDefault,
+        chatPresetMappings: ChatPresetMappings? = nil
+    ) throws {
+        try self.init(
+            id: id,
+            name: name,
+            modelStrings: [model.rawValue],
+            description: description,
+            supportedModes: supportedModes,
+            proEditingOverride: proEditingOverride,
+            chatPresetMappings: chatPresetMappings
+        )
+    }
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        models: [AIModel],
+        description: String? = nil,
+        supportedModes: SupportedModes? = nil,
+        proEditingOverride: ProEditingOverride = .useDefault,
+        chatPresetMappings: ChatPresetMappings? = nil
+    ) throws {
+        try self.init(
+            id: id,
+            name: name,
+            modelStrings: models.map(\.rawValue),
+            description: description,
+            supportedModes: supportedModes,
+            proEditingOverride: proEditingOverride,
+            chatPresetMappings: chatPresetMappings
+        )
+    }
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        modelStrings: [String],
+        description: String? = nil,
+        supportedModes: SupportedModes? = nil,
+        proEditingOverride: ProEditingOverride = .useDefault,
+        chatPresetMappings: ChatPresetMappings? = nil
+    ) throws {
+        guard (OracleRosterContract.minimumCount ... OracleRosterContract.maximumCount).contains(modelStrings.count) else {
+            throw OracleGroupContractError.invalidRosterCount(modelStrings.count)
+        }
         self.id = id
         self.name = Self.sanitizeName(name)
-        modelString = model.rawValue
+        self.modelStrings = try modelStrings.map(OracleRosterContract.normalizedModelID)
         self.description = description
         self.supportedModes = supportedModes
         self.proEditingOverride = proEditingOverride
         self.chatPresetMappings = chatPresetMappings
     }
 
-    /// Custom decoding to handle missing fields in existing presets
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(UUID.self, forKey: .id)
-        name = try container.decode(String.self, forKey: .name)
-        modelString = try container.decode(String.self, forKey: .modelString)
-        description = try container.decodeIfPresent(String.self, forKey: .description)
-        supportedModes = try container.decodeIfPresent(SupportedModes.self, forKey: .supportedModes)
-        // Default to .useDefault if not present (for backward compatibility)
-        proEditingOverride = try container.decodeIfPresent(ProEditingOverride.self, forKey: .proEditingOverride) ?? .useDefault
-        // Default to nil if not present (for backward compatibility)
-        chatPresetMappings = try container.decodeIfPresent(ChatPresetMappings.self, forKey: .chatPresetMappings)
+        guard !container.contains(.modelString) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .modelString,
+                in: container,
+                debugDescription: "Schema-2 model presets must not contain modelString"
+            )
+        }
+        try self.init(
+            id: container.decode(UUID.self, forKey: .id),
+            name: container.decode(String.self, forKey: .name),
+            modelStrings: container.decode([String].self, forKey: .modelStrings),
+            description: container.decodeIfPresent(String.self, forKey: .description),
+            supportedModes: container.decodeIfPresent(SupportedModes.self, forKey: .supportedModes),
+            proEditingOverride: container.decodeIfPresent(ProEditingOverride.self, forKey: .proEditingOverride) ?? .useDefault,
+            chatPresetMappings: container.decodeIfPresent(ChatPresetMappings.self, forKey: .chatPresetMappings)
+        )
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(name, forKey: .name)
-        try container.encode(modelString, forKey: .modelString)
+        try container.encode(modelStrings, forKey: .modelStrings)
         try container.encodeIfPresent(description, forKey: .description)
         try container.encodeIfPresent(supportedModes, forKey: .supportedModes)
         try container.encodeIfPresent(chatPresetMappings, forKey: .chatPresetMappings)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, modelString, description, supportedModes, proEditingOverride, chatPresetMappings
+        case id, name, modelStrings, modelString, description, supportedModes, proEditingOverride, chatPresetMappings
     }
 
     /// Sanitizes a preset name to ensure it's valid for command-line use
@@ -143,13 +195,12 @@ struct ModelPreset: Codable, Identifiable, Equatable {
     }
 
     /// Convenience initializer from current chat model
-    static func fromCurrentChatModel(modelRawString: String) -> ModelPreset {
-        let model = AIModel.fromModelName(modelRawString) ?? .claude4Sonnet
-        return ModelPreset(
+    static func fromCurrentChatModel(_ model: AIModel) throws -> ModelPreset {
+        try ModelPreset(
             name: "Default",
             model: model,
             description: "Current chat model",
-            supportedModes: nil, // No restrictions by default
+            supportedModes: nil,
             proEditingOverride: .useDefault,
             chatPresetMappings: nil
         )
@@ -352,6 +403,7 @@ class ModelPresetsManager: ObservableObject {
     /// Loads presets from Application Support JSON.
     private func loadPresets() {
         presets = presetFileStore.loadModelPresets().modelPresets
+        persistenceErrorMessage = presetFileStore.modelLoadWarning
     }
 
     /// Saves presets to Application Support JSON.
@@ -397,6 +449,10 @@ class ModelPresetsManager: ObservableObject {
         mutateAndPersist {
             presets.move(fromOffsets: source, toOffset: destination)
         }
+    }
+
+    func reportCreationError(_ error: Error) {
+        persistenceErrorMessage = "The model preset couldn't be created. \(error.localizedDescription)"
     }
 
     func clearPersistenceError() {

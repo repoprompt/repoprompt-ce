@@ -80,10 +80,13 @@ struct ModelPresetsSettingsView: View {
                 .frame(maxWidth: 300)
 
             Button(action: {
-                // Create default preset from current chat model
-                let defaultPreset = ModelPreset.fromCurrentChatModel(modelRawString: promptViewModel.preferredModel)
-                if presetsManager.addPreset(defaultPreset) {
-                    editingPreset = defaultPreset
+                do {
+                    let defaultPreset = try ModelPreset.fromCurrentChatModel(promptViewModel.preferredAIModel)
+                    if presetsManager.addPreset(defaultPreset) {
+                        editingPreset = defaultPreset
+                    }
+                } catch {
+                    presetsManager.reportCreationError(error)
                 }
             }) {
                 Label("Create Default Preset", systemImage: "plus.circle")

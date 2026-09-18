@@ -11,10 +11,11 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence, TextIO
+from typing import Callable, Iterable, Mapping, Optional, Sequence, TextIO
 
 XCTEST_BUNDLE_GLOB = "*.xctest"
-CommandExecutor = Callable[[Sequence[str], Path | None, Mapping[str, str]], int]
+SANDBOX_MARKER_NAME = ".issue944-test-sandbox"
+CommandExecutor = Callable[[Sequence[str], Optional[Path], Mapping[str, str]], int]
 
 
 @dataclass(frozen=True)
@@ -237,6 +238,7 @@ def isolated_suite_environment(
     data = suite_root / "data"
     for directory in (home, temporary, config, cache, data):
         directory.mkdir(parents=True, exist_ok=True)
+    (suite_root / SANDBOX_MARKER_NAME).touch(exist_ok=True)
 
     environment = dict(base_environment or os.environ)
     environment.update(
@@ -271,6 +273,29 @@ def execute_command(
     except OSError as error:
         print(f"Unable to launch {command[0]}: {error}", file=sys.stderr)
         return 127
+
+
+def run_local_tests(
+    *,
+    swift_binary: str,
+    cwd: Path | None,
+    test_filter: str | None = None,
+    test_product: str | None = None,
+    executor: CommandExecutor = execute_command,
+) -> int:
+    # Keep compilation and its caches outside the disposable runtime home.
+    environment = dict(os.environ)
+    status = executor((swift_binary, "build", "--build-tests"), cwd, environment)
+    if status != 0:
+        return status
+    command = [swift_binary, "test", "--skip-build"]
+    if test_product:
+        command.extend(["--test-product", test_product])
+    if test_filter:
+        command.extend(["--filter", test_filter])
+    with tempfile.TemporaryDirectory(prefix="rpce-local-tests-") as directory:
+        environment = isolated_suite_environment(Path(directory), "local", environment)
+        return executor(command, cwd, environment)
 
 
 def run_selected_suites(
@@ -327,15 +352,28 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run deterministic RepoPrompt CE XCTest suites."
     )
+    parser.add_argument("--local", action="store_true", help="Build, then run sandboxed local tests with SwiftPM selection")
+    parser.add_argument("--filter", dest="test_filter")
+    parser.add_argument("--test-product")
     parser.add_argument("--swift-binary", default="swift")
     parser.add_argument("--cwd", type=Path, default=None)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=1)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.local and (args.shard_count != 1 or args.shard_index != 1):
+        parser.error("--local cannot be combined with sharding")
+    if not args.local and (args.test_filter or args.test_product):
+        parser.error("--filter and --test-product require --local")
+    return args
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    if args.local:
+        return run_local_tests(
+            swift_binary=args.swift_binary, cwd=args.cwd,
+            test_filter=args.test_filter, test_product=args.test_product,
+        )
     try:
         validate_shard_args(args.shard_count, args.shard_index)
         suite_methods = list_suite_methods(args.swift_binary, args.cwd)

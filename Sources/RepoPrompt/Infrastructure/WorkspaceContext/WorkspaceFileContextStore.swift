@@ -4967,7 +4967,20 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    #if DEBUG
+        enum PrimaryRootQueryabilityFailureForTesting { case blocked, failed }
+        private var primaryRootQueryabilityFailuresForTesting: [UUID: PrimaryRootQueryabilityFailureForTesting] = [:]
+
+        /// Fail-closed fault injection at the shared authority predicate, never a readiness override.
+        func setPrimaryRootQueryabilityFailureForTesting(rootID: UUID, failure: PrimaryRootQueryabilityFailureForTesting?) {
+            primaryRootQueryabilityFailuresForTesting[rootID] = failure
+        }
+    #endif
+
     private func publishedSeededAuthorityIsQueryable(rootID: UUID) -> Bool {
+        #if DEBUG
+            if primaryRootQueryabilityFailuresForTesting[rootID] != nil { return false }
+        #endif
         guard let fence = publishedSeededAuthorityFencesByRootID[rootID] else { return true }
         guard let state = publishedSeededAuthorityStatesByRootID[rootID],
               !state.isBlocked,
@@ -7410,6 +7423,37 @@ actor WorkspaceFileContextStore {
         guard rootScopeAvailability(rootScope) == .available else { return nil }
 
         return sessionRootLifetimeClock.snapshot(physicalRootPaths: expectedPaths.sorted())
+    }
+
+    func primaryRootReadinessObservation(orderedPaths: [String]) -> WorkspacePrimaryRootReadinessObservation {
+        let primaryRoots = rootStatesByID.values.filter { $0.root.kind == .primaryWorkspace }.map {
+            WorkspaceRootRef(id: $0.root.id, name: $0.root.name, fullPath: $0.root.fullPath)
+        }
+        var requested: [WorkspaceRootRef] = []
+        var missing: [String] = []
+        var wrongKind: [String] = []
+        var nonqueryable: [String] = []
+        for path in orderedPaths {
+            guard let id = rootIDsByStandardizedPath[path], let root = rootStatesByID[id]?.root else {
+                missing.append(path)
+                continue
+            }
+            guard root.kind == .primaryWorkspace else {
+                wrongKind.append(path)
+                continue
+            }
+            let ref = WorkspaceRootRef(id: id, name: root.name, fullPath: root.fullPath)
+            guard case .valid = WorkspaceLookupRootSelectorValidator.validate(canonicalRoots: [ref], physicalRoots: []) else {
+                missing.append(path)
+                continue
+            }
+            requested.append(ref)
+            if !publishedSeededAuthorityIsQueryable(rootID: id) { nonqueryable.append(path) }
+        }
+        return WorkspacePrimaryRootReadinessObservation(
+            primaryRoots: primaryRoots, requestedRoots: requested, missingPaths: missing,
+            wrongKindPaths: wrongKind, nonqueryablePaths: nonqueryable
+        )
     }
 
     func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {

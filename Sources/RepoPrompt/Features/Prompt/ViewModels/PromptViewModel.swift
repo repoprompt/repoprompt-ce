@@ -6153,11 +6153,65 @@ class PromptViewModel: ObservableObject {
         }
     }
 
+    func captureOraclePromptConfiguration(
+        chatPreset: ChatPreset,
+        mode: OracleMode
+    ) throws -> OraclePromptConfiguration {
+        guard let resolved = resolvedPromptContext(from: chatPreset) else {
+            throw ChatToolError.invalidParams("Chat Preset '\(chatPreset.name)' has no resolvable prompt context.")
+        }
+        let activeConfig = applyingGlobalCodeMapOverride(resolved)
+        let idsCandidate = activeConfig.storedPromptIds ?? chatPreset.storedPromptIds
+        let systemStoredPrompt: StoredPrompt? = if chatPreset.useStoredPromptsAsSystem ?? false,
+                                                   let ids = idsCandidate,
+                                                   ids.count == 1,
+                                                   let only = ids.first
+        {
+            storedPrompts.first(where: { $0.id == only })
+        } else {
+            nil
+        }
+        let systemPrompt: String
+        switch mode {
+        case .plan:
+            var prompt = customPlanningPrompt.isEmpty ? architectPrompt.content : customPlanningPrompt
+            prompt += "\n\nYou may include one chat-name tag on its own line near the top: <chatName=\"Unique name describing user request\"/>"
+            prompt += "\n\nProvide your response in clean, well-formatted Markdown. Use proper headings, lists, code blocks, and other Markdown elements to make your response easy to read and understand. Do not emit machine-readable edit blocks."
+            systemPrompt = prompt
+        case .chat, .review:
+            if let systemStoredPrompt {
+                var prompt = systemStoredPrompt.content
+                prompt += "\n\nYou may include one chat-name tag on its own line near the top: <chatName=\"Unique name describing user request\"/>"
+                prompt += "\n\nProvide your response in clean, well-formatted Markdown. Use proper headings, lists, code blocks, and other Markdown elements to make your response easy to read and understand. Do not emit machine-readable edit blocks."
+                systemPrompt = prompt
+            } else {
+                systemPrompt = getChatPrompt()
+            }
+        }
+        let metaInstructions: [MetaInstruction] = if let ids = activeConfig.storedPromptIds, !ids.isEmpty, systemStoredPrompt == nil {
+            storedPrompts
+                .filter { ids.contains($0.id) }
+                .map { MetaInstruction(title: $0.title, content: $0.content) }
+        } else if let systemStoredPrompt {
+            metaInstructionsForChat.filter { $0.title != systemStoredPrompt.title }
+        } else {
+            metaInstructionsForChat
+        }
+        return OraclePromptConfiguration(
+            chatPreset: chatPreset,
+            mode: mode,
+            promptContext: activeConfig,
+            systemPrompt: systemPrompt,
+            metaInstructions: metaInstructions
+        )
+    }
+
     func packagePrompt(
         conversation: [ConversationEntry],
         overrideModel: AIModel? = nil,
         overridePromptConfig: PromptContextResolved? = nil,
         overrideChatPreset: ChatPreset? = nil,
+        oraclePromptConfiguration: OraclePromptConfiguration? = nil,
         overrideMode: PlanActMode? = nil,
         gitInclusionOverride: GitInclusion? = nil,
         gitBaseOverride: String? = nil,
@@ -6165,9 +6219,11 @@ class PromptViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil
     ) async -> AIMessage {
-        // Use pro file edit based on the specified or current chat preset
-        let preset = overrideChatPreset ?? currentChatPreset()
+        let preset = oraclePromptConfiguration?.chatPreset ?? overrideChatPreset ?? currentChatPreset()
         var resolvedConfig: PromptContextResolved = {
+            if let oraclePromptConfiguration {
+                return oraclePromptConfiguration.promptContext
+            }
             if let overridePromptConfig {
                 return overridePromptConfig
             }
@@ -6179,12 +6235,21 @@ class PromptViewModel: ObservableObject {
         if let gitInclusionOverride {
             resolvedConfig.gitInclusion = gitInclusionOverride
         }
-        let activeConfig = applyingGlobalCodeMapOverride(resolvedConfig)
+        let activeConfig = oraclePromptConfiguration == nil
+            ? applyingGlobalCodeMapOverride(resolvedConfig)
+            : resolvedConfig
         let logicalSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
         let lookupContext = lookupContextOverride ?? allLoadedWorkspaceLookupContext()
 
         // Determine effective read-only mode. Legacy/manual edit settings are treated as Chat.
         let effectiveMode: PlanActMode = {
+            if let mode = oraclePromptConfiguration?.mode {
+                return switch mode {
+                case .chat: .chat
+                case .plan: .plan
+                case .review: .review
+                }
+            }
             if let override = overrideMode { return override == .edit ? .chat : override }
             if preset.id == ChatPreset.BuiltIn.manual.id {
                 return self.planActMode == .edit ? .chat : self.planActMode
@@ -6205,51 +6270,48 @@ class PromptViewModel: ObservableObject {
         } else {
             await freezePromptGitReviewContext(base: gitBaseOverride ?? gitViewModel.selectedDiffBranch)
         }
-        // Identify a stored prompt to be used as SYSTEM prompt when configured
-        let idsCandidate = activeConfig.storedPromptIds ?? preset.storedPromptIds
-        var systemStoredPrompt: StoredPrompt? = nil
-        if preset.useStoredPromptsAsSystem ?? false,
-           let ids = idsCandidate,
-           ids.count == 1,
-           let only = ids.first,
-           let found = storedPrompts.first(where: { $0.id == only })
-        {
-            systemStoredPrompt = found
-        }
-        let useStoredAsSystem = (systemStoredPrompt != nil)
-
-        // Build system prompt (generic rules; no "isReviewPreset")
-        var systemPrompt: String
-        switch effectiveMode {
-        case .plan:
-            systemPrompt = customPlanningPrompt.isEmpty ? architectPrompt.content : customPlanningPrompt
-            systemPrompt += "\n\nYou may include one chat-name tag on its own line near the top: <chatName=\\\"Unique name describing user request\\\"/>"
-            systemPrompt += "\n\nProvide your response in clean, well-formatted Markdown. Use proper headings, lists, code blocks, and other Markdown elements to make your response easy to read and understand. Do not emit machine-readable edit blocks."
-        case .chat, .review, .edit:
-            if let sp = systemStoredPrompt {
-                // Use the configured stored prompt as SYSTEM prompt
-                systemPrompt = sp.content
-                systemPrompt += "\n\nYou may include one chat-name tag on its own line near the top: <chatName=\"Unique name describing user request\"/>"
-                systemPrompt += "\n\nProvide your response in clean, well-formatted Markdown. Use proper headings, lists, code blocks, and other Markdown elements to make your response easy to read and understand. Do not emit machine-readable edit blocks."
+        let systemPrompt: String
+        let metaForThisChat: [MetaInstruction]
+        if let oraclePromptConfiguration {
+            systemPrompt = oraclePromptConfiguration.systemPrompt
+            metaForThisChat = oraclePromptConfiguration.metaInstructions
+        } else {
+            let idsCandidate = activeConfig.storedPromptIds ?? preset.storedPromptIds
+            let systemStoredPrompt: StoredPrompt? = if preset.useStoredPromptsAsSystem ?? false,
+                                                       let ids = idsCandidate,
+                                                       ids.count == 1,
+                                                       let only = ids.first
+            {
+                storedPrompts.first(where: { $0.id == only })
             } else {
-                // Default chat prompt
-                systemPrompt = getChatPrompt()
+                nil
+            }
+            switch effectiveMode {
+            case .plan:
+                var prompt = customPlanningPrompt.isEmpty ? architectPrompt.content : customPlanningPrompt
+                prompt += "\n\nYou may include one chat-name tag on its own line near the top: <chatName=\\\"Unique name describing user request\\\"/>"
+                prompt += "\n\nProvide your response in clean, well-formatted Markdown. Use proper headings, lists, code blocks, and other Markdown elements to make your response easy to read and understand. Do not emit machine-readable edit blocks."
+                systemPrompt = prompt
+            case .chat, .review, .edit:
+                if let systemStoredPrompt {
+                    var prompt = systemStoredPrompt.content
+                    prompt += "\n\nYou may include one chat-name tag on its own line near the top: <chatName=\"Unique name describing user request\"/>"
+                    prompt += "\n\nProvide your response in clean, well-formatted Markdown. Use proper headings, lists, code blocks, and other Markdown elements to make your response easy to read and understand. Do not emit machine-readable edit blocks."
+                    systemPrompt = prompt
+                } else {
+                    systemPrompt = getChatPrompt()
+                }
+            }
+            if let ids = activeConfig.storedPromptIds, !ids.isEmpty, systemStoredPrompt == nil {
+                metaForThisChat = storedPrompts
+                    .filter { ids.contains($0.id) }
+                    .map { MetaInstruction(title: $0.title, content: $0.content) }
+            } else if let systemStoredPrompt {
+                metaForThisChat = metaInstructionsForChat.filter { $0.title != systemStoredPrompt.title }
+            } else {
+                metaForThisChat = metaInstructionsForChat
             }
         }
-
-        // Meta prompts:
-        // - If override supplies stored prompts AND they are NOT used as system, use them.
-        // - Otherwise, use global chat meta; when a stored prompt is used as system, exclude it from meta.
-        let metaForThisChat: [MetaInstruction] = {
-            if let ids = activeConfig.storedPromptIds, !ids.isEmpty, !useStoredAsSystem {
-                let selected = storedPrompts.filter { ids.contains($0.id) }
-                return selected.map { MetaInstruction(title: $0.title, content: $0.content) }
-            }
-            if let sys = systemStoredPrompt {
-                return metaInstructionsForChat.filter { $0.title != sys.title }
-            }
-            return metaInstructionsForChat
-        }()
 
         let packaged: (message: AIMessage, preAssembly: PromptContextPreAssemblyResult)
         do {
@@ -7337,7 +7399,7 @@ extension PromptViewModel {
         // If that fails, try looking up by ModelPreset name
         // (modelPresetName can be either a raw model string OR a ModelPreset name)
         if let modelPreset = ModelPresetsManager.shared.preset(named: raw) {
-            return modelPreset.optionalModel
+            return modelPreset.optionalPrimaryModel
         }
 
         return nil

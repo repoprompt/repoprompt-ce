@@ -369,7 +369,7 @@ jobs:
         run: ./trusted-control-plane/Scripts/main_tip_release.sh stage
 
       - name: Upload staged tip source
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: RepoPrompt-CE-staged-tip
           path: |
@@ -397,7 +397,7 @@ jobs:
           persist-credentials: false
 
       - name: Download staged tip source
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           name: RepoPrompt-CE-staged-tip
           path: staged-tip
@@ -690,7 +690,7 @@ jobs:
         run: ./trusted-control-plane/Scripts/main_tip_release.sh validate-assets
 
       - name: Upload signed tip assets for smoke and publish
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: RepoPrompt-CE-signed-tip
           path: tip-source/dist/
@@ -715,7 +715,7 @@ jobs:
           persist-credentials: false
 
       - name: Download signed tip assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           name: RepoPrompt-CE-signed-tip
           path: signed-tip
@@ -772,7 +772,7 @@ jobs:
 
       - name: Upload Tip smoke diagnostics
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: RepoPrompt-CE-tip-smoke-diagnostics
           path: ${{ runner.temp }}/tip-smoke-diagnostics
@@ -801,7 +801,7 @@ jobs:
           persist-credentials: false
 
       - name: Download signed tip assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           name: RepoPrompt-CE-signed-tip
           path: tip-assets

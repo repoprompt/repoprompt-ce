@@ -38,14 +38,6 @@ enum AppOracleGroupRouting {
         !additionalModelRaws.isEmpty
     }
 
-    static func startsConfiguredGroup(
-        route: OracleConversationRoute,
-        additionalModelRaws: [String]
-    ) -> Bool {
-        guard case .start = route else { return false }
-        return usesGroup(additionalModelRaws: additionalModelRaws)
-    }
-
     static func executionProfile(for model: AIModel) -> OracleExecutionProfile? {
         try? OracleExecutionProfile(
             providerID: providerID(for: model),
@@ -93,7 +85,9 @@ extension OracleViewModel {
         tabContext: OracleSendTabContext? = nil,
         frozenInput: OracleInput? = nil,
         callbacks: AppOracleGroupExecutionCallbacks? = nil,
-        capturedProfile: AgentModelsSettingsProfile? = nil
+        capturedProfile: AgentModelsSettingsProfile? = nil,
+        selectionSnapshotOverride: OracleSelectionSnapshot? = nil,
+        resolvedStartExecution: ResolvedOracleExecution? = nil
     ) async throws -> [String: Value] {
         switch try await executeConfiguredRosterDispatch(
             args: args,
@@ -102,6 +96,8 @@ extension OracleViewModel {
             frozenInput: frozenInput,
             callbacks: callbacks,
             capturedProfile: capturedProfile,
+            selectionSnapshotOverride: selectionSnapshotOverride,
+            resolvedStartExecution: resolvedStartExecution,
             singleFallback: .executeSingleMCPValue
         ) {
         case let .singleMCPValue(value):
@@ -122,7 +118,9 @@ extension OracleViewModel {
         tabContext: OracleSendTabContext? = nil,
         frozenInput: OracleInput? = nil,
         callbacks: AppOracleGroupExecutionCallbacks? = nil,
-        capturedProfile: AgentModelsSettingsProfile? = nil
+        capturedProfile: AgentModelsSettingsProfile? = nil,
+        selectionSnapshotOverride: OracleSelectionSnapshot? = nil,
+        resolvedStartExecution: ResolvedOracleExecution? = nil
     ) async throws -> OracleGroupRuntime.Completion {
         switch try await executeConfiguredRosterDispatch(
             args: args,
@@ -131,6 +129,8 @@ extension OracleViewModel {
             frozenInput: frozenInput,
             callbacks: callbacks,
             capturedProfile: capturedProfile,
+            selectionSnapshotOverride: selectionSnapshotOverride,
+            resolvedStartExecution: resolvedStartExecution,
             singleFallback: .rejectTypedCompletion
         ) {
         case .singleMCPValue:
@@ -148,6 +148,8 @@ extension OracleViewModel {
         frozenInput: OracleInput?,
         callbacks: AppOracleGroupExecutionCallbacks?,
         capturedProfile: AgentModelsSettingsProfile?,
+        selectionSnapshotOverride: OracleSelectionSnapshot?,
+        resolvedStartExecution: ResolvedOracleExecution?,
         singleFallback: AppOracleConfiguredRosterSingleFallback
     ) async throws -> AppOracleConfiguredRosterDispatch {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
@@ -165,17 +167,56 @@ extension OracleViewModel {
             tabContext: tabContext,
             workspaceID: workspaceID
         )
-        let startsConfiguredGroup = AppOracleGroupRouting.startsConfiguredGroup(
-            route: route,
-            additionalModelRaws: profile.additionalOracleModelRaws
-        )
-        guard startsConfiguredGroup || selection.group != nil else {
+        let beginsNewConversation: Bool = switch route {
+        case .start:
+            true
+        case .implicitContinuation:
+            selection.group == nil && selection.singleSessionID == nil
+        case .continuation:
+            false
+        }
+        let startExecution = beginsNewConversation
+            ? try resolvedStartExecution ?? resolveOracleStartExecution(
+                mode: args["mode"]?.stringValue ?? "chat",
+                modelParam: args["model"]?.stringValue,
+                profile: profile,
+                promptVM: promptVM,
+                snapshotOverride: selectionSnapshotOverride
+            )
+            : nil
+        let singleExecution: ResolvedOracleExecution? = if let startExecution {
+            startExecution
+        } else if let sessionID = selection.singleSessionID,
+                  let session = sessions.first(where: { $0.id == sessionID })
+        {
+            if session.oracleExecutionAuthority == .frozen {
+                try resolveOracleConversationExecution(
+                    session: session,
+                    mode: args["mode"]?.stringValue ?? "chat",
+                    profile: profile,
+                    promptVM: promptVM,
+                    snapshotOverride: selectionSnapshotOverride
+                )
+            } else {
+                try resolveOracleStartExecution(
+                    mode: args["mode"]?.stringValue ?? "chat",
+                    modelParam: nil,
+                    profile: profile,
+                    promptVM: promptVM,
+                    snapshotOverride: selectionSnapshotOverride
+                )
+            }
+        } else {
+            nil
+        }
+        guard (startExecution?.roster.count ?? selection.group?.roster.count ?? 1) > 1 else {
             switch singleFallback {
             case .executeSingleMCPValue:
                 let value = try await tool_chatSend(
                     args: args,
                     promptVM: promptVM,
                     tabContext: tabContext,
+                    resolvedExecution: singleExecution,
                     implicitSessionID: selection.singleSessionID
                 )
                 return .singleMCPValue(value)
@@ -190,7 +231,8 @@ extension OracleViewModel {
             promptVM: promptVM,
             tabContext: tabContext,
             workspaceID: workspaceID,
-            profile: profile,
+            startExecution: startExecution,
+            selectionSnapshotOverride: selectionSnapshotOverride,
             existingGroup: selection.group,
             frozenInput: frozenInput,
             callbacks: callbacks
@@ -221,7 +263,16 @@ extension OracleViewModel {
                 if sessions.contains(where: { Self.isOracleProjection($0, addressedBy: chatID) }) {
                     throw ChatToolError.internalError("Canonical Oracle group was not found.")
                 }
-                return AppOracleConfiguredRosterSelection(group: nil, singleSessionID: nil)
+                let session = try await resolveSessionForExplicitContinuation(
+                    id: chatID,
+                    tabID: tabID,
+                    agentModeSessionID: tabContext?.agentModeSessionID,
+                    agentModeRunID: tabContext?.agentModeRunID
+                )
+                guard session.oracleGroupID == nil else {
+                    throw ChatToolError.internalError("Canonical Oracle group was not found.")
+                }
+                return AppOracleConfiguredRosterSelection(group: nil, singleSessionID: session.id)
             }
             guard let member = group.members.first(where: { $0.publicChatID == chatID }) else {
                 throw ChatToolError.internalError("Canonical Oracle group member was not found.")
@@ -268,7 +319,8 @@ extension OracleViewModel {
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext?,
         workspaceID: UUID?,
-        profile: AgentModelsSettingsProfile,
+        startExecution: ResolvedOracleExecution?,
+        selectionSnapshotOverride: OracleSelectionSnapshot?,
         existingGroup: OracleGroupDocument?,
         frozenInput: OracleInput?,
         callbacks: AppOracleGroupExecutionCallbacks?
@@ -299,10 +351,14 @@ extension OracleViewModel {
         let owner = try Self.oracleGroupOwner(workspaceID: workspaceID, tabID: tabID)
         let runtime = AppDomainRuntimeComposition.shared.oracleGroupRuntime
 
-        let roster = try Self.oracleRoster(
-            primaryRaw: args["model"]?.stringValue ?? profile.planningModelRaw,
-            additionalRaws: profile.additionalOracleModelRaws
-        )
+        let roster: OracleRoster
+        if let existingGroup {
+            roster = existingGroup.roster
+        } else if let startExecution {
+            roster = startExecution.roster
+        } else {
+            throw ChatToolError.internalError("Resolved Oracle execution is required for a new group.")
+        }
         let input = try frozenInput ?? OracleInput(mode: mode, userMessage: message)
         guard input.mode == mode, input.userMessage == message else {
             throw ChatToolError.invalidParams("Frozen Oracle input does not match the requested mode and message.")
@@ -316,7 +372,8 @@ extension OracleViewModel {
                     document,
                     workspaceID: workspaceID,
                     tabID: tabID,
-                    tabContext: tabContext
+                    tabContext: tabContext,
+                    startExecution: startExecution
                 )
                 if let turn = document.turns.last {
                     try await callbacks?.prepared(document.group.id, turn.id, document.members)
@@ -329,6 +386,8 @@ extension OracleViewModel {
                     args: args,
                     promptVM: promptVM,
                     tabContext: tabContext,
+                    startExecution: startExecution,
+                    selectionSnapshotOverride: selectionSnapshotOverride,
                     executionContext: invocation.context,
                     callbacks: callbacks
                 )
@@ -462,7 +521,8 @@ extension OracleViewModel {
         _ group: OracleGroupDocument,
         workspaceID: UUID?,
         tabID: UUID,
-        tabContext: OracleSendTabContext?
+        tabContext: OracleSendTabContext?,
+        startExecution: ResolvedOracleExecution?
     ) async throws {
         for member in group.members {
             let expectedName = Self.oracleProjectionName(base: group.name, laneIndex: member.laneID.index)
@@ -510,6 +570,12 @@ extension OracleViewModel {
             guard created == member.memberID.rawValue else {
                 throw ChatToolError.internalError("failed to restore Oracle group projection")
             }
+            if let startExecution,
+               let index = sessions.firstIndex(where: { $0.id == member.memberID.rawValue })
+            {
+                sessions[index].preferredAIModel = startExecution.models[member.laneID.index].rawValue
+                sessions[index].selectedChatPresetID = startExecution.promptConfiguration.chatPresetID
+            }
         }
     }
 
@@ -519,6 +585,8 @@ extension OracleViewModel {
         args: [String: Value],
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext?,
+        startExecution: ResolvedOracleExecution?,
+        selectionSnapshotOverride: OracleSelectionSnapshot?,
         executionContext: OracleLaneExecutionContext,
         callbacks: AppOracleGroupExecutionCallbacks?
     ) async throws -> OracleLaneExecutionResponse {
@@ -527,19 +595,30 @@ extension OracleViewModel {
         laneArgs["new_chat"] = .bool(false)
         laneArgs.removeValue(forKey: "model")
         laneArgs.removeValue(forKey: "chat_name")
-        let modelResolution = PromptViewModel.mcpOraclePlanningModelResolution(
-            rawValue: member.model.modelID,
-            isModelAvailable: { promptVM.mcpOracleIsProviderConfigured(for: $0) }
-        )
-        guard case let .configured(resolvedModel) = modelResolution else {
-            let message = PromptViewModel.mcpOraclePlanningModelErrorMessage(
-                for: modelResolution,
-                availabilityGuidance: { model in
-                    "Please check that the \(model.providerType.displayName) provider is configured in Settings."
-                }
-            ) ?? "Oracle lane model is not configured."
-            throw OracleLaneFailure(code: "model_unavailable", message: message)
+        let laneExecution: ResolvedOracleExecution
+        let resolvedLaneIndex: Int
+        if let startExecution {
+            laneExecution = startExecution
+            resolvedLaneIndex = member.laneID.index
+        } else {
+            guard var session = sessions.first(where: { $0.id == member.memberID.rawValue }) else {
+                throw ChatToolError.internalError("Oracle group projection is unavailable.")
+            }
+            session.preferredAIModel = member.model.modelID
+            if session.oracleExecutionAuthority == nil {
+                session.selectedChatPresetID = nil
+            }
+            let profile = GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: tabContext?.workspaceID)
+            laneExecution = try resolveOracleConversationExecution(
+                session: session,
+                mode: args["mode"]?.stringValue ?? "chat",
+                profile: profile,
+                promptVM: promptVM,
+                snapshotOverride: selectionSnapshotOverride
+            )
+            resolvedLaneIndex = 0
         }
+        let resolvedModel = laneExecution.models[resolvedLaneIndex]
         let executionProfile = AppOracleGroupRouting.executionProfile(for: resolvedModel)
         let laneContext: OracleSendTabContext? = if member.laneID.index == 0 {
             tabContext
@@ -556,7 +635,8 @@ extension OracleViewModel {
                     args: laneArgs,
                     promptVM: promptVM,
                     tabContext: laneContext,
-                    resolvedModel: resolvedModel,
+                    resolvedExecution: laneExecution,
+                    resolvedLaneIndex: resolvedLaneIndex,
                     onProgress: { text, reasoning in
                         partialResponse = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
                         callbacks?.laneProgress(member.laneID, text, reasoning)

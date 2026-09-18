@@ -3232,7 +3232,7 @@ class OperationRegistry:
             lanes = ["build", "debugArtifact"] + (["release"] if config == "release" else [])
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
-            argv = ["swift", "test"]
+            argv = [sys.executable, script("ci_app_test_runner.py"), "--local"]
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("filter"):

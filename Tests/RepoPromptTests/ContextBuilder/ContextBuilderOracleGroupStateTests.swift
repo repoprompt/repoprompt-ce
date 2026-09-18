@@ -254,6 +254,136 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
     }
 
     @MainActor
+    func testUIOriginGroupIgnoresMCPExposureAndSharesCapturedPromptAcrossLanes() async throws {
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -883,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContextBuilderUIOracleGroup-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            composition.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting(nil)
+            composition.workspaceManager.prepareForWindowClose()
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let workspace = composition.workspaceManager.createWorkspace(
+            name: "Context Builder UI Oracle group",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        var tab = ComposeTabState(name: "UI Oracle group")
+        tab.promptText = "Build a plan"
+        let workspaceIndex = try XCTUnwrap(
+            composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id })
+        )
+        composition.workspaceManager.workspaces[workspaceIndex].composeTabs = [tab]
+        composition.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tab.id
+        await composition.workspaceManager.switchWorkspace(
+            to: composition.workspaceManager.workspaces[workspaceIndex],
+            saveState: false,
+            reason: #function
+        )
+        composition.promptManager.loadComposeTabsFromWorkspace(
+            composition.workspaceManager.workspaces[workspaceIndex],
+            syncPromptText: true
+        )
+        composition.apiSettingsViewModel.openAIApiKey = "test-key"
+        composition.apiSettingsViewModel.isOpenAIKeyValid = true
+
+        let marker = "CONTEXT BUILDER CAPTURED PROMPT"
+        let chatPreset = ChatPreset(name: "Captured Plan", mode: .plan)
+        let profile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Mini.rawValue,
+            additionalOracleModelRaws: [AIModel.gpt54Mini.rawValue]
+        )
+        let execution = try OracleExecutionResolver(
+            resolveModel: AIModel.fromModelName,
+            isModelAvailable: { _ in true },
+            capturePromptConfiguration: { preset, mode in
+                OraclePromptConfiguration(
+                    chatPreset: preset,
+                    mode: mode,
+                    promptContext: PromptContextResolved(
+                        includeFiles: true,
+                        includeUserPrompt: true,
+                        includeMetaPrompts: false,
+                        includeFileTree: true,
+                        fileTreeMode: .auto,
+                        codeMapUsage: .auto,
+                        gitInclusion: .none,
+                        storedPromptIds: []
+                    ),
+                    systemPrompt: marker,
+                    metaInstructions: []
+                )
+            }
+        ).resolve(
+            choice: .automatic,
+            mode: "plan",
+            snapshot: OracleSelectionSnapshot(
+                origin: .contextBuilderUI,
+                agentModelsProfile: profile,
+                modelPresets: [],
+                modelPresetsExposed: false,
+                modelPresetsTemporarilyDisabled: true,
+                chatPresets: [chatPreset],
+                defaultChatPresets: [.plan: chatPreset],
+                contextBuilderUIModelStrings: [
+                    AIModel.gpt54Mini.rawValue,
+                    AIModel.gpt54Mini.rawValue
+                ],
+                contextBuilderUIChatPreset: chatPreset
+            )
+        )
+        var capturedMessages: [AIMessage] = []
+        composition.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting { message, _ in
+            capturedMessages.append(message)
+            let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                continuation.yield(
+                    ChatStreamOutput(text: "done", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed)
+                )
+                continuation.finish()
+            }
+            return (UUID(), stream)
+        }
+        let owner = try OracleViewModel.oracleGroupOwner(workspaceID: workspace.id, tabID: tab.id)
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        var groupIDForCleanup: OracleGroupID?
+        defer {
+            if let groupIDForCleanup {
+                addTeardownBlock {
+                    if let retained = try await store.load(groupID: groupIDForCleanup, owner: owner) {
+                        try await store.delete(
+                            groupID: retained.group.id,
+                            owner: owner,
+                            expectedRevision: retained.revision
+                        )
+                    }
+                }
+            }
+        }
+
+        let reply = try await composition.contextBuilderAgentViewModel.runMCPPlanOrQuestion(
+            for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
+            oracleViewModel: composition.oracleViewModel,
+            mode: .plan,
+            execution: execution,
+            prompt: tab.promptText,
+            selection: tab.selection,
+            reviewGitContext: .automaticOnly()
+        )
+        groupIDForCleanup = reply.oracleGroup?.result.groupID
+
+        XCTAssertEqual(reply.oracleGroup?.result.oracleCount, 2)
+        XCTAssertEqual(capturedMessages.count, 2)
+        XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt == marker })
+    }
+
+    @MainActor
     func testPrelaunchFailureUsesOwningGenerationCleanup() async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -295,21 +425,55 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
         let viewModel = composition.contextBuilderAgentViewModel
         viewModel.replaceSessionForTesting(tabID: tab.id)
         let session = try XCTUnwrap(viewModel.sessions[tab.id])
-        session.mcpAgentModelsProfile = AgentModelsSettingsProfile(
+        let profile = AgentModelsSettingsProfile(
             planningModelRaw: composition.promptManager.preferredAIModel.rawValue,
             additionalOracleModelRaws: [composition.promptManager.preferredAIModel.rawValue]
+        )
+        let chatPreset = ChatPreset.BuiltIn.plan
+        let execution = try OracleExecutionResolver(
+            resolveModel: AIModel.fromModelName,
+            isModelAvailable: { _ in true },
+            capturePromptConfiguration: { preset, mode in
+                OraclePromptConfiguration(
+                    chatPreset: preset,
+                    mode: mode,
+                    promptContext: PromptContextResolved(
+                        includeFiles: true,
+                        includeUserPrompt: true,
+                        includeMetaPrompts: false,
+                        includeFileTree: true,
+                        fileTreeMode: .auto,
+                        codeMapUsage: .auto,
+                        gitInclusion: .none,
+                        storedPromptIds: preset.storedPromptIds
+                    ),
+                    systemPrompt: preset.name,
+                    metaInstructions: []
+                )
+            }
+        ).resolve(
+            choice: .automatic,
+            mode: "plan",
+            snapshot: OracleSelectionSnapshot(
+                origin: .contextBuilderUI,
+                agentModelsProfile: profile,
+                modelPresets: [],
+                modelPresetsExposed: false,
+                modelPresetsTemporarilyDisabled: false,
+                chatPresets: [chatPreset],
+                defaultChatPresets: [.plan: chatPreset],
+                contextBuilderUIModelStrings: [
+                    composition.promptManager.preferredAIModel.rawValue,
+                    composition.promptManager.preferredAIModel.rawValue
+                ],
+                contextBuilderUIChatPreset: chatPreset
+            )
         )
         viewModel.installRunTestHooks(.init(
             beforeProcessingProviderEvent: nil,
             providerEventDisposition: nil,
             teardownCompleted: nil,
-            resolveMCPFollowUpModel: { _ in
-                (
-                    model: composition.promptManager.preferredAIModel,
-                    chatPresetID: nil,
-                    mcpControlInfo: nil
-                )
-            },
+            isOracleModelAvailable: { _ in true },
             beforeOracleGroupPackaging: {
                 throw ProbeError.packagingFailed
             }
@@ -321,6 +485,7 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
                 for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
                 oracleViewModel: composition.oracleViewModel,
                 mode: .plan,
+                execution: execution,
                 prompt: "Build a plan",
                 selection: tab.selection,
                 reviewGitContext: .automaticOnly()
@@ -368,6 +533,7 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
                 for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
                 oracleViewModel: composition.oracleViewModel,
                 mode: .plan,
+                execution: execution,
                 prompt: "Superseded replacement",
                 selection: tab.selection,
                 reviewGitContext: .automaticOnly()
@@ -390,6 +556,7 @@ final class ContextBuilderOracleGroupStateTests: XCTestCase {
                 for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
                 oracleViewModel: composition.oracleViewModel,
                 mode: .plan,
+                execution: execution,
                 prompt: "Already cancelled replacement",
                 selection: tab.selection,
                 reviewGitContext: .automaticOnly()

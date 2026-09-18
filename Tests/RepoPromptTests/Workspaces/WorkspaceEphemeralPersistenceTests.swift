@@ -52,6 +52,38 @@ import XCTest
             XCTAssertNil(scratch.isSavedWorkspace, "Legacy grouping must not rewrite provenance")
         }
 
+        func testLegacyLastUsedDecodeUsesPersistedModificationDateDeterministically() throws {
+            let workspaceID = UUID()
+            var object: [String: Any] = [
+                "id": workspaceID.uuidString,
+                "name": "Legacy",
+                "repoPaths": [],
+                "dateModified": 0
+            ]
+
+            var decoded = try decodeWorkspace(object)
+            XCTAssertEqual(decoded.lastUsed, Date(timeIntervalSinceReferenceDate: 0))
+
+            object["dateModified"] = 1
+            object["lastUsed"] = true
+            decoded = try decodeWorkspace(object)
+            XCTAssertEqual(decoded.lastUsed, Date(timeIntervalSinceReferenceDate: 1))
+
+            object["lastUsed"] = 0
+            decoded = try decodeWorkspace(object)
+            XCTAssertEqual(decoded.lastUsed, Date(timeIntervalSinceReferenceDate: 0))
+
+            object["dateModified"] = "invalid"
+            object["lastUsed"] = "invalid"
+            decoded = try decodeWorkspace(object)
+            XCTAssertEqual(decoded.lastUsed, .distantPast)
+        }
+
+        private func decodeWorkspace(_ object: [String: Any]) throws -> WorkspaceModel {
+            let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            return try JSONDecoder().decode(WorkspaceModel.self, from: data)
+        }
+
         func testNewWorkspaceWaitsForItsOwnSaveWithoutBlockingOtherOpens() async throws {
             let runtime = MCPDomainRuntime(configuration: .init(
                 mode: .app,

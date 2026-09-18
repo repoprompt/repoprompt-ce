@@ -847,40 +847,6 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertEqual(resumed, session.id)
     }
 
-    func testOnlyExplicitStartUsesConfiguredAdditionalModelsToCreateGroup() throws {
-        let explicitStart = try OracleConversationRoute.resolve(
-            chatID: nil,
-            newChat: true,
-            modelOverride: nil,
-            whenMissingChatID: .continueCurrent
-        )
-        let implicitContinuation = try OracleConversationRoute.resolve(
-            chatID: nil,
-            newChat: false,
-            modelOverride: nil,
-            whenMissingChatID: .continueCurrent
-        )
-        let exactContinuation = try OracleConversationRoute.resolve(
-            chatID: "single-chat",
-            newChat: false,
-            modelOverride: nil,
-            whenMissingChatID: .continueCurrent
-        )
-
-        XCTAssertTrue(AppOracleGroupRouting.startsConfiguredGroup(
-            route: explicitStart,
-            additionalModelRaws: ["model-b"]
-        ))
-        XCTAssertFalse(AppOracleGroupRouting.startsConfiguredGroup(
-            route: implicitContinuation,
-            additionalModelRaws: ["model-b"]
-        ))
-        XCTAssertFalse(AppOracleGroupRouting.startsConfiguredGroup(
-            route: exactContinuation,
-            additionalModelRaws: ["model-b"]
-        ))
-    }
-
     func testGroupedDeleteRejectsProjectionThatIsNotACanonicalMember() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }

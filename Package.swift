@@ -123,6 +123,7 @@ let package = Package(
             name: "RepoPromptDomainRuntime",
             dependencies: [
                 "RepoPromptShared",
+                "RepoPromptWorkspaceCore",
                 "RepoPromptC",
                 "RepoPromptCodeMapCore",
                 .product(name: "Logging", package: "swift-log"),

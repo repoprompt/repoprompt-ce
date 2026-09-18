@@ -1247,7 +1247,7 @@ final class MCPServerViewModel: ObservableObject {
                 _ = authorization
             #endif
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, execution, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
@@ -1257,6 +1257,7 @@ final class MCPServerViewModel: ObservableObject {
                         agentModeSessionID,
                         agentModeRunID,
                         mode,
+                        execution,
                         prompt,
                         selection,
                         lookupContext,
@@ -1273,6 +1274,7 @@ final class MCPServerViewModel: ObservableObject {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
                 mode: mode,
+                execution: execution,
                 prompt: prompt,
                 selection: selection,
                 lookupContext: lookupContext,
@@ -4014,15 +4016,19 @@ final class MCPServerViewModel: ObservableObject {
                 guard let workspaceID = context.workspaceID,
                       let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID })
                 else {
-                    throw MCPError.invalidParams("context_builder could not resolve the invoking Agent Mode workspace.")
+                    throw MCPError.invalidParams(ContextBuilderWorkspaceContextError.readiness(
+                        WorkspaceRootReadinessFailure(reason: .workspaceUnavailable, expectedCount: 0, loadedCount: 0, missingCount: 0)
+                    ).localizedDescription)
                 }
                 do {
                     workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
                         from: context,
                         workspaceRepoPaths: workspace.repoPaths,
                         workspaceDirectoryPath: targetWindow.workspaceManager.workspaceDirectory(for: workspace).path,
-                        store: targetWindow.promptManager.workspaceFileContextStore
+                        workspaceManager: targetWindow.workspaceManager
                     )
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
                     throw MCPError.invalidParams(error.localizedDescription)
                 }

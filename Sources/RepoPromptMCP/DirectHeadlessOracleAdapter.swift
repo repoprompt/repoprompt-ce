@@ -11,6 +11,7 @@ extension DomainOracleConversationStore: DirectHeadlessOracleStore {}
 actor DirectHeadlessOracleAdapter {
     enum AdapterError: Error, LocalizedError, Equatable {
         case contextPackRequired
+        case appOnlyOraclePreset
         case unsupportedProviderOverride
         case unknownChatID
         case rosterConflict
@@ -21,6 +22,8 @@ actor DirectHeadlessOracleAdapter {
             switch self {
             case .contextPackRequired:
                 "context_pack_required: grouped Context Builder execution requires a frozen canonical context pack."
+            case .appOnlyOraclePreset:
+                "oracle_preset is available only through the app-backed Context Builder."
             case .unsupportedProviderOverride:
                 "Direct Oracle provider overrides are unsupported; select a model or start a new chat."
             case .unknownChatID:
@@ -196,6 +199,9 @@ actor DirectHeadlessOracleAdapter {
         invocationID: UUID,
         runID: UUID
     ) async throws -> InvocationPlan {
+        if toolName == "context_builder", arguments["oracle_preset"] != nil {
+            throw AdapterError.appOnlyOraclePreset
+        }
         if arguments["provider"] != nil { throw AdapterError.unsupportedProviderOverride }
         let route: OracleConversationRoute
         let input: OracleInput
