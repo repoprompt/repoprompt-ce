@@ -274,15 +274,10 @@ struct ContextBuilderOracleGroupReply: Codable, Equatable {
         result.oracleResults
     }
 
-    func requiredCompletedPrimaryResponse() throws -> String {
+    func requiredCompletedPrimaryResponse() throws -> String? {
         let primary = result.primary
         guard primary.status == .completed else {
-            let error = primary.error
-            throw ContextBuilderOraclePrimaryCompletionError.notCompleted(
-                status: primary.status,
-                code: error?.code ?? "oracle_primary_not_completed",
-                message: error?.message ?? "Primary Oracle did not complete successfully."
-            )
+            return nil
         }
         guard let response = primary.response,
               !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
