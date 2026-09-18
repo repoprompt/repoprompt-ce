@@ -193,7 +193,7 @@
                 switch agent {
                 case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
                     break
-                case .openCode, .cursor, .grokBuild, .antigravity:
+                case .openCode, .cursor, .grokBuild, .antigravity, .devin:
                     throw PromptExperimentSubmissionError.rejected(
                         "This provider does not have a proven exact-model, synthetic-cwd, file/shell-free discovery profile for the isolated pilot."
                     )
