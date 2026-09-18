@@ -409,7 +409,6 @@ struct MessageBubble: View {
 
                     CopyButtonOverlay(
                         message: message,
-                        viewModel: viewModel,
                         showCopyButton: true,
                         isHoveringCopy: $isHoveringCopy,
                         showingDeleteConfirmation: $showingDeleteConfirmation
@@ -476,7 +475,6 @@ struct MessageBubble: View {
                 HStack(spacing: 8) {
                     CopyButtonOverlay(
                         message: message,
-                        viewModel: viewModel,
                         showCopyButton: message.isFinalized,
                         isHoveringCopy: $isHoveringCopy,
                         showingDeleteConfirmation: $showingDeleteConfirmation
@@ -530,7 +528,7 @@ struct MessageBubble: View {
 /// Add the new ForkButtonOverlay struct
 private struct ForkButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
+    let viewModel: OracleViewModel
     @Binding var isHoveringFork: Bool
 
     var body: some View {
@@ -596,7 +594,7 @@ private struct EditButtonOverlay: View {
 
 private struct DeleteButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
+    let viewModel: OracleViewModel
     @Binding var isHoveringDelete: Bool
     @Binding var showingConfirmation: Bool
     @Environment(\.colorScheme) private var colorScheme
@@ -653,7 +651,6 @@ private struct DeleteButtonOverlay: View {
 
 private struct CopyButtonOverlay: View {
     let message: AIChatMessage
-    @ObservedObject var viewModel: OracleViewModel
     let showCopyButton: Bool
     @Binding var isHoveringCopy: Bool
     @Binding var showingDeleteConfirmation: Bool
@@ -835,7 +832,7 @@ private struct MessageBubbleContent: View {
     }
 
     private var shouldShowCollapsedAssistantView: Bool {
-        !message.isUser && !isLatestMessage && message.content.lineEquivalentCount > 10
+        !message.isUser && !isLatestMessage && message.content.exceedsLineEquivalentLimit(10)
     }
 
     private var assistantPreview: String {
@@ -912,13 +909,15 @@ private struct MessageBubbleContent: View {
 }
 
 private extension String {
-    var lineEquivalentCount: Int {
-        guard !isEmpty else { return 0 }
-        return split(separator: "\n", omittingEmptySubsequences: false).count
+    /// Whether the text has more than `limit` line equivalents. Bounded: splitting stops
+    /// after `limit` separators, so the returned count saturates at `limit + 1`.
+    func exceedsLineEquivalentLimit(_ limit: Int) -> Bool {
+        guard !isEmpty else { return false }
+        return split(separator: "\n", maxSplits: limit, omittingEmptySubsequences: false).count > limit
     }
 
     func firstLineEquivalents(_ limit: Int) -> String {
-        split(separator: "\n", omittingEmptySubsequences: false)
+        split(separator: "\n", maxSplits: limit, omittingEmptySubsequences: false)
             .prefix(limit)
             .joined(separator: "\n")
     }
