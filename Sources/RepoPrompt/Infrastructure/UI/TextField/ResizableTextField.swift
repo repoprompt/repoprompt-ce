@@ -180,6 +180,8 @@ struct ResizableTextField: View {
     @Binding var resetTrigger: Bool
     var onImagePaste: ((NSPasteboard) -> Bool)?
     var features: ResizableTextFieldFeatures = .plain
+    /// Revision for intentional programmatic text changes while the editor is focused.
+    var externalUpdateTick: Int? = .none
 
     /// Callback for height changes to coordinate with parent
     var onHeightChange: (CGFloat) -> Void = { _ in }
@@ -231,6 +233,7 @@ struct ResizableTextField: View {
             onReturn: onReturn,
             onImagePaste: onImagePaste,
             features: features,
+            externalUpdateTick: externalUpdateTick,
             currentHeightPresetIndex: $currentHeightPresetIndex,
             onHeightChange: onHeightChange
         )
@@ -264,6 +267,7 @@ struct CustomTextField: NSViewRepresentable {
     var onReturn: () -> Void
     var onImagePaste: ((NSPasteboard) -> Bool)?
     var features: ResizableTextFieldFeatures = .plain
+    var externalUpdateTick: Int? = .none
     @Binding var currentHeightPresetIndex: Int
 
     /// Callback for height changes
@@ -272,6 +276,15 @@ struct CustomTextField: NSViewRepresentable {
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
+    }
+
+    static func shouldApplyTextSynchronization(
+        isFirstResponder: Bool,
+        hasMarkedText: Bool,
+        hasPendingExternalUpdate: Bool
+    ) -> Bool {
+        guard !hasMarkedText else { return false }
+        return !isFirstResponder || hasPendingExternalUpdate
     }
 
     func makeCoordinator() -> Coordinator {
@@ -339,6 +352,7 @@ struct CustomTextField: NSViewRepresentable {
             suggestionsProvider: features.slashSkillSuggestionsProvider
         )
         textView.string = text
+        context.coordinator.lastAppliedExternalUpdateTick = externalUpdateTick
         context.coordinator.clearUndoHistory()
 
         // Initial height calculation
@@ -377,29 +391,41 @@ struct CustomTextField: NSViewRepresentable {
         )
 
         var appliedProgrammaticTextChange = false
-        // IME FIX: Avoid stomping marked text (composition) with programmatic writes.
+        let isFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
+        let hasPendingExternalUpdate = externalUpdateTick.map {
+            context.coordinator.lastAppliedExternalUpdateTick != $0
+        } ?? false
+        // Avoid replacing active user edits with a stale SwiftUI binding snapshot. Explicit
+        // external updates are allowed through via externalUpdateTick. Callers that do not
+        // opt into revision tracking retain the previous synchronization behavior.
         if textView.string != text {
-            // If an IME composition is active, DO NOT overwrite.
-            if textView.hasMarkedText() { return }
-
-            context.coordinator.internalUpdateInProgress = true
-
-            // Preserve selection when applying programmatic changes.
-            let prevSel = textView.selectedRange()
-            context.coordinator.performExternalReplacement(in: textView) {
-                textView.string = text
+            let hasMarkedText = textView.hasMarkedText()
+            if hasMarkedText {
+                if let externalUpdateTick, hasPendingExternalUpdate {
+                    context.coordinator.pendingExternalTextUpdate = (
+                        text: text,
+                        tick: externalUpdateTick
+                    )
+                }
+                return
             }
-            let nsLen = (text as NSString).length
-            let clampedLoc = min(max(prevSel.location, 0), nsLen)
-            let maxLenFromLoc = max(0, nsLen - clampedLoc)
-            let clampedLen = min(max(prevSel.length, 0), maxLenFromLoc)
-            textView.setSelectedRange(NSRange(location: clampedLoc, length: clampedLen))
+            let shouldApplyFocusedBindingUpdate = externalUpdateTick == nil || hasPendingExternalUpdate
+            guard Self.shouldApplyTextSynchronization(
+                isFirstResponder: isFirstResponder,
+                hasMarkedText: false,
+                hasPendingExternalUpdate: shouldApplyFocusedBindingUpdate
+            ) else { return }
 
-            context.coordinator.internalUpdateInProgress = false
+            context.coordinator.applyExternalTextReplacement(
+                text,
+                to: textView,
+                externalUpdateTick: externalUpdateTick
+            )
             appliedProgrammaticTextChange = true
-
-            Task { @MainActor in
-                context.coordinator.updateHeightIfNeeded(textView: textView)
+        } else {
+            // Consume an external revision even when the requested text is already installed.
+            if let externalUpdateTick {
+                context.coordinator.lastAppliedExternalUpdateTick = externalUpdateTick
             }
         }
         if appliedProgrammaticTextChange {
@@ -425,6 +451,8 @@ struct CustomTextField: NSViewRepresentable {
         var parent: CustomTextField
         var internalUpdateInProgress = false
         var lastReportedHeight: CGFloat?
+        var lastAppliedExternalUpdateTick: Int?
+        var pendingExternalTextUpdate: (text: String, tick: Int)?
 
         private let textViewUndoManager = UndoManager()
         private let fileTagHelper = FileTagMentionHelper()
@@ -439,7 +467,28 @@ struct CustomTextField: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             if internalUpdateInProgress { return }
             guard isActive, let textView = notification.object as? NSTextView else { return }
-            parent.text = textView.string
+
+            if textView.hasMarkedText() {
+                // Let the input method finish composing before reflecting text into SwiftUI.
+                // This prevents a stale binding snapshot from being fed back into the editor.
+                updateHeightIfNeeded(textView: textView)
+                return
+            }
+
+            if let pendingExternalTextUpdate {
+                self.pendingExternalTextUpdate = nil
+                if textView.string != pendingExternalTextUpdate.text {
+                    applyExternalTextReplacement(
+                        pendingExternalTextUpdate.text,
+                        to: textView,
+                        externalUpdateTick: pendingExternalTextUpdate.tick
+                    )
+                } else {
+                    lastAppliedExternalUpdateTick = pendingExternalTextUpdate.tick
+                }
+            } else {
+                parent.text = textView.string
+            }
 
             updateHeightIfNeeded(textView: textView)
             scheduleFileTagSuggestionsRefresh(for: textView, immediate: false)
@@ -504,7 +553,31 @@ struct CustomTextField: NSViewRepresentable {
             textViewUndoManager
         }
 
-        func performExternalReplacement(
+        func applyExternalTextReplacement(
+            _ text: String,
+            to textView: NSTextView,
+            externalUpdateTick: Int?
+        ) {
+            internalUpdateInProgress = true
+
+            let previousSelection = textView.selectedRange()
+            performExternalReplacement(in: textView) {
+                textView.string = text
+            }
+            let nsLength = (text as NSString).length
+            let clampedLocation = min(max(previousSelection.location, 0), nsLength)
+            let maxLengthFromLocation = max(0, nsLength - clampedLocation)
+            let clampedLength = min(max(previousSelection.length, 0), maxLengthFromLocation)
+            textView.setSelectedRange(NSRange(location: clampedLocation, length: clampedLength))
+
+            internalUpdateInProgress = false
+            if let externalUpdateTick {
+                lastAppliedExternalUpdateTick = externalUpdateTick
+            }
+            updateHeightIfNeeded(textView: textView)
+        }
+
+        private func performExternalReplacement(
             in textView: NSTextView,
             mutation: () -> Void
         ) {
