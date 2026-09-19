@@ -39,10 +39,10 @@ enum ACPPromptContentBuilder {
             }
         }
         for image in transientImages {
-            if let title = image.normalizedTitle {
+            if let annotation = image.titleAnnotation {
                 blocks.append([
                     "type": "text",
-                    "text": "Image title: \(title)"
+                    "text": annotation
                 ])
             }
             blocks.append([

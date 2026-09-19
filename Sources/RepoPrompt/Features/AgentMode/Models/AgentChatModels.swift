@@ -147,7 +147,7 @@ public struct AgentCrossSessionAttribution: Codable, Sendable, Equatable, Hashab
 enum AgentToolArgumentPersistencePolicy {
     static func sanitizedArgsJSON(toolName: String?, argsJSON: String?) -> String? {
         guard let argsJSON else { return nil }
-        guard normalizedToolName(toolName) == "ask_oracle" else { return argsJSON }
+        guard isOracleImageTool(toolName) else { return argsJSON }
         guard let data = argsJSON.data(using: .utf8),
               var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
@@ -162,6 +162,19 @@ enum AgentToolArgumentPersistencePolicy {
         return String(data: sanitized, encoding: .utf8)
     }
 
+    /// Top-level parse state while scanning a partial `ask_oracle` arguments object. Anything
+    /// that cannot appear at that position in a strict JSON object prefix fails closed.
+    private enum PartialTopLevelState {
+        case expectingKey
+        case expectingColon
+        case expectingValue
+        case afterValue
+    }
+
+    /// Fails closed: returns `true` whenever a malformed/truncated arguments prefix *could*
+    /// contain a top-level `"images"` key, or whenever the prefix is syntactically impossible
+    /// in strict JSON. `false` is reserved for prefixes that are provably image-free strict
+    /// JSON prefixes (or end inside a top-level key that cannot complete to `"images"`).
     private static func partialArgumentsCouldContainImagesKey(_ text: String) -> Bool {
         let target = "images"
         let scalars = Array(text.unicodeScalars)
@@ -174,7 +187,8 @@ enum AgentToolArgumentPersistencePolicy {
         index += 1
 
         var depth = 1
-        var expectingTopLevelKey = true
+        var state: PartialTopLevelState = .expectingKey
+        var literalValueStarted = false
         var inString = false
         var stringIsTopLevelKey = false
         var key = ""
@@ -191,6 +205,7 @@ enum AgentToolArgumentPersistencePolicy {
                 if escaped {
                     if scalar == "u" {
                         guard index + 4 < scalars.count else {
+                            // Truncated `\u` escape: fail closed when it could still be a key.
                             return stringIsTopLevelKey && target.hasPrefix(key)
                         }
                         if stringIsTopLevelKey {
@@ -229,8 +244,12 @@ enum AgentToolArgumentPersistencePolicy {
                         return true
                     }
                     inString = false
-                    if stringIsTopLevelKey {
-                        expectingTopLevelKey = false
+                    if depth == 1 {
+                        if stringIsTopLevelKey {
+                            state = .expectingColon
+                        } else if state == .expectingValue {
+                            state = .afterValue
+                        }
                     }
                 } else if stringIsTopLevelKey {
                     appendKeyScalar(scalar, to: &key)
@@ -241,36 +260,75 @@ enum AgentToolArgumentPersistencePolicy {
 
             switch scalar {
             case "\"":
+                if depth == 1 {
+                    switch state {
+                    case .expectingKey:
+                        stringIsTopLevelKey = true
+                        key = ""
+                    case .expectingValue where !literalValueStarted:
+                        stringIsTopLevelKey = false
+                    default:
+                        // A string where a key/value separator or comma was required is not a
+                        // strict JSON prefix (e.g. `{"a":"b" "images":...`).
+                        return true
+                    }
+                } else {
+                    stringIsTopLevelKey = false
+                }
                 inString = true
-                stringIsTopLevelKey = depth == 1 && expectingTopLevelKey
-                key = ""
             case "{", "[":
+                if depth == 1 {
+                    guard state == .expectingValue, !literalValueStarted else { return true }
+                    literalValueStarted = false
+                }
                 depth += 1
             case "}", "]":
                 depth -= 1
                 if depth <= 0 { return true }
+                if depth == 1 { state = .afterValue }
+            case ":" where depth == 1:
+                guard state == .expectingColon else { return true }
+                state = .expectingValue
+                literalValueStarted = false
             case "," where depth == 1:
-                expectingTopLevelKey = true
+                guard state == .afterValue else { return true }
+                state = .expectingKey
             default:
-                if depth == 1, expectingTopLevelKey,
-                   !CharacterSet.whitespacesAndNewlines.contains(scalar)
-                {
-                    return true
+                if depth == 1, !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                    switch state {
+                    case .expectingValue:
+                        // Start/continuation of a number or literal value.
+                        literalValueStarted = true
+                    default:
+                        return true
+                    }
                 }
             }
             index += 1
         }
 
-        guard inString, stringIsTopLevelKey else { return false }
+        guard inString else {
+            // Only a prefix that stops cleanly after a complete top-level value is provably
+            // image-free. Mid-key, mid-pair, or post-comma prefixes could still add "images".
+            return state != .afterValue
+        }
+        guard stringIsTopLevelKey else { return false }
         return escaped || target.hasPrefix(key)
     }
 
-    private static func normalizedToolName(_ toolName: String?) -> String? {
-        toolName?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .components(separatedBy: "__")
-            .last
+    /// Whether the tool name resolves to RepoPrompt's `ask_oracle`, using the canonical MCP
+    /// name resolver plus a fail-closed suffix check for server prefixes the resolver does
+    /// not own.
+    private static func isOracleImageTool(_ toolName: String?) -> Bool {
+        guard let toolName else { return false }
+        if MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) == "ask_oracle" {
+            return true
+        }
+        let lowered = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lowered == "ask_oracle"
+            || lowered.hasSuffix("__ask_oracle")
+            || lowered.hasSuffix(":ask_oracle")
+            || lowered.hasSuffix(".ask_oracle")
     }
 }
 

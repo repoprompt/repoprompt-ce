@@ -98,7 +98,14 @@ final class OracleImageContractTests: XCTestCase {
             (#"{"message":"x","ima"#, nil),
             (#"{"images":[{"path":"/Users/secret.png""#, nil),
             (#"{"\u0069mages":[{"path":"/Users/secret.png""#, nil),
-            (#"{"i\u006Dages":[{"path":"/Users/secret.png""#, nil)
+            (#"{"i\u006Dages":[{"path":"/Users/secret.png""#, nil),
+            // Missing comma before a would-be "images" key is not a strict JSON prefix.
+            (#"{"message":"x" "images":[{"path":"/Users/secret.png""#, nil),
+            (#"{"message":"x" "ima"#, nil),
+            (#"{"message":1 "images""#, nil),
+            (#"{"message":"x"}{"images":[]"#, nil),
+            // A completed top-level key whose value never started is not a clean prefix.
+            (#"{"message":"x","other""#, nil)
         ]
 
         for (raw, expected) in cases {
@@ -117,6 +124,40 @@ final class OracleImageContractTests: XCTestCase {
                 ),
                 raw,
                 raw
+            )
+        }
+    }
+
+    func testNamespacedAndAliasedOracleToolNamesAreRedacted() throws {
+        let raw = #"{"message":"inspect","images":[{"path":"/Users/secret.png"}]}"#
+        let oracleNames = [
+            "ask_oracle",
+            "mcp__RepoPromptCE__ask_oracle",
+            "RepoPromptCE__ask_oracle",
+            "RepoPromptCE_ask_oracle",
+            "functions.ask_oracle",
+            "other_server:ask_oracle",
+            "mcp__other__ask_oracle"
+        ]
+        for name in oracleNames {
+            let sanitized = try XCTUnwrap(
+                AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(toolName: name, argsJSON: raw),
+                name
+            )
+            XCTAssertFalse(sanitized.contains("secret.png"), name)
+            XCTAssertTrue(sanitized.contains("inspect"), name)
+        }
+
+        // Non-oracle tools keep their arguments untouched.
+        let unrelated = #"{"images":[{"path":"/tmp/not-an-oracle-image.png"}]}"#
+        for name in ["ask_oracle_extended", "oracle_send", "read_file"] {
+            XCTAssertEqual(
+                AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                    toolName: name,
+                    argsJSON: unrelated
+                ),
+                unrelated,
+                name
             )
         }
     }

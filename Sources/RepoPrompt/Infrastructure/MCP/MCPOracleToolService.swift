@@ -780,34 +780,40 @@ struct MCPOracleToolService {
         let storeRoots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let representedPhysicalPaths = Set(storeRoots.map(\.standardizedFullPath))
         let namespace = lookupContext.exactFileNamespace(storeRoots: storeRoots)
-        do {
-            var seen: Set<String> = []
-            var capturesByPhysicalRootPath: [String: OracleImagePhysicalRootCapture] = [:]
-            var projections: [OracleImageRootProjection] = []
-            for binding in namespace.rootBindings
-                where representedPhysicalPaths.contains(binding.lookupRoot.standardizedFullPath)
-            {
-                let physicalRootPath = binding.lookupRoot.standardizedFullPath
-                let capture: OracleImagePhysicalRootCapture
-                if let existing = capturesByPhysicalRootPath[physicalRootPath] {
-                    capture = existing
-                } else {
-                    capture = try OracleImagePhysicalRootCapture.capture(
-                        physicalRootPath: physicalRootPath,
-                        index: requests[0].index
-                    )
-                    capturesByPhysicalRootPath[physicalRootPath] = capture
-                }
-                let logicalRootPaths = [physicalRootPath] + binding.clientRoots.map(\.standardizedFullPath)
-                for logicalRootPath in logicalRootPaths {
-                    let key = "\(logicalRootPath)\u{0}\(physicalRootPath)"
-                    guard seen.insert(key).inserted else { continue }
-                    projections.append(capture.projection(logicalRootPath: logicalRootPath))
-                }
+
+        // Pure in-memory projection: merge every represented binding's logical aliases under
+        // its physical root. Root capture itself runs off the main actor inside
+        // deriveAuthorityDetached, and a root that fails to capture is isolated so it only
+        // fails the image requests that actually resolve under it.
+        var physicalRootOrder: [String] = []
+        var logicalRootsByPhysicalPath: [String: [String]] = [:]
+        for binding in namespace.rootBindings
+            where representedPhysicalPaths.contains(binding.lookupRoot.standardizedFullPath)
+        {
+            let physicalRootPath = binding.lookupRoot.standardizedFullPath
+            if logicalRootsByPhysicalPath[physicalRootPath] == nil {
+                physicalRootOrder.append(physicalRootPath)
+                logicalRootsByPhysicalPath[physicalRootPath] = []
             }
+            for logicalRootPath in [physicalRootPath] + binding.clientRoots.map(\.standardizedFullPath)
+                where !(logicalRootsByPhysicalPath[physicalRootPath] ?? []).contains(logicalRootPath)
+            {
+                logicalRootsByPhysicalPath[physicalRootPath]?.append(logicalRootPath)
+            }
+        }
+        let rootSpecs = physicalRootOrder.map {
+            OracleImageRootSpec(
+                physicalRootPath: $0,
+                logicalRootPaths: logicalRootsByPhysicalPath[$0] ?? [$0]
+            )
+        }
+        do {
+            let authority = try await OracleImageAttachmentLoader.deriveAuthorityDetached(
+                rootSpecs: rootSpecs
+            )
             return try await OracleImageAttachmentLoader.loadDetached(
                 requests: requests,
-                authority: OracleImageWorkspaceAuthority(roots: projections)
+                authority: authority
             )
         } catch is CancellationError {
             throw CancellationError()

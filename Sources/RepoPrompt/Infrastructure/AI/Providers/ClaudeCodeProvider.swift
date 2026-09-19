@@ -159,7 +159,7 @@ final class ClaudeCodeProvider: AIProvider {
         if aiMessage.transientImages.isEmpty {
             stdin = prompt
         } else {
-            options.inputFormat = "stream-json"
+            Self.applyStreamJSONImageTransport(to: &options)
             stdin = try Self.makeStreamJSONInput(prompt: prompt, images: aiMessage.transientImages)
         }
         let outputFormat: CLIOutputFormat = usesStreamJSONOutput ? .streamJson : .json
@@ -241,14 +241,21 @@ final class ClaudeCodeProvider: AIProvider {
 
     // MARK: - Private Helpers
 
+    /// stream-json input requires `--verbose` alongside `--input-format`/`--output-format
+    /// stream-json` in print mode, matching the Agent Mode Claude session runner.
+    static func applyStreamJSONImageTransport(to options: inout ClaudeCLIOptions) {
+        options.inputFormat = "stream-json"
+        options.verbose = true
+    }
+
     static func makeStreamJSONInput(prompt: String, images: [AITransientImage]) throws -> String {
         var content: [[String: Any]] = []
         if !prompt.isEmpty {
             content.append(["type": "text", "text": prompt])
         }
         for image in images {
-            if let title = image.normalizedTitle {
-                content.append(["type": "text", "text": "Image title: \(title)"])
+            if let annotation = image.titleAnnotation {
+                content.append(["type": "text", "text": annotation])
             }
             content.append([
                 "type": "image",

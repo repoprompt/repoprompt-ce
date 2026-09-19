@@ -28,6 +28,11 @@ struct AITransientImage: Equatable {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Provider-agnostic caption line emitted as a text part before each image part.
+    var titleAnnotation: String? {
+        normalizedTitle.map { "Image title: \($0)" }
+    }
+
     var preferredFileExtension: String {
         switch mediaType {
         case .png: "png"
@@ -353,8 +358,8 @@ struct AIMessage {
             parts.append(.text(text))
         }
         for image in transientImages {
-            if let title = image.normalizedTitle {
-                parts.append(.text("Image title: \(title)"))
+            if let annotation = image.titleAnnotation {
+                parts.append(.text(annotation))
             }
             parts.append(.imageUrl(.init(url: URL(string: image.openAIDataURL)!, detail: nil)))
         }
@@ -367,8 +372,8 @@ struct AIMessage {
             parts.append(.text(SwiftOpenAI.TextContent(text: text)))
         }
         for image in transientImages {
-            if let title = image.normalizedTitle {
-                parts.append(.text(SwiftOpenAI.TextContent(text: "Image title: \(title)")))
+            if let annotation = image.titleAnnotation {
+                parts.append(.text(SwiftOpenAI.TextContent(text: annotation)))
             }
             parts.append(.image(SwiftOpenAI.ImageContent(detail: "auto", imageUrl: image.openAIDataURL)))
         }
