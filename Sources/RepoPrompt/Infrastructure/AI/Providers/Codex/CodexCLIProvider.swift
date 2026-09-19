@@ -204,7 +204,8 @@ final class CodexCLIProvider: AIProvider {
         logCollector: CLIProcessLogCollector? = nil,
         appServerReadyHook: (() async throws -> Void)? = nil,
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
-        sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil
+        sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil,
+        configureDiscoveryServer: Bool = true
     ) {
         self.workingDirectory = workingDirectory
         self.launchSnapshot = launchSnapshot
@@ -221,8 +222,11 @@ final class CodexCLIProvider: AIProvider {
         self.sessionControllerFactory = sessionControllerFactory
         _ = logCollector
 
-        // Ensure RepoPrompt MCP server entry exists before building overrides.
-        _ = MCPIntegrationHelper.ensureCodexServerForDiscovery(launchSnapshot: launchSnapshot)
+        // Ensure RepoPrompt MCP server entry exists before building overrides. Tests pass
+        // `configureDiscoveryServer: false` so construction cannot write managed Codex state.
+        if configureDiscoveryServer {
+            _ = MCPIntegrationHelper.ensureCodexServerForDiscovery(launchSnapshot: launchSnapshot)
+        }
     }
 
     #if DEBUG
@@ -335,6 +339,10 @@ final class CodexCLIProvider: AIProvider {
         )
     }
 
+    /// Bridges are expected to finish once their request client stops, but a wedged event
+    /// stream must not hang provider disposal forever.
+    private static let disposeDrainTimeout: TimeInterval = 15
+
     func dispose() async {
         let activeTasks = activeStreamTasks.closeAndCancelAll()
         let activeClients = snapshotActiveRequestClients()
@@ -342,7 +350,16 @@ final class CodexCLIProvider: AIProvider {
             await client.stop()
         }
         for task in activeTasks {
-            await task.value
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await task.value }
+                group.addTask {
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(Self.disposeDrainTimeout * 1_000_000_000)
+                    )
+                }
+                _ = await group.next()
+                group.cancelAll()
+            }
         }
     }
 
@@ -1153,9 +1170,7 @@ final class CodexCLIProvider: AIProvider {
     }
 
     private func promptAppendingImageTitles(_ prompt: String, images: [AITransientImage]) -> String {
-        let titles = images.compactMap { image in
-            image.normalizedTitle.map { "Image title: \($0)" }
-        }
+        let titles = images.compactMap(\.titleAnnotation)
         guard !titles.isEmpty else { return prompt }
         return ([prompt] + titles).filter { !$0.isEmpty }.joined(separator: "\n\n")
     }

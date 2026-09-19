@@ -67,8 +67,30 @@ struct OracleImageRootProjection: Equatable {
     let rootIdentity: OracleImageRootIdentity
 }
 
+/// One physical workspace root to capture, together with every logical alias whose paths
+/// should resolve into it. Built from workspace namespace bindings before authority capture.
+struct OracleImageRootSpec: Equatable {
+    let physicalRootPath: String
+    let logicalRootPaths: [String]
+}
+
+/// A represented workspace root whose descriptor capture failed. Kept so a request path that
+/// resolves under it is attributed `missingOrUnreadable` instead of a misleading
+/// `outsideAuthority`, and so unrelated roots do not block images elsewhere in the workspace.
+struct OracleImageUnavailableRoot: Equatable {
+    /// Logical and unresolved-physical prefixes this root would have matched.
+    let candidatePrefixes: [String]
+
+    func covers(_ path: String) -> Bool {
+        candidatePrefixes.contains { prefix in
+            path == prefix || path.hasPrefix(prefix + "/")
+        }
+    }
+}
+
 struct OracleImageWorkspaceAuthority: Equatable {
     let roots: [OracleImageRootProjection]
+    var unavailableRoots: [OracleImageUnavailableRoot] = []
 }
 
 struct OracleImageAttachmentLimits: Equatable {
@@ -154,6 +176,50 @@ struct OracleImageAttachmentLoader {
         }
     }
 
+    /// Captures physical root identity for every represented workspace root off the caller's
+    /// executor. A root that cannot be captured is recorded in `unavailableRoots` so only image
+    /// requests under it fail, rather than one broken root rejecting the whole request.
+    static func deriveAuthorityDetached(
+        rootSpecs: [OracleImageRootSpec]
+    ) async throws -> OracleImageWorkspaceAuthority {
+        try Task.checkCancellation()
+        let task = Task.detached(priority: .userInitiated) {
+            try deriveAuthority(rootSpecs: rootSpecs)
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    static func deriveAuthority(
+        rootSpecs: [OracleImageRootSpec]
+    ) throws -> OracleImageWorkspaceAuthority {
+        var roots: [OracleImageRootProjection] = []
+        var unavailableRoots: [OracleImageUnavailableRoot] = []
+        var seenProjections: Set<String> = []
+        for spec in rootSpecs {
+            try Task.checkCancellation()
+            do {
+                let capture = try OracleImagePhysicalRootCapture.capture(
+                    physicalRootPath: spec.physicalRootPath,
+                    index: 0
+                )
+                for logicalRootPath in spec.logicalRootPaths {
+                    let key = "\(logicalRootPath)\u{0}\(spec.physicalRootPath)"
+                    guard seenProjections.insert(key).inserted else { continue }
+                    roots.append(capture.projection(logicalRootPath: logicalRootPath))
+                }
+            } catch {
+                unavailableRoots.append(OracleImageUnavailableRoot(
+                    candidatePrefixes: spec.logicalRootPaths + [spec.physicalRootPath]
+                ))
+            }
+        }
+        return OracleImageWorkspaceAuthority(roots: roots, unavailableRoots: unavailableRoots)
+    }
+
     func load(
         requests: [OracleImageRequest],
         authority: OracleImageWorkspaceAuthority
@@ -162,7 +228,7 @@ struct OracleImageAttachmentLoader {
             throw OracleImageLoadError.tooMany(maximumCount: limits.maxCount)
         }
         guard !requests.isEmpty else { return [] }
-        guard !authority.roots.isEmpty else {
+        guard !authority.roots.isEmpty || !authority.unavailableRoots.isEmpty else {
             throw OracleImageLoadError.outsideAuthority(index: requests[0].index)
         }
 
@@ -359,6 +425,9 @@ struct OracleImageAttachmentLoader {
             }
         }
         guard let maximumSpecificity = matches.map(\.specificity).max() else {
+            if authority.unavailableRoots.contains(where: { $0.covers(rawPath) }) {
+                throw OracleImageLoadError.missingOrUnreadable(index: request.index)
+            }
             throw OracleImageLoadError.outsideAuthority(index: request.index)
         }
         let mostSpecific = matches.filter { $0.specificity == maximumSpecificity }
@@ -507,9 +576,12 @@ struct OracleImageAttachmentLoader {
         {
             return .png
         }
+        // Byte-level format sniffing only — not a decodability proof. JPEG requires the SOI
+        // marker plus a segment marker byte; trailing padding/metadata after EOI is legal and
+        // must not reject the file. Decode safety is bounded by the byte-size limits and left
+        // to provider-side validation.
         if data.count >= 4,
-           data.starts(with: [0xFF, 0xD8, 0xFF]),
-           Array(data.suffix(2)) == [0xFF, 0xD9]
+           data.starts(with: [0xFF, 0xD8, 0xFF])
         {
             return .jpeg
         }
@@ -549,6 +621,22 @@ struct OracleImageAttachmentLoader {
     }
 }
 
+/// Route admission for Oracle image attachments. This gates *transport capability*: whether
+/// the provider implementation provably serializes `transientImages` onto the wire, not
+/// whether the selected model accepts image input (models without vision return a normal
+/// provider error).
+///
+/// Verified transports:
+/// - `anthropic` → `AnthropicProvider.makeMessages` emits image blocks.
+/// - `openAI` and every `OpenAIProvider` subclass (`ollama`, `azure`, `openRouter`, `gemini`,
+///   `deepseek`, `customProvider`, `fireworks`, `grok`, `groq`, `zAI`) →
+///   `AIMessage.openAIChatMessages` / `openAIResponsesInput` emit image parts.
+/// - `claudeCode` → stream-json stdin via `ClaudeCodeProvider.makeStreamJSONInput`.
+/// - `codex` → staged image attachments via `CodexCLIProvider.TransientImageLease`.
+/// - `openCode` / `cursor` → ACP image blocks via `ACPPromptContentBuilder`.
+///
+/// Not admitted: `grokBuild` (advertises no image capability over ACP) and `devin` (no image
+/// serialization path).
 enum OracleImageRouteAdmission {
     static func supports(_ model: AIModel) -> Bool {
         switch model.providerType {
@@ -569,7 +657,8 @@ enum OracleImageRouteAdmission {
              .openCode,
              .cursor:
             true
-        case .grokBuild:
+        case .grokBuild,
+             .devin:
             false
         }
     }

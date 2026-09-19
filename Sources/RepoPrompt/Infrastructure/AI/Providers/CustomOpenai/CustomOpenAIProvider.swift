@@ -477,8 +477,8 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                         parts.append(.text(userContent))
                     }
                     for image in aiMessage.transientImages {
-                        if let title = image.normalizedTitle {
-                            parts.append(.text("Image title: \(title)"))
+                        if let annotation = image.titleAnnotation {
+                            parts.append(.text(annotation))
                         }
                         parts.append(.imageURL(url: image.openAIDataURL, detail: "auto"))
                     }
@@ -503,8 +503,8 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                 parts.append(.text(additionsForFinalUserMessage))
             }
             for image in aiMessage.transientImages {
-                if let title = image.normalizedTitle {
-                    parts.append(.text("Image title: \(title)"))
+                if let annotation = image.titleAnnotation {
+                    parts.append(.text(annotation))
                 }
                 parts.append(.imageURL(url: image.openAIDataURL, detail: "auto"))
             }

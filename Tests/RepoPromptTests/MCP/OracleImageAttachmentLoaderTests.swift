@@ -222,16 +222,82 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         }
     }
 
-    func testRejectsExtensionMismatchIncompleteJPEGAndFileReplacementDuringRead() throws {
-        let incompleteJPEGURL = testRoot.appendingPathComponent("incomplete.jpg")
-        try Self.jpegData.dropLast(2).write(to: incompleteJPEGURL)
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
-            requests: [.init(index: 0, path: incompleteJPEGURL.path, title: nil)],
-            authority: authority(logical: testRoot, physical: testRoot)
-        )) { error in
-            XCTAssertEqual(error as? OracleImageLoadError, .unsupportedFormat(index: 0))
-        }
+    func testJPEGDetectionIsByteLevelAndToleratesTrailingBytes() throws {
+        // Legal JPEGs may carry padding or appended metadata after the EOI marker; the loader
+        // performs format sniffing (SOI + marker), not full decodability validation.
+        let paddedJPEGURL = testRoot.appendingPathComponent("padded.jpg")
+        try (Self.jpegData + Data([0x00, 0x00, 0xAA])).write(to: paddedJPEGURL)
+        let truncatedJPEGURL = testRoot.appendingPathComponent("truncated.jpg")
+        try Self.jpegData.dropLast(2).write(to: truncatedJPEGURL)
 
+        let images = try OracleImageAttachmentLoader().load(
+            requests: [
+                .init(index: 0, path: paddedJPEGURL.path, title: nil),
+                .init(index: 1, path: truncatedJPEGURL.path, title: nil)
+            ],
+            authority: authority(logical: testRoot, physical: testRoot)
+        )
+        XCTAssertEqual(images.map(\.mediaType), [.jpeg, .jpeg])
+        XCTAssertEqual(images[0].bytes, Self.jpegData + Data([0x00, 0x00, 0xAA]))
+    }
+
+    func testDecodableMinimalPNGPassesFormatSniffing() throws {
+        // A real 1x1 PNG fixture (valid IHDR/IDAT/IEND), not just a magic-byte header.
+        let pngURL = testRoot.appendingPathComponent("pixel.png")
+        try Self.realPNGData.write(to: pngURL)
+
+        let images = try OracleImageAttachmentLoader().load(
+            requests: [.init(index: 0, path: pngURL.path, title: nil)],
+            authority: authority(logical: testRoot, physical: testRoot)
+        )
+        XCTAssertEqual(images.first?.mediaType, .png)
+        XCTAssertEqual(images.first?.bytes, Self.realPNGData)
+    }
+
+    func testDeriveAuthorityIsolatesUnavailableRootsPerImage() throws {
+        let missingRoot = testRoot.appendingPathComponent("missing-root", isDirectory: true)
+        let authority = try OracleImageAttachmentLoader.deriveAuthority(rootSpecs: [
+            OracleImageRootSpec(
+                physicalRootPath: testRoot.path,
+                logicalRootPaths: [testRoot.path]
+            ),
+            OracleImageRootSpec(
+                physicalRootPath: missingRoot.path,
+                logicalRootPaths: [missingRoot.path, testRoot.appendingPathComponent("alias").path]
+            )
+        ])
+        XCTAssertEqual(authority.roots.count, 1)
+        XCTAssertEqual(authority.unavailableRoots.count, 1)
+
+        let imageURL = testRoot.appendingPathComponent("image.png")
+        try Self.pngData.write(to: imageURL)
+        let images = try OracleImageAttachmentLoader().load(
+            requests: [.init(index: 0, path: imageURL.path, title: nil)],
+            authority: authority
+        )
+        XCTAssertEqual(images.first?.bytes, Self.pngData)
+
+        // A path under the unavailable root fails closed with an accurate per-image error.
+        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+            requests: [.init(
+                index: 7,
+                path: missingRoot.appendingPathComponent("image.png").path,
+                title: nil
+            )],
+            authority: authority
+        )) { error in
+            XCTAssertEqual(error as? OracleImageLoadError, .missingOrUnreadable(index: 7))
+        }
+        // Unrelated paths still fail as outside authority.
+        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+            requests: [.init(index: 3, path: "/nonexistent-outside/image.png", title: nil)],
+            authority: authority
+        )) { error in
+            XCTAssertEqual(error as? OracleImageLoadError, .outsideAuthority(index: 3))
+        }
+    }
+
+    func testRejectsExtensionMismatchAndFileReplacementDuringRead() throws {
         let mismatchURL = testRoot.appendingPathComponent("wrong.jpg")
         try Self.pngData.write(to: mismatchURL)
         XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
@@ -320,6 +386,11 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         bytes += Array(repeating: 0, count: 17)
         return Data(bytes)
     }()
+
+    /// A genuine 1x1 transparent PNG (signature + IHDR + IDAT + IEND).
+    private static let realPNGData = Data(
+        base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    )!
 
     private static let jpegData = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0xFF, 0xD9])
     private static let gifData = Data(Array("GIF89a".utf8) + [1, 0, 1, 0])

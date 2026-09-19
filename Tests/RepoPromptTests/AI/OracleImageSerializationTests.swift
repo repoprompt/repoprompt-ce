@@ -17,7 +17,51 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertTrue(try jsonText(XCTUnwrap(messages.last)).contains("AQID"))
     }
 
-    func testRouteAdmissionAllowsEveryOracleProviderTransport() {
+    func testAnthropicSynthesizesUserTurnWhenNoUserEntryExists() throws {
+        let message = AIMessage(
+            systemPrompt: "system",
+            fileTree: "root",
+            conversationMessages: [.init(role: .assistant, content: "answer")],
+            transientImages: [
+                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Diagram")
+            ],
+            temperature: nil,
+            promptSectionsOrder: [.fileMap],
+            disabledPromptSections: []
+        )
+        let json = try jsonObject(AnthropicProvider.makeMessages(for: message))
+        let messages = try XCTUnwrap(json as? [[String: Any]])
+        let synthesized = try XCTUnwrap(messages.last)
+
+        XCTAssertEqual(synthesized["role"] as? String, "user")
+        XCTAssertEqual(countObjects(type: "image", in: json), 1)
+        XCTAssertTrue(try jsonText(synthesized).contains("AQID"))
+    }
+
+    func testAnthropicImageTurnOmitsEmptyTextAndNormalizesTitles() throws {
+        let message = AIMessage(
+            systemPrompt: "system",
+            conversationMessages: [.init(role: .user, content: "")],
+            transientImages: [
+                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "  Diagram  ")
+            ],
+            temperature: nil,
+            promptSectionsOrder: [],
+            disabledPromptSections: []
+        )
+        let json = try jsonObject(AnthropicProvider.makeMessages(for: message))
+        let messages = try XCTUnwrap(json as? [[String: Any]])
+        let content = try XCTUnwrap(messages.last?["content"] as? [[String: Any]])
+        let textBlocks = content.filter { $0["type"] as? String == "text" }
+
+        // Anthropic rejects empty text blocks; only the normalized title line may appear.
+        XCTAssertTrue(textBlocks.allSatisfy { (($0["text"] as? String) ?? "").isEmpty == false })
+        XCTAssertTrue(try jsonText(content).contains("Image title: Diagram"))
+        XCTAssertFalse(try jsonText(content).contains("  Diagram  "))
+        XCTAssertEqual(countObjects(type: "image", in: json), 1)
+    }
+
+    func testRouteAdmissionAllowsEveryVerifiedOracleProviderTransport() {
         let models: [AIModel] = [
             .claude4Sonnet,
             .anthropicCustom(name: "custom"),
@@ -43,6 +87,7 @@ final class OracleImageSerializationTests: XCTestCase {
             XCTAssertTrue(OracleImageRouteAdmission.supports(model), "Expected \(model) to admit images")
         }
         XCTAssertFalse(OracleImageRouteAdmission.supports(.grokBuildCustom(name: "grok")))
+        XCTAssertFalse(OracleImageRouteAdmission.supports(.devinCustom(name: "devin")))
     }
 
     func testOpenAITextOnlyMessagesRemainScalar() throws {
@@ -234,9 +279,13 @@ final class OracleImageSerializationTests: XCTestCase {
 
         var options = ClaudeCLIOptions()
         XCTAssertFalse(options.toTokens().contains("--input-format"))
-        options.inputFormat = "stream-json"
-        XCTAssertTrue(options.toTokens().contains("--input-format"))
-        XCTAssertTrue(options.toTokens().contains("stream-json"))
+        ClaudeCodeProvider.applyStreamJSONImageTransport(to: &options)
+        let tokens = options.toTokens()
+        XCTAssertTrue(tokens.contains("--input-format"))
+        XCTAssertTrue(tokens.contains("stream-json"))
+        // stream-json input in print mode requires --verbose, matching the Agent Mode runner.
+        XCTAssertTrue(tokens.contains("--verbose"))
+        XCTAssertTrue(tokens.contains("-p"))
     }
 
     func testClaudeStreamJSONParsesTerminalResultAndUsage() throws {

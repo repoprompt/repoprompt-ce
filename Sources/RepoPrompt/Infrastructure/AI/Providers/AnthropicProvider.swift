@@ -36,24 +36,10 @@ class AnthropicProvider: AIProvider {
             let role: MessageParameter.Message.Role = (entry.role == .user) ? .user : .assistant
             let content: MessageParameter.Message.Content
             if entry.role == .user, idx == lastUserIndex, !aiMessage.transientImages.isEmpty {
-                var blocks: [MessageParameter.Message.Content.ContentObject] = [.text(contentText)]
-                for image in aiMessage.transientImages {
-                    if let title = image.title, !title.isEmpty {
-                        blocks.append(.text("Image title: \(title)"))
-                    }
-                    let mediaType: MessageParameter.Message.Content.ImageSource.MediaType = switch image.mediaType {
-                    case .png: .png
-                    case .jpeg: .jpeg
-                    case .gif: .gif
-                    case .webp: .webp
-                    }
-                    blocks.append(.image(.init(
-                        type: .base64,
-                        mediaType: mediaType,
-                        data: image.bytes.base64EncodedString()
-                    )))
-                }
-                content = .list(blocks)
+                content = .list(Self.imageContentBlocks(
+                    text: contentText,
+                    images: aiMessage.transientImages
+                ))
             } else {
                 content = .text(contentText)
             }
@@ -65,7 +51,47 @@ class AnthropicProvider: AIProvider {
             )
         }
 
+        // Edge-case parity with the OpenAI encoders: when no user entry exists, images (and
+        // any remaining context) still need a user turn or they would be silently dropped.
+        if lastUserIndex == nil, !aiMessage.transientImages.isEmpty {
+            messages.append(MessageParameter.Message(
+                role: .user,
+                content: .list(Self.imageContentBlocks(
+                    text: tail,
+                    images: aiMessage.transientImages
+                ))
+            ))
+        }
+
         return messages
+    }
+
+    private static func imageContentBlocks(
+        text: String,
+        images: [AITransientImage]
+    ) -> [MessageParameter.Message.Content.ContentObject] {
+        var blocks: [MessageParameter.Message.Content.ContentObject] = []
+        // Anthropic rejects empty text blocks.
+        if !text.isEmpty {
+            blocks.append(.text(text))
+        }
+        for image in images {
+            if let annotation = image.titleAnnotation {
+                blocks.append(.text(annotation))
+            }
+            let mediaType: MessageParameter.Message.Content.ImageSource.MediaType = switch image.mediaType {
+            case .png: .png
+            case .jpeg: .jpeg
+            case .gif: .gif
+            case .webp: .webp
+            }
+            blocks.append(.image(.init(
+                type: .base64,
+                mediaType: mediaType,
+                data: image.bytes.base64EncodedString()
+            )))
+        }
+        return blocks
     }
 
     private func createSystemParameter(systemPrompt: String) -> MessageParameter.System {

@@ -4,7 +4,7 @@ import XCTest
 
 final class CodexCLIProviderDisposalTests: XCTestCase {
     func testDisposeAwaitsCancelledBridgeTaskCleanup() async {
-        let provider = CodexCLIProvider()
+        let provider = CodexCLIProvider(configureDiscoveryServer: false)
         let gate = DisposalGate()
         let bridgeTask = provider.test_registerActiveStreamTask(id: UUID()) {
             Task {
@@ -34,7 +34,7 @@ final class CodexCLIProviderDisposalTests: XCTestCase {
     }
 
     func testRegistrationAfterDisposeIsRefusedWithoutStartingTask() async {
-        let provider = CodexCLIProvider()
+        let provider = CodexCLIProvider(configureDiscoveryServer: false)
         await provider.dispose()
         let invocation = InvocationFlag()
 
