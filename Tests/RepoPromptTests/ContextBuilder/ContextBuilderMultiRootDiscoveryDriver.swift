@@ -14,6 +14,12 @@ import XCTest
         var streamStarts = 0
         var disposed = 0
         var teardownIDs: [UUID] = []
+        /// Actual provider-bound messages keyed by run ID, recorded before the stream body runs.
+        var messagesByRunID: [UUID: AgentMessage] = [:]
+        private var teardownExpectationsByRunID: [UUID: [XCTestExpectation]] = [:]
+        /// Runs observed by the driver (stream entry, per-run join registration, or still active
+        /// at shutdown) whose teardown has not completed. Shutdown joins every one cooperatively.
+        private(set) var pendingTeardownRunIDs: Set<UUID> = []
         var committed: MCPServerViewModel.ContextBuilderCommittedTabSnapshot?
         var committedByRunID: [UUID: MCPServerViewModel.ContextBuilderCommittedTabSnapshot] = [:]
         var afterCommittedTabSnapshotCaptured: (@MainActor @Sendable (
@@ -109,10 +115,13 @@ import XCTest
             vm.installRunTestHooks(.init(
                 beforeProcessingProviderEvent: nil, providerEventDisposition: nil,
                 teardownCompleted: { [weak self] runID in
-                    self?.teardownIDs.append(runID)
-                    self?.teardown.fulfill()
-                    let waiters = self?.teardownWaiters ?? []
-                    self?.teardownWaiters.removeAll()
+                    guard let self else { return }
+                    teardownIDs.append(runID)
+                    pendingTeardownRunIDs.remove(runID)
+                    teardown.fulfill()
+                    teardownExpectationsByRunID.removeValue(forKey: runID)?.forEach { $0.fulfill() }
+                    let waiters = teardownWaiters
+                    teardownWaiters.removeAll()
                     waiters.forEach { $0.resume() }
                 },
                 validateContextBuilderProviders: { [weak self] in
@@ -242,6 +251,25 @@ import XCTest
             )
             XCTAssertNotNil(canonicalWorkspace.composeTabs.first(where: { $0.id == tab.id }))
             return tab.id
+        }
+
+        /// Per-run teardown join for journeys that admit more than one run. Every call returns a
+        /// fresh expectation (an XCTestExpectation must not be waited on twice); already torn-down
+        /// runs return one that is fulfilled immediately.
+        func teardownExpectation(runID: UUID) -> XCTestExpectation {
+            let expectation = XCTestExpectation(description: "run teardown joined for \(runID)")
+            if teardownIDs.contains(runID) {
+                expectation.fulfill()
+            } else {
+                notePendingTeardown(runID: runID)
+                teardownExpectationsByRunID[runID, default: []].append(expectation)
+            }
+            return expectation
+        }
+
+        private func notePendingTeardown(runID: UUID) {
+            guard !teardownIDs.contains(runID) else { return }
+            pendingTeardownRunIDs.insert(runID)
         }
 
         func activeTabID(forRunID runID: UUID) throws -> UUID {
@@ -416,6 +444,7 @@ import XCTest
         private func shutdown() async {
             fixture.releaseAllGates()
             if let window {
+                if let active = vm.activeRunIDForTesting(tabID: tabID) { notePendingTeardown(runID: active) }
                 let needsTeardownJoin = vm.activeRunIDForTesting(tabID: tabID) != nil || constructed > 0
                 manager.rootReconciliationGateForTesting = nil
                 manager.rootReconciliationWaiterCountDidChangeForTesting = nil
@@ -427,6 +456,11 @@ import XCTest
                 afterCommittedTabSnapshotCaptured = nil
                 streamBody = nil
                 if needsTeardownJoin, teardownIDs.isEmpty {
+                    await withCheckedContinuation { teardownWaiters.append($0) }
+                }
+                // Runs admitted after an earlier teardown are joined too. This is the same
+                // cooperative join as above: it waits for the run's own teardown and has no deadline.
+                while !pendingTeardownRunIDs.isEmpty {
                     await withCheckedContinuation { teardownWaiters.append($0) }
                 }
                 for parent in parentRuns {
@@ -466,6 +500,8 @@ import XCTest
             func streamAgentMessage(_ message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
                 driver.streamStarts += 1
                 let id = try XCTUnwrap(runID)
+                driver.messagesByRunID[id] = message
+                driver.notePendingTeardown(runID: id)
                 if let body = driver.streamBody { try await body(id) }
                 else { throw NSError(domain: "Fixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "unexpected stream start"]) }
                 return AsyncThrowingStream { $0.finish() }
