@@ -37,7 +37,7 @@ struct WorkspaceCodemapGraphCommittedSnapshot: Hashable {
     let snapshotID: UUID
     let graphRevision: UInt64
     let rootEpoch: WorkspaceCodemapRootEpoch
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+    let rootAuthority: WorkspaceCodemapRootAuthorityToken
     let catalogWatermark: WorkspaceCodemapGraphIndexCatalogToken
     let coverage: WorkspaceCodemapGraphCatalogCoverage
     let appliedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
@@ -55,7 +55,7 @@ struct WorkspaceCodemapGraphCommittedSnapshot: Hashable {
 
 enum WorkspaceCodemapGraphApplyRejection: Error, Hashable {
     case rootEpochMismatch
-    case repositoryAuthorityMismatch
+    case rootAuthorityMismatch
     case schemaMismatch
     case policyMismatch
     case staleGeneration

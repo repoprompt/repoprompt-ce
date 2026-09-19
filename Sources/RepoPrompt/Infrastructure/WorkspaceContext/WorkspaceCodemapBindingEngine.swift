@@ -123,13 +123,26 @@ actor WorkspaceCodemapBindingEngine {
 
     private struct UnavailableRoot {
         let registration: WorkspaceCodemapBindingRootRegistration
-        let state: WorkspaceCodemapGitCapabilityState
+        let state: WorkspaceCodemapRootCapabilityState
     }
 
-    private struct PipelineSession {
-        let id: UUID
-        let language: LanguageType
-        let pipelineIdentity: CodeMapPipelineIdentity
+    /// Identity of the one session a fenced invalidation is allowed to act on.
+    private struct SessionAuthorityExpectation {
+        let sessionID: UUID
+        let rootAuthority: WorkspaceCodemapRootAuthorityToken
+    }
+
+    /// Graph state removed from an epoch and owned by the caller across its suspensions.
+    private struct DetachedGraphRoot {
+        let graph: WorkspaceCodemapSelectionGraph?
+        let pull: (id: UUID, task: Task<Void, Never>)?
+    }
+
+    /// Durable Git manifest state for one pipeline.
+    ///
+    /// Everything a Git root persists lives here so a filesystem pipeline cannot present an empty
+    /// or failed manifest that later reads as successful durable persistence.
+    private struct GitPipelineManifest {
         let namespace: CodeMapRootManifestNamespace
         var authority: CodeMapRootManifestAuthority
         var previouslyObservedManifestAuthority: CodeMapRootManifestAuthority?
@@ -143,11 +156,53 @@ actor WorkspaceCodemapBindingEngine {
         var pendingManifestChanges: [String: PendingManifestChange]
     }
 
+    private enum PipelineManifest {
+        case git(GitPipelineManifest)
+        /// Filesystem roots have no Git manifest lifecycle at all.
+        case notApplicable
+
+        var git: GitPipelineManifest? {
+            get {
+                guard case let .git(payload) = self else { return nil }
+                return payload
+            }
+            set {
+                guard case .git = self, let newValue else { return }
+                self = .git(newValue)
+            }
+        }
+    }
+
+    private struct PipelineSession {
+        let id: UUID
+        let language: LanguageType
+        let pipelineIdentity: CodeMapPipelineIdentity
+        var manifest: PipelineManifest
+
+        /// Git manifest payload. Reading yields nil for a filesystem pipeline and writing through
+        /// it is a no-op there, because such a pipeline has no manifest to mutate.
+        var git: GitPipelineManifest? {
+            get { manifest.git }
+            set { manifest.git = newValue }
+        }
+    }
+
+    private enum ManifestSession: Equatable {
+        case git(CodeMapRootManifestWriterSessionToken)
+        /// Filesystem roots never register a manifest writer session.
+        case notApplicable
+
+        var writerSession: CodeMapRootManifestWriterSessionToken? {
+            guard case let .git(token) = self else { return nil }
+            return token
+        }
+    }
+
     private struct Session {
         let id: UUID
         let registration: WorkspaceCodemapBindingRootRegistration
-        let capability: GitCodemapRootCapability
-        let manifestWriterSession: CodeMapRootManifestWriterSessionToken
+        let capability: WorkspaceCodemapRootCapability
+        let manifest: ManifestSession
         var pipelines: [CodeMapPipelineIdentity: PipelineSession]
         var pathGenerations: [String: UInt64]
         var generation: UInt64
@@ -198,7 +253,7 @@ actor WorkspaceCodemapBindingEngine {
         let sessionGeneration: UInt64
         let pipelineIdentity: CodeMapPipelineIdentity
         let pipelineSessionID: UUID
-        let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+        let rootAuthority: WorkspaceCodemapRootAuthorityToken
         let reservedSourceBytes: UInt64
         var overlayOwner: WorkspaceCodemapLiveDemandOwner?
         var preflight: WorkspaceCodemapLiveDemandPreflightTicket?
@@ -388,6 +443,9 @@ actor WorkspaceCodemapBindingEngine {
         case enumerationSealed
         case persisting
         case durable
+        /// A filesystem root has no manifest to seal. This is neither durable persistence nor a
+        /// degraded or discarded seal; it records that the phase does not apply.
+        case notApplicable
         case degraded
         case discarded
     }
@@ -409,7 +467,7 @@ actor WorkspaceCodemapBindingEngine {
         let sessionID: UUID
         let sessionGeneration: UInt64
         let invalidationGeneration: UInt64
-        let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+        let rootAuthority: WorkspaceCodemapRootAuthorityToken
         let catalogGeneration: UInt64
         let ingressGeneration: UInt64
         var phase: WorkspaceCodemapGraphIndexPhase
@@ -530,6 +588,17 @@ actor WorkspaceCodemapBindingEngine {
         case eligible(Session)
     }
 
+    /// Mode-specific coordinates accepted for one classified candidate.
+    private enum ClassificationBinding: Equatable {
+        case git(repositoryRelativePath: String)
+        case filesystem
+
+        var repositoryRelativePath: String? {
+            guard case let .git(path) = self else { return nil }
+            return path
+        }
+    }
+
     private struct ResolvedArtifact {
         let resolution: CodeMapArtifactCoordinatorResolution
         let association: VerifiedGitBlobCodeMapLocatorAssociation?
@@ -557,7 +626,7 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     private let runtime: CodeMapArtifactRuntime
-    private let capabilityService: WorkspaceCodemapGitCapabilityService
+    private let capabilityService: WorkspaceCodemapRootCapabilityService
     private let identityService: GitBlobIdentityService
     private let materializationService: GitBlobSourceMaterializationService
     private let sourceReader: WorkspaceCodemapValidatedSourceReaderClient
@@ -672,7 +741,7 @@ actor WorkspaceCodemapBindingEngine {
 
     init(
         runtime: CodeMapArtifactRuntime,
-        capabilityService: WorkspaceCodemapGitCapabilityService,
+        capabilityService: WorkspaceCodemapRootCapabilityService,
         identityService: GitBlobIdentityService = GitBlobIdentityService(),
         materializationService: GitBlobSourceMaterializationService = GitBlobSourceMaterializationService(),
         sourceReader: WorkspaceCodemapValidatedSourceReaderClient,
@@ -710,8 +779,11 @@ actor WorkspaceCodemapBindingEngine {
         self.accessEpochSeconds = accessEpochSeconds
     }
 
+    /// Registers one loaded root. `evidence` is the store's admission evidence and is separate from
+    /// the equality-bearing registration value, so a proof refresh cannot break duplicate detection.
     func registerRoot(
         _ registration: WorkspaceCodemapBindingRootRegistration,
+        evidence: WorkspaceCodemapRootEligibilityEvidence? = nil,
         selectionGraph providedSelectionGraph: WorkspaceCodemapSelectionGraph? = nil
     ) async -> WorkspaceCodemapBindingRegistrationResult {
         guard !isShuttingDown else { return .failed }
@@ -751,7 +823,10 @@ actor WorkspaceCodemapBindingEngine {
         let attempt = RegistrationAttempt(id: UUID(), registration: registration, cancelled: false)
         roots[rootEpoch] = .registering(attempt)
         incrementCounter(\.capabilityResolutions)
-        var capabilityState = await capabilityService.resolve(root: registration.capabilityRequest)
+        var capabilityState = await capabilityService.resolve(
+            root: registration.capabilityRequest,
+            evidence: evidence
+        )
         guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
             await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
@@ -762,7 +837,10 @@ actor WorkspaceCodemapBindingEngine {
         {
             incrementCounter(\.capabilityRetries)
             emit(.capabilityTransientRetry, rootEpoch: rootEpoch)
-            capabilityState = await capabilityService.reload(root: registration.capabilityRequest)
+            capabilityState = await capabilityService.reload(
+                root: registration.capabilityRequest,
+                evidence: evidence
+            )
             guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
                 await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
                 finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
@@ -814,19 +892,27 @@ actor WorkspaceCodemapBindingEngine {
             return .failed
         }
 
-        let manifestWriterSession: CodeMapRootManifestWriterSessionToken
-        do {
-            manifestWriterSession = try await runtime.manifestStore.registerManifestWriterSession()
-        } catch {
-            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
-            _ = await overlay.unregister(rootEpoch: rootEpoch)
-            await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
-            finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
-            recordFailure(rootEpoch)
-            return .failed
+        // Only Git roots have a manifest lifecycle, so only Git roots register a writer session.
+        let manifestSession: ManifestSession
+        switch capability {
+        case .git:
+            do {
+                manifestSession = try await .git(runtime.manifestStore.registerManifestWriterSession())
+            } catch {
+                await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
+                _ = await overlay.unregister(rootEpoch: rootEpoch)
+                await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
+                finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
+                recordFailure(rootEpoch)
+                return .failed
+            }
+        case .filesystem:
+            manifestSession = .notApplicable
         }
         guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
-            await runtime.manifestStore.endManifestWriterSession(manifestWriterSession)
+            if let writerSession = manifestSession.writerSession {
+                await runtime.manifestStore.endManifestWriterSession(writerSession)
+            }
             await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
@@ -837,7 +923,7 @@ actor WorkspaceCodemapBindingEngine {
             id: UUID(),
             registration: registration,
             capability: capability,
-            manifestWriterSession: manifestWriterSession,
+            manifest: manifestSession,
             pipelines: [:],
             pathGenerations: [:],
             generation: 1,
@@ -1010,13 +1096,32 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapGraphRevocationReason
     ) async {
+        await shutdownDetachedGraphRoot(detachGraphRoot(rootEpoch: rootEpoch), reason: reason)
+    }
+
+    /// Removes the epoch's graph and pull task without suspending.
+    ///
+    /// Callers that must survive their own awaits detach here first and shut the captured pair down
+    /// afterwards, so a replacement registered for the same epoch while they were suspended cannot
+    /// have its graph removed by an epoch lookup that no longer describes them.
+    private func detachGraphRoot(rootEpoch: WorkspaceCodemapRootEpoch) -> DetachedGraphRoot {
+        DetachedGraphRoot(
+            graph: selectionGraphsByRootEpoch.removeValue(forKey: rootEpoch),
+            pull: graphPullTasksByRootEpoch.removeValue(forKey: rootEpoch)
+        )
+    }
+
+    private func shutdownDetachedGraphRoot(
+        _ detached: DetachedGraphRoot,
+        reason: WorkspaceCodemapGraphRevocationReason
+    ) async {
         // Revoke first so a detached candidate observes cooperative cancellation. Only then drain
         // the pull task; waiting for the pull before revocation can deadlock root replacement on a
         // large candidate build.
-        if let graph = selectionGraphsByRootEpoch.removeValue(forKey: rootEpoch) {
+        if let graph = detached.graph {
             await graph.shutdown(reason: reason)
         }
-        if let pull = graphPullTasksByRootEpoch.removeValue(forKey: rootEpoch) {
+        if let pull = detached.pull {
             pull.task.cancel()
             await pull.task.value
         }
@@ -1025,6 +1130,12 @@ actor WorkspaceCodemapBindingEngine {
     #if DEBUG
         func graphPullTaskCountForTesting() -> Int {
             graphPullTasksByRootEpoch.count
+        }
+
+        /// Root capability bookkeeping, so a scenario can observe that unload terminalized the
+        /// epoch instead of leaving an active record behind.
+        func capabilitySnapshotForTesting() async -> WorkspaceCodemapRootCapabilityService.Snapshot {
+            await capabilityService.snapshotForTesting()
         }
     #endif
 
@@ -1074,7 +1185,7 @@ actor WorkspaceCodemapBindingEngine {
             sessionID: session.id,
             sessionGeneration: session.generation,
             invalidationGeneration: session.invalidationGeneration,
-            repositoryAuthority: session.capability.repositoryAuthority,
+            rootAuthority: session.capability.rootAuthority,
             catalogGeneration: session.registration.catalogGeneration,
             ingressGeneration: session.registration.ingressGeneration,
             phase: .scheduled,
@@ -1491,7 +1602,7 @@ actor WorkspaceCodemapBindingEngine {
         let manifestWriterSession: CodeMapRootManifestWriterSessionToken? = if case let .eligible(session)? =
             roots[rootEpoch]
         {
-            session.manifestWriterSession
+            session.manifest.writerSession
         } else {
             nil
         }
@@ -1549,7 +1660,7 @@ actor WorkspaceCodemapBindingEngine {
         let graphIndexTasks = Array(drainingGraphIndexTasks.values)
         let manifestWriterSessions = roots.values.compactMap { record -> CodeMapRootManifestWriterSessionToken? in
             guard case let .eligible(session) = record else { return nil }
-            return session.manifestWriterSession
+            return session.manifest.writerSession
         }
         let requestIDs = Array(queuedRequests.keys) + Array(activeRequests.keys)
         roots.removeAll()
@@ -1623,12 +1734,30 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
+    /// Snapshot, freeze and cached-ready access are serving boundaries: consuming a graph or a
+    /// frozen result still requires validating that the root binding is current.
+    ///
+    /// The overlay await is itself a suspension point, so each result is checked against the
+    /// authority that was validated; a value produced for a replacement authority is not the one
+    /// this caller asked for.
     func snapshot(rootEpoch: WorkspaceCodemapRootEpoch) async -> WorkspaceCodemapLiveRootSnapshot? {
-        await overlay.snapshot(rootEpoch: rootEpoch)
+        guard let expectation = await validatedRootAuthority(rootEpoch: rootEpoch),
+              let snapshot = await overlay.snapshot(rootEpoch: rootEpoch),
+              snapshot.rootAuthority == expectation.rootAuthority,
+              sessionIsCurrent(expectation, rootEpoch: rootEpoch)
+        else { return nil }
+        return snapshot
     }
 
     func freeze(rootEpoch: WorkspaceCodemapRootEpoch) async -> WorkspaceCodemapLiveOverlayBundle? {
-        await overlay.freeze(rootEpoch: rootEpoch)
+        guard let expectation = await validatedRootAuthority(rootEpoch: rootEpoch),
+              let bundle = await overlay.freeze(rootEpoch: rootEpoch)
+        else { return nil }
+        guard servedBundleIsCurrent(bundle, expectation: expectation, rootEpoch: rootEpoch) else {
+            bundle.close()
+            return nil
+        }
+        return bundle
     }
 
     func freezeReadyArtifact(
@@ -1636,11 +1765,30 @@ actor WorkspaceCodemapBindingEngine {
         fileID: UUID,
         requestGeneration: UInt64
     ) async -> WorkspaceCodemapLiveOverlayBundle? {
-        await overlay.freezeReadyArtifact(
-            rootEpoch: rootEpoch,
-            fileID: fileID,
-            requestGeneration: requestGeneration
-        )
+        guard let expectation = await validatedRootAuthority(rootEpoch: rootEpoch),
+              let bundle = await overlay.freezeReadyArtifact(
+                  rootEpoch: rootEpoch,
+                  fileID: fileID,
+                  requestGeneration: requestGeneration
+              )
+        else { return nil }
+        guard servedBundleIsCurrent(bundle, expectation: expectation, rootEpoch: rootEpoch) else {
+            bundle.close()
+            return nil
+        }
+        return bundle
+    }
+
+    /// The overlay await is a suspension point of its own: the validated session may have been
+    /// revoked while it ran, and its result still carries the matching authority token. Serving
+    /// therefore requires both the token and the session that was validated to still be installed.
+    private func servedBundleIsCurrent(
+        _ bundle: WorkspaceCodemapLiveOverlayBundle,
+        expectation: SessionAuthorityExpectation,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> Bool {
+        bundle.rootAuthority == expectation.rootAuthority &&
+            sessionIsCurrent(expectation, rootEpoch: rootEpoch)
     }
 
     @discardableResult
@@ -1701,7 +1849,7 @@ actor WorkspaceCodemapBindingEngine {
             case let .eligible(session):
                 eligible += 1
                 dirty += session.pipelines.values.count(where: {
-                    $0.manifestState == .dirtyRetryRequired
+                    $0.git?.manifestState == .dirtyRetryRequired
                 })
             }
         }
@@ -2142,9 +2290,9 @@ actor WorkspaceCodemapBindingEngine {
             observedPredecessor: CodeMapRootManifestAuthority?
         )? {
             guard case let .eligible(session)? = roots[rootEpoch],
-                  let pipeline = session.pipelines[pipelineIdentity]
+                  let gitPipeline = session.pipelines[pipelineIdentity]?.git
             else { return nil }
-            return (pipeline.authority, pipeline.previouslyObservedManifestAuthority)
+            return (gitPipeline.authority, gitPipeline.previouslyObservedManifestAuthority)
         }
 
         func debugGraphIndexAdmissionSnapshot(
@@ -2611,6 +2759,10 @@ actor WorkspaceCodemapBindingEngine {
             supersedeGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch)
             return .superseded
         }
+        // One bounded root-proof check per page, not per candidate.
+        guard await rootAuthorityIsCurrent(rootEpoch: rootEpoch),
+              currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil
+        else { return .superseded }
         switch reserveGraphIndexResources(
             jobID: jobID,
             rootEpoch: rootEpoch,
@@ -2631,11 +2783,11 @@ actor WorkspaceCodemapBindingEngine {
                   job.id == jobID,
                   graphIndexJobIsCurrent(job),
                   overlaySnapshot.catalogGeneration == job.catalogGeneration,
-                  overlaySnapshot.repositoryAuthority == job.repositoryAuthority
+                  overlaySnapshot.rootAuthority == job.rootAuthority
             else { return .retry }
             job.generation = WorkspaceCodemapGraphIndexGeneration(
                 catalogToken: page.token,
-                repositoryAuthority: job.repositoryAuthority,
+                rootAuthority: job.rootAuthority,
                 contributionGeneration: overlaySnapshot.contributionGeneration
             )
             graphIndexJobs[rootEpoch] = job
@@ -2740,12 +2892,17 @@ actor WorkspaceCodemapBindingEngine {
         for candidate in page.entries {
             guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
                   case let .eligible(session)? = roots[rootEpoch],
-                  session.id == afterPageRead.sessionID,
-                  let repositoryRelativePath = repositoryPath(
-                      loadedRootRelativePath: candidate.identity.standardizedRelativePath,
-                      prefix: session.capability.repositoryRelativeLoadedRootPrefix
-                  )
+                  session.id == afterPageRead.sessionID
             else { return .superseded }
+            // Only Git roots have manifest coordinates to look a cached record up by.
+            guard let gitCapability = session.capability.gitCapability else {
+                misses.append(candidate)
+                continue
+            }
+            guard let repositoryRelativePath = repositoryPath(
+                loadedRootRelativePath: candidate.identity.standardizedRelativePath,
+                prefix: gitCapability.repositoryRelativeLoadedRootPrefix
+            ) else { return .superseded }
             let record = manifestRecordsByPipeline[pipelineIdentity]?[repositoryRelativePath]
             if let record,
                let entry = graphIndexEntry(
@@ -2770,9 +2927,8 @@ actor WorkspaceCodemapBindingEngine {
             guard updateGraphIndexPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .classifyingBatch),
                   case let .eligible(session)? = roots[rootEpoch]
             else { return .cancelled }
-            incrementCounter(\.classifications)
-            let classifications = await identityService.classify(
-                workspaceRoot: session.registration.capabilityRequest.loadedRootURL,
+            let classifications = await classifyCandidates(
+                session: session,
                 relativePaths: misses.map(\.identity.standardizedRelativePath)
             )
             guard !Task.isCancelled,
@@ -2788,7 +2944,11 @@ actor WorkspaceCodemapBindingEngine {
                 -> (UUID, WorkspaceCodemapSourceAuthorityRequest)? in
                 guard let classification = classificationsByPath[
                     candidate.identity.standardizedRelativePath
-                ], let repositoryRelativePath = classification.repositoryRelativePath else { return nil }
+                ], classificationBinding(
+                    classification,
+                    session: session,
+                    expectedRelativePath: candidate.identity.standardizedRelativePath
+                ) != nil else { return nil }
                 switch classification.outcome {
                 case .oidEligible, .requiresValidatedWorktreeBytes:
                     break
@@ -2801,7 +2961,7 @@ actor WorkspaceCodemapBindingEngine {
                 return (
                     candidate.identity.fileID,
                     WorkspaceCodemapSourceAuthorityRequest(
-                        candidateRepositoryRelativePath: repositoryRelativePath,
+                        candidateRootRelativePath: candidate.identity.standardizedRelativePath,
                         observedPathGeneration: candidate.pathGeneration,
                         currentPathGeneration: currentPathGeneration,
                         observedIngressGeneration: afterPageRead.ingressGeneration,
@@ -2812,7 +2972,7 @@ actor WorkspaceCodemapBindingEngine {
             let issuedAuthorities = await capabilityService.makeSourceAuthorities(
                 capability: session.capability,
                 observedRootEpoch: rootEpoch,
-                observedRepositoryAuthority: afterPageRead.repositoryAuthority,
+                observedRootAuthority: afterPageRead.rootAuthority,
                 candidates: authorityCandidates.map(\.1)
             )
             guard !Task.isCancelled,
@@ -3218,6 +3378,11 @@ actor WorkspaceCodemapBindingEngine {
         guard let completion = catalogCompletion,
               progress.catalogCompletion == completion
         else { return .retry }
+        // Final publication also validates root currentness: a completed coverage must describe the
+        // root that is bound now, not the one bound when enumeration began.
+        guard await rootAuthorityIsCurrent(rootEpoch: rootEpoch),
+              currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) != nil
+        else { return .superseded }
         let finalDisposition = await publishGraphIndexEntries(
             [],
             progress: progress,
@@ -3234,9 +3399,17 @@ actor WorkspaceCodemapBindingEngine {
             let hasSealWork = completedJob.manifestStages.values.contains {
                 !$0.isDegraded && !$0.stagedRecordsByPath.isEmpty
             }
-            completedJob.manifestSealState = hasSealWork ? .enumerationSealed : (
-                completedJob.manifestStages.values.contains(where: \.isDegraded) ? .degraded : .durable
-            )
+            // A filesystem root has no manifest to seal, so its completed graph must not claim
+            // durable persistence. Only Git roots reach the durable/degraded seal outcomes.
+            completedJob.manifestSealState = if graphIndexJobHasManifestLifecycle(completedJob) {
+                hasSealWork ? .enumerationSealed : (
+                    completedJob.manifestStages.values.contains(where: \.isDegraded)
+                        ? .degraded
+                        : .durable
+                )
+            } else {
+                .notApplicable
+            }
             completedJob.phase = hasSealWork ? .persistingManifestCache : .complete
             completedJob.phaseEnteredUptimeNanoseconds = completedUptimeNanoseconds
             completedJob.lastProgressUptimeNanoseconds = completedUptimeNanoseconds
@@ -3365,9 +3538,11 @@ actor WorkspaceCodemapBindingEngine {
             heartbeatGraphIndexManifestSealStage(jobID: jobID, rootEpoch: rootEpoch)
         }
         guard var completed = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch) else { return }
-        completed.manifestSealState = completed.manifestStages.values.contains(where: \.isDegraded)
-            ? .degraded
-            : .durable
+        completed.manifestSealState = if graphIndexJobHasManifestLifecycle(completed) {
+            completed.manifestStages.values.contains(where: \.isDegraded) ? .degraded : .durable
+        } else {
+            .notApplicable
+        }
         completed.phase = .complete
         let completedUptimeNanoseconds = uptimeNanoseconds()
         completed.phaseEnteredUptimeNanoseconds = completedUptimeNanoseconds
@@ -3403,32 +3578,33 @@ actor WorkspaceCodemapBindingEngine {
 
         guard case var .eligible(session)? = roots[rootEpoch],
               var pipeline = session.pipelines[pipelineIdentity],
+              var gitPipeline = pipeline.git,
               pipeline.id == stage.pipelineSessionID,
-              pipeline.namespace == stage.namespace,
-              observedAuthority != pipeline.authority,
-              observedAuthority.authorityGeneration >= pipeline.authority.authorityGeneration,
+              gitPipeline.namespace == stage.namespace,
+              observedAuthority != gitPipeline.authority,
+              observedAuthority.authorityGeneration >= gitPipeline.authority.authorityGeneration,
               observedAuthority.authorityGeneration < UInt64.max,
-              pipeline.persistedManifestRevision == 0,
-              pipeline.manifestRevision == 1,
-              pipeline.pendingManifestChanges.isEmpty
+              gitPipeline.persistedManifestRevision == 0,
+              gitPipeline.manifestRevision == 1,
+              gitPipeline.pendingManifestChanges.isEmpty
         else { return nil }
         let stagedPaths = Set(stage.stagedRecordsByPath.keys)
-        guard Set(pipeline.manifestRecords.keys).isSubset(of: stagedPaths),
-              Set(pipeline.automaticSelectionCandidateRecords.keys).isSubset(of: stagedPaths)
+        guard Set(gitPipeline.manifestRecords.keys).isSubset(of: stagedPaths),
+              Set(gitPipeline.automaticSelectionCandidateRecords.keys).isSubset(of: stagedPaths)
         else { return nil }
         let workKey = ManifestWriterWorkKey(
             scope: PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity),
             sessionID: session.id,
             pipelineSessionID: pipeline.id
         )
-        if let writer = manifestWriters[pipeline.namespace] {
+        if let writer = manifestWriters[gitPipeline.namespace] {
             guard writer.inFlightBatch?.workKey != workKey,
                   writer.deferredHeadBatch?.workKey != workKey,
                   !writer.queuedWork.contains(where: { $0.workKey == workKey }),
                   !writer.deferredWork.contains(where: { $0.workKey == workKey })
             else { return nil }
         }
-        let currentAuthority = pipeline.authority
+        let currentAuthority = gitPipeline.authority
         guard let liftedAuthority = try? CodeMapRootManifestAuthority(
             authorityGeneration: observedAuthority.authorityGeneration + 1,
             repositoryBindingEpoch: currentAuthority.repositoryBindingEpoch,
@@ -3442,21 +3618,22 @@ actor WorkspaceCodemapBindingEngine {
         ) else { return nil }
         let restamped = stage.stagedRecordsByPath.values.compactMap {
             try? $0.restampedVerifiedAuthority(
-                namespace: pipeline.namespace,
+                namespace: gitPipeline.namespace,
                 authority: liftedAuthority
             )
         }
         guard restamped.count == stage.stagedRecordsByPath.count else { return nil }
-        pipeline.authority = liftedAuthority
-        pipeline.previouslyObservedManifestAuthority = observedAuthority
+        gitPipeline.authority = liftedAuthority
+        gitPipeline.previouslyObservedManifestAuthority = observedAuthority
         for record in restamped {
-            pipeline.manifestRecords[record.repositoryRelativePath] = record
+            gitPipeline.manifestRecords[record.repositoryRelativePath] = record
             if record.contributionEnvelope != nil {
-                pipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
+                gitPipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
             }
             stage.cachedRecordsByPath[record.repositoryRelativePath] = record
             stage.stagedRecordsByPath[record.repositoryRelativePath] = record
         }
+        pipeline.git = gitPipeline
         session.pipelines[pipelineIdentity] = pipeline
         roots[rootEpoch] = .eligible(session)
         job.manifestStages[pipelineIdentity] = stage
@@ -3496,8 +3673,10 @@ actor WorkspaceCodemapBindingEngine {
               case let .eligible(session)? = roots[rootEpoch],
               let pipeline = session.pipelines[pipelineIdentity]
         else { return nil }
+        // A filesystem root has no manifest to load; every candidate resolves from current bytes.
+        guard let gitPipeline = pipeline.git else { return [:] }
         if let stage = job.manifestStages[pipelineIdentity] {
-            guard stage.namespace == pipeline.namespace,
+            guard stage.namespace == gitPipeline.namespace,
                   stage.pipelineSessionID == pipeline.id
             else { return nil }
             return stage.cachedRecordsByPath
@@ -3515,8 +3694,8 @@ actor WorkspaceCodemapBindingEngine {
         let load: CodeMapRootManifestLoadResult
         do {
             load = try await runtime.manifestStore.loadCurrentManifest(
-                namespace: pipeline.namespace,
-                currentAuthority: pipeline.authority
+                namespace: gitPipeline.namespace,
+                currentAuthority: gitPipeline.authority
             )
         } catch {
             #if DEBUG
@@ -3615,8 +3794,8 @@ actor WorkspaceCodemapBindingEngine {
                 isDegraded: false
             )
         case let .hit(snapshot):
-            guard snapshot.namespace == pipeline.namespace,
-                  snapshot.authority == pipeline.authority
+            guard snapshot.namespace == gitPipeline.namespace,
+                  snapshot.authority == gitPipeline.authority
             else {
                 incrementCounter(\.graphIndexEnvelopeStale)
                 return [:]
@@ -3649,10 +3828,11 @@ actor WorkspaceCodemapBindingEngine {
     ) -> [String: CodeMapRootManifestRecord]? {
         guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               case var .eligible(session)? = roots[rootEpoch],
-              var pipeline = session.pipelines[pipelineIdentity]
+              var pipeline = session.pipelines[pipelineIdentity],
+              let gitPipeline = pipeline.git
         else { return nil }
         if let observedAuthority {
-            pipeline.previouslyObservedManifestAuthority = observedAuthority
+            pipeline.git?.previouslyObservedManifestAuthority = observedAuthority
         }
         let retainedCount = job.manifestStages.values.reduce(0) {
             addingSaturating($0, $1.cachedRecordsByPath.count)
@@ -3664,7 +3844,7 @@ actor WorkspaceCodemapBindingEngine {
             : Dictionary(uniqueKeysWithValues: records.map { ($0.repositoryRelativePath, $0) })
         let scope = PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity)
         job.manifestStages[pipelineIdentity] = GraphIndexManifestStage(
-            namespace: pipeline.namespace,
+            namespace: gitPipeline.namespace,
             pipelineSessionID: pipeline.id,
             cachedRecordsByPath: cachedRecordsByPath,
             stagedRecordsByPath: [:],
@@ -3693,7 +3873,7 @@ actor WorkspaceCodemapBindingEngine {
               var stage = job.manifestStages[pipelineIdentity],
               case let .eligible(session)? = roots[rootEpoch],
               let pipeline = session.pipelines[pipelineIdentity],
-              stage.namespace == pipeline.namespace,
+              stage.namespace == pipeline.git?.namespace,
               stage.pipelineSessionID == pipeline.id
         else { return false }
         guard !stage.isDegraded else { return true }
@@ -3825,15 +4005,16 @@ actor WorkspaceCodemapBindingEngine {
     ) {
         guard record.contributionEnvelope != nil,
               case var .eligible(session)? = roots[rootEpoch],
-              var pipeline = session.pipelines[pipelineIdentity]
+              var pipeline = session.pipelines[pipelineIdentity],
+              let gitPipeline = pipeline.git
         else { return }
-        if pipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] == nil {
+        if gitPipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] == nil {
             let retainedCount = session.pipelines.values.reduce(0) {
-                addingSaturating($0, $1.automaticSelectionCandidateRecords.count)
+                addingSaturating($0, $1.git?.automaticSelectionCandidateRecords.count ?? 0)
             }
             guard retainedCount < policy.maximumRetainedManifestRecordCountPerRoot else { return }
         }
-        pipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
+        pipeline.git?.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
         session.pipelines[pipelineIdentity] = pipeline
         roots[rootEpoch] = .eligible(session)
     }
@@ -3850,11 +4031,10 @@ actor WorkspaceCodemapBindingEngine {
               case let .eligible(session)? = roots[rootEpoch],
               session.id == job.sessionID,
               let pipeline = session.pipelines[pipelineIdentity],
-              classification.relativePath == candidate.identity.standardizedRelativePath,
-              let repositoryRelativePath = classification.repositoryRelativePath,
-              repositoryRelativePath == repositoryPath(
-                  loadedRootRelativePath: candidate.identity.standardizedRelativePath,
-                  prefix: session.capability.repositoryRelativeLoadedRootPrefix
+              let binding = classificationBinding(
+                  classification,
+                  session: session,
+                  expectedRelativePath: candidate.identity.standardizedRelativePath
               )
         else { return .transient }
 
@@ -3892,8 +4072,9 @@ actor WorkspaceCodemapBindingEngine {
               let sourceAuthority,
               sourceAuthority.isFactoryValidated,
               sourceAuthority.rootEpoch == rootEpoch,
-              sourceAuthority.repositoryAuthority == job.repositoryAuthority,
-              sourceAuthority.standardizedRepositoryRelativePath == repositoryRelativePath,
+              sourceAuthority.rootAuthority == job.rootAuthority,
+              sourceAuthority.candidateRootRelativePath == candidate.identity.standardizedRelativePath,
+              sourceAuthority.standardizedRepositoryRelativePath == binding.repositoryRelativePath,
               sourceAuthority.pathGeneration == candidate.pathGeneration,
               sourceAuthority.ingressGeneration == job.ingressGeneration,
               graphIndexCandidateIsCurrent(
@@ -3906,9 +4087,12 @@ actor WorkspaceCodemapBindingEngine {
 
         switch classification.outcome {
         case let .oidEligible(blobOID):
+            guard let gitCapability = session.capability.gitCapability,
+                  let repositoryRelativePath = binding.repositoryRelativePath
+            else { return .transient }
             incrementCounter(\.cleanClassifications)
             let locator = GitBlobCodeMapLocatorIdentity(
-                repositoryNamespace: session.capability.repositoryNamespace,
+                repositoryNamespace: gitCapability.repositoryNamespace,
                 blobOID: blobOID,
                 pipelineIdentity: pipelineIdentity
             )
@@ -3953,7 +4137,7 @@ actor WorkspaceCodemapBindingEngine {
                     resolved = try await Self.materializeAndResolveClean(
                         runtime: runtime,
                         materializationService: materializationService,
-                        capability: session.capability,
+                        capability: gitCapability,
                         language: candidate.language,
                         locator: locator,
                         ownerID: jobID,
@@ -4406,7 +4590,7 @@ actor WorkspaceCodemapBindingEngine {
         else { return .superseded }
         currentJob.generation = WorkspaceCodemapGraphIndexGeneration(
             catalogToken: generation.catalogToken,
-            repositoryAuthority: generation.repositoryAuthority,
+            rootAuthority: generation.rootAuthority,
             contributionGeneration: overlaySnapshot.contributionGeneration,
             schemaVersion: generation.schemaVersion,
             policyVersion: generation.policyVersion
@@ -4543,7 +4727,7 @@ actor WorkspaceCodemapBindingEngine {
         guard let current = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
               current.generation == generation,
               overlaySnapshot.catalogGeneration == current.catalogGeneration,
-              overlaySnapshot.repositoryAuthority == current.repositoryAuthority
+              overlaySnapshot.rootAuthority == current.rootAuthority
         else { return .terminal }
         return overlaySnapshot.contributionGeneration > generation.contributionGeneration
             ? .restartGeneration
@@ -4589,6 +4773,18 @@ actor WorkspaceCodemapBindingEngine {
         return true
     }
 
+    /// Whether this job's root persists a Git manifest at all. Absence is a source-mode fact, not
+    /// a failure: a filesystem root completes its graph without any seal work.
+    ///
+    /// A superseded job whose session is already gone keeps the Git answer, so this never turns a
+    /// lost session into a claim that persistence did not apply.
+    private func graphIndexJobHasManifestLifecycle(_ job: GraphIndexJob) -> Bool {
+        guard case let .eligible(session)? = roots[job.rootEpoch], session.id == job.sessionID else {
+            return true
+        }
+        return session.manifest.writerSession != nil
+    }
+
     private func graphIndexJobAuthorityIsCurrent(_ job: GraphIndexJob) -> Bool {
         guard case let .eligible(session)? = roots[job.rootEpoch] else { return false }
         return session.id == job.sessionID &&
@@ -4596,11 +4792,11 @@ actor WorkspaceCodemapBindingEngine {
             session.invalidationGeneration == job.invalidationGeneration &&
             session.registration.catalogGeneration == job.catalogGeneration &&
             session.registration.ingressGeneration == job.ingressGeneration &&
-            session.capability.repositoryAuthority == job.repositoryAuthority &&
+            session.capability.rootAuthority == job.rootAuthority &&
             job.generation.map { generation in
                 generation.rootEpoch == job.rootEpoch &&
                     generation.catalogGeneration == job.catalogGeneration &&
-                    generation.repositoryAuthority == job.repositoryAuthority
+                    generation.rootAuthority == job.rootAuthority
             } ?? true
     }
 
@@ -5365,12 +5561,13 @@ actor WorkspaceCodemapBindingEngine {
               initial.generation == attempt.sessionGeneration,
               initial.invalidationGeneration == attempt.invalidationGeneration,
               initial.registration.catalogGeneration == attempt.catalogGeneration,
-              initial.capability.repositoryAuthority == attempt.repositoryAuthority,
+              initial.capability.gitCapability?.repositoryAuthority == attempt.repositoryAuthority,
               let initialPipeline = initial.pipelines[pipelineIdentity],
+              let initialGitPipeline = initialPipeline.git,
               initialPipeline.id == attempt.pipelineSessionID,
-              initialPipeline.namespace == attempt.namespace,
-              initialPipeline.authority == attempt.authority,
-              initialPipeline.manifestRevision == attempt.manifestRevision
+              initialGitPipeline.namespace == attempt.namespace,
+              initialGitPipeline.authority == attempt.authority,
+              initialGitPipeline.manifestRevision == attempt.manifestRevision
         else { return .superseded }
         let pipelineScope = attempt.scope
         guard let ticket = await overlay.beginManifestAdoption(
@@ -5410,8 +5607,8 @@ actor WorkspaceCodemapBindingEngine {
         let load: CodeMapRootManifestLoadResult
         do {
             load = try await runtime.manifestStore.loadCurrentManifest(
-                namespace: initialPipeline.namespace,
-                currentAuthority: initialPipeline.authority
+                namespace: initialGitPipeline.namespace,
+                currentAuthority: initialGitPipeline.authority
             )
         } catch {
             #if DEBUG
@@ -5507,12 +5704,13 @@ actor WorkspaceCodemapBindingEngine {
                     releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
                     return .superseded
                 }
-                guard record.locatorIdentity.repositoryNamespace == initial.capability.repositoryNamespace,
-                      record.locatorIdentity.blobOID.objectFormat == initial.capability.objectFormat,
+                guard let gitCapability = initial.capability.gitCapability,
+                      record.locatorIdentity.repositoryNamespace == gitCapability.repositoryNamespace,
+                      record.locatorIdentity.blobOID.objectFormat == gitCapability.objectFormat,
                       record.locatorIdentity.pipelineIdentity == initialPipeline.pipelineIdentity,
                       let loadedPath = loadedRootPath(
                           repositoryRelativePath: record.repositoryRelativePath,
-                          prefix: initial.capability.repositoryRelativeLoadedRootPrefix
+                          prefix: gitCapability.repositoryRelativeLoadedRootPrefix
                       ), !loadedPath.isEmpty
                 else { continue }
                 let candidate = await catalogClient.resolveManifestBinding(rootEpoch, loadedPath)
@@ -5569,10 +5767,10 @@ actor WorkspaceCodemapBindingEngine {
             let sourceAuthorities = await capabilityService.makeSourceAuthorities(
                 capability: initial.capability,
                 observedRootEpoch: rootEpoch,
-                observedRepositoryAuthority: initial.capability.repositoryAuthority,
+                observedRootAuthority: initial.capability.rootAuthority,
                 candidates: authorityCandidates.map { candidate in
                     WorkspaceCodemapSourceAuthorityRequest(
-                        candidateRepositoryRelativePath: candidate.record.repositoryRelativePath,
+                        candidateRootRelativePath: candidate.loadedPath,
                         observedPathGeneration: candidate.candidate.pathGeneration,
                         currentPathGeneration: candidate.candidate.pathGeneration,
                         observedIngressGeneration: candidate.candidate.ingressGeneration,
@@ -5792,6 +5990,7 @@ actor WorkspaceCodemapBindingEngine {
             guard stillCurrent,
                   case var .eligible(session)? = roots[rootEpoch],
                   var pipeline = session.pipelines[pipelineIdentity],
+                  var gitPipeline = pipeline.git,
                   adoptionReservations[pipelineScope]?.id == adoptionID,
                   let reservation = adoptionReservations.removeValue(forKey: pipelineScope)
             else {
@@ -5802,13 +6001,14 @@ actor WorkspaceCodemapBindingEngine {
                 releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
                 return .superseded
             }
-            pipeline.manifestRecords = verifiedRecords
-            pipeline.automaticSelectionCandidateRecords = automaticSelectionCandidateRecords
+            gitPipeline.manifestRecords = verifiedRecords
+            gitPipeline.automaticSelectionCandidateRecords = automaticSelectionCandidateRecords
             for (path, generation) in pathGenerations {
                 session.pathGenerations[path] = generation
             }
-            pipeline.manifestState = .clean(generation: snapshot.manifestGeneration)
-            pipeline.persistedManifestRevision = pipeline.manifestRevision
+            gitPipeline.manifestState = .clean(generation: snapshot.manifestGeneration)
+            gitPipeline.persistedManifestRevision = gitPipeline.manifestRevision
+            pipeline.git = gitPipeline
             session.pipelines[pipelineIdentity] = pipeline
             roots[rootEpoch] = .eligible(session)
             retainedAdoptions[pipelineScope] = reservation
@@ -5823,7 +6023,7 @@ actor WorkspaceCodemapBindingEngine {
                case var .eligible(session)? = roots[rootEpoch],
                var pipeline = session.pipelines[pipelineIdentity]
             {
-                pipeline.automaticSelectionCandidateRecords = automaticSelectionCandidateRecords
+                pipeline.git?.automaticSelectionCandidateRecords = automaticSelectionCandidateRecords
                 session.pipelines[pipelineIdentity] = pipeline
                 roots[rootEpoch] = .eligible(session)
             }
@@ -5843,10 +6043,13 @@ actor WorkspaceCodemapBindingEngine {
         pipelineIdentity: CodeMapPipelineIdentity
     ) async {
         let scope = PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity)
+        // Filesystem roots never adopt a manifest; there is nothing to load or wait for.
         guard case var .eligible(session)? = roots[rootEpoch],
-              var pipeline = session.pipelines[pipelineIdentity]
+              let gitCapability = session.capability.gitCapability,
+              var pipeline = session.pipelines[pipelineIdentity],
+              let gitPipeline = pipeline.git
         else { return }
-        if pipeline.manifestLoadFinished {
+        if gitPipeline.manifestLoadFinished {
             return
         }
         if let operation = manifestAdoptionOperations[scope] {
@@ -5864,12 +6067,12 @@ actor WorkspaceCodemapBindingEngine {
             invalidationGeneration: session.invalidationGeneration,
             pipelineSessionID: pipeline.id,
             catalogGeneration: session.registration.catalogGeneration,
-            repositoryAuthority: session.capability.repositoryAuthority,
-            namespace: pipeline.namespace,
-            authority: pipeline.authority,
-            manifestRevision: pipeline.manifestRevision
+            repositoryAuthority: gitCapability.repositoryAuthority,
+            namespace: gitPipeline.namespace,
+            authority: gitPipeline.authority,
+            manifestRevision: gitPipeline.manifestRevision
         )
-        pipeline.manifestLoadStarted = true
+        pipeline.git?.manifestLoadStarted = true
         session.pipelines[pipelineIdentity] = pipeline
         roots[rootEpoch] = .eligible(session)
         let task = Task {
@@ -5937,18 +6140,19 @@ actor WorkspaceCodemapBindingEngine {
         session: Session,
         pipeline: PipelineSession
     ) -> Bool {
-        guard pipeline.manifestRevision == 0,
-              pipeline.persistedManifestRevision == 0,
-              pipeline.pendingManifestChanges.isEmpty,
-              pipeline.manifestRecords.isEmpty,
-              pipeline.automaticSelectionCandidateRecords.isEmpty
+        guard let gitPipeline = pipeline.git,
+              gitPipeline.manifestRevision == 0,
+              gitPipeline.persistedManifestRevision == 0,
+              gitPipeline.pendingManifestChanges.isEmpty,
+              gitPipeline.manifestRecords.isEmpty,
+              gitPipeline.automaticSelectionCandidateRecords.isEmpty
         else { return false }
         let workKey = ManifestWriterWorkKey(
             scope: scope,
             sessionID: session.id,
             pipelineSessionID: pipeline.id
         )
-        guard let writer = manifestWriters[pipeline.namespace] else { return true }
+        guard let writer = manifestWriters[gitPipeline.namespace] else { return true }
         return writer.inFlightBatch?.workKey != workKey &&
             writer.deferredHeadBatch?.workKey != workKey &&
             !writer.queuedWork.contains(where: { $0.workKey == workKey }) &&
@@ -5962,8 +6166,8 @@ actor WorkspaceCodemapBindingEngine {
         session: inout Session,
         pipeline: inout PipelineSession
     ) -> Bool {
-        let currentAuthority = pipeline.authority
-        guard observedAuthority != currentAuthority,
+        guard let currentAuthority = pipeline.git?.authority,
+              observedAuthority != currentAuthority,
               observedAuthority.authorityGeneration >= currentAuthority.authorityGeneration,
               observedAuthority.authorityGeneration < UInt64.max,
               manifestPipelineIsVirgin(scope: scope, session: session, pipeline: pipeline)
@@ -5980,8 +6184,8 @@ actor WorkspaceCodemapBindingEngine {
             metadataGeneration: currentAuthority.metadataGeneration
         )
         else { return false }
-        pipeline.authority = lifted
-        pipeline.previouslyObservedManifestAuthority = observedAuthority
+        pipeline.git?.authority = lifted
+        pipeline.git?.previouslyObservedManifestAuthority = observedAuthority
         return true
     }
 
@@ -6002,7 +6206,7 @@ actor WorkspaceCodemapBindingEngine {
            current.invalidationGeneration == attempt.invalidationGeneration,
            var currentPipeline = current.pipelines[scope.pipelineIdentity],
            currentPipeline.id == attempt.pipelineSessionID,
-           currentPipeline.manifestRevision == attempt.manifestRevision
+           currentPipeline.git?.manifestRevision == attempt.manifestRevision
         {
             switch outcome {
             case let .terminal(_, observedStaleAuthority):
@@ -6014,11 +6218,11 @@ actor WorkspaceCodemapBindingEngine {
                         pipeline: &currentPipeline
                     )
                 }
-                currentPipeline.manifestLoadFinished = true
+                currentPipeline.git?.manifestLoadFinished = true
             case .retryable:
-                currentPipeline.manifestLoadStarted = false
-                currentPipeline.manifestLoadFinished = false
-                currentPipeline.manifestState = .dirtyRetryRequired
+                currentPipeline.git?.manifestLoadStarted = false
+                currentPipeline.git?.manifestLoadFinished = false
+                currentPipeline.git?.manifestState = .dirtyRetryRequired
             case .superseded:
                 break
             }
@@ -6038,7 +6242,7 @@ actor WorkspaceCodemapBindingEngine {
     ) -> Bool {
         guard classification.relativePath == candidate.identity.standardizedRelativePath,
               classification.repositoryRelativePath == record.repositoryRelativePath,
-              classification.objectFormat == session.capability.objectFormat,
+              classification.objectFormat == session.capability.gitCapability?.objectFormat,
               classification.porcelainRecord == nil,
               !classification.intentToAdd,
               !classification.hasConflictStages,
@@ -6088,10 +6292,10 @@ actor WorkspaceCodemapBindingEngine {
             session.invalidationGeneration == context.invalidationGeneration &&
             pipeline.id == context.pipelineSessionID &&
             session.registration.catalogGeneration == context.catalogGeneration &&
-            session.capability.repositoryAuthority == context.repositoryAuthority &&
-            pipeline.namespace == context.namespace &&
-            pipeline.authority == context.authority &&
-            pipeline.manifestRevision == context.manifestRevision
+            session.capability.gitCapability?.repositoryAuthority == context.repositoryAuthority &&
+            pipeline.git?.namespace == context.namespace &&
+            pipeline.git?.authority == context.authority &&
+            pipeline.git?.manifestRevision == context.manifestRevision
     }
 
     private func updateManifestState(
@@ -6103,7 +6307,7 @@ actor WorkspaceCodemapBindingEngine {
               case var .eligible(session)? = roots[rootEpoch],
               var pipeline = session.pipelines[context.pipelineIdentity]
         else { return }
-        pipeline.manifestState = state
+        pipeline.git?.manifestState = state
         session.pipelines[context.pipelineIdentity] = pipeline
         roots[rootEpoch] = .eligible(session)
     }
@@ -6117,7 +6321,7 @@ actor WorkspaceCodemapBindingEngine {
               case var .eligible(session)? = roots[rootEpoch],
               var pipeline = session.pipelines[context.pipelineIdentity]
         else { return }
-        pipeline.previouslyObservedManifestAuthority = authority
+        pipeline.git?.previouslyObservedManifestAuthority = authority
         session.pipelines[context.pipelineIdentity] = pipeline
         roots[rootEpoch] = .eligible(session)
     }
@@ -6130,9 +6334,10 @@ actor WorkspaceCodemapBindingEngine {
         let replacedRecordCount: Int
         if case let .eligible(session)? = roots[scope.rootEpoch] {
             currentRootRecordCount = session.pipelines.values.reduce(0) {
-                addingSaturating($0, $1.manifestRecords.count)
+                addingSaturating($0, $1.git?.manifestRecords.count ?? 0)
             }
-            replacedRecordCount = session.pipelines[scope.pipelineIdentity]?.manifestRecords.count ?? 0
+            replacedRecordCount = session.pipelines[scope.pipelineIdentity]?
+                .git?.manifestRecords.count ?? 0
         } else {
             currentRootRecordCount = 0
             replacedRecordCount = 0
@@ -6302,7 +6507,7 @@ actor WorkspaceCodemapBindingEngine {
             }
             guard case let .eligible(session) = item.value else { return partial }
             return session.pipelines.values.reduce(partial) {
-                addingSaturating($0, $1.manifestRecords.count)
+                addingSaturating($0, $1.git?.manifestRecords.count ?? 0)
             }
         }
     }
@@ -6446,18 +6651,19 @@ actor WorkspaceCodemapBindingEngine {
         let pathGeneration = session.pathGenerations[request.identity.standardizedRelativePath]
             ?? request.pathGeneration
         guard pathGeneration == request.pathGeneration,
+              let gitCapability = session.capability.gitCapability,
               let repositoryRelativePath = repositoryPath(
                   loadedRootRelativePath: request.identity.standardizedRelativePath,
-                  prefix: session.capability.repositoryRelativeLoadedRootPrefix
+                  prefix: gitCapability.repositoryRelativeLoadedRootPrefix
               ),
-              let record = pipeline.manifestRecords[repositoryRelativePath]
+              let record = pipeline.git?.manifestRecords[repositoryRelativePath]
         else {
             return .failure(.graphIndexMissing)
         }
         guard record.bindingGeneration == request.pathGeneration,
-              record.locatorIdentity.repositoryNamespace == session.capability.repositoryNamespace,
+              record.locatorIdentity.repositoryNamespace == gitCapability.repositoryNamespace,
               record.locatorIdentity.pipelineIdentity == pipelineIdentity,
-              record.locatorIdentity.blobOID.objectFormat == session.capability.objectFormat
+              record.locatorIdentity.blobOID.objectFormat == gitCapability.objectFormat
         else {
             return .failure(.currentnessMismatch)
         }
@@ -6486,7 +6692,7 @@ actor WorkspaceCodemapBindingEngine {
               session.registration.ingressGeneration == request.ingressGeneration,
               let pipeline = session.pipelines[context.pipelineIdentity],
               pipeline.id == context.pipelineSessionID,
-              pipeline.manifestRecords[context.repositoryRelativePath] == context.record
+              pipeline.git?.manifestRecords[context.repositoryRelativePath] == context.record
         else { return false }
         let pathGeneration = session.pathGenerations[request.identity.standardizedRelativePath]
             ?? request.pathGeneration
@@ -6525,6 +6731,144 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
+    /// Source and manifest mode of one registered root, derived from real session state.
+    func sourceMode(rootEpoch: WorkspaceCodemapRootEpoch) -> WorkspaceCodemapRootSourceMode? {
+        guard case let .eligible(session)? = roots[rootEpoch] else { return nil }
+        return WorkspaceCodemapRootSourceMode(
+            sourceKind: session.capability.gitCapability == nil ? .filesystem : .git,
+            manifestMode: session.manifest.writerSession == nil ? .notApplicable : .git
+        )
+    }
+
+    /// The single classification dispatch used by both the graph batch path and interactive demand.
+    ///
+    /// Git keeps its existing discovery-based classifier. A filesystem root classifies with no Git
+    /// process at all, and an unavailable proof surfaces as a typed transient batch failure rather
+    /// than an empty success.
+    private func classifyCandidates(
+        session: Session,
+        relativePaths: [String]
+    ) async -> GitBlobIdentityBatch {
+        incrementCounter(\.classifications)
+        switch session.capability {
+        case .git:
+            return await identityService.classify(
+                workspaceRoot: session.registration.capabilityRequest.loadedRootURL,
+                relativePaths: relativePaths
+            )
+        case .filesystem:
+            guard let evidence = await capabilityService.filesystemClassificationEvidence(
+                for: session.capability
+            ) else {
+                return GitBlobIdentityBatch(
+                    objectFormat: nil,
+                    classifications: [],
+                    retriedAfterInstability: false,
+                    failure: .filesystemProofUnavailable
+                )
+            }
+            return await identityService.classifyFilesystem(
+                evidence: evidence,
+                relativePaths: relativePaths
+            )
+        }
+    }
+
+    /// Common per-candidate classification validation.
+    ///
+    /// Both modes must agree on the loaded-root-relative path. Only Git additionally requires the
+    /// translated repository-relative path; a filesystem classification carrying Git coordinates or
+    /// claiming `oidEligible` is a mismatch, never an accelerated path.
+    private func classificationBinding(
+        _ classification: GitBlobIdentityClassification,
+        session: Session,
+        expectedRelativePath: String
+    ) -> ClassificationBinding? {
+        guard classification.relativePath == expectedRelativePath else { return nil }
+        switch session.capability {
+        case let .git(gitCapability):
+            guard let repositoryRelativePath = classification.repositoryRelativePath,
+                  repositoryRelativePath == repositoryPath(
+                      loadedRootRelativePath: expectedRelativePath,
+                      prefix: gitCapability.repositoryRelativeLoadedRootPrefix
+                  )
+            else { return nil }
+            return .git(repositoryRelativePath: repositoryRelativePath)
+        case .filesystem:
+            guard classification.repositoryRelativePath == nil else { return nil }
+            if case .oidEligible = classification.outcome { return nil }
+            return .filesystem
+        }
+    }
+
+    /// Root currentness for serving paths, yielding the validated root authority.
+    ///
+    /// Git reuses its existing per-demand checks and performs no new Git discovery here. Filesystem
+    /// roots revalidate one bounded root proof through the capability actor; a changed binding
+    /// fences serving first and then reports through the existing catalog route.
+    ///
+    /// Actor isolation does not survive the capability await, so the captured session is
+    /// re-established afterwards. Without that, a validation started for one session could revoke
+    /// the replacement installed while this worker was suspended, or report a success that belongs
+    /// to a session nobody is serving any more.
+    private func validatedRootAuthority(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async -> SessionAuthorityExpectation? {
+        guard case let .eligible(session)? = roots[rootEpoch] else { return nil }
+        let expectation = SessionAuthorityExpectation(
+            sessionID: session.id,
+            rootAuthority: session.capability.rootAuthority
+        )
+        guard case .filesystem = session.capability else { return expectation }
+        let registration = session.registration
+        let validation = await capabilityService.revalidateRootAuthority(
+            capability: session.capability
+        )
+        guard sessionIsCurrent(expectation, rootEpoch: rootEpoch) else { return nil }
+        switch validation {
+        case .current:
+            return expectation
+        case .changed:
+            // Prevent serving and late publication before reporting. The invalidation names the
+            // validated session, and the report names its registration, so neither can act on a
+            // replacement for the same root epoch. Cleanup stays owned by the store's existing
+            // cleanup flight, so this never awaits the calling worker's own drain.
+            _ = await invalidateRootAuthority(
+                rootEpoch: rootEpoch,
+                reason: .authorityChanged,
+                expecting: expectation
+            )
+            await catalogClient.reportRootAuthorityInvalidated(registration)
+            return nil
+        case .unavailable:
+            return nil
+        }
+    }
+
+    private func sessionIsCurrent(
+        _ expectation: SessionAuthorityExpectation,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> Bool {
+        guard case let .eligible(session)? = roots[rootEpoch],
+              session.id == expectation.sessionID,
+              session.capability.rootAuthority == expectation.rootAuthority
+        else { return false }
+        return true
+    }
+
+    private func rootAuthorityIsCurrent(rootEpoch: WorkspaceCodemapRootEpoch) async -> Bool {
+        await validatedRootAuthority(rootEpoch: rootEpoch) != nil
+    }
+
+    /// Serving validation for consumers that already hold a root-local selection graph.
+    ///
+    /// A retained graph actor keeps answering from its committed snapshot after indexing finishes,
+    /// so structure and automatic-selection queries validate the root binding at their own serving
+    /// boundary instead of relying on graph-indexing work that may no longer be running.
+    func rootAuthorityIsCurrentForServing(rootEpoch: WorkspaceCodemapRootEpoch) async -> Bool {
+        await rootAuthorityIsCurrent(rootEpoch: rootEpoch)
+    }
+
     private func ensurePipeline(
         rootEpoch: WorkspaceCodemapRootEpoch,
         language: LanguageType
@@ -6542,29 +6886,38 @@ actor WorkspaceCodemapBindingEngine {
             }
             return pipelineIdentity
         }
-        let namespace = try CodeMapRootManifestNamespace(
-            capability: session.capability,
-            pipelineIdentity: pipelineIdentity
-        )
-        let authority = try CodeMapRootManifestAuthority(
-            namespace: namespace,
-            token: session.capability.repositoryAuthority
-        )
+        // Pipeline identity is common to both source modes; only Git creates manifest state.
+        let manifest: PipelineManifest
+        switch session.capability {
+        case let .git(gitCapability):
+            let namespace = try CodeMapRootManifestNamespace(
+                capability: gitCapability,
+                pipelineIdentity: pipelineIdentity
+            )
+            manifest = try .git(GitPipelineManifest(
+                namespace: namespace,
+                authority: CodeMapRootManifestAuthority(
+                    namespace: namespace,
+                    token: gitCapability.repositoryAuthority
+                ),
+                previouslyObservedManifestAuthority: nil,
+                manifestRecords: [:],
+                automaticSelectionCandidateRecords: [:],
+                manifestState: .miss,
+                manifestLoadStarted: false,
+                manifestLoadFinished: false,
+                manifestRevision: 0,
+                persistedManifestRevision: 0,
+                pendingManifestChanges: [:]
+            ))
+        case .filesystem:
+            manifest = .notApplicable
+        }
         session.pipelines[pipelineIdentity] = PipelineSession(
             id: UUID(),
             language: language,
             pipelineIdentity: pipelineIdentity,
-            namespace: namespace,
-            authority: authority,
-            previouslyObservedManifestAuthority: nil,
-            manifestRecords: [:],
-            automaticSelectionCandidateRecords: [:],
-            manifestState: .miss,
-            manifestLoadStarted: false,
-            manifestLoadFinished: false,
-            manifestRevision: 0,
-            persistedManifestRevision: 0,
-            pendingManifestChanges: [:]
+            manifest: manifest
         )
         roots[rootEpoch] = .eligible(session)
         return pipelineIdentity
@@ -6670,7 +7023,7 @@ actor WorkspaceCodemapBindingEngine {
             sessionGeneration: context.session.generation,
             pipelineIdentity: context.pipelineIdentity,
             pipelineSessionID: pipeline.id,
-            repositoryAuthority: context.session.capability.repositoryAuthority,
+            rootAuthority: context.session.capability.rootAuthority,
             reservedSourceBytes: sourceBytes,
             overlayOwner: nil,
             preflight: nil,
@@ -6896,21 +7249,25 @@ actor WorkspaceCodemapBindingEngine {
               session.pipelines[request.pipelineIdentity]?.id == request.pipelineSessionID
         else { throw CancellationError() }
         try Task.checkCancellation()
-        incrementCounter(\.classifications)
-        let batch = await identityService.classify(
-            workspaceRoot: session.registration.capabilityRequest.loadedRootURL,
+        let batch = await classifyCandidates(
+            session: session,
             relativePaths: [request.relativePath]
         )
         try Task.checkCancellation()
         guard let current = currentRequest(requestID) else { throw CancellationError() }
+        if batch.failure == .filesystemProofUnavailable {
+            // The root proof could not be re-established for this batch. That is transient work to
+            // retry, not a permanent classification mismatch for this candidate.
+            emit(.classificationUnavailable, rootEpoch: current.rootEpoch)
+            return .unavailable(.transient)
+        }
         guard batch.failure == nil,
               batch.classifications.count == 1,
               let classification = batch.classifications.first,
-              classification.relativePath == current.relativePath,
-              let repositoryRelativePath = classification.repositoryRelativePath,
-              repositoryRelativePath == repositoryPath(
-                  loadedRootRelativePath: current.relativePath,
-                  prefix: session.capability.repositoryRelativeLoadedRootPrefix
+              let binding = classificationBinding(
+                  classification,
+                  session: session,
+                  expectedRelativePath: current.relativePath
               )
         else {
             emit(.classificationUnavailable, rootEpoch: current.rootEpoch)
@@ -6930,8 +7287,8 @@ actor WorkspaceCodemapBindingEngine {
         let sourceAuthority = await capabilityService.makeSourceAuthority(
             capability: session.capability,
             observedRootEpoch: current.rootEpoch,
-            observedRepositoryAuthority: session.capability.repositoryAuthority,
-            candidateRepositoryRelativePath: repositoryRelativePath,
+            observedRootAuthority: session.capability.rootAuthority,
+            candidateRootRelativePath: current.relativePath,
             observedPathGeneration: current.demand.pathGeneration,
             currentPathGeneration: current.demand.pathGeneration,
             observedIngressGeneration: current.demand.ingressGeneration,
@@ -6957,7 +7314,9 @@ actor WorkspaceCodemapBindingEngine {
 
         switch classification.outcome {
         case let .oidEligible(blobOID):
-            guard let pipeline = latest.pipelines[current.pipelineIdentity] else {
+            guard let pipeline = latest.pipelines[current.pipelineIdentity],
+                  let repositoryRelativePath = binding.repositoryRelativePath
+            else {
                 return .rejected(.staleCompletion)
             }
             incrementCounter(\.cleanClassifications)
@@ -6987,10 +7346,12 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     private func prepareManifestForRequest(_ request: ActiveRequest) async {
+        // Filesystem demands skip straight to source resolution: there is no manifest to adopt.
         guard case let .eligible(session)? = roots[request.rootEpoch],
               let pipeline = session.pipelines[request.pipelineIdentity],
               pipeline.id == request.pipelineSessionID,
-              !pipeline.manifestLoadFinished
+              let gitPipeline = pipeline.git,
+              !gitPipeline.manifestLoadFinished
         else { return }
 
         switch request.demand.priority {
@@ -7016,8 +7377,11 @@ actor WorkspaceCodemapBindingEngine {
         preflight: WorkspaceCodemapLiveDemandPreflightTicket
     ) async throws -> WorkspaceCodemapBindingDemandResult {
         guard let request = currentRequest(requestID) else { throw CancellationError() }
+        guard let gitCapability = session.capability.gitCapability else {
+            return .rejected(.sourceAuthorityUnavailable)
+        }
         let locator = GitBlobCodeMapLocatorIdentity(
-            repositoryNamespace: session.capability.repositoryNamespace,
+            repositoryNamespace: gitCapability.repositoryNamespace,
             blobOID: blobOID,
             pipelineIdentity: pipeline.pipelineIdentity
         )
@@ -7040,13 +7404,13 @@ actor WorkspaceCodemapBindingEngine {
         case let .result(result): return result
         case let .ticket(ticket):
             guard let current = currentRequest(requestID) else { throw CancellationError() }
-            let manifestRecord = pipeline.manifestRecords[repositoryRelativePath].flatMap {
+            let manifestRecord = pipeline.git?.manifestRecords[repositoryRelativePath].flatMap {
                 $0.locatorIdentity == locator ? $0 : nil
             }
             let resolved = try await Self.resolveClean(
                 runtime: runtime,
                 materializationService: materializationService,
-                capability: session.capability,
+                capability: gitCapability,
                 language: current.demand.language,
                 locator: locator,
                 manifestRecord: manifestRecord,
@@ -7365,7 +7729,7 @@ actor WorkspaceCodemapBindingEngine {
               session.generation == request.sessionGeneration,
               session.pipelines[request.pipelineIdentity]?.id == request.pipelineSessionID,
               session.registration.catalogGeneration == request.demand.catalogGeneration,
-              session.capability.repositoryAuthority == request.repositoryAuthority
+              session.capability.rootAuthority == request.rootAuthority
         else { return nil }
         let pathGeneration = session.pathGenerations[request.relativePath]
             ?? request.demand.pathGeneration
@@ -7601,19 +7965,21 @@ actor WorkspaceCodemapBindingEngine {
         proof: ManifestMutationAuthority,
         retainRecordsInMemory: Bool
     ) async -> ManifestMutationSubmissionResult {
+        // Only Git roots persist manifest mutations; a filesystem root never reaches this path.
         guard !mutations.isEmpty,
               case var .eligible(session)? = roots[rootEpoch],
               var pipeline = session.pipelines[pipelineIdentity],
+              var gitPipeline = pipeline.git,
               manifestMutationProofIsCurrent(
                   proof,
                   rootEpoch: rootEpoch,
                   session: session,
                   pipeline: pipeline
               ),
-              pipeline.manifestRevision < UInt64.max
+              gitPipeline.manifestRevision < UInt64.max
         else { return .durabilityFailure }
         let workItemID = UUID()
-        let revision = pipeline.manifestRevision + 1
+        let revision = gitPipeline.manifestRevision + 1
         let byteCount = mutations.reduce(UInt64(0)) {
             addingSaturating($0, manifestMutationByteCount($1))
         }
@@ -7673,9 +8039,12 @@ actor WorkspaceCodemapBindingEngine {
             #endif
         }
 
+        // The Git payload is extracted once and written back once below. Mutating it through the
+        // `git` projection inside these loops would read, copy and reassign the record
+        // dictionaries on every iteration instead of mutating the local storage in place.
         if retainRecordsInMemory {
             let currentRootCount = session.pipelines.values.reduce(0) {
-                addingSaturating($0, $1.manifestRecords.count)
+                addingSaturating($0, $1.git?.manifestRecords.count ?? 0)
             }
             let currentGlobalCount = addingSaturating(
                 retainedManifestRecordCount(excluding: rootEpoch),
@@ -7695,32 +8064,33 @@ actor WorkspaceCodemapBindingEngine {
             for mutation in mutations {
                 switch mutation {
                 case let .upsert(record):
-                    if pipeline.manifestRecords[record.repositoryRelativePath] != nil ||
+                    if gitPipeline.manifestRecords[record.repositoryRelativePath] != nil ||
                         retainAllowance > 0
                     {
-                        if pipeline.manifestRecords[record.repositoryRelativePath] == nil {
+                        if gitPipeline.manifestRecords[record.repositoryRelativePath] == nil {
                             retainAllowance -= 1
                         }
-                        pipeline.manifestRecords[record.repositoryRelativePath] = record
+                        gitPipeline.manifestRecords[record.repositoryRelativePath] = record
                         if record.contributionEnvelope != nil {
-                            pipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
+                            gitPipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
                         }
                     }
                 case let .remove(repositoryRelativePath):
-                    pipeline.manifestRecords.removeValue(forKey: repositoryRelativePath)
-                    pipeline.automaticSelectionCandidateRecords.removeValue(forKey: repositoryRelativePath)
+                    gitPipeline.manifestRecords.removeValue(forKey: repositoryRelativePath)
+                    gitPipeline.automaticSelectionCandidateRecords.removeValue(forKey: repositoryRelativePath)
                 }
             }
         }
-        pipeline.manifestRevision = revision
-        pipeline.manifestState = .dirtyRetryRequired
+        gitPipeline.manifestRevision = revision
+        gitPipeline.manifestState = .dirtyRetryRequired
         for mutation in mutations {
-            pipeline.pendingManifestChanges[mutation.repositoryRelativePath] = PendingManifestChange(
+            gitPipeline.pendingManifestChanges[mutation.repositoryRelativePath] = PendingManifestChange(
                 revision: revision,
                 workItemID: workItemID,
                 record: mutation.record
             )
         }
+        pipeline.git = gitPipeline
         session.pipelines[pipelineIdentity] = pipeline
         roots[rootEpoch] = .eligible(session)
         let scope = PipelineScope(rootEpoch: rootEpoch, pipelineIdentity: pipelineIdentity)
@@ -7737,7 +8107,7 @@ actor WorkspaceCodemapBindingEngine {
             mutations: mutations,
             byteCount: byteCount
         )
-        enqueueManifestWorkItem(item, namespace: pipeline.namespace)
+        enqueueManifestWorkItem(item, namespace: gitPipeline.namespace)
         emit(.manifestRevisionQueued, rootEpoch: rootEpoch, numericValue: revision)
         await hooks.afterManifestRevisionQueuedBeforeWaiterInstall(rootEpoch, revision)
         #if DEBUG
@@ -7770,7 +8140,7 @@ actor WorkspaceCodemapBindingEngine {
             scope: scope,
             revision: revision,
             workKey: workKey,
-            namespace: pipeline.namespace
+            namespace: gitPipeline.namespace
         )
         if case let .graphIndex(jobID, _, _) = proof,
            var job = graphIndexJobs[rootEpoch], job.id == jobID
@@ -7973,8 +8343,9 @@ actor WorkspaceCodemapBindingEngine {
             guard case let .eligible(initialSession)? = roots[scope.rootEpoch],
                   initialSession.id == workKey.sessionID,
                   let initialPipeline = initialSession.pipelines[scope.pipelineIdentity],
+                  let initialGitPipeline = initialPipeline.git,
                   initialPipeline.id == workKey.pipelineSessionID,
-                  initialPipeline.namespace == namespace,
+                  initialGitPipeline.namespace == namespace,
                   manifestMutationProofIsCurrent(
                       batch.proof,
                       rootEpoch: scope.rootEpoch,
@@ -7987,7 +8358,8 @@ actor WorkspaceCodemapBindingEngine {
             }
             var session = initialSession
             var pipeline = initialPipeline
-            if batch.highestRevision <= pipeline.persistedManifestRevision {
+            var gitPipeline = initialGitPipeline
+            if batch.highestRevision <= gitPipeline.persistedManifestRevision {
                 guard var currentWriter = currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
@@ -8023,6 +8395,7 @@ actor WorkspaceCodemapBindingEngine {
                       case let .eligible(revalidated)? = roots[scope.rootEpoch],
                       revalidated.id == session.id,
                       let revalidatedPipeline = revalidated.pipelines[scope.pipelineIdentity],
+                      let revalidatedGitPipeline = revalidatedPipeline.git,
                       revalidatedPipeline.id == pipeline.id,
                       manifestMutationProofIsCurrent(
                           batch.proof,
@@ -8036,12 +8409,13 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 session = revalidated
                 pipeline = revalidatedPipeline
+                gitPipeline = revalidatedGitPipeline
             }
             let sessionID = session.id
             let pipelineSessionID = pipeline.id
             let revision = batch.highestRevision
             var changes = batch.changesByPath
-            for (path, change) in pipeline.pendingManifestChanges where change.revision <= revision {
+            for (path, change) in gitPipeline.pendingManifestChanges where change.revision <= revision {
                 if (changes[path]?.revision ?? 0) <= change.revision {
                     changes[path] = change
                 }
@@ -8066,10 +8440,14 @@ actor WorkspaceCodemapBindingEngine {
                 #if DEBUG
                     manifestAttemptStartedUptimeNanoseconds = uptimeNanoseconds()
                 #endif
+                guard let writerSession = session.manifest.writerSession else {
+                    discardManifestBatch(batch, namespace: namespace, writerID: writerID)
+                    continue
+                }
                 let claimedWriterAuthority = await runtime.manifestStore.claimManifestWriterAuthority(
                     namespace: namespace,
-                    authority: pipeline.authority,
-                    writerSession: session.manifestWriterSession
+                    authority: gitPipeline.authority,
+                    writerSession: writerSession
                 )
                 guard currentManifestWriterState(
                     namespace: namespace,
@@ -8108,9 +8486,9 @@ actor WorkspaceCodemapBindingEngine {
                     ) {
                         try await mergeManifestChanges(
                             namespace: namespace,
-                            authority: pipeline.authority,
+                            authority: gitPipeline.authority,
                             writerAuthority: writerAuthority,
-                            previouslyObservedAuthority: pipeline.previouslyObservedManifestAuthority,
+                            previouslyObservedAuthority: gitPipeline.previouslyObservedManifestAuthority,
                             upserts: upserts,
                             removals: removals
                         )
@@ -8118,9 +8496,9 @@ actor WorkspaceCodemapBindingEngine {
                 #else
                     let result = try await mergeManifestChanges(
                         namespace: namespace,
-                        authority: pipeline.authority,
+                        authority: gitPipeline.authority,
                         writerAuthority: writerAuthority,
-                        previouslyObservedAuthority: pipeline.previouslyObservedManifestAuthority,
+                        previouslyObservedAuthority: gitPipeline.previouslyObservedManifestAuthority,
                         upserts: upserts,
                         removals: removals
                     )
@@ -8160,30 +8538,32 @@ actor WorkspaceCodemapBindingEngine {
                 if case var .eligible(current)? = roots[scope.rootEpoch],
                    current.id == sessionID,
                    var currentPipeline = current.pipelines[scope.pipelineIdentity],
+                   var currentGitPipeline = currentPipeline.git,
                    currentPipeline.id == pipelineSessionID,
-                   currentPipeline.namespace == namespace
+                   currentGitPipeline.namespace == namespace
                 {
                     if let observedPredecessorAuthority = result.observedPredecessorAuthority {
-                        currentPipeline.previouslyObservedManifestAuthority = observedPredecessorAuthority
+                        currentGitPipeline.previouslyObservedManifestAuthority = observedPredecessorAuthority
                     }
                     for (path, change) in changes
-                        where currentPipeline.pendingManifestChanges[path]?.revision == change.revision
+                        where currentGitPipeline.pendingManifestChanges[path]?.revision == change.revision
                     {
-                        currentPipeline.pendingManifestChanges.removeValue(forKey: path)
+                        currentGitPipeline.pendingManifestChanges.removeValue(forKey: path)
                     }
-                    currentPipeline.persistedManifestRevision = max(
-                        currentPipeline.persistedManifestRevision,
+                    currentGitPipeline.persistedManifestRevision = max(
+                        currentGitPipeline.persistedManifestRevision,
                         revision
                     )
-                    if currentPipeline.pendingManifestChanges.isEmpty,
-                       currentPipeline.manifestRevision == revision
+                    if currentGitPipeline.pendingManifestChanges.isEmpty,
+                       currentGitPipeline.manifestRevision == revision
                     {
-                        currentPipeline.manifestState = .clean(
+                        currentGitPipeline.manifestState = .clean(
                             generation: manifestGeneration(result.writeResult)
                         )
                     } else {
-                        currentPipeline.manifestState = .dirtyRetryRequired
+                        currentGitPipeline.manifestState = .dirtyRetryRequired
                     }
+                    currentPipeline.git = currentGitPipeline
                     current.pipelines[scope.pipelineIdentity] = currentPipeline
                     roots[scope.rootEpoch] = .eligible(current)
                 }
@@ -8196,7 +8576,7 @@ actor WorkspaceCodemapBindingEngine {
                     recordManifestWriteDebugEvent(
                         kind: .manifestWrite,
                         rootEpoch: scope.rootEpoch,
-                        currentAuthorityGeneration: pipeline.authority.authorityGeneration,
+                        currentAuthorityGeneration: gitPipeline.authority.authorityGeneration,
                         observedPredecessorAuthorityGeneration:
                         result.observedPredecessorAuthority?.authorityGeneration,
                         attemptStartedUptimeNanoseconds:
@@ -8260,10 +8640,10 @@ actor WorkspaceCodemapBindingEngine {
                         reason: classified.reason,
                         operation: classified.operation,
                         currentAuthorityGeneration: classified.currentAuthorityGeneration
-                            ?? pipeline.authority.authorityGeneration,
+                            ?? gitPipeline.authority.authorityGeneration,
                         observedPredecessorAuthorityGeneration:
                         classified.observedPredecessorAuthorityGeneration
-                            ?? pipeline.previouslyObservedManifestAuthority?.authorityGeneration,
+                            ?? gitPipeline.previouslyObservedManifestAuthority?.authorityGeneration,
                         attemptStartedUptimeNanoseconds:
                         manifestAttemptStartedUptimeNanoseconds ?? attemptCompletedUptimeNanoseconds,
                         attemptCompletedUptimeNanoseconds: attemptCompletedUptimeNanoseconds,
@@ -8276,7 +8656,7 @@ actor WorkspaceCodemapBindingEngine {
                         kind: .manifestFailure,
                         rootEpoch: scope.rootEpoch,
                         currentAuthorityGeneration: failure.currentAuthorityGeneration
-                            ?? pipeline.authority.authorityGeneration,
+                            ?? gitPipeline.authority.authorityGeneration,
                         observedPredecessorAuthorityGeneration:
                         failure.observedPredecessorAuthorityGeneration,
                         attemptStartedUptimeNanoseconds: failure.attemptStartedUptimeNanoseconds,
@@ -8353,16 +8733,18 @@ actor WorkspaceCodemapBindingEngine {
         if case var .eligible(session)? = roots[workKey.scope.rootEpoch],
            session.id == workKey.sessionID,
            var pipeline = session.pipelines[workKey.scope.pipelineIdentity],
+           var gitPipeline = pipeline.git,
            pipeline.id == workKey.pipelineSessionID
         {
-            for (path, change) in pipeline.pendingManifestChanges
+            for (path, change) in gitPipeline.pendingManifestChanges
                 where workItemIDs.contains(change.workItemID)
             {
-                pipeline.pendingManifestChanges.removeValue(forKey: path)
+                gitPipeline.pendingManifestChanges.removeValue(forKey: path)
             }
-            pipeline.manifestState = pipeline.pendingManifestChanges.isEmpty
-                ? pipeline.manifestState
-                : .dirtyRetryRequired
+            if !gitPipeline.pendingManifestChanges.isEmpty {
+                gitPipeline.manifestState = .dirtyRetryRequired
+            }
+            pipeline.git = gitPipeline
             session.pipelines[workKey.scope.pipelineIdentity] = pipeline
             roots[workKey.scope.rootEpoch] = .eligible(session)
         }
@@ -8432,13 +8814,16 @@ actor WorkspaceCodemapBindingEngine {
             guard case var .eligible(session)? = roots[workKey.scope.rootEpoch],
                   session.id == workKey.sessionID,
                   var pipeline = session.pipelines[workKey.scope.pipelineIdentity],
+                  var gitPipeline = pipeline.git,
                   pipeline.id == workKey.pipelineSessionID
             else { continue }
+            // Extracted once so the pending-change dictionary is mutated in place rather than
+            // copied through the projection on every discarded mutation.
             var didRemove = false
             for item in workItems where item.workKey == workKey {
                 for mutation in item.mutations {
-                    if pipeline.pendingManifestChanges[mutation.repositoryRelativePath]?.workItemID == item.id {
-                        pipeline.pendingManifestChanges.removeValue(forKey: mutation.repositoryRelativePath)
+                    if gitPipeline.pendingManifestChanges[mutation.repositoryRelativePath]?.workItemID == item.id {
+                        gitPipeline.pendingManifestChanges.removeValue(forKey: mutation.repositoryRelativePath)
                         didRemove = true
                     }
                 }
@@ -8446,8 +8831,9 @@ actor WorkspaceCodemapBindingEngine {
             if didRemove {
                 // Abandonment is never equivalent to durability. Keep the live session dirty
                 // even when the discarded newest mutation owned the only pending path entry.
-                pipeline.manifestState = .dirtyRetryRequired
+                gitPipeline.manifestState = .dirtyRetryRequired
             }
+            pipeline.git = gitPipeline
             session.pipelines[workKey.scope.pipelineIdentity] = pipeline
             roots[workKey.scope.rootEpoch] = .eligible(session)
         }
@@ -8559,7 +8945,7 @@ actor WorkspaceCodemapBindingEngine {
                   job.id == jobID,
                   graphIndexJobIsCurrent(job),
                   job.generation == generation,
-                  pipeline.pipelineIdentity == pipeline.namespace.pipelineIdentity
+                  pipeline.pipelineIdentity == pipeline.git?.namespace.pipelineIdentity
             else { return false }
             return true
         }
@@ -8919,15 +9305,16 @@ actor WorkspaceCodemapBindingEngine {
         namespace: CodeMapRootManifestNamespace
     ) async -> ManifestRevisionCompletion {
         guard case let .eligible(session)? = roots[scope.rootEpoch],
-              let pipeline = session.pipelines[scope.pipelineIdentity]
+              let pipeline = session.pipelines[scope.pipelineIdentity],
+              let gitPipeline = pipeline.git
         else { return .discarded }
-        if pipeline.persistedManifestRevision >= revision {
+        if gitPipeline.persistedManifestRevision >= revision {
             return .persisted
         }
         let waiterID = UUID()
         guard workKey.sessionID == session.id,
               workKey.pipelineSessionID == pipeline.id,
-              pipeline.namespace == namespace
+              gitPipeline.namespace == namespace
         else { return .discarded }
         pendingManifestWaiterInstalls.insert(waiterID)
         return await withTaskCancellationHandler {
@@ -8941,13 +9328,14 @@ actor WorkspaceCodemapBindingEngine {
                       case let .eligible(currentSession)? = roots[scope.rootEpoch],
                       currentSession.id == workKey.sessionID,
                       let currentPipeline = currentSession.pipelines[scope.pipelineIdentity],
+                      let currentGitPipeline = currentPipeline.git,
                       currentPipeline.id == workKey.pipelineSessionID,
-                      currentPipeline.namespace == namespace
+                      currentGitPipeline.namespace == namespace
                 else {
                     continuation.resume(returning: .discarded)
                     return
                 }
-                if currentPipeline.persistedManifestRevision >= revision {
+                if currentGitPipeline.persistedManifestRevision >= revision {
                     continuation.resume(returning: .persisted)
                     return
                 }
@@ -9104,7 +9492,7 @@ actor WorkspaceCodemapBindingEngine {
             )
         }
         guard session.invalidationGeneration < UInt64.max,
-              session.pipelines.values.allSatisfy({ $0.manifestRevision < UInt64.max }),
+              session.pipelines.values.allSatisfy({ ($0.git?.manifestRevision ?? 0) < UInt64.max }),
               safePaths.allSatisfy({ (session.pathGenerations[$0] ?? 0) < UInt64.max })
         else {
             return await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .authorityChanged)
@@ -9121,10 +9509,12 @@ actor WorkspaceCodemapBindingEngine {
         var manifestRemovals: [CodeMapPipelineIdentity: [ManifestMutation]] = [:]
         for identity in session.pipelines.keys {
             for path in safePaths {
-                if let repositoryPath = repositoryPath(
-                    loadedRootRelativePath: path,
-                    prefix: session.capability.repositoryRelativeLoadedRootPrefix
-                ) {
+                if let prefix = session.capability.gitCapability?.repositoryRelativeLoadedRootPrefix,
+                   let repositoryPath = repositoryPath(
+                       loadedRootRelativePath: path,
+                       prefix: prefix
+                   )
+                {
                     manifestRemovals[identity, default: []].append(
                         .remove(repositoryRelativePath: repositoryPath)
                     )
@@ -9182,14 +9572,26 @@ actor WorkspaceCodemapBindingEngine {
 
     private func invalidateRootAuthority(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        reason: WorkspaceCodemapLiveOverlayInvalidationReason
+        reason: WorkspaceCodemapLiveOverlayInvalidationReason,
+        expecting expectation: SessionAuthorityExpectation? = nil
     ) async -> WorkspaceCodemapBindingInvalidationResult {
         if case let .registering(attempt)? = roots[rootEpoch] {
+            // A fenced invalidation names one already eligible session. A registration attempt is
+            // never that session, and cancelling it here would destroy the replacement instead of
+            // the authority the caller actually validated.
+            guard expectation == nil else {
+                return WorkspaceCodemapBindingInvalidationResult(
+                    revokedOverlayCount: 0,
+                    cancelledRequestCount: 0,
+                    manifestWriteFailed: false
+                )
+            }
             replacementCancelledRegistrationAttemptIDs.insert(attempt.id)
             roots.removeValue(forKey: rootEpoch)
             pruneAdmissionHistory()
+            let detachedAttemptGraphRoot = detachGraphRoot(rootEpoch: rootEpoch)
             await capabilityService.invalidateForAuthorityReplacement(rootEpoch: rootEpoch)
-            await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .rootUnloaded)
+            await shutdownDetachedGraphRoot(detachedAttemptGraphRoot, reason: .rootUnloaded)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             emit(.invalidation, rootEpoch: rootEpoch, invalidationReason: reason)
             return WorkspaceCodemapBindingInvalidationResult(
@@ -9198,13 +9600,19 @@ actor WorkspaceCodemapBindingEngine {
                 manifestWriteFailed: false
             )
         }
-        guard case let .eligible(session)? = roots[rootEpoch] else {
+        guard case let .eligible(session)? = roots[rootEpoch],
+              expectation.map({ sessionIsCurrent($0, rootEpoch: rootEpoch) }) ?? true
+        else {
             return WorkspaceCodemapBindingInvalidationResult(
                 revokedOverlayCount: 0,
                 cancelledRequestCount: 0,
                 manifestWriteFailed: false
             )
         }
+        // Everything this epoch owns is detached before the first suspension below. `registerRoot`
+        // may install a replacement over the `.unavailable(.unresolved)` state written here, so any
+        // later epoch lookup could act on that replacement instead of the session being revoked.
+        // After this point only captured resources and authority-fenced calls are used.
         _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
         let requestIDs = activeRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id)
         let queuedIDs = queuedRequests.values.filter { $0.rootEpoch == rootEpoch }.map(\.id)
@@ -9215,17 +9623,29 @@ actor WorkspaceCodemapBindingEngine {
         detachManifestWriters(rootEpoch: rootEpoch)
         detachManifestAdoptionOperations(rootEpoch: rootEpoch)
         let cancellationBatch = synchronouslyCancelRequests(requestIDs + queuedIDs)
-        await runtime.manifestStore.endManifestWriterSession(session.manifestWriterSession)
-
-        let revoked = await overlay.invalidateRootAuthority(
-            rootEpoch: rootEpoch,
-            expectedAuthority: session.capability.repositoryAuthority,
-            reason: reason
-        )
-        await shutdownGraphRoot(rootEpoch: rootEpoch, reason: .repositoryAuthorityChanged)
+        let detachedGraphRoot = detachGraphRoot(rootEpoch: rootEpoch)
         adoptionReservations = adoptionReservations.filter { $0.key.rootEpoch != rootEpoch }
         retainedAdoptions = retainedAdoptions.filter { $0.key.rootEpoch != rootEpoch }
         pruneAdmissionHistory()
+
+        if reason == .authorityChanged {
+            // Same-epoch authority replacement must drop the actor record too, or the replacement
+            // registration would be handed the revoked capability again. This is non-tombstoning:
+            // the retained high-water generation keeps the next authority strictly newer, and the
+            // old Git layout is released with the record.
+            await capabilityService.invalidateForAuthorityReplacement(rootEpoch: rootEpoch)
+        }
+        // A filesystem session never registered a writer session, so there is nothing to end.
+        if let writerSession = session.manifest.writerSession {
+            await runtime.manifestStore.endManifestWriterSession(writerSession)
+        }
+
+        let revoked = await overlay.invalidateRootAuthority(
+            rootEpoch: rootEpoch,
+            expectedAuthority: session.capability.rootAuthority,
+            reason: reason
+        )
+        await shutdownDetachedGraphRoot(detachedGraphRoot, reason: .rootAuthorityChanged)
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
         emit(.invalidation, rootEpoch: rootEpoch, invalidationReason: reason)
@@ -9296,6 +9716,9 @@ actor WorkspaceCodemapBindingEngine {
         association: VerifiedGitBlobCodeMapLocatorAssociation,
         bindingGeneration: UInt64
     ) throws -> CodeMapRootManifestRecord {
+        guard let gitPipeline = pipeline.git else {
+            throw WorkspaceCodemapBindingEngineProviderError.unconfigured
+        }
         let contribution: CodeMapSelectionGraphContribution? = switch association.outcome {
         case let .ready(artifact):
             CodeMapSelectionGraphContribution(
@@ -9312,12 +9735,12 @@ actor WorkspaceCodemapBindingEngine {
             nil
         }
         return try CodeMapRootManifestRecord.verifiedClean(
-            namespace: pipeline.namespace,
+            namespace: gitPipeline.namespace,
             repositoryRelativePath: repositoryRelativePath,
             gitMode: gitMode,
             association: association,
             contribution: contribution,
-            authority: pipeline.authority,
+            authority: gitPipeline.authority,
             bindingGeneration: bindingGeneration
         )
     }

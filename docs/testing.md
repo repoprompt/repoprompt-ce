@@ -469,10 +469,9 @@ The smoke lane uses a script-owned app worktree and temporary roots. It checks:
   UUID/path/type evidence plus binding and per-file root/path evidence to
   exclude cross-root/non-Git substitutions;
 - main/worktree/non-Git marker searches do not leak across explicit root filters;
-- non-Git search/read work and codemap returns an explicit typed unavailable
-  status and issue code rather than a
-  graph from another root, with exactly one attributed `get_code_structure`
-  work record and zero Git commands;
+- non-Git search/read work and the code map returns that root's own current
+  marker content rather than a graph from another root, with exactly one
+  attributed `get_code_structure` work record and zero Git commands;
 - watcher create, edit, rename, and delete converge via bounded polling of
   successful exact-binding raw search records;
 - before, during, and after every ordinary/linked-worktree add/remove, the
@@ -493,7 +492,8 @@ The smoke lane uses a script-owned app worktree and temporary roots. It checks:
   folder” rejection is accepted. Generic or mismatched failures are rejected,
   and the surviving root must still succeed through exact binding/path evidence.
   The separate non-Git codemap check instead requires the current non-Git root
-  remain present in the binding with typed `git_root_unavailable` evidence.
+  remain present in the binding and serve successful current-marker code-map
+  structure evidence.
 
 The harness records and checks parent and child terminal status, removes only
 roots it added, cancels/waits only sessions it started, and removes registered,
@@ -593,6 +593,14 @@ self-attest:
 }
 ```
 
+Baseline validation compares the schema, gate, metric, configuration, privacy,
+and fixture-digest inventories, not individual correctness scenario keys, and
+the non-Git checks contribute no performance metric. A previously accepted
+same-fixture baseline therefore stays valid across the non-Git scenario change;
+record the changed scenario set in the run's acceptance notes instead of
+bumping the schema version, loosening thresholds, or self-accepting a baseline
+from the feature run.
+
 The release gate deliberately refuses a missing, hand-written/unaccepted,
 different-fixture, wrong-count, missing-inventory, zero, `NaN`, or infinite
 baseline:
@@ -655,8 +663,14 @@ The command passes only when all of these gates pass:
    removal, that exact session/context must terminalize or be cancelled and an
    atomic probe of its old full path must return typed empty revocation with the
    linked root absent from binding and no primary/cross-root fallback.
-5. Non-Git search/read succeeds, structure is typed terminal, and the scoped
-   build/projection/catalog counters remain unchanged. Watcher
+5. Non-Git search/read succeeds and structure maps the root's current on-disk
+   bytes: the scoped engine is present, reports `source_kind:filesystem` and
+   `manifest_mode:not_applicable`, records no manifest write or queued manifest
+   mutation byte, and a subsequent edit replaces the old marker with the new one
+   in the next structure reply. Build/projection/catalog counters are not
+   required to move, because automatic indexing may already have completed and
+   content-addressed reuse can avoid extraction; process absence is proven by
+   the native injected-spawner test, not by this mode text. Watcher
    create/edit/rename/delete publishes only current structure and markers.
    Strict directory overflow returns empty `budget`, `attempted:2`, `limit:1`,
    and zero downstream build/projection/catalog demand.
@@ -689,8 +703,9 @@ The command passes only when all of these gates pass:
    session and has no 1,000-session cap.
 
 Any missing raw evidence, missing retry delay, stale path/content/marker,
-privacy leak, non-Git codemap work, latency/resource regression, nonterminal
-agent, ambiguous ownership, or incomplete cleanup is a hard failure. On an
+privacy leak, non-Git manifest persistence, stale non-Git marker,
+latency/resource regression, nonterminal agent, ambiguous ownership, or
+incomplete cleanup is a hard failure. On an
 interrupted run, use the existing `cleanup` command with the artifact path; it
 releases or proves expiry of recorded codemap holds and removes recorded added
 roots only when its independent ownership checks pass. Temporary non-Git roots
