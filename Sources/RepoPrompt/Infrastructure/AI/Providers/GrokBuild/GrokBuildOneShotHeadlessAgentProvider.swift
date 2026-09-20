@@ -26,18 +26,6 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         self.apiKeyProvider = apiKeyProvider
     }
 
-    #if DEBUG
-        static func test_promptArguments(
-            promptFilePath: String = "/tmp/prompt.txt"
-        ) -> [String] {
-            GrokBuildOneShotCLIOptions(
-                promptFilePath: promptFilePath,
-                model: nil,
-                effort: nil
-            ).toTokens()
-        }
-    #endif
-
     func streamAgentMessage(
         _ message: AgentMessage,
         runID: UUID? = nil

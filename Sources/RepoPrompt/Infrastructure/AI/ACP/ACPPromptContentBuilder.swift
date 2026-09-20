@@ -15,18 +15,11 @@ enum ACPPromptContentBuilder {
 
     static func blocks(
         text: String,
-        attachments: [AgentImageAttachment]
-    ) throws -> [[String: Any]] {
-        try blocks(text: text, attachments: attachments, transientImages: [])
-    }
-
-    static func blocks(
-        text: String,
         attachments: [AgentImageAttachment],
-        transientImages: [AITransientImage]
+        transientImages: [AITransientImage] = []
     ) throws -> [[String: Any]] {
         var blocks: [[String: Any]] = []
-        if !text.isEmpty || attachments.isEmpty && transientImages.isEmpty {
+        if !text.isEmpty || (attachments.isEmpty && transientImages.isEmpty) {
             blocks.append([
                 "type": "text",
                 "text": text

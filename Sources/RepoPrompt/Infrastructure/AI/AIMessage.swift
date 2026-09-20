@@ -361,7 +361,8 @@ struct AIMessage {
             if let annotation = image.titleAnnotation {
                 parts.append(.text(annotation))
             }
-            parts.append(.imageUrl(.init(url: URL(string: image.openAIDataURL)!, detail: nil)))
+            guard let imageURL = URL(string: image.openAIDataURL) else { continue }
+            parts.append(.imageUrl(.init(url: imageURL, detail: nil)))
         }
         return .contentArray(parts)
     }

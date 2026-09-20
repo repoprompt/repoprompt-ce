@@ -88,33 +88,38 @@ final class OracleImageContractTests: XCTestCase {
         XCTAssertEqual(unrelated.toolArgsJSON, raw)
     }
 
-    func testPartialArgumentsFailClosedOnlyWhenImagesKeyIsPossible() {
-        let cases: [(String, String?)] = [
-            (#"{"message":"partial""#, #"{"message":"partial""#),
-            (#"{"message":"say \"images\": hi""#, #"{"message":"say \"images\": hi""#),
-            (#"{"message":"\ud83d"#, #"{"message":"\ud83d"#),
-            (#"{"message":"x","m"#, #"{"message":"x","m"#),
-            (#"{"message":"x",""#, nil),
-            (#"{"message":"x","ima"#, nil),
-            (#"{"images":[{"path":"/Users/secret.png""#, nil),
-            (#"{"\u0069mages":[{"path":"/Users/secret.png""#, nil),
-            (#"{"i\u006Dages":[{"path":"/Users/secret.png""#, nil),
-            // Missing comma before a would-be "images" key is not a strict JSON prefix.
-            (#"{"message":"x" "images":[{"path":"/Users/secret.png""#, nil),
-            (#"{"message":"x" "ima"#, nil),
-            (#"{"message":1 "images""#, nil),
-            (#"{"message":"x"}{"images":[]"#, nil),
-            // A completed top-level key whose value never started is not a clean prefix.
-            (#"{"message":"x","other""#, nil)
+    func testMalformedOracleArgumentsFailClosed() {
+        // Every malformed or truncated ask_oracle payload fails closed — a partial prefix
+        // might yet grow an "images" key, and an impossible prefix may already carry one.
+        let malformed = [
+            #"{"message":"partial""#,
+            #"{"message":"say \"images\": hi""#,
+            #"{"message":"\ud83d"#,
+            #"{"message":"x","m"#,
+            #"{"message":"x",""#,
+            #"{"message":"x","ima"#,
+            #"{"images":[{"path":"/Users/secret.png""#,
+            #"{"\u0069mages":[{"path":"/Users/secret.png""#,
+            #"{"i\u006Dages":[{"path":"/Users/secret.png""#,
+            #"{"message":"x" "images":[{"path":"/Users/secret.png""#,
+            #"{"message":"x" "ima"#,
+            #"{"message":1 "images""#,
+            #"{"message":"x"}{"images":[]"#,
+            #"{"message":"x","other""#,
+            // Syntactically impossible nested content still carrying image material.
+            #"{"message":["x","images":[{"path":"/Users/secret.png","title":"Secret"#,
+            // Complete non-object values cannot carry a top-level images key, but fail
+            // closed anyway — tool arguments are always objects.
+            #"[{"images":[]}]"#,
+            #""images""#
         ]
 
-        for (raw, expected) in cases {
-            XCTAssertEqual(
+        for raw in malformed {
+            XCTAssertNil(
                 AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
                     toolName: "ask_oracle",
                     argsJSON: raw
                 ),
-                expected,
                 raw
             )
             XCTAssertEqual(
@@ -211,7 +216,7 @@ final class OracleImageContractTests: XCTestCase {
         XCTAssertEqual(oracleRoundTrip.toolArgsJSON, oracleRaw)
     }
 
-    func testLateAndPartialToolArgumentsPreserveTextButRedactImages() throws {
+    func testLateToolArgumentsRedactImagesAndFailClosed() throws {
         let raw = #"{"message":"inspect","images":[{"path":"/Users/late-secret.png"}]}"#
         var item = AgentChatItem.toolCall(name: "read_file", argsJSON: nil)
         item.toolName = "ask_oracle"
@@ -222,7 +227,7 @@ final class OracleImageContractTests: XCTestCase {
         XCTAssertFalse(sanitized.contains("late-secret"))
 
         item.toolArgsJSON = #"{"message":"partial"#
-        XCTAssertEqual(item.toolArgsJSON, #"{"message":"partial"#)
+        XCTAssertNil(item.toolArgsJSON)
         item.toolArgsJSON = #"{"images":[{"path":"/Users/partial-secret.png"#
         XCTAssertNil(item.toolArgsJSON)
     }
