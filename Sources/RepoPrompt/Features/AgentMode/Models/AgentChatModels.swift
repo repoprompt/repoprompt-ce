@@ -151,7 +151,9 @@ enum AgentToolArgumentPersistencePolicy {
         guard let data = argsJSON.data(using: .utf8),
               var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return partialArgumentsCouldContainImagesKey(argsJSON) ? nil : argsJSON
+            // Fail closed: malformed or truncated ask_oracle arguments may contain an
+            // unparseable "images" key, so nothing partial is ever persisted.
+            return nil
         }
         guard object.removeValue(forKey: "images") != nil else { return argsJSON }
         guard JSONSerialization.isValidJSONObject(object),
@@ -160,160 +162,6 @@ enum AgentToolArgumentPersistencePolicy {
             return nil
         }
         return String(data: sanitized, encoding: .utf8)
-    }
-
-    /// Top-level parse state while scanning a partial `ask_oracle` arguments object. Anything
-    /// that cannot appear at that position in a strict JSON object prefix fails closed.
-    private enum PartialTopLevelState {
-        case expectingKey
-        case expectingColon
-        case expectingValue
-        case afterValue
-    }
-
-    /// Fails closed: returns `true` whenever a malformed/truncated arguments prefix *could*
-    /// contain a top-level `"images"` key, or whenever the prefix is syntactically impossible
-    /// in strict JSON. `false` is reserved for prefixes that are provably image-free strict
-    /// JSON prefixes (or end inside a top-level key that cannot complete to `"images"`).
-    private static func partialArgumentsCouldContainImagesKey(_ text: String) -> Bool {
-        let target = "images"
-        let scalars = Array(text.unicodeScalars)
-        var index = 0
-        while index < scalars.count, CharacterSet.whitespacesAndNewlines.contains(scalars[index]) {
-            index += 1
-        }
-        guard index < scalars.count else { return false }
-        guard scalars[index] == "{" else { return true }
-        index += 1
-
-        var depth = 1
-        var state: PartialTopLevelState = .expectingKey
-        var literalValueStarted = false
-        var inString = false
-        var stringIsTopLevelKey = false
-        var key = ""
-        var escaped = false
-
-        func appendKeyScalar(_ scalar: UnicodeScalar, to key: inout String) {
-            guard key.count <= target.count else { return }
-            key.unicodeScalars.append(scalar)
-        }
-
-        while index < scalars.count {
-            let scalar = scalars[index]
-            if inString {
-                if escaped {
-                    if scalar == "u" {
-                        guard index + 4 < scalars.count else {
-                            // Truncated `\u` escape: fail closed when it could still be a key.
-                            return stringIsTopLevelKey && target.hasPrefix(key)
-                        }
-                        if stringIsTopLevelKey {
-                            let digits = String(String.UnicodeScalarView(scalars[(index + 1) ... (index + 4)]))
-                            guard let value = UInt32(digits, radix: 16), let decoded = UnicodeScalar(value) else {
-                                return true
-                            }
-                            appendKeyScalar(decoded, to: &key)
-                        }
-                        index += 5
-                        escaped = false
-                        continue
-                    }
-                    if stringIsTopLevelKey {
-                        let decoded: UnicodeScalar = switch scalar {
-                        case "\"": "\""
-                        case "\\": "\\"
-                        case "/": "/"
-                        case "b": "\u{08}"
-                        case "f": "\u{0C}"
-                        case "n": "\n"
-                        case "r": "\r"
-                        case "t": "\t"
-                        default: scalar
-                        }
-                        appendKeyScalar(decoded, to: &key)
-                    }
-                    escaped = false
-                    index += 1
-                    continue
-                }
-                if scalar == "\\" {
-                    escaped = true
-                } else if scalar == "\"" {
-                    if stringIsTopLevelKey, key == target {
-                        return true
-                    }
-                    inString = false
-                    if depth == 1 {
-                        if stringIsTopLevelKey {
-                            state = .expectingColon
-                        } else if state == .expectingValue {
-                            state = .afterValue
-                        }
-                    }
-                } else if stringIsTopLevelKey {
-                    appendKeyScalar(scalar, to: &key)
-                }
-                index += 1
-                continue
-            }
-
-            switch scalar {
-            case "\"":
-                if depth == 1 {
-                    switch state {
-                    case .expectingKey:
-                        stringIsTopLevelKey = true
-                        key = ""
-                    case .expectingValue where !literalValueStarted:
-                        stringIsTopLevelKey = false
-                    default:
-                        // A string where a key/value separator or comma was required is not a
-                        // strict JSON prefix (e.g. `{"a":"b" "images":...`).
-                        return true
-                    }
-                } else {
-                    stringIsTopLevelKey = false
-                }
-                inString = true
-            case "{", "[":
-                if depth == 1 {
-                    guard state == .expectingValue, !literalValueStarted else { return true }
-                    literalValueStarted = false
-                }
-                depth += 1
-            case "}", "]":
-                depth -= 1
-                if depth <= 0 { return true }
-                if depth == 1 { state = .afterValue }
-            case ":" where depth == 1:
-                guard state == .expectingColon else { return true }
-                state = .expectingValue
-                literalValueStarted = false
-            case "," where depth == 1:
-                guard state == .afterValue else { return true }
-                state = .expectingKey
-            default:
-                if depth == 1, !CharacterSet.whitespacesAndNewlines.contains(scalar) {
-                    switch state {
-                    case .expectingValue:
-                        // Start/continuation of a number or literal value.
-                        literalValueStarted = true
-                    default:
-                        return true
-                    }
-                }
-            }
-            index += 1
-        }
-
-        guard inString else {
-            // Only a prefix that stops cleanly after a complete top-level value is provably
-            // image-free. Mid-key, mid-pair, or post-comma prefixes could still add "images".
-            return state != .afterValue
-        }
-        guard stringIsTopLevelKey else { return false }
-        return escaped || target.hasPrefix(key)
     }
 
     /// Whether the tool name resolves to RepoPrompt's `ask_oracle`, using the canonical MCP
@@ -491,36 +339,6 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             AgentLaneUpdateDisplayAttribution.self,
             forKey: .laneUpdateDisplayAttribution
         )?.validated
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(timestamp, forKey: .timestamp)
-        try container.encode(kind, forKey: .kind)
-        try container.encode(text, forKey: .text)
-        try container.encode(attachments, forKey: .attachments)
-        try container.encode(taggedFileAttachments, forKey: .taggedFileAttachments)
-        let acceptedToolName = AgentToolNamePolicy.accepted(toolName)
-        try container.encodeIfPresent(acceptedToolName, forKey: .toolName)
-        try container.encodeIfPresent(toolInvocationID, forKey: .toolInvocationID)
-        try container.encodeIfPresent(
-            AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
-                toolName: acceptedToolName,
-                argsJSON: toolArgsJSON
-            ),
-            forKey: .toolArgsJSON
-        )
-        try container.encodeIfPresent(toolResultJSON, forKey: .toolResultJSON)
-        try container.encodeIfPresent(toolIsError, forKey: .toolIsError)
-        try container.encodeIfPresent(reasoning, forKey: .reasoning)
-        try container.encode(sequenceIndex, forKey: .sequenceIndex)
-        try container.encode(isStreaming, forKey: .isStreaming)
-        try container.encodeIfPresent(workflow, forKey: .workflow)
-        try container.encodeIfPresent(codexGoalMode, forKey: .codexGoalMode)
-        try container.encode(isLocalControlPlaneEcho, forKey: .isLocalControlPlaneEcho)
-        try container.encodeIfPresent(crossSessionAttribution, forKey: .crossSessionAttribution)
-        try container.encodeIfPresent(laneUpdateDisplayAttribution, forKey: .laneUpdateDisplayAttribution)
     }
 
     // MARK: - Factory Methods
@@ -810,36 +628,6 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case isLocalControlPlaneEcho
         case crossSessionAttribution
         case laneUpdateDisplayAttribution
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(timestamp, forKey: .timestamp)
-        try container.encode(kind, forKey: .kind)
-        try container.encode(text, forKey: .text)
-        try container.encode(attachments, forKey: .attachments)
-        try container.encode(taggedFileAttachments, forKey: .taggedFileAttachments)
-        let acceptedToolName = AgentToolNamePolicy.accepted(toolName)
-        try container.encodeIfPresent(acceptedToolName, forKey: .toolName)
-        try container.encodeIfPresent(toolInvocationID, forKey: .toolInvocationID)
-        try container.encodeIfPresent(
-            AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
-                toolName: acceptedToolName,
-                argsJSON: toolArgsJSON
-            ),
-            forKey: .toolArgsJSON
-        )
-        try container.encodeIfPresent(toolResultJSON, forKey: .toolResultJSON)
-        try container.encodeIfPresent(toolIsError, forKey: .toolIsError)
-        try container.encodeIfPresent(toolResultStatus, forKey: .toolResultStatus)
-        try container.encodeIfPresent(reasoning, forKey: .reasoning)
-        try container.encode(sequenceIndex, forKey: .sequenceIndex)
-        try container.encodeIfPresent(workflow, forKey: .workflow)
-        try container.encodeIfPresent(codexGoalMode, forKey: .codexGoalMode)
-        try container.encode(isLocalControlPlaneEcho, forKey: .isLocalControlPlaneEcho)
-        try container.encodeIfPresent(crossSessionAttribution, forKey: .crossSessionAttribution)
-        try container.encodeIfPresent(laneUpdateDisplayAttribution, forKey: .laneUpdateDisplayAttribution)
     }
 
     public init(from decoder: Decoder) throws {

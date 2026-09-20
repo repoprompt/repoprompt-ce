@@ -100,6 +100,20 @@ final class CodexCLIProvider: AIProvider {
         }
     }
 
+    /// Resumes a continuation at most once; the losing racer exits quietly.
+    private final class ResumeOnceGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var didResume = false
+
+        func resume(_ continuation: CheckedContinuation<Void, Never>) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !didResume else { return }
+            didResume = true
+            continuation.resume()
+        }
+    }
+
     private struct ReconciledTerminalTurn: Equatable {
         let turnID: String
         let status: CodexNativeSessionController.TurnStatus
@@ -340,8 +354,8 @@ final class CodexCLIProvider: AIProvider {
     }
 
     /// Bridges are expected to finish once their request client stops, but a wedged event
-    /// stream must not hang provider disposal forever.
-    private static let disposeDrainTimeout: TimeInterval = 15
+    /// stream must not hang provider disposal forever. `var` so tests can shorten it.
+    static var disposeDrainTimeout: TimeInterval = 15
 
     func dispose() async {
         let activeTasks = activeStreamTasks.closeAndCancelAll()
@@ -350,15 +364,21 @@ final class CodexCLIProvider: AIProvider {
             await client.stop()
         }
         for task in activeTasks {
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { await task.value }
-                group.addTask {
+            // Awaiting `task.value` inside a task group cannot be cancelled — a wedged bridge
+            // would hang the group on scope exit. Race an unstructured waiter against the
+            // timeout instead; on timeout the bridge keeps owning its staged-file cleanup.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let gate = ResumeOnceGate()
+                Task {
+                    await task.value
+                    gate.resume(continuation)
+                }
+                Task {
                     try? await Task.sleep(
                         nanoseconds: UInt64(Self.disposeDrainTimeout * 1_000_000_000)
                     )
+                    gate.resume(continuation)
                 }
-                _ = await group.next()
-                group.cancelAll()
             }
         }
     }

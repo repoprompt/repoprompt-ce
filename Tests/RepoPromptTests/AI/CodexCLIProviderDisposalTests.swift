@@ -33,6 +33,22 @@ final class CodexCLIProviderDisposalTests: XCTestCase {
         XCTAssertTrue(bridgeFinished)
     }
 
+    func testDisposeReturnsWhenBridgeTaskIgnoresCancellation() async {
+        CodexCLIProvider.disposeDrainTimeout = 0.05
+        defer { CodexCLIProvider.disposeDrainTimeout = 15 }
+
+        let provider = CodexCLIProvider(configureDiscoveryServer: false)
+        let bridgeTask = provider.test_registerActiveStreamTask(id: UUID()) {
+            // Ignores cancellation forever: awaits a continuation that never resumes.
+            Task { await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in } }
+        }
+        XCTAssertNotNil(bridgeTask)
+
+        let started = Date()
+        await provider.dispose()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+    }
+
     func testRegistrationAfterDisposeIsRefusedWithoutStartingTask() async {
         let provider = CodexCLIProvider(configureDiscoveryServer: false)
         await provider.dispose()

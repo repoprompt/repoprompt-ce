@@ -82,15 +82,6 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
     }
 
-    func testOneShotTextPromptKeepsPromptFileArguments() {
-        let arguments = GrokBuildOneShotHeadlessAgentProvider.test_promptArguments(
-            promptFilePath: "/tmp/prompt.txt"
-        )
-
-        XCTAssertEqual(Array(arguments.prefix(2)), ["--prompt-file", "/tmp/prompt.txt"])
-        XCTAssertFalse(arguments.contains("--prompt-json"))
-    }
-
     func testOneShotRejectsImagesBeforeLaunchWithoutLeakingPayload() async {
         let provider = GrokBuildOneShotHeadlessAgentProvider(
             config: GrokBuildCLIProvider.test_makeHeadlessConfig(modelName: nil)

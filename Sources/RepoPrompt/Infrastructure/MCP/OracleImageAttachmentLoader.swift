@@ -80,12 +80,6 @@ struct OracleImageRootSpec: Equatable {
 struct OracleImageUnavailableRoot: Equatable {
     /// Logical and unresolved-physical prefixes this root would have matched.
     let candidatePrefixes: [String]
-
-    func covers(_ path: String) -> Bool {
-        candidatePrefixes.contains { prefix in
-            path == prefix || path.hasPrefix(prefix + "/")
-        }
-    }
 }
 
 struct OracleImageWorkspaceAuthority: Equatable {
@@ -424,11 +418,24 @@ struct OracleImageAttachmentLoader {
                 )))
             }
         }
+        // Longest unavailable-binding prefix covering this path. A failed capture still owns
+        // its logical/physical prefixes, so it competes in specificity with available roots.
+        let unavailableSpecificity = authority.unavailableRoots
+            .flatMap(\.candidatePrefixes)
+            .filter { rawPath == $0 || rawPath.hasPrefix($0 + "/") }
+            .map(\.count)
+            .max()
+
         guard let maximumSpecificity = matches.map(\.specificity).max() else {
-            if authority.unavailableRoots.contains(where: { $0.covers(rawPath) }) {
+            if unavailableSpecificity != nil {
                 throw OracleImageLoadError.missingOrUnreadable(index: request.index)
             }
             throw OracleImageLoadError.outsideAuthority(index: request.index)
+        }
+        // A binding at least as specific as the best available match wins the request and
+        // fails it — a broader root must not substitute a different copy of the file.
+        if let unavailableSpecificity, unavailableSpecificity >= maximumSpecificity {
+            throw OracleImageLoadError.missingOrUnreadable(index: request.index)
         }
         let mostSpecific = matches.filter { $0.specificity == maximumSpecificity }
         let physicalPaths = Set(mostSpecific.map(\.resolution.physicalFilePath))

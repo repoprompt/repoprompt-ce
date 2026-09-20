@@ -8,8 +8,8 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
     private var testRoot: URL!
 
     override func setUpWithError() throws {
-        testRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".build/oracle-image-tests-\(UUID().uuidString)", isDirectory: true)
+        testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("oracle-image-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
     }
 
@@ -294,6 +294,67 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             authority: authority
         )) { error in
             XCTAssertEqual(error as? OracleImageLoadError, .outsideAuthority(index: 3))
+        }
+    }
+
+    func testUnavailableNestedBindingFailsInsteadOfFallingBackToBroaderRoot() throws {
+        // The nested binding's physical root is missing, but the same logical path also
+        // exists inside the available parent. The unavailable binding is more specific, so
+        // it must win the request and fail — not silently load the parent's copy.
+        let nestedLogical = testRoot.appendingPathComponent("pkg", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedLogical, withIntermediateDirectories: true)
+        try Self.pngData.write(to: nestedLogical.appendingPathComponent("diagram.png"))
+        let missingPhysical = testRoot.appendingPathComponent("missing-worktree", isDirectory: true)
+
+        let authority = try OracleImageAttachmentLoader.deriveAuthority(rootSpecs: [
+            OracleImageRootSpec(
+                physicalRootPath: testRoot.path,
+                logicalRootPaths: [testRoot.path]
+            ),
+            OracleImageRootSpec(
+                physicalRootPath: missingPhysical.path,
+                logicalRootPaths: [nestedLogical.path]
+            )
+        ])
+        XCTAssertEqual(authority.roots.count, 1)
+        XCTAssertEqual(authority.unavailableRoots.count, 1)
+
+        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+            requests: [.init(
+                index: 4,
+                path: nestedLogical.appendingPathComponent("diagram.png").path,
+                title: nil
+            )],
+            authority: authority
+        )) { error in
+            XCTAssertEqual(error as? OracleImageLoadError, .missingOrUnreadable(index: 4))
+        }
+    }
+
+    func testUnavailableBindingAtEqualSpecificityFailsClosed() throws {
+        // An available root and a failed binding claim the same logical prefix. The conflict
+        // is ambiguous, so the request fails rather than trusting the available root.
+        let missingPhysical = testRoot.appendingPathComponent("missing-worktree", isDirectory: true)
+        let authority = try OracleImageAttachmentLoader.deriveAuthority(rootSpecs: [
+            OracleImageRootSpec(
+                physicalRootPath: testRoot.path,
+                logicalRootPaths: [testRoot.path]
+            ),
+            OracleImageRootSpec(
+                physicalRootPath: missingPhysical.path,
+                logicalRootPaths: [testRoot.path]
+            )
+        ])
+        XCTAssertEqual(authority.roots.count, 1)
+        XCTAssertEqual(authority.unavailableRoots.count, 1)
+
+        let imageURL = testRoot.appendingPathComponent("image.png")
+        try Self.pngData.write(to: imageURL)
+        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+            requests: [.init(index: 2, path: imageURL.path, title: nil)],
+            authority: authority
+        )) { error in
+            XCTAssertEqual(error as? OracleImageLoadError, .missingOrUnreadable(index: 2))
         }
     }
 
