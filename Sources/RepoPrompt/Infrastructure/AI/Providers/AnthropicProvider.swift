@@ -34,15 +34,15 @@ class AnthropicProvider: AIProvider {
             }
 
             let role: MessageParameter.Message.Role = (entry.role == .user) ? .user : .assistant
-            let content: MessageParameter.Message.Content
-            if entry.role == .user, idx == lastUserIndex, !aiMessage.transientImages.isEmpty {
-                content = .list(Self.imageContentBlocks(
-                    text: contentText,
-                    images: aiMessage.transientImages
-                ))
-            } else {
-                content = .text(contentText)
-            }
+            let content: MessageParameter.Message.Content =
+                if entry.role == .user, idx == lastUserIndex, !aiMessage.transientImages.isEmpty {
+                    .list(Self.imageContentBlocks(
+                        text: contentText,
+                        images: aiMessage.transientImages
+                    ))
+                } else {
+                    .text(contentText)
+                }
             messages.append(
                 MessageParameter.Message(
                     role: role,
