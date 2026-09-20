@@ -734,6 +734,19 @@ import XCTest
             XCTAssertTrue(message.userMessage.contains("<token_budget>68500</token_budget>"), "A budget missing", file: file, line: line)
             XCTAssertFalse(message.userMessage.contains("<token_budget>\(liveBudgetTag)</token_budget>"), "live B budget present", file: file, line: line)
             XCTAssertTrue(message.systemPrompt.contains("ask_user"), "A question guidance missing", file: file, line: line)
+            // Captured A is Augment; desired B is Preserve. The mode instructions must come from the capture.
+            XCTAssertTrue(
+                message.systemPrompt.contains("Augment the handoff prompt (MANDATORY)"),
+                "captured Augment handoff guidance missing from the provider-bound system prompt",
+                file: file,
+                line: line
+            )
+            XCTAssertFalse(
+                message.systemPrompt.contains("Leave the prompt COMPLETELY unchanged"),
+                "live Preserve handoff guidance present in the provider-bound system prompt",
+                file: file,
+                line: line
+            )
         }
 
         /// Run IDs admitted by a journey, shared with the guaranteed cleanup even when the journey throws.
