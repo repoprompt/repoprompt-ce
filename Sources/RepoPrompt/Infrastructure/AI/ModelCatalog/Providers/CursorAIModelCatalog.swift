@@ -111,6 +111,18 @@ enum CursorAIModelCatalog {
     private static let entries: [Entry] = [
         Entry(AgentModel.cursorAuto.rawValue, AgentModel.cursorAuto.displayName),
         Entry(
+            "grok-4.7",
+            "Cursor Grok 4.7",
+            parameters: [
+                effortDefinition(
+                    values: ["low", "medium", "high", "xhigh"],
+                    defaultValue: "high",
+                    configID: "reasoning_effort"
+                ),
+                speedDefinition(defaultValue: "true")
+            ]
+        ),
+        Entry(
             "grok-4.6",
             "Cursor Grok 4.6",
             aliases: ["cursor-grok-4.6"],

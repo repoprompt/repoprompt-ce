@@ -4,8 +4,8 @@ import XCTest
 final class CursorLocalModelCatalogTests: XCTestCase {
     func testCatalogPublishesReleaseGatedCursorModelsInProductOrder() {
         XCTAssertEqual(
-            CursorAIModelCatalog.options.prefix(4).map(\.rawValue),
-            ["auto", "grok-4.6", "grok-4.5", "composer-2.5"]
+            CursorAIModelCatalog.options.prefix(5).map(\.rawValue),
+            ["auto", "grok-4.7", "grok-4.6", "grok-4.5", "composer-2.5"]
         )
         XCTAssertTrue(CursorAIModelCatalog.contains(modelRaw: "grok-4.6"))
         XCTAssertTrue(CursorAIModelCatalog.contains(modelRaw: "Cursor Grok 4.6"))
