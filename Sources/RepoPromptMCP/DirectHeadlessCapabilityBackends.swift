@@ -1252,7 +1252,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                     }
                     pipe.fileHandleForReading.readabilityHandler = nil
                     let snapshot = outputCapture.finish {
-                        pipe.fileHandleForReading.readDataToEndOfFile()
+                        self.pipe.fileHandleForReading.readDataToEndOfFile()
                     }
                     if isCancellationRequested() {
                         continuation.resume(throwing: CancellationError())
