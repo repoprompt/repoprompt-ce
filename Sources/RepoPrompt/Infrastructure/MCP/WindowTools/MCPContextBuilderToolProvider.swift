@@ -4,6 +4,25 @@ import MCP
 import Ontology
 import RepoPromptDomainRuntime
 
+/// An unsatisfied prerequisite rejects discovery without rolling back earlier selection or binding effects.
+enum MCPContextBuilderSelectionPrerequisiteError: Error, Equatable, LocalizedError, CustomStringConvertible {
+    case deferred
+    case invalidated
+
+    var description: String {
+        switch self {
+        case .deferred:
+            "context_builder_selection_prerequisite_deferred: Context Builder discovery was not started because its selection prerequisite was deferred."
+        case .invalidated:
+            "context_builder_selection_prerequisite_invalidated: Context Builder discovery was not started because its selection prerequisite was invalidated."
+        }
+    }
+
+    var errorDescription: String? {
+        description
+    }
+}
+
 /// Carries existing non-Sendable UI snapshot/DTO values through the provider's @Sendable timeline
 /// wrappers without broadening their conformances. Each operation stores once and is fully awaited
 /// before the owning task loads once; the lock makes that narrow handoff explicit and race-safe.
@@ -468,11 +487,20 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             ),
             explicitWindowRoutingHint: metadata.explicitWindowRoutingHint
         )
-        guard try await dependencies.files.drainReadFileAutoSelection(
+        let selectionPrerequisite = try await dependencies.files.drainReadFileAutoSelection(
             targetMetadata,
             .mirroredSelectionAndMetrics
-        ) == .completed else {
+        )
+        try Task.checkCancellation()
+        switch selectionPrerequisite {
+        case .completed:
+            break
+        case .cancelled:
             throw CancellationError()
+        case .deferred:
+            throw MCPContextBuilderSelectionPrerequisiteError.deferred
+        case .invalidated:
+            throw MCPContextBuilderSelectionPrerequisiteError.invalidated
         }
         let runAuthority: ContextBuilderResolvedRunAuthority
         do {
