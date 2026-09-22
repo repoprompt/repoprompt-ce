@@ -128,6 +128,8 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             description: """
             Short-lived, read-only explore child agents for narrow codebase probes. Each child runs in a fresh session with its own context window. Always uses the `explore` role; no custom `model_id`, workflows, session reuse, `steer`, or `respond`.
 
+            When the app-global Model Router is enabled, each new explore child is routed across the configured subagent targets.
+
             Explore children inherit the caller's worktree bindings by default; pass `inherit_worktree=false` to opt out. Start-only worktree controls can bind an existing worktree or create one before provider startup, overriding an inherited primary-root binding. Multi-message creates produce one worktree per child when branch/path are implicit and reject a shared explicit branch or path.
 
             **Operations**: start | poll | wait | cancel
@@ -226,6 +228,8 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             - `design` — Architecture, design discussions, creative problem solving; writes a markdown review document (saved under `docs/reviews/`, `docs/designs/`, or `docs/analysis/`) as its primary deliverable for review/analysis tasks
 
             Role labels resolve through the effective global role-default mapping; see the top-level `task_labels` array from `agent_manage.list_agents` for the authoritative label→model mapping. If `model_id` is omitted on `start`, RepoPrompt uses the `pair` role. To pin an exact agent+model+effort target, pass a specific compound `model_id` from `agents[].models[].model_id` in the same response.
+
+            When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or explicit `model_parameters` remains an exact pin and bypasses routing.
 
             **Operations**: start | poll | wait | cancel | steer | respond
 

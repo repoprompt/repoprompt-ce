@@ -147,6 +147,29 @@ if not urls:
 url = urls[-1]
 status = "200"
 
+if url.startswith(f"https://api.github.com/repos/{os.environ['TIP_UPDATE_REPOSITORY']}/releases/"):
+    expected = f"Authorization: Bearer {os.environ['TIP_GH_TOKEN']}"
+    if expected not in args:
+        output.write_text('{"message":"API rate limit exceeded"}')
+        print("403", end="")
+        raise SystemExit(0)
+    if state["scenario"] == "metadata-denied":
+        output.write_text('{"message":"Forbidden"}')
+        print("403", end="")
+        raise SystemExit(0)
+    if url.endswith("/releases/latest") and "publish" in state["mutations"]:
+        state["latest_polls"] = state.get("latest_polls", 0) + 1
+        Path(os.environ["PUBLISHER_STUB_STATE"]).write_text(json.dumps(state))
+        if state["scenario"] == "latest-stale" or (
+            state["scenario"] == "latest-lag" and state["latest_polls"] < 3
+        ):
+            output.write_text('{"tag_name":"tip-bbbbbbbbbbbb"}')
+            print("200", end="")
+            raise SystemExit(0)
+elif url.startswith("https://github.com/"):
+    if any("Authorization:" in argument for argument in args):
+        raise SystemExit("public download must remain anonymous")
+
 if url.startswith("https://uploads.github.com/"):
     expected = f"Authorization: Bearer {os.environ['TIP_GH_TOKEN']}"
     if expected not in args:
@@ -244,6 +267,7 @@ class PublishTipReleaseTests(unittest.TestCase):
         self.stable_appcast = self.root / "stable-appcast.xml"
         self._write_executable(self.bin_dir / "gh", GH_STUB)
         self._write_executable(self.bin_dir / "curl", CURL_STUB)
+        self._write_executable(self.bin_dir / "sleep", "#!/bin/sh\nexit 0\n")
         self.assets, self.declaration = self._generate_candidate()
         self.stable_appcast.write_text(
             '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -469,6 +493,24 @@ class PublishTipReleaseTests(unittest.TestCase):
         self.assertFalse(state["release"]["draft"])
         self.assertEqual(state["tag_list_lookups_after_create"], 0)
         self.assert_compatible_lookup(state)
+
+    def test_metadata_authorization_failure_stops_before_mutation(self) -> None:
+        result = self._run("metadata-denied", None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Live Tip release lookup failed with HTTP 403", result.stderr)
+        self.assertEqual(self._state()["mutations"], [])
+
+    def test_latest_pointer_converges_after_publication(self) -> None:
+        result = self._run("latest-lag", None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._state()["latest_polls"], 3)
+
+    def test_latest_pointer_never_converges_fails_after_bounded_reads(self) -> None:
+        result = self._run("latest-stale", None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("after bounded convergence", result.stderr)
+        self.assertEqual(self._state()["latest_polls"], 7)
+        self.assertEqual(self._state()["mutations"].count("publish"), 1)
 
     def test_existing_empty_draft_resumes_by_release_id_and_publishes(self) -> None:
         release = self._release(draft=True)

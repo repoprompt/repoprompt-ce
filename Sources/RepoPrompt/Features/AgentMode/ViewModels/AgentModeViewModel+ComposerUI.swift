@@ -21,6 +21,7 @@ extension AgentModeViewModel {
         let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
         let acpControls = acpModelParameterControls(session: session)
         let acpRunLocksModelControls = session?.runState.isActive == true && !acpControls.isEmpty
+        let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
         return AgentComposerProps(
             currentTabID: tabID,
             submitTarget: submitTarget,
@@ -35,11 +36,13 @@ extension AgentModeViewModel {
             isWaitingForInstruction: isWaitingForInstruction,
             canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
             isCurrentTabMCPControlled: isMCPControlled,
-            areModelControlsDisabled: isMCPControlled || acpRunLocksModelControls,
+            areModelControlsDisabled: isMCPControlled || acpRunLocksModelControls || routerControlsFreshTask,
             providerControls: activeProviderControlsBinding,
             isCodexRunActive: isCodexRunActive,
             hasAvailableAgentProviders: hasAvailableAgentProviders,
             canSendWithCurrentProvider: canSendWithCurrentProvider,
+            isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
+            isGlobalModelRouterControllingFreshTask: routerControlsFreshTask,
             unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,

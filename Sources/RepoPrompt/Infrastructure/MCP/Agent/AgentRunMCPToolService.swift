@@ -332,6 +332,16 @@ struct AgentRunMCPToolService {
         resolvedTabID == nil ? defaultStartTaskLabelKind : nil
     }
 
+    static func taskLabelKindForRouterOwnedStart(
+        requestedModelID: String?,
+        defaultTaskLabel: AgentModelCatalog.TaskLabelKind?
+    ) -> AgentModelCatalog.TaskLabelKind? {
+        guard let requestedModelID else { return defaultTaskLabel }
+        let normalized = requestedModelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return defaultTaskLabel }
+        return AgentModelCatalog.taskLabels.first(where: { $0.label == normalized })?.kind
+    }
+
     let toolName: String
     let captureRequestMetadata: () async -> RequestMetadata
     let requireTargetWindow: () throws -> WindowState
@@ -504,13 +514,50 @@ struct AgentRunMCPToolService {
         // for agent_run.start resolves through the effective workspace Pair role default.
         let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
 
-        // Validate model selection before creating a target. Role labels resolve through effective workspace/global role defaults.
-        let selection = try AgentMCPSelectionResolver.resolve(
-            modelID: normalizedString(args["model_id"]),
-            defaultTaskLabel: defaultTaskLabel,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
+        // Router mode owns the child target before any caller-supplied model is resolved. This lets
+        // it replace stale or currently unavailable child pins instead of failing on a selection it
+        // will not use. With Router disabled, preserve the existing strict model_id validation.
+        let requestedModelID = normalizedString(args["model_id"])
+        let routedTaskLabelKind = Self.taskLabelKindForRouterOwnedStart(
+            requestedModelID: requestedModelID,
+            defaultTaskLabel: defaultTaskLabel
         )
+        var selection: AgentMCPSelectionResolver.ResolvedSelection
+        var routedReasoningEffortRaw: String?
+        var routerSelectedTarget = false
+        do {
+            if let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
+                task: message,
+                surface: .general
+            ) {
+                selection = AgentMCPSelectionResolver.ResolvedSelection(
+                    agentRaw: routed.agentRaw,
+                    modelRaw: routed.modelRaw,
+                    taskLabelKind: routedTaskLabelKind,
+                    modelParameterSelections: routed.modelParameters
+                )
+                routedReasoningEffortRaw = routed.reasoningEffortRaw
+                routerSelectedTarget = true
+                #if DEBUG
+                    AgentModePerfDiagnostics.event("modelRouter.subagent.selected", fields: [
+                        "entryPoint": "agent_run.start",
+                        "provider": routed.agentRaw,
+                        "model": routed.modelRaw,
+                        "effort": routed.reasoningEffortRaw ?? "provider-default",
+                        "overrodeRequestedModel": String(requestedModelID != nil || args["model_parameters"] != nil)
+                    ])
+                #endif
+            } else {
+                selection = try AgentMCPSelectionResolver.resolve(
+                    modelID: requestedModelID,
+                    defaultTaskLabel: defaultTaskLabel,
+                    availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+                    workspaceID: workspace.id
+                )
+            }
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -773,7 +820,7 @@ struct AgentRunMCPToolService {
                 .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
                 ?? workspace.repoPaths.first
             let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
-                value: args["model_parameters"],
+                value: routerSelectedTarget ? nil : args["model_parameters"],
                 agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
                 modelRaw: selection.modelRaw,
                 workspacePath: runParameterWorkspacePath
@@ -837,7 +884,7 @@ struct AgentRunMCPToolService {
                 agentModeVM,
                 selection.agentRaw,
                 selection.modelRaw,
-                nil,
+                routedReasoningEffortRaw,
                 selection.taskLabelKind,
                 workflow,
                 spawnParentSessionID,
@@ -1264,8 +1311,12 @@ struct AgentRunMCPToolService {
 
         // Steer-and-wait: optionally block until the agent reaches an interesting state
         let shouldWait: Bool = {
-            if let explicit = parseBool(args["wait"]) { return explicit }
-            if args["timeout_seconds"] != nil { return true }
+            if let explicit = parseBool(args["wait"]) {
+                return explicit
+            }
+            if args["timeout_seconds"] != nil {
+                return true
+            }
             return false
         }()
         let capturedDefaultWaitSeconds = Self.capturedDefaultWaitTimeoutSeconds()
@@ -2768,7 +2819,9 @@ struct AgentRunMCPToolService {
 
     private func optionalString(in object: [String: Value], key: String) throws -> String? {
         guard let value = object[key] else { return nil }
-        if case .null = value { return nil }
+        if case .null = value {
+            return nil
+        }
         guard let string = value.stringValue else {
             throw MCPError.internalError("Agent run snapshot interaction contained a malformed string field.")
         }
@@ -2785,7 +2838,9 @@ struct AgentRunMCPToolService {
 
     private func nullableBool(in object: [String: Value], key: String) throws -> Bool? {
         guard let value = object[key] else { return nil }
-        if case .null = value { return nil }
+        if case .null = value {
+            return nil
+        }
         return try optionalBool(in: object, key: key)
     }
 

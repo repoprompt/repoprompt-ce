@@ -509,6 +509,9 @@ class WindowStatesManager: ObservableObject {
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
 
+    /// App-global bundled router registry plus shared backend credential/readiness authorities.
+    let modelRouterRuntime = AgentTaskRouterRuntime()
+
     /// Serializes workspace activation and deletion claims across every app window.
     let workspaceActivityCoordinator = WorkspaceActivityCoordinator()
 
@@ -1271,6 +1274,7 @@ class WindowStatesManager: ObservableObject {
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            self.modelRouterRuntime.cancelAll()
             // Cancel any pending focus/workspace change notifications that might trigger updates
             self.cancellablesDuringTermination()
         }

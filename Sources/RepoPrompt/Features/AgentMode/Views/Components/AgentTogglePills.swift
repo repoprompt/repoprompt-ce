@@ -103,3 +103,52 @@ struct AgentInterviewPill: View {
         .accessibilityAddTraits(accessibilityTraits)
     }
 }
+
+// MARK: - Model Router Pill
+
+struct AgentModelRouterPill: View {
+    let props: AgentModelRouterPillProps
+    let onToggle: () -> Void
+
+    @ObservedObject private var fontScale = FontScaleManager.shared
+
+    private var tooltip: String {
+        if let reason = props.disabledReason, !props.isAvailable { return reason }
+        if props.isRouting { return "Router is choosing a target for this new session" }
+        return props.isOn
+            ? "Router on: New primary sessions and subagents are routed automatically"
+            : "Router off: New sessions use their current or requested target"
+    }
+
+    var body: some View {
+        let cornerRadius = AgentPillMetrics.cornerRadius()
+        let size = AgentPillMetrics.height()
+        Button(action: onToggle) {
+            ZStack {
+                if props.isOn {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.12))
+                }
+                if props.isRouting {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(fontScale.preset.swiftUIFont(sizeAtNormal: 14, weight: .semibold))
+                        .foregroundStyle(props.isOn ? Color.accentColor : .secondary)
+                }
+            }
+            .frame(width: size, height: size)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(props.isOn ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: props.isOn ? 0.8 : 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!props.isAvailable || props.isRouting)
+        .hoverTooltip(tooltip, .top)
+        .accessibilityLabel("Model Router")
+        .accessibilityValue(props.isOn ? "On" : "Off")
+    }
+}

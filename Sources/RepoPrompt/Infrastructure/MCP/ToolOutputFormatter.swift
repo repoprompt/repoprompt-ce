@@ -1068,6 +1068,17 @@ extension ToolOutputFormatter {
             lines.append("## History Session \(status)")
             lines.append("- `\(sessionID)` **\(sessionName)** (\(workspaceName))")
             lines.append("- **Turns**: \(start)–\(end) of \(totalTurns)")
+            if let usage = object["token_usage_summary"]?.objectValue {
+                let providerInput = usage["provider_input_tokens"]?.intValue ?? 0
+                let providerOutput = usage["provider_output_tokens"]?.intValue ?? 0
+                let codexTotal = usage["codex_total_tokens"]?.intValue
+                if providerInput > 0 || providerOutput > 0 || codexTotal != nil {
+                    var usageLine = "- **Provider tokens**: input \(providerInput), output \(providerOutput)"
+                    if let codexTotal { usageLine += ", Codex cumulative \(codexTotal)" }
+                    usageLine += " • attributed runs: \(usage["attributed_run_count"]?.intValue ?? 0)"
+                    lines.append(usageLine)
+                }
+            }
             if let targetTurn { lines.append("- **Target turn**: \(targetTurn)") }
             if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
             appendHistoryScanMetadata(object, to: &lines)
@@ -1093,6 +1104,18 @@ extension ToolOutputFormatter {
                 }
                 if let toolSummary = nonEmpty(turn["tool_call_summary"]?.stringValue) {
                     lines.append("- **Tools**: \(toolSummary)")
+                }
+                let runIDs = turn["run_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                if !runIDs.isEmpty {
+                    lines.append("- **Run IDs**: \(runIDs.joined(separator: ", "))")
+                }
+                let tokenUsage = turn["token_usage"]?.arrayValue ?? []
+                for usageValue in tokenUsage {
+                    guard let usage = usageValue.objectValue else { continue }
+                    let input = usage["input_tokens"]?.intValue ?? 0
+                    let output = usage["output_tokens"]?.intValue ?? 0
+                    let run = nonEmpty(usage["run_id"]?.stringValue) ?? "unattributed"
+                    lines.append("- **Token usage** (`\(run)`): input \(input), output \(output)")
                 }
                 let entries = turn["entries"]?.arrayValue ?? []
                 for entryValue in entries {

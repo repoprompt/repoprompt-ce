@@ -33,6 +33,8 @@ enum AgentSessionError: Error, LocalizedError {
 }
 
 struct AgentTokenUsagePersist: Codable, Equatable {
+    let runID: UUID?
+    let turnID: UUID?
     let promptTokens: Int
     let completionTokens: Int
     let contextUsedTokens: Int?
@@ -42,6 +44,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     let timestamp: Date
 
     init(
+        runID: UUID? = nil,
+        turnID: UUID? = nil,
         promptTokens: Int,
         completionTokens: Int,
         contextUsedTokens: Int? = nil,
@@ -50,6 +54,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         estimatedToolOutputTokens: Int = 0,
         timestamp: Date = Date()
     ) {
+        self.runID = runID
+        self.turnID = turnID
         self.promptTokens = max(0, promptTokens)
         self.completionTokens = max(0, completionTokens)
         if let contextUsedTokens {
@@ -84,6 +90,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case runID
+        case turnID
         case promptTokens
         case completionTokens
         case contextUsedTokens
@@ -95,6 +103,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        runID = try container.decodeIfPresent(UUID.self, forKey: .runID)
+        turnID = try container.decodeIfPresent(UUID.self, forKey: .turnID)
         promptTokens = try max(0, container.decode(Int.self, forKey: .promptTokens))
         completionTokens = try max(0, container.decode(Int.self, forKey: .completionTokens))
         if let decodedContext = try container.decodeIfPresent(Int.self, forKey: .contextUsedTokens) {
@@ -111,6 +121,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(runID, forKey: .runID)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
         try container.encode(promptTokens, forKey: .promptTokens)
         try container.encode(completionTokens, forKey: .completionTokens)
         try container.encodeIfPresent(contextUsedTokens, forKey: .contextUsedTokens)

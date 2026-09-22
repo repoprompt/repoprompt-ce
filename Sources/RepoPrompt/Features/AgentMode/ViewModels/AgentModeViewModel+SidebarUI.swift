@@ -417,7 +417,7 @@ extension AgentModeViewModel {
         // Seed on first observation so restored persisted sessions don't show
         // an unseen badge just because we're seeing their run state for the
         // first time this VM's lifetime.
-        guard let oldState else {
+        guard oldState != nil else {
             sidebarObservedRunStateByTabID[tabID] = newState
             return
         }
@@ -428,30 +428,29 @@ extension AgentModeViewModel {
         // same tab — the old "completed in background" has been acknowledged
         // by the user kicking off a new turn.
         if newState == .running {
-            let didPublishClear = ui.sessionSidebar.clearRunStateAttention(tabID: tabID)
-            if !didPublishClear, oldState != .running {
-                // Make sure the sidebar row picks up the new running arc even
-                // if no attention clear was needed.
-                syncSidebarUIState(refresh: true, reason: .runState)
-            }
+            _ = ui.sessionSidebar.clearRunStateAttention(tabID: tabID)
+            syncSidebarUIState(refresh: true, reason: .runState)
             return
         }
 
         // The user is already looking at this tab — no unseen badge needed.
         if tabID == currentTabID {
             _ = ui.sessionSidebar.clearRunStateAttention(tabID: tabID)
+            syncSidebarUIState(refresh: true, reason: .runState)
             return
         }
 
         if AgentSessionSidebarUIStore.isAttentionEligible(newState) {
             _ = ui.sessionSidebar.markRunStateAttention(tabID: tabID, state: newState)
+            syncSidebarUIState(refresh: true, reason: .runState)
             return
         }
 
-        // Non-attention state (e.g. idle, cancelled). Drop any stale badge but
-        // don't force a separate refresh — the ordinary run-state refresh
-        // path already handles row updates for these transitions.
+        // Non-attention state (e.g. idle, cancelled). Drop any stale badge and
+        // refresh through the fingerprint so cached search fields cannot retain
+        // the previous status if the ordinary run-state path skips this tab.
         _ = ui.sessionSidebar.clearRunStateAttention(tabID: tabID)
+        syncSidebarUIState(refresh: true, reason: .runState)
     }
 
     /// Clear unseen-run-state attention for the given tab, typically because

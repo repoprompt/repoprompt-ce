@@ -3429,7 +3429,7 @@ func printVersion() {
 }
 
 private let repoPromptCEReleaseBundleIdentifier = "com.repoprompt.ce"
-private let repoPromptCEDebugBundleIdentifier = "com.pvncher.repoprompt.ce.debug"
+private let repoPromptCEDebugBundleIdentifier = "com.repoprompt.ce.debug"
 private let repoPromptCEBundleIdentifier: String = {
     #if DEBUG
         return repoPromptCEDebugBundleIdentifier

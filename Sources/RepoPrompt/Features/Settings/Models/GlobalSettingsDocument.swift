@@ -26,6 +26,8 @@ private func strictAdditionalOracleModelRaws(_ raws: [String], codingPath: [Codi
 /// workspace-scoped Agent Models profiles. Schema v5 fences the Context Builder
 /// behavior group from pre-Context-Builder typed writers. Schema v7 adds the Oracle
 /// roster. Schema v8 adds OpenCode-style ACP parameter pins to Agent Models profiles.
+/// Schema v9 adds the optional app-global model-router policy group. Schema v10
+/// adds global primary/subagent scope policy and custom router guidance.
 /// Scalar fields stay optional so missing JSON fields fall back through the
 /// typed GlobalSettingsStore accessors without losing current default behavior.
 struct GlobalSettingsDocument: Codable {
@@ -41,8 +43,11 @@ struct GlobalSettingsDocument: Codable {
     static let oracleRosterSchemaVersion = 7
     /// OpenCode-style ACP parameter pins stored on Agent Models profiles.
     static let agentModelParameterPinsSchemaVersion = 8
+    /// Initial optional app-global model-router configuration.
+    static let modelRouterSchemaVersion = 9
+    static let scopedModelRouterSchemaVersion = 10
     static let rejectedExperimentalSchemaVersions = 6 ... 6
-    static let currentSchemaVersion = 8
+    static let currentSchemaVersion = 10
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -124,6 +129,15 @@ struct GlobalSettingsDocument: Codable {
         }
         if hasGlobalParameterPins || hasWorkspaceParameterPins {
             requiredVersion = max(requiredVersion, Self.agentModelParameterPinsSchemaVersion)
+        }
+        if let router = scalarPreferences?.modelRouter {
+            requiredVersion = max(requiredVersion, Self.modelRouterSchemaVersion)
+            if router.primaryProviderRawValue != nil
+                || router.subagentProviderRawValue != nil
+                || router.customInstructions != nil
+            {
+                requiredVersion = max(requiredVersion, Self.scopedModelRouterSchemaVersion)
+            }
         }
         return requiredVersion
     }
@@ -632,6 +646,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
     var agentMode: AgentModeSettings?
     var telemetry: TelemetrySettings?
     var modelOverrides: ModelOverrideSettingsData?
+    var modelRouter: ModelRouterSettings?
 
     init(
         ui: UISettings? = nil,
@@ -642,7 +657,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         fileSystem: FileSystemSettings? = nil,
         agentMode: AgentModeSettings? = nil,
         telemetry: TelemetrySettings? = nil,
-        modelOverrides: ModelOverrideSettingsData? = nil
+        modelOverrides: ModelOverrideSettingsData? = nil,
+        modelRouter: ModelRouterSettings? = nil
     ) {
         self.ui = ui
         self.promptPackaging = promptPackaging
@@ -653,6 +669,35 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.agentMode = agentMode
         self.telemetry = telemetry
         self.modelOverrides = modelOverrides
+        self.modelRouter = modelRouter
+    }
+
+    struct ModelRouterSettings: Codable, Equatable {
+        var enabled: Bool?
+        var selectedBackendRawValue: String?
+        var candidateRoleRawValues: [String]?
+        var allowedProviderRawValues: [String]?
+        var primaryProviderRawValue: String?
+        var subagentProviderRawValue: String?
+        var customInstructions: String?
+
+        init(
+            enabled: Bool? = nil,
+            selectedBackendRawValue: String? = nil,
+            candidateRoleRawValues: [String]? = nil,
+            allowedProviderRawValues: [String]? = nil,
+            primaryProviderRawValue: String? = nil,
+            subagentProviderRawValue: String? = nil,
+            customInstructions: String? = nil
+        ) {
+            self.enabled = enabled
+            self.selectedBackendRawValue = selectedBackendRawValue
+            self.candidateRoleRawValues = candidateRoleRawValues
+            self.allowedProviderRawValues = allowedProviderRawValues
+            self.primaryProviderRawValue = primaryProviderRawValue
+            self.subagentProviderRawValue = subagentProviderRawValue
+            self.customInstructions = customInstructions
+        }
     }
 
     struct UISettings: Codable, Equatable {

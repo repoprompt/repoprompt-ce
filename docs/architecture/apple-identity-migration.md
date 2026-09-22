@@ -77,8 +77,10 @@ asset by asset, before it is accepted as the latest Tip release.
    manifest, commit the dual-identity Keychain journal, and select the bridge as the canonical backend.
 7. Later launches authenticate the journal and bridge manifest by inspecting their decrypt ACLs and
    requiring exactly the legacy and successor designated requirements before accepting the JSON.
-   Later builds validate that ACL again before copying it to a new bridge item. The version-2 catalog
-   remains frozen; accounts added to the app later are created in the already-authoritative bridge.
+   Later builds validate that ACL, reconstruct a fresh access object from the same exact code
+   requirements, validate the reconstructed ACL, and use it for each new bridge item. They never reuse
+   the manifest's persisted `SecAccess` object. The version-2 catalog remains frozen; accounts added to
+   the app later are created in the already-authoritative bridge.
 8. If any read needs interaction, validation or read-back fails, or either manifest cannot be persisted,
    the old secure-storage service remains canonical and Sparkle is paused. Settings surfaces distinguish
    a locked Keychain, cancelled access, authentication failure, and generic verification failure, then

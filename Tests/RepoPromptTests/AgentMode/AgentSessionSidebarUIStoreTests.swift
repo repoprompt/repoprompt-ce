@@ -616,6 +616,59 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         XCTAssertEqual(AgentSidebarSelectionGesture(modifiers: [.command, .shift]), .range)
     }
 
+    /// `rowContentRevision` is the only content term of `SidebarSessionRowsCacheKey`,
+    /// so bumping it discards every built sidebar row. Thread collapse and attention
+    /// badges are applied downstream of row construction, so they must advance
+    /// `revision` (re-projection) without advancing `rowContentRevision` (rebuild).
+    func testPresentationOnlyChangesAdvanceRevisionWithoutInvalidatingRowContent() {
+        let store = AgentSessionSidebarUIStore()
+        let thread = AgentSidebarThreadKey.session(id(1))
+        let tabID = id(2)
+
+        XCTAssertEqual(store.snapshot.rowContentRevision, 0)
+
+        store.setThreadCollapsed(true, for: thread)
+        store.clearCollapsedThreads()
+        store.seedDefaultCollapsedThreads(eligibleKeys: [AgentSidebarThreadKey.session(id(3))])
+        store.expandAllSidebarThreads(eligibleKeys: [thread])
+        XCTAssertTrue(store.markRunStateAttention(tabID: tabID, state: .completed))
+        XCTAssertTrue(store.clearRunStateAttention(tabID: tabID))
+        XCTAssertTrue(store.markRunStateAttention(tabID: tabID, state: .failed))
+        XCTAssertTrue(store.clearRunStateAttention(for: [tabID]))
+
+        XCTAssertEqual(
+            store.snapshot.rowContentRevision,
+            0,
+            "presentation-only sidebar state must not force a row rebuild"
+        )
+        XCTAssertGreaterThan(
+            store.snapshot.revision,
+            0,
+            "presentation-only sidebar state must still re-project"
+        )
+    }
+
+    /// `update(searchText:...)` and `refresh()` are the two remaining publish paths.
+    /// Search/pagination stays presentation-only; `refresh()` is the single
+    /// row-content invalidation path, used only after its caller's content
+    /// fingerprint has already proven sidebar-visible content changed.
+    func testSearchAndPaginationStayPresentationOnlyWhileRefreshInvalidatesRowContent() {
+        let store = AgentSessionSidebarUIStore()
+
+        store.update(searchText: "query", visibleSessionCount: 25, archivedVisibleSessionCount: 10)
+        XCTAssertEqual(store.snapshot.searchText, "query")
+        XCTAssertEqual(store.snapshot.rowContentRevision, 0)
+
+        let revisionBeforeRefresh = store.snapshot.revision
+        store.refresh()
+        XCTAssertEqual(store.snapshot.rowContentRevision, 1)
+        XCTAssertEqual(store.snapshot.revision, revisionBeforeRefresh + 1)
+
+        // `refresh()` is a forced publish, so repeated calls keep invalidating.
+        store.refresh()
+        XCTAssertEqual(store.snapshot.rowContentRevision, 2)
+    }
+
     private func id(_ value: Int) -> UUID {
         let suffix = String(format: "%012d", value)
         return UUID(uuidString: "00000000-0000-0000-0000-\(suffix)")!

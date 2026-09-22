@@ -280,6 +280,23 @@ struct HistoryInventoryBudget: Equatable {
 struct HistoryLoadedSession {
     let name: String?
     let transcript: AgentTranscript
+    let providerTokenUsageByTurn: [AgentTokenUsagePersist]
+    let codexLastTotalTokens: Int?
+    let codexTotalTotalTokens: Int?
+
+    init(
+        name: String?,
+        transcript: AgentTranscript,
+        providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
+        codexLastTotalTokens: Int? = nil,
+        codexTotalTotalTokens: Int? = nil
+    ) {
+        self.name = name
+        self.transcript = transcript
+        self.providerTokenUsageByTurn = providerTokenUsageByTurn
+        self.codexLastTotalTokens = codexLastTotalTokens
+        self.codexTotalTotalTokens = codexTotalTotalTokens
+    }
 }
 
 struct HistoryDirectSessionLocation: Equatable {
@@ -651,6 +668,9 @@ actor HistorySessionScanner: HistorySessionScanning {
         let signature: FileSignature
         let sessionName: String?
         let transcript: AgentTranscript
+        let providerTokenUsageByTurn: [AgentTokenUsagePersist]
+        let codexLastTotalTokens: Int?
+        let codexTotalTotalTokens: Int?
         let byteCount: Int64
         let accessOrdinal: UInt64
     }
@@ -1032,7 +1052,32 @@ actor HistorySessionScanner: HistorySessionScanning {
             }
         }
 
-        return results
+        // A session may remain projected into more than one workspace index after a move,
+        // restore, or consolidation. Session IDs are globally unique, so counting every
+        // projection inflates time, turn, and tool totals. Retain the freshest projection;
+        // callers still receive its owning workspace for exact transcript loading.
+        var canonicalBySessionID: [UUID: HistoryFilteredSessionRecord] = [:]
+        var orderedSessionIDs: [UUID] = []
+        for candidate in results {
+            guard let existing = canonicalBySessionID[candidate.record.id] else {
+                canonicalBySessionID[candidate.record.id] = candidate
+                orderedSessionIDs.append(candidate.record.id)
+                continue
+            }
+            let candidateFreshness = candidate.record.observedFileModificationDate
+                ?? candidate.record.lastIndexedAt
+            let existingFreshness = existing.record.observedFileModificationDate
+                ?? existing.record.lastIndexedAt
+            if candidateFreshness > existingFreshness
+                || (
+                    candidateFreshness == existingFreshness
+                        && candidate.record.savedAt > existing.record.savedAt
+                )
+            {
+                canonicalBySessionID[candidate.record.id] = candidate
+            }
+        }
+        return orderedSessionIDs.compactMap { canonicalBySessionID[$0] }
     }
 
     // MARK: - Direct Session Resolution
@@ -1261,10 +1306,19 @@ actor HistorySessionScanner: HistorySessionScanning {
                 signature: cached.signature,
                 sessionName: cached.sessionName,
                 transcript: cached.transcript,
+                providerTokenUsageByTurn: cached.providerTokenUsageByTurn,
+                codexLastTotalTokens: cached.codexLastTotalTokens,
+                codexTotalTotalTokens: cached.codexTotalTotalTokens,
                 byteCount: cached.byteCount,
                 accessOrdinal: transcriptCacheAccessOrdinal
             )
-            return HistoryLoadedSession(name: cached.sessionName, transcript: cached.transcript)
+            return HistoryLoadedSession(
+                name: cached.sessionName,
+                transcript: cached.transcript,
+                providerTokenUsageByTurn: cached.providerTokenUsageByTurn,
+                codexLastTotalTokens: cached.codexLastTotalTokens,
+                codexTotalTotalTokens: cached.codexTotalTotalTokens
+            )
         }
 
         let effectiveFileLimit = min(
@@ -1315,9 +1369,18 @@ actor HistorySessionScanner: HistorySessionScanning {
                 signature: signature,
                 sessionName: session.name,
                 transcript: transcript,
+                providerTokenUsageByTurn: session.providerTokenUsageByTurn,
+                codexLastTotalTokens: session.codexLastTotalTokens,
+                codexTotalTotalTokens: session.codexTotalTotalTokens,
                 byteCount: Int64(data.count)
             )
-            return HistoryLoadedSession(name: session.name, transcript: transcript)
+            return HistoryLoadedSession(
+                name: session.name,
+                transcript: transcript,
+                providerTokenUsageByTurn: session.providerTokenUsageByTurn,
+                codexLastTotalTokens: session.codexLastTotalTokens,
+                codexTotalTotalTokens: session.codexTotalTotalTokens
+            )
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as HistorySessionScannerError {
@@ -1381,6 +1444,9 @@ actor HistorySessionScanner: HistorySessionScanning {
         signature: FileSignature,
         sessionName: String?,
         transcript: AgentTranscript,
+        providerTokenUsageByTurn: [AgentTokenUsagePersist],
+        codexLastTotalTokens: Int?,
+        codexTotalTotalTokens: Int?,
         byteCount: Int64
     ) {
         removeTranscriptCacheEntry(key)
@@ -1390,6 +1456,9 @@ actor HistorySessionScanner: HistorySessionScanning {
             signature: signature,
             sessionName: sessionName,
             transcript: transcript,
+            providerTokenUsageByTurn: providerTokenUsageByTurn,
+            codexLastTotalTokens: codexLastTotalTokens,
+            codexTotalTotalTokens: codexTotalTotalTokens,
             byteCount: normalizedBytes,
             accessOrdinal: transcriptCacheAccessOrdinal
         )

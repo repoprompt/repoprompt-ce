@@ -232,6 +232,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let accumulatorContextUsed = accumulator?.observedContextUsedTokens ?? 0
         let persistedContextUsed = resolvedContextUsed > 0 ? resolvedContextUsed : (accumulatorContextUsed > 0 ? accumulatorContextUsed : 0)
         let usage = AgentTokenUsagePersist(
+            runID: session.runID,
+            turnID: session.transcript.turns.last?.id,
             promptTokens: prompt,
             completionTokens: completion,
             contextUsedTokens: persistedContextUsed > 0 ? persistedContextUsed : nil,

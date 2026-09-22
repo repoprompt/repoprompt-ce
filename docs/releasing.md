@@ -333,8 +333,11 @@ does not depend on the new draft immediately appearing in paginated list results
 resumed only when their metadata and uploaded bytes exactly match;
 missing assets are added without overwriting anything. After publication, every public asset is
 downloaded anonymously and compared byte-for-byte with the signed local inventory, and the release
-must be the repository's latest. The update-repository token is not available to setup, staging, or
-smoke jobs.
+must be the repository's latest. Release metadata API reads use the update-repository token to
+avoid the shared runner's anonymous API quota; public artifact downloads remain unauthenticated.
+The final latest-pointer check allows seven observations ten seconds apart for GitHub propagation,
+and fails if the expected tag never becomes latest. Authorization errors fail immediately.
+The update-repository token is not available to setup, staging, or smoke jobs.
 
 Configure protected GitHub Actions environments named `release` and `tip-release`, with maintainer
 approval and protected-branch restrictions. Before the rehearsal, store this one-time identity

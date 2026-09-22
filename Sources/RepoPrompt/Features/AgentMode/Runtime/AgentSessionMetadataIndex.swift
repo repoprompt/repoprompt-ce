@@ -1,8 +1,8 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    /// 7 adds the granular observer-session Auto-wake target UUID set.
-    static let currentSchemaVersion = 7
+    /// 8 adds canonical transcript-turn counts for history analytics.
+    static let currentSchemaVersion = 8
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -81,6 +81,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var coveredTurnDurationSeconds: Int
     var interActiveIntervalGapSeconds: [Int]
     var toolCallCount: Int
+    var transcriptTurnCount: Int
 
     /// Default idle threshold in minutes. Gaps between merged active intervals longer than this are idle.
     static let defaultIdleThresholdMinutes = 10
@@ -104,7 +105,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
 
     /// True when this record carries no transcript-derived fields, i.e. it was built from a
     /// transcript-less stub during a cheap `rebuildMetadataIndex` pass. The history tool uses this to
-    /// decide which records need on-demand enrichment: any populated v5 field implies a real
+    /// decide which records need on-demand enrichment: any populated transcript-derived field implies a real
     /// transcript was already seen (the save/load path), so the record is passed through unchanged.
     ///
     /// Maintenance: any new transcript-derived field must be added to this check, or a stub-built
@@ -116,6 +117,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && interActiveIntervalGapSeconds.isEmpty
             && keyPaths.isEmpty
             && toolCallCount == 0
+            && transcriptTurnCount == 0
     }
 
     init(
@@ -154,7 +156,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         keyPaths: Set<String> = [],
         coveredTurnDurationSeconds: Int = 0,
         interActiveIntervalGapSeconds: [Int] = [],
-        toolCallCount: Int = 0
+        toolCallCount: Int = 0,
+        transcriptTurnCount: Int = 0
     ) {
         self.id = id
         self.filename = filename
@@ -192,6 +195,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.coveredTurnDurationSeconds = coveredTurnDurationSeconds
         self.interActiveIntervalGapSeconds = interActiveIntervalGapSeconds
         self.toolCallCount = toolCallCount
+        self.transcriptTurnCount = transcriptTurnCount
     }
 
     enum CodingKeys: String, CodingKey {
@@ -231,6 +235,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case coveredTurnDurationSeconds
         case interActiveIntervalGapSeconds
         case toolCallCount
+        case transcriptTurnCount
     }
 
     init(from decoder: Decoder) throws {
@@ -288,6 +293,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         coveredTurnDurationSeconds = try container.decodeIfPresent(Int.self, forKey: .coveredTurnDurationSeconds) ?? 0
         interActiveIntervalGapSeconds = try container.decodeIfPresent([Int].self, forKey: .interActiveIntervalGapSeconds) ?? []
         toolCallCount = try container.decodeIfPresent(Int.self, forKey: .toolCallCount) ?? 0
+        transcriptTurnCount = try container.decodeIfPresent(Int.self, forKey: .transcriptTurnCount) ?? 0
     }
 
     func sidebarEntry(tabID overrideTabID: UUID? = nil, displayName: String? = nil) -> AgentSessionIndexEntry? {
@@ -373,6 +379,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && coveredTurnDurationSeconds == other.coveredTurnDurationSeconds
             && interActiveIntervalGapSeconds == other.interActiveIntervalGapSeconds
             && toolCallCount == other.toolCallCount
+            && transcriptTurnCount == other.transcriptTurnCount
     }
 
     static func record(
@@ -424,7 +431,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             keyPaths: aggregatedKeyPaths,
             coveredTurnDurationSeconds: durationPrimitives.coveredSeconds,
             interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
-            toolCallCount: computedToolCallCount
+            toolCallCount: computedToolCallCount,
+            transcriptTurnCount: turns.count
         )
     }
 
@@ -448,7 +456,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         return collected
     }
 
-    /// Return a copy with the transcript-derived v5 fields (activity bounds, keyPaths, toolCount,
+    /// Return a copy with the transcript-derived fields (activity bounds, keyPaths, toolCount,
     /// duration primitives) recomputed from `turns`. The `history` tool calls this to enrich index
     /// records that were rebuilt from lightweight stubs (`firstActivityAt == nil`) on demand, so the
     /// shared `rebuildMetadataIndex` path — which feeds the agent-mode sidebar and workspace restore —
@@ -464,6 +472,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         copy.coveredTurnDurationSeconds = primitives.coveredSeconds
         copy.interActiveIntervalGapSeconds = primitives.gapSeconds
         copy.toolCallCount = Self.computeToolCallCount(from: turns)
+        copy.transcriptTurnCount = turns.count
         return copy
     }
 
@@ -546,21 +555,33 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         return max(0, covered + activeGaps)
     }
 
-    /// Compute threshold-independent duration primitives from transcript turns:
-    /// the union of merged per-turn active intervals (`coveredSeconds`) and the positive gaps
-    /// between those merged intervals (`gapSeconds`). Each interval is
-    /// `[startedAt, completedAt ?? lastActivityAt ?? startedAt]`; intervals with end earlier than
-    /// start are dropped. Intervals are sorted and merged (overlaps collapsed) before measuring,
-    /// so overlapping or nested turns are never double-counted. Zero-duration (point) intervals are
-    /// retained so sessions whose turns carry only `startedAt` still yield gap-based estimates.
-    private static func computeDurationPrimitives(from turns: [AgentTranscriptTurn]) -> (coveredSeconds: Int, gapSeconds: [Int]) {
+    /// Convert a turn into observed work intervals. Provider response spans are continuous active
+    /// intervals; request, summary, turn-boundary, and individual activity timestamps are points.
+    /// This preserves measured provider work without treating a turn that waits hours or days for
+    /// an approval/resume as continuously active.
+    static func activityIntervals(from turn: AgentTranscriptTurn) -> [(start: Date, end: Date)] {
+        var timestamps: [Date] = [turn.startedAt]
+        if let requestTimestamp = turn.request?.timestamp { timestamps.append(requestTimestamp) }
+        if let lastUserInteractionAt = turn.summary?.lastUserInteractionAt { timestamps.append(lastUserInteractionAt) }
+        if let lastActivityAt = turn.lastActivityAt { timestamps.append(lastActivityAt) }
+        if let completedAt = turn.completedAt { timestamps.append(completedAt) }
         var intervals: [(start: Date, end: Date)] = []
-        intervals.reserveCapacity(turns.count)
-        for turn in turns {
-            let start = turn.startedAt
-            let end = turn.completedAt ?? turn.lastActivityAt ?? start
-            if end >= start { intervals.append((start, end)) }
+        for span in turn.responseSpans {
+            timestamps.append(span.startedAt)
+            if let lastActivityAt = span.lastActivityAt { timestamps.append(lastActivityAt) }
+            if let completedAt = span.completedAt { timestamps.append(completedAt) }
+            timestamps.append(contentsOf: span.activities.map(\.timestamp))
+            let spanEnd = span.completedAt ?? span.lastActivityAt ?? span.startedAt
+            if spanEnd >= span.startedAt {
+                intervals.append((start: span.startedAt, end: spanEnd))
+            }
         }
+        intervals.append(contentsOf: Array(Set(timestamps)).sorted().map { (start: $0, end: $0) })
+        return intervals
+    }
+
+    static func computeDurationPrimitives(from turns: [AgentTranscriptTurn]) -> (coveredSeconds: Int, gapSeconds: [Int]) {
+        let intervals = turns.flatMap(Self.activityIntervals(from:))
         let merged = mergedIntervals(intervals)
         guard !merged.isEmpty else { return (0, []) }
 

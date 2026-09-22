@@ -171,7 +171,13 @@ enum SecureKeyValueStorageFactory {
                 EphemeralSecureKeyValueStore.shared
             }
         case .appleDevelopmentDebug:
-            KeychainService.debugShared
+            if decision.appleDevelopmentTeamIdentifier == RuntimeCodeSigningPolicy.signingTeamIdentifier {
+                KeychainService.debugShared
+            } else if let teamIdentifier = decision.appleDevelopmentTeamIdentifier {
+                KeychainService.appleDevelopmentDebug(teamIdentifier: teamIdentifier)
+            } else {
+                EphemeralSecureKeyValueStore.shared
+            }
         case .ephemeral:
             EphemeralSecureKeyValueStore.shared
         }

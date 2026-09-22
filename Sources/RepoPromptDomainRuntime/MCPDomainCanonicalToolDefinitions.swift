@@ -1165,6 +1165,10 @@ package enum MCPDomainCanonicalToolDefinitions {
         var description = definition.description
 
         if definition.name == MCPWindowToolName.agentRun {
+            let routerDescription = "When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or explicit `model_parameters` remains an exact pin and bypasses routing."
+            if !description.contains(routerDescription) {
+                description += "\n\n\(routerDescription)"
+            }
             description = description.replacingOccurrences(
                 of: "Waits up to `timeout` seconds (default 120).",
                 with: "Waits up to `timeout` seconds when present. Omitted `timeout` uses the \(phrase)."
@@ -1176,6 +1180,10 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
 
         if definition.name == MCPWindowToolName.agentExplore {
+            let routerDescription = "When the app-global Model Router is enabled, each new explore child is routed across the configured subagent targets."
+            if !description.contains(routerDescription) {
+                description += "\n\n\(routerDescription)"
+            }
             description = description.replacingOccurrences(
                 of: "- `wait`: Block until the first referenced explore run finishes or needs input. `timeout=0` behaves like poll.",
                 with: "- `wait`: Block until the first referenced explore run finishes or needs input. Omit `timeout` for the \(phrase); use shorter waits for closer supervision or longer waits for well-scoped independent work. `timeout=0` behaves like poll."

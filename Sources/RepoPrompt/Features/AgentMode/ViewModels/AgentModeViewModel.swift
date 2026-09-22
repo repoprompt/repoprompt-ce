@@ -705,6 +705,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
+    var modelRouterSettingsStore: GlobalSettingsStore = .shared
+    var modelRouterRuntime: AgentTaskRouterRuntime?
+    struct StagedTaskRoutingResult {
+        let candidates: [AgentTaskRoutingCandidateBuilder.Candidate]
+        let outcome: AgentTaskRoutingBackendOutcome
+    }
+
+    struct FreshTaskRoutingOwnership {
+        let requestID: UUID
+        let sourceTabID: UUID
+        let destinationTabID: UUID
+        let task: Task<StagedTaskRoutingResult, Never>
+    }
+
+    var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
 
     private var isRestoringState = false
     private var activeUISyncSuppressionDepth = 0
@@ -884,6 +899,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var sidebarSessionRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var agentChatsSidebarRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var sidebarListProjectionCache: (key: SidebarListProjectionCacheKey, projection: SidebarListProjection)?
+    /// Memoized normalized search fields, keyed by sidebar row id. Populated only
+    /// while a sidebar search query is active and replaced by the current row set
+    /// on each call, so it stays bounded by the visible sidebar.
+    var sidebarSearchFieldsMemo: [UUID: (source: AgentSessionSearchFieldSource, fields: AgentSessionSearchFields)] = [:]
     private var lastKnownWorkspaceSnapshot: WorkspaceModel?
     var sidebarRuntimeWorkspaceID: UUID? {
         lastKnownWorkspaceSnapshot?.id
@@ -900,6 +919,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         private var test_persistentBindingResolutionSnapshotBuildCount = 0
         var test_sidebarSessionRowsBuildCount = 0
         var test_sidebarListProjectionBuildCount = 0
+        /// Counts rows whose normalized search fields were actually materialized.
+        /// Stays at zero while the sidebar search box is empty.
+        var test_sidebarSearchFieldsMaterializationCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
         /// Runs on the `@MainActor` inside `agentSessionLinkTranscriptPage(...)`, after the page has
@@ -930,7 +952,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #endif
     private var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
-    private static let sessionSidebarRestoreBatchSize = 32
+    /// The restore service has already loaded and projected all metadata before
+    /// it begins yielding preferred rows. Publishing those rows in fixed-size
+    /// batches therefore adds no I/O overlap; it only forces the main actor to
+    /// rebuild the complete sidebar once per batch. Yield all preferred rows in
+    /// one bounded batch (at most one per persisted tab), after the separately
+    /// prioritized active-tab result has restored first-paint responsiveness.
+    static func sessionSidebarRestoreBatchSize(forPersistedTabCount count: Int) -> Int {
+        max(count, 1)
+    }
+
     private nonisolated static let sessionSidebarRestoreRetryLimit = 1
     nonisolated static let transcriptVisibleItemLimit = 50
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
@@ -1749,8 +1780,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private var agentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+    var agentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
         promptManager?.apiSettingsViewModel?.agentModeAvailabilityContext ?? .current
+    }
+
+    var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        promptManager?.apiSettingsViewModel?.modelRouterAvailabilityContext ?? .current
     }
 
     var hasAvailableAgentProviders: Bool {
@@ -2261,7 +2296,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         oracleViewModel: OracleViewModel? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
-        skillCatalog: AgentSkillCatalog? = nil
+        skillCatalog: AgentSkillCatalog? = nil,
+        modelRouterSettingsStore: GlobalSettingsStore = .shared,
+        modelRouterRuntime: AgentTaskRouterRuntime? = nil
     ) {
         self.windowID = windowID
         self.promptManager = promptManager
@@ -2270,6 +2307,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.mcpServer = mcpServer
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
+        self.modelRouterSettingsStore = modelRouterSettingsStore
+        self.modelRouterRuntime = modelRouterRuntime
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
@@ -2443,6 +2482,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restoreLastUsedAgentSelectionIfNeeded()
 
         setupObservers()
+        modelRouterRuntime?.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.handleModelRouterRuntimeChanged() }
+            .store(in: &cancellables)
+        modelRouterSettingsStore.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.syncAllActiveUIState()
+                }
+            }
+            .store(in: &cancellables)
         updateDynamicModelPolling(startCursorPolling: false)
         syncAllActiveUIState()
         scheduleInitialSkillCatalogRefresh()
@@ -3302,6 +3354,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     self?.handleAgentProviderAvailabilityChanged()
                 }
                 .store(in: &cancellables)
+            Publishers.CombineLatest(
+                apiSettingsViewModel.$contextBuilderVerifiedCLIProviders,
+                apiSettingsViewModel.$isContextBuilderProviderValidationComplete
+            )
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleModelRouterAvailabilityChanged()
+            }
+            .store(in: &cancellables)
         }
 
         // Observe workspace file-system deltas and invalidate the skill catalog
@@ -3632,18 +3693,42 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func isComposeTabProtectedFromSidebarArchiveSuggestion(_ tabID: UUID) -> Bool {
         guard let session = sessions[tabID] else { return true }
-        if session.runState.isActive { return true }
-        if tabsWithActiveAgentRun.contains(tabID) { return true }
-        if session.mcpControlContext != nil { return true }
-        if session.hasPendingQuestionUI { return true }
-        if session.pendingApproval != nil { return true }
-        if session.hasPendingCodexHookReviewWait { return true }
-        if session.pendingPermissionsRequest != nil { return true }
-        if session.pendingMCPElicitationRequest != nil { return true }
-        if session.pendingApplyEditsReview != nil { return true }
-        if session.pendingUserInputRequest != nil { return true }
-        if session.waitingPrompt != nil { return true }
-        if session.instructionContinuation != nil { return true }
+        if session.runState.isActive {
+            return true
+        }
+        if tabsWithActiveAgentRun.contains(tabID) {
+            return true
+        }
+        if session.mcpControlContext != nil {
+            return true
+        }
+        if session.hasPendingQuestionUI {
+            return true
+        }
+        if session.pendingApproval != nil {
+            return true
+        }
+        if session.hasPendingCodexHookReviewWait {
+            return true
+        }
+        if session.pendingPermissionsRequest != nil {
+            return true
+        }
+        if session.pendingMCPElicitationRequest != nil {
+            return true
+        }
+        if session.pendingApplyEditsReview != nil {
+            return true
+        }
+        if session.pendingUserInputRequest != nil {
+            return true
+        }
+        if session.waitingPrompt != nil {
+            return true
+        }
+        if session.instructionContinuation != nil {
+            return true
+        }
         return false
     }
 
@@ -14071,7 +14156,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let prioritizedBuilder = sidebarPrioritizedIndexBuilder
         let streamBuilder = sidebarIndexStreamBuilder
-        let restoreBatchSize = Self.sessionSidebarRestoreBatchSize
+        let restoreBatchSize = Self.sessionSidebarRestoreBatchSize(forPersistedTabCount: persistedTabs.count)
         sessionListCacheTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             #if DEBUG
@@ -15402,10 +15487,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   initialLocation != .local,
                   pendingState.initialStartLocation == initialLocation
             else {
-                let result = submitUserTurn(
+                let result = await submitUserTurnAfterFreshTaskRouting(
                     text: text,
-                    tabID: target.tabID,
-                    rawDraftText: claim.attempt.rawDraftSnapshot
+                    claim: claim,
+                    session: preparedSession,
+                    destinationTabID: target.tabID
                 )
                 if result == .submitted {
                     clearComposerDraftIfUnchanged(for: claim)
@@ -15469,10 +15555,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if target.tabID == currentTabID {
                 applySessionToBindings(preparedSession)
             }
-            let result = submitUserTurn(
+            let result = await submitUserTurnAfterFreshTaskRouting(
                 text: text,
-                tabID: target.tabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot
+                claim: claim,
+                session: preparedSession,
+                destinationTabID: target.tabID
             )
             if result == .submitted {
                 clearComposerDraftIfUnchanged(for: claim)
@@ -15509,11 +15596,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard !Task.isCancelled,
                   composerSubmitClaimIsCurrent(claim)
             else {
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard sessions[target.tabID] === sourceSession else {
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let rejectionReason = submitTargetRejectionReason(
@@ -15523,7 +15610,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ) {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason)
                 resyncAfterRejectedSubmitTarget(target)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard composerSubmitClaimIsCurrent(claim),
@@ -15531,20 +15618,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed")
                 resyncAfterRejectedSubmitTarget(target)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard destinationTabID != target.tabID else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: "Failed to create a new agent session.")
             }
             let destinationSession = session(for: destinationTabID)
             guard isFreshFirstSendDestination(destinationSession) else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: "Failed to create a new agent session.")
             }
             if preparesExecutionLocation {
@@ -15565,7 +15652,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
                 clearPendingUserTurnState(on: destinationSession)
-                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return blocked
             }
             if preparesExecutionLocation {
@@ -15580,7 +15667,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     }
                 } catch {
                     clearPendingUserTurnState(on: destinationSession)
-                    await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                    await discardFreshFirstSendDestinationIfPossible(
+                        destinationTabID,
+                        reactivateSourceTabID: target.tabID
+                    )
                     return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
                 }
             }
@@ -15592,23 +15682,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   Self.pendingUserTurnState(from: destinationSession) == pendingState
             else {
                 clearPendingUserTurnState(on: destinationSession)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
                 clearPendingUserTurnState(on: destinationSession)
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return blocked
             }
             destinationSession.pendingInitialStartLocation = .local
             if destinationTabID == currentTabID {
                 applySessionToBindings(destinationSession)
             }
-            let result = submitUserTurn(
+            let result = await submitUserTurnAfterFreshTaskRouting(
                 text: text,
-                tabID: destinationTabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot
+                claim: claim,
+                session: destinationSession,
+                destinationTabID: destinationTabID
             )
             guard result == .submitted else {
                 clearPendingUserTurnState(on: destinationSession)
+                await discardFreshFirstSendDestinationIfPossible(
+                    destinationTabID,
+                    reactivateSourceTabID: target.tabID
+                )
                 return result
             }
             clearPendingUserTurnState(on: sourceSession)
@@ -15688,8 +15785,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func isFreshFirstSendDestination(_ session: TabSession) -> Bool {
+    func isFreshFirstSendDestination(_ session: TabSession) -> Bool {
         !session.runState.isActive
+            && !session.hasSentFirstMessage
             && session.runID == nil
             && session.activeRunAttemptID == nil
             && session.items.isEmpty
@@ -15909,7 +16007,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && !session.pendingHandoff.hasPayload
     }
 
-    private func discardFreshFirstSendDestinationIfPossible(_ tabID: UUID) async {
+    private func discardFreshFirstSendDestinationIfPossible(
+        _ tabID: UUID,
+        reactivateSourceTabID: UUID? = nil
+    ) async {
         guard let session = sessions[tabID], isFreshFirstSendDestination(session) else { return }
         if promptManager?.currentComposeTabs.contains(where: { $0.id == tabID }) == true {
             await promptManager?.closeComposeTab(tabID)
@@ -15917,6 +16018,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessions.removeValue(forKey: tabID)
             sessionIndexStore.removeSortDate(forTabID: tabID)
             removePendingUIRefresh(for: tabID)
+        }
+        if let reactivateSourceTabID, sessions[reactivateSourceTabID] != nil {
+            await promptManager?.switchComposeTab(reactivateSourceTabID)
         }
     }
 
@@ -19085,6 +19189,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard ObjectIdentifier(session) == attempt.sourceTabSessionIdentity else {
             let rejection = AgentComposerSubmitClaimRejection.sourceSessionIdentityMismatch
             logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+        if let routing = freshTaskRoutingByTabID[target.tabID] {
+            let rejection = AgentComposerSubmitClaimRejection.activeAttemptExists(activeAttemptID: routing.requestID)
+            logRejectedSubmitTarget(
+                target,
+                session: session,
+                reason: rejection.diagnosticReason,
+                attempt: attempt
+            )
             resyncAfterRejectedSubmitTarget(target)
             return .rejected(rejection)
         }

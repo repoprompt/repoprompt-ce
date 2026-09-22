@@ -60,6 +60,12 @@ Dispatch a sub-agent when a side investigation or delegated chunk of work would 
 
 **Export handoff:** when `context_builder` or `ask_oracle` returns `oracle_export_path`, include that path inside the child agent's next `message` so it reads the export with `read_file`.
 
+### Reliability and cost guardrails
+
+\(sharedAgentReliabilityGuardrails())
+
+\(sharedSessionCleanupHint(variant: variant))
+
 ## Quick Reference
 
 \(example(variant,

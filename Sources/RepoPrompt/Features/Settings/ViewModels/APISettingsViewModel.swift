@@ -453,6 +453,12 @@ public class APISettingsViewModel: ObservableObject {
         )
     }
 
+    /// Provider availability safe for automatic routing. Persisted connection flags are only
+    /// configuration hints; Router may choose a provider only after this process has verified it.
+    var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        contextBuilderRestorationAvailabilityContext
+    }
+
     var recommendationProviderStatusSnapshot: ProviderStatusSnapshot {
         ProviderStatusSnapshot(
             claudeCodeCLI: recommendationAvailability(isConnected: isClaudeCodeConnected, provider: .claudeCode),

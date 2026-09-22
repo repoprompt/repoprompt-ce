@@ -200,7 +200,8 @@ enum AgentNavigationHUDSnapshotBuilder {
         windowTitle: String,
         runStateByTabID: [UUID: AgentSessionRunState] = [:],
         attentionRunStateByTabID: [UUID: AgentSessionRunState] = [:],
-        attentionMarkedAtByTabID: [UUID: Date] = [:]
+        attentionMarkedAtByTabID: [UUID: Date] = [:],
+        baseSearchFieldsByRowID: [UUID: AgentSessionSearchFields] = [:]
     ) -> [AgentNavigationHUDItem] {
         let rootDescendantCounts = descendantCountsByRootTabID(
             rows: rows,
@@ -211,8 +212,9 @@ enum AgentNavigationHUDSnapshotBuilder {
             let runState = runStateByTabID[row.tabID]
             let attentionState = attentionRunStateByTabID[row.tabID]
             let mergeLabel = row.worktreeMergeAttention?.targetLabel
+            let baseSearchFields = baseSearchFieldsByRowID[row.id] ?? row.makeSearchFields()
             let searchFields = AgentSessionSearchFields(
-                fields: row.searchFields.fields + AgentSessionSearchFields(
+                fields: baseSearchFields.fields + AgentSessionSearchFields(
                     title: nil,
                     primary: [workspaceTitle, windowTitle],
                     status: [attentionState?.searchLabel, runState?.searchLabel, mergeLabel == nil ? nil : "merge"],
@@ -368,6 +370,10 @@ enum AgentNavigationHUDSnapshotBuilder {
         let tabs = windowState.promptManager.currentComposeTabs
         let currentTabID = windowState.promptManager.activeComposeTabID
         let rows = agentModeVM.sidebarSessions(for: tabs)
+        let baseSearchFields = agentModeVM.sidebarSearchFields(for: rows)
+        let baseSearchFieldsByRowID = Dictionary(
+            uniqueKeysWithValues: zip(rows, baseSearchFields).map { ($0.id, $1) }
+        )
         let attentionSnapshot = agentModeVM.ui.sessionSidebar.snapshot
         return currentWindowItems(
             rows: rows,
@@ -378,7 +384,8 @@ enum AgentNavigationHUDSnapshotBuilder {
             windowTitle: windowState.displayedWindowTitle,
             runStateByTabID: agentModeVM.agentNavigationHUDRunStateByTabID(for: rows.map(\.tabID)),
             attentionRunStateByTabID: attentionSnapshot.attentionRunStateByTabID,
-            attentionMarkedAtByTabID: attentionSnapshot.attentionMarkedAtByTabID
+            attentionMarkedAtByTabID: attentionSnapshot.attentionMarkedAtByTabID,
+            baseSearchFieldsByRowID: baseSearchFieldsByRowID
         )
     }
 }

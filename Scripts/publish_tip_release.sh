@@ -190,8 +190,12 @@ verify_downloaded_asset() {
 
 fetch_json_status() {
     local url="$1" output="$2" status
-    if ! status="$(curl --location --silent --show-error \
+    # Metadata uses the updater token; artifact downloads below remain anonymous.
+    [[ "$url" == "https://api.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/"* ]] ||
+        fail "Unexpected Tip metadata API URL"
+    if ! status="$(curl --silent --show-error \
         --connect-timeout 10 --max-time 30 \
+        -H "Authorization: Bearer $TIP_GH_TOKEN" \
         -H 'Accept: application/vnd.github+json' \
         -H 'X-GitHub-Api-Version: 2022-11-28' \
         --output "$output" --write-out '%{http_code}' "$url")"; then
@@ -726,13 +730,23 @@ PY
     [[ "$count" == "${#EXPECTED_NAMES[@]}" ]] ||
         fail "Public Tip release asset inventory mismatch: expected=${#EXPECTED_NAMES[@]} actual=$count"
 
-    local latest_file="$TMP_DIR/latest-public-release.json" latest_status latest_tag
-    latest_status="$(fetch_json_status \
-        "https://api.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/latest" \
-        "$latest_file")"
-    [[ "$latest_status" == "200" ]] || fail "Latest Tip release lookup failed with HTTP $latest_status"
-    latest_tag="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tag_name", ""))' "$latest_file")"
-    [[ "$latest_tag" == "$TIP_TAG" ]] || fail "Published Tip release is not the latest release"
+    local latest_file="$TMP_DIR/latest-public-release.json" latest_status latest_tag attempt
+    # GitHub's latest pointer can lag a successful publish. Bound convergence;
+    # authorization errors and malformed responses still fail immediately.
+    for attempt in 1 2 3 4 5 6 7; do
+        latest_status="$(fetch_json_status \
+            "https://api.github.com/repos/$TIP_UPDATE_REPOSITORY/releases/latest" \
+            "$latest_file")"
+        [[ "$latest_status" == "200" ]] || fail "Latest Tip release lookup failed with HTTP $latest_status"
+        latest_tag="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tag_name", ""))' "$latest_file")"
+        [[ "$latest_tag" =~ ^tip-[0-9a-f]{12}$ ]] || fail "Latest Tip release tag is malformed"
+        [[ "$latest_tag" == "$TIP_TAG" ]] && return 0
+        if [[ "$attempt" -lt 7 ]]; then
+            printf 'Waiting for latest Tip release to converge (attempt %s/7).\n' "$attempt" >&2
+            sleep 10
+        fi
+    done
+    fail "Published Tip release is not the latest release after bounded convergence"
 }
 
 validate_candidate_bindings
