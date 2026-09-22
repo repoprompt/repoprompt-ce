@@ -165,6 +165,20 @@ enum ContextBuilderBehaviorPresentation: Equatable {
         }
     }
 
+    /// Empty input still describes this run while discovery is active, not the next-run preference.
+    var instructionsPlaceholder: String {
+        switch enhancementMode {
+        case .fullRewrite:
+            "Describe your task here...\n\nExample: \"Add a dark mode toggle to the settings page with system, light, and dark options. Store the preference and apply it app-wide.\""
+        case .augment:
+            "Add extra details to help the agent find relevant files and enhance your prompt"
+        case .preserve:
+            "Describe what files to look for (your instructions won't be modified)"
+        case nil:
+            Self.unavailableSummary
+        }
+    }
+
     var questionIndicatorSymbolName: String {
         switch allowsClarifyingQuestions {
         case true?: "questionmark.circle.fill"
@@ -1190,7 +1204,7 @@ struct ContextBuilderAgentView: View {
             ContextBuilderInstructionsEditor(
                 text: $viewModel.contextBuilderInstructions,
                 windowID: windowID,
-                enhancementMode: viewModel.enhancementMode,
+                presentation: behaviorPresentation,
                 allowNonContiguousLayout: viewModel.agentRunState.isRunning
             )
         }
@@ -1280,7 +1294,7 @@ struct ContextBuilderAgentView: View {
 private struct ContextBuilderInstructionsEditor: View {
     @Binding var text: String
     let windowID: Int
-    let enhancementMode: PromptEnhancementMode
+    let presentation: ContextBuilderBehaviorPresentation
     /// When true, enables non-contiguous layout to avoid expensive full-layout on click
     let allowNonContiguousLayout: Bool
 
@@ -1293,15 +1307,8 @@ private struct ContextBuilderInstructionsEditor: View {
     @State private var writeBackDebounceItem: DispatchWorkItem? = nil
     @State private var writeBackWorkGate = WorkItemGate()
 
-    private var placeholderText: String {
-        switch enhancementMode {
-        case .fullRewrite:
-            "Describe your task here...\n\nExample: \"Add a dark mode toggle to the settings page with system, light, and dark options. Store the preference and apply it app-wide.\""
-        case .augment:
-            "Add extra details to help the agent find relevant files and enhance your prompt"
-        case .preserve:
-            "Describe what files to look for (your instructions won't be modified)"
-        }
+    private var enhancementMode: PromptEnhancementMode? {
+        presentation.enhancementMode
     }
 
     private var editorMinHeight: CGFloat {
@@ -1346,7 +1353,7 @@ private struct ContextBuilderInstructionsEditor: View {
         .overlay(
             Group {
                 if localText.isEmpty {
-                    Text(placeholderText)
+                    Text(presentation.instructionsPlaceholder)
                         .font(.callout)
                         .foregroundColor(.secondary.opacity(0.5))
                 }
