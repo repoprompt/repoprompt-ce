@@ -173,8 +173,13 @@ import XCTest
             let initialContent = "let value = 2\n" + padding
             try fixture.write(initialContent, to: "Feature.swift", at: repo)
             let fileURL = repo.appendingPathComponent("Feature.swift")
-            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-            let originalModificationDate = try XCTUnwrap(attributes[.modificationDate] as? Date)
+            // Use an exactly representable whole-second timestamp for both writes. Restoring
+            // an arbitrary filesystem timestamp through Date can lose fractional precision.
+            let originalModificationDate = Date(timeIntervalSince1970: 1_700_000_000)
+            try FileManager.default.setAttributes(
+                [.modificationDate: originalModificationDate],
+                ofItemAtPath: fileURL.path
+            )
             let service = VCSService()
             let engine = GitDiffEngine(
                 vcsService: service,
