@@ -640,10 +640,10 @@ struct OracleImageAttachmentLoader {
 ///   `AIMessage.openAIChatMessages` / `openAIResponsesInput` emit image parts.
 /// - `claudeCode` → stream-json stdin via `ClaudeCodeProvider.makeStreamJSONInput`.
 /// - `codex` → staged image attachments via `CodexCLIProvider.TransientImageLease`.
-/// - `openCode` / `cursor` → ACP image blocks via `ACPPromptContentBuilder`.
+/// - `openCode` / `cursor` / `devin` → ACP image blocks via `ACPPromptContentBuilder`.
 ///
-/// Not admitted: `grokBuild` (advertises no image capability over ACP) and `devin` (no image
-/// serialization path).
+/// Not admitted: `grokBuild` (advertises `promptCapabilities.image = false` over ACP, and its
+/// one-shot prompt-file CLI exposes no attachment channel).
 enum OracleImageRouteAdmission {
     static func supports(_ model: AIModel) -> Bool {
         switch model.providerType {
@@ -662,10 +662,10 @@ enum OracleImageRouteAdmission {
              .claudeCode,
              .codex,
              .openCode,
-             .cursor:
-            true
-        case .grokBuild,
+             .cursor,
              .devin:
+            true
+        case .grokBuild:
             false
         }
     }

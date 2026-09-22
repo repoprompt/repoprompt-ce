@@ -81,13 +81,13 @@ final class OracleImageSerializationTests: XCTestCase {
             .claudeCodeSonnet,
             .codexCustom(name: "codex"),
             .openCodeCustom(name: "opencode"),
-            .cursorCustom(name: "cursor")
+            .cursorCustom(name: "cursor"),
+            .devinCustom(name: "devin")
         ]
         for model in models {
             XCTAssertTrue(OracleImageRouteAdmission.supports(model), "Expected \(model) to admit images")
         }
         XCTAssertFalse(OracleImageRouteAdmission.supports(.grokBuildCustom(name: "grok")))
-        XCTAssertFalse(OracleImageRouteAdmission.supports(.devinCustom(name: "devin")))
     }
 
     func testOpenAITextOnlyMessagesRemainScalar() throws {
@@ -217,9 +217,35 @@ final class OracleImageSerializationTests: XCTestCase {
         let message = makeMessage()
         let openCode = OpenCodeCLIProvider.test_makeAgentMessage(from: message)
         let cursor = CursorCLIProvider.test_makeAgentMessage(from: message)
+        let devin = DevinCLIProvider.test_makeAgentMessage(from: message)
 
         XCTAssertEqual(openCode.transientImages, message.transientImages)
         XCTAssertEqual(cursor.transientImages, message.transientImages)
+        XCTAssertEqual(devin.transientImages, message.transientImages)
+    }
+
+    func testDevinACPPromptBlocksCarryTransientImages() throws {
+        let message = DevinCLIProvider.test_makeAgentMessage(from: makeMessage())
+        let provider = DevinACPAgentProvider(
+            config: DevinCLIProvider.test_makeHeadlessConfig(modelName: nil)
+        )
+        let blocks = try provider.buildPromptBlocks(
+            for: message,
+            request: ACPRunRequest(
+                agentKind: .devin,
+                modelString: nil,
+                workspacePath: nil,
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil,
+                launchPermissionMode: nil
+            )
+        )
+        let imageBlock = try XCTUnwrap(blocks.last)
+
+        XCTAssertEqual(imageBlock["type"] as? String, "image")
+        XCTAssertEqual(imageBlock["mimeType"] as? String, "image/png")
+        XCTAssertEqual(imageBlock["data"] as? String, "AQID")
     }
 
     func testCodexStagesTransientImagesWithOwnerOnlyPermissionsAndCleansUp() async throws {
