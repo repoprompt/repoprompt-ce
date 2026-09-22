@@ -3,6 +3,7 @@ import SwiftUI
 struct AgentStatusPillsRow: View {
     let agentModeVM: AgentModeViewModel
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
+    let openContextDrawerFiles: () -> Void
     @ObservedObject var oracleViewModel: OracleViewModel
     @ObservedObject var promptManager: PromptViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -39,9 +40,16 @@ struct AgentStatusPillsRow: View {
                     selectWorkflow: { agentModeVM.selectWorkflow($0) }
                 )
 
+                AgentMonitorPill(statusPillsUI: statusPillsUI)
+
                 AgentInterviewPill(
                     isOn: snapshot.interviewFirst,
                     onToggle: { agentModeVM.toggleInterviewFirst() }
+                )
+
+                AgentModelRouterPill(
+                    props: snapshot.modelRouter,
+                    onToggle: { agentModeVM.toggleGlobalModelRouter() }
                 )
 
                 if let stagedSlashCommand = snapshot.stagedSlashCommand {
@@ -74,6 +82,7 @@ struct AgentStatusPillsRow: View {
 
                 AgentContextPill(
                     promptManager: promptManager,
+                    openContextDrawerFiles: openContextDrawerFiles,
                     selectionCoordinator: selectionCoordinator,
                     runtimeVM: runtimeVM,
                     currentTabID: snapshot.currentTabID,

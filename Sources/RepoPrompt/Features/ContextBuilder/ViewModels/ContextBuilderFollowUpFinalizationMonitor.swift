@@ -118,7 +118,7 @@ actor ContextBuilderFollowUpFinalizationState {
 enum ContextBuilderFollowUpFinalizationMonitor {
     typealias Clock = @Sendable () -> TimeInterval
     typealias Sleep = @Sendable (_ seconds: TimeInterval) async throws -> Void
-    typealias WaitForFinalization = @Sendable () async throws -> Void
+    typealias WaitForFinalization = @Sendable () async throws -> String
     typealias CancelStreaming = @Sendable () async -> Void
     typealias ReportPhase = @Sendable (_ phase: ContextBuilderMCPProgressPhase) async -> Void
     typealias ReportActivity = @Sendable (
@@ -127,8 +127,9 @@ enum ContextBuilderFollowUpFinalizationMonitor {
     ) async -> Void
 
     private enum MonitorResult {
-        case finalised
+        case finalised(String)
         case timedOut(ContextBuilderFollowUpTimeoutSnapshot)
+        case contextBuilderFailed(OracleContextBuilderCompletionError)
         case failed(String)
         case cancelled
         case observerEnded
@@ -145,15 +146,17 @@ enum ContextBuilderFollowUpFinalizationMonitor {
         cancelStreaming: @escaping CancelStreaming,
         reportPhase: ReportPhase? = nil,
         reportActivity: ReportActivity? = nil
-    ) async throws {
+    ) async throws -> String {
         let state = ContextBuilderFollowUpFinalizationState(startedAt: clock())
         let result = await withTaskGroup(of: MonitorResult.self) { group in
             group.addTask {
                 do {
-                    try await waitForFinalization()
-                    return .finalised
+                    let response = try await waitForFinalization()
+                    return .finalised(response)
                 } catch is CancellationError {
                     return .cancelled
+                } catch let error as OracleContextBuilderCompletionError {
+                    return .contextBuilderFailed(error)
                 } catch {
                     return .failed(error.localizedDescription)
                 }
@@ -194,21 +197,27 @@ enum ContextBuilderFollowUpFinalizationMonitor {
                     continue
                 }
                 group.cancelAll()
+                if case .timedOut = next {
+                    // Select the timeout before cancellation can finalize a response.
+                    // Stop the stream before the task group joins its children: a
+                    // completion waiter may need stream teardown in order to settle.
+                    await cancelStreaming()
+                }
                 return next
             }
             return .cancelled
         }
 
         switch result {
-        case .finalised:
+        case let .finalised(response):
             if await state.claimFinalizationTransitionOnCompletion() {
                 await reportPhase?(.messageFinalization)
             }
-            return
+            return response
         case let .timedOut(timeout):
-            // The timeout outcome is already fixed before cancellation can trigger finalization.
-            await cancelStreaming()
             throw ChatToolError.internalError(timeout.message)
+        case let .contextBuilderFailed(error):
+            throw error
         case let .failed(message):
             throw ChatToolError.internalError("Follow-up finalization monitoring failed: \(message)")
         case .cancelled, .observerEnded:

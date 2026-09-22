@@ -16,6 +16,18 @@ load_release_metadata "$ROOT_DIR"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+ROLLOUT_TOOL="$CONTROL_PLANE_SCRIPTS_DIR/stable_rollout.py"
+APPLE_IDENTITY_POLICY="$CONTROL_PLANE_SCRIPTS_DIR/apple_identity_policy.json"
+ROLLOUT_DECLARATION="$ROOT_DIR/tip-rollout.json"
+[[ -f "$ROLLOUT_TOOL" && -f "$APPLE_IDENTITY_POLICY" && -f "$ROLLOUT_DECLARATION" ]] ||
+    fail "Tip identity rollout authority is incomplete"
+eval "$(python3 "$ROLLOUT_TOOL" packaging-context \
+    --declaration "$ROLLOUT_DECLARATION" \
+    --policy "$APPLE_IDENTITY_POLICY" \
+    --version-env "$ROOT_DIR/version.env")"
+[[ "$ROLLOUT_CHANNEL" == "tip" ]] || fail "Tip release requires a Tip rollout declaration"
+TIP_PUBLISH_INSTALLATION_TYPE="${TIP_PUBLISH_INSTALLATION_TYPE:-$ROLLOUT_INSTALLATION_TYPE}"
+
 TIP_COMMIT="${TIP_COMMIT:-$(git rev-parse HEAD)}"
 TIP_SHORT_SHA="${TIP_SHORT_SHA:-${TIP_COMMIT:0:12}}"
 if [[ -z "${TIP_BUILD_NUMBER:-}" ]]; then
@@ -28,8 +40,9 @@ fi
 TIP_BUILD_NUMBER="${TIP_BUILD_NUMBER//[[:space:]]/}"
 TIP_TAG="${TIP_TAG:-tip-$TIP_SHORT_SHA}"
 TIP_UPDATE_REPOSITORY="${TIP_UPDATE_REPOSITORY:-repoprompt/repoprompt-ce-tip-updates}"
-TIP_DOWNLOAD_URL_PREFIX="${TIP_DOWNLOAD_URL_PREFIX:-https://github.com/$TIP_UPDATE_REPOSITORY/releases/download/$TIP_TAG/}"
-TIP_GH_TOKEN="${TIP_GH_TOKEN:-${GH_TOKEN:-}}"
+[[ "$TIP_UPDATE_REPOSITORY" == "$ROLLOUT_UPDATE_REPOSITORY" ]] ||
+    fail "TIP_UPDATE_REPOSITORY must match the reviewed identity policy"
+TIP_GH_TOKEN="${TIP_GH_TOKEN:-}"
 
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
@@ -37,23 +50,53 @@ DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"
 ARCHIVE_BASENAME="$APP_NAME-tip-$TIP_SHORT_SHA-$TIP_BUILD_NUMBER"
 UPDATE_ZIP="$DIST_DIR/$ARCHIVE_BASENAME.zip"
 DMG="$DIST_DIR/$ARCHIVE_BASENAME.dmg"
+TRANSITION_PKG="$DIST_DIR/$ARCHIVE_BASENAME.pkg"
+if [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" ]]; then
+    ENCLOSURE="$TRANSITION_PKG"
+else
+    ENCLOSURE="$UPDATE_ZIP"
+fi
 APPCAST="$DIST_DIR/appcast.xml"
 CHECKSUMS="$DIST_DIR/SHA256SUMS"
 BUILD_ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 FINAL_METADATA="$DIST_DIR/$ARCHIVE_BASENAME-metadata.json"
+ROLLOUT_MANIFEST="$DIST_DIR/identity-rollout.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
 STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
 SIGN_UPDATE="$TRUSTED_ROOT/Vendor/Sparkle/bin/sign_update"
+PUBLISH_TIP_RELEASE="$CONTROL_PLANE_SCRIPTS_DIR/publish_tip_release.sh"
 TMP_DIR=""
+PHASE_LABEL=""
+PHASE_START_EPOCH=""
 
 require_command() { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
 require_env() { [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"; }
 require_file() { [[ -f "$1" ]] || fail "Missing required file: $1"; }
 cleanup() { [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"; }
-trap cleanup EXIT
+finish() {
+    local status="$1"
+    trap - EXIT
+    cleanup
+    if [[ -n "$PHASE_LABEL" ]]; then
+        local end_epoch end_utc elapsed outcome
+        end_epoch="$(date -u +%s)"
+        end_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        elapsed=$((end_epoch - PHASE_START_EPOCH))
+        if (( status == 0 )); then outcome="success"; else outcome="failure"; fi
+        printf 'PHASE END: %s utc=%s elapsed_seconds=%s status=%s\n' \
+            "$PHASE_LABEL" "$end_utc" "$elapsed" "$outcome"
+    fi
+    exit "$status"
+}
+start_phase() {
+    PHASE_LABEL="$1"
+    PHASE_START_EPOCH="$(date -u +%s)"
+    printf 'PHASE START: %s utc=%s\n' "$PHASE_LABEL" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+trap 'finish $?' EXIT
 
 prepare_dist() {
     [[ "$DIST_DIR" != "/" ]] || fail "DIST_DIR must not be /"
@@ -129,7 +172,7 @@ validate_packaged_legal() {
 
 write_tip_metadata() {
     cat > "$FINAL_METADATA" <<JSON
-{"commit":"$TIP_COMMIT","short_sha":"$TIP_SHORT_SHA","tag":"$TIP_TAG","marketing_version":"$MARKETING_VERSION","build_number":"$TIP_BUILD_NUMBER"}
+{"commit":"$TIP_COMMIT","short_sha":"$TIP_SHORT_SHA","tag":"$TIP_TAG","marketing_version":"$MARKETING_VERSION","build_number":"$TIP_BUILD_NUMBER","rollout_role":"$ROLLOUT_ROLE","signing_identity":"$ROLLOUT_IDENTITY","migration_phase":"$REPOPROMPT_IDENTITY_MIGRATION_PHASE"}
 JSON
 }
 
@@ -160,6 +203,7 @@ PYTHON
 
 stage_tip() {
     require_command ditto
+    require_command curl
     require_command git
     require_command shasum
     [[ "$TIP_BUILD_NUMBER" =~ ^[0-9]{1,4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]] ||
@@ -171,7 +215,11 @@ stage_tip() {
         REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$CONTROL_PLANE_SCRIPTS_DIR" \
         MARKETING_VERSION="$MARKETING_VERSION" \
+        BUNDLE_ID="$BUNDLE_ID" \
+        SIGNING_TEAM_ID="$SIGNING_TEAM_ID" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
+        REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1 \
+        REPOPROMPT_IDENTITY_MIGRATION_PHASE="$REPOPROMPT_IDENTITY_MIGRATION_PHASE" \
         REPOPROMPT_ENABLE_SENTRY=1 \
         RELEASE_ALLOW_ADHOC_SIGNING=1 \
         "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" release
@@ -197,6 +245,7 @@ stage_tip() {
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
         "repoprompt-mcp"
+    cp "$ROLLOUT_DECLARATION" "$stage_root/tip-rollout.json"
     write_tip_version_env "$stage_root/version.env"
     cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
@@ -207,125 +256,138 @@ stage_tip() {
     printf 'OK: staged tip build %s (%s) for %s.\n' "$TIP_TAG" "$TIP_BUILD_NUMBER" "$TIP_COMMIT"
 }
 
+fetch_notarization_log() {
+    local submission_id="$1"
+    printf 'Fetching Apple notarization log for submission %s.\n' "$submission_id" >&2
+    if ! xcrun notarytool log "$submission_id" \
+        --key "$NOTARYTOOL_PRIVATE_KEY" \
+        --key-id "$NOTARYTOOL_KEY_ID" \
+        --issuer "$NOTARYTOOL_ISSUER_ID" \
+        --output-format json; then
+        printf 'WARNING: unable to retrieve Apple notarization log for submission %s.\n' "$submission_id" >&2
+    fi
+}
+
 submit_notarization() {
-    xcrun notarytool submit "$1" \
+    local artifact="$1"
+    require_file "$artifact"
+    require_env NOTARYTOOL_PRIVATE_KEY
+    require_env NOTARYTOOL_KEY_ID
+    require_env NOTARYTOOL_ISSUER_ID
+    require_file "$NOTARYTOOL_PRIVATE_KEY"
+    [[ -n "$TMP_DIR" ]] || TMP_DIR="$(mktemp -d)"
+
+    local response_file submit_status fields submission_id submission_status
+    response_file="$(mktemp "$TMP_DIR/notarytool-submit.XXXXXX")"
+    if xcrun notarytool submit "$artifact" \
         --key "$NOTARYTOOL_PRIVATE_KEY" \
         --key-id "$NOTARYTOOL_KEY_ID" \
         --issuer "$NOTARYTOOL_ISSUER_ID" \
         --wait \
-        --timeout "${NOTARYTOOL_TIMEOUT:-30m}"
+        --timeout "${NOTARYTOOL_TIMEOUT:-30m}" \
+        --output-format json > "$response_file"; then
+        submit_status=0
+    else
+        submit_status=$?
+    fi
+    cat "$response_file"
+
+    fields="$(python3 - "$response_file" <<'PYTHON'
+import json
+import sys
+import uuid
+from pathlib import Path
+
+try:
+    response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    print("|")
+    raise SystemExit(0)
+submission_id = response.get("id", "")
+status = response.get("status", "")
+try:
+    submission_id = str(uuid.UUID(str(submission_id))) if submission_id else ""
+except (ValueError, AttributeError, TypeError):
+    submission_id = ""
+print(f"{submission_id}|{status if isinstance(status, str) else ''}")
+PYTHON
+)"
+    submission_id="${fields%%|*}"
+    submission_status="${fields#*|}"
+    if [[ -n "$submission_id" ]]; then
+        printf 'Apple notarization submission ID: %s\n' "$submission_id"
+    fi
+    if (( submit_status != 0 )) || [[ "$submission_status" != "Accepted" || -z "$submission_id" ]]; then
+        if [[ -n "$submission_id" ]]; then
+            fetch_notarization_log "$submission_id"
+        else
+            printf 'Apple notarization did not return a valid submission ID; no notarytool log can be retrieved.\n' >&2
+        fi
+        fail "Apple notarization failed for $(basename "$artifact") (exit=$submit_status status=${submission_status:-unknown})"
+    fi
 }
 
 derive_sparkle_public_key() {
     xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/derive_sparkle_public_key.swift" "$1"
 }
 
-label_generated_tip_appcast() {
-    python3 - "$APPCAST" "$MARKETING_VERSION" "$TIP_BUILD_NUMBER" "$TIP_SHORT_SHA" <<'PYTHON'
-import sys
-import xml.etree.ElementTree as ET
+generate_tip_rollout_appcast() {
+    require_env SPARKLE_PRIVATE_KEY
+    local predecessor_dir="$TMP_DIR/predecessors"
+    mkdir -p "$predecessor_dir"
+    # macOS still ships Bash 3.2, where expanding an empty array under
+    # `set -u` aborts the script. Keep this argument vector non-empty for the
+    # preparer role, whose rollout intentionally has no predecessors.
+    local rollout_generate_args=(--declaration "$ROLLOUT_DECLARATION")
+    local position=0 role tag digest path actual_digest
+    while IFS=$'\t' read -r role tag digest; do
+        [[ -n "$role" ]] || continue
+        position=$((position + 1))
+        path="$predecessor_dir/$position-identity-rollout.json"
+        curl --fail --location --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            "https://github.com/$TIP_UPDATE_REPOSITORY/releases/download/$tag/identity-rollout.json" \
+            --output "$path"
+        actual_digest="$(shasum -a 256 "$path" | awk '{print $1}')"
+        [[ "$actual_digest" == "$digest" ]] ||
+            fail "Tip predecessor $role manifest digest mismatch for $tag"
+        rollout_generate_args+=(--predecessor-manifest "$path")
+    done < <(python3 "$ROLLOUT_TOOL" predecessor-values --declaration "$ROLLOUT_DECLARATION")
 
-sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
-ET.register_namespace("sparkle", sparkle)
-tree = ET.parse(sys.argv[1])
-root = tree.getroot()
-items = root.findall("./channel/item")
-if len(items) != 1:
-    raise SystemExit(f"tip appcast must contain exactly one item, got {len(items)}")
+    local enclosure_signature
+    enclosure_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" |
+        "$SIGN_UPDATE" --ed-key-file - -p "$ENCLOSURE" |
+        tr -d '\r\n')"
+    [[ -n "$enclosure_signature" ]] || fail "Unable to sign Tip rollout enclosure"
 
-item = items[0]
-marketing_version, build_number, short_sha = sys.argv[2:]
-
-def singleton_or_create(element_name, qualified_name):
-    elements = item.findall(qualified_name)
-    if len(elements) > 1:
-        raise SystemExit(
-            f"tip appcast item must contain at most one {element_name}, got {len(elements)}"
-        )
-    return elements[0] if elements else ET.SubElement(item, qualified_name)
-
-title = singleton_or_create("title", "title")
-title.text = f"Tip build {build_number} · v{marketing_version} · commit {short_sha}"
-short_version = singleton_or_create(
-    "sparkle:shortVersionString", f"{{{sparkle}}}shortVersionString"
-)
-short_version.text = marketing_version
-# Sparkle embeds releaseNotesLink targets inside its stock update window.
-# Tip releases intentionally keep that dialog compact instead of loading a full
-# GitHub release page as web content.
-for release_notes_link in item.findall(f"{{{sparkle}}}releaseNotesLink"):
-    item.remove(release_notes_link)
-for description in item.findall("description"):
-    item.remove(description)
-
-tree.write(sys.argv[1], encoding="utf-8", xml_declaration=True)
-PYTHON
-}
-
-validate_generated_tip_appcast() {
-    local appcast_values="$TMP_DIR/tip-appcast-values.tsv"
-    python3 - "$APPCAST" > "$appcast_values" <<'PYTHON'
-import sys
-import xml.etree.ElementTree as ET
-
-sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
-root = ET.parse(sys.argv[1]).getroot()
-items = root.findall("./channel/item")
-if len(items) != 1:
-    raise SystemExit(f"tip appcast must contain exactly one item, got {len(items)}")
-enclosures = items[0].findall("enclosure")
-if len(enclosures) != 1:
-    raise SystemExit(f"tip appcast item must contain exactly one enclosure, got {len(enclosures)}")
-item = items[0]
-enclosure = enclosures[0]
-titles = item.findall("title")
-versions = item.findall(f"{{{sparkle}}}version")
-short_versions = item.findall(f"{{{sparkle}}}shortVersionString")
-release_notes_links = item.findall(f"{{{sparkle}}}releaseNotesLink")
-descriptions = item.findall("description")
-if len(titles) != 1:
-    raise SystemExit(f"tip appcast item must contain exactly one title, got {len(titles)}")
-if len(versions) != 1:
-    raise SystemExit(
-        f"tip appcast item must contain exactly one sparkle:version, got {len(versions)}"
-    )
-if len(short_versions) != 1:
-    raise SystemExit(
-        "tip appcast item must contain exactly one "
-        f"sparkle:shortVersionString, got {len(short_versions)}"
-    )
-if release_notes_links:
-    raise SystemExit(
-        "tip appcast item must not contain sparkle:releaseNotesLink"
-    )
-if descriptions:
-    raise SystemExit("tip appcast item must not contain description")
-values = [
-    enclosure.attrib.get("url", ""),
-    enclosure.attrib.get(f"{{{sparkle}}}edSignature", ""),
-    enclosure.attrib.get("length", ""),
-    versions[0].text or "",
-    short_versions[0].text or "",
-    titles[0].text or "",
-]
-print("\x1f".join([str(len(values)), *values]))
-PYTHON
-
-    local appcast_field_count enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing appcast_title
-    IFS=$'\x1f' read -r appcast_field_count enclosure_url enclosure_signature enclosure_length appcast_build appcast_marketing appcast_title < "$appcast_values"
-    [[ "$appcast_field_count" == "6" ]] ||
-        fail "Tip appcast metadata field count mismatch: expected 6, got $appcast_field_count"
-    [[ "$enclosure_url" == "$TIP_DOWNLOAD_URL_PREFIX$(basename "$UPDATE_ZIP")" ]] ||
-        fail "Tip appcast enclosure URL mismatch: $enclosure_url"
-    [[ -n "$enclosure_signature" ]] || fail "Tip appcast enclosure is missing an EdDSA signature"
-    [[ "$enclosure_length" == "$(stat -f %z "$UPDATE_ZIP")" ]] ||
-        fail "Tip appcast enclosure length does not match $(basename "$UPDATE_ZIP")"
-    [[ "$appcast_build" == "$TIP_BUILD_NUMBER" ]] ||
-        fail "Tip appcast build mismatch: expected $TIP_BUILD_NUMBER, got $appcast_build"
-    [[ "$appcast_marketing" == "$MARKETING_VERSION" ]] ||
-        fail "Tip appcast marketing version mismatch: expected $MARKETING_VERSION, got $appcast_marketing"
-    [[ "$appcast_title" == "Tip build $TIP_BUILD_NUMBER · v$MARKETING_VERSION · commit $TIP_SHORT_SHA" ]] ||
-        fail "Tip appcast presentation title mismatch: $appcast_title"
+    python3 "$ROLLOUT_TOOL" generate \
+        "${rollout_generate_args[@]}" \
+        --policy "$APPLE_IDENTITY_POLICY" \
+        --version-env "$ROOT_DIR/version.env" \
+        --release-tag "$TIP_TAG" \
+        --release-commit "$TIP_COMMIT" \
+        --migration-phase "$REPOPROMPT_IDENTITY_MIGRATION_PHASE" \
+        --allowed-roles legacy,preparer,transition,successor \
+        --enclosure "$ENCLOSURE" \
+        --enclosure-basename "$ARCHIVE_BASENAME" \
+        --enclosure-signature "$enclosure_signature" \
+        --app-artifact-manifest "$FINAL_ARTIFACT_MANIFEST" \
+        --appcast-output "$APPCAST" \
+        --manifest-output "$ROLLOUT_MANIFEST"
+    python3 "$ROLLOUT_TOOL" validate \
+        "${rollout_generate_args[@]}" \
+        --policy "$APPLE_IDENTITY_POLICY" \
+        --version-env "$ROOT_DIR/version.env" \
+        --release-tag "$TIP_TAG" \
+        --release-commit "$TIP_COMMIT" \
+        --migration-phase "$REPOPROMPT_IDENTITY_MIGRATION_PHASE" \
+        --allowed-roles legacy,preparer,transition,successor \
+        --enclosure "$ENCLOSURE" \
+        --enclosure-basename "$ARCHIVE_BASENAME" \
+        --enclosure-signature "$enclosure_signature" \
+        --app-artifact-manifest "$FINAL_ARTIFACT_MANIFEST" \
+        --appcast "$APPCAST" \
+        --manifest "$ROLLOUT_MANIFEST"
 
     local private_key_file="$TMP_DIR/tip-sparkle-private-key"
     local public_key_file="$TMP_DIR/tip-sparkle-public-key"
@@ -338,17 +400,56 @@ PYTHON
     [[ "$derived_public_key" == "$committed_public_key" ]] ||
         fail "Tip Sparkle private key does not match the app bundle SUPublicEDKey"
     reproduced_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" |
-        "$SIGN_UPDATE" --ed-key-file - -p "$UPDATE_ZIP" |
+        "$SIGN_UPDATE" --ed-key-file - -p "$ENCLOSURE" |
         tr -d '\r\n')"
     [[ "$reproduced_signature" == "$enclosure_signature" ]] ||
         fail "Tip Sparkle private key does not reproduce the generated appcast signature"
 
     printf '%s' "$committed_public_key" > "$public_key_file"
     xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift" \
-        "$public_key_file" "$enclosure_signature" "$UPDATE_ZIP"
+        "$public_key_file" "$enclosure_signature" "$ENCLOSURE"
 }
 
-sign_tip() {
+require_application_rollout() {
+    [[ "$ROLLOUT_INSTALLATION_TYPE" == "application" ]] ||
+        fail "Application notarization requires a policy-derived application rollout"
+}
+
+require_package_rollout() {
+    [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" && "$ROLLOUT_ROLE" == "transition" ]] ||
+        fail "Package phase requires the policy-derived transition package rollout"
+    require_env EXPECTED_INSTALLER_IDENTITY
+}
+
+notarize_application_bundle() {
+    require_application_rollout
+    local notary_zip="$TMP_DIR/$ARCHIVE_BASENAME-notarization.zip"
+    ditto -c -k --norsrc --keepParent "$APP_BUNDLE" "$notary_zip"
+    submit_notarization "$notary_zip"
+    xcrun stapler staple "$APP_BUNDLE"
+    xcrun stapler validate "$APP_BUNDLE"
+}
+
+notarize_application_dmg() {
+    require_application_rollout
+    submit_notarization "$DMG"
+    xcrun stapler staple "$DMG"
+    xcrun stapler validate "$DMG"
+}
+
+notarize_signed_app_for_rollout() {
+    case "$ROLLOUT_INSTALLATION_TYPE" in
+        application) notarize_application_bundle ;;
+        package)
+            require_package_rollout
+            printf 'OK: package rollout skips standalone application notarization.\n'
+            ;;
+        *) fail "Unsupported policy-derived installation type: $ROLLOUT_INSTALLATION_TYPE" ;;
+    esac
+}
+
+sign_tip_application_phase() {
+    require_command curl
     require_command ditto
     require_command hdiutil
     require_command plutil
@@ -361,17 +462,17 @@ sign_tip() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"
     require_env SIGN_IDENTITY
     require_env REPOPROMPT_PROVISIONING_PROFILE
-    require_env SPARKLE_PRIVATE_KEY
-    require_env NOTARYTOOL_PRIVATE_KEY
-    require_env NOTARYTOOL_KEY_ID
-    require_env NOTARYTOOL_ISSUER_ID
     require_env RELEASE_COMMIT
     require_env REPOPROMPT_APPROVED_SOURCE_ROOT
     require_tip_sentry_configuration
+    [[ "$SIGN_IDENTITY" == "$EXPECTED_SIGN_IDENTITY" ]] ||
+        fail "SIGN_IDENTITY does not match the reviewed $ROLLOUT_IDENTITY identity"
     [[ "$RELEASE_COMMIT" == "$TIP_COMMIT" ]] || fail "RELEASE_COMMIT must match TIP_COMMIT"
     [[ -d "$APP_BUNDLE" ]] || fail "Missing staged tip app bundle: $APP_BUNDLE"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
+        REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1 \
+        REPOPROMPT_IDENTITY_MIGRATION_PHASE="$REPOPROMPT_IDENTITY_MIGRATION_PHASE" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
     verify_release_sentry_symbol_uuids_before_signing \
         "$SENTRY_SYMBOLS_DIR" \
@@ -382,14 +483,14 @@ sign_tip() {
         "repoprompt-mcp"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
+        REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1 \
+        REPOPROMPT_IDENTITY_MIGRATION_PHASE="$REPOPROMPT_IDENTITY_MIGRATION_PHASE" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
     prepare_dist
     TMP_DIR="$(mktemp -d)"
-    local notary_zip="$TMP_DIR/$ARCHIVE_BASENAME-notarization.zip"
-    ditto -c -k --norsrc --keepParent "$APP_BUNDLE" "$notary_zip"
-    submit_notarization "$notary_zip"
-    xcrun stapler staple "$APP_BUNDLE"
-    xcrun stapler validate "$APP_BUNDLE"
+
+    notarize_signed_app_for_rollout
+
     "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" write \
         --app "$APP_BUNDLE" \
         --output "$FINAL_ARTIFACT_MANIFEST" \
@@ -405,68 +506,216 @@ sign_tip() {
         "repoprompt-mcp.dSYM" \
         "repoprompt-mcp"
 
+    if [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" ]]; then
+        printf 'OK: signed and validated Tip application for package rollout %s.\n' "$TIP_TAG"
+        return
+    fi
+
     local distribution_dir="$TMP_DIR/distribution"
     mkdir -p "$distribution_dir"
     ditto "$APP_BUNDLE" "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME"
     ditto -c -k --norsrc --keepParent "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME" "$UPDATE_ZIP"
     validate_distribution_zip "$UPDATE_ZIP" "$FINAL_ARTIFACT_MANIFEST" "Final tip distribution" "$SIGNING_TEAM_ID"
     hdiutil create -volname "$DISPLAY_NAME Tip" -srcfolder "$distribution_dir" -ov -format UDZO "$DMG"
-    submit_notarization "$DMG"
-    xcrun stapler staple "$DMG"
-    xcrun stapler validate "$DMG"
+    notarize_application_dmg
+    generate_tip_rollout_appcast
+    local checksum_assets=(
+        "$(basename "$UPDATE_ZIP")"
+        "$(basename "$DMG")"
+        "$(basename "$APPCAST")"
+        "$(basename "$FINAL_ARTIFACT_MANIFEST")"
+        "$(basename "$FINAL_METADATA")"
+        "$(basename "$ROLLOUT_MANIFEST")"
+    )
+    (cd "$DIST_DIR" && shasum -a 256 "${checksum_assets[@]}" > "$(basename "$CHECKSUMS")")
+    printf 'OK: signed and notarized Tip %s application artifact %s.\n' "$ROLLOUT_ROLE" "$TIP_TAG"
+}
 
-    local appcast_dir="$TMP_DIR/appcast"
-    mkdir -p "$appcast_dir"
-    cp "$UPDATE_ZIP" "$appcast_dir/"
-    printf '%s' "$SPARKLE_PRIVATE_KEY" |
-        "$TRUSTED_ROOT/Vendor/Sparkle/bin/generate_appcast" \
-            --ed-key-file - \
-            --download-url-prefix "$TIP_DOWNLOAD_URL_PREFIX" \
-            -o "$APPCAST" \
-            "$appcast_dir"
-    label_generated_tip_appcast
-    validate_generated_tip_appcast
-    (cd "$DIST_DIR" && shasum -a 256 \
-        "$(basename "$UPDATE_ZIP")" \
-        "$(basename "$DMG")" \
-        "$(basename "$APPCAST")" \
-        "$(basename "$FINAL_ARTIFACT_MANIFEST")" \
-        "$(basename "$FINAL_METADATA")" \
-        > "$(basename "$CHECKSUMS")")
-    printf 'OK: signed and notarized tip artifact %s.\n' "$TIP_TAG"
+build_tip_package_phase() {
+    require_package_rollout
+    REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+        "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" build \
+        --app "$APP_BUNDLE" \
+        --output "$TRANSITION_PKG" \
+        --installer-identity "$EXPECTED_INSTALLER_IDENTITY"
+}
+
+submit_tip_package_notarization_phase() {
+    require_package_rollout
+    require_command xcrun
+    TMP_DIR="$(mktemp -d)"
+    submit_notarization "$TRANSITION_PKG"
+}
+
+staple_tip_package_phase() {
+    require_package_rollout
+    REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+        "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" staple "$TRANSITION_PKG"
+}
+
+validate_tip_package_phase() {
+    require_package_rollout
+    require_command curl
+    require_command shasum
+    require_command xcrun
+    require_file "$SIGN_UPDATE"
+    require_file "$FINAL_ARTIFACT_MANIFEST"
+    require_file "$FINAL_METADATA"
+    TMP_DIR="$(mktemp -d)"
+    REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+        "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" validate \
+        "$TRANSITION_PKG" --expected-app "$APP_BUNDLE"
+    generate_tip_rollout_appcast
+    local checksum_assets=(
+        "$(basename "$TRANSITION_PKG")"
+        "$(basename "$APPCAST")"
+        "$(basename "$FINAL_ARTIFACT_MANIFEST")"
+        "$(basename "$FINAL_METADATA")"
+        "$(basename "$ROLLOUT_MANIFEST")"
+    )
+    (cd "$DIST_DIR" && shasum -a 256 "${checksum_assets[@]}" > "$(basename "$CHECKSUMS")")
+    printf 'OK: signed, notarized, stapled, and validated Tip package artifact %s.\n' "$TIP_TAG"
+}
+
+sign_tip() {
+    sign_tip_application_phase
+    if [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" ]]; then
+        build_tip_package_phase
+        submit_tip_package_notarization_phase
+        staple_tip_package_phase
+        validate_tip_package_phase
+    fi
+}
+
+tip_publish_assets() {
+    TIP_PUBLISH_ASSETS=("$APPCAST" "$CHECKSUMS" "$FINAL_ARTIFACT_MANIFEST" "$FINAL_METADATA" "$ROLLOUT_MANIFEST")
+    case "$TIP_PUBLISH_INSTALLATION_TYPE" in
+        package) TIP_PUBLISH_ASSETS+=("$TRANSITION_PKG") ;;
+        application) TIP_PUBLISH_ASSETS+=("$UPDATE_ZIP" "$DMG") ;;
+        *) fail "TIP_PUBLISH_INSTALLATION_TYPE must be application or package" ;;
+    esac
+}
+
+validate_tip_publish_assets() {
+    require_command python3
+    tip_publish_assets
+    local expected_basenames=()
+    local path
+    for path in "${TIP_PUBLISH_ASSETS[@]}"; do
+        expected_basenames+=("$(basename "$path")")
+    done
+    python3 - "$DIST_DIR" "${expected_basenames[@]}" <<'PYTHON'
+import sys
+from pathlib import Path
+
+dist = Path(sys.argv[1])
+expected = set(sys.argv[2:])
+if not dist.is_dir():
+    raise SystemExit(f"ERROR: Missing Tip publish directory: {dist}")
+actual = {entry.name for entry in dist.iterdir()}
+missing = sorted(expected - actual)
+extra = sorted(actual - expected)
+if missing or extra:
+    raise SystemExit(
+        "ERROR: Tip publish asset inventory mismatch: "
+        f"missing={missing or 'none'} extra={extra or 'none'}"
+    )
+for name in sorted(expected):
+    path = dist / name
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"ERROR: Tip publish asset must be a regular non-symlink file: {path}")
+print(f"OK: Tip publish asset inventory contains exactly {len(expected)} files.")
+PYTHON
+    (cd "$DIST_DIR" && shasum -a 256 -c "$(basename "$CHECKSUMS")")
+    python3 - "$CHECKSUMS" "${expected_basenames[@]}" <<'PYTHON'
+import re
+import sys
+from pathlib import Path
+
+checksum_path = Path(sys.argv[1])
+expected = set(sys.argv[2:]) - {checksum_path.name}
+actual = set()
+for line in checksum_path.read_text(encoding="utf-8").splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64})  ([^/]+)", line)
+    if not match:
+        raise SystemExit(f"ERROR: malformed SHA256SUMS line: {line!r}")
+    name = match.group(2)
+    if name in actual:
+        raise SystemExit(f"ERROR: duplicate SHA256SUMS entry: {name}")
+    actual.add(name)
+if actual != expected:
+    raise SystemExit(
+        "ERROR: SHA256SUMS entry set mismatch: "
+        f"missing={sorted(expected - actual)} extra={sorted(actual - expected)}"
+    )
+PYTHON
 }
 
 publish_tip() {
-    require_command gh
     require_env TIP_GH_TOKEN
+    require_env TIP_SOURCE_GH_TOKEN
+    require_env TIP_SOURCE_REPOSITORY
+    require_env TIP_SOURCE_BRANCH
+    require_file "$PUBLISH_TIP_RELEASE"
     case "$TIP_UPDATE_REPOSITORY" in
         repoprompt/repoprompt-ce|repoprompt/repoprompt-ce-updates)
             fail "TIP_UPDATE_REPOSITORY must not target the source or stable update repository"
             ;;
     esac
-    for path in "$UPDATE_ZIP" "$DMG" "$APPCAST" "$CHECKSUMS" "$FINAL_ARTIFACT_MANIFEST" "$FINAL_METADATA"; do
-        [[ -f "$path" ]] || fail "Missing tip publish asset: $path"
-    done
-    GH_TOKEN="$TIP_GH_TOKEN" gh release create "$TIP_TAG" \
-        "$UPDATE_ZIP" \
-        "$DMG" \
-        "$APPCAST" \
-        "$CHECKSUMS" \
-        "$FINAL_ARTIFACT_MANIFEST" \
-        "$FINAL_METADATA" \
-        --repo "$TIP_UPDATE_REPOSITORY" \
-        --target main \
-        --latest \
-        --title "$DISPLAY_NAME Tip $TIP_SHORT_SHA" \
-        --notes "Tip build from main commit \`$TIP_COMMIT\` with build number \`$TIP_BUILD_NUMBER\`."
-    printf 'OK: published tip update release %s to %s.\n' "$TIP_TAG" "$TIP_UPDATE_REPOSITORY"
+    validate_tip_publish_assets
+    TIP_GH_TOKEN="$TIP_GH_TOKEN" \
+    TIP_SOURCE_GH_TOKEN="$TIP_SOURCE_GH_TOKEN" \
+    TIP_UPDATE_REPOSITORY="$TIP_UPDATE_REPOSITORY" \
+    TIP_SOURCE_REPOSITORY="$TIP_SOURCE_REPOSITORY" \
+    TIP_SOURCE_BRANCH="$TIP_SOURCE_BRANCH" \
+    TIP_COMMIT="$TIP_COMMIT" \
+    TIP_TAG="$TIP_TAG" \
+    TIP_BUILD_NUMBER="$TIP_BUILD_NUMBER" \
+    TIP_PUBLISH_INSTALLATION_TYPE="$TIP_PUBLISH_INSTALLATION_TYPE" \
+    TIP_RELEASE_TITLE="$DISPLAY_NAME Tip $ROLLOUT_ROLE $TIP_SHORT_SHA" \
+    TIP_RELEASE_NOTES="Tip identity rollout role \`$ROLLOUT_ROLE\` from main commit \`$TIP_COMMIT\` with build number \`$TIP_BUILD_NUMBER\`." \
+    TIP_EXPECTED_ROLLOUT_ROLE="$ROLLOUT_ROLE" \
+    TIP_EXPECTED_SIGNING_IDENTITY="$ROLLOUT_IDENTITY" \
+    TIP_EXPECTED_MIGRATION_PHASE="$REPOPROMPT_IDENTITY_MIGRATION_PHASE" \
+        exec "$PUBLISH_TIP_RELEASE" \
+            --rollout-declaration "$ROLLOUT_DECLARATION" "${TIP_PUBLISH_ASSETS[@]}"
 }
+
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "$MODE" in
-        stage) stage_tip ;;
-        sign) sign_tip ;;
+        stage)
+            start_phase "Stage Tip application"
+            stage_tip
+            ;;
+        sign)
+            start_phase "Sign and notarize Tip"
+            sign_tip
+            ;;
+        sign-application)
+            start_phase "Sign application"
+            sign_tip_application_phase
+            ;;
+        build-package)
+            start_phase "Build package"
+            build_tip_package_phase
+            ;;
+        submit-package-notarization)
+            start_phase "Submit package notarization"
+            submit_tip_package_notarization_phase
+            ;;
+        staple-package)
+            start_phase "Staple package"
+            staple_tip_package_phase
+            ;;
+        validate-package)
+            start_phase "Validate package"
+            validate_tip_package_phase
+            ;;
+        validate-assets) validate_tip_publish_assets ;;
         publish-tip) publish_tip ;;
-        *) fail "Usage: $0 stage|sign|publish-tip" ;;
+        *)
+            fail "Usage: $0 stage|sign|sign-application|build-package|submit-package-notarization|staple-package|validate-package|validate-assets|publish-tip"
+            ;;
     esac
 fi

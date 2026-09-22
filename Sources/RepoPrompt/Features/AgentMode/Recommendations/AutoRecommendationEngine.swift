@@ -54,6 +54,7 @@ final class AutoRecommendationEngine {
                 claudeCodeCLI: .notConfigured,
                 codexCLI: .notConfigured,
                 cursorCLI: .notConfigured,
+                grokBuildCLI: .notConfigured,
                 openAI: .notConfigured
             )
         }
@@ -344,13 +345,15 @@ final class AutoRecommendationEngine {
            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
            !modelRaw.isEmpty,
+           AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
            AgentModelCatalog.isAgentAvailable(agent, availability: availability),
            isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
         {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: agent.rawValue,
                 modelRaw: modelRaw,
-                availability: availability
+                availability: availability,
+                surface: .headless
             )
         }
 
@@ -358,17 +361,22 @@ final class AutoRecommendationEngine {
             claudeCodeCLI: availability.claudeCodeAvailable ? .ready : .notConfigured,
             codexCLI: availability.codexAvailable ? .ready : .notConfigured,
             cursorCLI: availability.cursorAvailable ? .ready : .notConfigured,
+            grokBuildCLI: availability.grokBuildAvailable ? .ready : .notConfigured,
             openAI: .notConfigured
         ).filtered(to: enabledRecommendationProviders)
         if let recommendation = contextBuilderRecommendation(status: status) {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: recommendation.recommendedAgent.rawValue,
                 modelRaw: recommendation.recommendedModel.rawValue,
-                availability: availability
+                availability: availability,
+                surface: .headless
             )
         }
 
-        guard let availableAgent = AgentModelCatalog.selectableAgents(availability: availability).first(where: {
+        guard let availableAgent = AgentModelCatalog.selectableAgents(
+            availability: availability,
+            surface: .headless
+        ).first(where: {
             switch $0 {
             case .claudeCode:
                 enabledRecommendationProviders.contains(.claudeCode)
@@ -376,8 +384,12 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
+            case .grokBuild:
+                enabledRecommendationProviders.contains(.grokBuild)
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
+            case .antigravity, .devin:
+                false
             }
         }) else {
             return nil

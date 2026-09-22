@@ -1,766 +1,574 @@
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 import XCTest
 
 final class CursorACPLaunchResolverTests: XCTestCase {
-    func testMakeLaunchConfigurationResolvesExactPathWithoutPriorProbe() throws {
+    func testHealthyLegacyDoesNotDiscoverSecondaryEntrypoint() async throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "cursor-agent", in: directory)
-        let resolver = CursorACPLaunchResolver()
-        let provider = CursorACPAgentProvider(
-            config: CursorAgentConfig(
-                commandName: executable.path,
-                additionalPathHints: [],
-                includeRepoPromptMCPServer: false
-            ),
-            launchResolver: resolver
+        let shellMarker = directory.appendingPathComponent("secondary-shell-lookup")
+        let shell = try makeExecutable(named: "shell", in: directory, marker: shellMarker, output: "")
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": directory.path, "SHELL": shell.path] },
+            supplementalPathProvider: { $0 }
         )
-
-        let launch = try provider.makeLaunchConfiguration(for: makeRunRequest(workspacePath: directory.path))
-
-        XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
-        XCTAssertEqual(launch.arguments, ["--approve-mcps", "acp"])
-        XCTAssertEqual(launch.expectedExecutableIdentity?.canonicalPath, launch.command)
-    }
-
-    func testBareCursorAgentUsesCapturedEnvironmentAndCachesCanonicalPathForSpawn() async throws {
-        let directory = try makeTemporaryDirectory()
-        let probePathRecord = directory.appendingPathComponent("probe-path")
-        let executable = try makeExecutable(named: "cursor-agent", in: directory, marker: probePathRecord)
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = directory.path
-        environment["SHELL"] = "/bin/false"
-        let testEnvironment = environment
-        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in testEnvironment })
-        let config = CursorAgentConfig(
-            commandName: "cursor-agent",
-            additionalPathHints: [],
-            includeRepoPromptMCPServer: false
-        )
+        let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
         let support = try await resolver.probeSupport(for: config)
-        let provider = CursorACPAgentProvider(config: config, launchResolver: resolver)
-        let launch = try provider.makeLaunchConfiguration(for: makeRunRequest(workspacePath: directory.path))
-        let probedPath = try String(contentsOf: probePathRecord, encoding: .utf8)
 
         XCTAssertEqual(support, .supported)
-        XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
-        XCTAssertEqual(probedPath, launch.command)
+        XCTAssertEqual(try resolver.resolvedLaunch(for: config).command, try canonicalExecutablePath(executable))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: shellMarker.path))
     }
 
-    func testLaunchConfigurationLeasesCursorApprovalForModernSessionMCPInjection() async throws {
-        let workspace = try makeTemporaryDirectory()
-        let executableDirectory = try makeTemporaryDirectory()
-        let executable = try makeExecutable(named: "cursor-agent", in: executableDirectory)
-        let cursorDataDirectory = try makeTemporaryDirectory()
-        let mcpConfiguration = RepoPromptMCPServerConfiguration(
-            command: "/tmp/repoprompt-mcp-fixture",
-            args: ["--fixture"],
-            env: [
-                .init(name: "RP_FIXTURE", value: "1")
-            ]
-        )
-        let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
-            workingDirectory: workspace.path,
-            cursorDataDirectory: cursorDataDirectory
-        )
-        try FileManager.default.createDirectory(
-            at: approvalURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        let originalData = Data(#"["existing-approval"]"#.utf8)
-        try originalData.write(to: approvalURL)
-
-        let capturedEnvironment = [
-            "CURSOR_DATA_DIR": cursorDataDirectory.path,
-            "HOME": "/ignored-by-explicit-cursor-data-dir",
-            "PATH": executableDirectory.path
-        ]
-        let provider = CursorACPAgentProvider(
-            config: CursorAgentConfig(
-                commandName: executable.path,
-                additionalPathHints: []
-            ),
-            repoPromptMCPConfiguration: mcpConfiguration,
-            launchResolver: CursorACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
-        )
-        let request = makeRunRequest(workspacePath: workspace.path)
-
-        let support = try await provider.support(for: request)
-        XCTAssertEqual(support, .supported)
-        let launch = try provider.makeLaunchConfiguration(for: request)
-        let artifact = try XCTUnwrap(launch.cleanupArtifact)
-        addTeardownBlock {
-            await provider.cleanupLaunchArtifacts(for: launch)
+    func testDuplicateCanonicalLegacyIsProbedOnceBeforeDistinctFallback() async throws {
+        let root = try makeTemporaryDirectory()
+        let directories = try ["legacy", "current", "first", "second"].map { name in
+            let directory = root.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
         }
-        let approvalsData = try Data(contentsOf: approvalURL)
-        let approvals = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: approvalsData) as? [String]
-        )
-        let expectedApproval = try CursorIntegrationConfiguration.approvalIdentifier(
-            projectRoot: CursorIntegrationConfiguration.projectRootURL(
-                workingDirectory: workspace.path
-            ).path,
-            repoPromptMCPConfiguration: mcpConfiguration
-        )
-        let session = try provider.makeSessionConfiguration(
-            for: makeRunRequest(workspacePath: workspace.path),
-            mcpServer: .repoPrompt
-        )
-
-        XCTAssertEqual(launch.environment["CURSOR_DATA_DIR"], cursorDataDirectory.path)
-        XCTAssertEqual(artifact.kind, CursorIntegrationConfiguration.cleanupArtifactKind)
-        XCTAssertEqual(approvals, ["existing-approval", expectedApproval])
-        XCTAssertEqual(session.mcpServers, [mcpConfiguration])
-        XCTAssertFalse(
-            FileManager.default.fileExists(
-                atPath: workspace.appendingPathComponent(".cursor/mcp.json").path
+        let legacy = try makeExecutable(named: "cursor-agent", in: directories[0])
+        let current = try makeExecutable(named: "cursor-agent", in: directories[1])
+        for directory in directories.suffix(2) {
+            try FileManager.default.createSymbolicLink(
+                at: directory.appendingPathComponent("cursor-agent"), withDestinationURL: legacy
             )
-        )
-
-        await provider.cleanupLaunchArtifacts(for: launch)
-        let retainedApprovals = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
-        )
-        XCTAssertEqual(retainedApprovals, ["existing-approval"])
-    }
-
-    func testApprovalIdentifierMatchesCursorCLIHashContract() throws {
-        let configuration = RepoPromptMCPServerConfiguration(
-            command: "/tmp/repoprompt mcp",
-            args: ["--flag", "value"],
-            env: [
-                .init(name: "A", value: "1"),
-                .init(name: "B", value: "two")
-            ]
-        )
-
-        XCTAssertEqual(
-            try CursorIntegrationConfiguration.approvalIdentifier(
-                projectRoot: "/tmp/rpce cursor",
-                repoPromptMCPConfiguration: configuration
-            ),
-            "RepoPromptCE-d23f237662b1345f"
-        )
-
-        let numericAndDuplicateEnvironmentConfiguration = RepoPromptMCPServerConfiguration(
-            command: #"/tmp/repo"prompt\mcp"#,
-            args: ["--path", "a/b", "line\nvalue"],
-            env: [
-                .init(name: "B", value: "first"),
-                .init(name: "2", value: "two"),
-                .init(name: "01", value: "leading"),
-                .init(name: "1", value: "one"),
-                .init(name: "B", value: "last"),
-                .init(name: "A", value: "line\nvalue")
-            ]
-        )
-        XCTAssertEqual(
-            try CursorIntegrationConfiguration.approvalIdentifier(
-                projectRoot: #"/tmp/rpce "cursor""#,
-                repoPromptMCPConfiguration: numericAndDuplicateEnvironmentConfiguration
-            ),
-            "RepoPromptCE-05aa1995d1d02aa0"
-        )
-    }
-
-    func testTmpAliasUsesCursorPhysicalProjectPathForApprovalDirectoryAndHash() throws {
-        let workspaceName = "CursorACPLaunchResolverTests-\(UUID().uuidString)"
-        let aliasWorkspace = URL(fileURLWithPath: "/tmp", isDirectory: true)
-            .appendingPathComponent(workspaceName, isDirectory: true)
-        let physicalWorkspace = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-            .appendingPathComponent(workspaceName, isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: aliasWorkspace,
-            withIntermediateDirectories: true
-        )
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: physicalWorkspace)
         }
-        XCTAssertNotEqual(aliasWorkspace.path, physicalWorkspace.path)
-
-        let cursorDataDirectory = try makeTemporaryDirectory()
-        let configuration = RepoPromptMCPServerConfiguration(command: "/tmp/repoprompt-mcp")
-        let aliasProjectRoot = CursorIntegrationConfiguration.projectRootURL(
-            workingDirectory: aliasWorkspace.path
+        // The same target also appears under the fallback name: deduplication spans stages.
+        try FileManager.default.createSymbolicLink(
+            at: directories[2].appendingPathComponent("agent"), withDestinationURL: legacy
         )
-        let physicalProjectRoot = CursorIntegrationConfiguration.projectRootURL(
-            workingDirectory: physicalWorkspace.path
+        try FileManager.default.createSymbolicLink(
+            at: directories[3].appendingPathComponent("agent"), withDestinationURL: current
         )
-        let aliasApprovalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
-            workingDirectory: aliasWorkspace.path,
-            cursorDataDirectory: cursorDataDirectory
-        )
-        let physicalApprovalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
-            workingDirectory: physicalWorkspace.path,
-            cursorDataDirectory: cursorDataDirectory
-        )
-
-        XCTAssertEqual(aliasProjectRoot, physicalWorkspace)
-        XCTAssertEqual(aliasProjectRoot, physicalProjectRoot)
-        XCTAssertEqual(aliasApprovalURL, physicalApprovalURL)
-        XCTAssertEqual(
-            aliasApprovalURL.deletingLastPathComponent().lastPathComponent,
-            "private-tmp-\(workspaceName)"
-        )
-
-        try CursorIntegrationConfiguration.prepareProjectMCPApproval(
-            workingDirectory: aliasWorkspace.path,
-            cursorDataDirectory: cursorDataDirectory,
-            repoPromptMCPConfiguration: configuration,
-            cleanupAfterRun: false
-        )
-
-        let approvals = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(contentsOf: aliasApprovalURL)) as? [String]
-        )
-        let physicalApproval = try CursorIntegrationConfiguration.approvalIdentifier(
-            projectRoot: physicalWorkspace.path,
-            repoPromptMCPConfiguration: configuration
-        )
-        let aliasApproval = try CursorIntegrationConfiguration.approvalIdentifier(
-            projectRoot: aliasWorkspace.path,
-            repoPromptMCPConfiguration: configuration
-        )
-        XCTAssertNotEqual(aliasApproval, physicalApproval)
-        XCTAssertEqual(approvals, [physicalApproval])
-    }
-
-    func testApprovalCleanupPreservesConcurrentEntriesAndRemovesTemporaryApproval() throws {
-        let workspace = try makeTemporaryDirectory()
-        let cursorDataDirectory = try makeTemporaryDirectory()
-        let configuration = RepoPromptMCPServerConfiguration(command: "/tmp/repoprompt-mcp")
-        let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
-            workingDirectory: workspace.path,
-            cursorDataDirectory: cursorDataDirectory
-        )
-        try FileManager.default.createDirectory(
-            at: approvalURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try Data(#"["existing-approval"]"#.utf8).write(to: approvalURL)
-        let artifact = try XCTUnwrap(
-            CursorIntegrationConfiguration.prepareProjectMCPApproval(
-                workingDirectory: workspace.path,
-                cursorDataDirectory: cursorDataDirectory,
-                repoPromptMCPConfiguration: configuration
-            )
-        )
-        let temporaryApproval = try CursorIntegrationConfiguration.approvalIdentifier(
-            projectRoot: CursorIntegrationConfiguration.projectRootURL(
-                workingDirectory: workspace.path
-            ).path,
-            repoPromptMCPConfiguration: configuration
-        )
-        let concurrentData = try JSONSerialization.data(
-            withJSONObject: ["existing-approval", temporaryApproval, "cursor-added-approval"],
-            options: [.prettyPrinted]
-        )
-        try concurrentData.write(to: approvalURL, options: .atomic)
-
-        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
-
-        let retainedApprovals = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
-        )
-        XCTAssertEqual(retainedApprovals, ["existing-approval", "cursor-added-approval"])
-    }
-
-    func testConcurrentApprovalLeasesRemoveOnlyRepoPromptInsertionsAfterFinalCleanup() throws {
-        for cleanupFirstLeaseFirst in [true, false] {
-            let workspace = try makeTemporaryDirectory()
-            let cursorDataDirectory = try makeTemporaryDirectory()
-            let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
-                workingDirectory: workspace.path,
-                cursorDataDirectory: cursorDataDirectory
-            )
-            try FileManager.default.createDirectory(
-                at: approvalURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let originalData = Data(#"["existing-approval"]"#.utf8)
-            try originalData.write(to: approvalURL)
-
-            let first = try XCTUnwrap(
-                CursorIntegrationConfiguration.prepareProjectMCPApproval(
-                    workingDirectory: workspace.path,
-                    cursorDataDirectory: cursorDataDirectory,
-                    repoPromptMCPConfiguration: .init(command: "/tmp/repoprompt-mcp-one")
+        let path = directories.suffix(2).map(\.path).joined(separator: ":")
+        let legacyPath = try canonicalExecutablePath(legacy)
+        let currentPath = try canonicalExecutablePath(current)
+        let probes = CursorProbeCommands()
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": path, "SHELL": "/bin/false"] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { launch, _, _, _ in
+                await probes.record(launch.command)
+                return CLIProcessRunner.Result(
+                    stdout: Data("Cursor Agent ACP support".utf8), stderr: Data(),
+                    status: launch.command == legacyPath ? 2 : 0, timedOut: false
                 )
-            )
-            let afterFirstLease = try XCTUnwrap(
-                JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
-            )
-            try JSONSerialization.data(
-                withJSONObject: afterFirstLease + ["cursor-added-between-leases"],
-                options: [.prettyPrinted]
-            ).write(to: approvalURL, options: .atomic)
+            }
+        )
+        let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-            let second = try XCTUnwrap(
-                CursorIntegrationConfiguration.prepareProjectMCPApproval(
-                    workingDirectory: workspace.path,
-                    cursorDataDirectory: cursorDataDirectory,
-                    repoPromptMCPConfiguration: .init(command: "/tmp/repoprompt-mcp-two")
+        let support = try await resolver.probeSupport(for: config)
+
+        XCTAssertEqual(support, .supported)
+        XCTAssertEqual(try resolver.resolvedLaunch(for: config).command, currentPath)
+        let commands = await probes.commands
+        XCTAssertEqual(commands, [legacyPath, currentPath])
+    }
+
+    func testInitialDiscoveryDoesNotConsumeCapabilityProbeBudget() async throws {
+        try await assertDiscoveryPreservesProbeBudget(staleLegacy: false)
+    }
+
+    func testFallbackDiscoveryDoesNotConsumeCapabilityProbeBudget() async throws {
+        try await assertDiscoveryPreservesProbeBudget(staleLegacy: true)
+    }
+
+    func testCancellationDuringDiscoveryDoesNotAdmitProducer() async throws {
+        let root = try makeTemporaryDirectory()
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let executable = try makeExecutable(named: "cursor-agent", in: root)
+        let enteredFIFO = root.appendingPathComponent("lookup-entered")
+        let releaseFIFO = root.appendingPathComponent("lookup-release")
+        for fifo in [enteredFIFO, releaseFIFO] {
+            guard mkfifo(fifo.path, 0o600) == 0 else { throw POSIXError(.EIO) }
+        }
+        let enteredDescriptor = open(enteredFIFO.path, O_RDWR | O_NONBLOCK)
+        guard enteredDescriptor >= 0 else { throw POSIXError(.EIO) }
+        let entered = expectation(description: "Shell lookup reached the release barrier")
+        let reader = DispatchSource.makeReadSource(fileDescriptor: enteredDescriptor, queue: .global())
+        reader.setEventHandler {
+            var byte: UInt8 = 0
+            if Darwin.read(enteredDescriptor, &byte, 1) == 1 { entered.fulfill() }
+        }
+        reader.setCancelHandler { close(enteredDescriptor) }
+        reader.resume()
+        defer { reader.cancel() }
+        let releaseDescriptor = open(releaseFIFO.path, O_RDWR | O_NONBLOCK)
+        guard releaseDescriptor >= 0 else { throw POSIXError(.EIO) }
+        defer { close(releaseDescriptor) }
+        let completedMarker = root.appendingPathComponent("lookup-completed")
+        let shell = try makeExecutable(named: "shell", in: root)
+        try """
+        #!/bin/sh
+        printf '1' > '\(enteredFIFO.path)'
+        IFS= read -r release < '\(releaseFIFO.path)'
+        printf '1' > '\(completedMarker.path)'
+        printf '%s\\n' '__RP_BEGIN__' '\(executable.path)' '__RP_END__'
+        """.write(to: shell, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shell.path)
+        let calls = CursorProbeCallCounter()
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": bin.path, "SHELL": shell.path] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { _, _, _, _ in
+                _ = await calls.nextCall()
+                return CLIProcessRunner.Result(
+                    stdout: Data("Cursor Agent ACP support".utf8), stderr: Data(), status: 0, timedOut: false
                 )
-            )
-            defer {
-                CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: first.id)
-                CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: second.id)
             }
-
-            let firstCleanup = cleanupFirstLeaseFirst ? first : second
-            let finalCleanup = cleanupFirstLeaseFirst ? second : first
-            CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: firstCleanup.id)
-            XCTAssertNotEqual(try Data(contentsOf: approvalURL), originalData)
-
-            CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: finalCleanup.id)
-            let retainedApprovals = try XCTUnwrap(
-                JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
-            )
-            XCTAssertEqual(retainedApprovals, ["existing-approval", "cursor-added-between-leases"])
-        }
-    }
-
-    func testFailedFinalApprovalCleanupRetainsRetryBookkeeping() throws {
-        let workspace = try makeTemporaryDirectory()
-        let cursorDataDirectory = try makeTemporaryDirectory()
-        let configuration = RepoPromptMCPServerConfiguration(command: "/tmp/repoprompt-mcp")
-        let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
-            workingDirectory: workspace.path,
-            cursorDataDirectory: cursorDataDirectory
         )
-        let artifact = try XCTUnwrap(
-            CursorIntegrationConfiguration.prepareProjectMCPApproval(
-                workingDirectory: workspace.path,
-                cursorDataDirectory: cursorDataDirectory,
-                repoPromptMCPConfiguration: configuration
-            )
-        )
-        let temporaryApproval = try CursorIntegrationConfiguration.approvalIdentifier(
-            projectRoot: CursorIntegrationConfiguration.projectRootURL(
-                workingDirectory: workspace.path
-            ).path,
-            repoPromptMCPConfiguration: configuration
-        )
-        defer {
-            CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
-        }
-
-        try FileManager.default.removeItem(at: approvalURL)
-        try FileManager.default.createDirectory(at: approvalURL, withIntermediateDirectories: false)
-        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
-
-        try FileManager.default.removeItem(at: approvalURL)
-        try JSONSerialization.data(
-            withJSONObject: [temporaryApproval, "cursor-added-after-failure"],
-            options: [.prettyPrinted]
-        ).write(to: approvalURL, options: .atomic)
-        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
-
-        let retainedApprovals = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
-        )
-        XCTAssertEqual(retainedApprovals, ["cursor-added-after-failure"])
-    }
-
-    func testRepeatedProbeRefreshesCurrentEnvironmentBeforeSpawn() async throws {
-        let firstDirectory = try makeTemporaryDirectory()
-        let secondDirectory = try makeTemporaryDirectory()
-        let firstExecutable = try makeExecutable(named: "cursor-agent", in: firstDirectory)
-        let secondExecutable = try makeExecutable(named: "cursor-agent", in: secondDirectory)
-        let environmentBox = TestEnvironmentBox(environment: [
-            "PATH": firstDirectory.path,
-            "SHELL": "/bin/false"
-        ])
-        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in
-            await environmentBox.current()
-        })
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
+        let supportTask = Task { try await resolver.probeSupport(for: config) }
 
-        let firstSupport = try await resolver.probeSupport(for: config)
-        let firstLaunch = try resolver.resolvedLaunch(for: config)
-        XCTAssertEqual(firstSupport, .supported)
-        XCTAssertEqual(firstLaunch.command, try canonicalExecutablePath(firstExecutable))
-
-        await environmentBox.set([
-            "PATH": secondDirectory.path,
-            "SHELL": "/bin/false"
-        ])
-        let secondSupport = try await resolver.probeSupport(for: config)
-        let secondLaunch = try resolver.resolvedLaunch(for: config)
-        XCTAssertEqual(secondSupport, .supported)
-        XCTAssertEqual(secondLaunch.command, try canonicalExecutablePath(secondExecutable))
-    }
-
-    func testBareCursorAgentWithoutCapturedDiscoveryFailsClosed() {
-        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in [:] })
-
-        XCTAssertThrowsError(
-            try resolver.resolvedLaunch(
-                for: CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-            )
-        ) { error in
-            guard case CursorACPLaunchResolutionError.environmentDiscoveryRequired = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-    }
-
-    func testBareCursorAgentFallsBackToAdditionalHintWhenPathCandidateIsUnsafe() async throws {
-        let unsafeDirectory = try makePrivateTemporaryDirectory()
-        let trustedDirectory = try makePrivateTemporaryDirectory()
-        _ = try makeExecutable(named: "cursor-agent", in: unsafeDirectory)
-        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: unsafeDirectory.path)
-        let trusted = try makeExecutable(named: "cursor-agent", in: trustedDirectory)
-        let environment = [
-            "PATH": unsafeDirectory.path,
-            "SHELL": "/bin/false"
-        ]
-        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in environment })
-        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [trustedDirectory.path])
-
-        let support = try await resolver.probeSupport(for: config)
-        XCTAssertEqual(support, .supported)
-        let launch = try resolver.resolvedLaunch(for: config)
-
-        XCTAssertEqual(launch.command, try canonicalExecutablePath(trusted))
-    }
-
-    func testNoValidLaunchCandidateDiagnosticsPreserveCandidateOrder() {
-        let failures = [
-            "/first/cursor-agent: first failure",
-            "/second/cursor-agent: second failure"
-        ]
-        let error = CursorACPLaunchResolutionError.noValidLaunchCandidate("cursor-agent", failures, nil)
-
-        XCTAssertEqual(
-            error.errorDescription,
-            "Cursor Agent CLI was not found as a valid executable regular file for `cursor-agent`. Tried: \(failures.joined(separator: "; "))"
-        )
-    }
-
-    func testAbsoluteConfiguredPathIgnoresDecoyCursorAgentEarlierInPath() throws {
-        let trustedDirectory = try makeTemporaryDirectory()
-        let decoyDirectory = try makeTemporaryDirectory()
-        let trusted = try makeExecutable(named: "cursor-agent", in: trustedDirectory)
-        _ = try makeExecutable(named: "cursor-agent", in: decoyDirectory)
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = decoyDirectory.path
-        environment["SHELL"] = "/bin/false"
-        let testEnvironment = environment
-        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in testEnvironment })
-        let config = CursorAgentConfig(
-            commandName: trusted.path,
-            additionalPathHints: []
-        )
-
-        let launch = try resolver.resolvedLaunch(for: config)
-
-        XCTAssertEqual(launch.command, try canonicalExecutablePath(trusted))
-    }
-
-    func testSymlinkIsCanonicalizedAndCanonicalWrapperBasenameIsAllowed() throws {
-        let directory = try makeTemporaryDirectory()
-        let target = try makeExecutable(named: "cursor-agent-wrapper", in: directory)
-        let link = directory.appendingPathComponent("cursor-agent")
-        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
-
-        let launch = try CursorACPLaunchResolver().resolvedLaunch(
-            for: CursorAgentConfig(commandName: link.path, additionalPathHints: [])
-        )
-
-        XCTAssertEqual(launch.command, try canonicalExecutablePath(target))
-    }
-
-    func testSymlinkWhoseCanonicalBasenameIsCursorIsRejected() throws {
-        let directory = try makeTemporaryDirectory()
-        let target = try makeExecutable(named: "cursor", in: directory)
-        let link = directory.appendingPathComponent("cursor-agent")
-        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
-
-        XCTAssertThrowsError(
-            try CursorACPLaunchResolver().resolvedLaunch(
-                for: CursorAgentConfig(commandName: link.path, additionalPathHints: [])
-            )
-        ) { error in
-            guard case CursorACPLaunchResolutionError.unsafeCanonicalBasename = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-    }
-
-    func testSymlinkIntoApplicationBundleIsRejected() throws {
-        let directory = try makeTemporaryDirectory()
-        let appExecutableDirectory = directory
-            .appendingPathComponent("Cursor.app", isDirectory: true)
-            .appendingPathComponent("Contents/MacOS", isDirectory: true)
-        try FileManager.default.createDirectory(at: appExecutableDirectory, withIntermediateDirectories: true)
-        let target = try makeExecutable(named: "cursor-agent-wrapper", in: appExecutableDirectory)
-        let link = directory.appendingPathComponent("cursor-agent")
-        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
-
-        XCTAssertThrowsError(
-            try CursorACPLaunchResolver().resolvedLaunch(
-                for: CursorAgentConfig(commandName: link.path, additionalPathHints: [])
-            )
-        ) { error in
-            guard case CursorACPLaunchResolutionError.unsafeApplicationPath = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-    }
-
-    func testCachedIdentityDriftFailsClosed() async throws {
-        let directory = try makeTemporaryDirectory()
-        let executable = try makeExecutable(named: "cursor-agent", in: directory)
-        let resolver = CursorACPLaunchResolver()
-        let config = CursorAgentConfig(commandName: executable.path, additionalPathHints: [])
-
-        let support = try await resolver.probeSupport(for: config)
-        XCTAssertEqual(support, .supported)
-        try FileManager.default.removeItem(at: executable)
-        _ = try makeExecutable(named: "cursor-agent", in: directory, output: "replacement ACP")
-
-        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config)) { error in
-            guard case ExecutableFileIdentityError.identityChanged = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-    }
-
-    func testMissingExecutableFailsClosed() throws {
-        let directory = try makeTemporaryDirectory()
-        let missing = directory.appendingPathComponent("cursor-agent")
-
-        XCTAssertThrowsError(
-            try CursorACPLaunchResolver().resolvedLaunch(
-                for: CursorAgentConfig(commandName: missing.path, additionalPathHints: [])
-            )
-        ) { error in
-            guard case CursorACPLaunchResolutionError.exactPathNotFound = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-    }
-
-    func testCursorTokenIsRejectedWithoutExecution() async throws {
-        let directory = try makeTemporaryDirectory()
-        let marker = directory.appendingPathComponent("cursor-ran")
-        _ = try makeExecutable(named: "cursor", in: directory, marker: marker)
-        let config = CursorAgentConfig(commandName: "cursor", additionalPathHints: [directory.path])
-
-        let support = try await CursorACPLaunchResolver().probeSupport(for: config)
-
-        guard case let .unsupported(reason) = support else {
-            return XCTFail("Expected unsupported result")
-        }
-        XCTAssertTrue(reason.contains("Refusing unsafe Cursor ACP command"))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
-    }
-
-    func testCancelledSupportProbePropagatesCancellationAndLeavesNoBareCommandCache() async throws {
-        let directory = try makeTemporaryDirectory()
-        let marker = directory.appendingPathComponent("probe-started")
-        _ = try makeExecutable(named: "cursor-agent", in: directory, marker: marker, sleepSeconds: 30)
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = directory.path
-        environment["SHELL"] = "/bin/false"
-        let capturedEnvironment = environment
-        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
-        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-
-        let probe = Task { try await resolver.probeSupport(for: config) }
-        let didStartProbe = await waitUntilFileExists(marker)
-        XCTAssertTrue(didStartProbe)
-        probe.cancel()
+        // This timeout is a deadlock guard, not a performance oracle.
+        await fulfillment(of: [entered], timeout: 30)
+        supportTask.cancel()
+        var releaseByte: UInt8 = 10
+        XCTAssertEqual(Darwin.write(releaseDescriptor, &releaseByte, 1), 1)
         do {
-            _ = try await probe.value
-            XCTFail("Expected support probe cancellation")
+            _ = try await supportTask.value
+            XCTFail("Expected cancellation after shell discovery")
         } catch is CancellationError {
-            // Expected: cancellation is not converted into an unsupported result.
+            // Expected.
         }
+        await resolver.waitForProbeAttemptSettlementForTesting()
 
-        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config)) { error in
-            guard case CursorACPLaunchResolutionError.environmentDiscoveryRequired = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: completedMarker.path))
+        let callCount = await calls.count()
+        XCTAssertEqual(callCount, 0)
+        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config))
     }
 
-    func testWorldWritableExecutableDirectoryIsRejectedWithoutExecution() async throws {
-        let directory = try makeTemporaryDirectory()
-        let marker = directory.appendingPathComponent("probe-ran")
-        let executable = try makeExecutable(named: "cursor-agent", in: directory, marker: marker)
-        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: directory.path)
-
-        let support = try await CursorACPLaunchResolver().probeSupport(
-            for: CursorAgentConfig(commandName: executable.path, additionalPathHints: [])
+    func testProductionDefaultFallsBackToVerifiedAgentAlias() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        let packageDirectory = rootDirectory.appendingPathComponent("cursor-package", isDirectory: true)
+        let binDirectory = rootDirectory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: packageDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        let cursorExecutable = try makeExecutable(named: "cursor-agent", in: packageDirectory)
+        try FileManager.default.createSymbolicLink(
+            at: binDirectory.appendingPathComponent("agent"),
+            withDestinationURL: cursorExecutable
         )
+        let resolver = makeResolver(path: binDirectory.path)
+        let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        guard case .unsupported = support else {
-            return XCTFail("Expected unsafe launch path to be unsupported")
+        let support = try await resolver.probeSupport(for: config)
+        guard support == .supported else {
+            return XCTFail("Expected supported Cursor entrypoint: \(support)")
         }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        let launch = try resolver.resolvedLaunch(for: config)
+
+        XCTAssertEqual(launch.command, try canonicalExecutablePath(cursorExecutable))
     }
 
-    func testFailedBareProbeDoesNotLeaveSpawnableCacheAndReplacementCanRecover() async throws {
+    func testProductionDefaultRejectsUnverifiedGenericAgentBeforeProbe() async throws {
         let directory = try makeTemporaryDirectory()
-        let executable = try makeExecutable(named: "cursor-agent", in: directory, exitStatus: 2)
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = directory.path
-        environment["SHELL"] = "/bin/false"
-        let capturedEnvironment = environment
-        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
-        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-
-        guard case .unsupported = try await resolver.probeSupport(for: config) else {
-            return XCTFail("Expected failed support probe")
-        }
-        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config)) { error in
-            guard case CursorACPLaunchResolutionError.environmentDiscoveryRequired = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-
-        try FileManager.default.removeItem(at: executable)
-        let replacement = try makeExecutable(named: "cursor-agent", in: directory)
-        let replacementSupport = try await resolver.probeSupport(for: config)
-        XCTAssertEqual(replacementSupport, .supported)
-        XCTAssertEqual(
-            try resolver.resolvedLaunch(for: config).command,
-            try canonicalExecutablePath(replacement)
-        )
-    }
-
-    func testFailedExactProbeDoesNotExecuteCursorFallback() async throws {
-        let directory = try makeTemporaryDirectory()
-        let probeMarker = directory.appendingPathComponent("cursor-agent-probed")
-        let fallbackMarker = directory.appendingPathComponent("cursor-fallback-ran")
-        let cursorAgent = try makeExecutable(
-            named: "cursor-agent",
+        let probeMarker = directory.appendingPathComponent("generic-agent-probed")
+        _ = try makeExecutable(
+            named: "agent",
             in: directory,
             marker: probeMarker,
-            exitStatus: 2
+            output: "Usage: agent acp\nStart the Cursor Agent as an ACP (Agent Client Protocol) server"
         )
-        _ = try makeExecutable(named: "cursor", in: directory, marker: fallbackMarker)
-        let config = CursorAgentConfig(
-            commandName: cursorAgent.path,
-            additionalPathHints: [directory.path]
-        )
+        let resolver = makeResolver(path: directory.path)
+        let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await CursorACPLaunchResolver().probeSupport(for: config)
+        let support = try await resolver.probeSupport(for: config)
 
         guard case .unsupported = support else {
-            return XCTFail("Expected unsupported result")
+            return XCTFail("Expected an unverified generic agent executable to be unsupported")
         }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: probeMarker.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fallbackMarker.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: probeMarker.path))
+        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config))
     }
 
-    func testControllerRejectsIdentityDriftBeforeSpawn() async throws {
+    func testProductionDefaultRejectsCursorAgentSymlinkToGenericAgentBeforeProbe() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        let packageDirectory = rootDirectory.appendingPathComponent("unrelated-package", isDirectory: true)
+        let binDirectory = rootDirectory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: packageDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        let probeMarker = rootDirectory.appendingPathComponent("generic-agent-probed")
+        let genericAgent = try makeExecutable(
+            named: "agent",
+            in: packageDirectory,
+            marker: probeMarker,
+            output: "Usage: agent acp\nStart the Cursor Agent as an ACP (Agent Client Protocol) server"
+        )
+        try FileManager.default.createSymbolicLink(
+            at: binDirectory.appendingPathComponent("cursor-agent"),
+            withDestinationURL: genericAgent
+        )
+        let resolver = makeResolver(path: binDirectory.path)
+        let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
+
+        let support = try await resolver.probeSupport(for: config)
+
+        guard case .unsupported = support else {
+            return XCTFail("Expected cursor-agent resolving to a generic agent executable to be unsupported")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: probeMarker.path))
+        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config))
+    }
+
+    func testProductionDefaultFallsThroughStaleCursorAgentToVerifiedAgentAlias() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        let legacyDirectory = rootDirectory.appendingPathComponent("legacy", isDirectory: true)
+        let currentDirectory = rootDirectory.appendingPathComponent("current", isDirectory: true)
+        let binDirectory = rootDirectory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacyDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: currentDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        let legacyProbeMarker = rootDirectory.appendingPathComponent("legacy-probed")
+        let legacyExecutable = try makeExecutable(
+            named: "cursor-agent",
+            in: legacyDirectory,
+            marker: legacyProbeMarker,
+            output: "Usage: cursor-agent [OPTIONS]"
+        )
+        let currentExecutable = try makeExecutable(named: "cursor-agent", in: currentDirectory)
+        try FileManager.default.createSymbolicLink(
+            at: binDirectory.appendingPathComponent("cursor-agent"),
+            withDestinationURL: legacyExecutable
+        )
+        try FileManager.default.createSymbolicLink(
+            at: binDirectory.appendingPathComponent("agent"),
+            withDestinationURL: currentExecutable
+        )
+        let resolver = makeResolver(path: binDirectory.path)
+        let config = CursorAgentConfig(additionalPathHints: [])
+
+        let support = try await resolver.probeSupport(for: config)
+        guard support == .supported else {
+            return XCTFail("Expected supported Cursor entrypoint: \(support)")
+        }
+        let launch = try resolver.resolvedLaunch(for: config)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: legacyProbeMarker.path))
+        XCTAssertEqual(launch.command, try canonicalExecutablePath(currentExecutable))
+    }
+
+    func testCapabilityProbeRejectsTimedOutZeroStatusAndDoesNotCacheLaunch() async throws {
         let directory = try makeTemporaryDirectory()
-        let spawnMarker = directory.appendingPathComponent("spawned")
-        let executable = try makeExecutable(named: "cursor-agent", in: directory)
-        let identity = try ExecutableFileIdentity.capture(atPath: executable.path)
-        let launch = ACPLaunchConfiguration(
-            providerID: .cursor,
-            command: identity.canonicalPath,
-            arguments: ["--approve-mcps", "acp"],
-            environment: [:],
-            workingDirectory: directory.path,
-            additionalPathHints: [],
-            enableDebugLogging: false,
-            expectedExecutableIdentity: identity
+        _ = try makeExecutable(named: "cursor-agent", in: directory)
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { _, _, _, _ in
+                CLIProcessRunner.Result(
+                    stdout: Data("Cursor Agent ACP support".utf8),
+                    stderr: Data(),
+                    status: 0,
+                    timedOut: true
+                )
+            }
         )
-        let provider = FixedLaunchACPProvider(launchConfiguration: launch, workingDirectory: directory.path)
-        let controller = try ACPAgentSessionController(
-            provider: provider,
-            runRequest: makeRunRequest(workspacePath: directory.path)
-        )
-        #if DEBUG
-            let runID = UUID()
-            await ServerNetworkManager.shared.debugClearRunRoutingHistoryForTesting()
-            await controller.setExpectedMCPRunID(runID)
-        #endif
+        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
 
-        try FileManager.default.removeItem(at: executable)
-        _ = try makeExecutable(named: "cursor-agent", in: directory, marker: spawnMarker)
+        let support = try await resolver.probeSupport(for: config)
 
-        do {
-            _ = try await controller.bootstrap()
-            XCTFail("Expected launch identity validation to fail")
-        } catch {
-            guard case ExecutableFileIdentityError.identityChanged = error else {
+        guard case .unsupported = support else {
+            return XCTFail("Expected a timed-out probe to be unsupported")
+        }
+        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config)) { error in
+            guard case CursorACPLaunchResolutionError.environmentDiscoveryRequired = error else {
                 return XCTFail("Unexpected error: \(error)")
             }
         }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: spawnMarker.path))
-        #if DEBUG
-            let payload = await ServerNetworkManager.shared.debugRunRoutingHistoryPayload(runID: runID, limit: 20)
-            let events = try XCTUnwrap(payload["events"] as? [[String: Any]])
-            let failed = try XCTUnwrap(events.first { $0["event"] as? String == "acp_launch_validation_failed" })
-            let fields = try XCTUnwrap(failed["fields"] as? [String: String])
-            XCTAssertEqual(fields["configured_command"], identity.canonicalPath)
-            XCTAssertEqual(fields["resolved_executable"], identity.canonicalPath)
-            XCTAssertEqual(fields["error_kind"], "executable_identity")
-            XCTAssertNotNil(fields["error_type"])
-            XCTAssertNotNil(Int(fields["error_code"] ?? ""))
-            XCTAssertFalse(events.contains { $0["event"] as? String == "acp_process_spawned" })
-        #endif
-        await controller.shutdown()
     }
 
-    func testModernModeErrorNormalizationPreservesRawDetail() {
-        let provider = makeProviderForNormalization()
-        let rawDetail = "ACP request session/set_config_option failed for mode ask: upstream detail 42"
-        let rawError = NSError(
-            domain: "CursorACP",
-            code: 42,
-            userInfo: [NSLocalizedDescriptionKey: rawDetail]
+    func testCapabilityProbeReservesTimeoutCleanupWithinAggregateDeadline() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        let legacyDirectory = rootDirectory.appendingPathComponent("legacy", isDirectory: true)
+        let currentDirectory = rootDirectory.appendingPathComponent("current", isDirectory: true)
+        let binDirectory = rootDirectory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacyDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: currentDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        let legacyExecutable = try makeExecutable(named: "cursor-agent", in: legacyDirectory)
+        let currentExecutable = try makeExecutable(named: "cursor-agent", in: currentDirectory)
+        try FileManager.default.createSymbolicLink(
+            at: binDirectory.appendingPathComponent("cursor-agent"),
+            withDestinationURL: legacyExecutable
+        )
+        try FileManager.default.createSymbolicLink(
+            at: binDirectory.appendingPathComponent("agent"),
+            withDestinationURL: currentExecutable
+        )
+        let timeline = CursorProbeTimeline(nowValues: [0, 1, 10, 10, 10])
+        let deadline = CursorProbeDeadlineBarrier()
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": binDirectory.path, "SHELL": "/bin/false"] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { _, _, timeout, timeoutCleanupPolicy in
+                timeline.record(timeout: timeout, cleanupAllowance: timeoutCleanupPolicy.maximumDuration)
+                return CLIProcessRunner.Result(stdout: Data(), stderr: Data(), status: 2, timedOut: false)
+            },
+            nowProvider: { timeline.nextNow() },
+            deadlineWaiter: { _ in await deadline.wait() },
+            aggregateProbeTimeout: 10
         )
 
-        let normalized = provider.normalizeError(rawError)
+        let support = try await resolver.probeSupport(for: CursorAgentConfig(additionalPathHints: []))
 
-        guard case let AIProviderError.invalidConfiguration(detail) = normalized else {
-            return XCTFail("Unexpected normalized error: \(normalized)")
+        guard case .unsupported = support else {
+            return XCTFail("Expected aggregate deadline exhaustion to be unsupported")
         }
-        XCTAssertEqual(detail, rawDetail)
+        XCTAssertEqual(timeline.recordedTimeouts(), [6])
+        XCTAssertEqual(timeline.recordedCleanupAllowances(), [3])
     }
 
-    func testUnclassifiedProviderErrorRetainsUnderlyingError() {
-        let provider = makeProviderForNormalization()
-        let rawError = NSError(
-            domain: "CursorACP.Raw",
-            code: 99,
-            userInfo: [NSLocalizedDescriptionKey: "unclassified upstream detail"]
+    func testCapabilityProbeDoesNotCacheSuccessAfterClockDeadlineBeforeTimerFires() async throws {
+        let directory = try makeTemporaryDirectory()
+        _ = try makeExecutable(named: "cursor-agent", in: directory)
+        let timeline = CursorProbeTimeline(nowValues: [0, 0, 10])
+        let deadline = CursorProbeDeadlineBarrier()
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { _, _, _, _ in
+                CLIProcessRunner.Result(
+                    stdout: Data("Cursor Agent ACP support".utf8),
+                    stderr: Data(),
+                    status: 0,
+                    timedOut: false
+                )
+            },
+            nowProvider: { timeline.nextNow() },
+            deadlineWaiter: { _ in await deadline.wait() },
+            aggregateProbeTimeout: 10
         )
+        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
 
-        let normalized = provider.normalizeError(rawError)
+        let support = try await resolver.probeSupport(for: config)
 
-        guard case let AIProviderError.apiError(source) = normalized else {
-            return XCTFail("Unexpected normalized error: \(normalized)")
+        guard case let .unsupported(reason) = support else {
+            return XCTFail("Expected an expired clock to reject the successful producer result")
         }
-        let sourceError = source as NSError?
-        XCTAssertEqual(sourceError?.domain, rawError.domain)
-        XCTAssertEqual(sourceError?.code, rawError.code)
-        XCTAssertEqual(sourceError?.localizedDescription, rawError.localizedDescription)
+        XCTAssertTrue(reason.contains("aggregate timeout"))
+        let timerWasSignaled = await deadline.wasSignaled()
+        XCTAssertFalse(timerWasSignaled)
+        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config))
     }
 
-    private func makeProviderForNormalization() -> CursorACPAgentProvider {
-        CursorACPAgentProvider(
-            config: CursorAgentConfig(commandName: "cursor-agent"),
-            launchResolver: CursorACPLaunchResolver()
+    func testCapabilityProbeTimeoutRejectsNewResolverUntilLateProducerSettles() async throws {
+        let directory = try makeTemporaryDirectory()
+        let executable = try makeExecutable(named: "cursor-agent", in: directory)
+        let producer = CursorProbeProducerBarrier()
+        let firstCalls = CursorProbeCallCounter()
+        let secondCalls = CursorProbeCallCounter()
+        let firstDeadline = CursorProbeDeadlineBarrier()
+        let secondDeadline = CursorProbeDeadlineBarrier()
+        let firstResolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { _, _, _, _ in
+                let call = await firstCalls.nextCall()
+                if call == 1 {
+                    await producer.enter()
+                    await withTaskCancellationHandler(operation: {
+                        await producer.waitForRelease()
+                    }, onCancel: {
+                        Task { await producer.recordCancellation() }
+                    })
+                    await producer.recordReturned()
+                }
+                return CLIProcessRunner.Result(
+                    stdout: Data("Cursor Agent ACP support".utf8),
+                    stderr: Data(),
+                    status: 0,
+                    timedOut: false
+                )
+            },
+            nowProvider: { 0 },
+            deadlineWaiter: { _ in await firstDeadline.wait() },
+            aggregateProbeTimeout: 10
         )
+        let secondResolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { _, _, _, _ in
+                await secondCalls.nextCall()
+                return CLIProcessRunner.Result(
+                    stdout: Data("Cursor Agent ACP support".utf8),
+                    stderr: Data(),
+                    status: 0,
+                    timedOut: false
+                )
+            },
+            nowProvider: { 0 },
+            deadlineWaiter: { _ in await secondDeadline.wait() },
+            aggregateProbeTimeout: 10,
+            sharingProbeOwnershipWith: firstResolver
+        )
+        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
+        let firstProbe = Task { try await firstResolver.probeSupport(for: config) }
+
+        await producer.waitUntilEntered()
+        await firstDeadline.waitUntilEntered()
+        await firstDeadline.signal()
+
+        let firstSupport = try await firstProbe.value
+        guard case let .unsupported(reason) = firstSupport else {
+            return XCTFail("Expected the aggregate deadline to retire the logical probe")
+        }
+        XCTAssertTrue(reason.contains("aggregate timeout"))
+        await producer.waitUntilCancellation()
+
+        let pendingSupport = try await secondResolver.probeSupport(for: config)
+        guard case let .unsupported(pendingReason) = pendingSupport else {
+            return XCTFail("Expected a retry to be rejected while the producer drains")
+        }
+        XCTAssertTrue(pendingReason.contains("cleanup is still pending"))
+        let firstCallCount = await firstCalls.count()
+        XCTAssertEqual(firstCallCount, 1)
+        let pendingCallCount = await secondCalls.count()
+        XCTAssertEqual(pendingCallCount, 0)
+
+        await producer.release()
+        await producer.waitUntilReturned()
+        await firstResolver.waitForProbeAttemptSettlementForTesting()
+        XCTAssertThrowsError(try secondResolver.resolvedLaunch(for: config))
+
+        let recoveredSupport = try await secondResolver.probeSupport(for: config)
+        XCTAssertEqual(recoveredSupport, .supported)
+        let recoveredCallCount = await secondCalls.count()
+        XCTAssertEqual(recoveredCallCount, 1)
+        let recoveredLaunch = try secondResolver.resolvedLaunch(for: config)
+        XCTAssertEqual(recoveredLaunch.command, try canonicalExecutablePath(executable))
     }
 
-    private func makeRunRequest(workspacePath: String) -> ACPRunRequest {
-        ACPRunRequest(
-            agentKind: .cursor,
-            modelString: nil,
-            workspacePath: workspacePath,
-            resumeSessionID: nil,
-            attachments: [],
-            taskLabelKind: nil
+    func testCapabilityProbeCancellationDrainsProducerBeforeRecovery() async throws {
+        let directory = try makeTemporaryDirectory()
+        let executable = try makeExecutable(named: "cursor-agent", in: directory)
+        let producer = CursorProbeProducerBarrier()
+        let calls = CursorProbeCallCounter()
+        let firstDeadline = CursorProbeDeadlineBarrier()
+        let secondDeadline = CursorProbeDeadlineBarrier()
+        let deadlines = CursorProbeDeadlineRouter([firstDeadline, secondDeadline])
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { _, _, _, _ in
+                let call = await calls.nextCall()
+                if call == 1 {
+                    await producer.enter()
+                    await withTaskCancellationHandler(operation: {
+                        await producer.waitForRelease()
+                    }, onCancel: {
+                        Task { await producer.recordCancellation() }
+                    })
+                    await producer.recordReturned()
+                }
+                return CLIProcessRunner.Result(
+                    stdout: Data("Cursor Agent ACP support".utf8),
+                    stderr: Data(),
+                    status: 0,
+                    timedOut: false
+                )
+            },
+            nowProvider: { 0 },
+            deadlineWaiter: { _ in await deadlines.wait() },
+            aggregateProbeTimeout: 10
+        )
+        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
+        let firstProbe = Task { try await resolver.probeSupport(for: config) }
+
+        await producer.waitUntilEntered()
+        firstProbe.cancel()
+        do {
+            _ = try await firstProbe.value
+            XCTFail("Expected cancellation to propagate from the logical probe")
+        } catch is CancellationError {
+            // Expected: the producer remains owned independently of this task.
+        }
+        await producer.waitUntilCancellation()
+
+        let pendingSupport = try await resolver.probeSupport(for: config)
+        guard case let .unsupported(pendingReason) = pendingSupport else {
+            return XCTFail("Expected a retry to be rejected while the canceled producer drains")
+        }
+        XCTAssertTrue(pendingReason.contains("cleanup is still pending"))
+        let pendingCallCount = await calls.count()
+        XCTAssertEqual(pendingCallCount, 1)
+
+        await producer.release()
+        await producer.waitUntilReturned()
+        await resolver.waitForProbeAttemptSettlementForTesting()
+        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config))
+
+        let recoveredSupport = try await resolver.probeSupport(for: config)
+        XCTAssertEqual(recoveredSupport, .supported)
+        let recoveredCallCount = await calls.count()
+        XCTAssertEqual(recoveredCallCount, 2)
+        let recoveredLaunch = try resolver.resolvedLaunch(for: config)
+        XCTAssertEqual(recoveredLaunch.command, try canonicalExecutablePath(executable))
+    }
+
+    private func assertDiscoveryPreservesProbeBudget(staleLegacy: Bool) async throws {
+        let root = try makeTemporaryDirectory()
+        let legacyDirectory = root.appendingPathComponent("legacy", isDirectory: true)
+        let currentDirectory = root.appendingPathComponent("current", isDirectory: true)
+        let binDirectory = root.appendingPathComponent("bin", isDirectory: true)
+        for directory in [legacyDirectory, currentDirectory, binDirectory] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let legacy = try makeExecutable(named: "cursor-agent", in: legacyDirectory)
+        let current = try makeExecutable(named: "cursor-agent", in: currentDirectory)
+        let alias = (staleLegacy ? root : binDirectory).appendingPathComponent("agent")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: current)
+        if staleLegacy {
+            try FileManager.default.createSymbolicLink(
+                at: binDirectory.appendingPathComponent("cursor-agent"), withDestinationURL: legacy
+            )
+        }
+        let lookupMarker = root.appendingPathComponent("shell-lookup")
+        let shell = try makeExecutable(
+            named: "shell", in: root, marker: lookupMarker,
+            output: staleLegacy ? "__RP_BEGIN__\n\(alias.path)\n__RP_END__" : ""
+        )
+        let legacyPath = try canonicalExecutablePath(legacy)
+        let currentPath = try canonicalExecutablePath(current)
+        let probes = CursorProbeCommands()
+        let clock = CursorDiscoveryClock(lookupMarker: lookupMarker)
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": binDirectory.path, "SHELL": shell.path] },
+            supplementalPathProvider: { $0 },
+            probeRunner: { launch, _, timeout, _ in
+                await probes.record(launch.command, timeout: timeout)
+                if launch.command == legacyPath { clock.advance(by: 6) }
+                return CLIProcessRunner.Result(
+                    stdout: Data("Cursor Agent ACP support".utf8), stderr: Data(),
+                    status: launch.command == legacyPath ? 2 : 0, timedOut: false
+                )
+            },
+            // Model slow discovery without sleeps or a host-dependent duration assertion.
+            nowProvider: { clock.now() },
+            deadlineWaiter: { _ in await CursorProbeDeadlineBarrier().wait() },
+            aggregateProbeTimeout: 10
+        )
+        let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
+
+        let support = try await resolver.probeSupport(for: config)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: lookupMarker.path))
+        XCTAssertEqual(support, .supported)
+        let commands = await probes.commands
+        XCTAssertEqual(commands, staleLegacy ? [legacyPath, currentPath] : [currentPath])
+        let timeouts = await probes.timeouts
+        XCTAssertEqual(timeouts, staleLegacy ? [7, 1] : [7])
+        XCTAssertEqual(try resolver.resolvedLaunch(for: config).command, currentPath)
+    }
+
+    private func makeResolver(path: String) -> CursorACPLaunchResolver {
+        CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": path, "SHELL": "/bin/false"] },
+            supplementalPathProvider: { $0 }
         )
     }
 
@@ -772,110 +580,253 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         try XCTUnwrap(FileSystemService.realpathString(url.path))
     }
 
-    private func makePrivateTemporaryDirectory() throws -> URL {
-        let directory = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-            .appendingPathComponent("CursorACPLaunchResolverTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-        addTeardownBlock {
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
-            try? FileManager.default.removeItem(at: directory)
-        }
-        return directory
-    }
-
     @discardableResult
     private func makeExecutable(
         named name: String,
         in directory: URL,
         marker: URL? = nil,
-        output: String = "Cursor Agent ACP support",
-        exitStatus: Int32 = 0,
-        sleepSeconds: Int? = nil
+        output: String = "Cursor Agent ACP support"
     ) throws -> URL {
         let executable = directory.appendingPathComponent(name)
         var lines = ["#!/bin/sh"]
         if let marker {
             lines.append("printf '%s' \"$0\" > '\(marker.path)'")
         }
-        if let sleepSeconds {
-            lines.append("exec /bin/sleep \(sleepSeconds)")
-        }
         lines.append("printf '%s\\n' '\(output)'")
-        lines.append("exit \(exitStatus)")
         try lines.joined(separator: "\n").write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         return executable
     }
+}
 
-    private func waitUntilFileExists(_ url: URL, timeout: TimeInterval = 2) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        repeat {
-            if FileManager.default.fileExists(atPath: url.path) { return true }
-            await Task.yield()
-        } while Date() < deadline
-        return false
+private final class CursorProbeTimeline: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nowValues: [TimeInterval]
+    private var timeouts: [TimeInterval] = []
+    private var cleanupAllowances: [TimeInterval] = []
+
+    init(nowValues: [TimeInterval]) {
+        self.nowValues = nowValues
+    }
+
+    func nextNow() -> TimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        return nowValues.removeFirst()
+    }
+
+    func record(timeout: TimeInterval, cleanupAllowance: TimeInterval) {
+        lock.lock()
+        timeouts.append(timeout)
+        cleanupAllowances.append(cleanupAllowance)
+        lock.unlock()
+    }
+
+    func recordedTimeouts() -> [TimeInterval] {
+        lock.lock()
+        defer { lock.unlock() }
+        return timeouts
+    }
+
+    func recordedCleanupAllowances() -> [TimeInterval] {
+        lock.lock()
+        defer { lock.unlock() }
+        return cleanupAllowances
     }
 }
 
-private actor TestEnvironmentBox {
-    private var environment: [String: String]
+private actor CursorProbeCallCounter {
+    private var callCount = 0
 
-    init(environment: [String: String]) {
-        self.environment = environment
+    func nextCall() -> Int {
+        callCount += 1
+        return callCount
     }
 
-    func current() -> [String: String] {
-        environment
-    }
-
-    func set(_ environment: [String: String]) {
-        self.environment = environment
+    func count() -> Int {
+        callCount
     }
 }
 
-private struct FixedLaunchACPProvider: ACPAgentProvider {
-    let launchConfiguration: ACPLaunchConfiguration
-    let workingDirectory: String
+private actor CursorProbeProducerBarrier {
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var cancellationContinuation: CheckedContinuation<Void, Never>?
+    private var returnedContinuation: CheckedContinuation<Void, Never>?
+    private var hasEntered = false
+    private var isReleased = false
+    private var cancellationRequested = false
+    private var hasReturned = false
 
-    var providerID: ACPProviderID {
-        .cursor
+    func enter() {
+        guard !hasEntered else { return }
+        hasEntered = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
     }
 
-    func support(for _: ACPRunRequest) async -> ACPSupportResult {
-        .supported
+    func waitUntilEntered() async {
+        guard !hasEntered else { return }
+        await withCheckedContinuation { continuation in
+            if hasEntered {
+                continuation.resume()
+            } else {
+                enteredContinuation = continuation
+            }
+        }
     }
 
-    func makeLaunchConfiguration(for _: ACPRunRequest) throws -> ACPLaunchConfiguration {
-        launchConfiguration
+    func waitForRelease() async {
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            if isReleased {
+                continuation.resume()
+            } else {
+                releaseContinuation = continuation
+            }
+        }
     }
 
-    func makeSessionConfiguration(
-        for _: ACPRunRequest,
-        mcpServer _: RepoPromptMCPServerConfiguration
-    ) throws -> ACPSessionConfiguration {
-        ACPSessionConfiguration(
-            mode: .new,
-            workingDirectory: workingDirectory,
-            mcpServers: []
-        )
+    func release() {
+        guard !isReleased else { return }
+        isReleased = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 
-    func buildPromptBlocks(
-        for _: AgentMessage,
-        request _: ACPRunRequest
-    ) throws -> [[String: Any]] {
-        []
+    func recordCancellation() {
+        guard !cancellationRequested else { return }
+        cancellationRequested = true
+        cancellationContinuation?.resume()
+        cancellationContinuation = nil
     }
 
-    func normalizeSessionUpdate(
-        _: [String: Any],
-        sessionID _: String
-    ) -> [NormalizedAgentRuntimeEvent] {
-        []
+    func waitUntilCancellation() async {
+        guard !cancellationRequested else { return }
+        await withCheckedContinuation { continuation in
+            if cancellationRequested {
+                continuation.resume()
+            } else {
+                cancellationContinuation = continuation
+            }
+        }
     }
 
-    func normalizeError(_ error: Error) -> Error {
-        error
+    func recordReturned() {
+        guard !hasReturned else { return }
+        hasReturned = true
+        returnedContinuation?.resume()
+        returnedContinuation = nil
+    }
+
+    func waitUntilReturned() async {
+        guard !hasReturned else { return }
+        await withCheckedContinuation { continuation in
+            if hasReturned {
+                continuation.resume()
+            } else {
+                returnedContinuation = continuation
+            }
+        }
+    }
+}
+
+private actor CursorProbeDeadlineBarrier {
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var waitContinuation: CheckedContinuation<Void, Never>?
+    private var hasEntered = false
+    private var isOpen = false
+
+    func wait() async {
+        if !hasEntered {
+            hasEntered = true
+            enteredContinuation?.resume()
+            enteredContinuation = nil
+        }
+        guard !isOpen else { return }
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if isOpen || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    waitContinuation = continuation
+                }
+            }
+        }, onCancel: {
+            Task { await self.cancelWaiter() }
+        })
+    }
+
+    func waitUntilEntered() async {
+        guard !hasEntered else { return }
+        await withCheckedContinuation { continuation in
+            if hasEntered {
+                continuation.resume()
+            } else {
+                enteredContinuation = continuation
+            }
+        }
+    }
+
+    func signal() {
+        guard !isOpen else { return }
+        isOpen = true
+        waitContinuation?.resume()
+        waitContinuation = nil
+    }
+
+    func wasSignaled() -> Bool {
+        isOpen
+    }
+
+    private func cancelWaiter() {
+        waitContinuation?.resume()
+        waitContinuation = nil
+    }
+}
+
+private actor CursorProbeDeadlineRouter {
+    private var barriers: [CursorProbeDeadlineBarrier]
+
+    init(_ barriers: [CursorProbeDeadlineBarrier]) {
+        self.barriers = barriers
+    }
+
+    func wait() async {
+        guard !barriers.isEmpty else { return }
+        let barrier = barriers.removeFirst()
+        await barrier.wait()
+    }
+}
+
+private actor CursorProbeCommands {
+    private(set) var commands: [String] = []
+    private(set) var timeouts: [TimeInterval] = []
+
+    func record(_ command: String, timeout: TimeInterval? = nil) {
+        commands.append(command)
+        if let timeout { timeouts.append(timeout) }
+    }
+}
+
+private final class CursorDiscoveryClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private let lookupMarker: URL
+    private var elapsedProbeTime: TimeInterval = 0
+
+    init(lookupMarker: URL) {
+        self.lookupMarker = lookupMarker
+    }
+
+    func advance(by duration: TimeInterval) {
+        lock.lock()
+        elapsedProbeTime += duration
+        lock.unlock()
+    }
+
+    func now() -> TimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        return elapsedProbeTime + (FileManager.default.fileExists(atPath: lookupMarker.path) ? 20 : 0)
     }
 }

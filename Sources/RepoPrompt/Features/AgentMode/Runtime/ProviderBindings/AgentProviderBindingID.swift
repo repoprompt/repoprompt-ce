@@ -5,6 +5,9 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
     case claude
     case openCode
     case cursor
+    case grokBuild
+    case antigravity
+    case devin
 
     var displayName: String {
         switch self {
@@ -16,6 +19,12 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
             "OpenCode"
         case .cursor:
             "Cursor CLI"
+        case .grokBuild:
+            "Grok Build"
+        case .antigravity:
+            "Google Antigravity"
+        case .devin:
+            "Devin CLI"
         }
     }
 }
@@ -31,6 +40,12 @@ extension AgentProviderKind {
             .openCode
         case .cursor:
             .cursor
+        case .grokBuild:
+            .grokBuild
+        case .antigravity:
+            .antigravity
+        case .devin:
+            .devin
         }
     }
 }

@@ -24,31 +24,6 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(launch.expectedExecutableIdentity?.canonicalPath, launch.command)
     }
 
-    func testBareCommandUsesCapturedEnvironmentAndCachesCanonicalPathForSpawn() async throws {
-        let directory = try makeTemporaryDirectory()
-        let probePathRecord = directory.appendingPathComponent("probe-path")
-        let executable = try makeExecutable(in: directory, marker: probePathRecord)
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = directory.path
-        environment["SHELL"] = "/bin/false"
-        let capturedEnvironment = environment
-        let resolver = OpenCodeACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
-        let config = OpenCodeAgentConfig(
-            commandName: "opencode",
-            additionalPathHints: [],
-            includeRepoPromptMCPServer: false,
-            includeManagedConfigOverlay: false
-        )
-
-        let support = try await resolver.probeSupport(for: config)
-        let launch = try resolver.resolvedLaunch(for: config)
-        let probedPath = try String(contentsOf: probePathRecord, encoding: .utf8)
-
-        XCTAssertEqual(support, .supported)
-        XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
-        XCTAssertEqual(probedPath, launch.command)
-    }
-
     func testDefaultProfileResolvesOpenCodeFromProviderSpecificHomeBin() async throws {
         let fakeHome = try makeTemporaryDirectory()
         let minimalPath = try makeTemporaryDirectory()
@@ -80,7 +55,8 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let fakeHome = try makeTemporaryDirectory()
         let pathDirectory = try makeTemporaryDirectory()
         let hintDirectory = try makeTemporaryDirectory()
-        let nonExecutable = hintDirectory.appendingPathComponent("opencode")
+        let commandName = "opencode-fixture-\(UUID().uuidString)"
+        let nonExecutable = hintDirectory.appendingPathComponent(commandName)
         try "not executable\n".write(to: nonExecutable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: nonExecutable.path)
         let environment = [
@@ -92,7 +68,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
             ACPLaunchEnvironment(environment: environment, shellEnvironmentSource: .enrichedFallback)
         })
         let config = OpenCodeAgentConfig(
-            commandName: "opencode",
+            commandName: commandName,
             additionalPathHints: [hintDirectory.path],
             includeRepoPromptMCPServer: false,
             includeManagedConfigOverlay: false
@@ -104,9 +80,9 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
             return XCTFail("Expected unsupported result with diagnostic reason")
         }
         XCTAssertTrue(reason.contains("Tried:"), reason)
-        XCTAssertTrue(reason.contains(hintDirectory.appendingPathComponent("opencode").path), reason)
+        XCTAssertTrue(reason.contains(hintDirectory.appendingPathComponent(commandName).path), reason)
         XCTAssertTrue(reason.contains("not executable"), reason)
-        XCTAssertTrue(reason.contains(pathDirectory.appendingPathComponent("opencode").path), reason)
+        XCTAssertTrue(reason.contains(pathDirectory.appendingPathComponent(commandName).path), reason)
         XCTAssertTrue(reason.contains("missing"), reason)
         XCTAssertTrue(reason.contains("fallback PATH"), reason)
         XCTAssertTrue(reason.contains("PATH may not match Terminal"), reason)
@@ -166,35 +142,6 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         }
     }
 
-    func testCancelledSupportProbePropagatesCancellationAndLeavesNoBareCommandCache() async throws {
-        let directory = try makeTemporaryDirectory()
-        let marker = directory.appendingPathComponent("probe-started")
-        _ = try makeExecutable(in: directory, marker: marker, sleepSeconds: 30)
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = directory.path
-        environment["SHELL"] = "/bin/false"
-        let capturedEnvironment = environment
-        let resolver = OpenCodeACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
-        let config = OpenCodeAgentConfig(commandName: "opencode", additionalPathHints: [])
-
-        let probe = Task { try await resolver.probeSupport(for: config) }
-        let didStartProbe = await waitUntilFileExists(marker)
-        XCTAssertTrue(didStartProbe)
-        probe.cancel()
-        do {
-            _ = try await probe.value
-            XCTFail("Expected support probe cancellation")
-        } catch is CancellationError {
-            // Expected: cancellation is not converted into an unsupported result.
-        }
-
-        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config)) { error in
-            guard case OpenCodeACPLaunchResolutionError.environmentDiscoveryRequired = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-    }
-
     func testWorldWritableExecutableDirectoryIsRejectedWithoutExecution() async throws {
         let directory = try makeTemporaryDirectory()
         let marker = directory.appendingPathComponent("probe-ran")
@@ -211,33 +158,38 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
-    func testFailedProbeDoesNotLeaveSpawnableCacheAndReplacementCanRecover() async throws {
+    func testGroupWritableExecutableFileIsRejectedWithoutExecution() async throws {
         let directory = try makeTemporaryDirectory()
-        let executable = try makeExecutable(in: directory, exitStatus: 2)
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = directory.path
-        environment["SHELL"] = "/bin/false"
-        let capturedEnvironment = environment
-        let resolver = OpenCodeACPLaunchResolver(environmentProvider: { _ in capturedEnvironment })
-        let config = OpenCodeAgentConfig(commandName: "opencode", additionalPathHints: [])
+        let marker = directory.appendingPathComponent("probe-ran")
+        let executable = try makeExecutable(in: directory, marker: marker)
+        try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: executable.path)
 
-        guard case .unsupported = try await resolver.probeSupport(for: config) else {
-            return XCTFail("Expected failed support probe")
-        }
-        XCTAssertThrowsError(try resolver.resolvedLaunch(for: config)) { error in
-            guard case OpenCodeACPLaunchResolutionError.environmentDiscoveryRequired = error else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-
-        try FileManager.default.removeItem(at: executable)
-        let replacement = try makeExecutable(in: directory)
-        let replacementSupport = try await resolver.probeSupport(for: config)
-        XCTAssertEqual(replacementSupport, .supported)
-        XCTAssertEqual(
-            try resolver.resolvedLaunch(for: config).command,
-            try canonicalExecutablePath(replacement)
+        let support = try await OpenCodeACPLaunchResolver().probeSupport(
+            for: OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
         )
+
+        guard case .unsupported = support else {
+            return XCTFail("Expected unsafe launch path to be unsupported")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testNonHomebrewGroupWritableAncestorIsRejectedWithoutExecution() async throws {
+        let root = try makeTemporaryDirectory()
+        let directory = root.appendingPathComponent("group-writable", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let marker = root.appendingPathComponent("probe-ran")
+        let executable = try makeExecutable(in: directory, marker: marker)
+        try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: directory.path)
+
+        let support = try await OpenCodeACPLaunchResolver().probeSupport(
+            for: OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [])
+        )
+
+        guard case .unsupported = support else {
+            return XCTFail("Expected unsafe launch path to be unsupported")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
     func testCachedIdentityDriftFailsBeforeSpawn() async throws {
@@ -282,31 +234,18 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         in directory: URL,
         marker: URL? = nil,
         output: String = "OpenCode ACP support",
-        exitStatus: Int32 = 0,
-        sleepSeconds: Int? = nil
+        exitStatus: Int32 = 0
     ) throws -> URL {
         let executable = directory.appendingPathComponent("opencode")
         var lines = ["#!/bin/sh"]
         if let marker {
             lines.append("printf '%s' \"$0\" > '\(marker.path)'")
         }
-        if let sleepSeconds {
-            lines.append("exec /bin/sleep \(sleepSeconds)")
-        }
         lines.append("printf '%s\\n' '\(output)'")
         lines.append("exit \(exitStatus)")
         try lines.joined(separator: "\n").write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         return executable
-    }
-
-    private func waitUntilFileExists(_ url: URL, timeout: TimeInterval = 2) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        repeat {
-            if FileManager.default.fileExists(atPath: url.path) { return true }
-            await Task.yield()
-        } while Date() < deadline
-        return false
     }
 }
 

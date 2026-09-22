@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 extension Value {
     /// Decode this Value into a Decodable type by going through JSON.
@@ -1067,6 +1068,17 @@ extension ToolOutputFormatter {
             lines.append("## History Session \(status)")
             lines.append("- `\(sessionID)` **\(sessionName)** (\(workspaceName))")
             lines.append("- **Turns**: \(start)–\(end) of \(totalTurns)")
+            if let usage = object["token_usage_summary"]?.objectValue {
+                let providerInput = usage["provider_input_tokens"]?.intValue ?? 0
+                let providerOutput = usage["provider_output_tokens"]?.intValue ?? 0
+                let codexTotal = usage["codex_total_tokens"]?.intValue
+                if providerInput > 0 || providerOutput > 0 || codexTotal != nil {
+                    var usageLine = "- **Provider tokens**: input \(providerInput), output \(providerOutput)"
+                    if let codexTotal { usageLine += ", Codex cumulative \(codexTotal)" }
+                    usageLine += " • attributed runs: \(usage["attributed_run_count"]?.intValue ?? 0)"
+                    lines.append(usageLine)
+                }
+            }
             if let targetTurn { lines.append("- **Target turn**: \(targetTurn)") }
             if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
             appendHistoryScanMetadata(object, to: &lines)
@@ -1092,6 +1104,18 @@ extension ToolOutputFormatter {
                 }
                 if let toolSummary = nonEmpty(turn["tool_call_summary"]?.stringValue) {
                     lines.append("- **Tools**: \(toolSummary)")
+                }
+                let runIDs = turn["run_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                if !runIDs.isEmpty {
+                    lines.append("- **Run IDs**: \(runIDs.joined(separator: ", "))")
+                }
+                let tokenUsage = turn["token_usage"]?.arrayValue ?? []
+                for usageValue in tokenUsage {
+                    guard let usage = usageValue.objectValue else { continue }
+                    let input = usage["input_tokens"]?.intValue ?? 0
+                    let output = usage["output_tokens"]?.intValue ?? 0
+                    let run = nonEmpty(usage["run_id"]?.stringValue) ?? "unattributed"
+                    lines.append("- **Token usage** (`\(run)`): input \(input), output \(output)")
                 }
                 let entries = turn["entries"]?.arrayValue ?? []
                 for entryValue in entries {
@@ -1830,10 +1854,6 @@ extension ToolOutputFormatter {
             let flags: [String] = [binding.explicit == true ? "explicit" : nil, binding.runScoped == true ? "run-scoped" : nil].compactMap(\.self)
             let flagSuffix = flags.isEmpty ? "" : " • " + flags.joined(separator: ", ")
             return "Tab context \(tab) in \(window)\(workspace)\(flagSuffix)"
-        case "window":
-            let window = binding.windowID.map { "window \($0)" } ?? "unknown window"
-            let workspace = binding.workspaceName.map { " • workspace \($0)" } ?? ""
-            return "Window-only affinity to \(window)\(workspace)"
         default:
             return "Unbound"
         }
@@ -1934,7 +1954,7 @@ extension ToolOutputFormatter {
             out.append("")
             out.append("### Next Steps")
             out.append("- Use `bind_context` with `op=bind` and a `context_id` to bind a specific tab context.")
-            out.append("- Or use `bind_context` with `op=bind` and a `window_id` to set window affinity.")
+            out.append("- Or use `bind_context` with `op=bind` and a `window_id` to capture and bind that window's current tab context.")
             if let windows = dto.windows, windows.count > 1 {
                 out.append("- Use `window_id` filter on `op=list` to see all tabs in a specific window.")
             }
@@ -2419,8 +2439,8 @@ extension ToolOutputFormatter {
             break
         }
 
-        // Build main section using our existing helper
-        let text = chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: "## Chat Send ✅")
+            ?? chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -2504,7 +2524,8 @@ extension ToolOutputFormatter {
             break
         }
 
-        let text = askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = formatOracleGroup(value: value, heading: "## Ask Oracle ✅")
+            ?? askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -4342,17 +4363,25 @@ extension ToolOutputFormatter {
                     "## Generated Response"
                 }
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                blocks.append(.text("\(separator)\(heading)\n"))
-                let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
-                blocks.append(contentsOf: planBlocks)
+                if let groupBlock = formatOracleGroup(value: planObj, heading: heading) {
+                    blocks.append(.text(separator + groupBlock))
+                } else {
+                    blocks.append(.text("\(separator)\(heading)\n"))
+                    let planBlocks = formatChatSend(args: [:], value: planObj, emitResources: false)
+                    blocks.append(contentsOf: planBlocks)
+                }
             }
 
             // If review was generated, format it using oracle_send formatter
             if let reviewObj = obj["review"], case .object = reviewObj {
                 let separator = blocks.isEmpty ? "" : "\n\n---\n\n"
-                blocks.append(.text("\(separator)## Code Review\n"))
-                let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
-                blocks.append(contentsOf: reviewBlocks)
+                if let groupBlock = formatOracleGroup(value: reviewObj, heading: "## Code Review") {
+                    blocks.append(.text(separator + groupBlock))
+                } else {
+                    blocks.append(.text("\(separator)## Code Review\n"))
+                    let reviewBlocks = formatChatSend(args: [:], value: reviewObj, emitResources: false)
+                    blocks.append(contentsOf: reviewBlocks)
+                }
             }
 
             // Follow-up hint
@@ -4374,6 +4403,63 @@ extension ToolOutputFormatter {
             return blocks
         }
         return formatGeneric(value: value)
+    }
+
+    private static func formatOracleGroup(
+        value: Value,
+        heading: String
+    ) -> String? {
+        guard let dto = value.decode(ToolResultDTOs.ChatSendDTO.self),
+              let count = dto.oracleCount,
+              let results = dto.oracleResults,
+              count == results.count,
+              count > 1
+        else { return nil }
+
+        let ordered = results.sorted { $0.laneIndex < $1.laneIndex }
+        guard ordered.enumerated().allSatisfy({ offset, lane in
+            lane.laneIndex == offset && lane.role == (offset == 0 ? "primary" : "additional")
+        }) else { return nil }
+
+        var lines = [heading]
+        if let status = dto.status {
+            lines.append("- Oracle group status: \(status)")
+        }
+        if let groupID = dto.oracleGroupID {
+            lines.append("- Oracle group: `\(groupID)`")
+        }
+        let payload = OracleLaneMarkdownPayload(lanes: ordered.map { lane in
+            let status: OracleLaneMarkdownPayload.Status = switch OracleLaneResultStatus(rawValue: lane.status) {
+            case .completed: .completed
+            case .failed: .failed
+            case .cancelled: .cancelled
+            case nil: .unavailable
+            }
+            return OracleLaneMarkdownPayload.Lane(
+                laneIndex: lane.laneIndex,
+                chatID: lane.chatID,
+                providerID: lane.executionProfile?.providerID ?? lane.providerID,
+                modelID: lane.executionProfile?.modelID ?? lane.modelID,
+                effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
+                status: status,
+                response: lane.response,
+                partialResponse: lane.error?.partialResponse,
+                errorCode: lane.error?.code,
+                errorMessage: lane.error?.message
+            )
+        })
+        let laneMarkdown = OracleLaneMarkdownFormatter.format(payload)
+        if !laneMarkdown.isEmpty {
+            lines.append("")
+            lines.append(laneMarkdown)
+        }
+        if let warnings = dto.warnings {
+            for warning in warnings {
+                lines.append("")
+                lines.append("Warning [\(warning.code)]: \(warning.message)")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     static func formatFileAction(value: Value) -> [MCP.Tool.Content] {
@@ -5706,6 +5792,20 @@ extension ToolOutputFormatter {
                 agentLine += " · reasoning `\(reasoning)`"
             }
             lines.append(agentLine)
+            if let parameters = agent?["model_parameters"]?.arrayValue,
+               !parameters.isEmpty
+            {
+                let selected = parameters.compactMap { parameter -> String? in
+                    guard let selection = parameter.objectValue,
+                          let configID = selection["config_id"]?.stringValue,
+                          let value = selection["value"]?.stringValue
+                    else { return nil }
+                    return "`\(configID)=\(value)`"
+                }
+                if !selected.isEmpty {
+                    lines.append("- Model parameters: \(selected.joined(separator: ", "))")
+                }
+            }
         }
         if let interactionKind, !interactionKind.isEmpty {
             lines.append("- Interaction: **\(interactionKind)**")
@@ -6053,6 +6153,20 @@ extension ToolOutputFormatter {
                     agentLine += " · `\(model)`"
                 }
                 lines.append(agentLine)
+                if let parameters = agentObject["model_parameters"]?.arrayValue,
+                   !parameters.isEmpty
+                {
+                    let selected = parameters.compactMap { parameter -> String? in
+                        guard let object = parameter.objectValue,
+                              let configID = object["config_id"]?.stringValue,
+                              let value = object["value"]?.stringValue
+                        else { return nil }
+                        return "`\(configID)=\(value)`"
+                    }
+                    if !selected.isEmpty {
+                        lines.append("- Model parameters: \(selected.joined(separator: ", "))")
+                    }
+                }
             }
         } else if let agent = object["agent"]?.stringValue, !agent.isEmpty {
             lines.append("- Agent: **\(agent)**")
@@ -6143,6 +6257,27 @@ extension ToolOutputFormatter {
                         lines.append("  `\(agentPrefix)\(family.base)-{\(effortList)}` — \(family.name)")
                     }
                 }
+                for model in models {
+                    guard let modelObject = model.objectValue,
+                          let modelID = modelObject["model_id"]?.stringValue,
+                          let parameters = modelObject["model_parameters"]?.arrayValue,
+                          !parameters.isEmpty
+                    else { continue }
+                    lines.append("  Parameters for `\(modelID)`:")
+                    for parameter in parameters {
+                        guard let parameterObject = parameter.objectValue,
+                              let configID = parameterObject["config_id"]?.stringValue,
+                              let parameterName = parameterObject["name"]?.stringValue,
+                              let choices = parameterObject["choices"]?.arrayValue
+                        else { continue }
+                        let choiceValues = choices.compactMap {
+                            $0.objectValue?["value"]?.stringValue
+                        }.joined(separator: "|")
+                        let current = parameterObject["current_value"]?.stringValue
+                        let currentSuffix = current.map { " (current: `\($0)`)" } ?? ""
+                        lines.append("    `\(configID)` — \(parameterName): `{\(choiceValues)}`\(currentSuffix)")
+                    }
+                }
             }
         }
         if let sessions = object["sessions"]?.arrayValue {
@@ -6159,6 +6294,16 @@ extension ToolOutputFormatter {
                 }
                 if !state.isEmpty { parts.append(state) }
                 if !agent.isEmpty { parts.append(agent) }
+                if let parameters = agentObject?["model_parameters"]?.arrayValue {
+                    let selected = parameters.compactMap { parameter -> String? in
+                        guard let object = parameter.objectValue,
+                              let configID = object["config_id"]?.stringValue,
+                              let value = object["value"]?.stringValue
+                        else { return nil }
+                        return "\(configID)=\(value)"
+                    }
+                    if !selected.isEmpty { parts.append(selected.joined(separator: ",")) }
+                }
                 lines.append("  - \(parts.joined(separator: " · "))")
             }
         }

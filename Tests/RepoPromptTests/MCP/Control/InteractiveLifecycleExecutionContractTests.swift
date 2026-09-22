@@ -6,7 +6,7 @@ import XCTest
 
 @MainActor
 final class InteractiveLifecycleExecutionContractTests: XCTestCase {
-    func testAskUserPreservesWorkspaceDefaultAndLongerCallerTimeout() throws {
+    func testAskUserPreservesResolvedDefaultAndLongerCallerTimeout() throws {
         XCTAssertEqual(
             try MCPAskUserToolProvider.resolvedInteractionTimeoutSeconds(
                 nil,
@@ -32,17 +32,5 @@ final class InteractiveLifecycleExecutionContractTests: XCTestCase {
             try MCPAgentSessionControlToolProvider.resolvedInstructionWaitTimeoutSeconds(.int(1200)),
             1200
         )
-    }
-
-    func testInteractiveLifecycleToolsHaveNoExecutionWatchdogDeadline() {
-        for toolName in [
-            MCPWindowToolName.askUser,
-            MCPWindowToolName.waitForNextInstruction
-        ] {
-            let contract = MCPToolExecutionContractCatalog.contract(for: toolName)
-            XCTAssertEqual(contract?.kind, .interactiveCancellable, toolName)
-            XCTAssertNil(contract?.deadline, toolName)
-            XCTAssertNil(contract?.cancellationGrace, toolName)
-        }
     }
 }

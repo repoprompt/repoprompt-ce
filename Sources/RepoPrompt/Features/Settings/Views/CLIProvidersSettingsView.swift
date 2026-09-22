@@ -4,7 +4,9 @@ import SwiftUI
 struct CLIProvidersSettingsView: View {
     @ObservedObject var viewModel: APISettingsViewModel
     @ObservedObject var promptViewModel: PromptViewModel
+    @ObservedObject private var codexSessionFence = CodexManagedSessionFence.shared
     let windowID: Int
+    private let codexRuntimeActiveSelection: CodexRuntimePreferences.Selection
     var onAPIKeyUpdated: (() -> Void)?
     var closeAction: (() -> Void)?
     /// Optional navigation callback so provider cards can deep-link into Agent Permissions
@@ -27,6 +29,7 @@ struct CLIProvidersSettingsView: View {
         self.viewModel = viewModel
         self.promptViewModel = promptViewModel
         self.windowID = windowID
+        codexRuntimeActiveSelection = CodexRuntimePreferences.activeSelection
         self.onAPIKeyUpdated = onAPIKeyUpdated
         self.closeAction = closeAction
         self.onNavigate = onNavigate
@@ -37,14 +40,25 @@ struct CLIProvidersSettingsView: View {
     @State private var alertMessage = ""
     @State private var isLoadingClaudeCode = false
     @State private var isLoadingCodex = false
-    @State private var isLoggingIntoCodex = false
+    @State private var isSigningOutCodex = false
+    @State private var activeCodexManagedLoginFlow: CodexManagedLoginFlow?
+    @State private var codexManagedLoginOperationID: UUID?
+    @State private var codexManagedDeviceCode: CodexManagedChatgptDeviceCode?
+    @State private var didCopyCodexManagedDeviceCode = false
+    @State private var showCodexSignOutConfirmation = false
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
+    @State private var isLoadingGrokBuild = false
+    @State private var isLoadingAntigravity = false
+    @State private var isTestingAntigravity = false
+    @State private var isAntigravityInstalled = false
+    @State private var isAntigravityExpanded = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
     @State private var showOpenCodeTraceDump = false
     @State private var showCursorTraceDump = false
+    @State private var showGrokBuildTraceDump = false
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
 
@@ -55,8 +69,14 @@ struct CLIProvidersSettingsView: View {
     @State private var isKimiCodeExpanded: Bool = false
     @State private var isCustomCompatibleExpanded: Bool = false
     @State private var isCodexExpanded: Bool = false
+    @State private var isCodexRuntimeAdvancedExpanded: Bool = false
+    @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
+    @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
+    @State private var isLoadingCodexRuntimePreflight = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
+    @State private var isGrokBuildExpanded: Bool = false
+    @State private var isDevinExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -75,6 +95,8 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isCodexConnected
             || viewModel.isOpenCodeConnected
             || viewModel.isCursorConnected
+            || viewModel.isGrokBuildConnected
+            || DevinRuntimeLocator.isInstalledSync()
     }
 
     private var codexStatusText: String? {
@@ -86,7 +108,9 @@ struct CLIProvidersSettingsView: View {
         case .testingAppServer:
             "Testing Codex app-server…"
         case .loggingIn:
-            "Waiting for ChatGPT login to complete…"
+            codexManagedDeviceCode == nil
+                ? "Waiting for ChatGPT login to complete…"
+                : "Waiting for device-code sign-in to complete…"
         case .authRequired:
             "Codex authentication needs attention. Use Login with ChatGPT, then retry."
         case let .failed(message):
@@ -105,7 +129,7 @@ struct CLIProvidersSettingsView: View {
                         .font(.title2)
                         .fontWeight(.semibold)
 
-                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, or Cursor to leverage your existing subscriptions — OpenCode can also proxy any API key.")
+                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Devin to leverage your existing subscriptions — OpenCode can also proxy any API key.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -132,18 +156,33 @@ struct CLIProvidersSettingsView: View {
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
+                grokBuildCard
+                antigravityCard
+                devinCard
             }
             .padding(16)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
+            viewModel.refreshDevinModels()
             Task {
                 await viewModel.loadCompatibleBackendState()
+                isAntigravityInstalled = AntigravityRuntimeManager.installedRuntimeSync() != nil
                 await viewModel.refreshClaudeCodeBinaryStatus()
             }
         }
         .alert(isPresented: $showAlert) {
-            if showClaudeCodeTraceDump, viewModel.hasClaudeCodeTrace() {
+            if showCodexSignOutConfirmation {
+                Alert(
+                    title: Text(CodexManagedSignOutConfirmation.title),
+                    message: Text(CodexManagedSignOutConfirmation.message),
+                    primaryButton: .destructive(
+                        Text(CodexManagedSignOutConfirmation.confirmTitle),
+                        action: stopCodexSessionsAndSignOut
+                    ),
+                    secondaryButton: .cancel(Text(CodexManagedSignOutConfirmation.cancelTitle))
+                )
+            } else if showClaudeCodeTraceDump, viewModel.hasClaudeCodeTrace() {
                 Alert(
                     title: Text("CLI Provider Management"),
                     message: Text(alertMessage),
@@ -185,6 +224,7 @@ struct CLIProvidersSettingsView: View {
                 showCodexTraceDump = false
                 showOpenCodeTraceDump = false
                 showCursorTraceDump = false
+                showCodexSignOutConfirmation = false
             }
         }
     }
@@ -1502,10 +1542,288 @@ struct CLIProvidersSettingsView: View {
 
     // MARK: - Codex Card
 
+    private func codexAccountSummary(_ account: CodexManagedAccount) -> some View {
+        let projection = account.settingsProjection
+        return Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
+            GridRow {
+                Text("Account")
+                    .foregroundColor(.secondary)
+                Text(projection.account)
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GridRow {
+                Text("Plan")
+                    .foregroundColor(.secondary)
+                Text(projection.plan)
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GridRow {
+                Text("Authentication")
+                    .foregroundColor(.secondary)
+                Text(projection.authentication)
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .font(.caption)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var codexRuntimeSelectionControl: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "shippingbox.fill")
+                    .foregroundColor(.secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Included with RepoPrompt")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Text("Codex \(CodexRuntimeAuthority.bundledVersion.description)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                if isLoadingCodexRuntimePreflight {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if codexRuntimePreflight?.bundledResolution.status == .available {
+                    Label("Ready", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                } else {
+                    Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+            }
+
+            if !isLoadingCodexRuntimePreflight,
+               let bundledResolution = codexRuntimePreflight?.bundledResolution,
+               bundledResolution.status != .available
+            {
+                Text(bundledResolution.userMessage)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !isLoadingCodexRuntimePreflight, let preflight = codexRuntimePreflight {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(
+                        "Active now: \(codexRuntimeChoiceDescription(codexRuntimeActiveSelection, resolution: preflight.activeResolution))",
+                        systemImage: "play.circle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                    if codexRuntimeProjection.changesAfterRelaunch {
+                        Label(
+                            "After relaunch: \(codexRuntimeChoiceDescription(codexRuntimePendingSelection, resolution: preflight.pendingResolution))",
+                            systemImage: "arrow.forward.circle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    }
+                }
+
+                if codexRuntimeSelectionIsCustom(codexRuntimeActiveSelection),
+                   preflight.activeResolution.status != .available
+                {
+                    Text("Active runtime: \(preflight.activeResolution.userMessage)")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if codexRuntimeProjection.changesAfterRelaunch,
+                   preflight.pendingResolution.status != .available
+                {
+                    Text("After relaunch: \(preflight.pendingResolution.userMessage)")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if codexRuntimePreflight?.ignoredLegacyEnvironmentOverride == true {
+                Text("RepoPrompt ignored the legacy \(CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey) override. Choose a custom executable under Advanced if you still need it.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isCodexRuntimeAdvancedExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .rotationEffect(.degrees(isCodexRuntimeAdvancedExpanded ? 90 : 0))
+                    Text("Advanced")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            if isCodexRuntimeAdvancedExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Custom Codex executables are not verified or managed by RepoPrompt and may be incompatible with its app-server integration. Use the included runtime unless you need an explicit compatibility escape hatch.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if codexRuntimeProjection.changesAfterRelaunch,
+                       let activePath = codexRuntimeExecutablePath(codexRuntimeActiveSelection)
+                    {
+                        Text("Active path: \(activePath)")
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .hoverTooltip(activePath)
+                    }
+
+                    if let pendingPath = codexRuntimeExecutablePath(codexRuntimePendingSelection) {
+                        Text("\(codexRuntimeProjection.changesAfterRelaunch ? "After relaunch path" : "Selected path"): \(pendingPath)")
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .hoverTooltip(pendingPath)
+                    }
+
+                    if codexCustomRuntimeIsConfigured,
+                       let resolution = codexRuntimePreflight?.pendingResolution,
+                       resolution.status == .available,
+                       let description = resolution.displayDescription
+                    {
+                        Text(
+                            codexRuntimeProjection.changesAfterRelaunch
+                                ? "After relaunch selection: \(description)"
+                                : "Selected: \(description)"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Choose Custom Executable…", action: chooseLocalCodexExecutable)
+                            .buttonStyle(CustomButtonStyle())
+
+                        if codexCustomRuntimeIsConfigured {
+                            Button("Restore Included Runtime") {
+                                setCodexRuntimeSelection(.bundled)
+                            }
+                            .buttonStyle(CustomButtonStyle())
+                        }
+                    }
+
+                    Text("Runtime changes apply after the next RepoPrompt launch and then refresh the model list. Existing saved model selections are not changed.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 2)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .task(id: codexRuntimeSelectionTaskID) {
+            await refreshCodexRuntimePreflight()
+        }
+    }
+
+    private var codexRuntimeProjection: CodexRuntimePreferences.RuntimeSelectionProjection {
+        CodexRuntimePreferences.runtimeSelectionProjection(
+            active: codexRuntimeActiveSelection,
+            pending: codexRuntimePendingSelection
+        )
+    }
+
+    private var codexCustomRuntimeIsConfigured: Bool {
+        codexRuntimeSelectionIsCustom(codexRuntimePendingSelection)
+    }
+
+    private func codexRuntimeSelectionIsCustom(_ selection: CodexRuntimePreferences.Selection) -> Bool {
+        switch selection {
+        case .external, .invalidExternalPreference:
+            true
+        case .inherited, .bundled:
+            false
+        }
+    }
+
+    private func codexRuntimeExecutablePath(_ selection: CodexRuntimePreferences.Selection) -> String? {
+        switch selection {
+        case let .external(path):
+            path
+        case .inherited, .bundled, .invalidExternalPreference:
+            nil
+        }
+    }
+
+    private func codexRuntimeChoiceDescription(
+        _ selection: CodexRuntimePreferences.Selection,
+        resolution: CodexProviderHelpers.CodexExecutableResolution
+    ) -> String {
+        switch selection {
+        case .inherited, .bundled:
+            "Included Codex \(CodexRuntimeAuthority.bundledVersion)"
+        case let .external(path):
+            if let runtime = resolution.runtime {
+                "Custom Codex \(runtime.version) (\(runtime.executableURL.lastPathComponent))"
+            } else {
+                "Custom Codex (\(URL(fileURLWithPath: path).lastPathComponent))"
+            }
+        case .invalidExternalPreference:
+            "Invalid custom executable preference"
+        }
+    }
+
+    private var codexRuntimeSelectionTaskID: String {
+        switch codexRuntimePendingSelection {
+        case .inherited:
+            "inherited"
+        case .bundled:
+            "bundled"
+        case let .external(path):
+            "external:\(path)"
+        case .invalidExternalPreference:
+            "invalid-external"
+        }
+    }
+
+    private func setCodexRuntimeSelection(_ selection: CodexRuntimePreferences.Selection) {
+        CodexRuntimePreferences.setSelection(selection)
+        codexRuntimePendingSelection = CodexRuntimePreferences.selection()
+    }
+
+    private func refreshCodexRuntimePreflight() async {
+        let pendingSelection = codexRuntimePendingSelection
+        isLoadingCodexRuntimePreflight = true
+        let preflight = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+            activeSelection: codexRuntimeActiveSelection,
+            pendingSelection: pendingSelection
+        )
+        guard !Task.isCancelled, codexRuntimePendingSelection == pendingSelection else { return }
+        codexRuntimePreflight = preflight
+        isLoadingCodexRuntimePreflight = false
+    }
+
     private var codexCard: some View {
         providerCard(
             title: "Codex CLI",
-            subtitle: "Runs the Codex CLI through RepoPrompt, honoring your existing login and configuration.",
+            subtitle: "Runs RepoPrompt CE's managed Codex runtime with a separate sign-in from ~/.codex.",
             infoURL: "https://developers.openai.com/codex/cli/",
             isConnected: viewModel.isCodexConnected,
             isExpanded: $isCodexExpanded
@@ -1524,8 +1842,20 @@ struct CLIProvidersSettingsView: View {
                     .buttonStyle(PlainButtonStyle())
                 }
 
+                Divider()
+                codexRuntimeSelectionControl
+
                 if viewModel.isCodexConnected {
                     Divider()
+
+                    if let account = viewModel.managedCodexAccount {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Signed in to Codex")
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            codexAccountSummary(account)
+                        }
+                    }
 
                     HStack(spacing: 8) {
                         Button(action: { testCodexConnection() }) {
@@ -1537,16 +1867,25 @@ struct CLIProvidersSettingsView: View {
                                 Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
                             }
                         }
-                        .disabled(isLoadingCodex)
+                        .disabled(isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress)
                         .buttonStyle(CustomButtonStyle())
 
                         Spacer()
 
-                        Button(action: { signOutFromCodex() }) {
-                            Text("Sign Out")
-                                .foregroundColor(.secondary)
+                        if viewModel.managedCodexAccount?.isConfirmedManagedAuthentication == true {
+                            Button(action: requestCodexSignOutConfirmation) {
+                                if isSigningOutCodex {
+                                    ProgressView()
+                                        .scaleEffect(0.6)
+                                        .frame(height: 16)
+                                } else {
+                                    Text("Sign Out")
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .disabled(isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress)
+                            .buttonStyle(CustomButtonStyle())
                         }
-                        .buttonStyle(CustomButtonStyle())
                     }
 
                     if case let .connected(resolvedExecutable) = viewModel.codexConnectionPhase,
@@ -1576,11 +1915,15 @@ struct CLIProvidersSettingsView: View {
                                 Label("Connect", systemImage: "link")
                             }
                         }
-                        .disabled(isLoadingCodex || isLoggingIntoCodex)
+                        .disabled(
+                            isLoadingCodex
+                                || activeCodexManagedLoginFlow != nil
+                                || codexSessionFence.isLogoutInProgress
+                        )
                         .buttonStyle(CustomButtonStyle())
 
                         Button(action: { startCodexManagedChatgptLogin() }) {
-                            if isLoggingIntoCodex {
+                            if activeCodexManagedLoginFlow == .browser {
                                 ProgressView()
                                     .scaleEffect(0.6)
                                     .frame(height: 16)
@@ -1588,8 +1931,56 @@ struct CLIProvidersSettingsView: View {
                                 Text(CodexManagedAuthRecoveryClassifier.loginActionTitle)
                             }
                         }
-                        .disabled(isLoadingCodex || isLoggingIntoCodex || !viewModel.canAttemptCodexManagedLogin)
+                        .disabled(
+                            isLoadingCodex
+                                || activeCodexManagedLoginFlow == .browser
+                                || (activeCodexManagedLoginFlow == nil && !viewModel.canAttemptCodexManagedLogin)
+                        )
                         .buttonStyle(CustomButtonStyle())
+
+                        Button(action: { startCodexManagedChatgptDeviceCodeLogin() }) {
+                            if activeCodexManagedLoginFlow == .deviceCode {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Text(CodexManagedAuthRecoveryClassifier.deviceCodeActionTitle)
+                            }
+                        }
+                        .disabled(
+                            isLoadingCodex
+                                || activeCodexManagedLoginFlow == .deviceCode
+                                || (activeCodexManagedLoginFlow == nil && !viewModel.canAttemptCodexManagedLogin)
+                        )
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    if let code = codexManagedDeviceCode {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Enter this one-time code on the verification page:")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            HStack(spacing: 10) {
+                                Text(code.userCode)
+                                    .font(.system(size: 18, weight: .semibold, design: .monospaced))
+                                    .textSelection(.enabled)
+                                Button(didCopyCodexManagedDeviceCode ? "Copied" : "Copy code") {
+                                    copyCodexManagedDeviceCode(code.userCode)
+                                }
+                                .buttonStyle(CustomButtonStyle())
+                                Button("Open verification page") {
+                                    NSWorkspace.shared.open(code.verificationURL)
+                                }
+                                .buttonStyle(CustomButtonStyle())
+                            }
+                            Text("Open the verification page in a browser, enter the code, and leave this panel open. RepoPrompt CE will keep checking this separate Codex sign-in until it completes or expires.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(10)
+                        .background(Color.secondary.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
 
                     if let error = viewModel.codexError, !error.isEmpty {
@@ -1598,7 +1989,7 @@ struct CLIProvidersSettingsView: View {
                             .foregroundColor(.red)
                             .fixedSize(horizontal: false, vertical: true)
                         if viewModel.isCodexExecutableUnavailable {
-                            Text("Reinstall RepoPrompt CE, or fix/remove REPOPROMPT_CODEX_EXECUTABLE, then click Connect to check again.")
+                            Text("Choose another custom executable under Advanced or restore the included runtime, then relaunch RepoPrompt. After relaunch, click Connect to check again.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -1701,7 +2092,211 @@ struct CLIProvidersSettingsView: View {
         return count == 1 ? "1 model discovered." : "\(count) models discovered."
     }
 
+    // MARK: - Antigravity Card
+
+    private var antigravityCard: some View {
+        providerCard(
+            title: "Google Antigravity",
+            subtitle: "Managed official Antigravity ACP runtime with Google OAuth authentication.",
+            infoURL: "https://antigravity.google/",
+            isConnected: isAntigravityInstalled,
+            isExpanded: $isAntigravityExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Button {
+                        isLoadingAntigravity = true
+                        Task {
+                            do {
+                                _ = try await AntigravityRuntimeManager.shared.install()
+                                await MainActor.run {
+                                    isAntigravityInstalled = true
+                                    isLoadingAntigravity = false
+                                    alertMessage = "Antigravity runtime installed. It will be authenticated when you start the first session."
+                                    showAlert = true
+                                }
+                            } catch {
+                                await MainActor.run {
+                                    isLoadingAntigravity = false
+                                    alertMessage = error.localizedDescription
+                                    showAlert = true
+                                }
+                            }
+                        }
+                    } label: {
+                        if isLoadingAntigravity {
+                            ProgressView().scaleEffect(0.6).frame(height: 16)
+                        } else {
+                            Label(isAntigravityInstalled ? "Update Runtime" : "Install Runtime", systemImage: "arrow.down.circle")
+                        }
+                    }
+                    .disabled(isLoadingAntigravity)
+                    .buttonStyle(CustomButtonStyle())
+
+                    Button {
+                        isTestingAntigravity = true
+                        Task {
+                            do {
+                                let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+                                _ = try await AntigravityACPAgentProvider().support(for: request)
+                                let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
+                                let count = AgentACPModelRegistry.shared.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
+                                await MainActor.run {
+                                    isTestingAntigravity = false
+                                    alertMessage = discovered && count > 0
+                                        ? "Antigravity ACP connected. \(count) models discovered."
+                                        : "Antigravity ACP is available, but it returned no selectable models."
+                                    showAlert = true
+                                }
+                            } catch {
+                                await MainActor.run {
+                                    isTestingAntigravity = false
+                                    alertMessage = error.localizedDescription
+                                    showAlert = true
+                                }
+                            }
+                        }
+                    } label: {
+                        if isTestingAntigravity { ProgressView().scaleEffect(0.6).frame(height: 16) }
+                        else { Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right") }
+                    }
+                    .disabled(isTestingAntigravity || !isAntigravityInstalled)
+                    .buttonStyle(CustomButtonStyle())
+
+                    Text(isAntigravityInstalled ? "Runtime ready. Google login will be requested by ACP." : "Runtime not installed.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    private var devinCard: some View {
+        let isInstalled = DevinRuntimeLocator.isInstalledSync()
+        return providerCard(
+            title: "Devin CLI",
+            subtitle: "Uses the installed `devin acp` runtime for interactive Agent Mode and Oracle.",
+            infoURL: "https://docs.devin.ai/cli/acp/zed",
+            isConnected: isInstalled,
+            isExpanded: $isDevinExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(
+                    isInstalled
+                        ? "Devin owns authentication and internal tools; RepoPrompt controls interactive launch permissions."
+                        : "Install and authenticate Devin, then ensure `devin acp` is available."
+                )
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+                if isInstalled {
+                    HStack(spacing: 10) {
+                        Button {
+                            viewModel.refreshDevinModels(force: true)
+                        } label: {
+                            if viewModel.isDiscoveringDevinModels {
+                                ProgressView().scaleEffect(0.6).frame(height: 16)
+                            } else {
+                                Label("Refresh Models", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(viewModel.isDiscoveringDevinModels)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let message = viewModel.devinModelDiscoveryMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    directProviderInlineControls(for: .devin)
+                }
+            }
+        }
+    }
+
     // MARK: - Cursor Card
+
+    private var grokBuildCard: some View {
+        providerCard(
+            title: "Grok Build",
+            subtitle: "Uses xAI's Grok Build ACP runtime (`grok agent stdio`) for Agent Mode and headless tasks. RepoPrompt MCP tools are added through the ACP session.",
+            infoURL: "https://docs.x.ai/build/overview",
+            isConnected: viewModel.isGrokBuildConnected,
+            isExpanded: $isGrokBuildExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isGrokBuildConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testGrokBuildConnection() }) {
+                            if isLoadingGrokBuild {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingGrokBuild)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromGrokBuild() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text(grokBuildModelSummary)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    directProviderInlineControls(for: .grokBuild)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testGrokBuildConnection() }) {
+                            if isLoadingGrokBuild {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingGrokBuild)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.grokBuildError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Install with `npm i -g @xai-official/grok` or the xAI installer. Authenticate with `grok login` or a Grok API key (stored under API Keys).")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var grokBuildModelSummary: String {
+        let options = viewModel.availableGrokBuildModelOptions
+        let count = options.count
+        if count <= 1 {
+            return "Using Grok's configured default model; dynamic model discovery will refresh in the background."
+        }
+        return count == 1 ? "1 model available." : "\(count) models available (including Default)."
+    }
+
+    // MARK: - Cursor CLI / ACP card
 
     private var cursorCard: some View {
         providerCard(
@@ -2034,40 +2629,127 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    private func chooseLocalCodexExecutable() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Codex Executable"
+        panel.message = "Select an installed Codex CLI executable. RepoPrompt validates its version before use."
+        panel.prompt = "Choose"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = false
+        if let pendingPath = codexRuntimeExecutablePath(codexRuntimePendingSelection) {
+            panel.directoryURL = URL(fileURLWithPath: pendingPath).deletingLastPathComponent()
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setCodexRuntimeSelection(.external(path: url.path))
+    }
+
     private func startCodexManagedChatgptLogin() {
-        isLoggingIntoCodex = true
-        Task {
+        guard activeCodexManagedLoginFlow != .browser else { return }
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        activeCodexManagedLoginFlow = .browser
+        clearCodexManagedDeviceCode()
+
+        Task { @MainActor in
+            defer { finishCodexManagedLogin(operationID: operationID) }
             do {
                 let ok = try await viewModel.startCodexManagedChatgptLogin { url in
+                    guard codexManagedLoginOperationID == operationID else { return }
                     NSWorkspace.shared.open(url)
                 }
-                await MainActor.run {
-                    isLoggingIntoCodex = false
-                    if ok {
-                        alertMessage = "Codex ChatGPT login completed."
-                        showCodexTraceDump = false
-                        showAlert = true
-                        onAPIKeyUpdated?()
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    isLoggingIntoCodex = false
-                    alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                guard codexManagedLoginOperationID == operationID else { return }
+                if ok {
+                    alertMessage = "Codex ChatGPT login completed."
                     showCodexTraceDump = false
                     showAlert = true
+                    onAPIKeyUpdated?()
                 }
+            } catch {
+                guard codexManagedLoginOperationID == operationID else { return }
+                alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                showCodexTraceDump = false
+                showAlert = true
             }
         }
     }
 
-    private func signOutFromCodex() {
-        Task {
-            await viewModel.resetCodexConnectionForSignOut(windowID: windowID)
-            await MainActor.run {
-                alertMessage = "Signed out from Codex CLI"
+    private func startCodexManagedChatgptDeviceCodeLogin() {
+        guard activeCodexManagedLoginFlow != .deviceCode else { return }
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        activeCodexManagedLoginFlow = .deviceCode
+        clearCodexManagedDeviceCode()
+
+        Task { @MainActor in
+            defer { finishCodexManagedLogin(operationID: operationID) }
+            do {
+                let ok = try await viewModel.startCodexManagedChatgptDeviceCodeLogin { code, shouldOpenVerificationURL in
+                    guard codexManagedLoginOperationID == operationID else { return }
+                    codexManagedDeviceCode = code
+                    if shouldOpenVerificationURL {
+                        NSWorkspace.shared.open(code.verificationURL)
+                    }
+                }
+                guard codexManagedLoginOperationID == operationID else { return }
+                if ok {
+                    alertMessage = "Codex ChatGPT device-code login completed."
+                    showCodexTraceDump = false
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                guard codexManagedLoginOperationID == operationID else { return }
+                alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                showCodexTraceDump = false
+                showAlert = true
+            }
+        }
+    }
+
+    private func finishCodexManagedLogin(operationID: UUID) {
+        guard codexManagedLoginOperationID == operationID else { return }
+        codexManagedLoginOperationID = nil
+        activeCodexManagedLoginFlow = nil
+        clearCodexManagedDeviceCode()
+    }
+
+    private func clearCodexManagedDeviceCode() {
+        codexManagedDeviceCode = nil
+        didCopyCodexManagedDeviceCode = false
+    }
+
+    private func copyCodexManagedDeviceCode(_ code: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        didCopyCodexManagedDeviceCode = true
+    }
+
+    private func requestCodexSignOutConfirmation() {
+        guard viewModel.managedCodexAccount?.isConfirmedManagedAuthentication == true,
+              !codexSessionFence.isLogoutInProgress
+        else { return }
+        showCodexSignOutConfirmation = true
+        showAlert = true
+    }
+
+    private func stopCodexSessionsAndSignOut() {
+        guard CodexManagedSignOutConfirmation.shouldProceed(with: .stopSessionsAndSignOut) else { return }
+        isSigningOutCodex = true
+        Task { @MainActor in
+            do {
+                try await viewModel.stopCodexSessionsAndSignOut(windowID: windowID)
+                isSigningOutCodex = false
+                alertMessage = "Signed out from Codex."
+                showCodexTraceDump = false
                 showAlert = true
                 onAPIKeyUpdated?()
+            } catch {
+                isSigningOutCodex = false
+                alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                showCodexTraceDump = false
+                showAlert = true
             }
         }
     }
@@ -2172,6 +2854,39 @@ struct CLIProvidersSettingsView: View {
         viewModel.disconnectCursor()
         alertMessage = "Signed out from Cursor CLI"
         showCursorTraceDump = false
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testGrokBuildConnection() {
+        isLoadingGrokBuild = true
+        Task {
+            do {
+                let ok = try await viewModel.testGrokBuildConnection()
+                await MainActor.run {
+                    isLoadingGrokBuild = false
+                    if ok {
+                        alertMessage = "Grok Build connected. \(grokBuildModelSummary.lowercased())"
+                        showGrokBuildTraceDump = false
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingGrokBuild = false
+                    alertMessage = viewModel.grokBuildError ?? error.asFriendlyString()
+                    showGrokBuildTraceDump = viewModel.hasGrokBuildTrace()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func signOutFromGrokBuild() {
+        viewModel.disconnectGrokBuild()
+        alertMessage = "Signed out from Grok Build"
+        showGrokBuildTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
     }

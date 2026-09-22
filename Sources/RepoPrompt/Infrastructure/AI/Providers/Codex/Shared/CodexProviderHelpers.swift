@@ -25,8 +25,12 @@ enum CodexProviderHelpers {
     /// Returns a fresh app-server client for non-agent Codex flows.
     /// These flows should not share transport/process state across chat, health checks,
     /// and model polling because failures become sticky across otherwise unrelated work.
-    static func makeOwnedNonAgentAppServerClient() -> CodexAppServerClient {
-        CodexAppServerClient()
+    static func makeOwnedNonAgentAppServerClient(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> CodexAppServerClient {
+        CodexAppServerClient(
+            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot()
+        )
     }
 
     struct CodexExecutableResolution: Equatable {
@@ -55,22 +59,33 @@ enum CodexProviderHelpers {
             case let .bundled(target):
                 "Bundled Codex \(runtime.version) (\(target))"
             case .externalOverride:
-                "External Codex override \(runtime.version) (\(runtime.executableURL.lastPathComponent))"
+                "Local Codex \(runtime.version) (\(runtime.executableURL.lastPathComponent))"
             }
         }
+    }
+
+    struct CodexRuntimeSettingsPreflight: Equatable {
+        let bundledResolution: CodexExecutableResolution
+        let activeResolution: CodexExecutableResolution
+        let pendingResolution: CodexExecutableResolution
+        let ignoredLegacyEnvironmentOverride: Bool
     }
 
     static func resolveCodexExecutable(
         commandName: String = CLILaunchProfiles.codex.commandName,
         environment: [String: String],
         additionalPathHints: [String] = CLILaunchProfiles.codex.supplementalSearchPaths,
-        logger: ((String) -> Void)? = nil
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil,
+        logger: ((String) -> Void)? = nil,
+        selection: CodexRuntimePreferences.Selection? = nil
     ) -> CodexExecutableResolution {
         _ = additionalPathHints // Kept for source compatibility; PATH fallback is intentionally disabled.
         let injectedOverride = commandName == CLILaunchProfiles.codex.commandName ? nil : commandName
-        switch CodexRuntimeAuthority.resolve(
+        switch CodexRuntimeAuthority.resolveConfigured(
             environment: environment,
-            explicitExecutableOverride: injectedOverride
+            explicitExecutableOverride: injectedOverride,
+            launchSnapshot: launchSnapshot,
+            selection: selection
         ) {
         case let .success(runtime):
             let debugMessage = runtime.redactedDiagnosticSummary
@@ -89,7 +104,8 @@ enum CodexProviderHelpers {
                 .unsupportedArchitecture
             case .externalOverrideTooOld:
                 .externalOverrideIncompatible
-            case .externalOverrideMustBeAbsolute,
+            case .externalPreferenceMalformed,
+                 .externalOverrideMustBeAbsolute,
                  .externalOverrideMissing,
                  .externalOverrideNotExecutable,
                  .externalOverrideVersionUnreadable:
@@ -116,8 +132,69 @@ enum CodexProviderHelpers {
         enableDebugLogging: Bool = false,
         logCollector: CLIProcessLogCollector? = nil,
         inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil
+        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil,
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
     ) async -> CodexExecutableResolution {
+        let environment = await codexPreflightEnvironment(
+            enableDebugLogging: enableDebugLogging,
+            inheritedEnvironment: inheritedEnvironment,
+            shellEnvironmentProvider: shellEnvironmentProvider
+        )
+        let resolution = await Task.detached(priority: .utility) {
+            resolveCodexExecutable(
+                commandName: commandName,
+                environment: environment,
+                additionalPathHints: additionalPathHints,
+                launchSnapshot: launchSnapshot
+            )
+        }.value
+        logPreflightResolution(
+            resolution,
+            enableDebugLogging: enableDebugLogging,
+            logCollector: logCollector
+        )
+        return resolution
+    }
+
+    static func preflightCodexRuntimeSettings(
+        enableDebugLogging: Bool = false,
+        logCollector: CLIProcessLogCollector? = nil,
+        inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil,
+        activeSelection injectedActiveSelection: CodexRuntimePreferences.Selection? = nil,
+        pendingSelection injectedPendingSelection: CodexRuntimePreferences.Selection? = nil
+    ) async -> CodexRuntimeSettingsPreflight {
+        let environment = await codexPreflightEnvironment(
+            enableDebugLogging: enableDebugLogging,
+            inheritedEnvironment: inheritedEnvironment,
+            shellEnvironmentProvider: shellEnvironmentProvider
+        )
+        let activeSelection = injectedActiveSelection ?? CodexRuntimePreferences.activeSelection
+        let pendingSelection = injectedPendingSelection ?? CodexRuntimePreferences.selection()
+        let preflight = await Task.detached(priority: .utility) {
+            CodexRuntimeSettingsPreflight(
+                bundledResolution: resolveCodexExecutable(environment: environment, selection: .bundled),
+                activeResolution: resolveCodexExecutable(environment: environment, selection: activeSelection),
+                pendingResolution: resolveCodexExecutable(environment: environment, selection: pendingSelection),
+                ignoredLegacyEnvironmentOverride: CodexRuntimeAuthority.ignoredLegacyEnvironmentOverride(
+                    environment: environment,
+                    selection: activeSelection
+                )
+            )
+        }.value
+        logPreflightResolution(
+            preflight.pendingResolution,
+            enableDebugLogging: enableDebugLogging,
+            logCollector: logCollector
+        )
+        return preflight
+    }
+
+    private static func codexPreflightEnvironment(
+        enableDebugLogging: Bool,
+        inheritedEnvironment: [String: String],
+        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider?
+    ) async -> [String: String] {
         let request = ProcessEnvironmentRequest(
             purpose: .codexPreflight,
             inheritedEnvironment: inheritedEnvironment,
@@ -131,18 +208,18 @@ enum CodexProviderHelpers {
         } else {
             await ProcessEnvironmentBuilder.build(request)
         }
-        let logger: ((String) -> Void)? = { message in
-            logCollector?.append(message)
-            if enableDebugLogging {
-                print("[CodexPreflight] \(message)")
-            }
+        return environmentResult.environment
+    }
+
+    private static func logPreflightResolution(
+        _ resolution: CodexExecutableResolution,
+        enableDebugLogging: Bool,
+        logCollector: CLIProcessLogCollector?
+    ) {
+        logCollector?.append(resolution.debugMessage)
+        if enableDebugLogging {
+            print("[CodexPreflight] \(resolution.debugMessage)")
         }
-        return resolveCodexExecutable(
-            commandName: commandName,
-            environment: environmentResult.environment,
-            additionalPathHints: additionalPathHints,
-            logger: logger
-        )
     }
 
     static func isCodexExecutableUnavailableMessage(_ message: String) -> Bool {
@@ -236,6 +313,7 @@ enum CodexProviderHelpers {
         case .bundledMetadataUnreadable: "bundled-metadata-unreadable"
         case .bundledMetadataMismatch: "bundled-metadata-mismatch"
         case .bundledLayoutIncomplete: "bundled-layout-incomplete"
+        case .externalPreferenceMalformed: "external-preference-malformed"
         case .externalOverrideMustBeAbsolute: "override-not-absolute"
         case .externalOverrideMissing: "override-missing"
         case .externalOverrideNotExecutable: "override-not-executable"

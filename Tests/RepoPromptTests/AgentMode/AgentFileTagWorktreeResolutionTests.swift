@@ -87,6 +87,69 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     }
 
     @MainActor
+    func testNonNilSearchServiceFallsBackToStoreDuringHeldRootLoadEvent() async throws {
+        let rootA = try makeTemporaryRoot(name: "AgentFileTagFreshnessA")
+        let rootB = try makeTemporaryRoot(name: "AgentFileTagFreshnessB")
+        try write("let existing = true\n", to: rootA.appendingPathComponent("Sources/Existing.swift"))
+        try write("let fresh = true\n", to: rootB.appendingPathComponent("Sources/FreshlyAddedUnique.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: rootA.path)
+        let snapshotA = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let searchService = WorkspaceSearchService()
+        let eventGate = AgentFileTagTestAsyncGate()
+        let commitSignal = AgentFileTagTestAsyncSignal()
+        addTeardownBlock {
+            await searchService.setCatalogChangeWillHandleHandler(nil)
+            await searchService.setAutomaticRebuildDidCommitHandler(nil)
+            await eventGate.open()
+            await searchService.stopKeepingFresh()
+        }
+
+        await searchService.startKeepingFresh(with: store, rootScope: .visibleWorkspace)
+        await searchService.rebuildIndex(from: snapshotA)
+        let service = AgentFileTagSuggestionService(
+            store: store,
+            searchService: searchService,
+            selectionCoordinator: nil,
+            lookupContextProvider: { .visibleWorkspace },
+            maxResults: 5
+        )
+        let warmSuggestions = await service.suggestions(for: "Existing")
+        XCTAssertEqual(warmSuggestions.map(\.relativePath), ["Sources/Existing.swift"])
+
+        await searchService.setCatalogChangeWillHandleHandler { event in
+            guard event.kind == .rootLoaded, event.rootPath == rootB.path else { return }
+            await eventGate.wait()
+        }
+
+        _ = try await store.loadRoot(path: rootB.path)
+        await eventGate.waitUntilEntered()
+        let currentGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+
+        let suggestions = await service.suggestions(for: "FreshlyAddedUnique")
+        let suggestion = try XCTUnwrap(suggestions.first)
+        let expectedRelativePath = "\(rootB.lastPathComponent)/Sources/FreshlyAddedUnique.swift"
+
+        XCTAssertEqual(suggestions.count, 1, String(describing: suggestions))
+        XCTAssertEqual(suggestion.relativePath, expectedRelativePath)
+        XCTAssertEqual(suggestion.commitDisplayText, suggestion.relativePath)
+        XCTAssertFalse(suggestion.relativePath.hasPrefix("/"))
+        XCTAssertFalse(suggestion.relativePath.contains(rootB.path))
+        XCTAssertFalse(suggestion.commitDisplayText?.contains(rootB.path) == true)
+
+        await searchService.setAutomaticRebuildDidCommitHandler { generation in
+            guard generation == currentGeneration else { return }
+            await commitSignal.signal()
+        }
+        await eventGate.open()
+        await commitSignal.wait()
+
+        let convergedSuggestions = await service.suggestions(for: "FreshlyAddedUnique")
+        XCTAssertEqual(convergedSuggestions.map(\.relativePath), [expectedRelativePath])
+    }
+
+    @MainActor
     func testExpandedAgentFileTagsReturnMoreThanCompactCapWithParentSubtitles() async throws {
         let root = try makeTemporaryRoot(name: "AgentFileTagExpanded")
         let matchingFileCount = 80
@@ -434,6 +497,70 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+private actor AgentFileTagTestAsyncSignal {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isSignaled = false
+
+    func wait() async {
+        guard !isSignaled else { return }
+        await withCheckedContinuation { continuation in
+            if isSignaled {
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func signal() {
+        guard !isSignaled else { return }
+        isSignaled = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor AgentFileTagTestAsyncGate {
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var openContinuation: CheckedContinuation<Void, Never>?
+    private var hasEntered = false
+    private var isOpen = false
+
+    func wait() async {
+        if !hasEntered {
+            hasEntered = true
+            enteredContinuation?.resume()
+            enteredContinuation = nil
+        }
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            if isOpen {
+                continuation.resume()
+            } else {
+                openContinuation = continuation
+            }
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !hasEntered else { return }
+        await withCheckedContinuation { continuation in
+            if hasEntered {
+                continuation.resume()
+            } else {
+                enteredContinuation = continuation
+            }
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        openContinuation?.resume()
+        openContinuation = nil
     }
 }
 

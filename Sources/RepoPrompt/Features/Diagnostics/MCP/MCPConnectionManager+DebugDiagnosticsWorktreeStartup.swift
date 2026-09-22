@@ -191,13 +191,15 @@ import MCP
                                 providerRunActive: false,
                                 errorCategory: "abort_requested"
                             )
-                            await resolved.agentModeVM.mcpDiscardSessionTarget(target)
-                            try diagnostics.recordRecoverableStartPhase(
-                                correlationID: correlationID,
-                                phase: .discardCompleted,
-                                providerRunActive: false
-                            )
-                            discardCompleted = true
+                            let discardResult = await resolved.agentModeVM.mcpDiscardSessionTarget(target)
+                            if discardResult == .complete {
+                                try diagnostics.recordRecoverableStartPhase(
+                                    correlationID: correlationID,
+                                    phase: .discardCompleted,
+                                    providerRunActive: false
+                                )
+                                discardCompleted = true
+                            }
                         case .existingSession, .existingTab:
                             throw DebugWorktreeStartupBenchmarkError.invalidRecovery
                         }

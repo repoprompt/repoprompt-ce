@@ -9,6 +9,21 @@ struct AgentChatOptionsMenuTarget: Equatable {
 }
 
 enum AgentSessionHandoffPrompt {
+    private static func quotedSingleLineTitle(_ title: String) -> String {
+        let reflected = String(reflecting: title)
+        var rendered = ""
+        rendered.reserveCapacity(reflected.utf8.count)
+        for scalar in reflected.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .control, .lineSeparator, .paragraphSeparator:
+                rendered += "\\u{\(String(scalar.value, radix: 16, uppercase: true))}"
+            default:
+                rendered.unicodeScalars.append(scalar)
+            }
+        }
+        return rendered
+    }
+
     static func render(
         target: AgentChatOptionsMenuTarget,
         cliCommandName: String,
@@ -17,6 +32,7 @@ enum AgentSessionHandoffPrompt {
         let prompt = """
         Use RepoPrompt CE to continue this exact Agent Mode session.
 
+        Session title: \(quotedSingleLineTitle(target.tabName))
         Window ID: \(target.windowID)
         Workspace ID: \(target.workspaceID.uuidString)
         Context ID (compose tab): \(target.tabID.uuidString)
@@ -40,6 +56,23 @@ enum AgentSessionHandoffPrompt {
 struct AgentChatOptionsMenuSnapshot: Equatable {
     let target: AgentChatOptionsMenuTarget
     let isPinned: Bool
+    /// Generation-bearing capture for Copy Session ID.
+    ///
+    /// `AgentChatOptionsMenuTarget` compares tab name and session ID but carries no binding
+    /// generations, so a tab that rebinds to the *same* session ID between menu open and click would
+    /// still validate. Carrying the exact incarnation here closes that gap. `nil` means the current
+    /// session is not an eligible oversight endpoint and the item is not offered.
+    let copySessionIDTarget: AgentSessionCopyIDTarget?
+
+    init(
+        target: AgentChatOptionsMenuTarget,
+        isPinned: Bool,
+        copySessionIDTarget: AgentSessionCopyIDTarget? = nil
+    ) {
+        self.target = target
+        self.isPinned = isPinned
+        self.copySessionIDTarget = copySessionIDTarget
+    }
 }
 
 struct AgentChatOptionsMenuActions {
@@ -47,6 +80,7 @@ struct AgentChatOptionsMenuActions {
     let rename: (AgentChatOptionsMenuTarget) -> Void
     let stash: (AgentChatOptionsMenuTarget) -> Void
     let copyHandoffPrompt: (AgentChatOptionsMenuTarget) -> Void
+    let copySessionID: (AgentSessionCopyIDTarget) -> Void
     let delete: (AgentChatOptionsMenuTarget) -> Void
 }
 
@@ -100,6 +134,13 @@ enum AgentChatOptionsMenuPresenter {
             symbolName: "arrow.right.doc.on.clipboard",
             handler: { actions.copyHandoffPrompt(target) }
         ))
+        if let copySessionIDTarget = snapshot.copySessionIDTarget {
+            menu.addItem(AgentChatOptionsMenuItem(
+                title: "Copy Session ID",
+                symbolName: "doc.on.doc",
+                handler: { actions.copySessionID(copySessionIDTarget) }
+            ))
+        }
         menu.addItem(.separator())
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Delete",

@@ -91,6 +91,22 @@ enum CodexAppServerRequestID: Hashable {
 }
 
 actor CodexAppServerClient {
+    struct FaultInjection {
+        let transportTerminationCleanup: @Sendable () async -> Void
+        let requestTimeoutDelivery: @Sendable (_ method: String, _ generation: UInt64) async -> Void
+        let subscriptionPreparation: @Sendable () async -> Void
+
+        init(
+            transportTerminationCleanup: @escaping @Sendable () async -> Void = {},
+            requestTimeoutDelivery: @escaping @Sendable (_ method: String, _ generation: UInt64) async -> Void = { _, _ in },
+            subscriptionPreparation: @escaping @Sendable () async -> Void = {}
+        ) {
+            self.transportTerminationCleanup = transportTerminationCleanup
+            self.requestTimeoutDelivery = requestTimeoutDelivery
+            self.subscriptionPreparation = subscriptionPreparation
+        }
+    }
+
     struct RequestFailure: Equatable {
         let method: String
         let code: Int?
@@ -103,7 +119,7 @@ actor CodexAppServerClient {
             else {
                 return message
             }
-            return "\(message) The active Codex runtime rejected RepoPrompt's required \(method) request shape. Reinstall or update RepoPrompt CE; if REPOPROMPT_CODEX_EXECUTABLE is set, update or remove that explicit override."
+            return "\(message) The active Codex runtime rejected RepoPrompt's required \(method) request shape. Reinstall or update RepoPrompt CE; if a local Codex executable is configured, update it or switch back to the bundled runtime."
         }
     }
 
@@ -183,6 +199,16 @@ actor CodexAppServerClient {
         let params: [String: CodexJSONValue]
     }
 
+    struct NotificationSubscription {
+        let stream: AsyncStream<Notification>
+        let transportGeneration: UInt64
+    }
+
+    struct ServerRequestSubscription {
+        let stream: AsyncStream<ServerRequest>
+        let transportGeneration: UInt64
+    }
+
     struct ProcessExitEvidence: Equatable {
         let executablePath: String
         let launchDirectory: String
@@ -244,10 +270,14 @@ actor CodexAppServerClient {
         }
     }
 
+    struct AmbiguousMutationError: Error {}
+
     enum TransportTerminationReason: Equatable {
         case stdinWrite(method: String?, errno: Int32?)
         case stdoutEOF
         case timeout(method: String, requestID: String)
+        case settlementDeadline(method: String, generation: UInt64)
+        case ambiguousMutationFailure(method: String, generation: UInt64)
         case explicitStop
         case livenessCheckFailed(method: String?)
         case decodeRecoveryBudgetExceeded(generation: UInt64)
@@ -283,6 +313,12 @@ actor CodexAppServerClient {
     private struct PendingRequestMetadata {
         let method: String
         let transportGeneration: UInt64
+        let onMutationUnsettled: (@Sendable (_ generation: UInt64) -> Void)?
+    }
+
+    private enum MutationFailureCause {
+        case timeout(Error)
+        case ambiguous
     }
 
     private struct ExitObservation {
@@ -323,6 +359,10 @@ actor CodexAppServerClient {
             nsError.localizedRecoverySuggestion
         ].compactMap(\.self)
         return candidates.contains(where: isTimeoutErrorMessage)
+    }
+
+    static func isAmbiguousMutationError(_ error: Error) -> Bool {
+        error is AmbiguousMutationError
     }
 
     private static func isTimeoutErrorMessage(_ message: String) -> Bool {
@@ -403,9 +443,12 @@ actor CodexAppServerClient {
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
     private let processSpawnPreparation: @Sendable () async throws -> Void
     private let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
+    private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
+    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
     private let provisionsRepoPromptMCPOnStart: Bool
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
+    private let faultInjection: FaultInjection
     #if DEBUG
         private var terminalObserverJoinCount = 0
     #endif
@@ -425,19 +468,27 @@ actor CodexAppServerClient {
         processEnvironmentBuilder: @escaping @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult = {
             await ProcessEnvironmentBuilder.build($0)
         },
+        runtimeStatePreparer: @escaping @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void = {
+            try $0.prepareState()
+        },
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         provisionsRepoPromptMCPOnStart: Bool = true,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver(pid: $0)
         },
-        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager
+        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager,
+        faultInjection: FaultInjection = .init()
     ) {
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
         self.processSpawnPreparation = processSpawnPreparation
         self.processEnvironmentBuilder = processEnvironmentBuilder
+        self.runtimeStatePreparer = runtimeStatePreparer
+        self.launchSnapshot = launchSnapshot
         self.provisionsRepoPromptMCPOnStart = provisionsRepoPromptMCPOnStart
         self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
+        self.faultInjection = faultInjection
     }
 
     func updateConfig(_ config: Config) {
@@ -456,6 +507,7 @@ actor CodexAppServerClient {
     /// the same captured launch context instead of consulting a second environment snapshot.
     func prepareRuntimeForLaunch() async throws -> CodexRuntimeAuthority.Runtime {
         if let runtime = preparedRuntimeLaunchContext?.resolution.runtime {
+            try prepareState(for: runtime)
             return runtime
         }
 
@@ -470,6 +522,7 @@ actor CodexAppServerClient {
             commandName: config.commandName,
             environment: environment,
             additionalPathHints: config.additionalPathHints,
+            launchSnapshot: launchSnapshot,
             logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
         )
         guard resolution.status == .available else {
@@ -478,13 +531,7 @@ actor CodexAppServerClient {
         guard let runtime = resolution.runtime else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: runtime resolution completed without runtime metadata.")
         }
-        do {
-            try runtime.prepareState()
-        } catch {
-            throw ClientError.executableUnavailable(
-                "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
-            )
-        }
+        try prepareState(for: runtime)
         environment.merge(resolution.environmentOverrides) { _, ownedValue in ownedValue }
         preparedRuntimeLaunchContext = PreparedRuntimeLaunchContext(
             environment: environment,
@@ -492,6 +539,30 @@ actor CodexAppServerClient {
         )
         return runtime
     }
+
+    private func prepareState(for runtime: CodexRuntimeAuthority.Runtime) throws {
+        do {
+            try runtimeStatePreparer(runtime)
+        } catch {
+            throw ClientError.executableUnavailable(
+                "RepoPrompt could not start Codex: unable to prepare its isolated Codex state (\(error.localizedDescription))."
+            )
+        }
+    }
+
+    private static func processEnvironmentForCurrentLaunch(
+        _ baseEnvironment: [String: String]
+    ) -> [String: String] {
+        DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: baseEnvironment)
+    }
+
+    #if DEBUG
+        static func testProcessEnvironmentForCurrentLaunch(
+            baseEnvironment: [String: String]
+        ) -> [String: String] {
+            processEnvironmentForCurrentLaunch(baseEnvironment)
+        }
+    #endif
 
     func setExpectedAgentPIDRegistration(_ registration: ExpectedAgentPIDRegistration?) async {
         expectedAgentPIDRegistration = registration
@@ -588,6 +659,28 @@ actor CodexAppServerClient {
         }
     }
 
+    func healthyTransportGeneration() -> UInt64? {
+        guard let activeTransport,
+              isInitialized,
+              !didTerminateTransport,
+              livenessProbe(activeTransport.process)
+        else {
+            return nil
+        }
+        return activeTransport.generation
+    }
+
+    func subscribeNotificationsWithTransportGeneration() async throws -> NotificationSubscription {
+        await faultInjection.subscriptionPreparation()
+        guard let generation = healthyTransportGeneration() else {
+            throw lastTransportFailure ?? ClientError.processNotRunning
+        }
+        return NotificationSubscription(
+            stream: subscribeNotifications(),
+            transportGeneration: generation
+        )
+    }
+
     func subscribeServerRequests() -> AsyncStream<ServerRequest> {
         AsyncStream { continuation in
             let id = UUID()
@@ -598,7 +691,22 @@ actor CodexAppServerClient {
         }
     }
 
+    func subscribeServerRequestsWithTransportGeneration() async throws -> ServerRequestSubscription {
+        await faultInjection.subscriptionPreparation()
+        guard let generation = healthyTransportGeneration() else {
+            throw lastTransportFailure ?? ClientError.processNotRunning
+        }
+        return ServerRequestSubscription(
+            stream: subscribeServerRequests(),
+            transportGeneration: generation
+        )
+    }
+
     func startIfNeeded() async throws {
+        try await startIfNeeded(initializationTimeout: nil)
+    }
+
+    func startIfNeeded(initializationTimeout: TimeInterval?) async throws {
         let authority = startupAuthorityEpoch
         if let termination = transportTerminationTask,
            termination.generation == transportGeneration
@@ -626,7 +734,10 @@ actor CodexAppServerClient {
         try ensureStartupAuthority(authority)
         let startupID = UUID()
         let task = Task<Void, Error> {
-            try await self.performStartupIfNeeded(startupAuthority: authority)
+            try await self.performStartupIfNeeded(
+                startupAuthority: authority,
+                initializationTimeout: initializationTimeout
+            )
         }
         startupTask = (id: startupID, task: task)
         do {
@@ -818,9 +929,13 @@ actor CodexAppServerClient {
         }
         timeoutTasks.removeAll()
         let requests = pendingRequests
+        let requestMetadata = pendingRequestMetadata
         pendingRequests.removeAll()
         pendingRequestMetadata.removeAll()
-        for continuation in requests.values {
+        for (requestID, continuation) in requests {
+            if let metadata = requestMetadata[requestID] {
+                metadata.onMutationUnsettled?(metadata.transportGeneration)
+            }
             continuation.resume(throwing: requestFailure)
         }
 
@@ -1060,6 +1175,7 @@ actor CodexAppServerClient {
 
     private func finishTransportTermination(_ terminatingTransport: TerminatingTransport?) async {
         guard let terminatingTransport else { return }
+        await faultInjection.transportTerminationCleanup()
         if let expectedAgentPIDToClear = terminatingTransport.expectedAgentPIDToClear {
             await expectedAgentPIDRegistrar.clear(
                 expectedAgentPIDToClear.pid,
@@ -1096,6 +1212,9 @@ actor CodexAppServerClient {
     private static func defaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
         // Use a non-destructive child-state check so exited/zombie children do not
         // look healthy, while leaving final reap/cleanup to the normal teardown path.
+        // `waitid` can report a stopped child on Darwin even with WEXITED; accepting
+        // any matching si_pid would misclassify SIGSTOP as exit and then join the
+        // exit observer forever before a request deadline can be armed.
         if ProcessTermination.childIsTerminalOrAlreadyReaped(process.pid) {
             return false
         }
@@ -1121,11 +1240,90 @@ actor CodexAppServerClient {
         )
     }
 
+    /// Performs a state-mutating request with a hard settlement boundary.
+    ///
+    /// A JSON-RPC timeout alone is insufficient for mutations because the server may
+    /// still apply the request after the caller resumes. This path captures the owning
+    /// transport generation, terminates that exact process on deadline, and awaits
+    /// process-family cleanup before returning the timeout. A stale completion from the
+    /// fenced generation therefore cannot mutate state after serialization is released.
+    func requestWithSettlementDeadline(
+        method: String,
+        params: [String: Any]?,
+        deadline: TimeInterval,
+        onUnsettled: @escaping @Sendable (_ generation: UInt64) -> Void = { _ in }
+    ) async throws -> [String: Any] {
+        guard let activeTransport, !didTerminateTransport else {
+            throw lastTransportFailure ?? ClientError.processNotRunning
+        }
+        let generation = activeTransport.generation
+        do {
+            return try await request(
+                method: method,
+                params: params,
+                timeout: deadline,
+                useDefaultTimeout: false,
+                onMutationUnsettled: onUnsettled
+            )
+        } catch {
+            let cause: MutationFailureCause
+            if Self.isTimeoutError(error) {
+                cause = .timeout(error)
+            } else {
+                // A decoded JSON-RPC error is an authoritative server response: the
+                // owning generation has conclusively rejected the mutation. Every other
+                // failure is locally ambiguous after dispatch and must settle the exact
+                // generation before trust-write serialization can be released.
+                if let clientError = error as? ClientError,
+                   case .requestFailed = clientError
+                {
+                    throw error
+                }
+                cause = .ambiguous
+            }
+            throw await settleMutationFailure(
+                method: method,
+                generation: generation,
+                cause: cause
+            )
+        }
+    }
+
+    private func settleMutationFailure(
+        method: String,
+        generation: UInt64,
+        cause: MutationFailureCause
+    ) async -> Error {
+        let reason: TransportTerminationReason
+        let returnedError: Error
+        switch cause {
+        case let .timeout(error):
+            if activeTransport?.generation == generation, !didTerminateTransport,
+               config.enableDebugLogging
+            {
+                print("[CodexAppServer] Settlement deadline reached for \(method) on generation \(generation); retiring transport")
+            }
+            reason = .settlementDeadline(method: method, generation: generation)
+            returnedError = error
+        case .ambiguous:
+            reason = .ambiguousMutationFailure(method: method, generation: generation)
+            returnedError = AmbiguousMutationError()
+        }
+        await terminateTransport(
+            flushStdout: false,
+            expectedGeneration: generation,
+            requestFailure: .processNotRunning,
+            reason: reason
+        )
+        return returnedError
+    }
+
     func request(
         method: String,
         params: [String: Any]?,
         timeout: TimeInterval?,
-        useDefaultTimeout: Bool
+        useDefaultTimeout: Bool,
+        onMutationUnsettled: (@Sendable (_ generation: UInt64) -> Void)? = nil
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard let activeTransport, !didTerminateTransport else {
@@ -1146,7 +1344,8 @@ actor CodexAppServerClient {
                 pendingRequests[requestID] = continuation
                 pendingRequestMetadata[requestID] = PendingRequestMetadata(
                     method: method,
-                    transportGeneration: generation
+                    transportGeneration: generation,
+                    onMutationUnsettled: onMutationUnsettled
                 )
                 if let deadline {
                     scheduleTimeout(for: requestID, after: deadline)
@@ -1293,7 +1492,7 @@ actor CodexAppServerClient {
         return models
     }
 
-    private func initializeIfNeeded() async throws {
+    private func initializeIfNeeded(timeout: TimeInterval?) async throws {
         if isInitialized {
             return
         }
@@ -1310,7 +1509,9 @@ actor CodexAppServerClient {
             params: [
                 "clientInfo": clientInfo,
                 "capabilities": capabilities
-            ]
+            ],
+            timeout: timeout,
+            useDefaultTimeout: timeout == nil
         )
         try notify(method: "initialized", params: nil)
         isInitialized = true
@@ -1322,14 +1523,17 @@ actor CodexAppServerClient {
         }
     }
 
-    private func performStartupIfNeeded(startupAuthority: UInt64) async throws {
+    private func performStartupIfNeeded(
+        startupAuthority: UInt64,
+        initializationTimeout: TimeInterval?
+    ) async throws {
         do {
             try ensureStartupAuthority(startupAuthority)
             if activeTransport == nil {
                 try await startProcess(startupAuthority: startupAuthority)
             }
             try ensureStartupAuthority(startupAuthority)
-            try await initializeIfNeeded()
+            try await initializeIfNeeded(timeout: initializationTimeout)
         } catch is CancellationError {
             if let termination = transportTerminationTask,
                termination.generation == transportGeneration
@@ -1365,7 +1569,7 @@ actor CodexAppServerClient {
         guard let launchContext = preparedRuntimeLaunchContext else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
         }
-        let environment = launchContext.environment
+        let environment = Self.processEnvironmentForCurrentLaunch(launchContext.environment)
         let resolution = launchContext.resolution
         if provisionsRepoPromptMCPOnStart {
             let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
@@ -2007,6 +2211,10 @@ actor CodexAppServerClient {
             return
         }
         let metadata = pendingRequestMetadata.removeValue(forKey: id)
+        if let metadata {
+            await faultInjection.requestTimeoutDelivery(metadata.method, metadata.transportGeneration)
+            metadata.onMutationUnsettled?(metadata.transportGeneration)
+        }
         if let metadata,
            Self.shouldPoisonTransportOnTimeout(method: metadata.method)
         {
@@ -2039,8 +2247,11 @@ actor CodexAppServerClient {
 
     private func failPendingRequestIfPresent(id: String, error: Error) {
         timeoutTasks.removeValue(forKey: id)?.cancel()
-        pendingRequestMetadata.removeValue(forKey: id)
+        let metadata = pendingRequestMetadata.removeValue(forKey: id)
         if let continuation = pendingRequests.removeValue(forKey: id) {
+            if let metadata {
+                metadata.onMutationUnsettled?(metadata.transportGeneration)
+            }
             continuation.resume(throwing: error)
         }
     }
@@ -2119,6 +2330,24 @@ actor CodexAppServerClient {
 
         func debugPendingRequestCount() -> Int {
             pendingRequests.count
+        }
+
+        func debugNotificationSubscriberCount() -> Int {
+            notificationContinuations.count
+        }
+
+        func debugServerRequestSubscriberCount() -> Int {
+            serverRequestContinuations.count
+        }
+
+        func debugBeginTransportFailure() {
+            let generation = transportGeneration
+            beginTransportTermination(
+                flushStdout: false,
+                expectedGeneration: generation,
+                requestFailure: .processNotRunning,
+                reason: .stdoutEOF
+            )
         }
 
         func debugTimeoutTaskCount() -> Int {

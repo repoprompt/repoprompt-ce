@@ -1,4 +1,5 @@
 import MCP
+import RepoPromptDomainRuntime
 
 /// Connection-specific MCP tool metadata adjustments for Codex compatibility.
 ///
@@ -10,12 +11,17 @@ enum CodexMCPToolAnnotationProjection {
         _ canonical: MCP.Tool.Annotations,
         clientIdentifier: String?
     ) -> MCP.Tool.Annotations {
-        guard MCPClientIdentity.canonicalFamilyID(clientIdentifier) == "codex-mcp-client" else {
-            return canonical
-        }
-
-        var projected = canonical
-        projected.readOnlyHint = nil
-        return projected
+        let profile: MCPClientToolAnnotationProfile =
+            MCPClientIdentity.canonicalFamilyID(clientIdentifier) == "codex-mcp-client"
+                ? .suppressReadOnlyHint
+                : .canonical
+        let domain = MCPDomainToolAnnotations(
+            title: canonical.title,
+            readOnlyHint: canonical.readOnlyHint,
+            destructiveHint: canonical.destructiveHint,
+            idempotentHint: canonical.idempotentHint,
+            openWorldHint: canonical.openWorldHint
+        ).projected(for: profile)
+        return domain.mcpAnnotations
     }
 }

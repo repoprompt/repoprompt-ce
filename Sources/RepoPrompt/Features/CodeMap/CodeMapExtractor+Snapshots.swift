@@ -12,7 +12,10 @@ enum WorkspaceFileTreePresentationRenderer {
         guard !snapshot.roots.isEmpty else { return "" }
         if Task.isCancelled { return "" }
 
-        let effectiveRoots = snapshot.onlyIncludeRootsWithSelectedFiles
+        let normalizedMode = snapshot.mode.lowercased()
+        let shouldFilterRootsToSelection = snapshot.onlyIncludeRootsWithSelectedFiles
+            && (normalizedMode != "full" || !snapshot.selectedFileIDs.isEmpty)
+        let effectiveRoots = shouldFilterRootsToSelection
             ? snapshot.roots.filter { snapshotFolderContainsSelectedFile($0, selectedFileIDs: snapshot.selectedFileIDs) }
             : snapshot.roots
         guard !effectiveRoots.isEmpty else { return "" }
@@ -96,7 +99,6 @@ enum WorkspaceFileTreePresentationRenderer {
             return (parts.joined(separator: "\n"), usedSelectedMarker, hitBudget)
         }
 
-        let normalizedMode = snapshot.mode.lowercased()
         if normalizedMode != "auto" {
             let built = buildOnce(mode: snapshot.mode, depthLimit: snapshot.maxDepth, tokenBudget: nil, siblingCap: nil)
             return finalizeSnapshotTree(

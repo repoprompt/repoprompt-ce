@@ -177,6 +177,109 @@ final class GitWorktreeDefaultPathPlannerTests: XCTestCase {
         XCTAssertEqual(second.path.lastPathComponent, first.path.lastPathComponent + "-2")
     }
 
+    func testDefaultPathCollisionUsesOccupiedRootsEvenWhenPathsDoNotExist() throws {
+        let mainRoot = tempRoot.appendingPathComponent("repo", isDirectory: true)
+        let request = GitWorktreeDefaultPathPlanner.Request(
+            mainWorktreeRoot: mainRoot,
+            branch: "feature/occupied-root",
+            purpose: .standaloneCreate(now: Date(timeIntervalSince1970: 0))
+        )
+        let baseline = try GitWorktreeDefaultPathPlanner.plan(request)
+        let occupiedRoots = (1 ... 128).map { suffix in
+            let leaf = suffix == 1
+                ? baseline.path.lastPathComponent
+                : "\(baseline.path.lastPathComponent)-\(suffix)"
+            return baseline.path.deletingLastPathComponent()
+                .appendingPathComponent(leaf, isDirectory: true)
+        }
+
+        XCTAssertTrue(occupiedRoots.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+
+        let plan = try GitWorktreeDefaultPathPlanner.plan(.init(
+            mainWorktreeRoot: mainRoot,
+            existingWorktreeRoots: occupiedRoots,
+            branch: "feature/occupied-root",
+            purpose: .standaloneCreate(now: Date(timeIntervalSince1970: 0))
+        ))
+        let expected = baseline.path.deletingLastPathComponent()
+            .appendingPathComponent("\(baseline.path.lastPathComponent)-129", isDirectory: true)
+            .standardizedFileURL
+
+        XCTAssertEqual(plan.path, expected)
+    }
+
+    func testDefaultPathNormalizesDuplicateDotAndTildeRootsWithDeterministicSuffix() throws {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let mainRoot = home.appendingPathComponent(
+            "GitWorktreeDefaultPathPlanner-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let request = GitWorktreeDefaultPathPlanner.Request(
+            mainWorktreeRoot: mainRoot,
+            branch: "feature/normalization",
+            purpose: .standaloneCreate(now: Date(timeIntervalSince1970: 0))
+        )
+        let baseline = try GitWorktreeDefaultPathPlanner.plan(request)
+        let secondOccupied = baseline.path.deletingLastPathComponent()
+            .appendingPathComponent("\(baseline.path.lastPathComponent)-2", isDirectory: true)
+        let dotAlias = URL(
+            fileURLWithPath: baseline.path.deletingLastPathComponent().path
+                + "/./"
+                + baseline.path.lastPathComponent
+        )
+        let tildeSuffix = String(secondOccupied.path.dropFirst(home.path.count))
+        let tildeAlias = URL(fileURLWithPath: "~\(tildeSuffix)")
+
+        XCTAssertTrue([
+            baseline.path,
+            secondOccupied
+        ].allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+
+        let normalized = try GitWorktreeDefaultPathPlanner.plan(.init(
+            mainWorktreeRoot: mainRoot,
+            existingWorktreeRoots: [dotAlias, tildeAlias, baseline.path, secondOccupied],
+            branch: "feature/normalization",
+            purpose: .standaloneCreate(now: Date(timeIntervalSince1970: 0))
+        ))
+        let expected = baseline.path.deletingLastPathComponent()
+            .appendingPathComponent("\(baseline.path.lastPathComponent)-3", isDirectory: true)
+            .standardizedFileURL
+
+        XCTAssertEqual(normalized.path, expected)
+        XCTAssertEqual(normalized.createRequest.knownWorktreeRoots.map(\.path), [
+            mainRoot.standardizedFileURL.path,
+            baseline.path.standardizedFileURL.path,
+            secondOccupied.standardizedFileURL.path
+        ])
+    }
+
+    func testSymlinkedMainRootPreservesStandardizedPathAuthority() throws {
+        let physicalRoot = tempRoot.appendingPathComponent("physical-repo", isDirectory: true)
+        try FileManager.default.createDirectory(at: physicalRoot, withIntermediateDirectories: true)
+        let symlinkRoot = tempRoot.appendingPathComponent("repo-link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: symlinkRoot, withDestinationURL: physicalRoot)
+
+        let plan = try GitWorktreeDefaultPathPlanner.plan(.init(
+            mainWorktreeRoot: symlinkRoot,
+            existingWorktreeRoots: [physicalRoot],
+            branch: "feature/symlink",
+            purpose: .standaloneCreate(now: Date(timeIntervalSince1970: 0))
+        ))
+        // Preserve the planner's existing lexical identity: standardized paths
+        // keep this symlink alias distinct from its physical target.
+        let lexicalSymlinkPath = symlinkRoot.standardizedFileURL.path
+        let physicalPath = physicalRoot.standardizedFileURL.path
+
+        XCTAssertNotEqual(lexicalSymlinkPath, physicalPath)
+        XCTAssertEqual(symlinkRoot.resolvingSymlinksInPath().standardizedFileURL.path, physicalPath)
+        XCTAssertEqual(try XCTUnwrap(plan.createRequest.mainWorktreeRoot).path, lexicalSymlinkPath)
+        XCTAssertEqual(
+            plan.appManagedContainer.path,
+            GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: symlinkRoot).path
+        )
+        XCTAssertEqual(plan.createRequest.knownWorktreeRoots.map(\.path), [lexicalSymlinkPath, physicalPath])
+    }
+
     func testDetachSuppressesDefaultBranch() throws {
         let mainRoot = tempRoot.appendingPathComponent("repo", isDirectory: true)
 

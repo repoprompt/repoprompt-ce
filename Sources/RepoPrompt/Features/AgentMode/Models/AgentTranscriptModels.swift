@@ -95,6 +95,16 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     public var reasoning: String?
     public var isSubstantiveAssistant: Bool
     public var sealsAssistantBoundary: Bool
+    /// Defensive: canonical user rows travel as request anchors, but this carrier reconstructs any
+    /// `itemKind` field-by-field, so a user row routed through it must not lose its provenance.
+    public var crossSessionAttribution: AgentCrossSessionAttribution?
+    /// Local-display lane labels for an accepted `.system` lane-update row.
+    ///
+    /// Carried for the same reason as `crossSessionAttribution`: this is the carrier every retained
+    /// activity is rebuilt from, so a field added to `AgentChatItem` alone would vanish the moment a
+    /// turn was reloaded. Every projection that leaves the machine selects `text` explicitly, so
+    /// carrying it here does not put it on the wire.
+    public var laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution?
 
     public init(
         id: UUID,
@@ -112,7 +122,9 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         toolExecution: AgentTranscriptToolExecution? = nil,
         reasoning: String? = nil,
         isSubstantiveAssistant: Bool = false,
-        sealsAssistantBoundary: Bool = false
+        sealsAssistantBoundary: Bool = false,
+        crossSessionAttribution: AgentCrossSessionAttribution? = nil,
+        laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -130,6 +142,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.reasoning = reasoning
         self.isSubstantiveAssistant = isSubstantiveAssistant
         self.sealsAssistantBoundary = sealsAssistantBoundary
+        self.crossSessionAttribution = crossSessionAttribution
+        self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
     }
 
     public init(from item: AgentChatItem, toolExecution: AgentTranscriptToolExecution? = nil, role: AgentTranscriptActivityRole? = nil, sealsAssistantBoundary: Bool = false) {
@@ -149,6 +163,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         reasoning = item.reasoning
         isSubstantiveAssistant = Self.defaultIsSubstantiveAssistant(for: item)
         self.sealsAssistantBoundary = sealsAssistantBoundary
+        crossSessionAttribution = item.crossSessionAttribution
+        laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
     }
 
     public func toItem(text overrideText: String? = nil, isStreaming overrideStreaming: Bool? = nil) -> AgentChatItem {
@@ -169,7 +185,11 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             isStreaming: overrideStreaming ?? isStreaming,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
+            crossSessionAttribution: crossSessionAttribution,
+            // Synthesized decoding cannot reject a malformed nested value without failing the whole
+            // activity, so the drop happens here instead.
+            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution?.validated
         )
     }
 
@@ -234,6 +254,12 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool?
+    /// Cross-session provenance for a user row delivered through an oversight link.
+    ///
+    /// Archived, condensed, and summary projections rebuild their user row from this anchor rather
+    /// than retaining the original `AgentChatItem`, so omitting it here would silently drop the
+    /// attribution badge as soon as a turn left the full retention tier.
+    public var crossSessionAttribution: AgentCrossSessionAttribution?
 
     public init(from item: AgentChatItem) {
         id = item.id
@@ -245,6 +271,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho ? true : nil
+        crossSessionAttribution = item.crossSessionAttribution
     }
 
     public func toItem() -> AgentChatItem {
@@ -258,7 +285,8 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
             sequenceIndex: sequenceIndex,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
+            crossSessionAttribution: crossSessionAttribution
         )
     }
 }

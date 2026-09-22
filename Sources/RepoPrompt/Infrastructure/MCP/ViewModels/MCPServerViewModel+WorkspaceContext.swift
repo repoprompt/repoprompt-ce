@@ -3,11 +3,11 @@ import Foundation
 extension MCPServerViewModel {
     @MainActor
     func buildTabWorkspaceContext(
-        context: TabScopedContext,
+        context: TabContextSnapshot,
         include: Set<String>,
         display: FilePathDisplay,
         copyPresetOverride: CopyPreset? = nil,
-        activeTabCompatibility: Bool = false
+        presentationActiveContext: Bool = false
     ) async throws -> ToolResultDTOs.PromptContextDTO {
         let includeSelection = include.contains("selection")
         let requireSelectionData = includeSelection
@@ -70,7 +70,7 @@ extension MCPServerViewModel {
                 collections: gathered,
                 resolvedContext: resolvedCfg,
                 lookupContext: lookupContext,
-                activeTabCompatibility: activeTabCompatibility
+                presentationActiveContext: presentationActiveContext
             )
             let reply = await SelectionReplyAssembler.buildSelectedFilesReply(
                 collections: gathered,
@@ -124,14 +124,14 @@ extension MCPServerViewModel {
                 profile: .uiAssisted
             )
             if treePresentation.rootCount == 0 {
-                let msg = activeTabCompatibility
+                let msg = presentationActiveContext
                     ? await workspaceContextMessage(forOperation: MCPWindowToolName.getFileTree, path: nil)
                     : await tabWorkspaceContextMessage(forOperation: tabFileTreeToolName, path: nil)
                 fileTreeDTO = .init(
                     rootsCount: 0,
                     usesLegend: false,
                     tree: msg,
-                    note: activeTabCompatibility ? "No workspace loaded" : nil,
+                    note: presentationActiveContext ? "No workspace loaded" : nil,
                     worktreeScope: worktreeScope
                 )
             } else {
@@ -205,8 +205,7 @@ extension MCPServerViewModel {
         let metadata = await captureRequestMetadata()
         return try resolveTabContextSnapshot(
             from: metadata,
-            toolName: "export_selected_files",
-            policy: .allowLegacyImplicitRouting
+            toolName: "export_selected_files"
         )
     }
 
@@ -252,7 +251,7 @@ extension MCPServerViewModel {
 
         let evaluationSelection: StoredSelection? = if let selectionOverride {
             lookupContext.physicalizeSelection(selectionOverride)
-        } else if let resolved, !resolved.usesActiveTabCompatibility {
+        } else if let resolved {
             lookupContext.physicalizeSelection(resolved.snapshot.selection)
         } else {
             nil
@@ -278,7 +277,7 @@ extension MCPServerViewModel {
     @MainActor
     func buildTabClipboardContent(
         cfg: PromptContextResolved,
-        context: TabScopedContext
+        context: TabContextSnapshot
     ) async -> String {
         // Use the resolved tab-scoped context directly.
         // Run-bound sessions and explicitly bound tabs should export from their bound tab

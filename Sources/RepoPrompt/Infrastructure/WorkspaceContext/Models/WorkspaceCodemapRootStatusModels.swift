@@ -15,6 +15,7 @@ enum WorkspaceCodemapRootStatusUnavailableReason: String, Hashable {
     case setupFailed
     case graphUnavailable
     case retryExhausted
+    case workerRecoveryExhausted
 }
 
 struct WorkspaceCodemapGraphCommitCadence: Hashable {

@@ -110,7 +110,7 @@ The remote-by-default policy avoids breaking checkouts that do not have a siblin
 | Agent Mode transcript mutation, tool-card UI, run-state ownership | core |
 | Native process control (`ClaudeNativeProcessSessionController`) | core (this wave) |
 | Provider-neutral runtime contract (`NativeAgentRuntimeControlling`) | core |
-| Provider-neutral RepoPrompt workflow prompt catalog and renderers (`Infrastructure/AI/Prompts/Workflows`) | core |
+| Provider-neutral RepoPrompt workflow prompt catalog and renderers (`RepoPromptShared/Workflows`) | core |
 | Headless wrapper (`ClaudeCodeAgentProvider`) | core (delegates pure rules to package) |
 | `AgentModel` raw values, option DTOs, defaults | core (adapter forwards plugin DTOs back to these) |
 | Plugin IDs (`ClaudeCompatibleProviderPluginID`), runtime variants, backend IDs | package DTOs |
@@ -220,6 +220,17 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 
 - **OpenCode:** Timeout values are milliseconds. For a 10,000-second call, set `"timeout": 10000000` on the existing RepoPrompt MCP server entry, preserving its `type`, `command`, and `environment` fields.
 - **Cursor Agent:** Current builds expose no supported ACP, CLI, environment, or configuration override that RepoPrompt CE can set to 10,000 seconds. Do not add a speculative CE timeout control; add one only if Cursor documents a supported configuration surface.
+- **Grok Build:** The session-injected RepoPrompt MCP server follows Grok's default MCP timeout. To pin one, add `tool_timeout_sec` under `[mcp_servers.RepoPromptCE]` in `~/.grok/config.toml` (Grok's per-server MCP config; seconds).
+
+### Grok Build provider notes
+
+`AgentProviderKind.grokBuild` drives `grok agent stdio` (ACP protocolVersion 1). Verified wire facts as of grok 1.0.3 (2026-08-13):
+
+- Model advertisement is a top-level `SessionModelState` (`models` in `session/new`/`session/load` responses), not modern `configOptions`; explicit selection goes through `session/set_model` (`{sessionId, modelId}`). The controller consults the provider's `ACPDirectSessionModelProvider` conformance only when no modern model selector exists; malformed modern selectors never fall back.
+- Usage arrives in the `session/prompt` response `_meta.usage` (same field names as the ACP-standard top-level `usage`); Grok emits no `usage_update` notifications.
+- Full access is a launch flag (`grok agent --always-approve stdio`), never controller-side permission-option auto-selection; `enable-always-approve` is denylisted from every option picker.
+- Auth: RepoPrompt never sends ACP `authenticate`; Grok's own precedence (config.toml key → `~/.grok/auth.json` → `XAI_API_KEY` env, the last injected from the existing `.grokAPI` keychain account at provider construction) applies.
+- MCP client name is `grok-shell-<injected server name>`; `MCPClientIdentity` maps the `grok-shell` prefix family.
 
 ## How a new provider plugs in
 
@@ -285,7 +296,7 @@ Add the relevant focused suite before any catalog/codec change, and snapshot mod
 - `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift` — single package import point.
 - `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/` — Agent-Mode facade and adapter trio.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift` — provider-neutral runtime contract.
-- `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/` — provider-neutral RepoPrompt workflow prompt catalog, metadata, variants, and renderers shared by installs and MCP prompt registration.
+- `Sources/RepoPromptShared/Workflows/` — provider-neutral RepoPrompt workflow IDs, catalog metadata, variants, and renderers shared by the app, installs, MCP prompt registration, and direct headless execution.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` — `AgentProviderKind` and headless factory.
 - `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift` — `makeClaudeCompatibleNativeController(...)`.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift` — interactive Claude-compatible coordinator.

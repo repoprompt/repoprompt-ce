@@ -23,10 +23,13 @@ enum ClaudeCodeAIModelCatalog {
     ]
 
     private static let modelDefinitions: [ModelDefinition] = [
+        ModelDefinition(runtimeModelRaw: "fable", displayName: "Fable Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-fable-5-1", displayName: "Fable 5.1", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "opus[1m]", displayName: "Opus Latest (1M)", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "opus", displayName: "Opus Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-opus-5", displayName: "Opus 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-4-8", displayName: "Opus 4.8", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-7", displayName: "Opus 4.7", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-6", displayName: "Opus 4.6", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-5-20251101", displayName: "Opus 4.5", supportedEfforts: []),

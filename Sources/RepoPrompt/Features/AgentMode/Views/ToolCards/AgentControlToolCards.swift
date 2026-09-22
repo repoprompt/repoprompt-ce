@@ -260,7 +260,7 @@ struct AgentRunResultCard: View {
         guard let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return false
         }
-        if let object = ToolRawJSON.object(from: item.toolResultJSON),
+        if let object = ToolJSON.rawObject(from: item.toolResultJSON),
            ToolRawJSON.bool(object, key: "summary_only") == true
         {
             return false
@@ -375,7 +375,7 @@ struct AgentExploreResultCard: View {
         guard let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return false
         }
-        if let object = ToolRawJSON.object(from: item.toolResultJSON),
+        if let object = ToolJSON.rawObject(from: item.toolResultJSON),
            ToolRawJSON.bool(object, key: "summary_only") == true
         {
             return false
@@ -478,7 +478,7 @@ struct AgentManageResultCard: View {
         guard let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return false
         }
-        if let object = ToolRawJSON.object(from: item.toolResultJSON),
+        if let object = ToolJSON.rawObject(from: item.toolResultJSON),
            ToolRawJSON.bool(object, key: "summary_only") == true
         {
             return false

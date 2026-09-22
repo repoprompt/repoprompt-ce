@@ -94,7 +94,7 @@ import XCTest
             XCTAssertEqual(GitDiffEngine.DiffTextCache.saturatingAdd(.max - 1, 1), .max)
         }
 
-        func testCacheDisabledRequestBypassesLookupButStillAdmitsRecomputedResult() async throws {
+        func testLookupBypassStillAdmitsRecomputedResult() async throws {
             let fixture = try ReviewGitRepositoryFixture(name: #function)
             let repo = try makeModifiedRepository(using: fixture)
             let engine = GitDiffEngine(
@@ -116,7 +116,7 @@ import XCTest
                 scope: .all,
                 selectedAbsolutePaths: [],
                 repoURL: repo,
-                useCache: false
+                allowCachedResult: false
             )
 
             XCTAssertEqual(bypassed.text, cached.text)
@@ -133,7 +133,7 @@ import XCTest
         }
 
         func testForcedRefreshReplacesStaleSameKeyEntryForLaterCachedReads() {
-            // Simulates force-refresh (useCache:false) when fingerprint/statusHash is
+            // Simulates force-refresh (allowCachedResult:false) when fingerprint/statusHash is
             // unchanged across content edits: recompute must admit/replace so the next
             // ordinary lookup returns the refreshed diff.
             let key = makeKey("same-status-hash")
@@ -156,43 +156,103 @@ import XCTest
         }
 
         func testForcedRefreshThenOrdinaryRequestReturnsRefreshedDiffText() async throws {
+            try await assertSameFingerprintCallerRefresh(oversized: false)
+        }
+
+        func testOversizedForcedRefreshRemovesStaleSameKeyEntry() async throws {
+            try await assertSameFingerprintCallerRefresh(oversized: true)
+        }
+
+        private func assertSameFingerprintCallerRefresh(oversized: Bool) async throws {
             let fixture = try ReviewGitRepositoryFixture(name: #function)
-            let repo = try makeModifiedRepository(using: fixture)
+            let padding = String(repeating: "let padding = 0\n", count: 256)
+            let repo = try fixture.makeRepository(
+                named: "repo",
+                files: ["Feature.swift": "let value = 1\n" + padding]
+            )
+            let initialContent = "let value = 2\n" + padding
+            try fixture.write(initialContent, to: "Feature.swift", at: repo)
+            let fileURL = repo.appendingPathComponent("Feature.swift")
+            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let originalModificationDate = try XCTUnwrap(attributes[.modificationDate] as? Date)
+            let service = VCSService()
             let engine = GitDiffEngine(
-                vcsService: VCSService(),
+                vcsService: service,
                 gitService: GitService(),
-                cacheLimits: .init(maximumEntryCount: 2, maximumRetainedUTF8Bytes: 1024 * 1024)
+                cacheLimits: .init(maximumEntryCount: 2, maximumRetainedUTF8Bytes: 4096)
             )
+            let status = GitStatusActor(vcsService: service, diffEngine: engine)
+            _ = await status.updateRoots([repo.path])
+            await status.setSelectedRoot(repo.path)
+            // Do not enable polling: this test drives every refresh explicitly.
+            let initial = await status.generateDiff(
+                rootPath: repo.path,
+                inclusionMode: .all,
+                selectedAbsolutePaths: []
+            )
+            XCTAssertTrue(try XCTUnwrap(initial).contains("+let value = 2"))
+            let initialFingerprint = try await engine.statusFingerprint(baseRef: "HEAD", repoURL: repo)
+            let beforeRefresh = await engine.cacheHealthSnapshot()
+            XCTAssertEqual(beforeRefresh.entryCount, 1)
+            XCTAssertEqual(beforeRefresh.admissionCount, 1)
 
-            let initial = try await engine.diffText(
-                target: .uncommitted(base: "HEAD"),
-                scope: .all,
+            let freshPadding = oversized ? padding.replacingOccurrences(of: "= 0", with: "= 9") : padding
+            let freshContent = "let value = 3\n" + freshPadding
+            XCTAssertEqual(freshContent.utf8.count, initialContent.utf8.count)
+            try fixture.write(freshContent, to: "Feature.swift", at: repo)
+            try FileManager.default.setAttributes(
+                [.modificationDate: originalModificationDate],
+                ofItemAtPath: fileURL.path
+            )
+            let freshFingerprint = try await engine.statusFingerprint(baseRef: "HEAD", repoURL: repo)
+            XCTAssertEqual(freshFingerprint.headSHA, initialFingerprint.headSHA)
+            XCTAssertEqual(freshFingerprint.baseRef, initialFingerprint.baseRef)
+            XCTAssertEqual(freshFingerprint.statusHash, initialFingerprint.statusHash)
+
+            let forced = await status.generateDiff(
+                rootPath: repo.path,
+                inclusionMode: .all,
                 selectedAbsolutePaths: [],
-                repoURL: repo
+                forceRefreshSnapshot: true
             )
-            XCTAssertTrue(initial.text.contains("let value = 2"))
+            let freshText = try XCTUnwrap(forced)
+            XCTAssertTrue(freshText.contains("+let value = 3"))
+            XCTAssertFalse(freshText.contains("+let value = 2"))
+            let afterRefresh = await engine.cacheHealthSnapshot()
+            XCTAssertEqual(afterRefresh.bypassCount, beforeRefresh.bypassCount + 1)
+            XCTAssertEqual(afterRefresh.hitCount, beforeRefresh.hitCount)
+            XCTAssertEqual(afterRefresh.missCount, beforeRefresh.missCount)
+            XCTAssertEqual(afterRefresh.replacementCount, beforeRefresh.replacementCount + 1)
+            if oversized {
+                XCTAssertGreaterThan(freshText.utf8.count, 4096)
+                XCTAssertEqual(afterRefresh.entryCount, 0)
+                XCTAssertEqual(afterRefresh.retainedUTF8Bytes, 0)
+                XCTAssertEqual(afterRefresh.admissionCount, beforeRefresh.admissionCount)
+                XCTAssertEqual(afterRefresh.oversizedRejectionCount, 1)
+            } else {
+                XCTAssertEqual(afterRefresh.entryCount, 1)
+                XCTAssertEqual(afterRefresh.admissionCount, beforeRefresh.admissionCount + 1)
+                XCTAssertEqual(afterRefresh.oversizedRejectionCount, 0)
+            }
 
-            try fixture.write("let value = 3\nlet added = true\nlet more = true\n", to: "Feature.swift", at: repo)
-
-            let forced = try await engine.diffText(
-                target: .uncommitted(base: "HEAD"),
-                scope: .all,
-                selectedAbsolutePaths: [],
-                repoURL: repo,
-                useCache: false
+            let ordinary = await status.generateDiff(
+                rootPath: repo.path,
+                inclusionMode: .all,
+                selectedAbsolutePaths: []
             )
-            XCTAssertTrue(forced.text.contains("let value = 3"))
-            XCTAssertFalse(forced.text.contains("+let value = 2"))
-
-            let ordinary = try await engine.diffText(
-                target: .uncommitted(base: "HEAD"),
-                scope: .all,
-                selectedAbsolutePaths: [],
-                repoURL: repo,
-                useCache: true
-            )
-            XCTAssertEqual(ordinary.text, forced.text)
-            XCTAssertTrue(ordinary.text.contains("let value = 3"))
+            XCTAssertEqual(ordinary, freshText)
+            let afterOrdinary = await engine.cacheHealthSnapshot()
+            if oversized {
+                XCTAssertEqual(afterOrdinary.hitCount, afterRefresh.hitCount)
+                XCTAssertEqual(afterOrdinary.missCount, afterRefresh.missCount + 1)
+                XCTAssertEqual(afterOrdinary.oversizedRejectionCount, 2)
+                XCTAssertEqual(afterOrdinary.entryCount, 0)
+                XCTAssertEqual(afterOrdinary.retainedUTF8Bytes, 0)
+            } else {
+                XCTAssertEqual(afterOrdinary.hitCount, afterRefresh.hitCount + 1)
+                XCTAssertEqual(afterOrdinary.missCount, afterRefresh.missCount)
+                XCTAssertEqual(afterOrdinary.admissionCount, afterRefresh.admissionCount)
+            }
         }
 
         func testOversizedResultIsReturnedButNotCached() async throws {

@@ -301,53 +301,6 @@ final class CodeMapArtifactContainerTests: XCTestCase {
         XCTAssertTrue(fileManager.fileExists(atPath: external.path))
     }
 
-    func testIndependentConcurrentReadersObserveOnlyCompleteImmutableContainers() throws {
-        let root = try makeSecureRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let store = try CodeMapArtifactFileStore(rootURL: root)
-        let key = try makeKey(sourceText: "concurrent readers")
-        let outcome = CodeMapSyntaxArtifactOutcome.ready(makeArtifact())
-
-        let lock = NSLock()
-        var failures: [String] = []
-        var insertedCount = 0
-        var alreadyPresentCount = 0
-        DispatchQueue.concurrentPerform(iterations: 32) { _ in
-            do {
-                let independent = try CodeMapArtifactFileStore(rootURL: root)
-                switch try independent.write(key: key, outcome: outcome) {
-                case .inserted:
-                    lock.withLock { insertedCount += 1 }
-                case .alreadyPresent:
-                    lock.withLock { alreadyPresentCount += 1 }
-                }
-            } catch {
-                lock.withLock { failures.append(String(describing: error)) }
-            }
-        }
-        XCTAssertEqual(insertedCount, 1)
-        XCTAssertEqual(alreadyPresentCount, 31)
-        XCTAssertEqual(failures, [])
-
-        DispatchQueue.concurrentPerform(iterations: 64) { _ in
-            do {
-                let independent = try CodeMapArtifactFileStore(rootURL: root)
-                guard try independent.read(key: key) == .hit(outcome) else {
-                    lock.withLock { failures.append("miss") }
-                    return
-                }
-            } catch {
-                lock.withLock { failures.append(String(describing: error)) }
-            }
-        }
-        XCTAssertEqual(failures, [])
-        XCTAssertEqual(try store.read(key: key), .hit(outcome))
-        XCTAssertFalse(
-            try recursiveRelativePaths(at: root.appendingPathComponent("CodeMapArtifacts/v1/artifacts"))
-                .contains { $0.contains(".tmp.") }
-        )
-    }
-
     func testRecoveryRemovesOnlyStrictInactiveOwnedRegularTempsAndLookupIgnoresPartials() throws {
         let fileManager = FileManager.default
         let root = try makeSecureRoot()

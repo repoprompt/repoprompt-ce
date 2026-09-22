@@ -2248,10 +2248,11 @@ final actor ClaudeNativeProcessSessionController {
         for (key, value) in resolverOverrides {
             env[key] = value
         }
-        return ProcessEnvironmentSanitizer.sanitizedForChildLaunch(
+        let sanitized = ProcessEnvironmentSanitizer.sanitizedForChildLaunch(
             env,
             additionalRemovedKeys: Set(["NODE_OPTIONS"]).union(resolverRemovedKeys)
         )
+        return DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: sanitized)
     }
 
     private func recordObservedSessionID(_ candidate: String?) {

@@ -149,22 +149,221 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertEqual(addQuery.stringValue(for: kSecAttrAccount), "api-key")
         XCTAssertEqual(addQuery.stringValue(for: kSecUseAuthenticationUI), kSecUseAuthenticationUISkip as String)
         XCTAssertEqual(addQuery.dataValue(for: kSecValueData), Data("stored-value".utf8))
-        XCTAssertEqual(addQuery.stringValue(for: kSecAttrAccessible), kSecAttrAccessibleAfterFirstUnlock as String)
-        XCTAssertEqual(addQuery.boolValue(for: kSecAttrSynchronizable), false)
+        XCTAssertNil(addQuery.stringValue(for: kSecAttrAccessible))
+        XCTAssertNil(addQuery.boolValue(for: kSecAttrSynchronizable))
+    }
+
+    func testSaveAddsCreationAttributesOnlyWhenCreatingItem() throws {
+        let fake = FakeSecItemClient(
+            copyHandler: { _, _ in errSecItemNotFound },
+            addHandler: { _, _ in errSecSuccess },
+            updateHandler: { _, _ in errSecItemNotFound }
+        )
+        let provider = FakeItemCreationAttributeProvider()
+        let service = KeychainService(
+            serviceName: KeychainService.identityMigrationBridgeServiceNamePrefix,
+            secItemClient: fake,
+            itemCreationAttributeProvider: provider
+        )
+
+        try service.save("stored-value", for: "api-key", accessMode: .nonInteractive(reason: .test))
+
+        XCTAssertEqual(provider.callCount, 1)
+        XCTAssertEqual(fake.addQueries.first?.stringValue(for: kSecAttrAccess), "test-access-policy")
+        XCTAssertNil(fake.addQueries.first?.stringValue(for: kSecAttrAccessible))
+        XCTAssertNil(fake.addQueries.first?.boolValue(for: kSecAttrSynchronizable))
+        XCTAssertNil(fake.updateAttributes.first?.stringValue(for: kSecAttrAccess))
+    }
+
+    func testCreateUsesAttemptScopedServiceIdentityWithoutGenericMarker() throws {
+        let attemptIdentifier = "123e4567-e89b-12d3-a456-426614174000"
+        let serviceName = try XCTUnwrap(
+            KeychainService.identityMigrationBridgeServiceName(for: attemptIdentifier)
+        )
+        let fake = FakeSecItemClient(
+            copyHandler: { _, _ in errSecItemNotFound },
+            addHandler: { _, _ in errSecSuccess }
+        )
+        let provider = FakeItemCreationAttributeProvider()
+        let service = KeychainService(
+            serviceName: serviceName,
+            secItemClient: fake,
+            itemCreationAttributeProvider: provider
+        )
+
+        try service.create("stored-value", for: "api-key", accessMode: .nonInteractive(reason: .test))
+
+        XCTAssertEqual(fake.operationLog, ["add"])
+        XCTAssertTrue(fake.updateQueries.isEmpty)
+        let addQuery = try XCTUnwrap(fake.addQueries.first)
+        XCTAssertEqual(addQuery.stringValue(for: kSecAttrService), serviceName)
+        XCTAssertNil(addQuery.dataValue(for: kSecAttrGeneric))
+        XCTAssertEqual(addQuery.stringValue(for: kSecAttrAccess), "test-access-policy")
+        XCTAssertNil(addQuery.stringValue(for: kSecAttrAccessible))
+        XCTAssertNil(addQuery.boolValue(for: kSecAttrSynchronizable))
+    }
+
+    func testAttemptScopedServiceIdentityRequiresCanonicalUUIDAndIsDistinct() throws {
+        let first = "123e4567-e89b-12d3-a456-426614174000"
+        let second = "123e4567-e89b-12d3-a456-426614174001"
+        let firstService = try XCTUnwrap(KeychainService.identityMigrationBridgeServiceName(for: first))
+        let secondService = try XCTUnwrap(KeychainService.identityMigrationBridgeServiceName(for: second))
+
+        XCTAssertNotEqual(firstService, secondService)
+        XCTAssertTrue(firstService.hasSuffix(first))
+        XCTAssertNil(KeychainService.identityMigrationBridgeServiceName(for: first.uppercased()))
+        XCTAssertNil(KeychainService.identityMigrationBridgeServiceName(for: "attempt-123"))
+    }
+
+    func testACLPrincipalValidationRequiresExactDesignatedRequirements() throws {
+        let legacyRequirement = Data("legacy-requirement".utf8)
+        let successorRequirement = Data("successor-requirement".utf8)
+        let expected = [legacyRequirement, successorRequirement]
+
+        XCTAssertNoThrow(try ClassicKeychainACLValidator.validate(
+            principals: [.requirement(successorRequirement), .requirement(legacyRequirement)],
+            expected: expected
+        ))
+        XCTAssertThrowsError(try ClassicKeychainACLValidator.validate(
+            principals: [.requirement(legacyRequirement)],
+            expected: expected
+        )) { error in
+            XCTAssertEqual(error as? KeychainACLValidationError, .missingPrincipal)
+        }
+        XCTAssertThrowsError(try ClassicKeychainACLValidator.validate(
+            principals: [.requirement(legacyRequirement), .wildcard],
+            expected: expected
+        )) { error in
+            XCTAssertEqual(error as? KeychainACLValidationError, .wildcardPrincipal)
+        }
+        XCTAssertThrowsError(try ClassicKeychainACLValidator.validate(
+            principals: [.requirement(legacyRequirement), .requirement(Data("attacker".utf8))],
+            expected: expected
+        )) { error in
+            XCTAssertEqual(error as? KeychainACLValidationError, .extraPrincipal)
+        }
+    }
+
+    func testReadRejectsForgedItemACLBeforeReturningCredentialValue() {
+        let fake = FakeSecItemClient { query, result in
+            if query.boolValue(for: kSecReturnRef) == true {
+                result?.pointee = NSObject()
+            } else {
+                result?.pointee = Data("attacker-value".utf8) as NSData
+            }
+            return errSecSuccess
+        }
+        let validator = FakeItemAccessValidator(error: KeychainACLValidationError.extraPrincipal)
+        let service = KeychainService(
+            serviceName: KeychainService.identityMigrationLegacyStateServiceName,
+            secItemClient: fake,
+            itemAccessValidator: validator,
+            itemAccessProvider: FakeSecKeychainItemAccessProvider()
+        )
+
+        XCTAssertThrowsError(
+            try service.get(for: "migration-journal", accessMode: .nonInteractive(reason: .test))
+        ) { error in
+            XCTAssertEqual(error as? KeychainACLValidationError, .extraPrincipal)
+        }
+        XCTAssertEqual(fake.copyQueries.count, 1)
+        XCTAssertEqual(fake.copyQueries.first?.boolValue(for: kSecReturnRef), true)
+    }
+
+    func testBridgeManifestACLIsValidatedBeforeFreshAccessRebuild() {
+        let fake = FakeSecItemClient { _, result in
+            result?.pointee = NSObject()
+            return errSecSuccess
+        }
+        let validator = FakeItemAccessValidator(error: KeychainACLValidationError.extraPrincipal)
+        let rebuilder = FakeKeychainAccessRebuilder()
+        let provider = ExistingKeychainItemAccessAttributeProvider(
+            serviceName: "attempt-service",
+            account: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
+            accessValidator: validator,
+            itemAccessProvider: FakeSecKeychainItemAccessProvider(),
+            accessRebuilder: rebuilder,
+            secItemClient: fake
+        )
+
+        XCTAssertThrowsError(try provider.attributesForNewItem()) { error in
+            XCTAssertEqual(error as? KeychainACLValidationError, .extraPrincipal)
+        }
+        XCTAssertEqual(validator.validationCount, 1)
+        XCTAssertEqual(rebuilder.rebuildCount, 0)
+    }
+
+    func testBridgeManifestACLIsRebuiltAndFreshAccessIsValidatedBeforeUse() throws {
+        let fake = FakeSecItemClient { _, result in
+            result?.pointee = NSObject()
+            return errSecSuccess
+        }
+        let donorAccess = NSObject()
+        let freshAccess = NSObject()
+        let validator = FakeItemAccessValidator()
+        let rebuilder = FakeKeychainAccessRebuilder(
+            donorAccess: donorAccess,
+            freshAccess: freshAccess
+        )
+        let provider = ExistingKeychainItemAccessAttributeProvider(
+            serviceName: "attempt-service",
+            account: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
+            accessValidator: validator,
+            itemAccessProvider: FakeSecKeychainItemAccessProvider(access: donorAccess),
+            accessRebuilder: rebuilder,
+            secItemClient: fake
+        )
+
+        let attributes = try provider.attributesForNewItem()
+
+        XCTAssertTrue(attributes[kSecAttrAccess as String] as AnyObject === freshAccess)
+        XCTAssertEqual(validator.validationCount, 2)
+        XCTAssertEqual(rebuilder.rebuildCount, 1)
+    }
+
+    func testFreshAccessRebuilderCreatesDistinctClassicAccessObject() throws {
+        var trustedApplication: SecTrustedApplication?
+        let applicationStatus = CommandLine.arguments[0].withCString { executablePath in
+            SecTrustedApplicationCreateFromPath(executablePath, &trustedApplication)
+        }
+        XCTAssertEqual(applicationStatus, errSecSuccess)
+        let unwrappedApplication = try XCTUnwrap(trustedApplication)
+
+        var donorAccess: SecAccess?
+        let accessStatus = SecAccessCreate(
+            "RepoPrompt CE rebuilder test" as CFString,
+            [unwrappedApplication] as CFArray,
+            &donorAccess
+        )
+        XCTAssertEqual(accessStatus, errSecSuccess)
+        let unwrappedDonorAccess = try XCTUnwrap(donorAccess)
+
+        let freshAccess = try FreshClassicKeychainAccessRebuilder().rebuild(unwrappedDonorAccess)
+
+        XCTAssertEqual(CFGetTypeID(freshAccess as CFTypeRef), SecAccessGetTypeID())
+        XCTAssertFalse(freshAccess === unwrappedDonorAccess)
     }
 
     func testPersistentServiceNamesAreIsolatedAndLegacyIsRepairOnly() throws {
         let fingerprintA = String(repeating: "A", count: 64)
         let fingerprintB = String(repeating: "B", count: 64)
+        XCTAssertEqual(KeychainService.debugServiceName, "com.repoprompt.ce.debug.keychain")
+        XCTAssertEqual(
+            KeychainService.appleDevelopmentDebugServiceName(teamIdentifier: "9S455R5DTM"),
+            "com.repoprompt.ce.debug.apple-development.9s455r5dtm.keychain.v1"
+        )
         let names = Set([
             KeychainService.legacyCanonicalServiceName,
             KeychainService.officialV2ServiceName,
+            KeychainService.identityMigrationBridgeServiceNamePrefix,
+            KeychainService.identityMigrationLegacyStateServiceName,
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 1),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 2),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintB, generation: 1),
-            KeychainService.debugServiceName
+            KeychainService.debugServiceName,
+            KeychainService.appleDevelopmentDebugServiceName(teamIdentifier: "9S455R5DTM")
         ])
-        XCTAssertEqual(names.count, 6)
+        XCTAssertEqual(names.count, 9)
 
         let fake = FakeSecItemClient { _, _ in errSecItemNotFound }
         let legacy = KeychainService.legacyRepairSource(secItemClient: fake)
@@ -183,6 +382,65 @@ final class KeychainServiceTests: XCTestCase {
             serviceName: serviceName,
             secItemClient: secItemClient
         )
+    }
+}
+
+private final class FakeItemCreationAttributeProvider: KeychainItemCreationAttributeProvider {
+    private(set) var callCount = 0
+
+    func attributesForNewItem() throws -> [String: Any] {
+        callCount += 1
+        return [kSecAttrAccess as String: "test-access-policy"]
+    }
+}
+
+private final class FakeItemAccessValidator: KeychainItemAccessValidator {
+    private let error: Error?
+    private(set) var validationCount = 0
+
+    init(error: Error? = nil) {
+        self.error = error
+    }
+
+    func validate(_: AnyObject) throws {
+        validationCount += 1
+        if let error {
+            throw error
+        }
+    }
+}
+
+private struct FakeSecKeychainItemAccessProvider: SecKeychainItemAccessProvider {
+    let access: AnyObject
+
+    init(access: AnyObject = NSObject()) {
+        self.access = access
+    }
+
+    func copyAccess(from _: AnyObject) throws -> AnyObject {
+        access
+    }
+}
+
+private final class FakeKeychainAccessRebuilder: KeychainAccessRebuilder {
+    private let donorAccess: AnyObject?
+    private let freshAccess: AnyObject
+    private(set) var rebuildCount = 0
+
+    init(
+        donorAccess: AnyObject? = nil,
+        freshAccess: AnyObject = NSObject()
+    ) {
+        self.donorAccess = donorAccess
+        self.freshAccess = freshAccess
+    }
+
+    func rebuild(_ access: AnyObject) throws -> AnyObject {
+        rebuildCount += 1
+        if let donorAccess {
+            XCTAssertTrue(access === donorAccess)
+        }
+        return freshAccess
     }
 }
 

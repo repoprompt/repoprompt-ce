@@ -1,5 +1,45 @@
 import Combine
+import RepoPromptShared
 import SwiftUI
+
+enum CodexHookApprovalWorkspaceSetting: CaseIterable, Hashable {
+    case appDefault
+    case alwaysRequireApproval
+    case dontRequireApproval
+
+    init(workspaceOverride: Bool?) {
+        switch workspaceOverride {
+        case true:
+            self = .alwaysRequireApproval
+        case false:
+            self = .dontRequireApproval
+        case nil:
+            self = .appDefault
+        }
+    }
+
+    var workspaceOverride: Bool? {
+        switch self {
+        case .appDefault:
+            nil
+        case .alwaysRequireApproval:
+            true
+        case .dontRequireApproval:
+            false
+        }
+    }
+
+    func label(globalStrictModeEnabled: Bool) -> String {
+        switch self {
+        case .appDefault:
+            "App default (currently: \(globalStrictModeEnabled ? "required" : "not required"))"
+        case .alwaysRequireApproval:
+            "Always require approval"
+        case .dontRequireApproval:
+            "Don't require approval"
+        }
+    }
+}
 
 /// Consolidated settings view for Agent Mode — the "Overview" tab.
 ///
@@ -11,9 +51,10 @@ import SwiftUI
 /// the canonical pages, and surfaces at-a-glance CLI provider connection
 /// status so users can spot missing configuration without leaving Overview.
 ///
-/// SEARCH-HELPER: Agent Mode Overview, Agent Mode Behavior, Safe Managed summary,
-/// Oracle Model summary, Context Builder summary, Agent Role Defaults summary,
-/// CLI provider status, Direct-Agent Permissions deep link, Sub-Agent Permissions deep link
+/// SEARCH-HELPER: Agent Mode Overview, Agent Mode Behavior, Agent Chats,
+/// Show MCP-created chats, Compose tabs without Agent sessions, Safe Managed summary, Oracle Model summary,
+/// Context Builder summary, Agent Role Defaults summary, CLI provider status,
+/// Direct-Agent Permissions deep link, Sub-Agent Permissions deep link
 ///
 /// Related:
 /// - Agent Models:      /RepoPrompt/Views/Settings/AgentModelsSettingsView.swift
@@ -24,11 +65,14 @@ import SwiftUI
 struct AgentModeGeneralSettingsView: View {
     @ObservedObject var promptVM: PromptViewModel
     @ObservedObject var apiSettingsVM: APISettingsViewModel
+    var workspaceID: UUID?
     var onNavigate: ((SettingsTab) -> Void)?
 
     /// Observe secure permission-store changes so the read-only summary rebuilds
     /// without relying on @AppStorage for sensitive policy keys.
     @State private var subagentPolicyRevision = 0
+    @AppStorage(SettingKeys.agentModeShowComposeTabsWithoutAgentSessions)
+    private var showComposeTabsWithoutAgentSessions = false
 
     @State private var handoffInstructionsDraft = ""
     @State private var handoffInstructionsBaseline = ""
@@ -121,9 +165,13 @@ struct AgentModeGeneralSettingsView: View {
                 tab: .agentModels
             )
 
+            subAgentSupervisionCard
+
             providersLinkRow
 
             providerCleanupActionCard
+
+            codexHookApprovalStrictModeCard
 
             handoffInstructionsCard
 
@@ -137,10 +185,90 @@ struct AgentModeGeneralSettingsView: View {
             )
 
             agentWorkflowsLinkRow
+
+            agentChatsCard
         }
     }
 
+    // MARK: - Agent Chats
+
+    private var agentChatsCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "bubble.left")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Text("Agent Chats")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Toggle("Show chats created by MCP tools", isOn: $showComposeTabsWithoutAgentSessions)
+                    .toggleStyle(.switch)
+
+                Text("Lists chats created by MCP tools before an agent has run in them, so you can observe and iterate on their selections, prompts, and Context Builder runs in Compose.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
     // MARK: - Provider cleanup
+
+    private var subAgentSupervisionCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Text("Sub-Agent Supervision")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+
+                Picker("Default subagent wait", selection: subagentDefaultWaitBinding) {
+                    ForEach(MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds, id: \.self) { seconds in
+                        Text(subagentDefaultWaitMenuLabel(for: seconds)).tag(seconds)
+                    }
+                }
+                .pickerStyle(.menu)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                .accessibilityLabel("Default subagent wait")
+
+                Text("Shorter waits allow more frequent progress checks. Longer waits reduce routine model calls. Completion, questions, and your steering can end a wait early.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Agents can choose shorter or longer waits for individual tasks.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private func subagentDefaultWaitMenuLabel(for seconds: Int) -> String {
+        let minutes = seconds / 60
+        if seconds == Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds) {
+            return "\(minutes) min (default)"
+        }
+        return "\(minutes) min"
+    }
+
+    private var subagentDefaultWaitBinding: Binding<Int> {
+        Binding(
+            get: { globalSettings.subagentDefaultWaitSeconds() },
+            set: { globalSettings.setSubagentDefaultWaitSeconds($0) }
+        )
+    }
 
     private var providerCleanupActionCard: some View {
         VStack(alignment: .leading, spacing: fontPreset.scaledClamped(8, max: 12)) {
@@ -173,6 +301,66 @@ struct AgentModeGeneralSettingsView: View {
         Binding(
             get: { globalSettings.providerConversationCleanupAction() },
             set: { globalSettings.setProviderConversationCleanupAction($0) }
+        )
+    }
+
+    // MARK: - Codex hook approval
+
+    private var codexHookApprovalStrictModeCard: some View {
+        HStack(alignment: .top, spacing: fontPreset.scaledClamped(12, max: 18)) {
+            Image(systemName: "checkmark.shield")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 17))
+                .frame(width: fontPreset.scaledClamped(22, max: 30), alignment: .center)
+                .foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: fontPreset.scaledClamped(6, max: 10)) {
+                Toggle("Require Codex project-hook approval", isOn: codexHookApprovalStrictModeBinding)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .semibold))
+                if workspaceID != nil {
+                    Picker("In this workspace:", selection: codexHookApprovalWorkspaceSettingBinding) {
+                        ForEach(CodexHookApprovalWorkspaceSetting.allCases, id: \.self) { setting in
+                            Text(setting.label(
+                                globalStrictModeEnabled: globalSettings.globalCodexHookApprovalStrictModeEnabled()
+                            ))
+                            .tag(setting)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                }
+                Text("When enabled, Continue Without Hooks is unavailable. Codex first turns remain blocked until the displayed project hooks are approved or become trusted externally.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: fontPreset.scaledClamped(10, max: 14))
+        }
+        .padding(.vertical, fontPreset.scaledClamped(6, max: 10))
+    }
+
+    private var codexHookApprovalStrictModeBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.globalCodexHookApprovalStrictModeEnabled() },
+            set: { globalSettings.setGlobalCodexHookApprovalStrictModeEnabled($0) }
+        )
+    }
+
+    private var codexHookApprovalWorkspaceSettingBinding: Binding<CodexHookApprovalWorkspaceSetting> {
+        Binding(
+            get: {
+                guard let workspaceID else { return .appDefault }
+                return CodexHookApprovalWorkspaceSetting(
+                    workspaceOverride: globalSettings.codexHookApprovalStrictModeWorkspaceOverride(
+                        workspaceID: workspaceID
+                    )
+                )
+            },
+            set: { setting in
+                guard let workspaceID else { return }
+                globalSettings.setCodexHookApprovalStrictModeOverride(
+                    setting.workspaceOverride,
+                    for: workspaceID
+                )
+            }
         )
     }
 
@@ -446,7 +634,11 @@ struct AgentModeGeneralSettingsView: View {
         case .claude: apiSettingsVM.isClaudeCodeConnected
         case .codex: apiSettingsVM.isCodexConnected
         case .openCode: apiSettingsVM.isOpenCodeConnected
+        case .antigravity: AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .cursor: apiSettingsVM.isCursorConnected
+        case .grokBuild: apiSettingsVM.isGrokBuildConnected
+        // Devin owns its own auth, so the installed CLI is the connection.
+        case .devin: DevinRuntimeLocator.isInstalledSync()
         }
     }
 

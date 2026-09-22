@@ -163,7 +163,7 @@ actor MCPBootstrapLease {
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "BootstrapLease")
 
     private var spec: MCPBootstrapLeaseSpec
-    private let mcpServerEnabler: (() async -> Void)?
+    private let mcpServerEnabler: (() async -> Bool)?
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
@@ -203,7 +203,7 @@ actor MCPBootstrapLease {
     ///     `ServerNetworkManager.shared.clearClientConnectionPolicy(...)`.
     init(
         spec: MCPBootstrapLeaseSpec,
-        mcpServerEnabler: (() async -> Void)? = nil,
+        mcpServerEnabler: (() async -> Bool)? = nil,
         policyInstaller: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
         policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
@@ -239,7 +239,11 @@ actor MCPBootstrapLease {
         // Ensure MCP server is started (agent-mode hook)
         if let enabler = mcpServerEnabler {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) enabling MCP server before gate acquire")
-            await enabler()
+            guard await enabler() else {
+                acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) MCP server enabler failed")
+                await cancelAndCleanup()
+                return false
+            }
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) MCP server enabler completed")
             if shouldAbortAcquire {
                 await cancelAndCleanup()
@@ -421,7 +425,8 @@ actor MCPBootstrapLease {
 
     private func releaseRouting(
         selection: RoutingWaitSelection,
-        progressReporter: MCPBootstrapRoutingProgressReporter?
+        progressReporter: MCPBootstrapRoutingProgressReporter?,
+        beforeRoutingCleanup: (@MainActor () async -> Bool)? = nil
     ) async -> MCPRoutingWaitOutcome {
         guard !hasReleased else {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) routing release ignored because lease already released")
@@ -492,6 +497,19 @@ actor MCPBootstrapLease {
             break
         }
 
+        if outcome == .routed,
+           let beforeRoutingCleanup,
+           await !beforeRoutingCleanup()
+        {
+            if Task.isCancelled {
+                outcome = .cancelled
+                await cancelAndCleanup()
+            } else {
+                outcome = .failed(.signalled)
+                await failAndCleanup()
+            }
+        }
+
         // Publish the finalized result to this run's lease before any awaited diagnostics or
         // cleanup can erase MCPRoutingWaiter's process-global terminal state.
         routingTerminalOutcome = outcome
@@ -538,10 +556,14 @@ actor MCPBootstrapLease {
     }
 
     /// Fail-closed routing readiness that consumes the typed absolute-deadline core.
-    func requireRouting(timeoutMs: Int = 10000) async throws {
+    func requireRouting(
+        timeoutMs: Int = 10000,
+        beforeRoutingCleanup: (@MainActor () async -> Bool)? = nil
+    ) async throws {
         let outcome = await releaseRouting(
             selection: .absolute(timeoutMs: timeoutMs),
-            progressReporter: nil
+            progressReporter: nil,
+            beforeRoutingCleanup: beforeRoutingCleanup
         )
         switch outcome {
         case .routed:

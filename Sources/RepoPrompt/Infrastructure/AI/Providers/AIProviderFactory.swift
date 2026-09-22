@@ -18,7 +18,7 @@ class AIProviderFactory {
         }
 
         // CLI providers don't need API keys - they leverage existing authentication
-        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor {
+        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .grokBuild || providerType == .devin {
             return try await createProvider(
                 for: providerType,
                 key: "",
@@ -87,6 +87,10 @@ class AIProviderFactory {
             return OpenCodeCLIProvider()
         case .cursor:
             return CursorCLIProvider()
+        case .grokBuild:
+            return GrokBuildCLIProvider()
+        case .devin:
+            return DevinCLIProvider()
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 
@@ -178,6 +182,8 @@ enum AIProviderType: Codable, Equatable {
     case codex // <-- New Codex CLI provider case
     case openCode // OpenCode CLI provider case
     case cursor // Cursor CLI provider case
+    case grokBuild // Grok Build CLI provider case
+    case devin
 }
 
 extension AIProviderType {
@@ -199,6 +205,8 @@ extension AIProviderType {
         case .codex: "Codex CLI"
         case .openCode: "OpenCode"
         case .cursor: "Cursor CLI"
+        case .grokBuild: "Grok Build"
+        case .devin: "Devin"
         }
     }
 
@@ -347,12 +355,21 @@ private extension String {
     }
 }
 
+enum AIProviderCompletionOutcome: Equatable {
+    case completed
+    case incomplete(reason: String)
+}
+
 /// Updated `AIStreamResult` to include optional `reasoning`, token counts, and tool metadata.
 struct AIStreamResult {
     /// Standard type strings for stream results
     static let lifecycleType = "lifecycle"
+    /// Transport-level activity with no semantic assistant payload.
+    static let transportActivityType = "transport_activity"
+    /// Provider-reported terminal state that preserves partial output without declaring success.
+    static let incompleteType = "message_incomplete"
 
-    let type: String // e.g. "content", "message_stop", "tool_call", "tool_result", "final_content", "lifecycle"
+    let type: String // e.g. "content", "message_stop", "tool_call", "tool_result", "final_content", "lifecycle", "transport_activity"
     let text: String? // normal content (like streaming tokens)
     let reasoning: String? // optional reasoning content
     let promptTokens: Int? // token usage
@@ -429,12 +446,20 @@ struct AICompletionResult {
     let promptTokens: Int?
     let completionTokens: Int?
     let cost: Double?
+    let completionOutcome: AIProviderCompletionOutcome
 
-    init(text: String, promptTokens: Int? = nil, completionTokens: Int? = nil, cost: Double? = nil) {
+    init(
+        text: String,
+        promptTokens: Int? = nil,
+        completionTokens: Int? = nil,
+        cost: Double? = nil,
+        completionOutcome: AIProviderCompletionOutcome = .completed
+    ) {
         self.text = text
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.cost = cost
+        self.completionOutcome = completionOutcome
     }
 }
 

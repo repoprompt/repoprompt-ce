@@ -2535,14 +2535,14 @@ actor WorkspaceCodemapLiveOverlay {
         _ root: inout RootState,
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
-        for identity in root.pipelines.keys {
+        for identity in Array(root.pipelines.keys) {
             guard var pipeline = root.pipelines[identity],
                   advanceManifestInvalidationGeneration(
                       &pipeline,
                       root: &root,
                       rootEpoch: rootEpoch
                   )
-            else { return }
+            else { continue }
             root.pipelines[identity] = pipeline
         }
     }

@@ -3,14 +3,20 @@ import Foundation
 /// Centralizes context builder budget selection so UI and MCP paths resolve
 /// clarify/omitted runs and follow-up-generation runs consistently.
 enum ContextBuilderBudgetResolver {
-    static func resolveBudget(
-        wantsResponse: Bool,
-        discoveryTokenBudget: Int?,
-        planTokenBudget: Int?
+    static func resolveUIBudget(
+        behaviorSettings: ContextBuilderBehaviorSettings
     ) -> Int {
-        if wantsResponse {
-            return planTokenBudget ?? ContextBuilderDefaults.planTokenBudget
-        }
-        return discoveryTokenBudget ?? ContextBuilderDefaults.discoveryTokenBudget
+        behaviorSettings.followUpAnalysisEnabled
+            ? behaviorSettings.analysisTokenBudget
+            : behaviorSettings.contextTokenBudget
+    }
+
+    static func resolveMCPBudget(
+        wantsResponse: Bool,
+        behaviorSettings: ContextBuilderBehaviorSettings
+    ) -> Int {
+        wantsResponse
+            ? behaviorSettings.analysisTokenBudget
+            : behaviorSettings.contextTokenBudget
     }
 }

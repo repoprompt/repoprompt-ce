@@ -205,10 +205,8 @@ enum HistoryMCPToolService {
                 firstActivityAt: iso8601DateTime.string(from: r.firstActivityAt ?? r.activityDate),
                 lastActivityAt: iso8601DateTime.string(from: r.lastActivityAt ?? r.savedAt),
                 activeDurationSeconds: r.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
-                // `turn_count` here is the projected visible item/row count (itemCount), not raw
-                // transcript turns; `time` calendar groups and `get_session.total_turns` count
-                // real turns. Kept as-is for `list_sessions` API stability (see spec).
-                turnCount: r.itemCount,
+                turnCount: r.transcriptTurnCount,
+                projectedItemCount: r.itemCount,
                 toolCallCount: r.toolCallCount,
                 filesTouched: cappedFilesTouched,
                 filesTouchedCount: filesTouched.count,
@@ -350,6 +348,22 @@ enum HistoryMCPToolService {
         }
         let transcript = loaded.transcript
         let sessionName = loaded.name ?? record?.name ?? ""
+        let tokenUsageSummary = HistoryGetSessionReply.TokenUsageSummaryDTO(
+            providerInputTokens: loaded.providerTokenUsageByTurn.reduce(0) { $0 + $1.promptTokens },
+            providerOutputTokens: loaded.providerTokenUsageByTurn.reduce(0) { $0 + $1.completionTokens },
+            estimatedToolInputTokens: loaded.providerTokenUsageByTurn.reduce(0) { $0 + $1.estimatedToolInputTokens },
+            estimatedToolOutputTokens: loaded.providerTokenUsageByTurn.reduce(0) { $0 + $1.estimatedToolOutputTokens },
+            attributedRunCount: Set(loaded.providerTokenUsageByTurn.compactMap(\.runID)).count,
+            unattributedUsageCount: loaded.providerTokenUsageByTurn.count(where: { $0.runID == nil }),
+            codexLastContextTokens: loaded.codexLastTotalTokens,
+            codexTotalTokens: loaded.codexTotalTotalTokens
+        )
+        let tokenUsageByTurnID = Dictionary(
+            grouping: loaded.providerTokenUsageByTurn.compactMap { usage in
+                usage.turnID.map { ($0, usage) }
+            },
+            by: { $0.0 }
+        ).mapValues { $0.map(\.1) }
         let totalTurns = transcript.turns.count
         guard totalTurns > 0 else {
             return .getSession(HistoryGetSessionReply(
@@ -362,6 +376,7 @@ enum HistoryMCPToolService {
                 truncated: false,
                 scanTruncated: lookupDiagnostics.isEmpty ? nil : true,
                 scanDiagnostics: nonEmptyScanDiagnostics(lookupDiagnostics),
+                tokenUsageSummary: tokenUsageSummary,
                 turns: []
             ))
         }
@@ -407,6 +422,7 @@ enum HistoryMCPToolService {
                 turn,
                 turnIndex: turnIndex,
                 roles: roles,
+                tokenUsage: tokenUsageByTurnID[turn.id] ?? [],
                 remainingChars: &remainingChars,
                 requestBudget: requestBudget
             )
@@ -434,6 +450,7 @@ enum HistoryMCPToolService {
             truncated: replyTruncated,
             scanTruncated: lookupDiagnostics.isEmpty ? nil : true,
             scanDiagnostics: nonEmptyScanDiagnostics(lookupDiagnostics),
+            tokenUsageSummary: tokenUsageSummary,
             turns: turnDTOs
         ))
     }
@@ -1140,9 +1157,6 @@ enum HistoryMCPToolService {
                 let start = turn.startedAt
                 if let dateFrom, start < dateFrom { continue }
                 if let dateTo, start > dateTo { continue }
-                let end = turn.completedAt ?? turn.lastActivityAt ?? start
-                guard end >= start else { continue }
-
                 // The turn (and its tool calls) belong to the group it started in.
                 guard let startGroup = groupBounds(for: start) else { continue }
                 turnsByKey[startGroup.key, default: 0] += 1
@@ -1172,16 +1186,19 @@ enum HistoryMCPToolService {
                     toolCallsByKey[startGroup.key, default: 0] += fallbackToolCalls
                 }
 
-                // Clip the interval to each group boundary it spans, so a cross-boundary
-                // turn contributes only its in-boundary portion to each group (a point
-                // turn — end == start — is attributed as-is). Without clipping, a turn
-                // that spans a boundary is fully attributed to its start's group and can
-                // overlap a turn in the next group, double-counting the overlap.
-                if end == start {
-                    intervalsByKey[startGroup.key, default: []].append((start, end))
-                } else {
-                    var cursor = start
-                    while cursor < end {
+                // Treat each observed request/provider/activity timestamp as a point of work.
+                // The idle threshold then decides which gaps are active, including gaps inside
+                // one long-lived turn. Using the full turn boundary here made approval waits and
+                // resumed multi-day turns look continuously active.
+                for interval in AgentSessionMetadataRecord.activityIntervals(from: turn) {
+                    if interval.start == interval.end {
+                        guard let group = groupBounds(for: interval.start) else { continue }
+                        intervalsByKey[group.key, default: []].append(interval)
+                        continue
+                    }
+
+                    var cursor = interval.start
+                    while cursor < interval.end {
                         collectionUnitsProcessed += 1
                         if collectionUnitsProcessed.isMultiple(of: 64),
                            let diagnostic = try await cooperativeCollectionCheckpoint(
@@ -1195,13 +1212,14 @@ enum HistoryMCPToolService {
                             budgetStopped = true
                             break
                         }
-                        guard let g = groupBounds(for: cursor) else { break }
-                        let clippedEnd = min(end, g.end)
-                        intervalsByKey[g.key, default: []].append((cursor, clippedEnd))
-                        cursor = g.end
+                        guard let group = groupBounds(for: cursor) else { break }
+                        let clippedEnd = min(interval.end, group.end)
+                        intervalsByKey[group.key, default: []].append((cursor, clippedEnd))
+                        cursor = clippedEnd
                     }
                     if budgetStopped { break }
                 }
+                if budgetStopped { break }
             }
 
             if budgetStopped { break calendarLoop }
@@ -1360,7 +1378,7 @@ enum HistoryMCPToolService {
         case "duration":
             { $0.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) > $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
         case "turn_count":
-            { $0.record.itemCount > $1.record.itemCount }
+            { $0.record.transcriptTurnCount > $1.record.transcriptTurnCount }
         case "last_activity":
             fallthrough
         default:
@@ -1436,10 +1454,10 @@ enum HistoryMCPToolService {
         }
         if let sortKeys { sortKeys(&orderedKeys) }
 
-        return orderedKeys.map { key in
-            let sessionsInGroup = grouped[key]!
+        return orderedKeys.compactMap { key in
+            guard let sessionsInGroup = grouped[key] else { return nil }
             let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
-            let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.itemCount }
+            let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.transcriptTurnCount }
             let totalToolCalls = sessionsInGroup.reduce(0) { $0 + $1.record.toolCallCount }
 
             return HistoryTimeReply.GroupDTO(
@@ -1454,7 +1472,7 @@ enum HistoryMCPToolService {
                             sessionID: s.record.id.uuidString,
                             sessionName: s.record.name,
                             activeDurationSeconds: s.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
-                            turnCount: s.record.itemCount
+                            turnCount: s.record.transcriptTurnCount
                         )
                     }
                     : nil
@@ -1531,6 +1549,7 @@ enum HistoryMCPToolService {
         _ turn: AgentTranscriptTurn,
         turnIndex: Int,
         roles: Set<String>,
+        tokenUsage: [AgentTokenUsagePersist],
         remainingChars: inout Int,
         requestBudget: HistoryRequestBudget
     ) async throws -> (
@@ -1622,6 +1641,20 @@ enum HistoryMCPToolService {
                 toolCallSummary: roles.contains("tool")
                     ? nil
                     : getSessionToolCallSummary(counts: toolCounts, order: toolOrder),
+                runIDs: Array(Set(turn.responseSpans.compactMap(\.runID))).map(\.uuidString).sorted(),
+                tokenUsage: tokenUsage.map {
+                    HistoryGetSessionReply.TokenUsageDTO(
+                        runID: $0.runID?.uuidString,
+                        turnID: $0.turnID?.uuidString,
+                        inputTokens: $0.promptTokens,
+                        outputTokens: $0.completionTokens,
+                        contextUsedTokens: $0.contextUsedTokens,
+                        estimatedUserInputTokens: $0.estimatedUserInputTokens,
+                        estimatedToolInputTokens: $0.estimatedToolInputTokens,
+                        estimatedToolOutputTokens: $0.estimatedToolOutputTokens,
+                        timestamp: iso8601DateTime.string(from: $0.timestamp)
+                    )
+                },
                 entries: entries,
                 truncated: turnTruncated,
                 entriesOmitted: entriesOmitted > 0 ? entriesOmitted : nil

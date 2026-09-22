@@ -8,12 +8,34 @@ struct ACPDynamicModelRecord: Codable, Hashable {
     let isProviderDefault: Bool
     let supportedReasoningEfforts: [String]
     let defaultReasoningEffort: String?
+    /// Variant provenance for synthesized effort options. Optional so records persisted
+    /// before effort support decode unchanged.
+    var effortVariant: AgentModelEffortVariant? = nil
 }
 
 struct ACPDynamicProviderRecord: Codable, Hashable {
     let providerID: String
     let currentModelRaw: String?
+    /// Active reasoning effort for providers with direct effort authority (e.g. Grok).
+    /// Optional so records persisted before effort support decode unchanged.
+    var currentEffortRaw: String? = nil
     let options: [ACPDynamicModelRecord]
+    /// Optional for backward-compatible decode of model-only registry records.
+    var modelParameterSets: [ACPModelParameterSet]? = nil
+
+    init(
+        providerID: String,
+        currentModelRaw: String?,
+        currentEffortRaw: String? = nil,
+        options: [ACPDynamicModelRecord],
+        modelParameterSets: [ACPModelParameterSet] = []
+    ) {
+        self.providerID = providerID
+        self.currentModelRaw = currentModelRaw
+        self.currentEffortRaw = currentEffortRaw
+        self.options = options
+        self.modelParameterSets = modelParameterSets
+    }
 }
 
 enum ACPDynamicModelStore {
@@ -81,7 +103,9 @@ enum ACPDynamicModelStore {
         return ACPDynamicProviderRecord(
             providerID: providerID.rawValue,
             currentModelRaw: normalizedCurrentModelRaw(snapshot.currentModelRaw, options: options),
-            options: options
+            currentEffortRaw: snapshot.currentEffortRaw,
+            options: options,
+            modelParameterSets: canonicalParameterSets(snapshot.modelParameterSets, options: options)
         )
     }
 
@@ -89,7 +113,60 @@ enum ACPDynamicModelStore {
         let options = record.options.compactMap(modelOption(from:))
         guard !options.isEmpty else { return nil }
         let currentModelRaw = normalizedCurrentModelRaw(record.currentModelRaw, options: record.options)
-        return ACPDiscoveredSessionModels(options: options, currentModelRaw: currentModelRaw)
+        return ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: currentModelRaw,
+            currentEffortRaw: record.currentEffortRaw,
+            modelParameterSets: canonicalParameterSets(record.modelParameterSets ?? [], options: record.options)
+        )
+    }
+
+    private static func canonicalParameterSets(
+        _ sets: [ACPModelParameterSet],
+        options: [ACPDynamicModelRecord]
+    ) -> [ACPModelParameterSet] {
+        var result: [ACPModelParameterSet] = []
+        for set in sets {
+            let modelMatches = options.filter {
+                $0.rawValue.caseInsensitiveCompare(set.baseModelRaw) == .orderedSame
+            }
+            guard modelMatches.count == 1, let canonicalModel = modelMatches.first?.rawValue else { continue }
+            var seenIDs = Set<String>()
+            let parameters = set.parameters.compactMap { definition -> ACPModelParameterDefinition? in
+                guard !definition.configID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      seenIDs.insert(definition.configID).inserted
+                else { return nil }
+                var seenValues = Set<String>()
+                let choices = definition.choices.filter {
+                    !$0.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && seenValues.insert($0.rawValue).inserted
+                }
+                guard !choices.isEmpty else { return nil }
+                let canonical = ACPModelParameterDefinition(
+                    kind: definition.kind,
+                    configID: definition.configID,
+                    displayName: definition.displayName,
+                    choices: choices,
+                    currentValueRaw: definition.currentValueRaw
+                )
+                guard let current = canonical.choice(matching: definition.currentValueRaw) else { return nil }
+                return ACPModelParameterDefinition(
+                    kind: canonical.kind,
+                    configID: canonical.configID,
+                    displayName: canonical.displayName,
+                    choices: canonical.choices,
+                    currentValueRaw: current.rawValue
+                )
+            }.sorted {
+                if $0.kind.sortOrder != $1.kind.sortOrder {
+                    return $0.kind.sortOrder < $1.kind.sortOrder
+                }
+                return $0.configID < $1.configID
+            }
+            guard !parameters.isEmpty else { continue }
+            result.append(.init(baseModelRaw: canonicalModel, parameters: parameters))
+        }
+        return result.sorted { $0.baseModelRaw.lowercased() < $1.baseModelRaw.lowercased() }
     }
 
     private static func loadProviderRecords(defaults: UserDefaults) -> [ACPDynamicProviderRecord] {
@@ -128,7 +205,8 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: option.isPlaceholderDefault,
             isProviderDefault: option.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: option.defaultReasoningEffort?.rawValue
+            defaultReasoningEffort: option.defaultReasoningEffort?.rawValue,
+            effortVariant: option.effortVariant
         )
     }
 
@@ -145,7 +223,8 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: record.isPlaceholderDefault,
             isProviderDefault: record.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort)
+            defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort),
+            effortVariant: record.effortVariant
         )
     }
 
@@ -196,7 +275,10 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: existing.isPlaceholderDefault || candidate.isPlaceholderDefault,
             isProviderDefault: existing.isProviderDefault || candidate.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort
+            defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort,
+            // Variant provenance is semantic identity, not metadata: keep it only when both
+            // records agree, so a real base (nil) never inherits stale variant provenance.
+            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil
         )
     }
 
@@ -288,7 +370,19 @@ enum ACPAIModelCatalog {
     }
 
     static func cursorModelsFromStore() -> [AIModel] {
-        cursorModelOptionsFromStore().map { .cursorCustom(name: $0.rawValue) }
+        cursorModelOptionsForPicker().map { .cursorCustom(name: $0.rawValue) }
+    }
+
+    static func grokBuildModelsFromStore() -> [AIModel] {
+        grokBuildModelOptionsFromStore().map { .grokBuildCustom(name: $0.rawValue) }
+    }
+
+    static func devinModelOptionsFromStore() -> [AgentModelOption] {
+        AgentACPModelRegistry.shared.resolvedSnapshot(for: .devin)?.options ?? []
+    }
+
+    static func devinModelsFromStore() -> [AIModel] {
+        devinModelOptionsFromStore().map { .devinCustom(name: $0.rawValue) }
     }
 
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
@@ -299,14 +393,20 @@ enum ACPAIModelCatalog {
     }
 
     static func cursorModelOption(for rawValue: String) -> AgentModelOption? {
+        CursorAIModelCatalog.option(matching: rawValue)
+    }
+
+    static func grokBuildModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
-        if let discovered = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options.first(where: {
-            $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame
-        }) {
-            return discovered
-        }
-        return cursorModelOptionsFromStore()
+        return grokBuildModelOptionsFromStore()
+            .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+    }
+
+    static func devinModelOption(for rawValue: String) -> AgentModelOption? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return devinModelOptionsFromStore()
             .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
     }
 
@@ -317,29 +417,22 @@ enum ACPAIModelCatalog {
         } else {
             trimmed[...]
         }
-        return String(base).replacingOccurrences(of: " ", with: "-")
+        return String(base)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: " ", with: "-")
     }
 
-    private static func staticCursorAutoModelOption() -> AgentModelOption {
-        AgentModelOption(
-            rawValue: AgentModel.cursorAuto.rawValue,
-            displayName: AgentModel.cursorAuto.displayName,
-            description: AgentModel.cursorAuto.description,
-            isDefault: true
+    /// Cursor discovery remains runtime authority for applying a selected model and
+    /// its parameters, but is deliberately not picker authority. The release-gated
+    /// catalog makes the non-Agent picker immediately available without an ACP session.
+    private static func cursorModelOptionsForPicker() -> [AgentModelOption] {
+        CursorAIModelCatalog.options
+    }
+
+    private static func grokBuildModelOptionsFromStore() -> [AgentModelOption] {
+        AgentModelCatalog.options(
+            for: .grokBuild,
+            availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
         )
-    }
-
-    private static func cursorModelOptionsFromStore() -> [AgentModelOption] {
-        let fallback = staticCursorAutoModelOption()
-        let discovered = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options ?? []
-        guard !discovered.isEmpty else { return [fallback] }
-        return [fallback] + discovered.filter { !isCursorAutoOption($0) }
-    }
-
-    private static func isCursorAutoOption(_ option: AgentModelOption) -> Bool {
-        let normalizedRaw = normalizedCursorModelAlias(option.rawValue)
-        let normalizedDisplayName = normalizedCursorModelAlias(option.displayName)
-        return normalizedRaw == AgentModel.cursorAuto.rawValue
-            || normalizedDisplayName == AgentModel.cursorAuto.rawValue
     }
 }

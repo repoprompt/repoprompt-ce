@@ -264,7 +264,7 @@ import MCP
             guard let workspace = window.workspaceManager.activeWorkspace else { return nil }
             let url = window.workspaceManager.workspaceFileURL(for: workspace)
             guard FileManager.default.fileExists(atPath: url.path),
-                  let diskWorkspace = try? WorkspaceManagerViewModel.loadWorkspaceFromFile(at: url)
+                  let diskWorkspace = try? WorkspaceManagerViewModel.loadWorkspaceFromFile(at: url, scheduleNormalizationWriteback: false)
             else {
                 return nil
             }

@@ -110,6 +110,16 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
                 CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
             case let .reasoningSummaries(enabled):
                 CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
+            case let .memories(enabled):
+                CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
+            case let .apps(enabled):
+                CodexAgentModeBooleanPreference.apps.setEnabled(enabled, defaults: defaults)
+            case let .plugins(enabled):
+                CodexAgentModeBooleanPreference.plugins.setEnabled(enabled, defaults: defaults)
+            case let .mcpElicitation(enabled):
+                CodexAgentModeBooleanPreference.mcpElicitation.setEnabled(enabled, defaults: defaults)
+            case let .toolSuggestions(enabled):
+                CodexAgentModeBooleanPreference.toolSuggestions.setEnabled(enabled, defaults: defaults)
             case let .mcpServer(normalizedName, enabled):
                 CodexAgentToolPreferences.setMCPServerEnabled(
                     normalizedName: normalizedName,
@@ -175,8 +185,14 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
             ClaudeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .openCode(level):
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .antigravity(level):
+            AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .grokBuild(level):
+            GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .devin(level):
+            DevinAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
     }
 

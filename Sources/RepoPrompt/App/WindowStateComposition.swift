@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 @MainActor
 struct WindowStateComposition {
@@ -10,6 +11,7 @@ struct WindowStateComposition {
     let promptManager: PromptViewModel
     let oracleViewModel: OracleViewModel
     let apiSettingsViewModel: APISettingsViewModel
+    let routerSettingsViewModel: RouterSettingsViewModel
     let contextBuilderAgentViewModel: ContextBuilderAgentViewModel
     let agentModeViewModel: AgentModeViewModel
     #if DEBUG
@@ -21,6 +23,7 @@ struct WindowStateComposition {
     let aiQueriesService: AIQueriesService
     let chatDataService: ChatDataService
     let workspaceManager: WorkspaceManagerViewModel
+    let domainWorkspacePresentationBridge: DomainWorkspacePresentationBridge?
 }
 
 @MainActor
@@ -29,13 +32,19 @@ enum WindowStateCompositionFactory {
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
+        settingsStore: GlobalSettingsStore = .shared,
+        domainRuntime: MCPDomainRuntime? = nil,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
+        keyManager injectedKeyManager: KeyManager? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil
     ) -> WindowStateComposition {
+        let modelRouterRuntime = injectedModelRouterRuntime ?? WindowStatesManager.shared.modelRouterRuntime
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
@@ -49,7 +58,7 @@ enum WindowStateCompositionFactory {
         let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
 
         // 2) AI queries
-        let keyManager = KeyManager()
+        let keyManager = injectedKeyManager ?? KeyManager()
         let aiQueriesService = aiQueriesServiceFactory?(keyManager)
             ?? AIQueriesService(keyManager: keyManager)
 
@@ -62,7 +71,7 @@ enum WindowStateCompositionFactory {
         )
 
         // 5) Settings Manager (per-window overlay)
-        let settingsManager = WindowSettingsManager(windowID: windowID)
+        let settingsManager = WindowSettingsManager(windowID: windowID, store: settingsStore)
 
         // 6) Prompt
         let promptManager = PromptViewModel(
@@ -70,16 +79,31 @@ enum WindowStateCompositionFactory {
             aiQueriesService: aiQueriesService,
             apiSettingsViewModel: apiSettingsViewModel,
             windowID: windowID,
-            settingsManager: settingsManager
+            settingsManager: settingsManager,
+            storedPromptPersistence: storedPromptPersistence
         )
 
-        // 7) Create the workspace manager
+        // 7) Create the workspace manager with construction-time runtime persistence ownership.
+        let domainWorkspaceClient = domainRuntime.map {
+            DomainWorkspaceAuthorityClient(store: $0.workspaceStore, windowID: windowID)
+        }
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
+            domainWorkspaceAuthorityClient: domainWorkspaceClient,
             switchTimingPolicy: workspaceSwitchTimingPolicy
         )
+        let routerSettingsViewModel = RouterSettingsViewModel(
+            settingsStore: settingsStore,
+            runtime: modelRouterRuntime,
+            apiSettingsViewModel: apiSettingsViewModel,
+            workspaceManager: workspaceManager
+        )
+        let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
+            DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)
+        }
+        domainWorkspacePresentationBridge?.start()
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,
             store: workspaceFileContextStore
@@ -132,6 +156,10 @@ enum WindowStateCompositionFactory {
                     workspaceManager: workspaceManager
                 )
             },
+            domainRoutingCoordinator: domainRuntime?.routingCoordinator,
+            domainWorkspaceAuthorityClient: domainWorkspaceClient,
+            domainReadSideEffectCoordinator: domainRuntime?.readSideEffectCoordinator,
+            domainReadRuntimeIdentity: domainRuntime?.identity,
             applyEditsApprovalStore: applyEditsApprovalStore
         )
         let closeCoordinator = WindowCloseCoordinator()
@@ -142,6 +170,7 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
+            settingsManager: settingsStore,
             providerFactory: contextBuilderProviderFactory,
             codexModelPollingService: codexModelPollingService
         )
@@ -153,10 +182,12 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
-            applyEditsApprovalStore: applyEditsApprovalStore
+            applyEditsApprovalStore: applyEditsApprovalStore,
+            modelRouterSettingsStore: settingsStore,
+            modelRouterRuntime: modelRouterRuntime
         )
-        workspaceFilesViewModel.setSessionWorktreeBindingsProvider { [weak agentModeViewModel] sessionID in
-            agentModeViewModel?.worktreeBindings(forAgentSessionID: sessionID) ?? []
+        workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
+            agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
         }
         if deferredInitialAgentSystemWorkspaceRefresh {
             agentModeViewModel.deferInitialSystemWorkspaceSessionListRefresh(reason: "programmaticNewWindowWorkspaceSwitch")
@@ -204,6 +235,7 @@ enum WindowStateCompositionFactory {
                 promptManager: promptManager,
                 oracleViewModel: oracleViewModel,
                 apiSettingsViewModel: apiSettingsViewModel,
+                routerSettingsViewModel: routerSettingsViewModel,
                 contextBuilderAgentViewModel: contextBuilderAgentViewModel,
                 agentModeViewModel: agentModeViewModel,
                 agentChatStressHarness: agentChatStressHarness,
@@ -212,7 +244,8 @@ enum WindowStateCompositionFactory {
                 keyManager: keyManager,
                 aiQueriesService: aiQueriesService,
                 chatDataService: chatDataService,
-                workspaceManager: workspaceManager
+                workspaceManager: workspaceManager,
+                domainWorkspacePresentationBridge: domainWorkspacePresentationBridge
             )
         #else
             return WindowStateComposition(
@@ -224,6 +257,7 @@ enum WindowStateCompositionFactory {
                 promptManager: promptManager,
                 oracleViewModel: oracleViewModel,
                 apiSettingsViewModel: apiSettingsViewModel,
+                routerSettingsViewModel: routerSettingsViewModel,
                 contextBuilderAgentViewModel: contextBuilderAgentViewModel,
                 agentModeViewModel: agentModeViewModel,
                 mcpServer: mcpServer,
@@ -231,7 +265,8 @@ enum WindowStateCompositionFactory {
                 keyManager: keyManager,
                 aiQueriesService: aiQueriesService,
                 chatDataService: chatDataService,
-                workspaceManager: workspaceManager
+                workspaceManager: workspaceManager,
+                domainWorkspacePresentationBridge: domainWorkspacePresentationBridge
             )
         #endif
     }

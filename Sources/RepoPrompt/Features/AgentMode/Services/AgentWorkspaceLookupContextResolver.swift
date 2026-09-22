@@ -66,6 +66,8 @@ struct AgentWorkspaceLookupContextSource: Equatable {
                         StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath),
                         binding.worktreeID,
                         StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath),
+                        binding.commonGitDir.map(StandardizedPath.absolute) ?? "",
+                        binding.isMainWorktree.map { String($0) } ?? "",
                         binding.branch ?? "",
                         binding.head ?? ""
                     ].joined(separator: "\u{1F}")
@@ -150,8 +152,17 @@ enum AgentWorkspaceLookupContextResolver {
         let logicalRootPaths = Set(bindings.compactMap {
             AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath($0.logicalRootPath)
         })
+        let bindingsMapDistinctLogicalRootsToWorktrees = bindings.allSatisfy { binding in
+            guard let logicalRootPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(
+                binding.logicalRootPath
+            ), let worktreeRootPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(
+                binding.worktreeRootPath
+            ) else { return false }
+            return logicalRootPath != worktreeRootPath
+        }
         guard logicalRootPaths.count == bindings.count,
-              logicalRootPaths.isSubset(of: visibleRootPaths)
+              logicalRootPaths.isSubset(of: visibleRootPaths),
+              bindingsMapDistinctLogicalRootsToWorktrees
         else {
             throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
         }

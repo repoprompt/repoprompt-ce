@@ -38,68 +38,6 @@ final class TextFieldMentionHelpersTests: XCTestCase {
         XCTAssertEqual(committed, second)
         XCTAssertEqual(textView.string, "@Sources/Second.swift ")
     }
-
-    func testSlashSkillClickSurvivesDelayedRefreshCompletionBeforeAccept() async throws {
-        let first = MentionSuggestion(
-            displayName: "/first",
-            relativePath: "first",
-            kind: .skill
-        )
-        let clicked = MentionSuggestion(
-            displayName: "/clicked",
-            relativePath: "clicked",
-            kind: .skill
-        )
-        let refreshed = MentionSuggestion(
-            displayName: "/refreshed",
-            relativePath: "refreshed",
-            kind: .skill
-        )
-        let provider = DelayedSuggestionProvider(initial: [first, clicked], refreshed: [refreshed])
-        let owner = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
-            styleMask: .borderless,
-            backing: .buffered,
-            defer: false
-        )
-        defer { owner.orderOut(nil) }
-        let textView = ImageAwareTextView(frame: NSRect(x: 20, y: 20, width: 300, height: 80))
-        textView.string = "/c"
-        textView.setSelectedRange(NSRange(location: 2, length: 0))
-        owner.contentView = textView
-        let helper = SlashSkillMentionHelper()
-        helper.configure(
-            textView: textView,
-            enabled: true,
-            suggestionsProvider: { query in await provider.suggestions(for: query) }
-        )
-        try await waitUntil { helper.suggestionsForTesting == [first, clicked] }
-
-        helper.scheduleRefresh(for: textView, immediate: true, enabled: true, isActive: true)
-        try await waitUntil { provider.callCount == 2 }
-        helper.clickSuggestionForTesting(at: 1)
-        provider.completeRefresh()
-        try await Task.sleep(nanoseconds: 50_000_000)
-
-        let handled = helper.handleCommandIfNeeded(
-            textView: textView,
-            commandSelector: #selector(NSResponder.insertNewline(_:)),
-            enabled: true
-        )
-
-        XCTAssertTrue(handled)
-        XCTAssertEqual(textView.string, "/clicked ")
-    }
-
-    private func waitUntil(
-        _ condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        for _ in 0 ..< 100 {
-            if condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition")
-    }
 }
 
 @MainActor

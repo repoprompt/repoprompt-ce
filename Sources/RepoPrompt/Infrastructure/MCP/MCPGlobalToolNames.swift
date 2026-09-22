@@ -1,14 +1,4 @@
-import Foundation
+import RepoPromptDomainRuntime
 
-/// Stable internal namespace for app-wide MCP tool names.
-enum MCPGlobalToolName {
-    static let appSettings = "app_settings"
-    static let bindContext = "bind_context"
-    static let manageWorkspaces = "manage_workspaces"
-
-    static let orderedToolNames = [
-        appSettings,
-        bindContext,
-        manageWorkspaces
-    ]
-}
+/// App compatibility name for the canonical domain-runtime namespace.
+typealias MCPGlobalToolName = RepoPromptDomainRuntime.MCPGlobalToolName

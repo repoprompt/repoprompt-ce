@@ -3,7 +3,9 @@ import RepoPromptShared
 import SwiftUI
 
 func normalizedToolCardName(_ name: String?) -> String? {
-    guard let raw = name?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+    guard let acceptedName = AgentToolNamePolicy.accepted(name) else { return nil }
+    let raw = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !raw.isEmpty else { return nil }
     let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(raw) ?? raw
     // External tools can be namespaced (for example, "functions.bash").
     // Route by suffix so tool cards stay consistent.
@@ -41,12 +43,14 @@ enum AgentOracleToolRouting {
     static func operationPopoverUserInfo(
         openContext: AgentOracleOpenContext?,
         chatID: String?,
-        tabID: UUID? = nil
+        tabID: UUID? = nil,
+        presentation: AgentOraclePopoverPresentation = .standard
     ) -> [AnyHashable: Any]? {
         AgentOraclePopoverRoute(
             openContext: openContext,
             chatID: chatID,
-            tabID: tabID
+            tabID: tabID,
+            presentation: presentation
         )?.notificationUserInfo
     }
 
@@ -631,8 +635,10 @@ private enum ToolCardSubtitleBuilder {
         if detach == true {
             return "detach"
         }
-        let resolvedTimeout = timeout ?? MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
-        return resolvedTimeout <= 0 ? "poll" : "wait ≤\(formatSeconds(resolvedTimeout))"
+        guard let timeout else {
+            return "wait (default)"
+        }
+        return timeout <= 0 ? "poll" : "wait ≤\(formatSeconds(timeout))"
     }
 
     private static func formatSeconds(_ seconds: Double) -> String {

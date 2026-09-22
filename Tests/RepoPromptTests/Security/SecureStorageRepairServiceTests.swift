@@ -3,6 +3,26 @@ import Foundation
 import XCTest
 
 final class SecureStorageRepairServiceTests: XCTestCase {
+    func testOfficialRuntimeFactoryRepairsIntoSelectedRuntimeBackend() async throws {
+        let legacy = TestSecureStorageBackend(values: [.openAIAPI: "legacy-secret"])
+        let selectedRuntimeBackend = TestSecureStorageBackend()
+        let decision = RuntimeSecureStorageDecision(
+            domain: .officialDeveloperID,
+            rejectionReason: nil
+        )
+        let service = try XCTUnwrap(SecureStorageRepairService.makeForRuntime(
+            decision: decision,
+            legacyStore: legacy,
+            targetStore: selectedRuntimeBackend
+        ))
+
+        let result = await service.importAccount(.openAIAPI)
+
+        XCTAssertEqual(result.state, .imported)
+        XCTAssertEqual(selectedRuntimeBackend.value(for: .openAIAPI), "legacy-secret")
+        XCTAssertEqual(legacy.value(for: .openAIAPI), "legacy-secret")
+    }
+
     func testScanClassifiesKnownAccountsNoninteractivelyAndContinuesAfterFailures() async {
         let accounts: [SecureStorageAccount] = [
             .anthropicAPI,

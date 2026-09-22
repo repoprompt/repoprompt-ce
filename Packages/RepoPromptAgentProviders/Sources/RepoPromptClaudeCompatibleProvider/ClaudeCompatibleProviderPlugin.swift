@@ -234,9 +234,12 @@ public enum ClaudeCompatibleModelCatalog {
     private static let haikuRaw = "haiku"
     private static let sonnetRaw = "sonnet"
     private static let opusRaw = "opus"
+    private static let fableRaw = "fable"
+    private static let fable51Raw = "claude-fable-5-1"
     private static let fable5Raw = "claude-fable-5"
     private static let opus1mRaw = "opus[1m]"
     private static let opus5Raw = "claude-opus-5"
+    private static let opus48Raw = "claude-opus-4-8"
     private static let opus47Raw = "claude-opus-4-7"
     private static let opus46Raw = "claude-opus-4-6"
     private static let opus45Raw = "claude-opus-4-5"
@@ -247,9 +250,21 @@ public enum ClaudeCompatibleModelCatalog {
 
     private static let claudeModels: [StaticModel] = [
         StaticModel(
+            rawValue: fableRaw,
+            displayName: "Fable Latest",
+            description: "Latest Claude Fable model for demanding reasoning and long-horizon agentic work.",
+            supportsXHigh: true
+        ),
+        StaticModel(
+            rawValue: fable51Raw,
+            displayName: "Fable 5.1",
+            description: "Pinned Claude Fable 5.1 with 1M context for demanding reasoning and long-horizon agentic work. Requires Claude Code 2.1.255 or newer.",
+            supportsXHigh: true
+        ),
+        StaticModel(
             rawValue: fable5Raw,
             displayName: "Fable 5",
-            description: "Claude Fable 5. Anthropic's most capable widely released model for demanding reasoning and long-horizon agentic work.",
+            description: "Pinned Claude Fable 5 with 1M context for demanding reasoning and long-horizon agentic work.",
             supportsXHigh: true
         ),
         StaticModel(
@@ -268,6 +283,12 @@ public enum ClaudeCompatibleModelCatalog {
             rawValue: opus5Raw,
             displayName: "Opus 5",
             description: "Pinned Claude Opus 5 with 1M context for demanding reasoning and long-horizon agentic work. Requires Claude Code 2.1.219 or newer.",
+            supportsXHigh: true
+        ),
+        StaticModel(
+            rawValue: opus48Raw,
+            displayName: "Opus 4.8",
+            description: "Pinned Claude Opus 4.8 with native 1M context. Opus-tier capability for complex reasoning and architecture.",
             supportsXHigh: true
         ),
         StaticModel(

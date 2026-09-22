@@ -25,14 +25,50 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "ZAIAPI",
                 "ClaudeCompatibleBackend.kimi.apiKey",
                 "ClaudeCompatibleBackend.custom.apiKey",
+                "JevRouterAPIKey",
                 "rp.agent.permissions.subagent.v1",
                 "rp.agent.permissions.codex.v1",
                 "rp.agent.permissions.claude.v1",
                 "rp.agent.permissions.openCode.v1",
-                "rp.agent.permissions.cursor.v1"
+                "rp.agent.permissions.cursor.v1",
+                "rp.agent.permissions.grokBuild.v1",
+                "rp.agent.permissions.antigravity.v1",
+                "rp.agent.permissions.devin.v1"
             ]
         )
-        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 23)
+        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 27)
+    }
+
+    func testIdentityMigrationV2CatalogRemainsFrozen() {
+        XCTAssertEqual(
+            SecureStorageAccountCatalog.identityMigrationV2Accounts.map(\.identifier),
+            [
+                "AnthropicAPI",
+                "OpenAIAPI",
+                "GeminiAPI",
+                "OpenRouterAPI",
+                "OllamaURL",
+                "AzureAPI",
+                "DeepSeekAPI",
+                "CustomProviderAPI",
+                "FireworksAPI",
+                "GrokAPI",
+                "GroqAPI",
+                "ClaudeCodeAPI",
+                "CodexCLIAPI",
+                "OpenCodeCLIAPI",
+                "CursorCLIAPI",
+                "ZAIAPI",
+                "ClaudeCompatibleBackend.kimi.apiKey",
+                "ClaudeCompatibleBackend.custom.apiKey",
+                "rp.agent.permissions.subagent.v1",
+                "rp.agent.permissions.codex.v1",
+                "rp.agent.permissions.claude.v1",
+                "rp.agent.permissions.openCode.v1",
+                "rp.agent.permissions.cursor.v1",
+                "rp.agent.permissions.grokBuild.v1"
+            ]
+        )
     }
 
     func testProviderMappingsUseCatalogAccounts() {
@@ -81,6 +117,7 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
             "Sources/RepoPrompt/Infrastructure/Security/KeychainService.swift",
             "Sources/RepoPrompt/Infrastructure/Security/SecureKeyService.swift",
             "Sources/RepoPrompt/Infrastructure/Security/SecureKeyValueStorageBackend.swift",
+            "Sources/RepoPrompt/Infrastructure/Security/SecureStorageIdentityMigration.swift",
             "Sources/RepoPrompt/Infrastructure/Security/SecureStorageRepairService.swift"
         ]
 

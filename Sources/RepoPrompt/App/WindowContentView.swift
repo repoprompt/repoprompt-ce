@@ -16,7 +16,9 @@ struct WindowContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     /// The WindowState itself (your big manager of fileManager, promptManager, etc.)
-    @StateObject private var windowState = WindowState()
+    @StateObject private var windowState = WindowState(
+        domainRuntime: AppDomainRuntimeComposition.shared.runtime
+    )
 
     var body: some View {
         ContentView(windowState: windowState)

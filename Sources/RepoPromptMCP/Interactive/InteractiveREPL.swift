@@ -13,6 +13,8 @@ import MCP
 struct InteractiveOptions {
     var snapshotPath: String?
     var initialWindowID: Int?
+    var tabID: String?
+    var contextID: String?
     var prettyJSON: Bool = true
     var rawJSON: Bool = false
     var verbose: Bool = false
@@ -84,6 +86,11 @@ actor InteractiveREPL {
 
         if let toolName = options.callTool {
             await session.setSelectedWindowID(options.initialWindowID)
+            try await session.establishStartupRouting(
+                contextID: options.contextID,
+                tabID: options.tabID,
+                windowID: options.initialWindowID
+            )
             try await callToolSingleShot(name: toolName, argsJSON: options.callArgs)
             return
         }
@@ -111,6 +118,12 @@ actor InteractiveREPL {
             printCallResult(result)
             workspaceCacheDirty = true
         }
+
+        try await session.establishStartupRouting(
+            contextID: options.contextID,
+            tabID: options.tabID,
+            windowID: options.initialWindowID
+        )
 
         // Initial status fetch
         await refreshStatusCache()

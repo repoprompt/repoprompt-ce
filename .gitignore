@@ -28,7 +28,6 @@ dist/
 *.trace
 *.xcresult/
 *.profraw
-docs/test-suite-optimizer/raw-logs/
 
 # Agent-authored working documents
 docs/analysis/
@@ -36,7 +35,6 @@ docs/designs/
 docs/references/
 docs/reviews/
 docs/plans/*
-!docs/plans/test-coverage-value-audit-2026-05-29.md
 
 # Python cache artifacts
 __pycache__/

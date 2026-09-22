@@ -1,380 +1,487 @@
+import Foundation
 @testable import RepoPromptApp
 import XCTest
 
 final class GitRepoTargetResolverTests: XCTestCase {
-    func testResolvesSupportedRepositorySelectorSyntax() async throws {
-        let fixture = ResolverFixture()
-        let scenarios = [
-            ("current worktree", ["@wt"], [fixture.mainRepo], fixture.linkedRepo, [fixture.linkedRepo.rootPath]),
-            ("main from linked worktree", ["@main"], [fixture.linkedRepo], fixture.linkedRepo, [fixture.mainRepo.rootPath]),
-            ("main branch", ["@main:feature/demo"], [fixture.mainRepo], fixture.mainRepo, [fixture.linkedRepo.rootPath]),
-            ("worktree ID", ["@id:\(fixture.linkedWorktree.worktreeID)"], [fixture.mainRepo], fixture.mainRepo, [fixture.linkedRepo.rootPath]),
-            ("explicit branch", ["@branch:feature/demo"], [fixture.mainRepo], fixture.mainRepo, [fixture.linkedRepo.rootPath]),
-            ("bare branch", ["feature/demo"], [fixture.mainRepo], fixture.mainRepo, [fixture.linkedRepo.rootPath]),
-            ("worktree name", ["repo-feature"], [fixture.mainRepo], fixture.mainRepo, [fixture.linkedRepo.rootPath]),
-            ("absolute path", [fixture.linkedRepo.rootPath], [fixture.mainRepo], fixture.mainRepo, [fixture.linkedRepo.rootPath])
+    func testRejectsSamePathWhenFinalExternalResolutionUsesDifferentRepositoryIdentity() async throws {
+        let loadedRootPath = "/tmp/issue-860/loaded"
+        let worktreePath = "/tmp/issue-860/advertised"
+        let advertisedIdentity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: "/tmp/repository-a/.git",
+            worktreeID: "worktree-a",
+            worktreeRootPath: worktreePath,
+            mainWorktreeRoot: loadedRootPath
+        )
+        let replacementIdentity = Self.identity(
+            repositoryID: "repo-b",
+            commonGitDir: "/tmp/repository-b/.git",
+            worktreeID: "worktree-b",
+            worktreeRootPath: worktreePath,
+            mainWorktreeRoot: "/tmp/repository-b"
+        )
+        let advertisedWorktree = Self.worktree(from: advertisedIdentity, path: worktreePath)
+        let resolver = Self.resolver(
+            advertisedWorktree: advertisedWorktree,
+            finalDescriptor: Self.repoDescriptor(from: replacementIdentity, path: worktreePath)
+        )
+
+        do {
+            _ = try await resolver.resolveWorktree(
+                selector: "@id:\(advertisedWorktree.worktreeID)",
+                repo: Self.loadedRepo(path: loadedRootPath),
+                allRepos: [Self.loadedRepo(path: loadedRootPath)],
+                authorizedRoots: [Self.root(path: loadedRootPath)]
+            )
+            XCTFail("A same-path resolution with a different repository identity must be rejected")
+        } catch let error as GitRepoTargetResolverError {
+            XCTAssertTrue(error.message.contains("worktree path must be inside a loaded root"))
+        }
+    }
+
+    func testRejectsSamePathWhenFinalExternalResolutionHasNoGitIdentity() async throws {
+        let loadedRootPath = "/tmp/issue-860/loaded"
+        let worktreePath = "/tmp/issue-860/advertised"
+        let identity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: "/tmp/repository-a/.git",
+            worktreeID: "worktree-a",
+            worktreeRootPath: worktreePath,
+            mainWorktreeRoot: loadedRootPath
+        )
+        let advertisedWorktree = Self.worktree(from: identity, path: worktreePath)
+        let finalDescriptor = GitRepoDescriptor(
+            rootURL: URL(fileURLWithPath: worktreePath),
+            rootPath: worktreePath,
+            repoKey: "replacement-repo",
+            displayName: "replacement"
+        )
+        let resolver = Self.resolver(advertisedWorktree: advertisedWorktree, finalDescriptor: finalDescriptor)
+
+        do {
+            _ = try await resolver.resolveWorktree(
+                selector: "@id:\(advertisedWorktree.worktreeID)",
+                repo: Self.loadedRepo(path: loadedRootPath),
+                allRepos: [Self.loadedRepo(path: loadedRootPath)],
+                authorizedRoots: [Self.root(path: loadedRootPath)]
+            )
+            XCTFail("An external resolution without Git identity must be rejected")
+        } catch let error as GitRepoTargetResolverError {
+            XCTAssertTrue(error.message.contains("worktree path must be inside a loaded root"))
+        }
+    }
+
+    func testAllowsSamePathWhenFinalExternalResolutionMatchesRepositoryAndWorktreeIdentity() async throws {
+        let loadedRootPath = "/tmp/issue-860/loaded"
+        let worktreePath = "/tmp/issue-860/advertised"
+        let identity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: "/tmp/repository-a/.git",
+            worktreeID: "worktree-a",
+            worktreeRootPath: worktreePath,
+            mainWorktreeRoot: loadedRootPath
+        )
+        let advertisedWorktree = Self.worktree(from: identity, path: worktreePath)
+        let resolver = Self.resolver(
+            advertisedWorktree: advertisedWorktree,
+            finalDescriptor: Self.repoDescriptor(from: identity, path: worktreePath)
+        )
+
+        let resolved = try await resolver.resolveWorktree(
+            selector: "@id:\(advertisedWorktree.worktreeID)",
+            repo: Self.loadedRepo(path: loadedRootPath),
+            allRepos: [Self.loadedRepo(path: loadedRootPath)],
+            authorizedRoots: [Self.root(path: loadedRootPath)]
+        )
+
+        XCTAssertEqual(resolved, advertisedWorktree)
+    }
+
+    func testPreservesInRootWorktreeWithoutExternalReresolution() async throws {
+        let loadedRootPath = "/tmp/issue-860/loaded"
+        let worktreePath = "/tmp/issue-860/loaded/feature"
+        let identity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: "/tmp/repository-a/.git",
+            worktreeID: "worktree-a",
+            worktreeRootPath: worktreePath,
+            mainWorktreeRoot: loadedRootPath
+        )
+        let advertisedWorktree = Self.worktree(from: identity, path: worktreePath)
+        let resolver = GitRepoTargetResolver(
+            dependencies: .init(
+                resolveRepo: { _ in nil },
+                listWorktrees: { _ in [advertisedWorktree] }
+            )
+        )
+
+        let resolved = try await resolver.resolveWorktree(
+            selector: "@id:\(advertisedWorktree.worktreeID)",
+            repo: Self.loadedRepo(path: loadedRootPath),
+            allRepos: [Self.loadedRepo(path: loadedRootPath)],
+            authorizedRoots: [Self.root(path: loadedRootPath)]
+        )
+
+        XCTAssertEqual(resolved, advertisedWorktree)
+    }
+
+    func testRejectsSamePathReplacementForRepoRootSelectorsAndExplicitPath() async throws {
+        let loadedRootPath = "/tmp/issue-860/loaded"
+        let worktreePath = "/tmp/issue-860/advertised"
+        let identity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: "/tmp/repository-a/.git",
+            worktreeID: "worktree-a",
+            worktreeRootPath: worktreePath,
+            mainWorktreeRoot: loadedRootPath
+        )
+        let advertisedWorktree = Self.worktree(from: identity, path: worktreePath)
+        let replacementIdentity = Self.identity(
+            repositoryID: "repo-b",
+            commonGitDir: "/tmp/repository-b/.git",
+            worktreeID: "worktree-b",
+            worktreeRootPath: worktreePath,
+            mainWorktreeRoot: "/tmp/repository-b"
+        )
+        let tokens = [
+            "@id:\(advertisedWorktree.worktreeID)",
+            "@branch:feature",
+            "feature",
+            worktreePath
+        ]
+
+        for token in tokens {
+            let resolver = Self.resolver(
+                advertisedWorktree: advertisedWorktree,
+                finalDescriptor: Self.repoDescriptor(from: replacementIdentity, path: worktreePath)
+            )
+            do {
+                _ = try await resolver.resolveRepoRoots(
+                    explicitRootTokens: [token],
+                    allRepos: [Self.loadedRepo(path: loadedRootPath)],
+                    visibleRoots: [Self.root(path: loadedRootPath)],
+                    defaultRepo: Self.loadedRepo(path: loadedRootPath)
+                )
+                XCTFail("A replaced external worktree must be rejected for repo_root=\(token)")
+            } catch let error as GitRepoTargetResolverError {
+                XCTAssertTrue(error.message.contains("worktree path must be inside a loaded root"))
+            }
+        }
+    }
+
+    func testAllowsValidExternalLinkedRepoRootSelectorsAndExplicitPath() async throws {
+        let loadedRootPath = "/tmp/issue-860/loaded"
+        let worktreePath = "/tmp/issue-860/advertised"
+        let identity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: "/tmp/repository-a/.git",
+            worktreeID: "worktree-a",
+            worktreeRootPath: worktreePath,
+            mainWorktreeRoot: loadedRootPath
+        )
+        let advertisedWorktree = Self.worktree(from: identity, path: worktreePath)
+        let tokens = [
+            "@id:\(advertisedWorktree.worktreeID)",
+            "@branch:feature",
+            "feature",
+            worktreePath
+        ]
+
+        for token in tokens {
+            let resolver = Self.resolver(
+                advertisedWorktree: advertisedWorktree,
+                finalDescriptor: Self.repoDescriptor(from: identity, path: worktreePath)
+            )
+            let resolved = try await resolver.resolveRepoRoots(
+                explicitRootTokens: [token],
+                allRepos: [Self.loadedRepo(path: loadedRootPath)],
+                visibleRoots: [Self.root(path: loadedRootPath)],
+                defaultRepo: Self.loadedRepo(path: loadedRootPath)
+            )
+            XCTAssertEqual(resolved.count, 1)
+            XCTAssertEqual(resolved.first?.rootPath, worktreePath)
+            XCTAssertEqual(resolved.first?.worktreeIdentity, identity)
+        }
+    }
+
+    func testAllowsValidMainRepoRootSelector() async throws {
+        let mainPath = "/tmp/issue-860/loaded"
+        let linkedPath = "/tmp/issue-860/advertised"
+        let repository = GitWorktreeRepositoryIdentity(
+            repositoryID: "repo-a",
+            repoKey: "repo-key-repo-a",
+            displayName: "repository",
+            commonGitDir: "/tmp/repository-a/.git",
+            mainWorktreeRoot: mainPath
+        )
+        let main = GitWorktreeDescriptor(
+            worktreeID: "worktree-main",
+            repository: repository,
+            path: mainPath,
+            gitDir: nil,
+            name: "loaded",
+            branch: "main",
+            head: "abc123",
+            isMain: true,
+            isCurrent: true,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil
+        )
+        let linked = Self.worktree(
+            from: Self.identity(
+                repositoryID: repository.repositoryID,
+                commonGitDir: repository.commonGitDir,
+                worktreeID: "worktree-linked",
+                worktreeRootPath: linkedPath,
+                mainWorktreeRoot: mainPath
+            ),
+            path: linkedPath
+        )
+        let resolverWithBothWorktrees = GitRepoTargetResolver(
+            dependencies: .init(
+                resolveRepo: { _ in nil },
+                listWorktrees: { _ in [main, linked] }
+            )
+        )
+
+        let resolved = try await resolverWithBothWorktrees.resolveRepoRoots(
+            explicitRootTokens: ["@main"],
+            allRepos: [Self.loadedRepo(path: mainPath)],
+            visibleRoots: [Self.root(path: mainPath)],
+            defaultRepo: Self.loadedRepo(path: mainPath)
+        )
+
+        XCTAssertEqual(resolved.count, 1)
+        XCTAssertEqual(resolved.first?.rootPath, mainPath)
+    }
+
+    func testRejectsSamePathReplacementForMainSelectorAliases() async throws {
+        let fixture = Self.externalMainSelectorFixture()
+        let scenarios: [(selector: String, target: GitWorktreeDescriptor, replacement: GitWorktreeIdentitySnapshot)] = [
+            ("@main", fixture.mainWorktree, fixture.replacementMainIdentity),
+            ("@primary", fixture.mainWorktree, fixture.replacementMainIdentity),
+            ("@main:feature", fixture.branchWorktree, fixture.replacementBranchIdentity),
+            ("@primary:feature", fixture.branchWorktree, fixture.replacementBranchIdentity)
         ]
 
         for scenario in scenarios {
-            let repos = try await fixture.resolver.resolveRepoRoots(
-                explicitRootTokens: scenario.1,
-                allRepos: scenario.2,
-                visibleRoots: fixture.visibleRoots,
-                defaultRepo: scenario.3
+            let resolver = Self.resolver(
+                worktrees: fixture.worktrees,
+                finalDescriptor: Self.repoDescriptor(from: scenario.replacement, path: scenario.target.path)
             )
-
-            XCTAssertEqual(repos.map(\.rootPath), scenario.4, scenario.0)
-        }
-    }
-
-    func testRejectsLegacyWorktreeBranchSpecifier() async throws {
-        let fixture = ResolverFixture()
-
-        do {
-            _ = try await fixture.resolver.resolveRepoRoots(
-                explicitRootTokens: ["@wt:feature/demo"],
-                allRepos: [fixture.mainRepo],
-                visibleRoots: fixture.visibleRoots,
-                defaultRepo: fixture.mainRepo
-            )
-            XCTFail("Expected @wt:<branch> to be rejected")
-        } catch let error as GitRepoTargetResolverError {
-            XCTAssertTrue(error.message.contains("@wt:feature/demo"))
-            XCTAssertTrue(error.message.contains("@main:feature/demo"))
-        }
-    }
-
-    func testRejectsStalePrunableWorktreeSelector() async throws {
-        let fixture = ResolverFixture(linkedWorktreePrunable: true)
-
-        do {
-            _ = try await fixture.resolver.resolveWorktree(
-                selector: "@branch:feature/demo",
-                repo: fixture.mainRepo,
-                allRepos: [fixture.mainRepo]
-            )
-            XCTFail("Expected a stale/prunable worktree to be rejected")
-        } catch let error as GitRepoTargetResolverError {
-            XCTAssertTrue(error.message.lowercased().contains("stale"), error.message)
-            XCTAssertTrue(error.message.contains("git worktree prune"), error.message)
-        }
-
-        // A healthy (non-prunable) worktree resolved by the same selector still succeeds.
-        let healthy = ResolverFixture()
-        let resolved = try await healthy.resolver.resolveWorktree(
-            selector: "@branch:feature/demo",
-            repo: healthy.mainRepo,
-            allRepos: [healthy.mainRepo]
-        )
-        XCTAssertEqual(resolved.path, healthy.linkedRepo.rootPath)
-    }
-
-    func testDeduplicatesReposByResolvedPath() async throws {
-        let fixture = ResolverFixture()
-        let repos = try await fixture.resolver.resolveRepoRoots(
-            explicitRootTokens: ["@main", fixture.mainRepo.rootPath],
-            allRepos: [fixture.mainRepo],
-            visibleRoots: fixture.visibleRoots,
-            defaultRepo: fixture.linkedRepo
-        )
-
-        XCTAssertEqual(repos.map(\.rootPath), [fixture.mainRepo.rootPath])
-    }
-
-    func testExplicitBaseBranchSpecifierDoesNotSearchOtherRepos() async throws {
-        let fixture = MultiRepoResolverFixture()
-
-        do {
-            _ = try await fixture.resolver.resolveRepoRoots(
-                explicitRootTokens: ["repo-a@branch:feature/demo"],
-                allRepos: [fixture.repoA.mainRepo, fixture.repoB.mainRepo],
-                visibleRoots: fixture.visibleRoots,
-                defaultRepo: fixture.repoA.mainRepo
-            )
-            XCTFail("Expected explicit repo-a branch selector not to resolve repo-b's worktree")
-        } catch let error as GitRepoTargetResolverError {
-            XCTAssertTrue(error.message.contains("No worktree found for branch 'feature/demo'"))
-        }
-
-        let global = try await fixture.resolver.resolveRepoRoots(
-            explicitRootTokens: ["@branch:feature/demo"],
-            allRepos: [fixture.repoA.mainRepo, fixture.repoB.mainRepo],
-            visibleRoots: fixture.visibleRoots,
-            defaultRepo: fixture.repoA.mainRepo
-        )
-        XCTAssertEqual(global.map(\.rootPath), [fixture.repoB.linkedRepo.rootPath])
-    }
-
-    func testMainSpecifierDoesNotListUnrelatedRepos() async throws {
-        let fixture = MultiRepoResolverFixture(repoBListShouldThrow: true)
-        let repos = try await fixture.resolver.resolveRepoRoots(
-            explicitRootTokens: ["repo-a@main"],
-            allRepos: [fixture.repoA.mainRepo, fixture.repoB.mainRepo],
-            visibleRoots: fixture.visibleRoots,
-            defaultRepo: fixture.repoA.mainRepo
-        )
-
-        XCTAssertEqual(repos.map(\.rootPath), [fixture.repoA.mainRepo.rootPath])
-    }
-
-    func testSeparateGitDirPrimaryMainSpecifierKeepsCheckoutRoot() async throws {
-        let fixture = try makeSeparateGitDirFixture(addLinkedWorktree: false)
-        let resolver = makeLiveFixtureResolver(repo: fixture.repo, linked: nil)
-        let repo = GitRepoDescriptor(rootURL: fixture.repo)
-
-        let resolved = try await resolver.resolveRepoRoots(
-            explicitRootTokens: ["@main"],
-            allRepos: [repo],
-            visibleRoots: [WorkspaceRootRef(id: UUID(), name: "repo", fullPath: repo.rootPath)],
-            defaultRepo: repo
-        )
-
-        XCTAssertEqual(resolved.map(\.rootPath), [fixture.repo.standardizedFileURL.path])
-        XCTAssertNotEqual(resolved.first?.rootPath, fixture.gitDir.standardizedFileURL.path)
-    }
-
-    func testExternalCommonDirLinkedMainSpecifierFailsInsteadOfReturningGitDirectory() async throws {
-        let fixture = try makeSeparateGitDirFixture(addLinkedWorktree: true)
-        let linked = try XCTUnwrap(fixture.linked)
-        let resolver = makeLiveFixtureResolver(repo: fixture.repo, linked: linked)
-        let linkedRepo = GitRepoDescriptor(rootURL: linked)
-
-        do {
-            _ = try await resolver.resolveRepoRoots(
-                explicitRootTokens: ["@main"],
-                allRepos: [linkedRepo],
-                visibleRoots: [WorkspaceRootRef(id: UUID(), name: "linked", fullPath: linkedRepo.rootPath)],
-                defaultRepo: linkedRepo
-            )
-            XCTFail("Expected unresolved external main checkout to fail safely")
-        } catch let error as GitRepoTargetResolverError {
-            XCTAssertTrue(error.message.contains("main checkout path could not be resolved"))
-            XCTAssertFalse(error.message.contains(fixture.gitDir.standardizedFileURL.path))
-        }
-    }
-
-    func testDuplicateWorktreeIDsAcrossReposRemainAmbiguous() async throws {
-        let fixture = MultiRepoResolverFixture(duplicateLinkedWorktreeID: true)
-
-        do {
-            _ = try await fixture.resolver.resolveRepoRoots(
-                explicitRootTokens: ["@id:wt_duplicate"],
-                allRepos: [fixture.repoA.mainRepo, fixture.repoB.mainRepo],
-                visibleRoots: fixture.visibleRoots,
-                defaultRepo: fixture.repoA.mainRepo
-            )
-            XCTFail("Expected duplicate cross-repo worktree IDs to be ambiguous")
-        } catch let error as GitRepoTargetResolverError {
-            XCTAssertTrue(error.message.contains("Ambiguous worktree selector"))
-        }
-    }
-
-    private func makeSeparateGitDirFixture(addLinkedWorktree: Bool) throws -> (repo: URL, gitDir: URL, linked: URL?) {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("GitRepoTargetResolverSeparateGitDirTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: root)
-        }
-
-        let repo = root.appendingPathComponent("repo", isDirectory: true)
-        let gitDir = root.appendingPathComponent("repo-git", isDirectory: true)
-        try runGit(["init", "-b", "main", "--separate-git-dir", gitDir.path, repo.path], cwd: root)
-        try runGit(["config", "user.email", "test@example.com"], cwd: repo)
-        try runGit(["config", "user.name", "Test User"], cwd: repo)
-        try "hello\n".write(to: repo.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
-        try runGit(["add", "."], cwd: repo)
-        try runGit(["commit", "-m", "Initial commit"], cwd: repo)
-
-        guard addLinkedWorktree else {
-            return (repo, gitDir, nil)
-        }
-        let linked = root.appendingPathComponent("repo-linked", isDirectory: true)
-        try runGit(["worktree", "add", "-b", "feature/linked", linked.path], cwd: repo)
-        return (repo, gitDir, linked)
-    }
-
-    private func makeLiveFixtureResolver(repo: URL, linked: URL?) -> GitRepoTargetResolver {
-        let service = VCSService()
-        let roots = [repo, linked].compactMap(\.self).map(\.standardizedFileURL)
-        return GitRepoTargetResolver(dependencies: .init(
-            resolveRepo: { url in
-                let path = url.standardizedFileURL.path
-                guard let root = roots.first(where: { path == $0.path || path.hasPrefix($0.path + "/") }) else {
-                    return nil
-                }
-                return GitRepoDescriptor(rootURL: root)
-            },
-            listWorktrees: { descriptor in
-                try await service.listGitWorktrees(at: descriptor.rootURL)
+            do {
+                _ = try await resolver.resolveRepoRoots(
+                    explicitRootTokens: [scenario.selector],
+                    allRepos: [fixture.defaultRepo],
+                    visibleRoots: [fixture.visibleRoot],
+                    defaultRepo: fixture.defaultRepo
+                )
+                XCTFail("A replaced external worktree must be rejected for repo_root=\(scenario.selector)")
+            } catch let error as GitRepoTargetResolverError {
+                XCTAssertTrue(error.message.contains("worktree path must be inside a loaded root"), error.message)
             }
-        ))
-    }
-
-    private func runGit(_ arguments: [String], cwd: URL) throws {
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        let result = try TestProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
-            arguments: arguments,
-            currentDirectoryURL: cwd,
-            environment: environment
-        )
-        guard result.terminationStatus == 0 else {
-            throw NSError(
-                domain: "GitRepoTargetResolverTests",
-                code: Int(result.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: result.outputText]
-            )
         }
     }
-}
 
-private struct MultiRepoResolverFixture {
-    let repoA: RepoFixtureData
-    let repoB: RepoFixtureData
-    let visibleRoots: [WorkspaceRootRef]
-    let resolver: GitRepoTargetResolver
-
-    init(repoBListShouldThrow: Bool = false, duplicateLinkedWorktreeID: Bool = false) {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("GitRepoTargetResolverMultiRepoTests", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let repoA = RepoFixtureData(root: root, name: "repo-a", linkedBranch: "topic/a", linkedWorktreeID: duplicateLinkedWorktreeID ? "wt_duplicate" : "wt_a")
-        let repoB = RepoFixtureData(root: root, name: "repo-b", linkedBranch: "feature/demo", linkedWorktreeID: duplicateLinkedWorktreeID ? "wt_duplicate" : "wt_b")
-        let visibleRoots = [
-            WorkspaceRootRef(id: UUID(), name: "repo-a", fullPath: repoA.mainRepo.rootPath),
-            WorkspaceRootRef(id: UUID(), name: "repo-b", fullPath: repoB.mainRepo.rootPath)
+    func testAllowsValidExternalMainSelectorAliases() async throws {
+        let fixture = Self.externalMainSelectorFixture()
+        let scenarios: [(selector: String, target: GitWorktreeDescriptor, identity: GitWorktreeIdentitySnapshot)] = [
+            ("@main", fixture.mainWorktree, fixture.mainIdentity),
+            ("@primary", fixture.mainWorktree, fixture.mainIdentity),
+            ("@main:feature", fixture.branchWorktree, fixture.branchIdentity),
+            ("@primary:feature", fixture.branchWorktree, fixture.branchIdentity)
         ]
 
-        let repos = [
-            repoA.mainRepo.rootPath: repoA.mainRepo,
-            repoA.linkedRepo.rootPath: repoA.linkedRepo,
-            repoB.mainRepo.rootPath: repoB.mainRepo,
-            repoB.linkedRepo.rootPath: repoB.linkedRepo
-        ]
-        let worktrees = [
-            repoA.mainRepo.rootPath: repoA.worktrees,
-            repoA.linkedRepo.rootPath: repoA.worktrees,
-            repoB.mainRepo.rootPath: repoB.worktrees,
-            repoB.linkedRepo.rootPath: repoB.worktrees
-        ]
-        let repoBMainPath = repoB.mainRepo.rootPath
-        let repoBLinkedPath = repoB.linkedRepo.rootPath
+        for scenario in scenarios {
+            let resolver = Self.resolver(
+                worktrees: fixture.worktrees,
+                finalDescriptor: Self.repoDescriptor(from: scenario.identity, path: scenario.target.path)
+            )
+            let resolved = try await resolver.resolveRepoRoots(
+                explicitRootTokens: [scenario.selector],
+                allRepos: [fixture.defaultRepo],
+                visibleRoots: [fixture.visibleRoot],
+                defaultRepo: fixture.defaultRepo
+            )
 
-        let resolver = GitRepoTargetResolver(dependencies: .init(
-            resolveRepo: { url in
-                let standardized = (url.path as NSString).standardizingPath
-                for repo in repos.values where standardized == repo.rootPath || standardized.hasPrefix(repo.rootPath + "/") {
-                    return repo
-                }
-                return nil
-            },
-            listWorktrees: { repo in
-                if repoBListShouldThrow, repo.rootPath == repoBMainPath || repo.rootPath == repoBLinkedPath {
-                    throw VCSError.parseError(message: "repo-b should not have been listed")
-                }
-                return worktrees[repo.rootPath] ?? []
-            }
-        ))
-
-        self.repoA = repoA
-        self.repoB = repoB
-        self.visibleRoots = visibleRoots
-        self.resolver = resolver
+            XCTAssertEqual(resolved.count, 1)
+            XCTAssertEqual(resolved.first?.rootPath, scenario.target.path)
+            XCTAssertEqual(resolved.first?.worktreeIdentity, scenario.identity)
+        }
     }
-}
 
-private struct RepoFixtureData {
-    let mainRepo: GitRepoDescriptor
-    let linkedRepo: GitRepoDescriptor
-    let worktrees: [GitWorktreeDescriptor]
+    private static func resolver(
+        advertisedWorktree: GitWorktreeDescriptor,
+        finalDescriptor: GitRepoDescriptor?
+    ) -> GitRepoTargetResolver {
+        resolver(worktrees: [advertisedWorktree], finalDescriptor: finalDescriptor)
+    }
 
-    init(root: URL, name: String, linkedBranch: String, linkedWorktreeID: String) {
-        let mainURL = root.appendingPathComponent(name, isDirectory: true).standardizedFileURL
-        let linkedURL = root.appendingPathComponent("\(name)-linked", isDirectory: true).standardizedFileURL
-        mainRepo = GitRepoDescriptor(rootURL: mainURL)
-        linkedRepo = GitRepoDescriptor(rootURL: linkedURL)
-        let repository = GitWorktreeRepositoryIdentity(
-            repositoryID: "gitrepo_\(name)",
-            repoKey: "\(name)-fixture",
-            displayName: name,
-            commonGitDir: mainURL.appendingPathComponent(".git", isDirectory: true).path,
-            mainWorktreeRoot: mainURL.path
+    private static func resolver(
+        worktrees: [GitWorktreeDescriptor],
+        finalDescriptor: GitRepoDescriptor?
+    ) -> GitRepoTargetResolver {
+        GitRepoTargetResolver(
+            dependencies: .init(
+                resolveRepo: { _ in finalDescriptor },
+                listWorktrees: { _ in worktrees }
+            )
         )
-        worktrees = [
-            GitWorktreeDescriptor(
-                worktreeID: "wt_main_\(name)",
-                repository: repository,
-                path: mainURL.path,
-                gitDir: mainURL.appendingPathComponent(".git", isDirectory: true).path,
-                name: name,
-                branch: "main",
-                head: "1111111111111111111111111111111111111111",
-                isMain: true,
-                isCurrent: false,
-                isDetached: false,
-                isLocked: false,
-                lockReason: nil,
-                isPrunable: false,
-                prunableReason: nil
+    }
+
+    private struct ExternalMainSelectorFixture {
+        let defaultRepo: GitRepoDescriptor
+        let visibleRoot: WorkspaceRootRef
+        let worktrees: [GitWorktreeDescriptor]
+        let mainWorktree: GitWorktreeDescriptor
+        let branchWorktree: GitWorktreeDescriptor
+        let mainIdentity: GitWorktreeIdentitySnapshot
+        let branchIdentity: GitWorktreeIdentitySnapshot
+        let replacementMainIdentity: GitWorktreeIdentitySnapshot
+        let replacementBranchIdentity: GitWorktreeIdentitySnapshot
+    }
+
+    private static func externalMainSelectorFixture() -> ExternalMainSelectorFixture {
+        let loadedPath = "/tmp/issue-860/loaded-linked"
+        let mainPath = "/tmp/issue-860/external-main"
+        let branchPath = "/tmp/issue-860/external-feature"
+        let mainWorktreeRoot = mainPath
+        let commonGitDir = "/tmp/repository-a/.git"
+        let loadedIdentity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: commonGitDir,
+            worktreeID: "worktree-loaded",
+            worktreeRootPath: loadedPath,
+            mainWorktreeRoot: mainWorktreeRoot
+        )
+        let mainIdentity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: commonGitDir,
+            worktreeID: "worktree-main",
+            worktreeRootPath: mainPath,
+            mainWorktreeRoot: mainWorktreeRoot,
+            isMain: true
+        )
+        let branchIdentity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: commonGitDir,
+            worktreeID: "worktree-feature",
+            worktreeRootPath: branchPath,
+            mainWorktreeRoot: mainWorktreeRoot
+        )
+        let replacementMainIdentity = Self.identity(
+            repositoryID: "repo-b",
+            commonGitDir: "/tmp/repository-b/.git",
+            worktreeID: "replacement-main",
+            worktreeRootPath: mainPath,
+            mainWorktreeRoot: "/tmp/repository-b",
+            isMain: true
+        )
+        let replacementBranchIdentity = Self.identity(
+            repositoryID: "repo-b",
+            commonGitDir: "/tmp/repository-b/.git",
+            worktreeID: "replacement-feature",
+            worktreeRootPath: branchPath,
+            mainWorktreeRoot: "/tmp/repository-b"
+        )
+        let loadedWorktree = Self.worktree(
+            from: loadedIdentity,
+            path: loadedPath,
+            name: "loaded-linked",
+            branch: "loaded"
+        )
+        let mainWorktree = Self.worktree(
+            from: mainIdentity,
+            path: mainPath,
+            name: "external-main",
+            branch: "main"
+        )
+        let branchWorktree = Self.worktree(
+            from: branchIdentity,
+            path: branchPath,
+            name: "external-feature",
+            branch: "feature"
+        )
+
+        return ExternalMainSelectorFixture(
+            defaultRepo: Self.repoDescriptor(from: loadedIdentity, path: loadedPath),
+            visibleRoot: Self.root(path: loadedPath),
+            worktrees: [loadedWorktree, mainWorktree, branchWorktree],
+            mainWorktree: mainWorktree,
+            branchWorktree: branchWorktree,
+            mainIdentity: mainIdentity,
+            branchIdentity: branchIdentity,
+            replacementMainIdentity: replacementMainIdentity,
+            replacementBranchIdentity: replacementBranchIdentity
+        )
+    }
+
+    private static func root(path: String) -> WorkspaceRootRef {
+        WorkspaceRootRef(id: UUID(), name: URL(fileURLWithPath: path).lastPathComponent, fullPath: path)
+    }
+
+    private static func loadedRepo(path: String) -> GitRepoDescriptor {
+        GitRepoDescriptor(
+            rootURL: URL(fileURLWithPath: path),
+            rootPath: path,
+            repoKey: "loaded-repo",
+            displayName: URL(fileURLWithPath: path).lastPathComponent
+        )
+    }
+
+    private static func identity(
+        repositoryID: String,
+        commonGitDir: String,
+        worktreeID: String,
+        worktreeRootPath: String,
+        mainWorktreeRoot: String,
+        isMain: Bool = false
+    ) -> GitWorktreeIdentitySnapshot {
+        GitWorktreeIdentitySnapshot(
+            repository: GitWorktreeRepositoryIdentity(
+                repositoryID: repositoryID,
+                repoKey: "repo-key-\(repositoryID)",
+                displayName: "repository",
+                commonGitDir: commonGitDir,
+                mainWorktreeRoot: mainWorktreeRoot
             ),
-            GitWorktreeDescriptor(
-                worktreeID: linkedWorktreeID,
-                repository: repository,
-                path: linkedURL.path,
-                gitDir: mainURL.appendingPathComponent(".git/worktrees/\(name)-linked", isDirectory: true).path,
-                name: "\(name)-linked",
-                branch: linkedBranch,
-                head: "2222222222222222222222222222222222222222",
-                isMain: false,
-                isCurrent: false,
-                isDetached: false,
-                isLocked: false,
-                lockReason: nil,
-                isPrunable: false,
-                prunableReason: nil
-            )
-        ]
-    }
-}
-
-private struct ResolverFixture {
-    let root: URL
-    let mainRepo: GitRepoDescriptor
-    let linkedRepo: GitRepoDescriptor
-    let repository: GitWorktreeRepositoryIdentity
-    let mainWorktree: GitWorktreeDescriptor
-    let linkedWorktree: GitWorktreeDescriptor
-    let visibleRoots: [WorkspaceRootRef]
-    let resolver: GitRepoTargetResolver
-
-    init(linkedWorktreePrunable: Bool = false) {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("GitRepoTargetResolverTests", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let mainURL = root.appendingPathComponent("repo", isDirectory: true).standardizedFileURL
-        let linkedURL = root.appendingPathComponent("repo-feature", isDirectory: true).standardizedFileURL
-        let mainRepo = GitRepoDescriptor(rootURL: mainURL)
-        let linkedRepo = GitRepoDescriptor(rootURL: linkedURL)
-        let repository = GitWorktreeRepositoryIdentity(
-            repositoryID: "gitrepo_fixture",
-            repoKey: "repo-fixture",
-            displayName: "repo",
-            commonGitDir: mainURL.appendingPathComponent(".git", isDirectory: true).path,
-            mainWorktreeRoot: mainURL.path
+            worktreeID: worktreeID,
+            worktreeRootPath: worktreeRootPath,
+            isMain: isMain
         )
-        let mainWorktree = GitWorktreeDescriptor(
-            worktreeID: "wt_main",
-            repository: repository,
-            path: mainURL.path,
-            gitDir: mainURL.appendingPathComponent(".git", isDirectory: true).path,
-            name: "repo",
-            branch: "main",
-            head: "1111111111111111111111111111111111111111",
-            isMain: true,
+    }
+
+    private static func repoDescriptor(
+        from identity: GitWorktreeIdentitySnapshot,
+        path: String
+    ) -> GitRepoDescriptor {
+        GitRepoDescriptor(
+            rootURL: URL(fileURLWithPath: path),
+            rootPath: path,
+            repoKey: identity.repository.repoKey,
+            displayName: identity.repository.displayName,
+            worktreeIdentity: identity
+        )
+    }
+
+    private static func worktree(
+        from identity: GitWorktreeIdentitySnapshot,
+        path: String,
+        name: String = "feature",
+        branch: String? = "feature"
+    ) -> GitWorktreeDescriptor {
+        GitWorktreeDescriptor(
+            worktreeID: identity.worktreeID,
+            repository: identity.repository,
+            path: path,
+            gitDir: identity.isMain ? nil : "/tmp/git/worktrees/\(identity.worktreeID)",
+            name: name,
+            branch: branch,
+            head: "abc123",
+            isMain: identity.isMain,
             isCurrent: false,
             isDetached: false,
             isLocked: false,
@@ -382,54 +489,152 @@ private struct ResolverFixture {
             isPrunable: false,
             prunableReason: nil
         )
-        let linkedWorktree = GitWorktreeDescriptor(
-            worktreeID: "wt_feature",
-            repository: repository,
-            path: linkedURL.path,
-            gitDir: mainURL.appendingPathComponent(".git/worktrees/repo-feature", isDirectory: true).path,
-            name: "repo-feature",
-            branch: "feature/demo",
-            head: "2222222222222222222222222222222222222222",
-            isMain: false,
-            isCurrent: false,
-            isDetached: false,
-            isLocked: false,
-            lockReason: nil,
-            isPrunable: linkedWorktreePrunable,
-            prunableReason: linkedWorktreePrunable ? "gitdir file points to non-existent location" : nil
+    }
+}
+
+final class AgentWorktreeRuntimeWorkspaceResolverIdentityTests: XCTestCase {
+    func testRejectsPersistedBindingWhenFreshIdentityChangesAtTheSamePath() {
+        let path = "/tmp/issue-860/advertised"
+        let binding = Self.binding(
+            path: path,
+            repositoryID: "repo-a",
+            worktreeID: "worktree-a",
+            commonGitDir: "/tmp/repository-a/.git"
         )
-        let visibleRoots = [
-            WorkspaceRootRef(id: UUID(), name: "repo", fullPath: mainURL.path)
-        ]
+        let replacement = Self.identity(
+            repositoryID: "repo-b",
+            commonGitDir: "/tmp/repository-b/.git",
+            worktreeID: "worktree-b",
+            worktreeRootPath: path
+        )
+        let dependencies = AgentWorktreeRuntimeWorkspaceResolver.Dependencies(
+            directoryExists: { _ in true },
+            resolveIdentity: { _ in replacement }
+        )
 
-        let descriptorsByPath = [
-            mainRepo.rootPath: mainRepo,
-            linkedRepo.rootPath: linkedRepo
-        ]
-        let worktrees = [mainRepo.rootPath: [mainWorktree, linkedWorktree], linkedRepo.rootPath: [mainWorktree, linkedWorktree]]
-        let resolver = GitRepoTargetResolver(dependencies: .init(
-            resolveRepo: { url in
-                let standardized = (url.path as NSString).standardizingPath
-                if standardized == mainRepo.rootPath || standardized.hasPrefix(mainRepo.rootPath + "/") {
-                    return mainRepo
-                }
-                if standardized == linkedRepo.rootPath || standardized.hasPrefix(linkedRepo.rootPath + "/") {
-                    return linkedRepo
-                }
-                return descriptorsByPath[standardized]
-            },
-            listWorktrees: { repo in
-                worktrees[repo.rootPath] ?? []
-            }
-        ))
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+                bindings: [binding],
+                fallbackWorkspacePath: "/tmp/issue-860/logical",
+                dependencies: dependencies
+            )
+        )
+    }
 
-        self.root = root
-        self.mainRepo = mainRepo
-        self.linkedRepo = linkedRepo
-        self.repository = repository
-        self.mainWorktree = mainWorktree
-        self.linkedWorktree = linkedWorktree
-        self.visibleRoots = visibleRoots
-        self.resolver = resolver
+    func testRejectsPersistedBindingWhenCommonGitDirectoryChangesAtTheSamePath() {
+        let path = "/tmp/issue-860/advertised"
+        let binding = Self.binding(
+            path: path,
+            repositoryID: "repo-a",
+            worktreeID: "worktree-a",
+            commonGitDir: "/tmp/repository-a/.git"
+        )
+        let replacement = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: "/tmp/repository-b/.git",
+            worktreeID: "worktree-a",
+            worktreeRootPath: path
+        )
+        let dependencies = AgentWorktreeRuntimeWorkspaceResolver.Dependencies(
+            directoryExists: { _ in true },
+            resolveIdentity: { _ in replacement }
+        )
+
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+                bindings: [binding],
+                fallbackWorkspacePath: "/tmp/issue-860/logical",
+                dependencies: dependencies
+            )
+        )
+    }
+
+    func testRejectsPersistedBindingWhenFreshIdentityIsUnavailable() {
+        let path = "/tmp/issue-860/advertised"
+        let binding = Self.binding(
+            path: path,
+            repositoryID: "repo-a",
+            worktreeID: "worktree-a",
+            commonGitDir: "/tmp/repository-a/.git"
+        )
+        let dependencies = AgentWorktreeRuntimeWorkspaceResolver.Dependencies(
+            directoryExists: { _ in true },
+            resolveIdentity: { _ in nil }
+        )
+
+        XCTAssertThrowsError(
+            try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+                bindings: [binding],
+                fallbackWorkspacePath: "/tmp/issue-860/logical",
+                dependencies: dependencies
+            )
+        )
+    }
+
+    func testAllowsPersistedBindingWhenFreshIdentityMatchesRepositoryAndWorktree() throws {
+        let path = "/tmp/issue-860/advertised"
+        let identity = Self.identity(
+            repositoryID: "repo-a",
+            commonGitDir: "/tmp/repository-a/.git",
+            worktreeID: "worktree-a",
+            worktreeRootPath: path
+        )
+        let binding = Self.binding(
+            path: path,
+            repositoryID: identity.repository.repositoryID,
+            worktreeID: identity.worktreeID,
+            commonGitDir: identity.repository.commonGitDir
+        )
+        let dependencies = AgentWorktreeRuntimeWorkspaceResolver.Dependencies(
+            directoryExists: { _ in true },
+            resolveIdentity: { _ in identity }
+        )
+
+        let resolved = try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+            bindings: [binding],
+            fallbackWorkspacePath: "/tmp/issue-860/logical",
+            dependencies: dependencies
+        )
+
+        XCTAssertEqual(resolved, path)
+    }
+
+    private static func binding(
+        path: String,
+        repositoryID: String,
+        worktreeID: String,
+        commonGitDir: String
+    ) -> AgentSessionWorktreeBinding {
+        AgentSessionWorktreeBinding(
+            id: "binding",
+            repositoryID: repositoryID,
+            repoKey: "repo-key-\(repositoryID)",
+            logicalRootPath: "/tmp/issue-860/logical",
+            worktreeID: worktreeID,
+            worktreeRootPath: path,
+            commonGitDir: commonGitDir,
+            isMainWorktree: false,
+            source: "test"
+        )
+    }
+
+    private static func identity(
+        repositoryID: String,
+        commonGitDir: String,
+        worktreeID: String,
+        worktreeRootPath: String
+    ) -> GitWorktreeIdentitySnapshot {
+        GitWorktreeIdentitySnapshot(
+            repository: GitWorktreeRepositoryIdentity(
+                repositoryID: repositoryID,
+                repoKey: "repo-key-\(repositoryID)",
+                displayName: "repository",
+                commonGitDir: commonGitDir,
+                mainWorktreeRoot: "/tmp/issue-860/loaded"
+            ),
+            worktreeID: worktreeID,
+            worktreeRootPath: worktreeRootPath,
+            isMain: false
+        )
     }
 }

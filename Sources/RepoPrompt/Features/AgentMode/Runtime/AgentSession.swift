@@ -33,6 +33,8 @@ enum AgentSessionError: Error, LocalizedError {
 }
 
 struct AgentTokenUsagePersist: Codable, Equatable {
+    let runID: UUID?
+    let turnID: UUID?
     let promptTokens: Int
     let completionTokens: Int
     let contextUsedTokens: Int?
@@ -42,6 +44,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     let timestamp: Date
 
     init(
+        runID: UUID? = nil,
+        turnID: UUID? = nil,
         promptTokens: Int,
         completionTokens: Int,
         contextUsedTokens: Int? = nil,
@@ -50,6 +54,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         estimatedToolOutputTokens: Int = 0,
         timestamp: Date = Date()
     ) {
+        self.runID = runID
+        self.turnID = turnID
         self.promptTokens = max(0, promptTokens)
         self.completionTokens = max(0, completionTokens)
         if let contextUsedTokens {
@@ -84,6 +90,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case runID
+        case turnID
         case promptTokens
         case completionTokens
         case contextUsedTokens
@@ -95,6 +103,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        runID = try container.decodeIfPresent(UUID.self, forKey: .runID)
+        turnID = try container.decodeIfPresent(UUID.self, forKey: .turnID)
         promptTokens = try max(0, container.decode(Int.self, forKey: .promptTokens))
         completionTokens = try max(0, container.decode(Int.self, forKey: .completionTokens))
         if let decodedContext = try container.decodeIfPresent(Int.self, forKey: .contextUsedTokens) {
@@ -111,6 +121,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(runID, forKey: .runID)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
         try container.encode(promptTokens, forKey: .promptTokens)
         try container.encode(completionTokens, forKey: .completionTokens)
         try container.encodeIfPresent(contextUsedTokens, forKey: .contextUsedTokens)
@@ -125,7 +137,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
-    static let currentSerializationVersion = 7
+    // 9 adds the granular observer-session Auto-wake target UUID set.
+    static let currentSerializationVersion = 9
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID
@@ -161,6 +174,9 @@ struct AgentSession: Codable, Identifiable {
     /// User-selected reasoning effort (Codex-only)
     var agentReasoningEffort: String?
 
+    /// Explicit provider-advertised ACP model parameters, stored independently from the base model.
+    var acpModelParameterSelections: [ACPModelParameterSelection]
+
     /// State of the last run
     var lastRunState: String?
 
@@ -172,6 +188,20 @@ struct AgentSession: Codable, Identifiable {
     /// a session ID may route cleanup, but does not imply remote deletion support.
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var autoEditEnabled: Bool
+    /// Whether this observer session may reserve one system-origin follow-up turn when sessions it
+    /// oversees change status.
+    ///
+    /// Session configuration rather than link or global state: it is scoped to this observer, saved
+    /// with it, and inert while the session oversees nothing. Nothing else about oversight is
+    /// gated on it — status collection and natural-turn delivery are always on for a live, eligible
+    /// direct link.
+    var autoWakeOnOversightUpdates: Bool
+    /// Granular target selections preserved even while the master setting is on.
+    var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
+    var routineWakeIntervalEnabled: Bool
+    var routineWakeIntervalSeconds: Int
+    var periodicIdleWakeEnabled: Bool
+    var periodicIdleWakeIntervalSeconds: Int
 
     /// Persisted per-turn token usage for non-Codex providers.
     /// Used to rebuild context usage after reopen/resume when tool payloads are pruned.
@@ -227,10 +257,17 @@ struct AgentSession: Codable, Identifiable {
         agentKind: String? = nil,
         agentModel: String? = nil,
         agentReasoningEffort: String? = nil,
+        acpModelParameterSelections: [ACPModelParameterSelection] = [],
         lastRunState: String? = nil,
         providerSessionID: String? = nil,
         providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
         autoEditEnabled: Bool = true,
+        autoWakeOnOversightUpdates: Bool = false,
+        agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
+        routineWakeIntervalEnabled: Bool = false,
+        routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds,
+        periodicIdleWakeEnabled: Bool = false,
+        periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
@@ -264,10 +301,17 @@ struct AgentSession: Codable, Identifiable {
         self.agentKind = agentKind
         self.agentModel = agentModel
         self.agentReasoningEffort = agentReasoningEffort
+        self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunState = lastRunState
         self.providerSessionID = providerSessionID
         self.providerCleanupHandle = providerCleanupHandle
         self.autoEditEnabled = autoEditEnabled
+        self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
+        self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
+        self.routineWakeIntervalEnabled = routineWakeIntervalEnabled
+        self.routineWakeIntervalSeconds = AgentSessionLinkRoutineWakeInterval.normalized(routineWakeIntervalSeconds)
+        self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
+        self.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds)
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
@@ -303,10 +347,17 @@ struct AgentSession: Codable, Identifiable {
         case agentKind
         case agentModel
         case agentReasoningEffort
+        case acpModelParameterSelections
         case lastRunState
         case providerSessionID
         case providerCleanupHandle
         case autoEditEnabled
+        case autoWakeOnOversightUpdates
+        case agentSessionLinkAutoWakeTargetSessionIDs
+        case routineWakeIntervalEnabled
+        case routineWakeIntervalSeconds
+        case periodicIdleWakeEnabled
+        case periodicIdleWakeIntervalSeconds
         case providerTokenUsageByTurn
         case codexConversationID
         case codexRolloutPath
@@ -345,10 +396,33 @@ struct AgentSession: Codable, Identifiable {
         agentKind = try container.decodeIfPresent(String.self, forKey: .agentKind)
         agentModel = try container.decodeIfPresent(String.self, forKey: .agentModel)
         agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
+        acpModelParameterSelections = try ACPModelParameterSelection.normalized(
+            container.decodeIfPresent([ACPModelParameterSelection].self, forKey: .acpModelParameterSelections) ?? []
+        )
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
+        // Additive and `decodeIfPresent`: every session written before version 8 decodes as off.
+        // Fresh live sessions now start on, but restore deliberately preserves this legacy value.
+        autoWakeOnOversightUpdates = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .autoWakeOnOversightUpdates
+        ) ?? false
+        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
+            Set<UUID>.self,
+            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
+        ) ?? []
+        routineWakeIntervalEnabled = try container.decodeIfPresent(Bool.self, forKey: .routineWakeIntervalEnabled) ?? false
+        routineWakeIntervalSeconds = try AgentSessionLinkRoutineWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .routineWakeIntervalSeconds)
+                ?? AgentSessionLinkRoutineWakeInterval.defaultSeconds
+        )
+        periodicIdleWakeEnabled = try container.decodeIfPresent(Bool.self, forKey: .periodicIdleWakeEnabled) ?? false
+        periodicIdleWakeIntervalSeconds = try AgentSessionLinkPeriodicWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .periodicIdleWakeIntervalSeconds)
+                ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
+        )
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)

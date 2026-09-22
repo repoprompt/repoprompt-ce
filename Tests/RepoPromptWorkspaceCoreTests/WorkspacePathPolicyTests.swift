@@ -28,6 +28,75 @@ final class WorkspacePathPolicyTests: XCTestCase {
         )
     }
 
+    func testExactFileInputParsesLiteralExplicitAndAbsoluteForms() throws {
+        XCTAssertEqual(try WorkspaceExactFileInput.parse("mimic/session.py"), .relative("mimic/session.py"))
+        XCTAssertEqual(
+            try WorkspaceExactFileInput.parse("One/App//Sources/./File.swift"),
+            .explicitRoot(alias: "One/App", relativePath: "Sources/File.swift")
+        )
+        XCTAssertEqual(
+            try WorkspaceExactFileInput.parse("~/Sources/../File.swift"),
+            .absolute(StandardizedPath.absolute(("~/Sources/../File.swift" as NSString).expandingTildeInPath))
+        )
+        XCTAssertEqual(try WorkspaceExactFileInput.parse("App:Sources/File.swift"), .relative("App:Sources/File.swift"))
+        XCTAssertEqual(try WorkspaceExactFileInput.parse(" Target.swift"), .relative(" Target.swift"))
+        XCTAssertEqual(
+            try WorkspaceExactFileInput.parse("~/Project//File.swift"),
+            .explicitRoot(alias: "~/Project", relativePath: "File.swift")
+        )
+    }
+
+    func testExactFileInputRejectsMalformedExplicitQualifier() {
+        for input in ["App//", "App///File.swift", "App//Dir//File.swift", "../File.swift"] {
+            XCTAssertThrowsError(try WorkspaceExactFileInput.parse(input), "Expected rejection for \(input)")
+        }
+    }
+
+    func testExplicitWorkspaceFilePathUsesCanonicalGeneratedAlias() {
+        let first = makeRoot(name: "App", fullPath: "/Users/test/Clients/One/App")
+        let second = makeRoot(name: "App", fullPath: "/Users/test/Clients/Two/App")
+
+        XCTAssertEqual(
+            ClientPathFormatter.explicitWorkspaceFilePath(
+                root: second,
+                relativePath: "Sources/File.swift",
+                visibleRoots: [first, second]
+            ),
+            "root@\(second.id.uuidString.lowercased())//Sources/File.swift"
+        )
+    }
+
+    func testExactRootAliasesRemainUniqueAcrossDisplayAliasCollisions() {
+        let first = makeRoot(name: "Project", fullPath: "/Docs")
+        let second = makeRoot(name: "Project", fullPath: "/tmp/Project")
+        let canonicalNameCollision = makeRoot(name: "Docs", fullPath: "/else/Docs")
+        let generatedAliasCollision = makeRoot(
+            name: "root@\(first.id.uuidString.lowercased())",
+            fullPath: "/natural/collision"
+        )
+        let roots = [first, second, canonicalNameCollision, generatedAliasCollision]
+        let aliases = ClientPathFormatter.exactRootAliases(visibleRoots: roots)
+
+        XCTAssertEqual(Set(aliases.values.map { $0.lowercased() }).count, roots.count)
+        XCTAssertNotEqual(aliases[first.id]?.lowercased(), aliases[canonicalNameCollision.id]?.lowercased())
+        XCTAssertTrue(
+            ClientPathFormatter.explicitWorkspaceFilePath(
+                root: first,
+                relativePath: "shared.txt",
+                visibleRoots: roots
+            ).hasSuffix("//shared.txt")
+        )
+    }
+
+    func testAmbiguousRootMessageUsesExplicitQualifier() {
+        let root = makeRoot(name: "App", fullPath: "/Users/test/App")
+        let message = PathResolutionIssueRenderer.message(
+            for: .ambiguousRootMatch(input: "Sources/File.swift", candidateRoots: [root])
+        )
+
+        XCTAssertTrue(message.contains("<root-alias>//<relative-path>"))
+    }
+
     func testCreatePreflightRejectsAmbiguousAndImplicitMultiRootPaths() {
         let first = makeRoot(name: "App", fullPath: "/Users/test/AppOne")
         let second = makeRoot(name: "App", fullPath: "/Users/test/AppTwo")

@@ -10,10 +10,7 @@ final class MentionOverlayController {
         case below
     }
 
-    struct ScreenGeometry: Equatable {
-        let frame: NSRect
-        let visibleFrame: NSRect
-    }
+    typealias ScreenGeometry = ScreenGeometrySnapshot
 
     struct RootPlacementResult: Equatable {
         let frame: NSRect
@@ -239,23 +236,7 @@ final class MentionOverlayController {
         for caret: NSRect,
         screens: [ScreenGeometry]
     ) -> NSRect? {
-        guard !screens.isEmpty else { return nil }
-
-        let intersecting = screens.enumerated().map { index, screen in
-            (index, screen, visibleIntersectionArea(caret, screen.frame))
-        }
-        if let best = intersecting.max(by: { lhs, rhs in
-            lhs.2 == rhs.2 ? lhs.0 > rhs.0 : lhs.2 < rhs.2
-        }), best.2 > 0 {
-            return best.1.visibleFrame
-        }
-
-        let caretCenter = NSPoint(x: caret.midX, y: caret.midY)
-        return screens.enumerated().min { lhs, rhs in
-            let leftDistance = squaredDistance(from: caretCenter, to: lhs.element.frame)
-            let rightDistance = squaredDistance(from: caretCenter, to: rhs.element.frame)
-            return leftDistance == rightDistance ? lhs.offset < rhs.offset : leftDistance < rightDistance
-        }?.element.visibleFrame
+        ScreenVisibleFrameResolver.selectedVisibleFrame(for: caret, screens: screens)
     }
 
     static func clampedFrame(_ frame: NSRect, to visibleFrame: NSRect?) -> NSRect {
@@ -308,12 +289,6 @@ final class MentionOverlayController {
         let intersection = lhs.intersection(rhs)
         guard !intersection.isNull else { return 0 }
         return max(intersection.width, 0) * max(intersection.height, 0)
-    }
-
-    private static func squaredDistance(from point: NSPoint, to rect: NSRect) -> CGFloat {
-        let dx = max(max(rect.minX - point.x, 0), point.x - rect.maxX)
-        let dy = max(max(rect.minY - point.y, 0), point.y - rect.maxY)
-        return dx * dx + dy * dy
     }
 
     private func chainWindow(_ w: SuggestionWindow, after prev: NSWindow) {

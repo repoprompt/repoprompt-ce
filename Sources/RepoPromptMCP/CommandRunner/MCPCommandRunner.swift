@@ -377,24 +377,37 @@ actor MCPCommandRunner {
         var args = try MCPCommandParser.parseJSONArgs(jsonPayload)
 
         // Normalize context_builder instruction aliases (task, prompt, etc. -> instructions)
-        if name == "context_builder", var argsDict = args {
+        if name == "context_builder" {
+            var argsDict = args ?? [:]
             try MCPCommandParser.normalizeContextBuilderArgs(&argsDict)
 
-            // Validate required instructions parameter
             let hasInstructions: Bool = if case let .string(value) = argsDict["instructions"] {
                 !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             } else {
                 false
             }
+            let hasContextPackReference: Bool = if case let .string(value) = argsDict["context_pack_ref"] {
+                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            } else {
+                false
+            }
 
-            guard hasInstructions else {
+            switch (hasInstructions, hasContextPackReference) {
+            case (true, false), (false, true):
+                break
+            case (true, true):
+                throw CommandParseError.invalidArgument(
+                    "context_builder accepts exactly one of instructions or context_pack_ref"
+                )
+            case (false, false):
                 throw CommandParseError.missingArgument(
                     """
-                    instructions (required)
+                    exactly one of instructions or context_pack_ref
 
                     Usage:
                       call context_builder {"task": "your task"}
                       call context_builder {"instructions": "...", "response_type": "plan"}
+                      call context_builder {"context_pack_ref": "oracle-pack:sha256:..."}
                     """
                 )
             }
@@ -599,7 +612,9 @@ actor MCPCommandRunner {
         Conversation:
           oracle_send                    Send oracle conversation turn
             message      (required)      The message to send
-            new_chat     (bool)          true=start new, false=continue (important!)
+            chat_id      (string)        Continue an exact conversation
+            new_chat     (bool)          true=start new; omitted resumes selected/recent
+            model        (string)        Primary override for explicit new_chat=true only
             mode         (string)        chat|plan|review
               review mode includes git diffs when published via git artifacts
             Example: oracle_send message="Review this" mode=review new_chat=true
@@ -679,14 +694,14 @@ actor MCPCommandRunner {
             op=poll session_ids=["<uuid1>","<uuid2>"]
                                           Poll multiple snapshots immediately
             op=wait session_id="..." [timeout=N]
-                                          Block until input needed or terminal (default \(Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds))s)
+                                          Block until input needed or terminal (omitted timeout uses configured subagent wait; factory default two minutes)
             op=wait session_ids=["<uuid1>","<uuid2>"] [timeout=N]
                                           Wait until first session needs input or terminates
             op=cancel session_id="..."    Request run cancellation
             op=steer session_id="..." message="..."
                                           Inject follow-up instruction mid-run
             op=steer session_id="..." message="..." wait=true [timeout_seconds=N]
-                                          Steer and wait for result (default \(Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds))s)
+                                          Steer and wait for result (omitted timeout uses configured subagent wait; factory default two minutes)
             op=respond session_id="..." interaction_id="..." response="..."
                                           Resolve a pending interaction (approval, question, etc)
             session_id lifecycle: start returns it; all other ops require it.
@@ -808,8 +823,8 @@ actor MCPCommandRunner {
           agent_run op=start message="Investigate the auth flow" model_id=engineer
           builder "Implement the plan" --response-type plan --export
           agent_run op=start message="Read the plan at prompt-exports/oracle-plan.md with read_file first. Implement item 1." workflow_name=orchestrate detach=true
-          agent_run op=wait session_id="<session-uuid>" timeout=30
-          agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60
+          agent_run op=wait session_id="<session-uuid>"
+          agent_run op=wait session_ids=["<uuid1>","<uuid2>"]
           agent_run op=poll session_ids=["<uuid1>","<uuid2>","<uuid3>"]
           agent_run op=steer session_id="<uuid>" message="Now fix it" wait=true
           agent_run op=respond session_id="<session-uuid>" interaction_id="<id>" response="accept"

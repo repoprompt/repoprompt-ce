@@ -5,6 +5,11 @@ import Foundation
 enum CodexAgentModeBooleanPreference {
     case goalSupport
     case reasoningSummaries
+    case memories
+    case apps
+    case plugins
+    case mcpElicitation
+    case toolSuggestions
 
     @MainActor
     func isEnabled(defaults: UserDefaults) -> Bool {
@@ -16,6 +21,16 @@ enum CodexAgentModeBooleanPreference {
             return CodexGoalSupport.isEnabled(defaults: defaults)
         case .reasoningSummaries:
             return CodexReasoningSummaries.isEnabled(defaults: defaults)
+        case .memories:
+            return CodexMemories.isEnabled(defaults: defaults)
+        case .apps:
+            return CodexCapabilityPreference.apps.isEnabled(defaults: defaults)
+        case .plugins:
+            return CodexCapabilityPreference.plugins.isEnabled(defaults: defaults)
+        case .mcpElicitation:
+            return CodexCapabilityPreference.mcpElicitation.isEnabled(defaults: defaults)
+        case .toolSuggestions:
+            return CodexCapabilityPreference.toolSuggestions.isEnabled(defaults: defaults)
         }
     }
 
@@ -30,6 +45,16 @@ enum CodexAgentModeBooleanPreference {
             CodexGoalSupport.setEnabled(enabled, defaults: defaults)
         case .reasoningSummaries:
             CodexReasoningSummaries.setEnabled(enabled, defaults: defaults)
+        case .memories:
+            CodexMemories.setEnabled(enabled, defaults: defaults)
+        case .apps:
+            CodexCapabilityPreference.apps.setEnabled(enabled, defaults: defaults)
+        case .plugins:
+            CodexCapabilityPreference.plugins.setEnabled(enabled, defaults: defaults)
+        case .mcpElicitation:
+            CodexCapabilityPreference.mcpElicitation.setEnabled(enabled, defaults: defaults)
+        case .toolSuggestions:
+            CodexCapabilityPreference.toolSuggestions.setEnabled(enabled, defaults: defaults)
         }
     }
 
@@ -40,6 +65,16 @@ enum CodexAgentModeBooleanPreference {
             GlobalSettingsStore.shared.codexGoalSupportEnabled()
         case .reasoningSummaries:
             GlobalSettingsStore.shared.codexReasoningSummariesEnabled()
+        case .memories:
+            GlobalSettingsStore.shared.codexMemoriesEnabled()
+        case .apps:
+            GlobalSettingsStore.shared.codexAppsEnabled()
+        case .plugins:
+            GlobalSettingsStore.shared.codexPluginsEnabled()
+        case .mcpElicitation:
+            GlobalSettingsStore.shared.codexMCPElicitationEnabled()
+        case .toolSuggestions:
+            GlobalSettingsStore.shared.codexToolSuggestionsEnabled()
         }
     }
 
@@ -50,6 +85,16 @@ enum CodexAgentModeBooleanPreference {
             GlobalSettingsStore.shared.setCodexGoalSupportEnabled(enabled)
         case .reasoningSummaries:
             GlobalSettingsStore.shared.setCodexReasoningSummariesEnabled(enabled)
+        case .memories:
+            GlobalSettingsStore.shared.setCodexMemoriesEnabled(enabled)
+        case .apps:
+            GlobalSettingsStore.shared.setCodexAppsEnabled(enabled)
+        case .plugins:
+            GlobalSettingsStore.shared.setCodexPluginsEnabled(enabled)
+        case .mcpElicitation:
+            GlobalSettingsStore.shared.setCodexMCPElicitationEnabled(enabled)
+        case .toolSuggestions:
+            GlobalSettingsStore.shared.setCodexToolSuggestionsEnabled(enabled)
         }
     }
 }

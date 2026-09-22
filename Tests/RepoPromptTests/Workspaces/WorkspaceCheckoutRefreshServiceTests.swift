@@ -2,24 +2,6 @@
 import XCTest
 
 final class WorkspaceCheckoutRefreshServiceTests: XCTestCase {
-    func testRefreshAfterCheckoutMutationFencesCodemapAuthorityWithoutRescan() async throws {
-        let root = try makeTemporaryRoot(name: "CheckoutRefreshCodemap")
-        let file = root.appendingPathComponent("Sources/App.swift")
-        try write("func branchBSymbol() {}\n", to: file)
-
-        let store = WorkspaceFileContextStore()
-        let record = try await store.loadRoot(path: root.path)
-        let service = WorkspaceCheckoutRefreshService(store: store, searchService: WorkspaceSearchService())
-        let result = await service.refreshAfterCheckoutMutation(rootPath: root.path)
-        await Task.yield()
-
-        let operations = await store.codemapPresentationOperationCountsForTesting()
-        XCTAssertTrue(result.didRefreshLoadedRoot)
-        XCTAssertEqual(result.refreshedRootIDs, [record.id])
-        XCTAssertEqual(operations.artifactDemandRequests, 0)
-        XCTAssertEqual(operations.presentationFreezeRequests, 0)
-    }
-
     func testRefreshAfterCheckoutMutationRebuildsVisibleSearchIndexFromFreshCatalogSnapshot() async throws {
         let root = try makeTemporaryRoot(name: "CheckoutRefreshSearch")
         try write("let seed = true\n", to: root.appendingPathComponent("Seed.swift"))

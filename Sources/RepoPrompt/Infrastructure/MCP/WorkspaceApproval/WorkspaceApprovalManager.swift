@@ -8,41 +8,25 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptDomainRuntime
 
-/// Manages approval requests for workspace operations triggered by MCP clients.
-/// Similar to the MCP client connection approval flow, but for workspace modifications.
+/// AppKit presenter and compatibility-policy façade for the domain mutation approval broker.
+/// Queueing, timeout, cancellation, and late-response authority are AppKit-free and runtime-owned.
 @MainActor
 public final class WorkspaceApprovalManager: ObservableObject {
-    // MARK: - Singleton
-
     public static let shared = WorkspaceApprovalManager()
 
-    // MARK: - Published State
-
-    /// The currently pending approval request, if any.
     @Published public private(set) var pendingRequest: WorkspaceApprovalRequest?
-
-    /// Whether the approval overlay should be visible.
     @Published public var isApprovalOverlayVisible: Bool = false
-
-    /// Current approval settings.
     @Published public private(set) var settings: WorkspaceApprovalSettings
 
-    // MARK: - Private State
-
-    /// Queue of pending approval requests.
-    private var pendingQueue: [(WorkspaceApprovalRequest, CheckedContinuation<WorkspaceApprovalResult, Never>)] = []
-
-    /// Current approval continuation (for the active request).
-    private var currentContinuation: CheckedContinuation<WorkspaceApprovalResult, Never>?
-
-    /// UserDefaults key for settings persistence.
     private static let settingsKey = "workspace.approvalSettings"
-
-    // MARK: - Init
+    private let broker = AppDomainRuntimeComposition.shared.runtime.mutationApprovalBroker
+    private var requestsByID: [UUID: WorkspaceApprovalRequest] = [:]
+    private var outstandingRequestIDs: Set<UUID> = []
+    private var presenterRegistered = false
 
     private init() {
-        // Load settings from UserDefaults
         if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
            let decoded = try? JSONDecoder().decode(WorkspaceApprovalSettings.self, from: data)
         {
@@ -52,149 +36,93 @@ public final class WorkspaceApprovalManager: ObservableObject {
         }
     }
 
-    // MARK: - Public API
-
-    /// Request approval for a workspace operation.
-    /// Returns the user's decision.
-    ///
-    /// The wait is cancellation-aware: if the calling task is cancelled (for example by a
-    /// tool-execution watchdog), the request resolves as `.denied` instead of parking the
-    /// caller on an unresolvable continuation while the side effect remains pending.
     public func requestApproval(for request: WorkspaceApprovalRequest) async -> WorkspaceApprovalResult {
-        // Check if auto-approved
         if settings.shouldAutoApprove(operation: request.operation, clientID: request.clientID) {
-            // Update last used timestamp for the client policy
             updatePolicyLastUsed(clientID: request.clientID)
             return .approved(alwaysAllow: false)
         }
+        guard !Task.isCancelled else { return .denied }
 
-        // Need user approval
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume(returning: .denied)
-                    return
-                }
+        await ensurePresenterRegistered()
+        requestsByID[request.id] = request
+        outstandingRequestIDs.insert(request.id)
+        defer {
+            requestsByID.removeValue(forKey: request.id)
+            outstandingRequestIDs.remove(request.id)
+        }
 
-                // If there's already a pending request, queue this one
-                if pendingRequest != nil {
-                    pendingQueue.append((request, continuation))
-                    return
-                }
-
-                // Show approval overlay
-                pendingRequest = request
-                currentContinuation = continuation
-                isApprovalOverlayVisible = true
-
-                // Bring window to front and request attention
-                bringWindowToFront(windowID: request.windowID)
-
-                if !NSApp.isActive {
-                    NSApp.requestUserAttention(.criticalRequest)
-                }
-            }
-        } onCancel: {
-            Task { @MainActor in
-                WorkspaceApprovalManager.shared.cancelPending(requestID: request.id)
-            }
+        let result = await broker.request(DomainMutationApprovalRequest(
+            id: request.id,
+            principalSummary: request.clientID,
+            toolName: "manage_workspaces",
+            action: request.operation.rawValue,
+            risk: request.operation.riskLevel.domainRisk,
+            summary: request.summary,
+            windowID: request.windowID,
+            deadline: Date().addingTimeInterval(300)
+        ))
+        switch result {
+        case let .approved(alwaysAllow):
+            return .approved(alwaysAllow: alwaysAllow)
+        case .timeout:
+            return .timeout
+        case .denied, .cancelled, .presenterUnavailable:
+            return .denied
         }
     }
 
-    /// Deny and clear a specific pending approval request, whether it is the active
-    /// request or still queued. No-op if the request has already been resolved.
     public func cancelPending(requestID: UUID) {
-        if pendingRequest?.id == requestID {
-            currentContinuation?.resume(returning: .denied)
-            currentContinuation = nil
-            pendingRequest = nil
-            isApprovalOverlayVisible = false
-            processNextQueuedRequest()
-            return
-        }
-
-        guard let index = pendingQueue.firstIndex(where: { $0.0.id == requestID }) else { return }
-        let (_, continuation) = pendingQueue.remove(at: index)
-        continuation.resume(returning: .denied)
+        clearPresentedRequestIfMatching(requestID)
+        requestsByID.removeValue(forKey: requestID)
+        outstandingRequestIDs.remove(requestID)
+        Task { await broker.cancel(requestID: requestID) }
     }
 
-    /// Resolve the current pending approval request.
     public func resolveApproval(allow: Bool, alwaysAllow: Bool = false) {
-        guard let request = pendingRequest,
-              let continuation = currentContinuation
-        else {
-            return
-        }
-
-        // If always-allow was selected, update the policy
-        if allow && alwaysAllow {
+        guard let request = pendingRequest else { return }
+        if allow, alwaysAllow {
             addAutoApproval(clientID: request.clientID, operation: request.operation)
         }
-
-        // Resume the continuation
-        let result: WorkspaceApprovalResult = allow ? .approved(alwaysAllow: alwaysAllow) : .denied
-        continuation.resume(returning: result)
-
-        // Clear current state
-        currentContinuation = nil
-        pendingRequest = nil
-        isApprovalOverlayVisible = false
-
-        // Process next queued request if any
-        processNextQueuedRequest()
+        let requestID = request.id
+        clearPresentedRequestIfMatching(requestID)
+        Task {
+            await broker.resolve(
+                requestID: requestID,
+                approved: allow,
+                alwaysAllow: alwaysAllow
+            )
+        }
     }
 
     #if DEBUG
         var pendingQueueCountForTesting: Int {
-            pendingQueue.count
+            max(0, outstandingRequestIDs.count - (pendingRequest == nil ? 0 : 1))
         }
     #endif
 
-    /// Cancel all pending approvals (e.g., when window closes).
     public func cancelAllPending() {
-        // Cancel current
-        if let continuation = currentContinuation {
-            continuation.resume(returning: .denied)
-        }
-
-        // Cancel queued
-        for (_, continuation) in pendingQueue {
-            continuation.resume(returning: .denied)
-        }
-
-        currentContinuation = nil
+        let ids = outstandingRequestIDs
+        requestsByID.removeAll()
+        outstandingRequestIDs.removeAll()
         pendingRequest = nil
-        pendingQueue = []
         isApprovalOverlayVisible = false
+        guard !ids.isEmpty else { return }
+        Task { await broker.cancel(requestIDs: ids) }
     }
 
-    /// Cancel approvals associated with a specific window without affecting other windows.
     public func cancelPending(forWindowID windowID: Int) {
-        if pendingRequest?.windowID == windowID {
-            currentContinuation?.resume(returning: .denied)
-            currentContinuation = nil
-            pendingRequest = nil
-            isApprovalOverlayVisible = false
+        let ids = Set(requestsByID.values.compactMap { request in
+            request.windowID == windowID ? request.id : nil
+        })
+        for id in ids {
+            requestsByID.removeValue(forKey: id)
+            outstandingRequestIDs.remove(id)
+            clearPresentedRequestIfMatching(id)
         }
-
-        var remainingQueue: [(WorkspaceApprovalRequest, CheckedContinuation<WorkspaceApprovalResult, Never>)] = []
-        for (request, continuation) in pendingQueue {
-            if request.windowID == windowID {
-                continuation.resume(returning: .denied)
-            } else {
-                remainingQueue.append((request, continuation))
-            }
-        }
-        pendingQueue = remainingQueue
-
-        if pendingRequest == nil {
-            processNextQueuedRequest()
-        }
+        guard !ids.isEmpty else { return }
+        Task { await broker.cancel(requestIDs: ids) }
     }
 
-    // MARK: - Settings Management
-
-    /// Add an auto-approval for a specific client and operation.
     public func addAutoApproval(clientID: String, operation: WorkspaceApprovalOperation) {
         let storageKey = matchingPolicyKeys(for: clientID).first ?? clientID
         var policy = settings.clientPolicies[storageKey] ?? WorkspaceApprovalClientPolicy(clientID: storageKey)
@@ -204,14 +132,12 @@ public final class WorkspaceApprovalManager: ObservableObject {
         saveSettings()
     }
 
-    /// Remove an auto-approval for a specific client and operation.
     public func removeAutoApproval(clientID: String, operation: WorkspaceApprovalOperation) {
         let keys = matchingPolicyKeys(for: clientID)
         guard !keys.isEmpty else { return }
         for key in keys {
             guard var policy = settings.clientPolicies[key] else { continue }
             policy.allowedOperations.remove(operation)
-
             if policy.allowedOperations.isEmpty {
                 settings.clientPolicies.removeValue(forKey: key)
             } else {
@@ -221,23 +147,18 @@ public final class WorkspaceApprovalManager: ObservableObject {
         saveSettings()
     }
 
-    /// Remove all auto-approvals for a client.
     public func removeAllAutoApprovals(for clientID: String) {
-        let keys = matchingPolicyKeys(for: clientID)
-        guard !keys.isEmpty else { return }
-        for key in keys {
+        for key in matchingPolicyKeys(for: clientID) {
             settings.clientPolicies.removeValue(forKey: key)
         }
         saveSettings()
     }
 
-    /// Set global auto-approve all setting.
     public func setAutoApproveAll(_ enabled: Bool) {
         settings.autoApproveAll = enabled
         saveSettings()
     }
 
-    /// Set global auto-approve for a specific operation.
     public func setAutoApproveOperation(_ operation: WorkspaceApprovalOperation, enabled: Bool) {
         if enabled {
             settings.autoApproveOperations.insert(operation)
@@ -247,38 +168,47 @@ public final class WorkspaceApprovalManager: ObservableObject {
         saveSettings()
     }
 
-    /// Get all trusted clients with their policies.
     public var trustedClients: [WorkspaceApprovalClientPolicy] {
         Array(settings.clientPolicies.values).sorted { $0.clientID < $1.clientID }
     }
 
-    // MARK: - Private Helpers
+    private func ensurePresenterRegistered() async {
+        guard !presenterRegistered else { return }
+        presenterRegistered = true
+        let manager = self
+        await broker.registerPresenter(DomainMutationApprovalPresenter(
+            present: { request in
+                await manager.presentDomainApproval(request)
+            },
+            dismiss: { requestID in
+                await manager.dismissDomainApproval(requestID)
+            }
+        ))
+    }
 
-    private func processNextQueuedRequest() {
-        guard !pendingQueue.isEmpty else { return }
-
-        let (nextRequest, continuation) = pendingQueue.removeFirst()
-
-        // Check if this queued request can now be auto-approved
-        if settings.shouldAutoApprove(operation: nextRequest.operation, clientID: nextRequest.clientID) {
-            updatePolicyLastUsed(clientID: nextRequest.clientID)
-            continuation.resume(returning: .approved(alwaysAllow: false))
-            processNextQueuedRequest()
-            return
-        }
-
-        // Show approval overlay for next request
-        pendingRequest = nextRequest
-        currentContinuation = continuation
+    private func presentDomainApproval(_ request: DomainMutationApprovalRequest) -> Bool {
+        guard let appRequest = requestsByID[request.id] else { return false }
+        pendingRequest = appRequest
         isApprovalOverlayVisible = true
+        bringWindowToFront(windowID: appRequest.windowID)
+        if !NSApp.isActive {
+            NSApp.requestUserAttention(.criticalRequest)
+        }
+        return true
+    }
 
-        bringWindowToFront(windowID: nextRequest.windowID)
+    private func dismissDomainApproval(_ requestID: UUID) {
+        clearPresentedRequestIfMatching(requestID)
+    }
+
+    private func clearPresentedRequestIfMatching(_ requestID: UUID) {
+        guard pendingRequest?.id == requestID else { return }
+        pendingRequest = nil
+        isApprovalOverlayVisible = false
     }
 
     private func updatePolicyLastUsed(clientID: String) {
-        let keys = matchingPolicyKeys(for: clientID)
-        guard !keys.isEmpty else { return }
-        for key in keys {
+        for key in matchingPolicyKeys(for: clientID) {
             guard var policy = settings.clientPolicies[key] else { continue }
             policy.lastUsedAt = Date()
             settings.clientPolicies[key] = policy
@@ -300,7 +230,6 @@ public final class WorkspaceApprovalManager: ObservableObject {
     }
 
     private func bringWindowToFront(windowID: Int?) {
-        // Try to find and activate the specific window, or just activate the app
         if let windowID,
            let windowState = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }),
            let nsWindow = windowState.nsWindow
@@ -309,51 +238,51 @@ public final class WorkspaceApprovalManager: ObservableObject {
                 NSApp.activate(ignoringOtherApps: true)
             }
             nsWindow.makeKeyAndOrderFront(nil)
-        } else {
-            // Just activate the app
-            if !NSApp.isActive {
-                NSApp.activate(ignoringOtherApps: true)
-            }
+        } else if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
         }
     }
 }
 
-// MARK: - Convenience Extensions
+private extension WorkspaceApprovalRiskLevel {
+    var domainRisk: DomainMutationApprovalRisk {
+        switch self {
+        case .low: .low
+        case .medium: .medium
+        case .high: .high
+        }
+    }
+}
 
 public extension WorkspaceApprovalManager {
-    /// Create and request approval for a workspace creation operation.
     func requestCreateWorkspaceApproval(
         clientID: String,
         workspaceName: String,
         windowID: Int?
     ) async -> WorkspaceApprovalResult {
-        let request = WorkspaceApprovalRequest(
+        await requestApproval(for: WorkspaceApprovalRequest(
             clientID: clientID,
             operation: .createWorkspace,
             workspaceName: workspaceName,
             windowID: windowID
-        )
-        return await requestApproval(for: request)
+        ))
     }
 
-    /// Create and request approval for a workspace deletion operation.
     func requestDeleteWorkspaceApproval(
         clientID: String,
         workspaceName: String,
         workspaceID: UUID,
         windowID: Int?
     ) async -> WorkspaceApprovalResult {
-        let request = WorkspaceApprovalRequest(
+        await requestApproval(for: WorkspaceApprovalRequest(
             clientID: clientID,
             operation: .deleteWorkspace,
             workspaceName: workspaceName,
             workspaceID: workspaceID,
             windowID: windowID
-        )
-        return await requestApproval(for: request)
+        ))
     }
 
-    /// Create and request approval for adding a folder to a workspace.
     func requestAddFolderApproval(
         clientID: String,
         folderPath: String,
@@ -361,18 +290,16 @@ public extension WorkspaceApprovalManager {
         workspaceID: UUID,
         windowID: Int?
     ) async -> WorkspaceApprovalResult {
-        let request = WorkspaceApprovalRequest(
+        await requestApproval(for: WorkspaceApprovalRequest(
             clientID: clientID,
             operation: .addFolder,
             workspaceName: workspaceName,
             workspaceID: workspaceID,
             folderPath: folderPath,
             windowID: windowID
-        )
-        return await requestApproval(for: request)
+        ))
     }
 
-    /// Create and request approval for removing a folder from a workspace.
     func requestRemoveFolderApproval(
         clientID: String,
         folderPath: String,
@@ -380,14 +307,13 @@ public extension WorkspaceApprovalManager {
         workspaceID: UUID,
         windowID: Int?
     ) async -> WorkspaceApprovalResult {
-        let request = WorkspaceApprovalRequest(
+        await requestApproval(for: WorkspaceApprovalRequest(
             clientID: clientID,
             operation: .removeFolder,
             workspaceName: workspaceName,
             workspaceID: workspaceID,
             folderPath: folderPath,
             windowID: windowID
-        )
-        return await requestApproval(for: request)
+        ))
     }
 }

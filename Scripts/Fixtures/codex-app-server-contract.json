@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "minimumCodexVersion": "0.145.0",
+  "minimumCodexVersion": "0.153.4",
   "experimental": true,
   "methodChecks": [
     {
@@ -13,6 +13,54 @@
         "clientInfo.version",
         "capabilities",
         "capabilities.experimentalApi"
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "account/login/start",
+      "alwaysSent": [
+        "type"
+      ],
+      "enumValues": {
+        "type": [
+          "chatgpt",
+          "chatgptDeviceCode"
+        ]
+      },
+      "responseSchema": "v2/LoginAccountResponse.json",
+      "consumedResponse": [
+        {
+          "path": "type",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "loginId",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "authUrl",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "userCode",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "verificationUrl",
+          "presence": "conditional",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "account/login/cancel",
+      "alwaysSent": [
+        "loginId"
       ]
     },
     {
@@ -82,6 +130,126 @@
           "nullable": true
         }
       ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "hooks/list",
+      "alwaysSent": [
+        "cwds"
+      ],
+      "responseSchema": "v2/HooksListResponse.json",
+      "consumedResponse": [
+        {
+          "path": "data",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].cwd",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].errors",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].warnings",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].key",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].currentHash",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].enabled",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].eventName",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].handlerType",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].command",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].sourcePath",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].source",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].hooks[].trustStatus",
+          "presence": "required",
+          "nullable": false
+        }
+      ],
+      "consumedEnumValues": {
+        "data[].hooks[].trustStatus": [
+          "managed",
+          "untrusted",
+          "trusted",
+          "modified"
+        ]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "config/batchWrite",
+      "alwaysSent": [
+        "edits",
+        "edits[].keyPath",
+        "edits[].value",
+        "edits[].mergeStrategy",
+        "reloadUserConfig"
+      ],
+      "enumValues": {
+        "edits[].mergeStrategy": [
+          "upsert"
+        ]
+      },
+      "responseSchema": "v2/ConfigWriteResponse.json",
+      "consumedResponse": [
+        {
+          "path": "status",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "skills/extraRoots/set",
+      "alwaysSent": [
+        "extraRoots"
+      ],
+      "responseSchema": "v2/SkillsExtraRootsSetResponse.json"
     },
     {
       "union": "ClientRequest.json",
@@ -193,6 +361,20 @@
     },
     {
       "union": "ClientRequest.json",
+      "method": "thread/memoryMode/set",
+      "alwaysSent": [
+        "threadId",
+        "mode"
+      ],
+      "enumValues": {
+        "mode": [
+          "enabled",
+          "disabled"
+        ]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
       "method": "thread/read",
       "alwaysSent": [
         "threadId",
@@ -281,7 +463,8 @@
           "completed",
           "declined",
           "failed",
-          "inProgress"
+          "inProgress",
+          "interrupted"
         ]
       }
     },
@@ -606,6 +789,27 @@
       "union": "ClientNotification.json",
       "method": "initialized",
       "alwaysSent": []
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "account/login/completed",
+      "consumedParams": [
+        {
+          "path": "loginId",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "success",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "error",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
     },
     {
       "union": "ServerNotification.json",

@@ -55,6 +55,19 @@ class ContentViewModel: ObservableObject {
                 self?.syncRouteWithWorkspaceState()
             }
             .store(in: &cancellables)
+
+        // The root shell reads approval state through this model. Forward only
+        // presentation changes so a request can appear without unrelated root
+        // navigation, without invalidating the root for every MCP dashboard update.
+        state.mcpServer.$pendingClientID
+            .combineLatest(state.mcpServer.$isApprovalOverlayVisible)
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Route Management

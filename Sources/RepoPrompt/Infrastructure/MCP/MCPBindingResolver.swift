@@ -35,14 +35,37 @@ struct MCPBindingResolver {
         }
     }
 
-    let collectMatchesForContextID: (UUID) async -> [MCPContextBindingMatch]
+    let collectMatchesForContextID: (UUID, UUID) async -> [MCPContextBindingMatch]
     let collectMatchesForWorkingDirs: ([String]) async -> [MCPContextBindingMatch]
+    let collectActiveMatchForWindowID: (Int) async -> MCPContextBindingMatch?
     let existingWindowIDForConnection: (UUID) async -> Int?
     let clientIdentifier: (UUID) async -> String?
     let reusableWindowForClient: (UUID, String) async -> Int?
     let sessionKeyForConnection: (UUID) async -> String?
     let preferredLiveRunWindowID: (String, String?) async -> Int?
     let preferredWindowID: (String, String?) async -> Int?
+
+    func resolvePresentationWindowBinding(
+        connectionID _: UUID,
+        requestedWindowID: Int
+    ) async throws -> MCPLogicalContextBindingResolution {
+        guard let match = await collectActiveMatchForWindowID(requestedWindowID) else {
+            throw MCPError.invalidParams(
+                "Window \(requestedWindowID) does not have an active RepoPrompt workspace/tab context to bind. Use bind_context op=list to discover available context_id values."
+            )
+        }
+        let logicalContext = MCPLogicalContextResolution(
+            tabID: match.tabID,
+            workspaceID: match.workspaceID,
+            workspaceName: match.workspaceName,
+            repoPaths: match.repoPaths,
+            windowIDs: [match.windowID]
+        )
+        return MCPLogicalContextBindingResolution(
+            logicalContext: logicalContext,
+            windowID: match.windowID
+        )
+    }
 
     func resolveLogicalContextBinding(
         connectionID: UUID,
@@ -64,10 +87,10 @@ struct MCPBindingResolver {
         let matches: [MCPContextBindingMatch]
         if let explicitContextID {
             sourceDescription = "context_id '\(explicitContextID.uuidString)'"
-            matches = await collectMatchesForContextID(explicitContextID)
+            matches = await collectMatchesForContextID(connectionID, explicitContextID)
         } else if let legacyTabID {
             sourceDescription = "_tabID '\(legacyTabID.uuidString)'"
-            matches = await collectMatchesForContextID(legacyTabID)
+            matches = await collectMatchesForContextID(connectionID, legacyTabID)
         } else if !workingDirs.isEmpty {
             sourceDescription = "working_dirs [\(workingDirs.joined(separator: ", "))]"
             matches = await collectMatchesForWorkingDirs(workingDirs)

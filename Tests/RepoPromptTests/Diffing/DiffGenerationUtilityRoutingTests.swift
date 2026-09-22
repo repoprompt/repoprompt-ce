@@ -2,6 +2,78 @@
 import XCTest
 
 final class DiffGenerationUtilityRoutingTests: XCTestCase {
+    func testReplaceAllHonorsSearchStartLineWithFullFileIndex() async throws {
+        let fileContent = ["same", "skip", "same", "middle", "same"]
+        let processed = fileContent.map {
+            DiffGenerationUtility.processLine($0, precision: .high)
+        }
+        let lineIndexMap = DiffGenerationUtility.buildLineIndexMapHigh(content: processed)
+
+        let chunks = try await DiffGenerationUtility.generateDiff(
+            fileContent: fileContent,
+            lineIndexMap: lineIndexMap,
+            startSelector: nil,
+            endSelector: nil,
+            searchBlock: ["same"],
+            newContent: ["replacement"],
+            action: .modify,
+            diffPrecision: .high,
+            processedFileContent: processed,
+            searchStartLine: 2,
+            replaceAll: true
+        )
+        let result = try DiffChunkTextApplier.apply(
+            chunks: chunks,
+            to: fileContent.joined(separator: "\n")
+        )
+
+        XCTAssertEqual(chunks.map(\.startLine), [2, 4])
+        XCTAssertEqual(result, "same\nskip\nreplacement\nmiddle\nreplacement")
+    }
+
+    func testBatchReplaceAllKeepsFullFileIndexCoordinatesAfterFirstMatch() async throws {
+        let original = [
+            "header",
+            "padding",
+            "TARGET",
+            "remove",
+            "gap one",
+            "gap two",
+            "gap three",
+            "TARGET",
+            "remove",
+            "footer"
+        ].joined(separator: "\n")
+        let request = ApplyEditsRequest(
+            path: "file.swift",
+            mode: .batch([
+                ApplyEditsOperation(
+                    search: "target\nremove",
+                    replace: "replacement",
+                    replaceAll: true
+                )
+            ]),
+            verbose: false
+        )
+
+        let result = try await ApplyEditsEngine.default.apply(request: request, to: original)
+
+        XCTAssertNil(result.note, "Case normalization should route through batch diff generation")
+        XCTAssertEqual(
+            result.updatedText,
+            [
+                "header",
+                "padding",
+                "replacement",
+                "gap one",
+                "gap two",
+                "gap three",
+                "replacement",
+                "footer"
+            ].joined(separator: "\n")
+        )
+    }
+
     func testReplaceAllBypassesDuplicateMatchAmbiguityAndAppliesCumulativeOffsets() async throws {
         let rows = [
             (

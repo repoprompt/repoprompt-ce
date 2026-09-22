@@ -1,5 +1,20 @@
 import SwiftUI
 
+enum ChatTranscriptActionPolicy: Equatable {
+    case standard
+    case nonMutating
+
+    /// Whether this transcript exposes controls that mutate chat or workspace state.
+    var allowsMutatingActions: Bool {
+        self == .standard
+    }
+
+    /// Whether this transcript displays provider token accounting.
+    var showsTokenUsage: Bool {
+        self == .standard
+    }
+}
+
 struct ChatMessagesView: View {
     @ObservedObject var viewModel: OracleViewModel
 
@@ -17,6 +32,9 @@ struct ChatMessagesView: View {
 
     /// Optional transcript session to render without changing global chat focus.
     let sessionIDOverride: UUID?
+
+    /// Controls which message actions this transcript presentation exposes.
+    let actionPolicy: ChatTranscriptActionPolicy
 
     private let contentAnimationDuration: Double = 0.2
 
@@ -48,7 +66,8 @@ struct ChatMessagesView: View {
         bottomOcclusion: CGFloat,
         showsScrollControls: Bool = true,
         autoScrollOnAppear: Bool = true,
-        sessionIDOverride: UUID? = nil
+        sessionIDOverride: UUID? = nil,
+        actionPolicy: ChatTranscriptActionPolicy = .standard
     ) {
         self.viewModel = viewModel
         _autoScrollEnabled = autoScrollEnabled
@@ -56,6 +75,7 @@ struct ChatMessagesView: View {
         self.showsScrollControls = showsScrollControls
         self.autoScrollOnAppear = autoScrollOnAppear
         self.sessionIDOverride = sessionIDOverride
+        self.actionPolicy = actionPolicy
     }
 
     private var renderedSessionID: UUID? {
@@ -209,7 +229,8 @@ struct ChatMessagesView: View {
                 MessageBubble(
                     message: message,
                     viewModel: viewModel,
-                    isLatestMessage: message.id == renderedMessages.last?.id
+                    isLatestMessage: message.id == renderedMessages.last?.id,
+                    actionPolicy: actionPolicy
                 )
                 .id(message.id)
                 .animation(.default, value: message.revisionCount)

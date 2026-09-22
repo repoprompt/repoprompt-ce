@@ -15,6 +15,8 @@ extension Notification.Name {
     static let showCLIProvidersTab = Notification.Name("showCLIProvidersTab")
     /// Posted when the UI should show the Agent Mode settings tab
     static let showAgentModeSettingsTab = Notification.Name("showAgentModeSettingsTab")
+    /// Posted when the UI should open Settings to the Model Router tab.
+    static let showModelRouterSettingsTab = Notification.Name("showModelRouterSettingsTab")
     /// Posted when the UI should open Settings to the Agent Models tab.
     static let showAgentModelsSettingsTab = Notification.Name("showAgentModelsSettingsTab")
     /// Posted when the UI should open Settings to the Agent Permissions tab.
@@ -71,6 +73,7 @@ extension Notification.Name {
     /// Posted when Agent Mode should open the Workflow pill popover.
     /// userInfo: ["windowID": Int]
     static let showAgentWorkflowPopover = Notification.Name("showAgentWorkflowPopover")
+
     /// Posted by WorkspaceManagerViewModel when workspace switch overlay visibility changes.
     /// object: WorkspaceManagerViewModel instance (window-scoped)
     /// userInfo: ["isVisible": Bool]

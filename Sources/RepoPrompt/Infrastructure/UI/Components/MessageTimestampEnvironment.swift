@@ -71,11 +71,15 @@ final class MessageTimestampBoundaryClock: ObservableObject {
 private struct MessageTimestampEnvironmentModifier: ViewModifier {
     @ObservedObject private var clock = MessageTimestampBoundaryClock.shared
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @Environment(\.calendar) private var calendar
+    @Environment(\.locale) private var locale
 
     func body(content: Content) -> some View {
         content
             .environment(\.showDatesInMessageTimestamps, globalSettings.showDatesInMessageTimestamps())
             .environment(\.messageTimestampNow, clock.now)
+            .environment(\.calendar, calendar)
+            .environment(\.locale, locale)
     }
 }
 
@@ -90,12 +94,16 @@ struct MessageTimestampText: View {
 
     @Environment(\.showDatesInMessageTimestamps) private var showDatesInMessageTimestamps
     @Environment(\.messageTimestampNow) private var messageTimestampNow
+    @Environment(\.calendar) private var calendar
+    @Environment(\.locale) private var locale
 
     var body: some View {
         Text(MessageTimestampFormatter.string(
             from: date,
             includeDateContext: showDatesInMessageTimestamps,
-            now: messageTimestampNow
+            now: messageTimestampNow,
+            calendar: calendar,
+            locale: locale
         ))
     }
 }

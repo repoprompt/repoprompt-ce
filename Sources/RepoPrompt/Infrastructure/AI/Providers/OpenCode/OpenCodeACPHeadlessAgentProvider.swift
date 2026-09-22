@@ -47,14 +47,26 @@ final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
                     resumeSessionID: message.resumeSessionID,
                     attachments: [],
                     taskLabelKind: nil,
-                    sessionModeID: config.sessionModeID
+                    sessionModeID: config.sessionModeID,
+                    modelParameterSelections: config.modelParameterSelections
                 )
             },
             makeController: controllerFactory,
-            beforePrompt: { controller, _ in
-                if let model = Self.selectedModelToApply(config: config) {
-                    try await controller.setSessionModel(model)
+            beforePrompt: { controller, request in
+                // Order matters: OpenCode advertises `effort` only after the model is set, so
+                // set model → apply selections → validate → set mode. A pin that cannot be
+                // honoured fails here, before `session/prompt`, rather than silently running at
+                // another level.
+                let modelToApply = Self.selectedModelToApply(config: config)
+                let selections = request.modelParameterSelections
+                if let modelToApply {
+                    // Force the model-selector RPC when a pin is pending: OpenCode advertises
+                    // `effort` only after an actual model set, so the ordinary no-op skip would
+                    // leave the pin unadvertised and therefore skipped.
+                    try await controller.setSessionModel(modelToApply, forceRPC: !selections.isEmpty)
                 }
+                let parameterReport = try await controller.applySessionModelParameterSelections(selections)
+                try parameterReport.validateNoSkippedSelections()
                 try await controller.setSessionMode(config.sessionModeID)
             },
             approvalPolicy: .declineUnsupported

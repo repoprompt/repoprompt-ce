@@ -1,19 +1,23 @@
+import Combine
+import Foundation
+import KeyboardShortcuts
 import SwiftUI
 
 // MARK: - Context Pill
 
 /// Always-visible pill showing context usage wheel + file/token info.
-/// Expands upward into a popover with export controls.
 struct AgentContextPill: View {
     @ObservedObject var promptManager: PromptViewModel
+    let openContextDrawerFiles: () -> Void
     let selectionCoordinator: WorkspaceSelectionCoordinator
     @ObservedObject var runtimeVM: AgentRuntimeSidebarViewModel
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
     let worktreeBindingsProvider: @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]
 
-    @State private var showPopover = false
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
+
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -34,6 +38,10 @@ struct AgentContextPill: View {
             return .filesOnly(count)
         }
         return AgentContextExportResolver.selectionSummary(for: currentExportSourceSelection)
+    }
+
+    private var selectionDisplayText: AgentContextSelectionDisplayText {
+        AgentContextFileCodemapCountSummary.selectionDisplayText(from: selectionSummary)
     }
 
     private var currentExportSourceSelection: StoredSelection {
@@ -58,6 +66,11 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.selectionTokens
     }
 
+    private var contextComposerActionText: String {
+        guard let contextComposerShortcut else { return "Click to review and edit" }
+        return "Click to review and edit · \(contextComposerShortcut)"
+    }
+
     private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
@@ -73,10 +86,11 @@ struct AgentContextPill: View {
             lines.append("Context usage unavailable")
         }
 
-        lines.append("Selected: \(detailedFileSummaryText)")
+        lines.append("Selected context: \(detailedFileSummaryText)")
         if let selectionTokens {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
         }
+        lines.append(contextComposerActionText)
 
         return lines.joined(separator: "\n")
     }
@@ -86,14 +100,18 @@ struct AgentContextPill: View {
             let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.context")
         #endif
         let cornerRadius = AgentPillMetrics.cornerRadius()
-        let summary = selectionSummary
-        let compactFileSummaryText = summary.compactText
-        let detailedFileSummaryText = summary.headlineText
+        let displayText = selectionDisplayText
+        let compactFileSummaryText = displayText.compact
+        let detailedFileSummaryText = displayText.detailed
 
         Button {
-            showPopover.toggle()
+            openContextDrawerFiles()
         } label: {
             HStack(spacing: 6) {
+                Image(systemName: "square.stack.3d.up")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+
                 Text(compactFileSummaryText)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                     .foregroundStyle(.secondary)
@@ -118,64 +136,9 @@ struct AgentContextPill: View {
         .buttonStyle(.plain)
         .hoverTooltip(contextUsageTooltip(detailedFileSummaryText: detailedFileSummaryText), .top)
         .accessibilityLabel("Agent context: \(detailedFileSummaryText)")
-        .accessibilityHint("Opens context export controls and usage details")
-        .popover(isPresented: $showPopover, arrowEdge: .bottom) {
-            contextPopoverContent
+        .accessibilityHint("Review and edit selected context")
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
         }
-    }
-
-    @ViewBuilder
-    private var contextPopoverContent: some View {
-        // Width grows with the font scale so the export card never feels
-        // pinched at Large/Extra Large.
-        let popoverWidth = fontPreset.scaledClamped(420, max: 520)
-        let summary = selectionSummary
-        let fileCount = summary.totalExplicitFileCount
-        let visibleManagerRows = min(max(fileCount, 3), 7)
-        let managerIdealHeight = min(360, Double(visibleManagerRows) * 40 + 54)
-
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                AgentContextIndicator(
-                    contextWindowTokens: contextWindowTokens,
-                    usedTokens: estimatedUsedTokens,
-                    sourceLabel: runtimeVM.snapshot.usedTokens != nil
-                        ? runtimeVM.snapshot.usageSource.label
-                        : "Estimated",
-                    style: .labeled
-                )
-                Spacer()
-            }
-
-            AgentSelectedFilesInlineManager(
-                promptManager: promptManager,
-                selectionCoordinator: selectionCoordinator,
-                currentTabID: currentTabID,
-                activeAgentSessionID: activeAgentSessionID,
-                worktreeBindingsProvider: worktreeBindingsProvider,
-                summary: summary
-            )
-            .frame(
-                minHeight: 124,
-                idealHeight: managerIdealHeight,
-                maxHeight: 360
-            )
-
-            Divider()
-
-            AgentExportCard(
-                promptManager: promptManager,
-                tokenCounter: promptManager.tokenCountingViewModel,
-                selectionCoordinator: selectionCoordinator,
-                fileCount: fileCount,
-                selectionTokens: selectionTokens,
-                showsFilesButton: false,
-                currentTabID: currentTabID,
-                activeAgentSessionID: activeAgentSessionID,
-                worktreeBindingsProvider: worktreeBindingsProvider
-            )
-        }
-        .padding(12)
-        .frame(width: popoverWidth)
     }
 }

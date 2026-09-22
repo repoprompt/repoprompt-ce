@@ -8,6 +8,15 @@ class AnthropicProvider: AIProvider {
         service = AnthropicServiceFactory.service(apiKey: apiKey, betaHeaders: betaHeaders)
     }
 
+    static func isSuccessfulCompletionStopReason(_ stopReason: String) -> Bool {
+        switch stopReason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "end_turn", "stop_sequence":
+            true
+        default:
+            false
+        }
+    }
+
     private func createMessages(for aiMessage: AIMessage) -> [MessageParameter.Message] {
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
@@ -52,7 +61,12 @@ class AnthropicProvider: AIProvider {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
-                continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                switch result.completionOutcome {
+                case .completed:
+                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                case let .incomplete(reason):
+                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
+                }
                 continuation.finish()
             }
         }
@@ -127,9 +141,12 @@ class AnthropicProvider: AIProvider {
                     // Track token counts
                     var promptTokens: Int? = nil
                     var completionTokens: Int? = nil
+                    var observedStopReason: String?
+                    var didObserveMessageStop = false
 
                     for try await result in stream {
                         var reasoning: String? = nil
+                        var shouldYieldEvent = true
 
                         // Handle different stream events
                         switch result.streamEvent {
@@ -157,7 +174,20 @@ class AnthropicProvider: AIProvider {
                                 currentThinking = ""
                             }
 
+                        case .messageDelta:
+                            if let stopReason = result.delta?.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines),
+                               !stopReason.isEmpty
+                            {
+                                observedStopReason = stopReason
+                            }
+                            if let usage = result.usage {
+                                promptTokens = usage.inputTokens
+                                completionTokens = usage.outputTokens + (usage.thinkingTokens ?? 0)
+                            }
+
                         case .messageStop:
+                            didObserveMessageStop = true
+                            shouldYieldEvent = false
                             // Extract token usage from the end of stream
                             if let usage = result.usage {
                                 promptTokens = usage.inputTokens
@@ -176,21 +206,29 @@ class AnthropicProvider: AIProvider {
                             type: result.type,
                             text: result.contentBlock?.text ?? result.delta?.text,
                             reasoning: reasoning,
-                            promptTokens: promptTokens, // Only include tokens in final message_stop
+                            promptTokens: promptTokens,
                             completionTokens: completionTokens
                         )
 
-                        continuation.yield(aiResult)
+                        if shouldYieldEvent {
+                            continuation.yield(aiResult)
+                        }
                     }
 
-                    // Send final message_stop with token counts
-                    continuation.yield(AIStreamResult(
-                        type: "message_stop",
-                        text: nil,
-                        reasoning: nil,
-                        promptTokens: promptTokens,
-                        completionTokens: completionTokens
-                    ))
+                    if didObserveMessageStop {
+                        let stopReason = observedStopReason ?? "missing_stop_reason"
+                        let type = Self.isSuccessfulCompletionStopReason(stopReason)
+                            ? "message_stop"
+                            : AIStreamResult.incompleteType
+                        continuation.yield(AIStreamResult(
+                            type: type,
+                            text: nil,
+                            reasoning: nil,
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens,
+                            stopReason: stopReason
+                        ))
+                    }
 
                     continuation.finish()
                 } catch {
@@ -280,10 +318,16 @@ class AnthropicProvider: AIProvider {
         let thinkingTokens = response.usage.thinkingTokens ?? 0
         let completionTokens = outputTokens + thinkingTokens
 
+        let stopReason = response.stopReason ?? "missing_stop_reason"
+        let completionOutcome: AIProviderCompletionOutcome = Self.isSuccessfulCompletionStopReason(stopReason)
+            ? .completed
+            : .incomplete(reason: stopReason)
+
         return AICompletionResult(
             text: text,
             promptTokens: promptTokens,
-            completionTokens: completionTokens
+            completionTokens: completionTokens,
+            completionOutcome: completionOutcome
         )
     }
 

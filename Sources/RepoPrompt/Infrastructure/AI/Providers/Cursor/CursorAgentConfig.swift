@@ -1,9 +1,14 @@
 import Foundation
 
+enum CursorAgentCommandSelection: Equatable {
+    case automatic
+    case exact(String)
+}
+
 struct CursorAgentConfig {
     static let promptOnlySessionModeID = "ask"
 
-    let commandName: String
+    let commandSelection: CursorAgentCommandSelection
     let additionalPathHints: [String]
     let enableDebugLogging: Bool
     let modelString: String?
@@ -11,8 +16,17 @@ struct CursorAgentConfig {
     let cleanupProjectMCPApproval: Bool
     let sessionModeID: String?
 
+    var commandName: String {
+        switch commandSelection {
+        case .automatic:
+            CLILaunchProfiles.cursor.commandName
+        case let .exact(commandName):
+            commandName
+        }
+    }
+
     init(
-        commandName: String = "cursor-agent",
+        commandName: String? = nil,
         additionalPathHints: [String] = CLIPathHints.cursor,
         enableDebugLogging: Bool = false,
         modelString: String? = nil,
@@ -20,7 +34,7 @@ struct CursorAgentConfig {
         cleanupProjectMCPApproval: Bool = true,
         sessionModeID: String? = nil
     ) {
-        self.commandName = commandName
+        commandSelection = commandName.map(CursorAgentCommandSelection.exact) ?? .automatic
         self.additionalPathHints = additionalPathHints
         self.enableDebugLogging = enableDebugLogging
         self.modelString = modelString

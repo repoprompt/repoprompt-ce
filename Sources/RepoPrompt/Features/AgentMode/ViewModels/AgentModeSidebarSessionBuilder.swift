@@ -6,7 +6,7 @@ struct AgentModeSidebarSessionBuilder {
     typealias TabSession = AgentModeViewModel.TabSession
 
     let allTabs: [ComposeTabState]
-    let linkedTabs: [ComposeTabState]
+    let rowTabs: [ComposeTabState]
     let sessions: [UUID: TabSession]
     let authoritativeSessionIDByTabID: [UUID: UUID]
     let sessionIndex: [UUID: AgentSessionIndexEntry]
@@ -20,7 +20,7 @@ struct AgentModeSidebarSessionBuilder {
         let tabNameByID: [UUID: String]
         let tabOrder: [UUID: Int]
         let sortDateByTabID: [UUID: Date]
-        let explicitSessionIDByTabID: [UUID: UUID]
+        let resolvedSessionIDByTabID: [UUID: UUID]
         let bestEntryByTabID: [UUID: AgentSessionIndexEntry]
         let useFrozenRestoreOrder: Bool
     }
@@ -30,7 +30,7 @@ struct AgentModeSidebarSessionBuilder {
             let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
         let context = makeBuildContext()
-        let rows = linkedTabs.map { tab in
+        let rows = rowTabs.map { tab in
             sidebarRow(for: tab, context: context)
         }
         let baseSortedSessions = sortedSidebarRows(rows, context: context)
@@ -44,9 +44,10 @@ struct AgentModeSidebarSessionBuilder {
                 fields: [
                     "allTabCount": String(allTabs.count),
                     "hasParentMetadata": String(hasParentMetadata),
-                    "linkedTabCount": String(linkedTabs.count),
                     "mcpControlledCount": String(mcpControlledTabIDs.count),
                     "resultCount": String(result.count),
+                    "rowTabCount": String(rowTabs.count),
+                    "sessionlessRowCount": String(result.count(where: { $0.sessionID == nil })),
                     "sessionCount": String(sessions.count),
                     "sessionIndexCount": String(sessionIndex.count),
                     "sortDateCount": String(sessionListSortDates.count)
@@ -77,10 +78,15 @@ struct AgentModeSidebarSessionBuilder {
         for tab in allTabs where tabByID[tab.id] == nil {
             tabByID[tab.id] = tab
         }
-        let tabNameByID = sidebarTabNameLookup(for: linkedTabs)
-        let tabOrder = sidebarTabOrder(for: linkedTabs)
+        let tabNameByID = sidebarTabNameLookup(for: rowTabs)
+        let tabOrder = sidebarTabOrder(for: rowTabs)
+        // `authoritativeSessionIDByTabID` and `rowTabs` can both contain roughly
+        // one entry per persisted chat. Scanning `rowTabs` for every binding made
+        // this O(tabs × bindings) during workspace restore (nearly one million
+        // comparisons in a 969-tab workspace). Build the membership set once.
+        let rowTabIDs = Set(rowTabs.map(\.id))
         let explicitSessionIDByTabID = authoritativeSessionIDByTabID.filter { tabID, _ in
-            linkedTabs.contains(where: { $0.id == tabID })
+            rowTabIDs.contains(tabID)
         }
         let explicitTabIDBySessionID = Dictionary(
             explicitSessionIDByTabID.map { ($0.value, $0.key) },
@@ -88,16 +94,21 @@ struct AgentModeSidebarSessionBuilder {
         )
         let indexEntriesByTabID = Dictionary(grouping: sessionIndex.values, by: \.tabID)
         let bestEntryByTabID = sidebarEntryMap(
-            for: linkedTabs,
+            for: rowTabs,
             tabNameByID: tabNameByID,
             explicitSessionIDByTabID: explicitSessionIDByTabID,
             explicitTabIDBySessionID: explicitTabIDBySessionID,
             indexEntriesBySessionID: sessionIndex,
             indexEntriesByTabID: indexEntriesByTabID
         )
+        let resolvedSessionIDByTabID = Dictionary(
+            uniqueKeysWithValues: rowTabs.compactMap { tab in
+                (explicitSessionIDByTabID[tab.id] ?? bestEntryByTabID[tab.id]?.id).map { (tab.id, $0) }
+            }
+        )
         let sortDateByTabID = sidebarSortDateLookup(
-            for: linkedTabs,
-            explicitSessionIDByTabID: explicitSessionIDByTabID,
+            for: rowTabs,
+            resolvedSessionIDByTabID: resolvedSessionIDByTabID,
             bestEntryByTabID: bestEntryByTabID
         )
         return BuildContext(
@@ -105,9 +116,12 @@ struct AgentModeSidebarSessionBuilder {
             tabNameByID: tabNameByID,
             tabOrder: tabOrder,
             sortDateByTabID: sortDateByTabID,
-            explicitSessionIDByTabID: explicitSessionIDByTabID,
+            resolvedSessionIDByTabID: resolvedSessionIDByTabID,
             bestEntryByTabID: bestEntryByTabID,
-            useFrozenRestoreOrder: shouldFreezeSidebarOrdering(for: linkedTabs)
+            useFrozenRestoreOrder: shouldFreezeSidebarOrdering(
+                for: rowTabs,
+                resolvedSessionIDByTabID: resolvedSessionIDByTabID
+            )
         )
     }
 
@@ -129,13 +143,14 @@ struct AgentModeSidebarSessionBuilder {
 
     private func sidebarSortDateLookup(
         for tabs: [ComposeTabState],
-        explicitSessionIDByTabID: [UUID: UUID],
+        resolvedSessionIDByTabID: [UUID: UUID],
         bestEntryByTabID: [UUID: AgentSessionIndexEntry]
     ) -> [UUID: Date] {
         var sortDateByTabID: [UUID: Date] = [:]
         for tab in tabs where sortDateByTabID[tab.id] == nil {
+            guard let resolvedSessionID = resolvedSessionIDByTabID[tab.id] else { continue }
             let liveSession: TabSession? = if let session = sessions[tab.id],
-                                              session.activeAgentSessionID == explicitSessionIDByTabID[tab.id],
+                                              session.activeAgentSessionID == resolvedSessionID,
                                               session.hasLoadedPersistedState
             {
                 session
@@ -153,13 +168,14 @@ struct AgentModeSidebarSessionBuilder {
         return sortDateByTabID
     }
 
-    private func shouldFreezeSidebarOrdering(for tabs: [ComposeTabState]) -> Bool {
+    private func shouldFreezeSidebarOrdering(
+        for tabs: [ComposeTabState],
+        resolvedSessionIDByTabID: [UUID: UUID]
+    ) -> Bool {
         guard !sessionListCacheReady, !sidebarRestoreFrozenOrderByTabID.isEmpty else { return false }
-        return tabs.allSatisfy { sidebarRestoreFrozenOrderByTabID[$0.id] != nil }
-    }
-
-    private func frozenSidebarOrderIndex(for tabID: UUID, fallback: Int) -> Int {
-        sidebarRestoreFrozenOrderByTabID[tabID] ?? fallback
+        let sessionBackedTabs = tabs.filter { resolvedSessionIDByTabID[$0.id] != nil }
+        guard !sessionBackedTabs.isEmpty else { return false }
+        return sessionBackedTabs.allSatisfy { sidebarRestoreFrozenOrderByTabID[$0.id] != nil }
     }
 
     private func sidebarEntryMap(
@@ -214,7 +230,14 @@ struct AgentModeSidebarSessionBuilder {
             agentKindRaw: entry.agentKindRaw,
             agentModelRaw: entry.agentModelRaw,
             agentReasoningEffortRaw: entry.agentReasoningEffortRaw,
+            acpModelParameterSelections: entry.acpModelParameterSelections,
             autoEditEnabled: entry.autoEditEnabled,
+            autoWakeOnOversightUpdates: entry.autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: entry.agentSessionLinkAutoWakeTargetSessionIDs,
+            routineWakeIntervalEnabled: entry.routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: entry.routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: entry.periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: entry.periodicIdleWakeIntervalSeconds,
             parentSessionID: entry.parentSessionID,
             hasUnknownConversationContent: entry.hasUnknownConversationContent,
             isMCPOriginated: entry.isMCPOriginated,
@@ -243,10 +266,10 @@ struct AgentModeSidebarSessionBuilder {
         for tab: ComposeTabState,
         context: BuildContext
     ) -> SidebarSession {
-        let authoritativeSessionID = context.explicitSessionIDByTabID[tab.id]
-            ?? context.bestEntryByTabID[tab.id]?.id
-        let boundLiveSession: TabSession? = if let session = sessions[tab.id],
-                                               session.activeAgentSessionID == authoritativeSessionID
+        let resolvedSessionID = context.resolvedSessionIDByTabID[tab.id]
+        let boundLiveSession: TabSession? = if let resolvedSessionID,
+                                               let session = sessions[tab.id],
+                                               session.activeAgentSessionID == resolvedSessionID
         {
             session
         } else {
@@ -268,12 +291,14 @@ struct AgentModeSidebarSessionBuilder {
         )
         let savedAt = sidebarSavedAt(for: tab, liveSession: metadataLiveSession, indexEntry: entry)
         let activityDate = Self.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
-        let resolvedSessionID = authoritativeSessionID ?? entry?.id
         let resolvedParentSessionID = metadataLiveSession?.parentSessionID ?? entry?.parentSessionID
         let isMCPControlled = mcpControlledTabIDs.contains(tab.id)
         let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
         let mergeAttention = sidebarRowWorktreeMergeAttention(liveSession: metadataLiveSession, entry: entry)
-        let searchFields = Self.searchFields(
+        let canStash = boundLiveSession?.items.isEmpty == false
+            || boundLiveSession?.transcript.turns.isEmpty == false
+            || entry.map(Self.sessionIndexEntryHasConversationContent) == true
+        let searchFieldSource = Self.searchFieldSource(
             title: title,
             entry: entry,
             runState: metadataLiveSession?.runState ?? entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") },
@@ -292,12 +317,13 @@ struct AgentModeSidebarSessionBuilder {
             activityDate: activityDate,
             isPinned: tab.isPinned,
             sessionID: resolvedSessionID,
+            canStash: canStash,
             parentSessionID: resolvedParentSessionID,
             depth: 0,
             isMCPControlled: isMCPControlled,
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
-            searchFields: searchFields
+            searchFieldSource: searchFieldSource
         )
     }
 
@@ -403,20 +429,30 @@ struct AgentModeSidebarSessionBuilder {
         context: BuildContext
     ) -> [SidebarSession] {
         rows.sorted { lhs, rhs in
-            let lhsIndex = context.tabOrder[lhs.tabID] ?? Int.max
-            let rhsIndex = context.tabOrder[rhs.tabID] ?? Int.max
             if context.useFrozenRestoreOrder {
-                let lhsFrozenIndex = frozenSidebarOrderIndex(for: lhs.tabID, fallback: lhsIndex)
-                let rhsFrozenIndex = frozenSidebarOrderIndex(for: rhs.tabID, fallback: rhsIndex)
-                if lhsFrozenIndex != rhsFrozenIndex {
-                    return lhsFrozenIndex < rhsFrozenIndex
+                let lhsFrozenIndex = sidebarRestoreFrozenOrderByTabID[lhs.tabID]
+                let rhsFrozenIndex = sidebarRestoreFrozenOrderByTabID[rhs.tabID]
+                switch (lhsFrozenIndex, rhsFrozenIndex) {
+                case let (.some(lhsIndex), .some(rhsIndex)) where lhsIndex != rhsIndex:
+                    return lhsIndex < rhsIndex
+                case (.some, .none):
+                    return true
+                case (.none, .some):
+                    return false
+                default:
+                    break
                 }
             }
             return sidebarRowPrecedes(lhs, rhs, tabOrder: context.tabOrder)
         }
     }
 
-    static func searchFields(
+    /// Captures the raw inputs a row needs to materialize search fields later.
+    ///
+    /// This is deliberately allocation-free: it only retains values the caller has
+    /// already computed. The expensive normalization lives in
+    /// `searchFields(source:)`, which runs only when a search query is active.
+    nonisolated static func searchFieldSource(
         title: String,
         entry: AgentSessionIndexEntry?,
         runState: AgentSessionRunState?,
@@ -424,22 +460,50 @@ struct AgentModeSidebarSessionBuilder {
         worktree: AgentWorktreeIndicator?,
         mergeAttention: AgentWorktreeMergeAttention?,
         sessionID: UUID?,
-        tabID: UUID
-    ) -> AgentSessionSearchFields {
-        let summaries = entry?.worktreeBindingSummaries ?? []
-        let mergeSummaries = entry?.activeWorktreeMergeSummaries ?? []
-        return AgentSessionSearchFields(
+        tabID: UUID?
+    ) -> AgentSessionSearchFieldSource {
+        AgentSessionSearchFieldSource(
             title: title,
+            runState: runState,
+            isMCPControlled: isMCPControlled,
+            worktree: worktree,
+            mergeAttention: mergeAttention,
+            sessionID: sessionID,
+            tabID: tabID,
+            entryID: entry?.id,
+            entryParentSessionID: entry?.parentSessionID,
+            lastRunStateRaw: entry?.lastRunStateRaw,
+            agentKindRaw: entry?.agentKindRaw,
+            agentModelRaw: entry?.agentModelRaw,
+            agentReasoningEffortRaw: entry?.agentReasoningEffortRaw,
+            autoEditEnabled: entry?.autoEditEnabled == true,
+            hasUnknownConversationContent: entry?.hasUnknownConversationContent == true,
+            worktreeBindingSummaries: entry?.worktreeBindingSummaries ?? [],
+            activeWorktreeMergeSummaries: entry?.activeWorktreeMergeSummaries ?? []
+        )
+    }
+
+    /// Materializes normalized search fields from a captured source.
+    ///
+    /// Field composition, ordering, and kinds are identical to the previous eager
+    /// implementation; only the point at which it runs has moved.
+    nonisolated static func searchFields(source: AgentSessionSearchFieldSource) -> AgentSessionSearchFields {
+        let summaries = source.worktreeBindingSummaries
+        let mergeSummaries = source.activeWorktreeMergeSummaries
+        let worktree = source.worktree
+        let mergeAttention = source.mergeAttention
+        return AgentSessionSearchFields(
+            title: source.title,
             status: [
-                runState?.searchLabel,
-                entry?.lastRunStateRaw,
-                isMCPControlled ? "MCP" : nil,
+                source.runState?.searchLabel,
+                source.lastRunStateRaw,
+                source.isMCPControlled ? "MCP" : nil,
                 mergeAttention == nil ? nil : "merge"
             ],
             model: [
-                entry?.agentKindRaw,
-                entry?.agentModelRaw,
-                entry?.agentReasoningEffortRaw
+                source.agentKindRaw,
+                source.agentModelRaw,
+                source.agentReasoningEffortRaw
             ],
             worktree: [
                 worktree?.label,
@@ -467,10 +531,10 @@ struct AgentModeSidebarSessionBuilder {
                 ]
             },
             secondary: [
-                isMCPControlled ? "MCP controlled" : nil,
-                entry?.autoEditEnabled == true ? "auto edit" : nil,
-                entry?.hasUnknownConversationContent == true ? "unknown content" : nil,
-                entry?.parentSessionID == nil ? nil : "sub-agent"
+                source.isMCPControlled ? "MCP controlled" : nil,
+                source.autoEditEnabled ? "auto edit" : nil,
+                source.hasUnknownConversationContent ? "unknown content" : nil,
+                source.entryParentSessionID == nil ? nil : "sub-agent"
             ],
             path: [
                 worktree?.logicalRootPath,
@@ -482,10 +546,34 @@ struct AgentModeSidebarSessionBuilder {
                 [summary.sourcePath, summary.targetPath]
             },
             identifier: [
-                sessionID?.uuidString,
-                tabID.uuidString,
-                entry?.id.uuidString
+                source.sessionID?.uuidString,
+                source.tabID?.uuidString,
+                source.entryID?.uuidString
             ]
+        )
+    }
+
+    nonisolated static func searchFields(
+        title: String,
+        entry: AgentSessionIndexEntry?,
+        runState: AgentSessionRunState?,
+        isMCPControlled: Bool,
+        worktree: AgentWorktreeIndicator?,
+        mergeAttention: AgentWorktreeMergeAttention?,
+        sessionID: UUID?,
+        tabID: UUID
+    ) -> AgentSessionSearchFields {
+        searchFields(
+            source: searchFieldSource(
+                title: title,
+                entry: entry,
+                runState: runState,
+                isMCPControlled: isMCPControlled,
+                worktree: worktree,
+                mergeAttention: mergeAttention,
+                sessionID: sessionID,
+                tabID: tabID
+            )
         )
     }
 
@@ -719,12 +807,13 @@ struct AgentModeSidebarSessionBuilder {
             activityDate: session.activityDate,
             isPinned: session.isPinned,
             sessionID: session.sessionID,
+            canStash: session.canStash,
             parentSessionID: session.parentSessionID,
             depth: depth,
             isMCPControlled: session.isMCPControlled,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
-            searchFields: session.searchFields
+            searchFieldSource: session.searchFieldSource
         )
     }
 

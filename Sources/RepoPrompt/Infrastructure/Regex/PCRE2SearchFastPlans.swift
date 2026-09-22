@@ -648,7 +648,7 @@ extension PCRE2Regex.MatchSession {
         options: PCRE2LineScanOptions,
         shouldCancel: () -> Bool = { false }
     ) throws -> PCRE2LineScanResult {
-        let prefilterNeedles = options.prefilter?.preparedNeedles() ?? []
+        let prefilterMatcher = options.prefilter.flatMap { PCRE2LinePrefilterMatcher(prefilter: $0) }
         var matchingLines: [Int] = []
         if options.collectMatches {
             matchingLines.reserveCapacity(8)
@@ -665,7 +665,7 @@ extension PCRE2Regex.MatchSession {
                 if let maxLineUTF8Length = options.maxLineUTF8Length, range.count > maxLineUTF8Length {
                     return true
                 }
-                if !prefilterNeedles.isEmpty, !lineContainsAnyPrefilterNeedle(buffer, range: range, needles: prefilterNeedles, caseInsensitive: options.prefilter?.caseInsensitive ?? false) {
+                if let prefilterMatcher, !prefilterMatcher.contains(in: buffer, range: range) {
                     return true
                 }
                 let base = buffer.baseAddress?.advanced(by: range.lowerBound)
@@ -687,40 +687,90 @@ extension PCRE2Regex.MatchSession {
     }
 }
 
-private extension PCRE2LinePrefilter {
-    func preparedNeedles() -> [[UInt8]] {
-        asciiRequiredAlternatives.compactMap { alternative in
-            let bytes = alternative.utf8.map { caseInsensitive ? PCRE2ASCIIWholeWordLiteral.asciiLowercase($0) : $0 }
-            guard !bytes.isEmpty, bytes.allSatisfy({ $0 < 0x80 }) else { return nil }
-            return bytes
-        }
+struct PCRE2LinePrefilterMatcher {
+    private struct Node {
+        var transitions: [UInt8: Int] = [:]
+        var failure = 0
+        var terminal = false
     }
-}
 
-private func lineContainsAnyPrefilterNeedle(
-    _ buffer: UnsafeBufferPointer<UInt8>,
-    range: Range<Int>,
-    needles: [[UInt8]],
-    caseInsensitive: Bool
-) -> Bool {
-    for needle in needles {
-        guard range.count >= needle.count else { continue }
-        var index = range.lowerBound
-        let lastStart = range.upperBound - needle.count
-        while index <= lastStart {
-            var matched = true
-            for offset in 0 ..< needle.count {
-                let hay = caseInsensitive ? PCRE2ASCIIWholeWordLiteral.asciiLowercase(buffer[index + offset]) : buffer[index + offset]
-                if hay != needle[offset] {
-                    matched = false
-                    break
+    private let nodes: [Node]
+    private let caseInsensitive: Bool
+
+    init?(prefilter: PCRE2LinePrefilter) {
+        var needles: [[UInt8]] = []
+        needles.reserveCapacity(prefilter.asciiRequiredAlternatives.count)
+        for alternative in prefilter.asciiRequiredAlternatives {
+            let bytes = alternative.utf8.map { byte in
+                prefilter.caseInsensitive ? PCRE2ASCIIWholeWordLiteral.asciiLowercase(byte) : byte
+            }
+            guard !bytes.isEmpty, bytes.allSatisfy({ $0 < 0x80 }) else { return nil }
+            needles.append(bytes)
+        }
+        guard !needles.isEmpty else { return nil }
+
+        var nodes = [Node()]
+        for needle in needles {
+            var state = 0
+            for byte in needle {
+                if let next = nodes[state].transitions[byte] {
+                    state = next
+                } else {
+                    let next = nodes.count
+                    nodes.append(Node())
+                    nodes[state].transitions[byte] = next
+                    state = next
                 }
             }
-            if matched { return true }
-            index += 1
+            nodes[state].terminal = true
         }
+
+        var queue = Array(nodes[0].transitions.values)
+        var queueIndex = 0
+        while queueIndex < queue.count {
+            let state = queue[queueIndex]
+            queueIndex += 1
+            let transitions = nodes[state].transitions
+            for (byte, next) in transitions {
+                var fallback = nodes[state].failure
+                while fallback != 0, nodes[fallback].transitions[byte] == nil {
+                    fallback = nodes[fallback].failure
+                }
+                let failureState = nodes[fallback].transitions[byte] ?? 0
+                nodes[next].failure = failureState
+                let failureTerminal = nodes[failureState].terminal
+                nodes[next].terminal = nodes[next].terminal || failureTerminal
+                queue.append(next)
+            }
+        }
+
+        self.nodes = nodes
+        caseInsensitive = prefilter.caseInsensitive
     }
-    return false
+
+    func contains(
+        in buffer: UnsafeBufferPointer<UInt8>,
+        range: Range<Int>
+    ) -> Bool {
+        if caseInsensitive {
+            for index in range where buffer[index] >= 0x80 {
+                return true
+            }
+        }
+
+        var state = 0
+        for index in range {
+            let byte = caseInsensitive ? PCRE2ASCIIWholeWordLiteral.asciiLowercase(buffer[index]) : buffer[index]
+            var next = nodes[state].transitions[byte]
+            while state != 0, next == nil {
+                state = nodes[state].failure
+                next = nodes[state].transitions[byte]
+            }
+            state = next ?? 0
+            if nodes[state].terminal { return true }
+        }
+        return false
+    }
 }
 
 @discardableResult

@@ -2,6 +2,7 @@ import Foundation
 
 enum RuntimeCodeSigningDomain: Hashable {
     case developerID
+    case successorDeveloperID
     case appleDevelopmentDebug
     case localSelfSigned
 }
@@ -53,6 +54,7 @@ struct RuntimeCodeSigningInfo: Equatable {
 
 enum RuntimeSecureStorageDomain: Equatable {
     case officialDeveloperID
+    case successorOfficialDeveloperID
     case localSelfSigned
     case appleDevelopmentDebug
     case ephemeral
@@ -88,31 +90,39 @@ struct RuntimeSecureStorageDecision: Equatable {
     let rejectionReason: RuntimeSecureStorageRejectionReason?
     let localCertificateFingerprint: String?
     let localServiceGeneration: Int?
+    let appleDevelopmentTeamIdentifier: String?
 
     init(
         domain: RuntimeSecureStorageDomain,
         rejectionReason: RuntimeSecureStorageRejectionReason?,
         localCertificateFingerprint: String? = nil,
-        localServiceGeneration: Int? = nil
+        localServiceGeneration: Int? = nil,
+        appleDevelopmentTeamIdentifier: String? = nil
     ) {
         self.domain = domain
         self.rejectionReason = rejectionReason
         self.localCertificateFingerprint = localCertificateFingerprint
         self.localServiceGeneration = localServiceGeneration
+        self.appleDevelopmentTeamIdentifier = appleDevelopmentTeamIdentifier
     }
 }
 
 enum RuntimeCodeSigningPolicy {
     static let developerIDBundleIdentifier = "com.pvncher.repoprompt.ce"
-    static let appleDevelopmentDebugBundleIdentifier = "com.pvncher.repoprompt.ce.debug"
+    static let appleDevelopmentDebugBundleIdentifier = "com.repoprompt.ce.debug"
     static let signingTeamIdentifier = "648A27MST5"
+    static let successorDeveloperIDBundleIdentifier = "com.repoprompt.ce"
+    static let successorSigningTeamIdentifier = "69N6K965SF"
     static let localSelfSignedCertificateName = "RepoPrompt CE Local Self-Signed Code Signing"
 
     static let developerIDRequirement =
         "anchor apple generic and identifier \"\(developerIDBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(signingTeamIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
 
     static let appleDevelopmentDebugRequirement =
-        "anchor apple generic and identifier \"\(appleDevelopmentDebugBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(signingTeamIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.12] exists"
+        "anchor apple generic and identifier \"\(appleDevelopmentDebugBundleIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.12] exists"
+
+    static let successorDeveloperIDRequirement =
+        "anchor apple generic and identifier \"\(successorDeveloperIDBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(successorSigningTeamIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
 
     private static let signingModePlistKey = "RepoPromptSigningMode"
     private static let debugStoragePlistKey = "RepoPromptDebugSecureStorageBackend"
@@ -195,6 +205,16 @@ enum RuntimeCodeSigningPolicy {
                 return ephemeral(.markerSignatureMismatch)
             }
             return RuntimeSecureStorageDecision(domain: .officialDeveloperID, rejectionReason: nil)
+        case "successor-developer-id":
+            guard matches(
+                signingInfo,
+                domain: .successorDeveloperID,
+                identifier: successorDeveloperIDBundleIdentifier,
+                teamIdentifier: successorSigningTeamIdentifier
+            ) else {
+                return ephemeral(.markerSignatureMismatch)
+            }
+            return RuntimeSecureStorageDecision(domain: .successorOfficialDeveloperID, rejectionReason: nil)
         case "local-self-signed":
             guard let localSigningContext else {
                 return ephemeral(.localIdentityRegistryUnavailable)
@@ -233,15 +253,16 @@ enum RuntimeCodeSigningPolicy {
             case nil:
                 return ephemeral(.missingDebugStorageMarker)
             case "keychain":
-                guard matches(
-                    signingInfo,
-                    domain: .appleDevelopmentDebug,
-                    identifier: appleDevelopmentDebugBundleIdentifier,
-                    teamIdentifier: signingTeamIdentifier
-                ) else {
+                guard let teamIdentifier = normalizedTeamIdentifier(signingInfo.teamIdentifier),
+                      matchesAppleDevelopmentDebug(signingInfo)
+                else {
                     return ephemeral(.markerSignatureMismatch)
                 }
-                return RuntimeSecureStorageDecision(domain: .appleDevelopmentDebug, rejectionReason: nil)
+                return RuntimeSecureStorageDecision(
+                    domain: .appleDevelopmentDebug,
+                    rejectionReason: nil,
+                    appleDevelopmentTeamIdentifier: teamIdentifier
+                )
             default:
                 return ephemeral(.unknownDebugStorageMarker)
             }
@@ -273,6 +294,17 @@ enum RuntimeCodeSigningPolicy {
         return true
     }
 
+    private static func matchesAppleDevelopmentDebug(_ signingInfo: RuntimeCodeSigningInfo) -> Bool {
+        guard !signingInfo.isAdHoc,
+              signingInfo.codeIdentifier == appleDevelopmentDebugBundleIdentifier,
+              normalizedTeamIdentifier(signingInfo.teamIdentifier) != nil,
+              signingInfo.validationResult.validates(.appleDevelopmentDebug)
+        else {
+            return false
+        }
+        return true
+    }
+
     private static func ephemeral(_ reason: RuntimeSecureStorageRejectionReason) -> RuntimeSecureStorageDecision {
         RuntimeSecureStorageDecision(domain: .ephemeral, rejectionReason: reason)
     }
@@ -281,5 +313,14 @@ enum RuntimeCodeSigningPolicy {
         guard let value else { return nil }
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func normalizedTeamIdentifier(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !normalized.isEmpty,
+              normalized.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) })
+        else { return nil }
+        return normalized
     }
 }

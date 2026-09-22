@@ -38,8 +38,8 @@ struct SettingsView: View {
     /// Canonical sidebar order. Agent-mode first, then General (app-wide
     /// preferences), MCP, models/providers, workspaces, and the copy-&-chat
     /// workflow.
-    private static let sidebarSectionOrder: [TabSection] = [
-        .agentMode, .general, .mcp, .api, .workspaces, .copyChat
+    static let sidebarSectionOrder: [TabSection] = [
+        .agentMode, .router, .general, .mcp, .api, .workspaces, .copyChat
     ]
 
     /// Legacy alias tabs that are kept in the enum for deep-link and
@@ -246,6 +246,8 @@ struct SettingsView: View {
             // deep-links into each of the other Agent Mode settings surfaces, so
             // it sits first in the sidebar.
             [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .contextBuilder]
+        case .router:
+            [.modelRouter]
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
         case .api:
@@ -391,9 +393,13 @@ struct SettingsView: View {
             AgentModeGeneralSettingsView(
                 promptVM: promptViewModel,
                 apiSettingsVM: apiSettingsViewModel,
+                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .modelRouter:
+            RouterSettingsView(viewModel: windowState.routerSettingsViewModel, onNavigate: { selectedTab = $0 })
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .agentModels:
             AgentModelsSettingsView(
                 promptVM: promptViewModel,
@@ -481,6 +487,7 @@ struct SettingsView: View {
 
 enum TabSection: String, Identifiable {
     case agentMode
+    case router
     case mcp
     case api
     case workspaces
@@ -494,6 +501,7 @@ enum TabSection: String, Identifiable {
     var title: String {
         switch self {
         case .agentMode: "Agent Mode"
+        case .router: "Router"
         case .mcp: "MCP Server"
         case .api: "Models & Providers"
         case .workspaces: "Workspaces"
@@ -529,6 +537,7 @@ enum SettingsTab: String, CaseIterable {
     case chatPresets // Chat presets management (legacy deep-link → workflowPresets with Chat scope)
     case contextBuilder // Context builder settings
     case agentMode // Agent Mode "Overview" tab (formerly labeled "Agent Mode Behavior")
+    case modelRouter // Optional backend-neutral fresh-task model routing
     case agentModels // NEW: Unified model config shell (Phase 1 IA scaffolding)
     case agentPermissions // NEW: Unified permissions shell (Phase 1 IA scaffolding)
     case agentWorkflows // Agent Mode workflow prompts and featured/custom workflows
@@ -558,6 +567,7 @@ enum SettingsTab: String, CaseIterable {
         case .chatPresets: "Chat Presets"
         case .contextBuilder: "Context Builder"
         case .agentMode: "Overview"
+        case .modelRouter: "Model Router"
         case .agentModels: "Agent Models"
         case .agentPermissions: "Agent Permissions"
         case .agentWorkflows: "Agent Workflows"
@@ -589,6 +599,7 @@ enum SettingsTab: String, CaseIterable {
         case .chatPresets: "bubble.left.and.bubble.right"
         case .contextBuilder: "sparkles"
         case .agentMode: "brain.head.profile"
+        case .modelRouter: "arrow.triangle.branch"
         case .agentModels: "brain"
         case .agentPermissions: "lock.shield"
         case .agentWorkflows: "bolt.fill"
@@ -605,6 +616,10 @@ enum SettingsTab: String, CaseIterable {
              .contextBuilder,
              .agentMode:
             .agentMode
+
+        // Optional model routing
+        case .modelRouter:
+            .router
 
         // MCP Server
         case .mcp, .mcpTools, .permissions, .modelPresets:
@@ -1038,12 +1053,12 @@ enum SettingsTab: String, CaseIterable {
                 "rewrite",
                 "augment",
                 "preserve",
-                "auto plan",
-                "plan generation",
+                "follow-up analysis",
+                "plan review question",
                 "claude code",
                 "codex",
                 "analysis budget",
-                "plan token budget",
+                "selected context",
                 "custom prompts",
                 "custom instructions",
                 "ui runs",
@@ -1073,7 +1088,27 @@ enum SettingsTab: String, CaseIterable {
                 "cleanup_sessions",
                 "investigate workflow",
                 "refactor workflow",
-                "orchestrate workflow"
+                "orchestrate workflow",
+                "agent chats",
+                "compose tabs",
+                "show mcp-created chats",
+                "mcp-created chats",
+                "compose tabs without agent sessions",
+                "sessionless compose tabs",
+                "show compose tabs",
+                "agent session visibility"
+            ]
+        case .modelRouter:
+            [
+                "model router",
+                "router",
+                "jev",
+                "typesafe",
+                "automatic model selection",
+                "route this task",
+                "routing backend",
+                "provider allowlist",
+                "privacy"
             ]
         case .agentModels:
             [

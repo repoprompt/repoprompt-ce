@@ -54,6 +54,7 @@ struct FileSystemSeedReplayResult {
 struct FileSystemSeedPublicationActivationProof: Equatable {
     let initializationID: FileSystemSeedInitializationID
     let watcherIngressGeneration: UInt64
+    let deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation
     let acceptedWatcherWatermark: FileSystemWatcherIngressMailbox.Watermark
     let servicePublicationSequence: UInt64
 }
@@ -61,6 +62,7 @@ struct FileSystemSeedPublicationActivationProof: Equatable {
 enum FileSystemSeedReplayError: Error, Equatable {
     case invalidJournalCut
     case watcherAlreadyActive
+    case watcherActivationTimedOut
     case initializationAlreadyActive
     case initializationNotCurrent
     case inventoryNotInstalled
@@ -94,6 +96,7 @@ struct FileSystemSeedInitializationState {
     let replayBaseAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark
     let replayBasePublicationSequence: UInt64
     var initialAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark
+    var deliveryGeneration: FSEventAsyncDeliveryBarrier.Generation?
     var phase: Phase
     var lastReplayPublicationSequence: UInt64
 }
@@ -111,13 +114,17 @@ extension FileSystemService {
         else {
             throw FileSystemSeedReplayError.invalidJournalCut
         }
+        guard !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired
+        else {
+            throw FileSystemSeedReplayError.recoveryRequired
+        }
         guard fseventStreamRef == nil else {
             throw FileSystemSeedReplayError.watcherAlreadyActive
         }
         guard seedInitializationState == nil else {
             throw FileSystemSeedReplayError.initializationAlreadyActive
         }
-
         watcherIngressMailbox.pauseAutomaticDraining()
         nextFSEventStreamStartEventID = journalCut.fseventID
         seedInitializationState = FileSystemSeedInitializationState(
@@ -127,6 +134,7 @@ extension FileSystemService {
             replayBaseAcceptedWatermark: lastPublishedWatcherAcceptedWatermark,
             replayBasePublicationSequence: lastServicePublicationSequence,
             initialAcceptedWatermark: captureAcceptedWatcherWatermark(),
+            deliveryGeneration: nil,
             phase: .capturing,
             lastReplayPublicationSequence: lastServicePublicationSequence
         )
@@ -134,8 +142,24 @@ extension FileSystemService {
         do {
             try startFSEventStream()
             if let stream = fseventStreamRef {
-                FSEventStreamFlushSync(stream)
+                let streamGeneration = fseventStreamGeneration
+                let deliveryGeneration = fseventDeliveryBarrier.currentGeneration
+                let flushTarget = FSEventStreamFlushAsync(stream)
+                let delivered = await fseventDeliveryBarrier.waitUntilDelivered(
+                    flushTarget,
+                    generation: deliveryGeneration
+                )
+                guard fseventStreamGeneration == streamGeneration else {
+                    seedInitializationState = nil
+                    throw FileSystemSeedReplayError.watcherNotActive
+                }
+                guard delivered else {
+                    stopFSEventStream(expectedGeneration: streamGeneration)
+                    seedInitializationState = nil
+                    throw FileSystemSeedReplayError.watcherActivationTimedOut
+                }
             }
+            seedInitializationState?.deliveryGeneration = fseventDeliveryBarrier.currentGeneration
             try requireCurrentSeedInitialization(initializationID)
             let initialAcceptedWatermark = captureAcceptedWatcherWatermark()
             seedInitializationState?.initialAcceptedWatermark = initialAcceptedWatermark
@@ -145,6 +169,11 @@ extension FileSystemService {
                 journalCut: journalCut,
                 initialAcceptedWatermark: initialAcceptedWatermark
             )
+        } catch FileSystemSeedReplayError.watcherActivationTimedOut {
+            throw FileSystemSeedReplayError.watcherActivationTimedOut
+        } catch FileSystemSeedReplayError.watcherNotActive {
+            seedInitializationState = nil
+            throw FileSystemSeedReplayError.watcherNotActive
         } catch {
             if fseventStreamRef != nil {
                 stopFSEventStream()
@@ -293,7 +322,11 @@ extension FileSystemService {
               state.initializationID == initializationID,
               state.watcherIngressGeneration == watcherIngressGeneration,
               state.phase == .readyForPublication,
-              fseventStreamRef != nil
+              fseventStreamRef != nil,
+              let deliveryGeneration = state.deliveryGeneration,
+              fseventDeliveryBarrier.currentGeneration == deliveryGeneration,
+              !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired
         else { return nil }
         #if DEBUG
             guard !seededPublicationActivationShouldFailForTesting else { return nil }
@@ -301,6 +334,7 @@ extension FileSystemService {
         let proof = FileSystemSeedPublicationActivationProof(
             initializationID: initializationID,
             watcherIngressGeneration: watcherIngressGeneration,
+            deliveryGeneration: deliveryGeneration,
             acceptedWatcherWatermark: captureAcceptedWatcherWatermark(),
             servicePublicationSequence: lastServicePublicationSequence
         )
@@ -319,16 +353,77 @@ extension FileSystemService {
               state.watcherIngressGeneration == proof.watcherIngressGeneration,
               state.phase == .activatedForPublication(proof),
               watcherIngressGeneration == proof.watcherIngressGeneration,
-              fseventStreamRef != nil
+              fseventStreamRef != nil,
+              let deliveryGeneration = state.deliveryGeneration,
+              proof.deliveryGeneration == deliveryGeneration,
+              fseventDeliveryBarrier.currentGeneration == deliveryGeneration,
+              !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired
         else { return false }
         return true
     }
+
+    /// Acquires the service-local recovery publication permit only while the
+    /// callback-owned sticky gate and this stream's delivery generation agree.
+    /// The caller owns the permit until its complete synchronous publication
+    /// assignment has finished; no await is permitted while it is held.
+    nonisolated func acquireSeededPublicationRecoveryPermit(
+        _ proof: FileSystemSeedPublicationActivationProof
+    ) -> FileSystemServiceFSEventRecoveryPublicationPermit? {
+        guard let permit = fseventRecoveryGate.acquirePublicationPermit() else {
+            return nil
+        }
+        guard fseventDeliveryBarrier.currentGeneration == proof.deliveryGeneration else {
+            permit.release()
+            return nil
+        }
+        return permit
+    }
+
+    nonisolated func seededPublicationRecoveryCutIsCurrent(
+        _ proof: FileSystemSeedPublicationActivationProof
+    ) -> Bool {
+        guard let permit = acquireSeededPublicationRecoveryPermit(proof) else {
+            return false
+        }
+        permit.release()
+        return true
+    }
+
+    #if DEBUG
+        /// Test seam for the real service permit. The callback-side action may
+        /// be queued by `onAcquired`; the production publication body remains
+        /// synchronous and the permit is released before the callback can mark.
+        nonisolated func withSeededPublicationRecoveryPermitForTesting<T>(
+            _ proof: FileSystemSeedPublicationActivationProof,
+            onAcquired: (() -> Void)? = nil,
+            body: () -> T
+        ) -> T? {
+            guard let permit = acquireSeededPublicationRecoveryPermit(proof) else {
+                return nil
+            }
+            onAcquired?()
+            defer { permit.release() }
+            return body()
+        }
+    #endif
 
     @discardableResult
     func finalizeSeededPublication(
         _ proof: FileSystemSeedPublicationActivationProof
     ) -> Bool {
-        guard seededPublicationActivationIsCurrent(proof) else { return false }
+        guard let state = seedInitializationState,
+              state.initializationID == proof.initializationID,
+              state.phase == .activatedForPublication(proof)
+        else { return false }
+        guard seededPublicationActivationIsCurrent(proof) else {
+            // Once visible publication has linearized, any lost proof is a
+            // recovery outcome, not a stale publication error. Retire the
+            // private seed phase so the owner can replace or reconcile the
+            // service through the normal recovery flight.
+            seedInitializationState = nil
+            return false
+        }
         seedInitializationState = nil
         return true
     }
@@ -542,6 +637,13 @@ extension FileSystemService {
         let state = try currentSeedInitialization(initializationID)
         guard state.watcherIngressGeneration == watcherIngressGeneration else {
             throw FileSystemSeedReplayError.watcherIngressChanged
+        }
+        guard !fseventRecoveryRequired,
+              !fseventRecoveryGate.isRequired,
+              let deliveryGeneration = state.deliveryGeneration,
+              fseventDeliveryBarrier.currentGeneration == deliveryGeneration
+        else {
+            throw FileSystemSeedReplayError.recoveryRequired
         }
         guard fseventStreamRef != nil else {
             throw FileSystemSeedReplayError.watcherNotActive

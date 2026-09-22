@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 public enum MCPTransportTerminalCause: String, Codable, Equatable, Sendable {
@@ -21,23 +22,7 @@ public struct MCPTransportCloseSnapshot: Equatable, Sendable {
     public let errorDescription: String?
 }
 
-struct MCPFirstTerminalRecordClaim: Equatable {
-    private(set) var record: MCPTerminalRecord?
-    private(set) var didPersist = false
-
-    mutating func claim(_ candidate: MCPTerminalRecord) -> MCPTerminalRecord? {
-        guard !didPersist else { return nil }
-        if record == nil {
-            record = candidate
-        }
-        return record
-    }
-
-    mutating func markPersisted() {
-        guard record != nil else { return }
-        didPersist = true
-    }
-}
+typealias MCPFirstTerminalRecordClaim = MCPDomainFirstTerminalClaim<MCPTerminalRecord>
 
 struct MCPTerminalToolExecutionContext: Equatable {
     let toolName: String

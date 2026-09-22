@@ -11,9 +11,11 @@ extension AgentModeViewModel {
             runState: runState,
             autoEditEnabled: autoEditEnabled,
             interviewFirst: interviewFirst,
+            modelRouter: modelRouterPillProps(),
             executionLocation: executionLocationProps(tabID: currentTabID),
             activeAgentSessionID: activeSession?.activeAgentSessionID,
-            activeRunID: activeSession?.runID
+            activeRunID: activeSession?.runID,
+            monitor: currentMonitorPillProps()
         )
     }
 

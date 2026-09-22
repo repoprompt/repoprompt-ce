@@ -5,6 +5,15 @@ import Foundation
     import Glibc
 #endif
 
+/// Safely converts a `stat.st_dev` value (which is `Int32` on macOS and can be
+/// negative for virtual/network filesystems) to `UInt64` without trapping.
+/// Using `UInt64(bitPattern: Int64(dev))` preserves the bit pattern instead of
+/// triggering a Swift overflow trap when `dev` is negative.
+@inline(__always)
+func safeDeviceID(_ dev: Int32) -> UInt64 {
+    UInt64(bitPattern: Int64(dev))
+}
+
 extension FileSystemService {
     struct DirEntry {
         let name: String
@@ -520,7 +529,7 @@ extension FileSystemService {
     static func dirID(followingSymlinksAtPath path: String) -> DirID? {
         var st = stat()
         guard stat(path, &st) == 0 else { return nil }
-        return DirID(dev: UInt64(st.st_dev), ino: UInt64(st.st_ino))
+        return DirID(dev: safeDeviceID(st.st_dev), ino: UInt64(st.st_ino))
     }
 
     /// Canonicalize a path via `realpath()`. Returns nil on ELOOP, missing targets, etc.

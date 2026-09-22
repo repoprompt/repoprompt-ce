@@ -489,16 +489,19 @@ actor GitDiffEngine {
         )
     }
 
+    /// When false, skips cache lookup and recomputes the diff. Every recomputed result
+    /// replaces the matching cache entry within the retention limits; oversized results
+    /// remove any old matching entry but are returned without being retained.
     func diffText(
         target: GitDiffTarget,
         scope: GitDiffScope,
         selectedAbsolutePaths: [String],
         repoURL: URL,
-        useCache: Bool = true
+        allowCachedResult: Bool = true
     ) async throws -> DiffTextResult {
         let normalizedSelected = normalizedAbsolutePaths(selectedAbsolutePaths)
         let selectedPathsKey = normalizedSelected.sorted().joined(separator: "|")
-        if !useCache {
+        if !allowCachedResult {
             cache.recordBypass()
         }
 
@@ -518,7 +521,7 @@ actor GitDiffEngine {
                 statusHash: fingerprint.statusHash,
                 backendKind: backend.kind
             )
-            if useCache, let cached = cache.value(for: cacheKey) {
+            if allowCachedResult, let cached = cache.value(for: cacheKey) {
                 return cached
             }
 
@@ -543,7 +546,7 @@ actor GitDiffEngine {
             )
             guard !filtered.isEmpty else {
                 let result = DiffTextResult(fingerprint: fingerprint, text: "", perFile: nil)
-                // Always admit recomputed results so useCache:false only bypasses
+                // Always admit recomputed results so allowCachedResult:false only bypasses
                 // lookup (force refresh), never leaves a stale resident entry.
                 cache.admit(result, for: cacheKey)
                 return result
@@ -594,7 +597,7 @@ actor GitDiffEngine {
                 statusHash: fingerprint.statusHash,
                 backendKind: backend.kind
             )
-            if useCache, let cached = cache.value(for: cacheKey) {
+            if allowCachedResult, let cached = cache.value(for: cacheKey) {
                 return cached
             }
 
@@ -660,7 +663,7 @@ actor GitDiffEngine {
                 scope: scope,
                 selectedAbsolutePaths: normalizedSelected,
                 repoURL: repoURL,
-                useCache: useCache
+                allowCachedResult: allowCachedResult
             )
 
         case let .range(from, to):
@@ -677,7 +680,7 @@ actor GitDiffEngine {
                 selectedAbsolutePaths: normalizedSelected,
                 repoURL: repoURL,
                 statusHashOverride: statusHashOverride,
-                useCache: useCache
+                allowCachedResult: allowCachedResult
             )
         }
     }
@@ -690,7 +693,7 @@ actor GitDiffEngine {
         selectedAbsolutePaths: [String],
         repoURL: URL,
         statusHashOverride: String? = nil,
-        useCache: Bool
+        allowCachedResult: Bool
     ) async throws -> DiffTextResult {
         let statusHash = statusHashOverride ?? target.keyString
         let backend = await vcsService.backend(forRepoRoot: repoURL)
@@ -709,7 +712,7 @@ actor GitDiffEngine {
             statusHash: statusHash,
             backendKind: backend.kind
         )
-        if useCache, let cached = cache.value(for: cacheKey) {
+        if allowCachedResult, let cached = cache.value(for: cacheKey) {
             return cached
         }
 

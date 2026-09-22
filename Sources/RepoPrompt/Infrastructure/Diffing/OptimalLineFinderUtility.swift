@@ -1,5 +1,6 @@
 import Dispatch
 import Foundation
+import RepoPromptDomainRuntime
 
 class OptimalLineFinderUtility {
     static func findOptimalLine(for change: FileChange, in content: [String], around startLine: Int, searchRadius: Int = 5) -> Int {

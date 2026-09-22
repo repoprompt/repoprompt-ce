@@ -51,7 +51,6 @@ When changing the Xcode generator, workflow wrapper, or generated scheme
 contracts, also run:
 
 ```bash
-make xcode-generator-test
 make xcode-validate
 ```
 

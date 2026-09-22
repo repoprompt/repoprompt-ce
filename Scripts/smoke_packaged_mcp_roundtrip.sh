@@ -14,8 +14,14 @@ APP_PID=""
 APP_COMMAND=""
 APP_START=""
 TEMP_ROOT=""
+ISOLATED_HOME=""
+ISOLATED_TMP=""
+SMOKE_KEYCHAIN_PATH=""
+SMOKE_KEYCHAIN_PASSWORD=""
 APP_LOG=""
 MCP_SOCKET_PATH=""
+DIAGNOSTICS_DIR="${REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR:-}"
+HELPER_DEBUG_LOG=""
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -24,6 +30,17 @@ fail() {
 
 log_phase() {
     printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+}
+
+isolated_security() {
+    env -i \
+        PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+        HOME="$ISOLATED_HOME" \
+        CFFIXED_USER_HOME="$ISOLATED_HOME" \
+        TMPDIR="$ISOLATED_TMP/" \
+        USER="${USER:-runner}" \
+        LOGNAME="${LOGNAME:-${USER:-runner}}" \
+        /usr/bin/security "$@"
 }
 
 process_matches() {
@@ -38,6 +55,24 @@ process_matches() {
 
 cleanup() {
     local status=$?
+    # Diagnostics are best-effort and must never prevent exact-PID shutdown or temp cleanup.
+    set +e
+    if (( status != 0 )) && [[ -n "$DIAGNOSTICS_DIR" ]]; then
+        mkdir -p "$DIAGNOSTICS_DIR"
+        if process_matches && command -v sample >/dev/null 2>&1; then
+            log_phase "$SMOKE_LABEL capturing launched app sample after failure"
+            sample "$APP_PID" 5 1 -file "$DIAGNOSTICS_DIR/packaged-app.sample.txt" >/dev/null 2>&1 || true
+        fi
+        [[ -z "$APP_LOG" || ! -f "$APP_LOG" ]] || cp "$APP_LOG" "$DIAGNOSTICS_DIR/packaged-app.log"
+        [[ -z "$HELPER_DEBUG_LOG" || ! -f "$HELPER_DEBUG_LOG" ]] || cp "$HELPER_DEBUG_LOG" "$DIAGNOSTICS_DIR/helper-socket-debug.log"
+        if [[ -n "$TEMP_ROOT" && -d "$TEMP_ROOT" ]]; then
+            find "$TEMP_ROOT" -maxdepth 1 -type f \( -name 'windows-attempt-*' -o -name 'socket-owner.err' -o -name 'launched-process.json' \) \
+                -exec cp {} "$DIAGNOSTICS_DIR/" \; 2>/dev/null || true
+        fi
+        printf '%s\n' "--- packaged app sample excerpt ---" >&2
+        sed -n '1,220p' "$DIAGNOSTICS_DIR/packaged-app.sample.txt" >&2 2>/dev/null || true
+        printf 'Packaged smoke diagnostics retained at %s\n' "$DIAGNOSTICS_DIR" >&2
+    fi
     if process_matches; then
         kill -TERM "$APP_PID" 2>/dev/null || true
         for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -53,6 +88,10 @@ cleanup() {
         printf '%s\n' "--- packaged app log tail ---" >&2
         tail -100 "$APP_LOG" >&2 || true
     fi
+    if [[ -n "$SMOKE_KEYCHAIN_PATH" && -n "$ISOLATED_HOME" && -n "$ISOLATED_TMP" ]]; then
+        isolated_security delete-keychain "$SMOKE_KEYCHAIN_PATH" >/dev/null 2>&1 || true
+    fi
+    SMOKE_KEYCHAIN_PASSWORD=""
     [[ -z "$TEMP_ROOT" ]] || rm -rf "$TEMP_ROOT"
     exit "$status"
 }
@@ -103,8 +142,20 @@ TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/repoprompt-packaged-smoke.XXXXXX")"
 ISOLATED_HOME="$TEMP_ROOT/home"
 ISOLATED_TMP="$TEMP_ROOT/tmp"
 APP_LOG="$TEMP_ROOT/app.log"
-mkdir -p "$ISOLATED_HOME" "$ISOLATED_TMP"
-chmod 700 "$TEMP_ROOT" "$ISOLATED_HOME" "$ISOLATED_TMP"
+mkdir -p "$ISOLATED_HOME/Library/Keychains" "$ISOLATED_HOME/Library/Preferences" "$ISOLATED_TMP"
+chmod 700 "$TEMP_ROOT" "$ISOLATED_HOME" "$ISOLATED_HOME/Library" \
+    "$ISOLATED_HOME/Library/Keychains" "$ISOLATED_HOME/Library/Preferences" "$ISOLATED_TMP"
+HELPER_DEBUG_LOG="$ISOLATED_HOME/Library/Application Support/RepoPrompt CE/socket-proxy-debug.log"
+# The signed app must exercise its production Keychain backend, but the isolated HOME has no
+# login keychain. Supply a short-lived unlocked default so first-launch writes cannot request UI.
+SMOKE_KEYCHAIN_PATH="$ISOLATED_HOME/Library/Keychains/repoprompt-packaged-smoke.keychain-db"
+SMOKE_KEYCHAIN_PASSWORD="$(uuidgen)"
+log_phase "$SMOKE_LABEL provisioning isolated unlocked user keychain"
+isolated_security create-keychain -p "$SMOKE_KEYCHAIN_PASSWORD" "$SMOKE_KEYCHAIN_PATH"
+isolated_security set-keychain-settings -lut 900 "$SMOKE_KEYCHAIN_PATH"
+isolated_security unlock-keychain -p "$SMOKE_KEYCHAIN_PASSWORD" "$SMOKE_KEYCHAIN_PATH"
+isolated_security list-keychains -d user -s "$SMOKE_KEYCHAIN_PATH"
+isolated_security default-keychain -d user -s "$SMOKE_KEYCHAIN_PATH"
 
 "$SOCKET_OWNER_HELPER" preflight "$MCP_SOCKET_DIR" ||
     fail "$SMOKE_LABEL requires no pre-existing live release MCP socket in $MCP_SOCKET_DIR"
@@ -152,6 +203,7 @@ environment = {
     "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "runner")),
     "LANG": "C",
     "LC_ALL": "C",
+    "MCP_SOCKET_DEBUG": "1",
 }
 try:
     completed = subprocess.run(
@@ -161,13 +213,119 @@ try:
         capture_output=True,
         timeout=int(helper_timeout),
     )
-except subprocess.TimeoutExpired:
+except subprocess.TimeoutExpired as error:
+    for value, destination in ((error.stdout, sys.stdout), (error.stderr, sys.stderr)):
+        if value:
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            print(value, end="", file=destination)
     raise SystemExit(124)
 if completed.stdout:
     print(completed.stdout, end="")
 if completed.stderr:
     print(completed.stderr, end="", file=sys.stderr)
 raise SystemExit(completed.returncode)
+PYTHON
+}
+
+run_external_initialize_request() {
+    python3 - "$MCP_HELPER" "$ISOLATED_HOME" "$ISOLATED_TMP" "$HELPER_REQUEST_TIMEOUT" <<'PYTHON'
+import json
+import os
+import subprocess
+import sys
+
+helper, home, temporary, helper_timeout = sys.argv[1:]
+environment = {
+    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME": home,
+    "CFFIXED_USER_HOME": home,
+    "TMPDIR": temporary + "/",
+    "USER": os.environ.get("USER", "runner"),
+    "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "runner")),
+    "LANG": "C",
+    "LC_ALL": "C",
+    "MCP_SOCKET_DEBUG": "1",
+}
+frames = [
+    {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {
+                "experimental": {
+                    "codex/auth-change": {},
+                },
+                "elicitation": {
+                    "form": {},
+                    "url": {},
+                },
+            },
+            "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.154.0",
+            },
+        },
+    },
+    {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {},
+    },
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {},
+    },
+]
+payload = "".join(json.dumps(frame, separators=(",", ":")) + "\n" for frame in frames)
+try:
+    completed = subprocess.run(
+        [helper, "--backend", "app"],
+        env=environment,
+        input=payload,
+        text=True,
+        capture_output=True,
+        timeout=int(helper_timeout),
+    )
+except subprocess.TimeoutExpired as error:
+    for value, destination in ((error.stdout, sys.stdout), (error.stderr, sys.stderr)):
+        if value:
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            print(value, end="", file=destination)
+    raise SystemExit(124)
+if completed.stderr:
+    print(completed.stderr, end="", file=sys.stderr)
+if completed.returncode != 0:
+    if completed.stdout:
+        print(completed.stdout, end="")
+    raise SystemExit(completed.returncode)
+
+responses = {}
+for line in completed.stdout.splitlines():
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(message, dict) and message.get("id") in (0, 1):
+        responses[message["id"]] = message
+
+for response_id, label in ((0, "initialize"), (1, "tools/list")):
+    response = responses.get(response_id)
+    if response is None:
+        raise SystemExit(f"missing {label} response in packaged MCP output")
+    if "error" in response:
+        raise SystemExit(f"{label} returned an error: {json.dumps(response['error'], sort_keys=True)}")
+
+tools = responses[1].get("result", {}).get("tools")
+if not isinstance(tools, list) or not tools:
+    raise SystemExit("tools/list returned no tools")
+print(f"OK: object-valued experimental capability initialized and tools/list returned {len(tools)} tools")
 PYTHON
 }
 
@@ -207,9 +365,15 @@ while (( $(date +%s) <= deadline )); do
     last_status=$?
     set -e
     log_phase "$SMOKE_LABEL CLI windows attempt ${attempt} exited with $last_status"
+    if (( last_status != 0 )) && [[ -f "$HELPER_DEBUG_LOG" ]]; then
+        printf '%s\n' "--- helper socket debug tail (attempt $attempt) ---" >&2
+        tail -100 "$HELPER_DEBUG_LOG" >&2 || true
+    fi
     if (( last_status == 0 )); then
         cat "$attempt_stdout"
         cat "$attempt_stderr" >&2
+        log_phase "$SMOKE_LABEL validating object-valued external initialize capability"
+        run_external_initialize_request
         "$SOCKET_OWNER_HELPER" verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE" ||
             fail "$SMOKE_LABEL release MCP socket ownership changed during the helper request"
         printf 'OK: %s completed bootstrap and windows request with exact helper %s against launched pid %s socket %s\n' \

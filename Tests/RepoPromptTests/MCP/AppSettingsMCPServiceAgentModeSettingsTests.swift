@@ -1,10 +1,69 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptShared
 import XCTest
 
 @MainActor
 final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
+    func testOracleRosterSettingIsOrderedValidatedAndPersistedAsSchemaV7() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceOracleRosterTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceOracleRosterTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        let service = AppSettingsMCPService(store: store)
+        let key = "models.additional_oracle_models"
+
+        let listed = try await service.handleForTesting([
+            "op": .string("list"),
+            "group": .string("models"),
+            "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let catalog = try XCTUnwrap(settings.first { $0.objectValue?["key"]?.stringValue == key })
+        XCTAssertEqual(catalog.objectValue?["type"]?.stringValue, "string[]")
+        XCTAssertEqual(catalog.objectValue?["value"]?.arrayValue, [])
+
+        let set = try await service.handleForTesting([
+            "op": .string("set"),
+            "key": .string(key),
+            "value": .array([.string(" model-a "), .string("model-a"), .string("model-b")])
+        ])
+        XCTAssertEqual(
+            set.objectValue?["new_value"]?.arrayValue?.compactMap(\.stringValue),
+            ["model-a", "model-a", "model-b"]
+        )
+        XCTAssertEqual(store.additionalOracleModelRaws(), ["model-a", "model-a", "model-b"])
+
+        let persisted = try JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any]
+        XCTAssertEqual(persisted?["schemaVersion"] as? Int, 7)
+        let scalar = persisted?["scalarPreferences"] as? [String: Any]
+        let models = scalar?["modelSelection"] as? [String: Any]
+        XCTAssertEqual(models?["additionalOracleModels"] as? [String], ["model-a", "model-a", "model-b"])
+        XCTAssertNil(models?["secondaryPlanningModels"])
+
+        do {
+            _ = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string(key),
+                "value": .array(["a", "b", "c", "d", "e"].map(Value.string))
+            ])
+            XCTFail("Expected an oversized roster to be rejected")
+        } catch {
+            // Expected: validation is atomic and leaves the previous value intact.
+        }
+        XCTAssertEqual(store.additionalOracleModelRaws(), ["model-a", "model-a", "model-b"])
+    }
+
     func testCodexReasoningSummariesSettingListsReadsAndWrites() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
@@ -58,6 +117,129 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertEqual(setFalse.objectValue?["new_value"]?.boolValue, false)
         XCTAssertEqual(setFalse.objectValue?["changed"]?.boolValue, true)
         XCTAssertFalse(store.codexReasoningSummariesEnabled())
+    }
+
+    func testAgentChatsPresentationPreferenceRemainsOutsideAppSettingsCatalog() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        )
+        let service = AppSettingsMCPService(store: store)
+        let listed = try await service.handleForTesting([
+            "op": .string("list"),
+            "group": .string("agent_mode"),
+            "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let keys = settings.compactMap { $0.objectValue?["key"]?.stringValue }
+        let candidateKey = "agent_mode.show_compose_tabs_without_agent_sessions"
+        XCTAssertFalse(keys.contains(candidateKey))
+
+        for arguments: [String: Value] in [
+            [
+                "op": .string("get"),
+                "key": .string(candidateKey)
+            ],
+            [
+                "op": .string("set"),
+                "key": .string(candidateKey),
+                "value": .bool(true)
+            ]
+        ] {
+            do {
+                _ = try await service.handleForTesting(arguments)
+                XCTFail("Expected \(candidateKey) to remain outside the app_settings catalog")
+            } catch {
+                XCTAssertTrue(
+                    String(describing: error).contains("Unknown or unavailable app setting key '\(candidateKey)'."),
+                    String(describing: error)
+                )
+            }
+        }
+    }
+
+    func testCodexHookApprovalStrictModeIsHumanOnlyAndPersistsWorkspaceOverride() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        let workspaceID = UUID()
+
+        XCTAssertFalse(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+        XCTAssertEqual(
+            CodexHookApprovalWorkspaceSetting(
+                workspaceOverride: store.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID)
+            ),
+            .appDefault
+        )
+
+        store.setGlobalCodexHookApprovalStrictModeEnabled(true)
+        XCTAssertTrue(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+        XCTAssertNil(store.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID))
+
+        for (setting, expectedEffectiveValue) in [
+            (CodexHookApprovalWorkspaceSetting.dontRequireApproval, false),
+            (.alwaysRequireApproval, true),
+            (.appDefault, true)
+        ] {
+            store.setCodexHookApprovalStrictModeOverride(setting.workspaceOverride, for: workspaceID)
+            XCTAssertEqual(
+                CodexHookApprovalWorkspaceSetting(
+                    workspaceOverride: store.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID)
+                ),
+                setting
+            )
+            XCTAssertEqual(store.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID), expectedEffectiveValue)
+        }
+
+        store.setCodexHookApprovalStrictModeOverride(
+            CodexHookApprovalWorkspaceSetting.dontRequireApproval.workspaceOverride,
+            for: workspaceID
+        )
+        let reloaded = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertTrue(reloaded.globalCodexHookApprovalStrictModeEnabled())
+        XCTAssertEqual(reloaded.codexHookApprovalStrictModeWorkspaceOverride(workspaceID: workspaceID), false)
+        XCTAssertFalse(reloaded.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID))
+
+        let service = AppSettingsMCPService(store: reloaded)
+        for key in [
+            "agent_mode.codex_hook_approval_strict_mode_enabled",
+            "agent_mode.codex_hook_approval_strict_mode_workspace_overrides"
+        ] {
+            do {
+                _ = try await service.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string(key),
+                    "value": .bool(true)
+                ])
+                XCTFail("Expected human-only setting rejection for \(key)")
+            } catch {
+                let diagnostic = String(describing: error)
+                XCTAssertTrue(diagnostic.contains("security-sensitive"), diagnostic)
+                XCTAssertTrue(diagnostic.contains("human"), diagnostic)
+            }
+        }
     }
 
     func testHandoffInstructionsRemainOutsideAppSettingsCatalog() async throws {
@@ -244,5 +426,118 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertTrue(warning.contains("original file is preserved"))
         XCTAssertTrue(warning.contains("explicit recovery"))
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), falseV4JSON)
+    }
+
+    func testSubagentDefaultWaitSecondsListsReadsPersistsAndRejectsInvalidValues() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        let service = AppSettingsMCPService(store: store)
+        let key = "agent_mode.subagent_default_wait_seconds"
+
+        XCTAssertEqual(store.subagentDefaultWaitSeconds(), 120)
+
+        let listed = try await service.handleForTesting([
+            "op": .string("list"),
+            "group": .string("agent_mode"),
+            "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let catalog = try XCTUnwrap(settings.first { $0.objectValue?["key"]?.stringValue == key })
+        XCTAssertEqual(catalog.objectValue?["type"]?.stringValue, "number")
+        XCTAssertEqual(
+            catalog.objectValue?["allowed_values"]?.arrayValue?.compactMap(\.stringValue),
+            MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds.map(String.init)
+        )
+        XCTAssertEqual(catalog.objectValue?["value"]?.intValue, 120)
+
+        for seconds in MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds {
+            let set = try await service.handleForTesting([
+                "op": .string("set"),
+                "key": .string(key),
+                "value": .int(seconds)
+            ])
+            XCTAssertEqual(set.objectValue?["status"]?.stringValue, "ok")
+            XCTAssertEqual(set.objectValue?["new_value"]?.intValue, seconds)
+            XCTAssertEqual(store.subagentDefaultWaitSeconds(), seconds)
+        }
+
+        let reloaded = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertEqual(reloaded.subagentDefaultWaitSeconds(), MCPTimeoutPolicy.supportedSubagentDefaultWaitSeconds.last)
+
+        let invalidPersistedJSON = """
+        {
+          "schemaVersion": 7,
+          "schemaLineage": "repoprompt-ce.global-settings",
+          "updatedAt": "2026-01-01T00:00:00Z",
+          "copySettingsByWorkspaceID": {},
+          "chatSettingsByWorkspaceID": {},
+          "globalDefaults": {},
+          "scalarPreferences": {
+            "agentMode": {
+              "subagentDefaultWaitSeconds": 999
+            }
+          }
+        }
+        """
+        try invalidPersistedJSON.data(using: .utf8)?.write(to: fileURL)
+        let invalidReloaded = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertEqual(invalidReloaded.subagentDefaultWaitSeconds(), 120)
+
+        let invalidService = AppSettingsMCPService(store: invalidReloaded)
+        let previous = invalidReloaded.subagentDefaultWaitSeconds()
+        // `1e20` and `-1e20` are finite and integral but outside `Int`; they must be rejected as
+        // invalid parameters rather than trapping during conversion. `.double(300.0)` is the same
+        // value a JSON round-trip can produce for a supported choice and must still be accepted.
+        for invalidValue: Value in [
+            .int(90),
+            .double(300.5),
+            .double(1e20),
+            .double(-1e20),
+            .double(.infinity),
+            .double(.nan),
+            .double(Double(Int.max)),
+            .string("600"),
+            .null
+        ] {
+            do {
+                _ = try await invalidService.handleForTesting([
+                    "op": .string("set"),
+                    "key": .string(key),
+                    "value": invalidValue
+                ])
+                XCTFail("Expected rejection for \(invalidValue)")
+            } catch {
+                // Expected atomic rejection.
+            }
+            XCTAssertEqual(invalidReloaded.subagentDefaultWaitSeconds(), previous)
+        }
+
+        XCTAssertFalse(invalidReloaded.setSubagentDefaultWaitSeconds(450))
+        XCTAssertEqual(invalidReloaded.subagentDefaultWaitSeconds(), previous)
+
+        _ = try await invalidService.handleForTesting([
+            "op": .string("set"),
+            "key": .string(key),
+            "value": .double(300)
+        ])
+        XCTAssertEqual(invalidReloaded.subagentDefaultWaitSeconds(), 300)
     }
 }

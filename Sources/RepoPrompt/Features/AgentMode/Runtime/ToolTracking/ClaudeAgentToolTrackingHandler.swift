@@ -46,7 +46,7 @@ final class ClaudeAgentToolTrackingHandler {
     private let trackingController = AgentToolTrackingController()
     private let maxExplicitProviderAckObservationCount = 24
 
-    // MARK: - Correlation State (moved from TabSession)
+    // MARK: - Correlation State (moved from AgentTabSession)
 
     /// Pending provider-stream invocation IDs queued for correlation with tracker callbacks, keyed by signature.
     private var pendingProviderRepoPromptInvocationsBySignature: [String: [UUID]] = [:]
@@ -97,7 +97,7 @@ final class ClaudeAgentToolTrackingHandler {
 
     func startTracking(
         runID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         clientNameHint: String?
     ) async {
         if trackedRunID != runID {
@@ -130,7 +130,7 @@ final class ClaudeAgentToolTrackingHandler {
     }
 
     func stopTracking(
-        for session: AgentModeViewModel.TabSession
+        for session: AgentTabSession
     ) async {
         await trackingController.stopTracking()
         resetCorrelationState(session)
@@ -138,7 +138,7 @@ final class ClaudeAgentToolTrackingHandler {
     }
 
     func resetTurnState(
-        for session: AgentModeViewModel.TabSession
+        for session: AgentTabSession
     ) {
         resetCorrelationState(session)
     }
@@ -148,7 +148,7 @@ final class ClaudeAgentToolTrackingHandler {
     @discardableResult
     func handleProviderToolEvent(
         _ event: AgentToolStreamEvent,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         switch event {
         case let .toolCall(call):
@@ -167,7 +167,7 @@ final class ClaudeAgentToolTrackingHandler {
     /// Returns `true` when the event was consumed (either processed or suppressed).
     private func handleProviderToolCall(
         _ call: AgentToolStreamEvent.ToolCall,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         let toolName = call.toolName
 
@@ -208,7 +208,7 @@ final class ClaudeAgentToolTrackingHandler {
     /// Returns `true` when the event was consumed (either processed or suppressed).
     private func handleProviderToolResult(
         _ result: AgentToolStreamEvent.ToolResult,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         let toolName = result.toolName
         let outputJSON = result.resultJSON
@@ -284,7 +284,7 @@ final class ClaudeAgentToolTrackingHandler {
     private func retractInvalidToolPlaceholder(
         toolName: String,
         invocationID: UUID?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         let turnStart = toolCorrelationStartSequenceIndex
         func isEligible(_ item: AgentChatItem) -> Bool {
@@ -303,7 +303,7 @@ final class ClaudeAgentToolTrackingHandler {
                     return byInvocation
                 }
             }
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(toolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
             let indexed = session.indexedNilInvocationToolItemIndices(
                 normalizedToolName: normalizedToolName
             )
@@ -379,7 +379,7 @@ final class ClaudeAgentToolTrackingHandler {
         invocationID: UUID?,
         toolName: String,
         argsJSON: String?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         guard AgentToolTrackingSupport.isExplicitRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -451,7 +451,7 @@ final class ClaudeAgentToolTrackingHandler {
         outputJSON: String,
         isError: Bool? = nil,
         invocationID: UUID?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
         if AgentToolTrackingSupport.isExplicitRepoPromptTool(toolName),
@@ -495,7 +495,7 @@ final class ClaudeAgentToolTrackingHandler {
         outputJSON: String,
         isError: Bool?,
         invocationID: UUID?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         guard let providerInvocationID = invocationID else { return false }
         let normalizedToolName = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName)
@@ -532,7 +532,7 @@ final class ClaudeAgentToolTrackingHandler {
         invocationID: UUID,
         toolName: String,
         args: [String: Value]?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -660,7 +660,7 @@ final class ClaudeAgentToolTrackingHandler {
             return
         }
 
-        let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(toolName)
+        let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
         let indexedNameCandidates = session.indexedNilInvocationToolItemIndices(
             normalizedToolName: normalizedToolName
         )
@@ -668,14 +668,14 @@ final class ClaudeAgentToolTrackingHandler {
         var matchingNilIDNameIndices = indexedNameCandidates.filter { index in
             let item = session.items[index]
             return item.kind == .toolCall
-                && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+                && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
         }
         var nameUsedFallback = false
         if matchingNilIDNameIndices.isEmpty {
             let fallback = session.activeTurnToolItemIndices(where: { item in
                 item.kind == .toolCall
                     && item.toolInvocationID == nil
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
             matchingNilIDNameIndices = fallback.indices
@@ -729,7 +729,7 @@ final class ClaudeAgentToolTrackingHandler {
         args: [String: Value]?,
         resultJSON: String,
         isError: Bool,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -819,7 +819,7 @@ final class ClaudeAgentToolTrackingHandler {
                 correlationPath = signatureUsedFallback ? "signature_active_turn_scan" : "signature"
                 return byPendingCallSignature
             }
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(toolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
             let indexedNameCandidates = session.indexedNilInvocationToolItemIndices(
                 normalizedToolName: normalizedToolName
             )
@@ -832,7 +832,7 @@ final class ClaudeAgentToolTrackingHandler {
                 let fallback = session.activeTurnToolItemIndices(where: { item in
                     item.kind == .toolCall
                         && item.toolInvocationID == nil
-                        && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+                        && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
                 })
                 inspectedItemCount += fallback.scannedItemCount
                 matchingPendingNameIndices = fallback.indices
@@ -897,7 +897,7 @@ final class ClaudeAgentToolTrackingHandler {
 
     // MARK: - Correlation Helpers
 
-    private func resetCorrelationState(_ session: AgentModeViewModel.TabSession) {
+    private func resetCorrelationState(_ session: AgentTabSession) {
         let pendingProviderCount = pendingProviderInvocationCount()
         let trackerMappingCount = providerInvocationByTrackerInvocationID.count
         if pendingProviderCount > 0 || trackerMappingCount > 0 {
@@ -1022,10 +1022,10 @@ final class ClaudeAgentToolTrackingHandler {
         invocationID: UUID?,
         signature: String,
         toolName: String,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Int? {
         let turnStartSequenceIndex = toolCorrelationStartSequenceIndex
-        let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(toolName)
+        let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
         func isEligible(_ item: AgentChatItem) -> Bool {
             item.sequenceIndex >= turnStartSequenceIndex
                 && (item.kind == .toolCall || item.kind == .toolResult)
@@ -1074,7 +1074,7 @@ final class ClaudeAgentToolTrackingHandler {
         }
         return session.activeTurnToolItemIndices(where: { item in
             guard isEligible(item) else { return false }
-            guard AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName else {
+            guard AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName else {
                 return false
             }
             if item.kind == .toolCall {
@@ -1086,7 +1086,7 @@ final class ClaudeAgentToolTrackingHandler {
 
     private func consumePendingProviderInvocationID(
         forSignature signature: String,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> UUID? {
         guard var queue = pendingProviderRepoPromptInvocationsBySignature[signature], !queue.isEmpty else {
             return nil
@@ -1112,7 +1112,7 @@ final class ClaudeAgentToolTrackingHandler {
     }
 
     private static func repoPromptInvocationSignature(toolName: String, argsJSON: String?) -> String {
-        AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
+        AgentTabSession.canonicalToolInvocationSignature(
             toolName: toolName,
             argsJSON: argsJSON
         )

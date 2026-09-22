@@ -104,28 +104,6 @@
             session.testAssertSourceItemDerivedStateIsConsistent()
         }
 
-        func testClaudeCompletionObserverUsesConstantWorkInvocationIndex() throws {
-            let handler = ClaudeAgentToolTrackingHandler()
-            let short = makeSession(priorTurnCount: 1)
-            let long = makeSession(priorTurnCount: 2000)
-
-            let shortAttribution = try claudeCompletionAttribution(
-                handler: handler,
-                session: short.session,
-                invocationID: short.invocationID
-            )
-            let longAttribution = try claudeCompletionAttribution(
-                handler: handler,
-                session: long.session,
-                invocationID: long.invocationID
-            )
-
-            XCTAssertEqual(shortAttribution.correlationPath, "invocation_id")
-            XCTAssertEqual(longAttribution.correlationPath, "invocation_id")
-            XCTAssertEqual(shortAttribution.scannedItemCount, 1)
-            XCTAssertEqual(longAttribution.scannedItemCount, 1)
-        }
-
         func testRunningSteeringUserItemPreservesInFlightToolCorrelation() {
             let handler = ClaudeAgentToolTrackingHandler()
             let session = AgentModeViewModel.TabSession(tabID: UUID())
@@ -159,66 +137,6 @@
             XCTAssertEqual(session.items[1].toolInvocationID, invocationID)
             XCTAssertEqual(session.items[2].kind, .user)
             session.testAssertSourceItemDerivedStateIsConsistent()
-        }
-
-        private func claudeCompletionAttribution(
-            handler: ClaudeAgentToolTrackingHandler,
-            session: AgentModeViewModel.TabSession,
-            invocationID: UUID
-        ) throws -> MCPToolObserverAttribution {
-            let recorder = MCPToolObserverAttributionRecorder()
-            MCPToolObserverAttributionContext.$recorder.withValue(recorder) {
-                handler.handleTrackerToolResult(
-                    invocationID: invocationID,
-                    toolName: "read_file",
-                    args: nil,
-                    resultJSON: #"{"content":"ok"}"#,
-                    isError: false,
-                    session: session
-                )
-            }
-            XCTAssertEqual(session.items.last?.kind, .toolResult)
-            return try XCTUnwrap(recorder.snapshot())
-        }
-
-        func testActiveTurnFallbackScanCostDoesNotScaleWithHistoricalTranscriptLength() {
-            let short = makeSession(priorTurnCount: 1)
-            let long = makeSession(priorTurnCount: 2000)
-
-            let shortScan = short.session.activeTurnToolItemIndices(where: { $0.toolName == "missing" })
-            let longScan = long.session.activeTurnToolItemIndices(where: { $0.toolName == "missing" })
-
-            XCTAssertEqual(shortScan.scannedItemCount, 1)
-            XCTAssertEqual(longScan.scannedItemCount, 1)
-            XCTAssertEqual(short.session.indexedToolItemIndices(invocationID: short.invocationID).count, 1)
-            XCTAssertEqual(long.session.indexedToolItemIndices(invocationID: long.invocationID).count, 1)
-        }
-
-        private func makeSession(priorTurnCount: Int) -> (
-            session: AgentModeViewModel.TabSession,
-            invocationID: UUID
-        ) {
-            var items: [AgentChatItem] = []
-            items.reserveCapacity(priorTurnCount * 2 + 2)
-            var sequenceIndex = 0
-            for turn in 0 ..< priorTurnCount {
-                items.append(.user("historical user \(turn)", sequenceIndex: sequenceIndex))
-                sequenceIndex += 1
-                items.append(.assistant("historical assistant \(turn)", sequenceIndex: sequenceIndex))
-                sequenceIndex += 1
-            }
-            items.append(.user("active user", sequenceIndex: sequenceIndex))
-            sequenceIndex += 1
-            let invocationID = UUID()
-            items.append(.toolCall(
-                name: "read_file",
-                invocationID: invocationID,
-                argsJSON: #"{"path":"Sources/Active.swift"}"#,
-                sequenceIndex: sequenceIndex
-            ))
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
-            session.setItemsSilently(items, reason: .testOverride)
-            return (session, invocationID)
         }
     }
 #endif

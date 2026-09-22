@@ -23,16 +23,19 @@ class CopyPresetManager: ObservableObject {
         }
     }
 
+    @Published private(set) var persistenceErrorMessage: String?
+
     // MARK: - Storage
 
-    private let presetFileStore = PresetFileStore.shared
+    private let presetFileStore: PresetFileStore
 
     /// All presets (built-in + user), with overrides applied to built-ins
     @Published private(set) var allPresets: [CopyPreset] = []
 
     // MARK: - Initialization
 
-    private init() {
+    init(presetFileStore: PresetFileStore = .shared) {
+        self.presetFileStore = presetFileStore
         load()
         rebuildAllPresetsCache()
     }
@@ -79,19 +82,15 @@ class CopyPresetManager: ObservableObject {
         )
     }
 
-    /// Save user presets to Application Support JSON.
-    func save() {
-        persistCopyState()
-    }
-
     /// Add a new user preset
     func add(_ preset: CopyPreset) {
         guard !preset.isBuiltIn else {
             print("Cannot add built-in preset as user preset")
             return
         }
-        userPresets.append(preset)
-        save()
+        mutateAndPersist {
+            userPresets.append(preset)
+        }
     }
 
     /// Update an existing user preset
@@ -102,8 +101,9 @@ class CopyPresetManager: ObservableObject {
         }
 
         if let index = userPresets.firstIndex(where: { $0.id == preset.id }) {
-            userPresets[index] = preset
-            save()
+            mutateAndPersist {
+                userPresets[index] = preset
+            }
         }
     }
 
@@ -114,14 +114,16 @@ class CopyPresetManager: ObservableObject {
             return
         }
 
-        userPresets.removeAll { $0.id == preset.id }
-        save()
+        mutateAndPersist {
+            userPresets.removeAll { $0.id == preset.id }
+        }
     }
 
     /// Remove a user preset by ID
     func remove(id: UUID) {
-        userPresets.removeAll { $0.id == id }
-        save()
+        mutateAndPersist {
+            userPresets.removeAll { $0.id == id }
+        }
     }
 
     /// Add a preset (convenience method matching the settings view)
@@ -141,9 +143,10 @@ class CopyPresetManager: ObservableObject {
 
     /// Toggle preset visibility
     func togglePresetVisibility(_ preset: CopyPreset) {
-        let currentVisibility = presetVisibility[preset.id] ?? true
-        presetVisibility[preset.id] = !currentVisibility
-        saveVisibility()
+        mutateAndPersist {
+            let currentVisibility = presetVisibility[preset.id] ?? true
+            presetVisibility[preset.id] = !currentVisibility
+        }
     }
 
     /// Check if a preset is visible
@@ -154,11 +157,6 @@ class CopyPresetManager: ObservableObject {
     /// Load visibility settings from Application Support JSON.
     private func loadVisibility() {
         presetVisibility = presetFileStore.loadWorkflowPresets().copyVisibility
-    }
-
-    /// Save visibility settings to Application Support JSON.
-    private func saveVisibility() {
-        persistCopyState()
     }
 
     /// Create a preset from current settings
@@ -234,8 +232,9 @@ class CopyPresetManager: ObservableObject {
         if trimmed.isEmpty {
             clearOverrides(for: override.presetID)
         } else {
-            overrides[override.presetID] = trimmed
-            saveOverrides()
+            mutateAndPersist {
+                overrides[override.presetID] = trimmed
+            }
         }
     }
 
@@ -248,8 +247,9 @@ class CopyPresetManager: ObservableObject {
 
     /// Clear all overrides for a preset
     func clearOverrides(for id: UUID) {
-        overrides.removeValue(forKey: id)
-        saveOverrides()
+        mutateAndPersist {
+            overrides.removeValue(forKey: id)
+        }
     }
 
     /// Get a resolved preset with overrides applied
@@ -298,17 +298,37 @@ class CopyPresetManager: ObservableObject {
         )
     }
 
-    /// Save overrides to Application Support JSON.
-    private func saveOverrides() {
-        persistCopyState()
+    func clearPersistenceError() {
+        persistenceErrorMessage = nil
     }
 
-    private func persistCopyState() {
+    private func mutateAndPersist(_ mutation: () -> Void) {
+        let previousUserPresets = userPresets
+        let previousVisibility = presetVisibility
+        let previousOverrides = overrides
+        mutation()
+
+        do {
+            try persistCopyState()
+            persistenceErrorMessage = nil
+        } catch {
+            userPresets = previousUserPresets
+            presetVisibility = previousVisibility
+            overrides = previousOverrides
+            reportPersistenceFailure(error)
+        }
+    }
+
+    private func persistCopyState() throws {
         let overridesList = Array(overrides.values)
-        presetFileStore.updateWorkflowPresets { document in
+        try presetFileStore.updateWorkflowPresets { document in
             document.copyUserPresets = userPresets
             document.copyVisibility = presetVisibility
             document.copyOverrides = overridesList
         }
+    }
+
+    private func reportPersistenceFailure(_ error: Error) {
+        persistenceErrorMessage = "Your copy preset change wasn't saved and has been reverted. \(error.localizedDescription)"
     }
 }

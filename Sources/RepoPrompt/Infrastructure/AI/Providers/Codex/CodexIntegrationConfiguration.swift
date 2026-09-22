@@ -32,6 +32,11 @@ enum CodexIntegrationConfiguration {
         repoPromptMCPConfiguration.command
     }
 
+    private static var serverArgumentsTOML: String {
+        let values = repoPromptMCPConfiguration.args.map { "\"\($0)\"" }
+        return "[\(values.joined(separator: ", "))]"
+    }
+
     struct ServerEntry {
         let rawName: String
         let normalizedName: String
@@ -170,9 +175,13 @@ enum CodexIntegrationConfiguration {
     /// Invoked from the UI when users opt-in to the integration. Ensures our MCP server exists and is
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
-    static func installPersistentMCPConfig() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+    static func installPersistentMCPConfig(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
         let runtime: CodexRuntimeAuthority.Runtime
-        switch CodexRuntimeAuthority.resolve() {
+        switch CodexRuntimeAuthority.resolveConfigured(
+            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot()
+        ) {
         case let .success(resolved):
             runtime = resolved
         case let .failure(failure):
@@ -218,8 +227,12 @@ enum CodexIntegrationConfiguration {
     /// `enabled = false` so normal Codex usage stays opt-in, while the agent enables it at runtime via
     /// `-c` overrides.
     @discardableResult
-    static func ensureServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
-        switch CodexRuntimeAuthority.resolve() {
+    static func ensureServerForDiscovery(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        switch CodexRuntimeAuthority.resolveConfigured(
+            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot()
+        ) {
         case let .success(resolved):
             ensureServerForDiscovery(runtime: resolved)
         case let .failure(failure):
@@ -881,7 +894,7 @@ enum CodexIntegrationConfiguration {
         supportsDirectOnlyToolNamespaces: Bool
     ) -> String? {
         guard supportsDirectOnlyToolNamespaces else {
-            return "RepoPrompt did not update Codex config because this external Codex version predates RepoPrompt's app-server contract (minimum \(CodexRuntimeAuthority.minimumExternalVersion)). Update the explicit override or use the bundled runtime."
+            return "RepoPrompt did not update Codex config because this external Codex version predates RepoPrompt's external-runtime compatibility floor (minimum \(CodexRuntimeAuthority.minimumExternalVersion)). Update the explicit override or use the bundled runtime."
         }
 
         let codeModePath = ["features", "code_mode"]
@@ -1026,7 +1039,7 @@ enum CodexIntegrationConfiguration {
         if ensureKey("command", value: "\"\(serverCommand)\"", in: &lines, blockRange: &block, force: true) {
             changed = true
         }
-        if ensureKey("args", value: "[]", in: &lines, blockRange: &block, afterKey: "command", force: true) {
+        if ensureKey("args", value: serverArgumentsTOML, in: &lines, blockRange: &block, afterKey: "command", force: true) {
             changed = true
         }
         if ensureRepoPromptPolicyKeys(in: &lines, blockRange: &block) {
@@ -1250,7 +1263,7 @@ enum CodexIntegrationConfiguration {
         var lines = [
             "[mcp_servers.\(cliPathComponent(forNormalizedServerName: repoPromptMCPServerName))]",
             "command = \"\(serverCommand)\"",
-            "args = []",
+            "args = \(serverArgumentsTOML)",
             "tool_timeout_sec = \(desiredToolTimeoutSeconds)",
             "supports_parallel_tool_calls = \(desiredSupportsParallelToolCalls)"
         ]

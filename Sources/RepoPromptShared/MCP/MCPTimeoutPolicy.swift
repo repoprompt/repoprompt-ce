@@ -1,10 +1,68 @@
 import Foundation
 
+public struct MCPToolCallDeadlineEnvelope: Codable, Equatable, Sendable {
+    public enum Kind: String, Codable, Sendable {
+        case ordinaryPromptExportV1 = "ordinary_prompt_export_v1"
+    }
+
+    public enum TimeoutMode: String, Codable, Sendable {
+        case ordinaryDefault = "default"
+        case explicitFinite = "explicit_finite"
+        case explicitUnbounded = "explicit_unbounded"
+    }
+
+    public let kind: Kind
+    public let expiresAtUnixMilliseconds: Int64?
+    public let timeoutMode: TimeoutMode
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case expiresAtUnixMilliseconds = "expires_at_unix_milliseconds"
+        case timeoutMode = "timeout_mode"
+    }
+
+    public init(
+        kind: Kind,
+        expiresAtUnixMilliseconds: Int64? = nil,
+        timeoutMode: TimeoutMode = .ordinaryDefault
+    ) {
+        self.kind = kind
+        self.expiresAtUnixMilliseconds = expiresAtUnixMilliseconds
+        self.timeoutMode = timeoutMode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(Kind.self, forKey: .kind)
+        expiresAtUnixMilliseconds = try container.decodeIfPresent(
+            Int64.self,
+            forKey: .expiresAtUnixMilliseconds
+        )
+        timeoutMode = try container.decodeIfPresent(TimeoutMode.self, forKey: .timeoutMode)
+            ?? .ordinaryDefault
+        if timeoutMode == .ordinaryDefault, expiresAtUnixMilliseconds == nil {
+            throw DecodingError.keyNotFound(
+                CodingKeys.expiresAtUnixMilliseconds,
+                .init(
+                    codingPath: container.codingPath,
+                    debugDescription: "Default export metadata requires an expiration"
+                )
+            )
+        }
+    }
+}
+
 /// RepoPrompt CE-owned timeout policy for MCP execution, delivery, and caller-driven defaults.
 /// Caller-supplied timeout values remain dynamic; these constants only define CE defaults and guards.
 public enum MCPTimeoutPolicy {
     public static let boundedToolExecutionDeadlineSeconds = 30
     public static let boundedToolExecutionDeadline: Duration = .seconds(boundedToolExecutionDeadlineSeconds)
+
+    public static let promptExportAdmissionHeadroomSeconds = 25
+    public static let promptExportExecutionDeadlineSeconds = 240
+    public static let promptExportExecutionDeadline: Duration = .seconds(
+        promptExportExecutionDeadlineSeconds
+    )
 
     /// macOS Finder Trash can legitimately retain synchronous post-move work after the source
     /// path disappears. Keep destructive file_actions bounded, but allow that system tail to
@@ -43,7 +101,19 @@ public enum MCPTimeoutPolicy {
         bootstrapReplacementPredecessorStopGraceSeconds
     )
 
-    public static let responseSendDeadlineSeconds = 30
+    public static let promptExportResponseDeliveryAllowanceSeconds = 30
+    public static let promptExportResponseDeliveryAllowance: Duration = .seconds(
+        promptExportResponseDeliveryAllowanceSeconds
+    )
+    public static let promptExportReservedEnvelopeArgumentKey = "_repoprompt_execution_envelope"
+    public static let promptExportReservedProviderAndCleanupSeconds =
+        promptExportExecutionDeadlineSeconds
+            + boundedToolCancellationCleanupGraceSeconds
+            + promptExportResponseDeliveryAllowanceSeconds
+    public static let promptExportTotalEnvelopeSeconds =
+        promptExportAdmissionHeadroomSeconds + promptExportReservedProviderAndCleanupSeconds
+
+    public static let responseSendDeadlineSeconds = promptExportResponseDeliveryAllowanceSeconds
     public static let responseSendDeadline: Duration = .seconds(responseSendDeadlineSeconds)
     public static let transportWriteStallTimeoutSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
 
@@ -60,7 +130,60 @@ public enum MCPTimeoutPolicy {
     /// and transport delivery before the CLI cancels the request.
     public static let cliSemanticWaitResponseMarginSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
 
+    /// Factory default for otherwise-quiet RP-managed subagent lifecycle waits
+    /// (start post-launch, wait, steer-and-wait). Not a startup, execution, or notification interval.
     public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 120
+
+    /// Session setup (worktree binding, provider startup, steer reactivation) runs before a
+    /// lifecycle wait begins, and the server starts the caller's full wait only afterwards.
+    /// Client deadlines add this allowance so setup cannot consume the requested wait.
+    public static let agentLifecycleSetupAllowanceSeconds: TimeInterval = 180
+
+    /// Discovery/help phrase for an omitted agent-control wait timeout.
+    public static let configuredSubagentWaitDiscoveryPhrase =
+        "configured subagent wait (factory default: two minutes)"
+
+    public static let agentControlTimeoutPropertyDescription =
+        "[start, wait] Max wait seconds. 0 = poll. Omitted timeout uses the \(configuredSubagentWaitDiscoveryPhrase)."
+
+    public static let agentControlSteerTimeoutPropertyDescription =
+        "[steer] Max wait seconds when wait=true. 0 = immediate post-steer snapshot. Omitted timeout uses the \(configuredSubagentWaitDiscoveryPhrase)."
+
+    /// App-wide subagent wait choices exposed in Settings and `app_settings`.
+    public static let supportedSubagentDefaultWaitSeconds: [Int] = [120, 300, 600, 1200, 1800, 3600]
+
+    /// Upper bound of `supportedSubagentDefaultWaitSeconds` for compatibility guards.
+    public static var maximumSupportedSubagentDefaultWaitSeconds: Int {
+        supportedSubagentDefaultWaitSeconds.max() ?? Int(agentLifecycleDefaultWaitSeconds)
+    }
+
+    /// `app_settings` key for the app-wide subagent wait preference.
+    public static let subagentDefaultWaitSettingsKey = "agent_mode.subagent_default_wait_seconds"
+
+    /// Budget for the CLI implicit-wait settings preflight, covering registration, send, and the
+    /// response. Cancellation delivery may add its usual drain grace on top before the caller's
+    /// lifecycle request proceeds under the compatibility guard.
+    public static let subagentDefaultWaitSettingsReadBudgetSeconds: TimeInterval = 5
+
+    /// CLI-side guard when implicit lifecycle preflight cannot pin a supported preference.
+    public static var cliImplicitLifecycleCompatibilityGuardSeconds: TimeInterval {
+        max(
+            cliDefaultToolCallTimeoutSeconds,
+            TimeInterval(maximumSupportedSubagentDefaultWaitSeconds) + cliSemanticWaitResponseMarginSeconds
+        )
+    }
+
+    public static func isSupportedSubagentDefaultWaitSeconds(_ seconds: Int) -> Bool {
+        supportedSubagentDefaultWaitSeconds.contains(seconds)
+    }
+
+    public static func resolvedSubagentDefaultWaitSeconds(_ stored: Int?) -> Int {
+        guard let stored, isSupportedSubagentDefaultWaitSeconds(stored) else {
+            return Int(agentLifecycleDefaultWaitSeconds)
+        }
+        return stored
+    }
+
     public static let askUserDefaultTimeoutSeconds: TimeInterval = 300
     public static let nextUserInstructionDefaultWaitSeconds: TimeInterval = 600
     public static let applyEditsApprovalTimeoutSeconds: TimeInterval = 300

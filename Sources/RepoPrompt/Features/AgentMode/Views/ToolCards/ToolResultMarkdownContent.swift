@@ -102,7 +102,7 @@ private enum ToolResultMarkdownRenderer {
     }
 
     private static func mcpTransportMarkdown(from payload: String) -> String? {
-        guard let object = ToolRawJSON.object(from: payload) else { return nil }
+        guard let object = ToolJSON.rawObject(from: payload) else { return nil }
         let envelope = (object["Ok"] as? [String: Any])
             ?? (object["ok"] as? [String: Any])
             ?? (object["Err"] as? [String: Any])

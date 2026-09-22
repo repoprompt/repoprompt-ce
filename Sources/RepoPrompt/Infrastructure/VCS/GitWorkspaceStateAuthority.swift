@@ -53,7 +53,8 @@ private final class GitWorkspaceAuthoritySynchronousState: @unchecked Sendable {
         let publicationGenerations: [GitWorkspaceAuthorityScopeKey: UInt64]
     }
 
-    private let lock = NSLock()
+    // While held, no synchronous Store cache invalidation/queryability or admitted Git subprocess may run.
+    private let lock = SameThreadReentryCheckedLock()
     private var repositories: [GitWorkspaceAuthorityRepositoryKey: RepositoryState] = [:]
 
     func update(
@@ -64,13 +65,13 @@ private final class GitWorkspaceAuthoritySynchronousState: @unchecked Sendable {
         publicationGenerations: [GitWorkspaceAuthorityScopeKey: UInt64]
     ) {
         lock.lock()
+        defer { lock.unlock() }
         repositories[repositoryKey] = RepositoryState(
             invalidationGeneration: invalidationGeneration,
             mutationDepth: mutationDepth,
             monitorCoverageUnavailable: monitorCoverageUnavailable,
             publicationGenerations: publicationGenerations
         )
-        lock.unlock()
     }
 
     func isCurrent(_ fence: GitWorkspacePendingInitializationAuthorityFence) -> Bool {
@@ -86,6 +87,8 @@ private final class GitWorkspaceAuthoritySynchronousState: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard fences.allSatisfy(matches) else { return nil }
+        // `body` cannot re-enter this lock, invalidate/query the Store cache,
+        // REENTRANCY-REVIEWED: no admitted Git subprocess may run while it is held.
         return body()
     }
 
@@ -946,6 +949,9 @@ actor GitWorkspaceStateAuthority {
             return .failure(.invalidatedDuringCollection)
         }
 
+        // The accepted-watermark callback holds the monitor lock while
+        // `updateSynchronousState` takes the authority mirror lock: monitor → mirror. No Store cache
+        // invalidation/queryability or admitted Git subprocess may run in this synchronous callback.
         let lease = metadataMonitor.withCurrentAcceptedWatermark(
             for: scopeKey.repositoryKey,
             expected: token.acceptedMetadataWatermark
@@ -1131,9 +1137,13 @@ actor GitWorkspaceStateAuthority {
             }
             expectedWatermarks[fence.repositoryKey] = fence.acceptedMetadataWatermark
         }
-        return synchronousState.withCurrentFences(fences) {
-            metadataMonitor.withCurrentAcceptedWatermarks(expectedWatermarks, body)
-        }
+        // Keep publication in monitor → mirror order. While these permits are held, the callback
+        // must not synchronously invalidate/query the Store cache or run an admitted Git subprocess.
+        guard let permitResult = metadataMonitor.withCurrentAcceptedWatermarks(
+            expectedWatermarks,
+            { synchronousState.withCurrentFences(fences, body) }
+        ) else { return nil }
+        return permitResult
     }
 
     func releasePendingInitializationAuthorityFence(
@@ -1798,7 +1808,7 @@ actor GitWorkspaceStateAuthority {
         else { throw GitPrefixControlEvidenceCacheError.rootIdentityChanged }
         return PrefixControlRootIdentity(
             canonicalPath: canonicalRoot.path,
-            device: UInt64(value.st_dev),
+            device: safeDeviceID(value.st_dev),
             inode: UInt64(value.st_ino)
         )
     }

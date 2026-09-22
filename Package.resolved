@@ -249,7 +249,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/repoprompt/swift-sdk.git",
       "state" : {
-        "revision" : "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"
+        "revision" : "5716de85a976a8f70dedc9cb000e50aaa0d8cc5b"
       }
     },
     {

@@ -195,14 +195,14 @@ struct NativeToolResultCard: View {
 enum NativeToolCardPresentationBuilder {
     static func build(item: AgentChatItem, normalizedToolName: String?) -> AgentToolCardRenderSummary? {
         let normalizedToolName = normalizedToolName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if let summaryObject = ToolRawJSON.object(from: item.toolResultJSON),
+        if let summaryObject = ToolJSON.rawObject(from: item.toolResultJSON),
            let renderSummary = AgentToolCardRenderSummary(summaryOnlyObject: summaryObject)
         {
             guard canTrustStoredSummary(renderSummary, normalizedToolName: normalizedToolName) else { return nil }
             return renderSummary
         }
-        let rawObject = ToolRawJSON.object(from: item.toolResultJSON)
-        let argsObject = ToolRawJSON.object(from: item.toolArgsJSON)
+        let rawObject = ToolJSON.rawObject(from: item.toolResultJSON)
+        let argsObject = ToolJSON.rawObject(from: item.toolArgsJSON)
         let statusWord = statusWord(for: item)
         return AgentToolCardRenderSummaryBuilder.build(
             normalizedToolName: normalizedToolName,
@@ -234,7 +234,7 @@ enum NativeToolCardPresentationBuilder {
     private static func statusWord(for item: AgentChatItem) -> String {
         if item.toolIsError == true { return "failed" }
         if item.toolIsError == false { return "success" }
-        guard let object = ToolRawJSON.object(from: item.toolResultJSON) else { return "unknown" }
+        guard let object = ToolJSON.rawObject(from: item.toolResultJSON) else { return "unknown" }
         for key in ["status", "state", "outcome", "result"] {
             if let value = ToolRawJSON.string(object, key: key)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
                 return value

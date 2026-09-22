@@ -1,10 +1,32 @@
 import SwiftUI
 
+enum ContextBuilderGeneratedAnswerActionText {
+    static let useAsPromptTooltip = "Use the generated answer as your prompt"
+    static let copyTooltip = "Copy answer to clipboard"
+    static let previewTooltip = "Preview the generated answer"
+    static let viewInChatTooltip = "Open answer in chat view"
+}
+
 struct ContextBuilderAgentView: View {
     @ObservedObject var viewModel: ContextBuilderAgentViewModel
     @ObservedObject var oracleViewModel: OracleViewModel
     let windowID: Int
     var availableWidth: CGFloat
+    let openGeneratedAnswerChat: (ContextBuilderGeneratedAnswerRoute) -> Void
+
+    init(
+        viewModel: ContextBuilderAgentViewModel,
+        oracleViewModel: OracleViewModel,
+        windowID: Int,
+        availableWidth: CGFloat,
+        openGeneratedAnswerChat: @escaping (ContextBuilderGeneratedAnswerRoute) -> Void
+    ) {
+        _viewModel = ObservedObject(wrappedValue: viewModel)
+        _oracleViewModel = ObservedObject(wrappedValue: oracleViewModel)
+        self.windowID = windowID
+        self.availableWidth = availableWidth
+        self.openGeneratedAnswerChat = openGeneratedAnswerChat
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -84,6 +106,26 @@ struct ContextBuilderAgentView: View {
         return viewModel.tabsWithActiveContextBuilderRun.contains(tabID)
     }
 
+    private var activeRunBehavior: ContextBuilderRunBehavior? {
+        guard isContextBuilderRunningForTab else { return nil }
+        return viewModel.activeRunBehavior(for: subjectTabID)
+    }
+
+    private var displayedFollowUpAnalysisEnabled: Bool {
+        activeRunBehavior?.automaticFollowUp != nil || (!isContextBuilderRunningForTab && viewModel.followUpAnalysisEnabled)
+    }
+
+    private var followUpTooltip: String {
+        let tokenBudget: Int
+        if isContextBuilderRunningForTab {
+            guard let activeRunBehavior else { return "Current run settings unavailable" }
+            tokenBudget = activeRunBehavior.tokenBudget
+        } else {
+            tokenBudget = viewModel.analysisTokenBudget
+        }
+        return "Auto-run after Context Builder\n\nUses \(planModelName) with \(tokenBudget / 1000)k tokens"
+    }
+
     /// Whether a prompt is available for plan generation
     private var hasPromptForPlan: Bool {
         guard let tabID = subjectTabID else { return false }
@@ -113,7 +155,7 @@ struct ContextBuilderAgentView: View {
                 if viewModel.isMCPControlledRun {
                     return "Context Builder running via context_builder"
                 }
-                if viewModel.autoGeneratePlan {
+                if displayedFollowUpAnalysisEnabled {
                     return "Will auto-generate when Context Builder completes"
                 }
                 return "Wait for Context Builder to complete"
@@ -125,9 +167,10 @@ struct ContextBuilderAgentView: View {
         }
     }
 
-    /// The model that will be used for plan generation
+    /// The primary Oracle model that will be used for follow-up generation.
     private var planModelName: String {
-        oracleViewModel.promptViewModel.preferredAIModel.displayName
+        let rawValue = oracleViewModel.promptViewModel.planningModelName
+        return AIModel.fromModelName(rawValue)?.displayName ?? "Select an Oracle model"
     }
 
     /// Text describing what MCP will do after Context Builder completes
@@ -172,19 +215,25 @@ struct ContextBuilderAgentView: View {
 
                     // Auto toggle (compact) with label
                     HStack(spacing: 4) {
-                        Image(systemName: viewModel.autoGeneratePlan ? "bolt.fill" : "bolt")
+                        Image(systemName: displayedFollowUpAnalysisEnabled ? "bolt.fill" : "bolt")
                             .font(.caption)
-                            .foregroundColor(viewModel.autoGeneratePlan ? .orange : .secondary)
+                            .foregroundColor(displayedFollowUpAnalysisEnabled ? .orange : .secondary)
                         Text("Auto")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        Toggle("", isOn: $viewModel.autoGeneratePlan)
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                            .labelsHidden()
-                            .disabled(isContextBuilderRunningForTab)
+                        Toggle(
+                            "",
+                            isOn: Binding(
+                                get: { displayedFollowUpAnalysisEnabled },
+                                set: { viewModel.followUpAnalysisEnabled = $0 }
+                            )
+                        )
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .labelsHidden()
+                        .disabled(isContextBuilderRunningForTab)
                     }
-                    .hoverTooltip("Auto-run after Context Builder\n\nUses \(planModelName) with \(viewModel.planTokenBudget / 1000)k tokens")
+                    .hoverTooltip(followUpTooltip)
 
                     Spacer()
                 }
@@ -203,8 +252,13 @@ struct ContextBuilderAgentView: View {
             }
 
             // Line 3: Plan actions (only when plan is ready)
-            if case let .ready(chatID, previewText) = status {
-                planReadyActions(chatID: chatID, previewText: previewText)
+            if case let .ready(route, previewText) = status {
+                planReadyActions(route: route, previewText: previewText)
+            } else if let route = viewModel.failedAnswerRoute(for: subjectTabID) {
+                Button("View in Chat", systemImage: "bubble.left.and.bubble.right") {
+                    viewGeneratedPlan(route: route)
+                }
+                .hoverTooltip(ContextBuilderGeneratedAnswerActionText.viewInChatTooltip)
             }
         }
         .padding(10)
@@ -212,71 +266,69 @@ struct ContextBuilderAgentView: View {
         .cornerRadius(8)
     }
 
-    /// MCP control indicator showing settings being used
+    /// MCP control indicator showing settings captured for the current run
     @ViewBuilder
     private var mcpControlIndicator: some View {
-        // Determine if response type wants a follow-up response (plan/question/review)
         let responseTypeRaw = viewModel.mcpResponseType?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-
         let wantsResponse = switch responseTypeRaw {
         case "plan", "question", "review":
             true
         default:
             false
         }
-
         let responseTypeLabel: String = {
             guard let raw = responseTypeRaw, !raw.isEmpty else { return "Clarify" }
             return raw.capitalized
         }()
 
-        // In clarify (or nil) mode, show discovery token budget (160k default).
-        // In plan/question/review, show the larger plan budget (120k default).
-        let budget = wantsResponse ? viewModel.planTokenBudget : viewModel.tokenBudget
-        let tokenBudgetK = budget / 1000
+        if let activeRunBehavior {
+            HStack(spacing: 8) {
+                Image(systemName: "server.rack")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.orange)
 
-        HStack(spacing: 8) {
-            Image(systemName: "server.rack")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundColor(.orange)
+                Text("MCP Controlled")
+                    .font(.callout)
+                    .fontWeight(.medium)
+                    .foregroundColor(.orange)
 
-            Text("MCP Controlled")
-                .font(.callout)
-                .fontWeight(.medium)
-                .foregroundColor(.orange)
-
-            Text("•")
-                .foregroundColor(.secondary)
-
-            Text(responseTypeLabel)
-                .font(.callout)
-                .foregroundColor(.primary)
-
-            Text("•")
-                .foregroundColor(.secondary)
-
-            Text("\(tokenBudgetK)k tokens")
-                .font(.callout)
-                .foregroundColor(.secondary)
-
-            if let model = viewModel.mcpPlanModel, wantsResponse {
                 Text("•")
                     .foregroundColor(.secondary)
-                Text(model)
+
+                Text(responseTypeLabel)
+                    .font(.callout)
+                    .foregroundColor(.primary)
+
+                Text("•")
+                    .foregroundColor(.secondary)
+
+                Text("\(activeRunBehavior.tokenBudget / 1000)k tokens")
                     .font(.callout)
                     .foregroundColor(.secondary)
-            }
 
-            Spacer(minLength: 0)
+                if let model = viewModel.mcpPlanModel, wantsResponse {
+                    Text("•")
+                        .foregroundColor(.secondary)
+                    Text(model)
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 4)
+            .padding(.horizontal, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.orange.opacity(0.1))
+            )
+        } else {
+            Label("Current MCP run settings unavailable", systemImage: "exclamationmark.triangle.fill")
+                .font(.callout)
+                .foregroundColor(.orange)
         }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color.orange.opacity(0.1))
-        )
     }
 
     /// Label for the current follow-up type (uses MCP response type when MCP-controlled)
@@ -292,6 +344,14 @@ struct ContextBuilderAgentView: View {
         return selectedFollowUpType.buttonLabel.lowercased()
     }
 
+    private var currentOracleGroupStreamingLabel: String? {
+        guard let tabID = subjectTabID, let session = viewModel.sessions[tabID] else { return nil }
+        return ContextBuilderOracleGroupProgressProjection.streamingLabel(
+            members: session.followUpOracleGroupState.members,
+            streamingSessionIDs: oracleViewModel.streamingSessions
+        )
+    }
+
     @ViewBuilder
     private var planStatusIndicator: some View {
         let status = viewModel.planStatus(for: subjectTabID)
@@ -301,7 +361,7 @@ struct ContextBuilderAgentView: View {
             HStack(spacing: 8) {
                 ProgressView()
                     .scaleEffect(0.7)
-                Text("Generating \(currentFollowUpLabel)...")
+                Text(currentOracleGroupStreamingLabel ?? "Generating \(currentFollowUpLabel)...")
                     .font(.callout)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
@@ -340,7 +400,7 @@ struct ContextBuilderAgentView: View {
         case .idle:
             // Show waiting state for both UI auto-plan and MCP-controlled runs
             let isWaitingForContextBuilder = isContextBuilderRunningForTab &&
-                (viewModel.autoGeneratePlan || viewModel.isMCPControlledRun)
+                (displayedFollowUpAnalysisEnabled || viewModel.isMCPControlledRun)
 
             if isWaitingForContextBuilder {
                 HStack(spacing: 8) {
@@ -382,13 +442,13 @@ struct ContextBuilderAgentView: View {
     /// Inline model picker for plan generation
     private var planModelPicker: some View {
         OptimizedModelPicker(
-            selection: $oracleViewModel.promptViewModel.preferredModel,
+            selection: $oracleViewModel.promptViewModel.planningModelName,
             availableModels: oracleViewModel.promptViewModel.availableModels,
             font: .callout,
             widthStyle: .flexible()
         )
         .disabled(isContextBuilderRunningForTab)
-        .hoverTooltip("Model for \(selectedFollowUpType.buttonLabel.lowercased()) generation")
+        .hoverTooltip("Primary Oracle for \(selectedFollowUpType.buttonLabel.lowercased()) generation. Additional Oracles come from Agent Models.")
     }
 
     /// Inline follow-up type picker (Plan/Review/Question)
@@ -507,7 +567,10 @@ struct ContextBuilderAgentView: View {
 
     /// Second line actions when plan is ready
     @ViewBuilder
-    private func planReadyActions(chatID: String, previewText: String?) -> some View {
+    private func planReadyActions(
+        route: ContextBuilderGeneratedAnswerRoute,
+        previewText: String?
+    ) -> some View {
         let fullResponseText = viewModel.generatedPlanResponseText(for: subjectTabID)
         HStack(spacing: 8) {
             // Use as Prompt - primary action
@@ -525,7 +588,7 @@ struct ContextBuilderAgentView: View {
                 height: 28
             ))
             .disabled(previewText == nil)
-            .hoverTooltip("Use the generated plan as your prompt")
+            .hoverTooltip(ContextBuilderGeneratedAnswerActionText.useAsPromptTooltip)
 
             if let text = previewText {
                 Button(action: copyGeneratedPlanToClipboard) {
@@ -542,7 +605,7 @@ struct ContextBuilderAgentView: View {
                     height: 28
                 ))
                 .disabled(fullResponseText == nil)
-                .hoverTooltip("Copy plan to clipboard")
+                .hoverTooltip(ContextBuilderGeneratedAnswerActionText.copyTooltip)
 
                 // Preview
                 Button(action: { showingPlanPreview.toggle() }) {
@@ -558,7 +621,7 @@ struct ContextBuilderAgentView: View {
                     horizontalPadding: 12,
                     height: 28
                 ))
-                .hoverTooltip("Preview the generated plan")
+                .hoverTooltip(ContextBuilderGeneratedAnswerActionText.previewTooltip)
                 .popover(isPresented: $showingPlanPreview) {
                     planPreviewPopover(overrideText: text)
                 }
@@ -567,7 +630,7 @@ struct ContextBuilderAgentView: View {
             Spacer()
 
             // View in Chat
-            Button(action: { viewGeneratedPlan(chatID: chatID) }) {
+            Button(action: { viewGeneratedPlan(route: route) }) {
                 HStack(spacing: 4) {
                     Image(systemName: "bubble.left.and.bubble.right")
                         .font(.callout)
@@ -580,7 +643,7 @@ struct ContextBuilderAgentView: View {
                 horizontalPadding: 12,
                 height: 28
             ))
-            .hoverTooltip("Open plan in chat view")
+            .hoverTooltip(ContextBuilderGeneratedAnswerActionText.viewInChatTooltip)
         }
     }
 
@@ -727,7 +790,7 @@ struct ContextBuilderAgentView: View {
         .padding(.bottom, 8)
     }
 
-    // MARK: - Auto Plan Generation
+    // MARK: - Follow-up Analysis
 
     /// Generate a plan/review/answer from built context based on selected follow-up type.
     /// Always uses headless generation so we can offer "View in Chat" or "Use as Prompt" options.
@@ -746,12 +809,12 @@ struct ContextBuilderAgentView: View {
         )
     }
 
-    /// Select the generated plan's Oracle chat session.
-    private func viewGeneratedPlan(chatID: String) {
-        oracleViewModel.selectSession(byShortID: chatID)
+    /// Open the generated answer's Oracle chat session.
+    private func viewGeneratedPlan(route: ContextBuilderGeneratedAnswerRoute) {
+        openGeneratedAnswerChat(route)
     }
 
-    /// Use the generated plan text as the prompt
+    /// Use the generated answer text as the prompt
     private func useAsPrompt() {
         viewModel.useGeneratedPlanAsPrompt()
     }
@@ -793,6 +856,33 @@ struct ContextBuilderAgentView: View {
                 .disabled(isContextBuilderRunningForTab)
                 .hoverTooltip("Select agent and model for Context Builder")
 
+                if let providerID = viewModel.selectedAgent.acpProviderID {
+                    let expectedModelRaw = viewModel.selectedModelRaw
+                    let expectedScope = viewModel.contextBuilderEditingScope
+                    ACPModelParameterProbeView(
+                        modelRaw: expectedModelRaw,
+                        providerID: providerID,
+                        probeContext: .resolved(viewModel.chooserProbeWorkspacePath),
+                        pinnedValueRaw: viewModel.contextBuilderThinkingParameterValueRaw,
+                        isEnabled: !isContextBuilderRunningForTab
+                    ) { configID, value in
+                        // Guarded write: re-check the live run permission, then re-check the
+                        // captured provider/model against live state inside the setter.
+                        guard !isContextBuilderRunningForTab else { return }
+                        viewModel.setContextBuilderModelParameter(
+                            ACPModelParameterSelection.thinkingPin(
+                                configID: configID,
+                                valueRaw: value,
+                                providerID: providerID,
+                                modelRaw: expectedModelRaw
+                            ),
+                            expectedProviderID: providerID,
+                            expectedModelRaw: expectedModelRaw,
+                            expectedScope: expectedScope
+                        )
+                    }
+                }
+
                 // Context Builder Prompts button
                 ContextBuilderPromptsButton(
                     selectedPromptIDs: $viewModel.selectedContextBuilderPromptIDs,
@@ -819,13 +909,36 @@ struct ContextBuilderAgentView: View {
             // Header bar with Build Context label, settings, and run button
             ContextBuilderHeaderBar(
                 contextBuilderInstructions: $viewModel.contextBuilderInstructions,
-                tokenBudget: $viewModel.tokenBudget,
-                enhancementMode: $viewModel.enhancementMode,
-                allowClarifyingQuestions: $viewModel.allowClarifyingQuestions,
-                allowClarifyingQuestionsForMCP: $viewModel.allowClarifyingQuestionsForMCP,
-                questionTimeoutSeconds: $viewModel.questionTimeoutSeconds,
-                planTokenBudget: $viewModel.planTokenBudget,
-                autoGeneratePlan: viewModel.autoGeneratePlan,
+                contextTokenBudget: Binding(
+                    get: { viewModel.contextTokenBudget },
+                    set: { viewModel.contextTokenBudget = $0 }
+                ),
+                enhancementMode: Binding(
+                    get: { viewModel.enhancementMode },
+                    set: { viewModel.enhancementMode = $0 }
+                ),
+                allowUIClarifyingQuestions: Binding(
+                    get: { viewModel.allowUIClarifyingQuestions },
+                    set: { viewModel.allowUIClarifyingQuestions = $0 }
+                ),
+                allowMCPClarifyingQuestions: Binding(
+                    get: { viewModel.allowMCPClarifyingQuestions },
+                    set: { viewModel.allowMCPClarifyingQuestions = $0 }
+                ),
+                questionTimeoutSeconds: Binding(
+                    get: { viewModel.questionTimeoutSeconds },
+                    set: { viewModel.questionTimeoutSeconds = $0 }
+                ),
+                analysisTokenBudget: Binding(
+                    get: { ContextBuilderDefaults.normalizedAnalysisTokenBudget(viewModel.analysisTokenBudget) },
+                    set: { viewModel.analysisTokenBudget = $0 }
+                ),
+                followUpAnalysisEnabled: Binding(
+                    get: { viewModel.followUpAnalysisEnabled },
+                    set: { viewModel.followUpAnalysisEnabled = $0 }
+                ),
+                activeRunTokenBudget: activeRunBehavior?.tokenBudget,
+                resetBehaviorSettings: viewModel.resetContextBuilderBehaviorSettings,
                 isRunning: isContextBuilderRunningForTab,
                 isDisabled: !isContextBuilderRunningForTab && viewModel.isAgentBusy,
                 isBusy: viewModel.isAgentBusy,
@@ -1119,13 +1232,15 @@ private struct ContextBuilderInstructionsEditor: View {
 /// Header bar above the text editor with Build Context label, token budget, settings, and run button
 private struct ContextBuilderHeaderBar: View {
     @Binding var contextBuilderInstructions: String
-    @Binding var tokenBudget: Int
+    @Binding var contextTokenBudget: Int
     @Binding var enhancementMode: PromptEnhancementMode
-    @Binding var allowClarifyingQuestions: Bool
-    @Binding var allowClarifyingQuestionsForMCP: Bool
+    @Binding var allowUIClarifyingQuestions: Bool
+    @Binding var allowMCPClarifyingQuestions: Bool
     @Binding var questionTimeoutSeconds: TimeInterval
-    @Binding var planTokenBudget: Int
-    let autoGeneratePlan: Bool
+    @Binding var analysisTokenBudget: Int
+    @Binding var followUpAnalysisEnabled: Bool
+    let activeRunTokenBudget: Int?
+    let resetBehaviorSettings: () -> Void
     let isRunning: Bool
     let isDisabled: Bool
     let isBusy: Bool
@@ -1136,9 +1251,11 @@ private struct ContextBuilderHeaderBar: View {
     @State private var showingSettingsPopover = false
     @State private var isSettingsHovered = false
 
-    /// The budget to display - shows planTokenBudget when Auto Plan is enabled
-    private var displayBudget: Int {
-        autoGeneratePlan ? planTokenBudget : tokenBudget
+    private var displayBudgetLabel: String {
+        let tokenBudget = isRunning
+            ? activeRunTokenBudget
+            : (followUpAnalysisEnabled ? analysisTokenBudget : contextTokenBudget)
+        return tokenBudget.map { "\($0 / 1000)k" } ?? "Unavailable"
     }
 
     private var headerText: String {
@@ -1174,9 +1291,9 @@ private struct ContextBuilderHeaderBar: View {
     private var settingsTooltip: String {
         var lines: [String] = []
         lines.append("Context Builder Settings")
-        lines.append("Token budget: \(displayBudget / 1000)k")
+        lines.append("Token budget: \(displayBudgetLabel)")
         lines.append("Prompt mode: \(modeLabel)")
-        if allowClarifyingQuestions {
+        if allowUIClarifyingQuestions {
             lines.append("Clarifying questions: On")
         }
         if isMCPControlled {
@@ -1227,7 +1344,7 @@ private struct ContextBuilderHeaderBar: View {
                             .foregroundColor(.secondary.opacity(0.7))
                             .lineLimit(1)
                             .truncationMode(.head)
-                        Text("\(displayBudget / 1000)k")
+                        Text(displayBudgetLabel)
                             .font(.callout)
                             .monospacedDigit()
                             .foregroundColor(.secondary)
@@ -1238,9 +1355,9 @@ private struct ContextBuilderHeaderBar: View {
                             .foregroundColor(.secondary.opacity(0.6))
 
                         // Question mark indicator
-                        Image(systemName: allowClarifyingQuestions ? "questionmark.circle.fill" : "questionmark.circle")
+                        Image(systemName: allowUIClarifyingQuestions ? "questionmark.circle.fill" : "questionmark.circle")
                             .font(.callout)
-                            .foregroundColor(allowClarifyingQuestions ? .blue : .secondary.opacity(0.5))
+                            .foregroundColor(allowUIClarifyingQuestions ? .blue : .secondary.opacity(0.5))
 
                         // Gear icon
                         Image(systemName: "gearshape.fill")
@@ -1278,12 +1395,14 @@ private struct ContextBuilderHeaderBar: View {
                 .hoverTooltip(settingsTooltip)
                 .popover(isPresented: $showingSettingsPopover) {
                     ContextBuilderSettingsPopover(
-                        tokenBudget: $tokenBudget,
+                        contextTokenBudget: $contextTokenBudget,
                         enhancementMode: $enhancementMode,
-                        allowClarifyingQuestions: $allowClarifyingQuestions,
-                        allowClarifyingQuestionsForMCP: $allowClarifyingQuestionsForMCP,
+                        allowUIClarifyingQuestions: $allowUIClarifyingQuestions,
+                        allowMCPClarifyingQuestions: $allowMCPClarifyingQuestions,
                         questionTimeoutSeconds: $questionTimeoutSeconds,
-                        planTokenBudget: $planTokenBudget,
+                        analysisTokenBudget: $analysisTokenBudget,
+                        followUpAnalysisEnabled: $followUpAnalysisEnabled,
+                        resetBehaviorSettings: resetBehaviorSettings,
                         isDisabled: isRunning
                     )
                 }
@@ -1369,15 +1488,17 @@ private struct CompactRunButton: View {
 
 /// Settings popover content extracted from TokenBudgetControl
 private struct ContextBuilderSettingsPopover: View {
-    @Binding var tokenBudget: Int
+    @Binding var contextTokenBudget: Int
     @Binding var enhancementMode: PromptEnhancementMode
-    @Binding var allowClarifyingQuestions: Bool
-    @Binding var allowClarifyingQuestionsForMCP: Bool
+    @Binding var allowUIClarifyingQuestions: Bool
+    @Binding var allowMCPClarifyingQuestions: Bool
     @Binding var questionTimeoutSeconds: TimeInterval
-    @Binding var planTokenBudget: Int
+    @Binding var analysisTokenBudget: Int
+    @Binding var followUpAnalysisEnabled: Bool
+    let resetBehaviorSettings: () -> Void
     let isDisabled: Bool
 
-    @State private var showAutoPlanBudget = false
+    @State private var showAnalysisBudget = false
 
     private var modeDescription: String {
         switch enhancementMode {
@@ -1397,14 +1518,7 @@ private struct ContextBuilderSettingsPopover: View {
                 Text("Context Builder Settings")
                     .font(.headline)
                 Spacer()
-                Button(action: {
-                    tokenBudget = ContextBuilderDefaults.discoveryTokenBudget
-                    planTokenBudget = ContextBuilderDefaults.planTokenBudget
-                    enhancementMode = ContextBuilderDefaults.enhancementMode
-                    allowClarifyingQuestions = ContextBuilderDefaults.allowClarifyingQuestions
-                    allowClarifyingQuestionsForMCP = ContextBuilderDefaults.allowClarifyingQuestionsForMCP
-                    questionTimeoutSeconds = ContextBuilderDefaults.questionTimeoutSeconds
-                }) {
+                Button(action: resetBehaviorSettings) {
                     HStack(spacing: 4) {
                         Image(systemName: "arrow.counterclockwise")
                         Text("Reset")
@@ -1427,22 +1541,22 @@ private struct ContextBuilderSettingsPopover: View {
                             .font(.subheadline)
                             .fontWeight(.medium)
 
-                        Text("Sets the target size for your final prompt. Use 160k for ChatGPT exports by default, or lower for a more token-efficient prompt.")
+                        Text("Sets the target size of the context package. Use ~160k for ChatGPT/web exports by default, or lower for a more token-efficient prompt.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
 
                         SettingsBudgetSliderRow(
                             label: "Target size",
-                            value: $tokenBudget,
+                            value: $contextTokenBudget,
                             range: 10000 ... 200_000,
                             isDisabled: isDisabled
                         )
 
                         // Collapsible Post-Discovery Analysis budget section
-                        Button(action: { withAnimation { showAutoPlanBudget.toggle() } }) {
+                        Button(action: { withAnimation { showAnalysisBudget.toggle() } }) {
                             HStack(spacing: 6) {
-                                Image(systemName: showAutoPlanBudget ? "chevron.down" : "chevron.right")
+                                Image(systemName: showAnalysisBudget ? "chevron.down" : "chevron.right")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                     .frame(width: 12)
@@ -1453,7 +1567,7 @@ private struct ContextBuilderSettingsPopover: View {
                                     .font(.callout)
                                     .foregroundColor(.primary)
                                 Spacer()
-                                Text("\(planTokenBudget / 1000)k")
+                                Text("\(analysisTokenBudget / 1000)k")
                                     .font(.callout)
                                     .foregroundColor(.secondary)
                                     .monospacedDigit()
@@ -1462,17 +1576,18 @@ private struct ContextBuilderSettingsPopover: View {
                         }
                         .buttonStyle(.plain)
 
-                        if showAutoPlanBudget {
+                        if showAnalysisBudget {
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("Follow-up analysis uses CLI/API calls which support larger context windows.")
+                                Text("Sets the target size of the context package when Context Builder will immediately produce a plan, review, or answer.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
 
                                 SettingsBudgetSliderRow(
                                     label: "Target size",
-                                    value: $planTokenBudget,
-                                    range: 40000 ... 200_000,
+                                    value: $analysisTokenBudget,
+                                    range: Double(ContextBuilderDefaults.analysisTokenBudgetRange.lowerBound)
+                                        ... Double(ContextBuilderDefaults.analysisTokenBudgetRange.upperBound),
                                     isDisabled: isDisabled
                                 )
                             }
@@ -1510,6 +1625,17 @@ private struct ContextBuilderSettingsPopover: View {
 
                     Divider()
 
+                    SettingsToggleRow(
+                        icon: "bolt.fill",
+                        iconColor: .orange,
+                        label: "Follow-up Analysis",
+                        description: "Automatically run this tab’s selected analysis after Context Builder",
+                        isOn: $followUpAnalysisEnabled,
+                        isDisabled: isDisabled
+                    )
+
+                    Divider()
+
                     // Clarifying Questions Section
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Clarifying Questions")
@@ -1522,26 +1648,26 @@ private struct ContextBuilderSettingsPopover: View {
                             .fixedSize(horizontal: false, vertical: true)
 
                         VStack(spacing: 8) {
-                            SettingsClarifyingToggleRow(
+                            SettingsToggleRow(
                                 icon: "questionmark.bubble.fill",
                                 iconColor: .blue,
                                 label: "Manual Runs (UI)",
                                 description: "When you click Run Context Builder",
-                                isOn: $allowClarifyingQuestions,
+                                isOn: $allowUIClarifyingQuestions,
                                 isDisabled: isDisabled
                             )
 
-                            SettingsClarifyingToggleRow(
+                            SettingsToggleRow(
                                 icon: "server.rack",
                                 iconColor: .green,
                                 label: "MCP Runs",
                                 description: "When called via context_builder",
-                                isOn: $allowClarifyingQuestionsForMCP,
+                                isOn: $allowMCPClarifyingQuestions,
                                 isDisabled: isDisabled
                             )
                         }
 
-                        if allowClarifyingQuestions || allowClarifyingQuestionsForMCP {
+                        if allowUIClarifyingQuestions || allowMCPClarifyingQuestions {
                             HStack(spacing: 8) {
                                 Text("Timeout")
                                     .font(.callout)
@@ -1586,7 +1712,7 @@ private struct SettingsBudgetSliderRow: View {
 
             Slider(
                 value: Binding(
-                    get: { Double(value) },
+                    get: { min(max(Double(value), range.lowerBound), range.upperBound) },
                     set: { value = Int($0) }
                 ),
                 in: range,
@@ -1603,8 +1729,8 @@ private struct SettingsBudgetSliderRow: View {
     }
 }
 
-/// Clarifying questions toggle row for settings popover
-private struct SettingsClarifyingToggleRow: View {
+/// Toggle row for Context Builder settings
+private struct SettingsToggleRow: View {
     let icon: String
     let iconColor: Color
     let label: String

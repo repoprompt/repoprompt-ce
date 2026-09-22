@@ -34,6 +34,12 @@ actor CodexModelPollingService {
     struct Snapshot: Equatable {
         let models: [CodexAppServerClient.RemoteModel]
         let fetchedAt: Date
+        let authPublicationToken: CodexManagedSessionFence.Token
+
+        @MainActor
+        var isAuthorizedForPublication: Bool {
+            CodexManagedSessionFence.shared.allowsAuthenticationPublication(authPublicationToken)
+        }
     }
 
     private let client: any CodexModelListingClient
@@ -49,6 +55,7 @@ actor CodexModelPollingService {
     #endif
     private var latest: Snapshot?
     private var isShutdown = false
+    private var isSuspendedForManagedSignOut = false
     private var isStoppingClientForIdle = false
 
     init(
@@ -71,6 +78,10 @@ actor CodexModelPollingService {
     #if DEBUG
         func test_subscriberCount() -> Int {
             continuations.count
+        }
+
+        func test_isSuspendedForManagedSignOut() -> Bool {
+            isSuspendedForManagedSignOut
         }
 
         func test_subscriberCountUpdates() -> AsyncStream<Int> {
@@ -120,12 +131,41 @@ actor CodexModelPollingService {
     /// Updates the registry and only broadcasts when the normalized model payload changes.
     /// Coalesces with any in-flight refresh to avoid overlapping network/process calls.
     func refreshNow() async {
-        guard !isShutdown else { return }
+        guard !isShutdown, !isSuspendedForManagedSignOut else { return }
         if let existing = inFlightRefresh {
             await existing.value
             return
         }
         await performRefresh()
+    }
+
+    /// Reversibly stops polling and its owned transport while managed sign-out runs.
+    /// Unlike `shutdown()`, subscribers remain registered and a later successful sign-in
+    /// can restart polling without reconstructing every view model.
+    func suspendForManagedSignOut() async {
+        guard !isShutdown else { return }
+        isSuspendedForManagedSignOut = true
+        latest = nil
+        _ = AgentCodexModelRegistry.shared.updateLiveModels([])
+        pollingTask?.cancel()
+        pollingTask = nil
+        let refresh = inFlightRefresh
+        refresh?.cancel()
+        isStoppingClientForIdle = true
+        await refresh?.value
+        await client.stop()
+        isStoppingClientForIdle = false
+        if !isShutdown, !isSuspendedForManagedSignOut, !continuations.isEmpty {
+            startPollingIfNeeded()
+        }
+    }
+
+    func resumeAfterManagedAuthentication() {
+        guard !isShutdown else { return }
+        isSuspendedForManagedSignOut = false
+        if !continuations.isEmpty {
+            startPollingIfNeeded()
+        }
     }
 
     func shutdown(finishSubscribers: Bool = true) async {
@@ -152,7 +192,7 @@ actor CodexModelPollingService {
     // MARK: - Internal
 
     private func startPollingIfNeeded() {
-        guard !isShutdown else { return }
+        guard !isShutdown, !isSuspendedForManagedSignOut else { return }
         guard !isStoppingClientForIdle else { return }
         guard pollingTask == nil else { return }
         pollingTask = Task { [weak self] in
@@ -183,7 +223,7 @@ actor CodexModelPollingService {
         await client.stop()
         isStoppingClientForIdle = false
 
-        if !isShutdown, !continuations.isEmpty {
+        if !isShutdown, !isSuspendedForManagedSignOut, !continuations.isEmpty {
             startPollingIfNeeded()
         }
     }
@@ -209,7 +249,7 @@ actor CodexModelPollingService {
     #endif
 
     private func performRefresh() async {
-        guard !isShutdown else { return }
+        guard !isShutdown, !isSuspendedForManagedSignOut else { return }
         // Single-flight: if a refresh is already running, await it instead of starting another.
         if let existing = inFlightRefresh {
             await existing.value
@@ -218,9 +258,16 @@ actor CodexModelPollingService {
         let task = Task { [weak self] in
             guard let self else { return }
             do {
+                let authPublicationToken = await MainActor.run {
+                    CodexManagedSessionFence.shared.capturePublicationToken()
+                }
                 let models = try await client.listModels(limit: 100)
                 guard !Task.isCancelled else { return }
-                let snapshot = Snapshot(models: models, fetchedAt: Date())
+                let snapshot = Snapshot(
+                    models: models,
+                    fetchedAt: Date(),
+                    authPublicationToken: authPublicationToken
+                )
                 await applyRefreshResult(snapshot)
             } catch {
                 // Keep existing cache when refresh fails; callers fall back to static list when empty.
@@ -232,7 +279,7 @@ actor CodexModelPollingService {
     }
 
     private func applyRefreshResult(_ snapshot: Snapshot) {
-        guard !isShutdown else { return }
+        guard !isShutdown, !isSuspendedForManagedSignOut else { return }
 
         // Single canonical registry update — no other call site should write to the registry.
         let didChange = AgentCodexModelRegistry.shared.updateLiveModels(snapshot.models)

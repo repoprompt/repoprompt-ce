@@ -155,11 +155,24 @@ private final class BootstrapHandshakeSocket: @unchecked Sendable {
     }
 }
 
+/// Process identity captured while accepting a bootstrap socket connection.
+/// `claimedPID` is handshake metadata used only for compatibility admission heuristics and diagnostics.
+/// `observedKernelPID` is obtained from LOCAL_PEERPID and is the only PID eligible for principal verification.
+struct BootstrapClientProcessIdentity: Equatable {
+    let claimedPID: Int
+    let observedKernelPID: Int?
+
+    var admissionPID: Int {
+        observedKernelPID ?? claimedPID
+    }
+}
+
 /// Actor that manages the single bootstrap UNIX socket.
 /// Accepts CLI connections and hands them off to ServerNetworkManager.
 actor BootstrapSocketServer {
     private let socketURL: URL
     private let logger: Logger
+    private let peerPIDResolver: @Sendable (Int32) -> Int?
     private let handshakeIOQueue = DispatchQueue(
         label: "com.repoprompt.mcp.bootstrap.handshake-io",
         qos: .userInitiated
@@ -217,13 +230,18 @@ actor BootstrapSocketServer {
         }
     }
 
-    /// Callback when a new CLI connects and completes handshake
-    /// Parameters: (clientFD, sessionToken, clientPid, clientName)
-    /// Returns: Admission decision with optional postAccept hook for MCP startup
-    private var onNewConnection: ((Int32, String, Int, String?) async -> Admission)?
+    /// Callback when a new CLI connects and completes handshake.
+    /// Claimed and kernel-observed process identity remain distinct across this boundary.
+    /// Returns: Admission decision with optional postAccept hook for MCP startup.
+    private var onNewConnection: ((Int32, String, BootstrapClientProcessIdentity, String?) async -> Admission)?
 
-    init(socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(), logger: Logger? = nil) {
+    init(
+        socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(),
+        logger: Logger? = nil,
+        peerPIDResolver: @escaping @Sendable (Int32) -> Int? = { BootstrapSocketServer.peerPID(for: $0) }
+    ) {
         self.socketURL = socketURL
+        self.peerPIDResolver = peerPIDResolver
         self.logger = {
             var l = logger ?? Logger(label: "com.repoprompt.mcp.bootstrap") {
                 _ in SwiftLogNoOpLogHandler()
@@ -240,7 +258,9 @@ actor BootstrapSocketServer {
     /// Starts listening on the bootstrap socket.
     /// - Parameter onNewConnection: Callback invoked for each new CLI connection.
     ///   Return an Admission with postAccept closure for MCP startup.
-    func start(onNewConnection: @escaping (Int32, String, Int, String?) async -> Admission) throws {
+    func start(
+        onNewConnection: @escaping (Int32, String, BootstrapClientProcessIdentity, String?) async -> Admission
+    ) throws {
         #if DEBUG
             print("[MCPStartup] BootstrapSocketServer.start entered socket=\(socketURL.path)")
         #endif
@@ -763,10 +783,16 @@ actor BootstrapSocketServer {
 
         guard isActiveHandshake(handshakeSocket, generation: generation) else { return }
 
-        let peerPid = Self.peerPID(for: clientFD)
-        let effectivePid = peerPid ?? request.clientPid
-        if let peerPid, peerPid != request.clientPid {
-            bootstrapSocketServerLog("BootstrapSocketServer: clientPid mismatch (request=\(request.clientPid), peer=\(peerPid)); using peer pid")
+        let processIdentity = BootstrapClientProcessIdentity(
+            claimedPID: request.clientPid,
+            observedKernelPID: peerPIDResolver(clientFD)
+        )
+        if let observedKernelPID = processIdentity.observedKernelPID,
+           observedKernelPID != processIdentity.claimedPID
+        {
+            bootstrapSocketServerLog("BootstrapSocketServer: clientPid mismatch (request=\(processIdentity.claimedPID), peer=\(observedKernelPID)); using peer pid for admission and verification")
+        } else if processIdentity.observedKernelPID == nil {
+            bootstrapSocketServerLog("BootstrapSocketServer: LOCAL_PEERPID unavailable; claimed pid remains unverified")
         }
 
         bootstrapSocketServerLog("BootstrapSocketServer: handshake from '\(request.clientName ?? "unknown")' session=\(request.sessionToken.prefix(8))...")
@@ -795,7 +821,7 @@ actor BootstrapSocketServer {
             EditFlowPerf.Stage.Bootstrap.admission,
             EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
         )
-        let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName)
+        let admission = await handler(clientFD, request.sessionToken, processIdentity, request.clientName)
         EditFlowPerf.end(
             EditFlowPerf.Stage.Bootstrap.admission,
             admissionState,

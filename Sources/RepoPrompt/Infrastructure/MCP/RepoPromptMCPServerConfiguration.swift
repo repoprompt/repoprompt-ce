@@ -33,7 +33,7 @@ struct RepoPromptMCPServerConfiguration: Equatable, Hashable {
     }
 
     static var repoPrompt: Self {
-        Self()
+        Self(args: ["--backend", "app"])
     }
 
     var environmentDictionary: [String: String] {

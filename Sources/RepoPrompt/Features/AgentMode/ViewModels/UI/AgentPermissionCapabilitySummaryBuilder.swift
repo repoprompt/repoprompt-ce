@@ -172,6 +172,56 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: level.autoApprovesACPToolPermissions ? "Auto-approve: on" : "Auto-approve: off",
                 warnings: warnings
             )
+        case .grokBuild:
+            let level = grokBuildPermissionLevel(profile: profile)
+            let warnings = level == .fullAccess
+                ? ["Grok Build launches with `--always-approve` — its tools run without per-request confirmation."]
+                : []
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Always-approve launch: \(level.launchesWithAlwaysApprove ? "on" : "off")",
+                shell: "Handled by Grok Build CLI",
+                externalMCP: "Third-party MCP: managed by Grok Build",
+                search: "Managed by Grok Build CLI",
+                approvalModeDescription: level.launchesWithAlwaysApprove ? "Always-approve: on" : "Always-approve: off",
+                warnings: warnings
+            )
+        case .antigravity:
+            let level = antigravityPermissionLevel(profile: profile)
+            let warnings = level == .yolo
+                ? ["Antigravity Yolo mode runs available tools without approval prompts."]
+                : []
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "ACP mode: \(level.displayName)",
+                shell: "Handled by Antigravity ACP",
+                externalMCP: safeManaged
+                    ? "Third-party MCP: suppressed"
+                    : "Third-party MCP: managed by Antigravity ACP",
+                search: "Managed by Antigravity ACP",
+                approvalModeDescription: "ACP mode: \(level.displayName)",
+                warnings: warnings
+            )
+        case .devin:
+            let level = devinPermissionLevel(profile: profile)
+            let warnings = level.isWarning
+                ? ["Devin launches with `--permission-mode dangerous` — its tools run without approval prompts."]
+                : []
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Permission mode: \(level.displayName)",
+                shell: "Handled by Devin CLI",
+                externalMCP: "Third-party MCP: managed by Devin CLI",
+                search: "Managed by Devin CLI",
+                approvalModeDescription: "Permission mode: \(level.displayName)",
+                warnings: warnings
+            )
         }
     }
 
@@ -193,6 +243,9 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .claude: availability.claudeCodeAvailable
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
+        case .grokBuild: availability.grokBuildAvailable
+        case .antigravity: availability.antigravityAvailable
+        case .devin: availability.devinAvailable
         }
     }
 
@@ -252,6 +305,41 @@ struct AgentPermissionCapabilitySummaryBuilder {
             level
         case .providerOverride:
             .managedDefault
+        }
+    }
+
+    private func grokBuildPermissionLevel(profile: AgentProviderPermissionProfile) -> GrokBuildAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.grokBuild(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
+    private func devinPermissionLevel(profile: AgentProviderPermissionProfile) -> DevinAgentToolPreferences.PermissionLevel {
+        profile.devinPermissionLevel(
+            userConfigured: DevinAgentToolPreferences.permissionLevel(
+                defaults: defaults,
+                secureStore: securePermissions
+            )
+        )
+    }
+
+    private func antigravityPermissionLevel(profile: AgentProviderPermissionProfile) -> AntigravityAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .autoEdit
+        case let .providerOverride(.antigravity(level)):
+            level
+        case .providerOverride:
+            .autoEdit
         }
     }
 }

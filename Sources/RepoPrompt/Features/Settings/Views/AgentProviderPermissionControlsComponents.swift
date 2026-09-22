@@ -87,8 +87,10 @@ struct AgentProviderPermissionLevelSection: View {
     private func permissionLevelLabel(for providerID: AgentProviderBindingID) -> String {
         switch providerID {
         case .codex, .claude: "Permission Level"
-        case .openCode: "ACP Session Mode"
+        case .openCode, .antigravity: "ACP Session Mode"
         case .cursor: "ACP Auto-Approve"
+        case .grokBuild: "Always-Approve Launch"
+        case .devin: "Permission Mode"
         }
     }
 }
@@ -139,7 +141,7 @@ struct AgentProviderToolsRuntimeDisclosure: View {
         switch providerID {
         case .codex: binding.codexTools != nil
         case .claude: binding.claudeTools != nil
-        case .openCode, .cursor: false
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin: false
         }
     }
 }
@@ -167,7 +169,7 @@ struct AgentProviderToolsRuntimeControls: View {
                         onApplyMutation: onApplyClaudeToolSettingMutation
                     )
                 }
-            case .openCode, .cursor:
+            case .openCode, .cursor, .grokBuild, .antigravity, .devin:
                 EmptyView()
             }
         }
@@ -215,6 +217,44 @@ struct CodexProviderToolsRuntimeSection: View {
                 onChange: { onApplyMutation(.reasoningSummaries(enabled: $0)) }
             )
             .hoverTooltip("Controls model_reasoning_summary for Codex Agent Mode app-server thread start/resume. Off sends none; on sends auto.")
+
+            ProviderRuntimeToggleRow(
+                title: "Local Memories",
+                description: "Let Codex generate and reuse local memories across Agent Mode chats. Memories are stored under Codex home (normally ~/.codex/memories). Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.",
+                isOn: tools.memoriesEnabled,
+                onChange: { onApplyMutation(.memories(enabled: $0)) }
+            )
+            .hoverTooltip("Controls Codex memory generation and use for app-server launch and thread start/resume. Off by default.")
+
+            ProviderRuntimeSubsection(title: "Optional Codex Features") {
+                ProviderRuntimeToggleRow(
+                    title: "Apps",
+                    description: "Allow Codex to use connected apps.",
+                    isOn: tools.appsEnabled,
+                    onChange: { onApplyMutation(.apps(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "Plugins",
+                    description: "Allow Codex to load installed plugins.",
+                    isOn: tools.pluginsEnabled,
+                    onChange: { onApplyMutation(.plugins(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "MCP Elicitation",
+                    description: "Allow MCP servers to request additional input during a run.",
+                    isOn: tools.mcpElicitationEnabled,
+                    onChange: { onApplyMutation(.mcpElicitation(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "Tool Suggestions",
+                    description: "Allow Codex to suggest apps or plugins to install or enable.",
+                    isOn: tools.toolSuggestionsEnabled,
+                    onChange: { onApplyMutation(.toolSuggestions(enabled: $0)) }
+                )
+            }
 
             ProviderRuntimeSubsection(
                 title: "MCP servers",

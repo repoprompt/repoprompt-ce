@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "channel": "stable",
+  "currentRole": "legacy",
+  "eligibilityProfile": "stable-rollout-v1",
+  "expectedMigrationPhase": "disabled",
+  "expectedSigningIdentity": "legacy",
+  "predecessors": []
+}

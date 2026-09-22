@@ -32,7 +32,7 @@ make dev-run    # coordinated build, package, stop existing RepoPrompt, and laun
 
 `make dev-run` routes through the developer daemon (see "Developer daemon / coordinated validation") and remains the ordinary FIFO coordinated launch path. For a user-directed newest lifecycle action, use `./conductor app relaunch`; the Finder launcher uses that operation when `python3` is available. The uncoordinated equivalents are `make run` or `./Scripts/run.sh`.
 
-Debug packaging may auto-detect an Apple Development signing identity for a valid local app signature, but auto-detected debug signing still uses ephemeral in-memory secure storage to avoid macOS Keychain prompts. Set an explicit `SIGN_IDENTITY="Apple Development: ..."` to opt in to persistent debug Keychain storage; `DEBUG_SECURE_STORAGE_BACKEND=keychain` is also supported for explicit debug storage opt-in when the signed app has a TeamIdentifier. If no stable identity is available, set `ALLOW_ADHOC_SIGNING=1` to build an ad-hoc debug app; ad-hoc debug builds use ephemeral in-memory secure storage, so API keys and secure permission changes do not persist across launches. Release packaging requires `SIGN_IDENTITY` and continues to use real Keychain storage.
+Debug packaging may auto-detect an Apple Development signing identity for a valid local app signature and persistent, team-isolated Keychain storage. Set `DEBUG_SECURE_STORAGE_BACKEND=alternate-in-memory` to opt out of persistence for a signed debug build. If no stable identity is available, set `ALLOW_ADHOC_SIGNING=1` to build an ad-hoc debug app; ad-hoc debug builds use ephemeral in-memory secure storage, so API keys and secure permission changes do not persist across launches. Release packaging requires `SIGN_IDENTITY` and continues to use real Keychain storage.
 
 ## Debug
 
@@ -73,12 +73,11 @@ authoritative.
 ```bash
 make xcode                  # generate and open
 make xcode-generate         # generate without opening
-make xcode-generator-test   # deterministic generator contract tests (default CI)
 make xcode-validate         # explicit full validation with xcodebuild -list
 make xcode-clean            # remove generated workspace metadata
 ```
 
-Default CI runs `make xcode-generator-test`; full `make xcode-validate` is explicit and runs through local `pr-ready` for Xcode workspace boundary changes or the dedicated `Xcode Workspace Validation` workflow.
+`make xcode-validate` is the canonical generated-workspace check and runs through local `pr-ready` for Xcode workspace boundary changes or the dedicated `Xcode Workspace Validation` workflow.
 
 Xcode 26.3 exposes the native `RepoPrompt` and `repoprompt-mcp` product schemes.
 Use `RepoPrompt CE App` and `RepoPrompt CE MCP` for conductor-coordinated debug
@@ -164,9 +163,7 @@ make dev-run
 make dev-launch-existing                         # launch current DebugApps bundle without building
 make dev-test                                       # full coordinated test suite
 make dev-test FILTER=WorkspaceFileContextStoreTests # focused coordinated test run
-make dev-test-list                                  # coordinated authoritative root XCTest method list
 make dev-provider-test                              # RepoPromptAgentProviders package tests (FILTER= also supported)
-make dev-provider-test-list                         # coordinated authoritative provider XCTest method list
 make dev-smoke          # non-disruptive: requires an already-running CE debug app and installed debug CLI
 make dev-smoke-launch   # builds/launches the debug app, then runs the smoke flow
 make dev-format-check   # non-mutating coordinated SwiftFormat check
@@ -217,7 +214,7 @@ These do not claim daemon lanes or lifecycle supersession, so when multiple agen
 
 ## Source placement rules
 
-See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). In short:
+See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). Before changing Agent Mode cross-session oversight, read [`docs/architecture/agent-session-oversight-auto-wake.md`](docs/architecture/agent-session-oversight-auto-wake.md): it records the four disjoint owners, why a snooze suppresses admission but never delivery, and why the `.cancelledBeforeDispatch` tombstone is a transport fence whose dependency lives in a different file. In short:
 
 - The shipped `RepoPrompt` executable target lives under `Sources/RepoPromptExecutable` and must remain a one-file entry shell over the internal `RepoPromptApp` target; do not add implementation code there.
 - Product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
@@ -299,9 +296,7 @@ Use `make dev-run` (or `make run`) only when it is safe to stop any existing Rep
 
 ### XCTest optimization inventory and timing
 
-See [`docs/testing.md`](docs/testing.md) for the contributor workflow, exact XCTest IDs, surgical contract-ledger maintenance, scenario accounting, and handoff checklist. Routine executable adds, renames, consolidations, and removals require the affected focused test, authoritative list, and `verify-ledger`; never regenerate or overwrite the curated ledger.
-
-Optimization/performance campaigns additionally require append-only inventory, baseline, focused, and full-root artifacts under `docs/test-suite-optimizer/artifacts/` plus updates to `docs/test-suite-optimizer/scoreboard.md`. The primary metric is warm local root conductor execution time, provider timing remains separate, and diagnostic/wake-probe runs are invalid timing samples retained only as local/uncommitted lifecycle evidence.
+See [`docs/testing.md`](docs/testing.md) for the contributor workflow, test-quality guidance, exact focused-filter examples, and handoff checklist. Routine executable adds, renames, consolidations, and removals require the affected focused test plus broader target or full-suite validation when the changed boundary warrants it.
 
 ## Cleanup
 

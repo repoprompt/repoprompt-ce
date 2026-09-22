@@ -6,45 +6,6 @@ import Logging
 import XCTest
 
 final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
-    func testContinuouslyReadableInputYieldsThenResumesProgress() {
-        let queue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests.continuous")
-        let script = ContinuousFrameReadOperation(frameCount: 6)
-        let state = ReaderCallbackState()
-        let queueYielded = expectation(description: "serial queue yielded")
-
-        let reader = makeReader(
-            queue: queue,
-            maxReadCallsPerEvent: 3,
-            readOperation: script.read,
-            state: state
-        )
-
-        queue.suspend()
-        queue.async {
-            reader.processReadableEvent()
-        }
-        queue.async {
-            state.readAttemptsObservedAtYield = script.readAttemptCount
-            state.framesObservedAtYield = state.frames
-            queueYielded.fulfill()
-        }
-        queue.resume()
-
-        wait(for: [queueYielded], timeout: 1)
-        XCTAssertEqual(state.readAttemptsObservedAtYield, 3)
-        XCTAssertEqual(state.framesObservedAtYield, ["frame-0", "frame-1", "frame-2"])
-        queue.sync {}
-        reader.stop()
-
-        XCTAssertEqual(state.frames, [
-            "frame-0", "frame-1", "frame-2",
-            "frame-3", "frame-4", "frame-5"
-        ])
-        XCTAssertEqual(state.bytesReadNotifications, 2)
-        XCTAssertTrue(state.errors.isEmpty)
-        XCTAssertEqual(state.eofResiduals, [])
-    }
-
     func testSplitAndMultipleFramesPreserveOrderAcrossReadableEvents() {
         let script = ScriptedReadOperation(outcomes: [
             .data(Data("fir".utf8)),
@@ -68,60 +29,6 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
         XCTAssertEqual(state.eofResiduals, [])
     }
 
-    func testEOFThroughDispatchSourceDrainsCompleteFramesBeforeTerminal() throws {
-        var sockets = [Int32](repeating: -1, count: 2)
-        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
-        defer {
-            if sockets[0] >= 0 {
-                close(sockets[0])
-            }
-            if sockets[1] >= 0 {
-                close(sockets[1])
-            }
-        }
-
-        let flags = fcntl(sockets[0], F_GETFL)
-        XCTAssertGreaterThanOrEqual(flags, 0)
-        XCTAssertEqual(fcntl(sockets[0], F_SETFL, flags | O_NONBLOCK), 0)
-
-        let queue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests.eof")
-        let state = ReaderCallbackState()
-        let eofDelivered = expectation(description: "EOF delivered")
-        let reader = NewlineDelimitedSocketReader(
-            fd: sockets[0],
-            queue: queue,
-            logger: Logger(label: "NewlineDelimitedSocketReaderFairnessTests.eof"),
-            onFrame: { frame in
-                let text = String(decoding: frame, as: UTF8.self)
-                state.frames.append(text)
-                state.callbackOrder.append("frame:\(text)")
-            },
-            onEOF: { hasResidualData in
-                state.eofResiduals.append(hasResidualData)
-                state.callbackOrder.append("eof:\(hasResidualData)")
-                eofDelivered.fulfill()
-            },
-            onError: { state.errors.append($0) },
-            onBytesRead: { state.bytesReadNotifications += 1 }
-        )
-        try reader.start()
-
-        let payload = Data("first\nsecond\npartial".utf8)
-        let written = payload.withUnsafeBytes { bytes in
-            Darwin.write(sockets[1], bytes.baseAddress, bytes.count)
-        }
-        XCTAssertEqual(written, payload.count)
-        XCTAssertEqual(shutdown(sockets[1], SHUT_WR), 0)
-        wait(for: [eofDelivered], timeout: 1)
-        queue.sync {}
-
-        XCTAssertEqual(state.callbackOrder, ["frame:first", "frame:second", "eof:true"])
-        XCTAssertEqual(state.frames, ["first", "second"])
-        XCTAssertEqual(state.eofResiduals, [true])
-        XCTAssertEqual(state.bytesReadNotifications, 1)
-        XCTAssertTrue(state.errors.isEmpty)
-    }
-
     func testHardReadErrorIsTerminalAndDeliveredExactlyOnce() {
         let script = ScriptedReadOperation(outcomes: [.error(EIO)])
         let state = ReaderCallbackState()
@@ -136,155 +43,8 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
         XCTAssertTrue(state.eofResiduals.isEmpty)
     }
 
-    func testReentrantReadableEventDoesNotNestFrameDelivery() {
-        let queue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests.reentrant")
-        let script = ScriptedReadOperation(outcomes: [
-            .data(Data("first\n".utf8)),
-            .data(Data("second\n".utf8)),
-            .wouldBlock
-        ])
-        let delivered = expectation(description: "both frames delivered")
-        var frames: [String] = []
-        var callbackDepth = 0
-        var maximumCallbackDepth = 0
-        weak var weakReader: NewlineDelimitedSocketReader?
-
-        let reader = NewlineDelimitedSocketReader(
-            fd: -1,
-            queue: queue,
-            logger: Logger(label: "NewlineDelimitedSocketReaderFairnessTests.reentrant"),
-            chunkSize: 64,
-            maxReadCallsPerEvent: 1,
-            readOperation: script.read,
-            onFrame: { frame in
-                callbackDepth += 1
-                maximumCallbackDepth = max(maximumCallbackDepth, callbackDepth)
-                frames.append(String(decoding: frame, as: UTF8.self))
-                if frames.count == 1 {
-                    weakReader?.processReadableEvent()
-                } else {
-                    weakReader?.stop()
-                    delivered.fulfill()
-                }
-                callbackDepth -= 1
-            },
-            onEOF: { _ in XCTFail("Unexpected EOF") },
-            onError: { XCTFail("Unexpected read error: \($0)") }
-        )
-        weakReader = reader
-
-        reader.processReadableEvent()
-        wait(for: [delivered], timeout: 1)
-
-        XCTAssertEqual(frames, ["first", "second"])
-        XCTAssertEqual(maximumCallbackDepth, 1)
-        XCTAssertEqual(script.readAttemptCount, 2)
-    }
-
-    func testStopDuringFrameDeliveryCancelsSourceAndSuppressesBufferedFrames() throws {
-        var sockets = [Int32](repeating: -1, count: 2)
-        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
-        defer {
-            if sockets[0] >= 0 {
-                close(sockets[0])
-            }
-            if sockets[1] >= 0 {
-                close(sockets[1])
-            }
-        }
-
-        let flags = fcntl(sockets[0], F_GETFL)
-        XCTAssertGreaterThanOrEqual(flags, 0)
-        XCTAssertEqual(fcntl(sockets[0], F_SETFL, flags | O_NONBLOCK), 0)
-
-        let queue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests.stop")
-        let cancelled = expectation(description: "read source cancelled")
-        var frames: [String] = []
-        var cancelCount = 0
-        weak var weakReader: NewlineDelimitedSocketReader?
-
-        let reader = NewlineDelimitedSocketReader(
-            fd: sockets[0],
-            queue: queue,
-            logger: Logger(label: "NewlineDelimitedSocketReaderFairnessTests.stop"),
-            onFrame: { frame in
-                frames.append(String(decoding: frame, as: UTF8.self))
-                weakReader?.stop()
-            },
-            onEOF: { _ in XCTFail("Unexpected EOF") },
-            onError: { XCTFail("Unexpected read error: \($0)") },
-            onCancel: {
-                cancelCount += 1
-                cancelled.fulfill()
-            }
-        )
-        weakReader = reader
-        try reader.start()
-
-        let payload = Data("first\nsecond\n".utf8)
-        let written = payload.withUnsafeBytes { bytes in
-            Darwin.write(sockets[1], bytes.baseAddress, bytes.count)
-        }
-        XCTAssertEqual(written, payload.count)
-
-        wait(for: [cancelled], timeout: 1)
-        queue.sync {}
-
-        XCTAssertEqual(frames, ["first"])
-        XCTAssertEqual(cancelCount, 1)
-    }
-
-    func testCrossQueueStopPreventsFurtherReadsAndCallbacks() {
-        let queue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests.crossQueueStop")
-        let script = ScriptedReadOperation(outcomes: [
-            .data(Data("first\n".utf8)),
-            .wouldBlock,
-            .data(Data("second\n".utf8)),
-            .wouldBlock
-        ])
-        let state = ReaderCallbackState()
-        let reader = makeReader(queue: queue, readOperation: script.read, state: state)
-        let stopped = expectation(description: "cross-queue stop returned")
-
-        reader.processReadableEvent()
-        DispatchQueue.global().async {
-            reader.stop()
-            stopped.fulfill()
-        }
-        wait(for: [stopped], timeout: 1)
-
-        reader.processReadableEvent()
-        queue.sync {}
-
-        XCTAssertEqual(script.readAttemptCount, 2)
-        XCTAssertEqual(state.frames, ["first"])
-        XCTAssertEqual(state.bytesReadNotifications, 1)
-        XCTAssertTrue(state.errors.isEmpty)
-        XCTAssertTrue(state.eofResiduals.isEmpty)
-    }
-
-    func testAppAndCLISocketReaderCopiesRemainIdentical() throws {
-        var root = URL(fileURLWithPath: #filePath)
-        for _ in 0 ..< 4 {
-            root.deleteLastPathComponent()
-        }
-
-        let appCopy = try Data(
-            contentsOf: root.appendingPathComponent(
-                "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift"
-            )
-        )
-        let cliCopy = try Data(
-            contentsOf: root.appendingPathComponent(
-                "Sources/RepoPromptMCP/Shared/NewlineDelimitedSocketReader.swift"
-            )
-        )
-        XCTAssertEqual(appCopy, cliCopy)
-    }
-
     private func makeReader(
         queue: DispatchQueue = DispatchQueue(label: "NewlineDelimitedSocketReaderFairnessTests"),
-        maxReadCallsPerEvent: Int = 32,
         readOperation: @escaping NewlineDelimitedSocketReader.ReadOperation,
         state: ReaderCallbackState
     ) -> NewlineDelimitedSocketReader {
@@ -293,7 +53,7 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
             queue: queue,
             logger: Logger(label: "NewlineDelimitedSocketReaderFairnessTests"),
             chunkSize: 64,
-            maxReadCallsPerEvent: maxReadCallsPerEvent,
+            maxReadCallsPerEvent: 32,
             readOperation: readOperation,
             onFrame: { frame in
                 let text = String(decoding: frame, as: UTF8.self)
@@ -318,35 +78,6 @@ private final class ReaderCallbackState {
     var callbackOrder: [String] = []
     var bytesReadNotifications = 0
     var cancelCount = 0
-    var readAttemptsObservedAtYield = 0
-    var framesObservedAtYield: [String] = []
-}
-
-private final class ContinuousFrameReadOperation {
-    private let frameCount: Int
-    private(set) var readAttemptCount = 0
-
-    init(frameCount: Int) {
-        self.frameCount = frameCount
-    }
-
-    func read(
-        _ fd: Int32,
-        _ buffer: UnsafeMutableRawPointer?,
-        _ count: Int
-    ) -> Int {
-        _ = fd
-        guard readAttemptCount < frameCount else {
-            errno = EAGAIN
-            readAttemptCount += 1
-            return -1
-        }
-        let frame = Data("frame-\(readAttemptCount)\n".utf8)
-        readAttemptCount += 1
-        precondition(frame.count <= count)
-        frame.copyBytes(to: buffer!.assumingMemoryBound(to: UInt8.self), count: frame.count)
-        return frame.count
-    }
 }
 
 private final class ScriptedReadOperation {

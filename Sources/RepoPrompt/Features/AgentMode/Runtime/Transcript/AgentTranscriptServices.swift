@@ -191,33 +191,78 @@ struct AgentConversationReplaySerialization: Equatable {
     }
 
     enum AgentTranscriptDebugInstrumentation {
-        nonisolated(unsafe) static var isEnabled = false
-        nonisolated(unsafe) static var protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)?
-        nonisolated(unsafe) static var compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)?
-        nonisolated(unsafe) static var workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)?
-        nonisolated(unsafe) static var rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)?
-        nonisolated(unsafe) static var projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)?
-        nonisolated(unsafe) static var refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)?
-        nonisolated(unsafe) static var presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)?
-        nonisolated(unsafe) static var sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)?
-        nonisolated(unsafe) static var projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)?
-        private static let refreshSignatureLock = NSLock()
-        private nonisolated(unsafe) static var lastRefreshInputSignatureByTabID: [UUID: String] = [:]
+        struct Handlers {
+            let protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)?
+            let compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)?
+            let workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)?
+            let rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)?
+            let projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)?
+            let refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)?
+            let presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)?
+            let sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)?
+            let projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)?
+
+            init(
+                protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)? = nil,
+                compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)? = nil,
+                workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)? = nil,
+                rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)? = nil,
+                projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)? = nil,
+                refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)? = nil,
+                presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)? = nil,
+                sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)? = nil,
+                projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)? = nil
+            ) {
+                self.protectedTailScanHandler = protectedTailScanHandler
+                self.compactionHandler = compactionHandler
+                self.workingSourceItemsHandler = workingSourceItemsHandler
+                self.rebuildHandler = rebuildHandler
+                self.projectionBuildHandler = projectionBuildHandler
+                self.refreshAttemptHandler = refreshAttemptHandler
+                self.presentationPublishHandler = presentationPublishHandler
+                self.sessionItemsReplacementHandler = sessionItemsReplacementHandler
+                self.projectionIdentityHandler = projectionIdentityHandler
+            }
+        }
+
+        private struct State {
+            var isEnabled = false
+            var handlers = Handlers()
+            var lastRefreshInputSignatureByTabID: [UUID: String] = [:]
+        }
+
+        private final class LockedState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = State()
+
+            func withLock<T>(_ body: (inout State) -> T) -> T {
+                lock.lock()
+                defer { lock.unlock() }
+                return body(&value)
+            }
+        }
+
+        private static let state = LockedState()
+
+        static var isEnabled: Bool {
+            state.withLock { $0.isEnabled }
+        }
+
+        static func configure(_ handlers: Handlers) {
+            state.withLock { $0 = State(isEnabled: true, handlers: handlers) }
+        }
 
         static func reset() {
-            isEnabled = false
-            protectedTailScanHandler = nil
-            compactionHandler = nil
-            workingSourceItemsHandler = nil
-            rebuildHandler = nil
-            projectionBuildHandler = nil
-            refreshAttemptHandler = nil
-            presentationPublishHandler = nil
-            sessionItemsReplacementHandler = nil
-            projectionIdentityHandler = nil
-            refreshSignatureLock.lock()
-            lastRefreshInputSignatureByTabID = [:]
-            refreshSignatureLock.unlock()
+            state.withLock { $0 = State() }
+        }
+
+        static func removeRefreshInputSignatures(for tabIDs: Set<UUID>) {
+            guard !tabIDs.isEmpty else { return }
+            state.withLock { state in
+                for tabID in tabIDs {
+                    state.lastRefreshInputSignatureByTabID.removeValue(forKey: tabID)
+                }
+            }
         }
 
         static func durationMS(since start: TimeInterval) -> Double {
@@ -237,12 +282,14 @@ struct AgentConversationReplaySerialization: Equatable {
             incrementalPath: String,
             inputSignature: String
         ) {
-            guard isEnabled else { return }
-            refreshSignatureLock.lock()
-            let previous = lastRefreshInputSignatureByTabID[tabID]
-            lastRefreshInputSignatureByTabID[tabID] = inputSignature
-            refreshSignatureLock.unlock()
-            refreshAttemptHandler?(.init(
+            let emission: (((AgentTranscriptRefreshAttemptMetrics) -> Void)?, String?)? = state.withLock {
+                guard $0.isEnabled else { return nil }
+                let previous = $0.lastRefreshInputSignatureByTabID[tabID]
+                $0.lastRefreshInputSignatureByTabID[tabID] = inputSignature
+                return ($0.handlers.refreshAttemptHandler, previous)
+            }
+            guard let emission else { return }
+            emission.0?(.init(
                 reason: reason,
                 sourceItemsRevision: sourceItemsRevision,
                 itemCount: itemCount,
@@ -253,9 +300,55 @@ struct AgentConversationReplaySerialization: Equatable {
                 pendingMutationSummary: pendingMutationSummary,
                 incrementalPath: incrementalPath,
                 inputSignature: inputSignature,
-                previousInputSignature: previous,
-                isConsecutiveDuplicateInput: previous == inputSignature
+                previousInputSignature: emission.1,
+                isConsecutiveDuplicateInput: emission.1 == inputSignature
             ))
+        }
+
+        static func emitProtectedTailScan(_ metrics: @autoclosure () -> AgentTranscriptProtectedTailScanMetrics) {
+            emit(\.protectedTailScanHandler, metrics)
+        }
+
+        static func emitCompaction(_ metrics: @autoclosure () -> AgentTranscriptCompactionMetrics) {
+            emit(\.compactionHandler, metrics)
+        }
+
+        static func emitWorkingSourceItems(_ metrics: @autoclosure () -> AgentTranscriptWorkingSourceItemsMetrics) {
+            emit(\.workingSourceItemsHandler, metrics)
+        }
+
+        static func emitRebuild(_ metrics: @autoclosure () -> AgentTranscriptRebuildMetrics) {
+            emit(\.rebuildHandler, metrics)
+        }
+
+        static func emitProjectionBuild(_ metrics: @autoclosure () -> AgentTranscriptProjectionBuildMetrics) {
+            emit(\.projectionBuildHandler, metrics)
+        }
+
+        static func emitPresentationPublish(_ metrics: @autoclosure () -> AgentTranscriptPresentationPublishMetrics) {
+            emit(\.presentationPublishHandler, metrics)
+        }
+
+        static func emitSessionItemsReplacement(
+            _ metrics: @autoclosure () -> AgentTranscriptSessionItemsReplacementMetrics
+        ) {
+            emit(\.sessionItemsReplacementHandler, metrics)
+        }
+
+        static func emitProjectionIdentity(_ metrics: @autoclosure () -> AgentTranscriptProjectionIdentityMetrics) {
+            emit(\.projectionIdentityHandler, metrics)
+        }
+
+        private static func emit<Metrics>(
+            _ handlerKeyPath: KeyPath<Handlers, ((Metrics) -> Void)?>,
+            _ metrics: () -> Metrics
+        ) {
+            let handler: ((Metrics) -> Void)? = state.withLock {
+                guard $0.isEnabled else { return nil }
+                return $0.handlers[keyPath: handlerKeyPath]
+            }
+            guard let handler else { return }
+            handler(metrics())
         }
 
         static func stableDigest(_ values: [String]) -> String {
@@ -2271,7 +2364,7 @@ enum AgentTranscriptIO {
         let repairedRows = repairedSourceItems(rows, diagnosticContext: "working_source_items")
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.workingSourceItemsHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitWorkingSourceItems(.init(
                     transcriptTurnCount: transcript.turns.count,
                     fullTurnCount: transcript.turns.count(where: { $0.retentionTier == .full }),
                     itemCount: repairedRows.count,
@@ -2448,7 +2541,7 @@ enum AgentTranscriptIO {
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 let worsening = retentionTierWorseningCounts(from: existingTranscript, to: compacted)
-                AgentTranscriptDebugInstrumentation.rebuildHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitRebuild(.init(
                     existingTurnCount: existingTranscript.turns.count,
                     workingItemsCount: workingItems.count,
                     existingWorkingItemCount: existingWorkingItemCount,
@@ -4546,8 +4639,10 @@ enum AgentTranscriptIO {
         let keyPaths = Array(NSOrderedSet(array: toolExecutions.flatMap(\.keyPaths))) as? [String] ?? []
         let allToolNames = toolNameCounts.isEmpty ? toolNames : Array(toolNameCounts.keys.sorted())
         let narration = latestCollapsedNarrationText(from: activities)
-        let shortNarration = narration.map {
-            $0.count > 120 ? String($0.prefix(120)) + "…" : $0
+        let shortNarration: String? = narration.flatMap {
+            let sanitized = $0.sanitizedForDisplay
+            guard !sanitized.isEmpty else { return nil }
+            return sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized
         }
         let toolGroups = ClusterToolCategory.buildGroups(toolNames: allToolNames, counts: toolNameCounts)
         let summary = AgentTranscriptClusterSummary(
@@ -4832,7 +4927,7 @@ enum AgentTranscriptCompactor {
             let trimmed = structurallyTrimmedTranscript(copy)
             #if DEBUG
                 if AgentTranscriptDebugInstrumentation.isEnabled {
-                    AgentTranscriptDebugInstrumentation.compactionHandler?(.init(
+                    AgentTranscriptDebugInstrumentation.emitCompaction(.init(
                         mode: mode,
                         initialWorkingUnitCount: initialWorkingUnitCount,
                         finalWorkingUnitCount: CompactionPressure(transcript: trimmed).workingUnitCount,
@@ -4880,7 +4975,7 @@ enum AgentTranscriptCompactor {
         let trimmed = structurallyTrimmedTranscript(copy)
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.compactionHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitCompaction(.init(
                     mode: mode,
                     initialWorkingUnitCount: initialWorkingUnitCount,
                     finalWorkingUnitCount: CompactionPressure(transcript: trimmed).workingUnitCount,
@@ -5075,7 +5170,7 @@ enum AgentTranscriptCompactor {
 
             func emit(countedToolExecutionCount: Int, protectedTurnCount: Int) {
                 guard AgentTranscriptDebugInstrumentation.isEnabled else { return }
-                AgentTranscriptDebugInstrumentation.protectedTailScanHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitProtectedTailScan(.init(
                     transcriptTurnCount: transcript.turns.count,
                     limit: limit,
                     turnsVisited: turnsVisited,
@@ -5643,7 +5738,7 @@ enum AgentTranscriptProjectionBuilder {
                 "[AgentTranscriptProjection] build turns=\(transcript.turns.count) workingRows=\(workingRows.count) workingBlocks=\(workingBlocks.count) reusedPrefixTurns=\(reusablePrefix?.turnCount ?? 0) cacheHits=\(cacheHitCount) workingRowTail=[\(workingRowTail)] workingBlockTail=[\(workingBlockTail)]"
             )
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.projectionBuildHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emitProjectionBuild(.init(
                     turnCount: transcript.turns.count,
                     reusedPrefixTurnCount: reusablePrefix?.turnCount ?? 0,
                     cacheHitCount: cacheHitCount,
@@ -7658,10 +7753,10 @@ enum AgentTranscriptProjectionBuilder {
         let containsFailure = toolExecutions.contains { $0.status == .failed || $0.status == .cancelled }
         let containsWarning = toolExecutions.contains { $0.status == .warning }
         let narration = latestNarrationText(from: rows)
-        let shortNarration: String? = if let narration, !narration.isEmpty {
-            narration.count > 120 ? String(narration.prefix(120)) + "…" : narration
-        } else {
-            nil
+        let shortNarration: String? = narration.flatMap {
+            let sanitized = $0.sanitizedForDisplay
+            guard !sanitized.isEmpty else { return nil }
+            return sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized
         }
         let allToolNames = toolNameCounts.isEmpty ? Array(toolNames) : Array(toolNameCounts.keys.sorted())
         let toolGroups = ClusterToolCategory.buildGroups(toolNames: allToolNames, counts: toolNameCounts)

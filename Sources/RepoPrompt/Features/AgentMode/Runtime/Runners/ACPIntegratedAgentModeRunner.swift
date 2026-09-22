@@ -3,8 +3,32 @@ import MCP
 
 @MainActor
 final class ACPIntegratedAgentModeRunner {
-    private struct ConsumeEventsOutcome {
-        let terminalState: AgentSessionRunState
+    private enum TransientOperationResult {
+        case completed
+        case cancelled
+        case failed(errorText: String?)
+        case superseded
+
+        var debugDescription: String {
+            switch self {
+            case .completed:
+                "state=completed error=nil"
+            case .cancelled:
+                "state=cancelled error=nil"
+            case let .failed(errorText):
+                "state=failed error=\(errorText ?? "nil")"
+            case .superseded:
+                "state=superseded error=nil"
+            }
+        }
+    }
+
+    private struct TransientExecutionClassification {
+        let report: DomainAgentRunExecutionReport
+        let errorText: String?
+    }
+
+    private struct ExplicitTerminalFailure: Error {
         let errorText: String?
     }
 
@@ -68,6 +92,41 @@ final class ACPIntegratedAgentModeRunner {
         return String(describing: error)
     }
 
+    private static func executeTransientOperation(
+        _ operation: () async throws -> TransientOperationResult
+    ) async -> TransientExecutionClassification {
+        var explicitFailureText: String??
+        let report = await DomainAgentRunExecutionCore.execute(
+            failureText: { error in
+                if let failure = error as? ExplicitTerminalFailure {
+                    return failure.errorText ?? ""
+                }
+                return displayText(for: error)
+            }
+        ) {
+            switch try await operation() {
+            case .completed:
+                return .completed(assistantText: nil)
+            case .cancelled:
+                throw CancellationError()
+            case let .failed(errorText):
+                explicitFailureText = .some(errorText)
+                throw ExplicitTerminalFailure(errorText: errorText)
+            case .superseded:
+                return .superseded
+            }
+        }
+
+        let errorText: String? = if case let .some(explicitText) = explicitFailureText {
+            explicitText
+        } else if case let .terminal(outcome) = report.result, outcome.kind == .failed {
+            outcome.assistantText
+        } else {
+            nil
+        }
+        return TransientExecutionClassification(report: report, errorText: errorText)
+    }
+
     init(
         hooks: AgentModeRunService.Hooks,
         terminalCommitBarrier: AgentRunTerminalCommitBarrier,
@@ -84,21 +143,21 @@ final class ACPIntegratedAgentModeRunner {
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         runRequest: ACPRunRequest,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease
     ) async {
-        let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
+        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
            !session.pendingNonCodexUserInputTokenQueue.isEmpty
         {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.estimateRuntimeTokens(initialMessageForRun)
+            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
         }
-        hooks.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
@@ -107,7 +166,7 @@ final class ACPIntegratedAgentModeRunner {
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runState = .running
-        hooks.setAgentRunActive(tabID, true)
+        hooks.presentation.setAgentRunActive(session, true)
         setRunningStatus(initialTransportStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
         let freshRunRequest = runRequest
@@ -172,14 +231,28 @@ final class ACPIntegratedAgentModeRunner {
         let lease = makeLease(runID)
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
 
-        guard let provider = providerFactory(runRequest.agentKind, runRequest.modelString) else {
+        let provider: any ACPAgentProvider
+        do {
+            guard let created = try await providerFactory(runRequest.agentKind, runRequest.modelString) else {
+                await failBeforeProviderSend(
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    attachmentReservationID: attachmentReservationID,
+                    errorText: "No ACP provider is registered for \(runRequest.agentKind.displayName)."
+                )
+                return
+            }
+            provider = created
+        } catch {
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
                 runID: runID,
                 runAttemptID: runAttemptID,
                 attachmentReservationID: attachmentReservationID,
-                errorText: "No ACP provider is registered for \(runRequest.agentKind.displayName)."
+                errorText: "ACP provider construction failed: \(error.localizedDescription)"
             )
             return
         }
@@ -280,7 +353,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     func submitActivePrompt(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         messageForRun: String,
         attachments: [AgentImageAttachment],
         runRequest: ACPRunRequest,
@@ -341,16 +414,43 @@ final class ACPIntegratedAgentModeRunner {
             return false
         }
 
-        let agentMessage = hooks.buildHeadlessAgentMessage(
+        let agentMessage = hooks.providerInput.buildHeadlessAgentMessage(
             session,
             messageForRun,
             runID,
             attachments
         )
+        // Active ACP steering is its own logical dispatch. If this send returns `false` the batch is
+        // requeued as a follow-up, which composes again through `runPromptTurn` under a different
+        // dispatch ID — correct, because this attempt was never accepted and the follow-up must
+        // render whatever membership is current when it dispatches.
+        let monitoring = hooks.providerInput.decoratedAgentMessage(
+            agentMessage,
+            session: session,
+            dispatchID: .acpActiveSteering(runAttemptID: runAttemptID)
+        )
+        guard !monitoring.mustAbortDispatch else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
+            return false
+        }
+        guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+            session,
+            .acpActiveSteering(runAttemptID: runAttemptID)
+        ) else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
+            return false
+        }
 
         do {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
-            try await controller.prompt(agentMessage, request: runRequest)
+            try await controller.prompt(monitoring.message, request: runRequest)
+            hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, monitoring.claim)
             log("active steering session/prompt completed attempt=\(runAttemptID)", runID: runID)
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
@@ -360,6 +460,10 @@ final class ACPIntegratedAgentModeRunner {
             // activeRunAttemptID to still be present here.
             return true
         } catch {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalized = await controller.normalizeError(error)
@@ -370,7 +474,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func isStartupStillCurrent(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID? = nil,
         runAttemptID: UUID
     ) -> Bool {
@@ -387,7 +491,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func failBeforeProviderSend(
         tabID _: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         attachmentReservationID: UUID?,
@@ -397,9 +501,9 @@ final class ACPIntegratedAgentModeRunner {
               let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .failed,
@@ -419,7 +523,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func cancelBeforeProviderSend(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         attachmentReservationID: UUID?
@@ -428,9 +532,9 @@ final class ACPIntegratedAgentModeRunner {
               let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .cancelled,
@@ -450,7 +554,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func startFreshRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -460,6 +564,7 @@ final class ACPIntegratedAgentModeRunner {
         lease: MCPBootstrapLease,
         attachmentReservationID: UUID?
     ) async {
+        let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let modelDescription = runRequest.modelString ?? "default"
         let resumeDescription = runRequest.resumeSessionID ?? "nil"
         let workspaceDescription = runRequest.workspacePath ?? "nil"
@@ -480,113 +585,110 @@ final class ACPIntegratedAgentModeRunner {
         }
 
         var providerInitializationCompleted = false
-        do {
-            let providerName = runRequest.agentKind.rawValue
-            await lease.providerInitializationStarted(provider: providerName)
-            log("bootstrap begin", runID: runID)
-            let bootstrap = try await controller.bootstrap()
-            providerInitializationCompleted = true
-            await lease.providerInitializationCompleted(provider: providerName, outcome: "ready")
-            log("bootstrap completed sessionID=\(bootstrap.sessionID)", runID: runID)
-            guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID
-            else {
-                await controller.shutdown()
-                return
-            }
-            var initialMessageForPromptTurn = initialMessageForRun
-            if bootstrap.didFallbackToNewSessionAfterLoadFailure {
-                await hooks.stageResumeRecoveryHandoffIfNeeded(session)
-                initialMessageForPromptTurn = hooks.prependPendingHandoffIfNeeded(initialMessageForRun, session)
-            }
-            applyProviderSessionIdentity(
-                bootstrap.providerSessionIdentity,
-                invalidatedResumeSessionID: bootstrap.invalidatedResumeSessionID,
-                session: session
-            )
-            _ = syncACPSelectedModelFromRegistryIfNeeded(agentKind: runRequest.agentKind, session: session)
-            session.isDirty = true
-            hooks.scheduleSave(session.tabID)
-            hooks.updateBindings(session)
-
-            try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
-            await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-            try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
-            setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
-
-            if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
-                let routed = await lease.releaseWhenRouted()
-                log("releaseWhenRouted routed=\(routed)", runID: runID)
-                guard routed else {
-                    await finalize(
-                        session: session,
-                        runID: runID,
-                        runAttemptID: runAttemptID,
-                        controller: controller,
-                        attachmentReservationID: attachmentReservationID,
-                        terminalState: .failed,
-                        errorText: "RepoPrompt MCP routing did not complete before \(runRequest.agentKind.displayName) ACP prompt submission.",
-                        notifyTurnComplete: false,
-                        shouldShutdownController: true
-                    )
-                    return
+        let classification = await Self.executeTransientOperation {
+            do {
+                let providerName = runRequest.agentKind.rawValue
+                await lease.providerInitializationStarted(provider: providerName)
+                log("bootstrap begin", runID: runID)
+                let bootstrap = try await controller.bootstrap()
+                providerInitializationCompleted = true
+                await lease.providerInitializationCompleted(provider: providerName, outcome: "ready")
+                log("bootstrap completed sessionID=\(bootstrap.sessionID)", runID: runID)
+                guard session.runID == runID,
+                      session.activeRunAttemptID == runAttemptID
+                else {
+                    await controller.shutdown()
+                    return .superseded
                 }
-            } else {
-                await lease.releaseGateForDeferredRouting()
-                log("deferred MCP routing until ACP prompt", runID: runID)
-            }
+                var initialMessageForPromptTurn = initialMessageForRun
+                if bootstrap.didFallbackToNewSessionAfterLoadFailure {
+                    // Periodic turns preserve handoffs, so they cannot adopt a contextless replacement.
+                    // Existing cancellation cleanup retires this unprompted controller.
+                    guard !isPeriodic else { throw CancellationError() }
 
-            await runPromptTurn(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                initialMessageForRun: initialMessageForPromptTurn,
-                attachments: attachments,
-                controller: controller,
-                runRequest: runRequest,
-                attachmentReservationID: attachmentReservationID,
-                prepareControllerForNextTurn: false
-            )
-        } catch is CancellationError {
-            if !providerInitializationCompleted {
-                await lease.providerInitializationCompleted(provider: runRequest.agentKind.rawValue, outcome: "cancelled")
+                    await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session)
+                    initialMessageForPromptTurn = hooks.providerInput.prependPendingHandoffIfNeeded(initialMessageForRun, session)
+                }
+                applyProviderSessionIdentity(
+                    bootstrap.providerSessionIdentity,
+                    invalidatedResumeSessionID: bootstrap.invalidatedResumeSessionID,
+                    session: session
+                )
+                _ = syncACPSelectedModelFromRegistryIfNeeded(agentKind: runRequest.agentKind, session: session)
+                session.isDirty = true
+                hooks.persistence.scheduleSave(session)
+                hooks.bindingObservation.updateBindings(session)
+
+                guard try await configureControllerForRun(
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    controller: controller,
+                    runRequest: runRequest
+                ) else {
+                    return .superseded
+                }
+                setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
+
+                if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
+                    let routed = await lease.releaseWhenRouted()
+                    log("releaseWhenRouted routed=\(routed)", runID: runID)
+                    guard routed else {
+                        return .failed(
+                            errorText: "RepoPrompt MCP routing did not complete before \(runRequest.agentKind.displayName) ACP prompt submission."
+                        )
+                    }
+                } else {
+                    await lease.releaseGateForDeferredRouting()
+                    log("deferred MCP routing until ACP prompt", runID: runID)
+                }
+
+                return await runPromptTurn(
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    initialMessageForRun: initialMessageForPromptTurn,
+                    attachments: attachments,
+                    controller: controller,
+                    runRequest: runRequest,
+                    attachmentReservationID: attachmentReservationID,
+                    prepareControllerForNextTurn: false
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let normalized = await controller.normalizeError(error)
+                let normalizedText = displayText(for: normalized)
+                log("fresh start failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
+                return .failed(errorText: normalizedText)
             }
-            log("fresh start cancelled", runID: runID)
-            await finalize(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                controller: controller,
-                attachmentReservationID: attachmentReservationID,
-                terminalState: .cancelled,
-                errorText: nil,
-                notifyTurnComplete: false,
-                shouldShutdownController: true
-            )
-        } catch {
-            if !providerInitializationCompleted {
-                await lease.providerInitializationCompleted(provider: runRequest.agentKind.rawValue, outcome: "failed")
-            }
-            let normalized = await controller.normalizeError(error)
-            let normalizedText = displayText(for: normalized)
-            log("fresh start failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
-            await finalize(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                controller: controller,
-                attachmentReservationID: attachmentReservationID,
-                terminalState: .failed,
-                errorText: normalizedText,
-                notifyTurnComplete: false,
-                shouldShutdownController: true
+        }
+
+        if !providerInitializationCompleted,
+           case let .terminal(outcome) = classification.report.result,
+           outcome.kind == .cancelled || outcome.kind == .failed
+        {
+            await lease.providerInitializationCompleted(
+                provider: runRequest.agentKind.rawValue,
+                outcome: outcome.kind == .cancelled ? "cancelled" : "failed"
             )
         }
+        if case let .terminal(outcome) = classification.report.result, outcome.kind == .cancelled {
+            log("fresh start cancelled", runID: runID)
+        }
+        await settleTransientExecution(
+            classification,
+            session: session,
+            runID: runID,
+            runAttemptID: runAttemptID,
+            controller: controller,
+            attachmentReservationID: attachmentReservationID
+        )
     }
 
     private func continueRun(
-        tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        tabID _: UUID,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -596,89 +698,66 @@ final class ACPIntegratedAgentModeRunner {
         deferredLease: MCPBootstrapLease?,
         attachmentReservationID: UUID?
     ) async {
-        do {
-            guard await controller.hasReusableSession else {
-                await finalize(
+        let classification = await Self.executeTransientOperation {
+            do {
+                guard await controller.hasReusableSession else {
+                    return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
+                }
+
+                guard try await configureControllerForRun(
                     session: session,
                     runID: runID,
                     runAttemptID: runAttemptID,
                     controller: controller,
-                    attachmentReservationID: attachmentReservationID,
-                    terminalState: .failed,
-                    errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.",
-                    notifyTurnComplete: false,
-                    shouldShutdownController: true
-                )
-                return
-            }
-
-            try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
-            await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-            try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
-
-            if let deferredLease {
-                let acquired = await deferredLease.acquire()
-                guard acquired else {
-                    await finalize(
-                        session: session,
-                        runID: runID,
-                        runAttemptID: runAttemptID,
-                        controller: controller,
-                        attachmentReservationID: attachmentReservationID,
-                        terminalState: .failed,
-                        errorText: "RepoPrompt MCP routing policy could not be prepared before \(runRequest.agentKind.displayName) ACP prompt submission.",
-                        notifyTurnComplete: false,
-                        shouldShutdownController: true
-                    )
-                    return
+                    runRequest: runRequest
+                ) else {
+                    return .superseded
                 }
-                await deferredLease.releaseGateForDeferredRouting()
-                log("deferred MCP routing until ACP follow-up prompt", runID: runID)
-            }
 
-            await runPromptTurn(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                initialMessageForRun: initialMessageForRun,
-                attachments: attachments,
-                controller: controller,
-                runRequest: runRequest,
-                attachmentReservationID: attachmentReservationID,
-                prepareControllerForNextTurn: true
-            )
-        } catch is CancellationError {
-            await finalize(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                controller: controller,
-                attachmentReservationID: attachmentReservationID,
-                terminalState: .cancelled,
-                errorText: nil,
-                notifyTurnComplete: false,
-                shouldShutdownController: true
-            )
-        } catch {
-            let normalized = await controller.normalizeError(error)
-            let normalizedText = displayText(for: normalized)
-            log("continue failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
-            await finalize(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                controller: controller,
-                attachmentReservationID: attachmentReservationID,
-                terminalState: .failed,
-                errorText: normalizedText,
-                notifyTurnComplete: false,
-                shouldShutdownController: true
-            )
+                if let deferredLease {
+                    let acquired = await deferredLease.acquire()
+                    guard acquired else {
+                        return .failed(
+                            errorText: "RepoPrompt MCP routing policy could not be prepared before \(runRequest.agentKind.displayName) ACP prompt submission."
+                        )
+                    }
+                    await deferredLease.releaseGateForDeferredRouting()
+                    log("deferred MCP routing until ACP follow-up prompt", runID: runID)
+                }
+
+                return await runPromptTurn(
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    initialMessageForRun: initialMessageForRun,
+                    attachments: attachments,
+                    controller: controller,
+                    runRequest: runRequest,
+                    attachmentReservationID: attachmentReservationID,
+                    prepareControllerForNextTurn: true
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let normalized = await controller.normalizeError(error)
+                let normalizedText = displayText(for: normalized)
+                log("continue failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
+                return .failed(errorText: normalizedText)
+            }
         }
+
+        await settleTransientExecution(
+            classification,
+            session: session,
+            runID: runID,
+            runAttemptID: runAttemptID,
+            controller: controller,
+            attachmentReservationID: attachmentReservationID
+        )
     }
 
     private func runPromptTurn(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -687,40 +766,29 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         attachmentReservationID: UUID?,
         prepareControllerForNextTurn: Bool
-    ) async {
+    ) async -> TransientOperationResult {
         log("prompt turn begin prepare=\(prepareControllerForNextTurn)", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
-        let agentMessage = hooks.buildHeadlessAgentMessage(
+        let agentMessage = hooks.providerInput.buildHeadlessAgentMessage(
             session,
             initialMessageForRun,
             runID,
             attachments
         )
-        hooks.recordPendingHandoffSendOutcome(session, true)
-        hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
-        hooks.markAttachmentsConsumed(session, attachmentReservationID)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
+        hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
+        hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
 
         if prepareControllerForNextTurn {
             let prepared = await controller.prepareForNextTurn()
             guard prepared else {
-                await finalize(
-                    session: session,
-                    runID: runID,
-                    runAttemptID: runAttemptID,
-                    controller: controller,
-                    attachmentReservationID: attachmentReservationID,
-                    terminalState: .failed,
-                    errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.",
-                    notifyTurnComplete: false,
-                    shouldShutdownController: true
-                )
-                return
+                return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
             }
         }
         let events = await controller.events
         let consumeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else {
-                return ConsumeEventsOutcome(terminalState: .failed, errorText: "ACP event consumer deallocated.")
+                return TransientOperationResult.failed(errorText: "ACP event consumer deallocated.")
             }
             return await consumeEvents(
                 events,
@@ -730,54 +798,69 @@ final class ACPIntegratedAgentModeRunner {
             )
         }
 
+        // Composed here, not next to `buildHeadlessAgentMessage`: `prepareForNextTurn()` and the
+        // event-stream acquisition above both suspend, and an oversight link can be added or revoked while
+        // they do. Reading membership before those awaits would ship enqueue-time inventory on every
+        // reused/follow-up turn. This covers the initial, resumed, reusable-session, and follow-up
+        // routes, which all converge here. Resumed providers still omit `AgentMessage.systemPrompt`;
+        // the supplement rides the user-message channel precisely because a resumed thread cannot
+        // refresh system text.
+        let monitoring = hooks.providerInput.decoratedAgentMessage(
+            agentMessage,
+            session: session,
+            dispatchID: .acpPromptTurn(runAttemptID: runAttemptID)
+        )
+        // Required lane content is the turn's only new provider input. Refusal is a quiet
+        // pre-acceptance cancellation, not an ACP prompt failure.
+        guard !monitoring.mustAbortDispatch else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
+            return .cancelled
+        }
+        guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+            session,
+            .acpPromptTurn(runAttemptID: runAttemptID)
+        ) else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
+            return .cancelled
+        }
+
         do {
             log("controller.prompt begin", runID: runID)
-            try await controller.prompt(agentMessage, request: runRequest)
+            try await controller.prompt(monitoring.message, request: runRequest)
+            // A non-throwing `controller.prompt` return is ACP's acceptance signal.
+            hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, monitoring.claim)
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)
         } catch {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalizedError = await controller.normalizeError(error)
             let normalizedText = displayText(for: normalizedError)
             log("controller.prompt failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
             let outcome = await consumeTask.value
-            let errorText = promptFailureErrorText(outcome: outcome, fallback: normalizedText)
-            await finalize(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                controller: controller,
-                attachmentReservationID: attachmentReservationID,
-                terminalState: .failed,
-                errorText: errorText,
-                notifyTurnComplete: false,
-                shouldShutdownController: true
-            )
-            return
+            return .failed(errorText: promptFailureErrorText(outcome: outcome, fallback: normalizedText))
         }
 
         let outcome = await consumeTask.value
-        let outcomeErrorDescription = outcome.errorText ?? "nil"
-        log("event consumer completed state=\(outcome.terminalState.rawValue) error=\(outcomeErrorDescription)", runID: runID)
-        await finalize(
-            session: session,
-            runID: runID,
-            runAttemptID: runAttemptID,
-            controller: controller,
-            attachmentReservationID: attachmentReservationID,
-            terminalState: outcome.terminalState,
-            errorText: outcome.errorText,
-            notifyTurnComplete: outcome.terminalState == .completed,
-            shouldShutdownController: outcome.terminalState != .completed
-        )
+        log("event consumer completed \(outcome.debugDescription)", runID: runID)
+        return outcome
     }
 
     private func applyProviderSessionIdentity(
         _ identity: ACPProviderSessionIdentity,
         invalidatedResumeSessionID: String? = nil,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         let providerSessionID = identity.loadSessionID ?? identity.runtimeSessionID
         var changed = false
@@ -804,14 +887,65 @@ final class ACPIntegratedAgentModeRunner {
         }
         guard changed else { return }
         session.isDirty = true
-        hooks.scheduleSave(session.tabID)
-        hooks.updateBindings(session)
+        hooks.persistence.scheduleSave(session)
+        hooks.bindingObservation.updateBindings(session)
+    }
+
+    private func configureControllerForRun(
+        session: AgentTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest
+    ) async throws -> Bool {
+        let isCurrent = { [self] in
+            isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
+                && session.acpController === controller
+        }
+        return try await Self.performConfigurationSequenceIfCurrent(
+            isCurrent: isCurrent,
+            operations: [
+                { [self] in
+                    try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                },
+                {
+                    let report = try await controller.applySessionModelParameterSelections(
+                        runRequest.modelParameterSelections
+                    )
+                    try report.validateNoSkippedSelections()
+                },
+                {
+                    await controller.setAutoApproveAllToolPermissions(
+                        runRequest.autoApproveAllToolPermissions
+                    )
+                },
+                { [self] in
+                    try await applyRequestedSessionModeIfNeeded(
+                        runRequest.sessionModeID,
+                        controller: controller
+                    )
+                }
+            ]
+        )
+    }
+
+    /// Configuration calls can suspend on provider RPCs. Re-check ownership before and after
+    /// every step so an attempt superseded during one response cannot continue with later writes.
+    private static func performConfigurationSequenceIfCurrent(
+        isCurrent: () -> Bool,
+        operations: [() async throws -> Void]
+    ) async throws -> Bool {
+        for operation in operations {
+            guard isCurrent() else { return false }
+            try await operation()
+            guard isCurrent() else { return false }
+        }
+        return true
     }
 
     private func applyRequestedSessionModeIfNeeded(
         _ requestedMode: String?,
-        controller: ACPAgentSessionController,
-        runID: UUID
+        controller: ACPAgentSessionController
     ) async throws {
         if let requestedMode = requestedMode?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
             try await controller.setSessionMode(requestedMode)
@@ -823,30 +957,68 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor else { return }
-        guard let model = runRequest.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-        else {
-            return
-        }
-        if runRequest.agentKind == .cursor,
-           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
-           AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.contains(rawModel: model) != true
-        {
+        guard let model = try Self.explicitSelectedModel(
+            agentKind: runRequest.agentKind,
+            modelString: runRequest.modelString
+        ) else {
             return
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
-        try await controller.setSessionModel(model)
+        // OpenCode advertises model-scoped parameter metadata (`effort`) only after a real model
+        // set. When a pin is inherited, the ordinary same-model no-op skip would leave `effort`
+        // unadvertised, the pin would land in `skipped`, and validation would throw before the
+        // prompt. Force the selector RPC for OpenCode whenever selections are pending; other ACP
+        // providers keep the skip. Covers fresh and continue runs (shared helper).
+        try await controller.setSessionModel(
+            model,
+            forceRPC: runRequest.agentKind == .openCode && !runRequest.modelParameterSelections.isEmpty
+        )
+    }
+
+    private static func explicitSelectedModel(
+        agentKind: AgentProviderKind,
+        modelString: String?
+    ) throws -> String? {
+        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity else { return nil }
+        guard let model = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty,
+              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+        else {
+            return nil
+        }
+        if agentKind == .cursor,
+           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
+           !CursorAIModelCatalog.contains(modelRaw: model)
+        {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Cursor model `\(model)` is not in this release's supported model catalog. Update RepoPrompt CE or choose Cursor Auto."
+            )
+        }
+        if agentKind == .grokBuild || agentKind == .antigravity,
+           let providerID = agentKind.acpProviderID,
+           AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)?.contains(rawModel: model) != true
+        {
+            // These ACP providers have no provider-side alias surface: an unknown
+            // concrete model fails instead of silently running the provider's default.
+            throw AIProviderError.invalidConfiguration(
+                detail: "\(agentKind.displayName) model `\(model)` is not in the discovered model set. Refresh its models and retry."
+            )
+        }
+        return model
     }
 
     private func promptFailureErrorText(
-        outcome: ConsumeEventsOutcome,
+        outcome: TransientOperationResult,
         fallback: String
     ) -> String {
         let unexpectedStreamEnd = "ACP events stream ended unexpectedly."
         let trimmedFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let outcomeError = outcome.errorText?.trimmingCharacters(in: .whitespacesAndNewlines),
+        let outcomeError: String? = if case let .failed(errorText) = outcome {
+            errorText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            nil
+        }
+        guard let outcomeError,
               !outcomeError.isEmpty,
               outcomeError != unexpectedStreamEnd
         else {
@@ -857,10 +1029,10 @@ final class ACPIntegratedAgentModeRunner {
 
     private func consumeEvents(
         _ events: AsyncStream<NormalizedAgentRuntimeEvent>,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID
-    ) async -> ConsumeEventsOutcome {
+    ) async -> TransientOperationResult {
         if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
             session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
         }
@@ -868,7 +1040,7 @@ final class ACPIntegratedAgentModeRunner {
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID
             else {
-                return ConsumeEventsOutcome(terminalState: .cancelled, errorText: nil)
+                return .superseded
             }
 
             if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
@@ -876,7 +1048,7 @@ final class ACPIntegratedAgentModeRunner {
             }
             switch event {
             case let .stream(result):
-                await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
+                await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             case let .approvalRequested(request):
                 session.pendingApproval = request
                 session.runState = .waitingForApproval
@@ -888,7 +1060,7 @@ final class ACPIntegratedAgentModeRunner {
                         session.runState = .running
                         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
                     } else {
-                        hooks.updateBindings(session)
+                        hooks.bindingObservation.updateBindings(session)
                     }
                 }
             case let .terminal(state, errorText):
@@ -900,19 +1072,26 @@ final class ACPIntegratedAgentModeRunner {
                     }
                     continue
                 }
-                return ConsumeEventsOutcome(terminalState: state, errorText: errorText)
+                switch state {
+                case .completed:
+                    return .completed
+                case .cancelled:
+                    return .cancelled
+                case .failed:
+                    return .failed(errorText: errorText)
+                default:
+                    assertionFailure("ACP terminal event must carry a terminal run state")
+                    return .failed(errorText: errorText)
+                }
             }
         }
 
-        return ConsumeEventsOutcome(
-            terminalState: .failed,
-            errorText: "ACP events stream ended unexpectedly."
-        )
+        return .failed(errorText: "ACP events stream ended unexpectedly.")
     }
 
     private func handleAcquireFailure(
         tabID _: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
@@ -922,9 +1101,9 @@ final class ACPIntegratedAgentModeRunner {
         guard let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: .cancelled,
@@ -944,8 +1123,38 @@ final class ACPIntegratedAgentModeRunner {
         ))
     }
 
+    private func settleTransientExecution(
+        _ classification: TransientExecutionClassification,
+        session: AgentTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        controller: ACPAgentSessionController,
+        attachmentReservationID: UUID?
+    ) async {
+        guard case let .terminal(outcome) = classification.report.result else { return }
+        let terminalState: AgentSessionRunState = switch outcome.kind {
+        case .completed:
+            .completed
+        case .cancelled:
+            .cancelled
+        case .failed:
+            .failed
+        }
+        await finalize(
+            session: session,
+            runID: runID,
+            runAttemptID: runAttemptID,
+            controller: controller,
+            attachmentReservationID: attachmentReservationID,
+            terminalState: terminalState,
+            errorText: classification.errorText,
+            notifyTurnComplete: terminalState == .completed,
+            shouldShutdownController: terminalState != .completed
+        )
+    }
+
     private func finalize(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController?,
@@ -965,7 +1174,7 @@ final class ACPIntegratedAgentModeRunner {
         }
         let supportsSessionResume = terminalState == .completed && controller != nil
         await terminalCommitBarrier.commit(.init(
-            session: session,
+            binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: terminalState,
@@ -998,7 +1207,7 @@ final class ACPIntegratedAgentModeRunner {
     // MARK: - Tool Tracking (per-tab, using shared AgentToolTrackingController)
 
     private func startToolTracking(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         runID: UUID,
         clientNameHint: String
     ) async {
@@ -1028,7 +1237,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func prepareToolTrackingTeardown(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         matchingRunID: UUID? = nil
     ) -> AgentRunAttemptTerminalResources.Teardown? {
         if let matchingRunID, toolTrackingRunIDByTabID[session.tabID] != matchingRunID {
@@ -1042,8 +1251,8 @@ final class ACPIntegratedAgentModeRunner {
 
     private func setRunningStatus(
         _ text: String?,
-        source: AgentModeViewModel.TabSession.RunningStatusSource?,
-        session: AgentModeViewModel.TabSession,
+        source: AgentTabSession.RunningStatusSource?,
+        session: AgentTabSession,
         urgent: Bool = false
     ) {
         let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1051,15 +1260,15 @@ final class ACPIntegratedAgentModeRunner {
         let normalizedSource = value == nil ? nil : source
         guard session.runningStatusText != value || session.runningStatusSource != normalizedSource else {
             if urgent {
-                hooks.updateBindings(session)
-                hooks.requestUIRefresh(session.tabID, true)
+                hooks.bindingObservation.updateBindings(session)
+                hooks.presentation.requestUIRefresh(session.tabID, true)
             }
             return
         }
         session.runningStatusText = value
         session.runningStatusSource = normalizedSource
-        hooks.updateBindings(session)
-        hooks.requestUIRefresh(session.tabID, urgent)
+        hooks.bindingObservation.updateBindings(session)
+        hooks.presentation.requestUIRefresh(session.tabID, urgent)
     }
 
     private func initialTransportStatusText(for _: AgentProviderKind) -> String {
@@ -1076,7 +1285,7 @@ final class ACPIntegratedAgentModeRunner {
         invocationID: UUID,
         toolName: String,
         args: [String: Value]?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -1161,7 +1370,7 @@ final class ACPIntegratedAgentModeRunner {
         args: [String: Value]?,
         resultJSON: String,
         isError: Bool,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -1222,7 +1431,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func indexedThenActiveTurnToolCandidates(
         indexedIndices: [Int],
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         where predicate: (AgentChatItem) -> Bool
     ) -> (indices: [Int], inspectedItemCount: Int, usedFallbackScan: Bool) {
         let indexedMatches = indexedIndices.filter { predicate(session.items[$0]) }
@@ -1238,7 +1447,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func correlatedToolCallItemIndex(
-        in session: AgentModeViewModel.TabSession,
+        in session: AgentTabSession,
         storedToolName: String,
         invocationID: UUID?,
         argsJSON: String?,
@@ -1294,12 +1503,12 @@ final class ACPIntegratedAgentModeRunner {
         if let argsJSON,
            hasAccountableToolPayload(argsJSON)
         {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let placeholderCandidates = session.activeTurnToolItemIndices(where: { item in
                 item.kind == .toolCall
                     && self.isProviderPlaceholderInvocation(item.toolInvocationID, tabID: session.tabID)
                     && self.isPlaceholderToolArgs(item.toolArgsJSON)
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
             })
             inspectedItemCount += placeholderCandidates.scannedItemCount
             if placeholderCandidates.indices.count == 1 {
@@ -1311,10 +1520,10 @@ final class ACPIntegratedAgentModeRunner {
             }
         }
         if allowNameOnlyFallback {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
             MCPToolObserverAttributionContext.record(
@@ -1331,7 +1540,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func correlatedToolResultItemIndex(
-        in session: AgentModeViewModel.TabSession,
+        in session: AgentTabSession,
         storedToolName: String,
         invocationID: UUID?,
         argsJSON: String?,
@@ -1429,10 +1638,10 @@ final class ACPIntegratedAgentModeRunner {
             }
         }
         if allowNameOnlyFallback {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
             MCPToolObserverAttributionContext.record(
@@ -1537,7 +1746,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func toolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
-        AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
+        AgentTabSession.canonicalToolInvocationSignature(
             toolName: toolName,
             argsJSON: argsJSON
         )
@@ -1580,7 +1789,7 @@ final class ACPIntegratedAgentModeRunner {
             invocationID: UUID,
             toolName: String,
             args: [String: Value]?,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) {
             handleTrackerToolCall(invocationID: invocationID, toolName: toolName, args: args, session: session)
         }
@@ -1591,7 +1800,7 @@ final class ACPIntegratedAgentModeRunner {
             args: [String: Value]?,
             resultJSON: String,
             isError: Bool,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) {
             handleTrackerToolResult(
                 invocationID: invocationID,
@@ -1605,9 +1814,71 @@ final class ACPIntegratedAgentModeRunner {
 
         func testSyncACPSelectedModelFromRegistryIfNeeded(
             agentKind: AgentProviderKind,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) -> Bool {
             syncACPSelectedModelFromRegistryIfNeeded(agentKind: agentKind, session: session)
+        }
+
+        static func testClassifyTransientTerminal(
+            state: AgentSessionRunState,
+            errorText: String?
+        ) async -> (
+            result: DomainAgentRunExecutionResult,
+            errorText: String?,
+            trace: [DomainAgentRunExecutionTraceEvent]
+        ) {
+            let operationResult: TransientOperationResult = switch state {
+            case .completed:
+                .completed
+            case .cancelled:
+                .cancelled
+            case .failed:
+                .failed(errorText: errorText)
+            default:
+                fatalError("Test requires a terminal ACP state")
+            }
+            let classification = await executeTransientOperation { operationResult }
+            return (
+                classification.report.result,
+                classification.errorText,
+                classification.report.trace
+            )
+        }
+
+        static func testClassifyTransientSupersession() async -> (
+            result: DomainAgentRunExecutionResult,
+            errorText: String?,
+            trace: [DomainAgentRunExecutionTraceEvent]
+        ) {
+            let classification = await executeTransientOperation { .superseded }
+            return (
+                classification.report.result,
+                classification.errorText,
+                classification.report.trace
+            )
+        }
+
+        static func testValidateModelParameterApplicationReport(
+            _ report: ACPModelParameterApplicationReport
+        ) throws {
+            try report.validateNoSkippedSelections()
+        }
+
+        static func testPerformConfigurationSequenceIfCurrent(
+            isCurrent: () -> Bool,
+            operations: [() async throws -> Void]
+        ) async throws -> Bool {
+            try await performConfigurationSequenceIfCurrent(
+                isCurrent: isCurrent,
+                operations: operations
+            )
+        }
+
+        static func testExplicitSelectedModel(
+            agentKind: AgentProviderKind,
+            modelString: String?
+        ) throws -> String? {
+            try explicitSelectedModel(agentKind: agentKind, modelString: modelString)
         }
     #endif
 
@@ -1615,9 +1886,10 @@ final class ACPIntegratedAgentModeRunner {
 
     private func syncACPSelectedModelFromRegistryIfNeeded(
         agentKind: AgentProviderKind,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         guard let providerID = agentKind.acpProviderID,
+              providerID != .cursor,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)
         else {
             return false
@@ -1644,7 +1916,7 @@ final class ACPIntegratedAgentModeRunner {
     @discardableResult
     func handleToolStreamEvent(
         _ event: AgentToolStreamEvent,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         // ACP provider events carry the provider's tool invocation IDs, while the
         // MCP tracker sees RepoPrompt's internal invocation IDs. Render explicit

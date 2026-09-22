@@ -22,6 +22,13 @@ struct ContentRootShellView: View {
                 .blur(radius: showWorkspaceSwitchOverlay ? 6 : 0, opaque: false)
                 .animation(.easeInOut(duration: 0.12), value: showWorkspaceSwitchOverlay)
 
+            VStack {
+                CodeStructureSettlementLimitNoticeBanner(server: viewModel.state.mcpServer)
+                Spacer(minLength: 0)
+            }
+            .padding(16)
+            .zIndex(997)
+
             if agentNavigationHUD.isPresented {
                 AgentNavigationHUDView(
                     viewModel: agentNavigationHUD,
@@ -151,6 +158,39 @@ struct ContentRootShellView: View {
                 agentModeVM: viewModel.state.agentModeViewModel,
                 promptManager: viewModel.promptManager
             )
+        }
+    }
+}
+
+/// Observes the per-window MCP model directly so a settlement recovery redraws
+/// without depending on an unrelated `ContentViewModel` publication.
+private struct CodeStructureSettlementLimitNoticeBanner: View {
+    @ObservedObject var server: MCPServerViewModel
+
+    var body: some View {
+        if let notice = server.codeStructureSettlementLimitNotice {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.title3)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(notice.title)
+                        .font(.headline)
+                    Text(notice.message)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(12)
+            .frame(maxWidth: 720, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(.orange.opacity(0.5), lineWidth: 1)
+            )
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(notice.title). \(notice.message)")
         }
     }
 }

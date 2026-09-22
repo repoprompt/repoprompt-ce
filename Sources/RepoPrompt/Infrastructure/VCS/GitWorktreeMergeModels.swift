@@ -40,7 +40,7 @@ public struct GitWorktreeMergeEndpoint: Codable, Sendable, Equatable, Hashable {
             worktreeID: descriptor.worktreeID,
             repositoryID: descriptor.repository.repositoryID,
             repoKey: descriptor.repository.repoKey,
-            path: descriptor.path,
+            path: GitRepoRootAuthorization.canonicalPath(descriptor.path),
             name: descriptor.name,
             branch: descriptor.branch,
             head: head,

@@ -33,6 +33,27 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertNil(store.diagnostic(for: .codex))
     }
 
+    func testMissingDevinDocumentCreatesAndSavesProviderDefault() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.devin.storageKey
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.devinPermissions().permissionLevel(), .providerDefault)
+
+        let saved = try decode(SecureDevinPermissionDocument.self, from: secureStrings.plainValues[key])
+        XCTAssertEqual(saved.permissionLevel(), .providerDefault)
+        XCTAssertNil(store.diagnostic(for: .devin))
+    }
+
+    func testMalformedDevinDocumentFailsClosedToNormal() {
+        let secureStrings = FakeSecurePlainStringStore()
+        secureStrings.plainValues[AgentPermissionSecureDomain.devin.storageKey] = "{"
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.devinPermissions().permissionLevel(), .normal)
+        XCTAssertEqual(store.diagnostic(for: .devin)?.kind, .decodeFailed)
+    }
+
     func testMissingSubagentDocumentCreatesAndSavesSafeManagedPolicy() throws {
         let secureStrings = FakeSecurePlainStringStore()
         let key = AgentPermissionSecureDomain.subagent.storageKey
@@ -324,6 +345,99 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertEqual(effective.permissionLevel(), .defaultPermission)
         XCTAssertEqual(effective.bashToolEnabled, false)
         XCTAssertEqual(store.diagnostic(for: .codex)?.kind, .keychainWriteFailed)
+    }
+
+    func testAntigravitySecurePreferencesIgnoreLegacyYoloDefaultsAndPostChange() throws {
+        let suiteName = "AgentPermissionSecureStoreTests.Antigravity.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(AntigravityAgentToolPreferences.PermissionLevel.yolo.rawValue, forKey: "antigravityACPAgentMode")
+
+        let secureStrings = FakeSecurePlainStringStore()
+        let notificationCenter = NotificationCenter()
+        let store = makeStore(secureStrings: secureStrings, notificationCenter: notificationCenter)
+
+        XCTAssertEqual(
+            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store),
+            .autoEdit,
+            "Legacy UserDefaults yolo state must not become trusted secure permission authority."
+        )
+
+        let changed = expectation(
+            forNotification: .agentPermissionSecureStoreDidChange,
+            object: store,
+            notificationCenter: notificationCenter
+        ) { notification in
+            XCTAssertEqual(
+                notification.userInfo?[AgentPermissionSecureStoreNotificationKey.domain] as? String,
+                AgentPermissionSecureDomain.antigravity.rawValue
+            )
+            XCTAssertEqual(
+                notification.userInfo?[AgentPermissionSecureStoreNotificationKey.writeSucceeded] as? Bool,
+                true
+            )
+            return true
+        }
+
+        AntigravityAgentToolPreferences.setPermissionLevel(.yolo, defaults: defaults, secureStore: store)
+        wait(for: [changed], timeout: 1)
+
+        XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .yolo)
+        let saved = try decode(
+            SecureAntigravityPermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey]
+        )
+        XCTAssertEqual(saved.permissionLevel(), .yolo)
+    }
+
+    func testMalformedAntigravityDocumentFailsClosed() {
+        let secureStrings = FakeSecurePlainStringStore()
+        secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey] = "{not-json"
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .autoEdit)
+        XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+    }
+
+    func testResetIncludesDevinAndPersistsNormalSafeDefault() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let store = makeStore(secureStrings: secureStrings)
+        XCTAssertTrue(store.setDevinPermissionLevel(.fullApproval))
+
+        let result = store.resetAgentPermissionsToSafeDefaults()
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(result.succeededDomains.contains(.devin))
+        XCTAssertEqual(store.devinPermissions().permissionLevel(), .normal)
+
+        let restartedStore = makeStore(secureStrings: secureStrings)
+        XCTAssertEqual(restartedStore.devinPermissions().permissionLevel(), .normal)
+        let saved = try decode(
+            SecureDevinPermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.devin.storageKey]
+        )
+        XCTAssertEqual(saved.permissionLevel(), .normal)
+    }
+
+    func testResetIncludesAntigravityAndPersistsSafeDefault() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let store = makeStore(secureStrings: secureStrings)
+        XCTAssertTrue(store.setAntigravityPermissionLevel(.yolo))
+
+        let result = store.resetAgentPermissionsToSafeDefaults()
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(result.succeededDomains.contains(.antigravity))
+        XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .autoEdit)
+
+        let restartedStore = makeStore(secureStrings: secureStrings)
+        XCTAssertEqual(restartedStore.antigravityPermissions().permissionLevel(), .autoEdit)
+        let saved = try decode(
+            SecureAntigravityPermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey]
+        )
+        XCTAssertEqual(saved.permissionLevel(), .autoEdit)
     }
 
     private func makeStore(

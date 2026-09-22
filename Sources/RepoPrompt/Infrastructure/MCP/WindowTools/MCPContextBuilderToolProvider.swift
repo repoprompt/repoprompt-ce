@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 
 /// Carries existing non-Sendable UI snapshot/DTO values through the provider's @Sendable timeline
 /// wrappers without broadening their conformances. Each operation stores once and is fully awaited
@@ -259,15 +260,21 @@ enum ContextBuilderTypedPromptResolver {
 }
 
 @MainActor
-final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .contextBuilder
+final class MCPContextBuilderToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .contextBuilder
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private typealias Dependencies = (
+        execution: MCPAppPhysicalCapabilityAdapters.Execution,
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        files: MCPAppPhysicalCapabilityAdapters.Files
+    )
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    private let dependencies: Dependencies
+
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution, context: MCPAppPhysicalCapabilityAdapters.Context, files: MCPAppPhysicalCapabilityAdapters.Files) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = (execution: execution, context: context, files: files)
     }
 
     func buildTools() -> [Tool] {
@@ -290,6 +297,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             | `question` | Answers a question about the codebase using built context |
             | `plan` | Generates implementation plan for the task |
             | `review` | Generates code review with git diff context |
+
+            **Oracle preset**: For app-backed `plan`, `question`, or `review` runs, pass `oracle_preset` to select an exposed Model Preset by name or UUID. The preset determines the complete ordered Oracle roster and request prompt; it is separate from the Context Builder discovery `agent` and `model`. Omit it to use automatic Model Preset selection. Direct-headless execution rejects this app-only argument.
 
             **Structuring instructions** (XML tags):
             - `<task>`: Main goal
@@ -316,29 +325,70 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 properties: [
                     "instructions": .string(description: "Your request, ideally structured with XML tags: <task> for the main goal, <context> for background/constraints/file references, <discovery_agent-guidelines> for optional starting hints. Describe what you need — the agent finds the right files."),
                     "response_type": .string(description: "Optional: 'plan' to generate implementation plan, 'question' to ask a question, or 'review' to generate a code review. Omit or 'clarify' to just return context.", enum: ["plan", "question", "review", "clarify"]),
+                    "oracle_preset": .string(
+                        description: "App-backed only: exposed Model Preset name or UUID for a plan, question, or review response. This selects the Oracle roster and prompt independently of the discovery model.",
+                        minLength: 1,
+                        maxLength: OracleRosterContract.maximumModelIdentifierLength
+                    ),
+                    "context_pack_ref": .string(description: "Direct-headless only: canonical oracle-pack:sha256 reference to an already persisted frozen Context Builder package. Mutually exclusive with instructions."),
                     "export_response": .boolean(description: "When true, export the generated response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Requires a response_type that generates a response. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt.")
                 ],
                 required: []
             )
         ) { [dependencies] _, args in
             let connectionID = ServerNetworkManager.currentConnectionID
-            let result = try await Self.executeContextBuilder(
-                args: args,
-                connectionID: connectionID,
-                dependencies: dependencies
-            )
-            return result.toMCPValue()
+            do {
+                let result = try await Self.executeContextBuilder(
+                    args: args,
+                    connectionID: connectionID,
+                    dependencies: dependencies
+                )
+                return result.toMCPValue()
+            } catch let error as ContextBuilderWorkspaceContextError {
+                throw MCPError.invalidParams(error.localizedDescription)
+            }
         }
+    }
+
+    nonisolated static func parseOraclePreset(
+        _ value: Value?,
+        responseType: ContextBuilderResponseType?
+    ) throws -> String? {
+        guard let value else { return nil }
+        guard let stringValue = value.stringValue else {
+            throw MCPError.invalidParams("oracle_preset must be a string")
+        }
+        let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw MCPError.invalidParams("oracle_preset cannot be blank")
+        }
+        guard trimmed.count <= OracleRosterContract.maximumModelIdentifierLength else {
+            throw MCPError.invalidParams(
+                "oracle_preset cannot exceed \(OracleRosterContract.maximumModelIdentifierLength) characters"
+            )
+        }
+        guard responseType?.wantsResponse == true else {
+            throw MCPError.invalidParams(
+                "oracle_preset requires response_type plan, question, or review."
+            )
+        }
+        return trimmed
     }
 
     private static func executeContextBuilder(
         args: [String: Value],
         connectionID: UUID?,
-        dependencies: MCPWindowToolDependencies
+        dependencies: Dependencies
     ) async throws -> ContextBuilderToolResult {
+        guard args["context_pack_ref"] == nil else {
+            throw MCPError.invalidParams(
+                "context_pack_ref is accepted only by the direct-headless Context Builder adapter."
+            )
+        }
         let instructions = args["instructions"]?.stringValue ?? ""
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata = await dependencies.context.captureRequestMetadata()
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
+        let oraclePreset = try parseOraclePreset(args["oracle_preset"], responseType: responseType)
         let exportResponse: Bool
         if let value = args["export_response"] {
             guard let boolValue = value.boolValue else {
@@ -352,8 +402,16 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             exportResponse = false
         }
 
-        let targetWindow = try dependencies.requireTargetWindow()
-        let tabResolution = try await dependencies.resolveContextBuilderTab(
+        let targetWindow = try dependencies.execution.requireTargetWindow()
+        #if DEBUG
+            let invokingBinding = connectionID.map { targetWindow.mcpServer.connectionBindingSnapshot(forConnection: $0) }
+            let startupObservation = targetWindow.contextBuilderAgentViewModel.startupObservationForTesting(
+                workspaceID: invokingBinding?.workspaceID, tabID: invokingBinding?.tabID,
+                invokingRunID: invokingBinding?.runID
+            )
+            defer { startupObservation?.recordRequestTerminal() }
+        #endif
+        let tabResolution = try await dependencies.execution.resolveContextBuilderTab(
             args,
             targetWindow,
             connectionID
@@ -366,7 +424,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         let workspaceContext = tabResolution.workspaceContext
         let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
         if workspaceContext == nil {
-            let scopedRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(
+            let scopedRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(
                 scope: lookupContext.rootScope
             )
             let scopedPaths = Set(scopedRoots.map(\.standardizedFullPath))
@@ -383,13 +441,13 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             throw MCPError.internalError("Resolved Context Builder tab is unavailable in its workspace")
         }
         try await workspaceContext?.validateReviewTargetAvailability(
-            store: dependencies.promptVM.workspaceFileContextStore
+            store: dependencies.context.promptVM.workspaceFileContextStore
         )
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
-            try dependencies.bindTabForConnection(
+            try dependencies.execution.bindTabForConnection(
                 connectionID,
                 clientName,
                 finalTabID,
@@ -410,25 +468,34 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             ),
             explicitWindowRoutingHint: metadata.explicitWindowRoutingHint
         )
-        guard await dependencies.drainReadFileAutoSelection(
+        guard try await dependencies.files.drainReadFileAutoSelection(
             targetMetadata,
             .mirroredSelectionAndMetrics
         ) == .completed else {
             throw CancellationError()
         }
-        let runAuthority = try await contextBuilderVM.resolveMCPRunAuthority(
-            identity: resolvedIdentity,
-            nestedTabContext: tabResolution.nestedTabContext,
-            workspaceContext: workspaceContext,
-            responseType: responseType?.rawValue
-        )
+        let runAuthority: ContextBuilderResolvedRunAuthority
+        do {
+            runAuthority = try await contextBuilderVM.resolveMCPRunAuthority(
+                identity: resolvedIdentity,
+                nestedTabContext: tabResolution.nestedTabContext,
+                workspaceContext: workspaceContext,
+                responseType: responseType?.rawValue,
+                oraclePreset: oraclePreset
+            )
+        } catch let error as OracleExecutionResolutionError {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+
+        try await workspaceContext?.validateStartupAvailability(workspaceManager: targetWindow.workspaceManager)
+        try Task.checkCancellation()
 
         // swiftformat:disable conditionalAssignment
         let capturedOracleExportDestination: OracleExportDestination?
         if exportResponse {
             // Export into the exact root scope selected by Context Builder's final tab resolution.
             // Ambient request metadata may still describe a different active tab.
-            capturedOracleExportDestination = try dependencies.makeOracleExportDestination(
+            capturedOracleExportDestination = try dependencies.execution.makeOracleExportDestination(
                 workspace,
                 targetWindow.windowID,
                 finalTabID,
@@ -457,41 +524,10 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 )
             }
         }) {
-            let wantsResponse = responseType?.wantsResponse ?? false
             let contextBuilderTokenBudget = runAuthority.configuration.effectiveTokenBudget
-            let promptManager = targetWindow.promptManager
+            let planModelName = runAuthority.configuration.generatedResponseAuthority.planningModelName
 
-            let planModelName: String? = await wantsResponse ? MainActor.run {
-                let settingsStore = GlobalSettingsStore.shared
-                let useModelPresets = settingsStore.mcpShowModelPresets()
-                let temporarilyDisabled = settingsStore.mcpTemporarilyDisablePresets()
-
-                if !useModelPresets {
-                    return runAuthority.configuration.planningModelRaw
-                        .flatMap(AIModel.fromModelName)?.displayName
-                }
-
-                let allPresets = ModelPresetsManager.shared.presets
-                let effectivePresets = temporarilyDisabled ? [] : allPresets
-
-                if effectivePresets.isEmpty {
-                    return runAuthority.configuration.planningModelRaw
-                        .flatMap(AIModel.fromModelName)?.displayName
-                }
-
-                let modeFiltered = effectivePresets.filter { preset in
-                    responseType?.supportsPresetMode(preset) ?? false
-                }
-                for preset in modeFiltered {
-                    if promptManager.isModelAvailable(preset.model) {
-                        return preset.model.displayName
-                    }
-                }
-                return runAuthority.configuration.planningModelRaw
-                    .flatMap(AIModel.fromModelName)?.displayName
-            } : nil
-
-            let sendStageProgress = dependencies.sendStageProgress
+            let sendStageProgress = dependencies.execution.sendStageProgress
             let progressTimeline = ContextBuilderMCPProgressTimeline { event in
                 await sendStageProgress(
                     connectionID,
@@ -508,14 +544,14 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             }
 
             func runContextBuilderAndPlan() async throws -> ContextBuilderToolResult {
-                await dependencies.sendStageProgress(
+                await dependencies.execution.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "starting",
                     "Starting context builder..."
                 )
 
-                await dependencies.sendStageProgress(
+                await dependencies.execution.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "discovering",
@@ -532,7 +568,6 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         try await contextBuilderVM.runContextBuilderForMCP(
                             authority: runAuthority,
                             instructionsOverride: instructions.isEmpty ? nil : instructions,
-                            planModelName: planModelName,
                             workspaceContext: workspaceContext,
                             mcpControlToken: mcpControlToken,
                             progressReporter: progressReporter,
@@ -541,7 +576,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     }
                 }
 
-                await dependencies.sendStageProgress(
+                await dependencies.execution.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "discovered",
@@ -634,9 +669,10 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         case let .failed(message): "failed: \(message)"
                         }
 
-                        try workspaceContext?.validateAvailability()
+                        try await workspaceContext?.validateStartupAvailability(workspaceManager: targetWindow.workspaceManager)
+                        try Task.checkCancellation()
                         let selection = resultTab.selection
-                        let reply = try await dependencies.buildTabSelectionReply(
+                        let reply = try await dependencies.execution.buildTabSelectionReply(
                             selection,
                             false,
                             .relative,
@@ -711,7 +747,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                                 message: "Still authorizing Context Builder review selection...",
                                 timeline: progressTimeline
                             ) {
-                                await dependencies.beforeContextBuilderFinalReviewAuthorization()
+                                await dependencies.execution.beforeContextBuilderFinalReviewAuthorization()
                                 let preAuthorizationCanonical = await MainActor.run {
                                     () -> (ComposeTabState?, UInt64) in
                                     let manager = targetWindow.workspaceManager
@@ -736,9 +772,9 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                                     workspaceID: committedTab.identity.workspaceID,
                                     tabID: committedTab.identity.tabID,
                                     selectionRevision: committedTab.selectionRevision,
-                                    store: dependencies.promptVM.workspaceFileContextStore
+                                    store: dependencies.context.promptVM.workspaceFileContextStore
                                 )
-                                await dependencies.didFinalizeContextBuilderReview(authorization)
+                                await dependencies.execution.didFinalizeContextBuilderReview(authorization)
 
                                 let finalCanonical = await MainActor.run {
                                     () -> (ComposeTabState?, UInt64) in
@@ -777,8 +813,17 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         )
                     }
 
+                    guard case let .generate(capturedMode, execution) =
+                        runAuthority.configuration.generatedResponseAuthority,
+                        capturedMode == mode
+                    else {
+                        throw MCPError.internalError(
+                            "Context Builder generated-response authority does not match the requested mode"
+                        )
+                    }
+
                     let modeLabel = responseType?.generationLabel ?? "question"
-                    await dependencies.sendStageProgress(
+                    await dependencies.execution.sendStageProgress(
                         connectionID,
                         MCPWindowToolName.contextBuilder,
                         "generating",
@@ -793,12 +838,13 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             message: "Still generating \(modeLabel)...",
                             timeline: progressTimeline
                         ) {
-                            try await dependencies.runMCPPlanOrQuestion(
+                            try await dependencies.execution.runMCPPlanOrQuestion(
                                 contextBuilderVM,
                                 resolvedIdentity,
                                 tabResolution.agentModeSessionID,
                                 tabResolution.agentModeRunID,
                                 mode,
+                                execution,
                                 prompt,
                                 sel,
                                 lookupContext,
@@ -815,10 +861,14 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     } else {
                         planReply = reply
                     }
-                    followUpHint = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(reply.shortId)\", new_chat: false)"
+                    followUpHint = Self.generatedResponseFollowUpHint(
+                        modeLabel: modeLabel,
+                        chatID: reply.shortId,
+                        oracleCount: reply.oracleGroup?.result.oracleCount
+                    )
                 }
 
-                await dependencies.sendStageProgress(
+                await dependencies.execution.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
                     "complete",
@@ -881,12 +931,12 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     guard let capturedOracleExportDestination else {
                         throw MCPError.internalError("Missing captured Oracle export destination for context_builder export.")
                     }
-                    let exportPath = try await dependencies.resolveDefaultOracleExportPath(
+                    let exportPath = try await dependencies.execution.resolveDefaultOracleExportPath(
                         exportMode,
                         chatID,
                         capturedOracleExportDestination
                     )
-                    let resolvedPath = try await dependencies.writeGeneratedOracleExportFile(
+                    let resolvedPath = try await dependencies.execution.writeGeneratedOracleExportFile(
                         exportPath,
                         markdown,
                         capturedOracleExportDestination
@@ -904,6 +954,18 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             }
             return try await runContextBuilderAndPlan()
         }
+    }
+
+    nonisolated static func generatedResponseFollowUpHint(
+        modeLabel: String,
+        chatID: String,
+        oracleCount: Int?
+    ) -> String {
+        let continuation = "Continue this \(modeLabel) conversation with ask_oracle(chat_id: \"\(chatID)\", new_chat: false)"
+        guard let oracleCount, oracleCount > 1 else { return continuation }
+
+        let groupGuidance = "The Oracle group returned ordered, independent lane results. Check each result against the task and report unresolved disagreements."
+        return groupGuidance + "\n\nOptional later follow-up: " + continuation
     }
 
     nonisolated static func responseDisposition(

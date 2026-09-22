@@ -3,7 +3,7 @@ import SwiftUI
 /// Optimized workspace row that minimizes re-renders
 struct OptimizedWorkspaceRow: View {
     let workspace: WorkspaceModel
-    let onSwitch: () -> Void
+    let onSwitch: (() -> Void)?
     let onRename: () -> Void
     let onToggleHidden: () -> Void
     let onDelete: () -> Void
@@ -22,12 +22,14 @@ struct OptimizedWorkspaceRow: View {
 
                 Spacer()
 
-                // Switch to workspace
-                Button(action: onSwitch) {
-                    Image(systemName: "arrow.right.circle")
+                if let onSwitch {
+                    // Switch to workspace
+                    Button(action: onSwitch) {
+                        Image(systemName: "arrow.right.circle")
+                    }
+                    .buttonStyle(CustomButtonStyle())
+                    .hoverTooltip("Switch to workspace")
                 }
-                .buttonStyle(CustomButtonStyle())
-                .hoverTooltip("Switch to workspace")
 
                 // Rename
                 Button(action: onRename) {
@@ -55,7 +57,7 @@ struct OptimizedWorkspaceRow: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Delete workspace?")
                             .font(fontPreset.headlineFont)
-                        Text("This will delete \"\(workspace.name)\" from your workspace list.")
+                        Text("This will delete \"\(workspace.name)\" and its saved tabs and session history, including pinned tabs. Running work will be stopped and affected windows will return to the welcome screen. Your project folders are kept.")
                             .font(fontPreset.subheadlineFont)
                             .foregroundColor(.secondary)
                         HStack {

@@ -266,7 +266,12 @@ import RepoPromptShared
                 return debugDiagnosticsResult(readFileAutoSelectionStaleProbePayload(op: op, entry: entry))
             }
             let settleElapsedMS = Self.debugDurationMilliseconds(settleStartedAt.duration(to: clock.now))
-            let result = drain.result == .completed ? "completed" : "cancelled"
+            let result = switch drain.result {
+            case .completed: "completed"
+            case .deferred: "deferred"
+            case .invalidated: "invalidated"
+            case .cancelled: "cancelled"
+            }
             let delta = readFileAutoSelectionDeltaPayload(baseline: entry.baseline, final: final)
 
             return debugDiagnosticsResult([
@@ -946,6 +951,7 @@ import RepoPromptShared
                     MCPConnectionCallLane.ordinary.rawValue: readSearchLimiterLanePayload(snapshot.ordinary),
                     MCPConnectionCallLane.control.rawValue: readSearchLimiterLanePayload(snapshot.control),
                     MCPConnectionCallLane.smallRead.rawValue: readSearchLimiterLanePayload(snapshot.smallRead),
+                    MCPConnectionCallLane.fileRead.rawValue: readSearchLimiterLanePayload(snapshot.fileRead),
                     MCPConnectionCallLane.gitRead.rawValue: readSearchLimiterLanePayload(snapshot.gitRead),
                     MCPConnectionCallLane.fileSearch.rawValue: readSearchLimiterLanePayload(snapshot.fileSearch)
                 ]

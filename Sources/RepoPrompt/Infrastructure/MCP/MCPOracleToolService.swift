@@ -1,11 +1,12 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 @MainActor
 struct MCPOracleToolService {
     typealias RequestMetadata = MCPServerViewModel.RequestMetadata
     typealias ResolvedTabContextSnapshot = MCPServerViewModel.ResolvedTabContextSnapshot
-    typealias TabScopedContext = MCPServerViewModel.TabScopedContext
+    typealias TabContextSnapshot = MCPServerViewModel.TabContextSnapshot
     typealias ChatSendOperation = @Sendable () async throws -> [String: Value]
     typealias SendChat = @MainActor @Sendable (
         _ args: [String: Value],
@@ -14,8 +15,8 @@ struct MCPOracleToolService {
     ) async throws -> [String: Value]
     typealias ExportOracleResponse = @MainActor @Sendable (OracleExportRequest) async throws -> OracleExportFile
     typealias StabilizedVirtualContext = @MainActor @Sendable (
-        _ context: TabScopedContext
-    ) async -> TabScopedContext
+        _ context: TabContextSnapshot
+    ) async -> TabContextSnapshot
     typealias ResolveDelegatedReviewPackaging = @MainActor @Sendable (
         _ conversationTabID: UUID,
         _ conversationWorkspaceID: UUID?,
@@ -30,7 +31,7 @@ struct MCPOracleToolService {
     let oracleVM: OracleViewModel
     let captureRequestMetadata: () async -> RequestMetadata
     let resolveTabContextSnapshot: (RequestMetadata) throws -> ResolvedTabContextSnapshot
-    let requireCurrentTabContext: (String) async throws -> TabScopedContext
+    let requireCurrentTabContext: (String) async throws -> TabContextSnapshot
     let stabilizedVirtualContext: StabilizedVirtualContext
     let resolveDelegatedReviewPackaging: ResolveDelegatedReviewPackaging
     let rebindChatSessionIfNeeded: (_ metadata: RequestMetadata, _ chatIDString: String) throws -> Void
@@ -91,7 +92,7 @@ struct MCPOracleToolService {
 
         let hasExplicitTabID = rawExplicitTabID(args) != nil
         let tabID: UUID
-        let tabContext: TabScopedContext?
+        let tabContext: TabContextSnapshot?
         if hasExplicitTabID {
             tabID = try await resolveTabIDForAgentMode(args, connectionID)
             let requestContext = try? await requireCurrentTabContext(oracleChatLogToolName)
@@ -116,13 +117,13 @@ struct MCPOracleToolService {
     // MARK: - ask_oracle (agent-mode only)
 
     func executeAskOracle(args: [String: Value]) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "export_response"]
+        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "export_response"]
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "ask_oracle only accepts: message, mode, chat_id, new_chat, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
+                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
             )
         }
 
@@ -138,23 +139,41 @@ struct MCPOracleToolService {
         let newChat = args["new_chat"]?.boolValue ?? false
         let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
+        let requestedModelOverride = try parseOracleModelOverride(args["model"])
+        let route: OracleConversationRoute
+        do {
+            route = try OracleConversationRoute.resolve(
+                chatID: normalizedChatID,
+                newChat: newChat,
+                modelOverride: requestedModelOverride,
+                whenMissingChatID: .startNew
+            )
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        let (isStartRoute, continuationChatID, modelOverride): (Bool, String?, String?) = switch route {
+        case let .start(primaryModelOverride): (true, nil, primaryModelOverride)
+        case let .continuation(chatID): (false, chatID, nil)
+        case .implicitContinuation:
+            throw MCPError.internalError("ask_oracle resolved an invalid implicit continuation route")
+        }
         let targetWindow = try requireTargetWindow()
 
         let tabID = try await resolveTabIDForAgentMode(args, connectionID)
         let requestContext = try? await requireCurrentTabContext(askOracleToolName)
         let virtualContext = (requestContext?.tabID == tabID) ? requestContext : nil
-        if let normalizedChatID {
-            guard let session = oracleVM.resolveSession(id: normalizedChatID) else {
-                throw MCPError.invalidParams("Chat with ID '\(normalizedChatID)' not found")
+        if let continuationChatID {
+            guard let session = oracleVM.resolveSession(id: continuationChatID) else {
+                throw MCPError.invalidParams("Chat with ID '\(continuationChatID)' not found")
             }
             guard let sessionTabID = session.composeTabID else {
                 throw MCPError.invalidParams(
-                    "Chat with ID '\(normalizedChatID)' is not bound to a compose tab. Use a chat_id from the current tab."
+                    "Chat with ID '\(continuationChatID)' is not bound to a compose tab. Use a chat_id from the current tab."
                 )
             }
             guard sessionTabID == tabID else {
                 throw MCPError.invalidParams(
-                    "Chat with ID '\(normalizedChatID)' belongs to a different tab. ask_oracle can only continue chats from the current tab."
+                    "Chat with ID '\(continuationChatID)' belongs to a different tab. ask_oracle can only continue chats from the current tab."
                 )
             }
         }
@@ -229,10 +248,13 @@ struct MCPOracleToolService {
         var chatArgs: [String: Value] = [
             "message": .string(message),
             "mode": .string(modeRaw),
-            "new_chat": .bool(newChat)
+            "new_chat": .bool(isStartRoute)
         ]
-        if let normalizedChatID {
-            chatArgs["chat_id"] = .string(normalizedChatID)
+        if let continuationChatID {
+            chatArgs["chat_id"] = .string(continuationChatID)
+        }
+        if let modelOverride {
+            chatArgs["model"] = .string(modelOverride)
         }
 
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
@@ -248,12 +270,14 @@ struct MCPOracleToolService {
         }
 
         if exportResponse {
+            let groupResult = try Self.decodeOracleGroupResultForExport(result)
             let export = try await exportOracleResponse(OracleExportRequest(
                 sourceTool: askOracleToolName,
                 mode: modeRaw,
                 message: message,
-                chatID: result["chat_id"]?.stringValue ?? normalizedChatID,
+                chatID: result["chat_id"]?.stringValue ?? continuationChatID,
                 response: result["response"]?.stringValue,
+                groupResult: groupResult,
                 destination: exportDestination
             ))
             result["oracle_export_path"] = .string(export.path)
@@ -281,6 +305,25 @@ struct MCPOracleToolService {
         let message = (args["message"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let modeRaw = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
         let exportResponse = try parseExportResponseFlag(args)
+        let newChat = args["new_chat"]?.boolValue ?? false
+        let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
+        let requestedModelOverride = try parseOracleModelOverride(args["model"])
+        let route: OracleConversationRoute
+        do {
+            route = try OracleConversationRoute.resolve(
+                chatID: normalizedChatID,
+                newChat: newChat,
+                modelOverride: requestedModelOverride,
+                whenMissingChatID: .continueCurrent
+            )
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        let continuationChatID: String? = switch route {
+        case .start, .implicitContinuation: nil
+        case let .continuation(chatID): chatID
+        }
 
         let connectionID = ServerNetworkManager.currentConnectionID
         let runPurpose: MCPRunPurpose = if let connectionID {
@@ -297,30 +340,25 @@ struct MCPOracleToolService {
         let resolvedContext = try resolveTabContextSnapshot(metadata)
         var tabContext: OracleViewModel.OracleSendTabContext? = nil
 
-        if !resolvedContext.usesActiveTabCompatibility {
-            if runPurpose != .agentModeRun,
-               let chatIDString = args["chat_id"]?.stringValue,
-               !chatIDString.isEmpty
-            {
-                try rebindChatSessionIfNeeded(metadata, chatIDString)
-            }
+        if runPurpose != .agentModeRun, let continuationChatID {
+            try rebindChatSessionIfNeeded(metadata, continuationChatID)
+        }
 
-            let context = try await requireCurrentTabContext(oracleSendToolName)
-            if runPurpose == .agentModeRun, let targetWindow {
-                let owner = await resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
-                tabContext = try await oracleSendTabContext(
-                    from: context,
-                    owner: owner,
-                    origin: .oracleSend,
-                    mode: modeRaw
-                )
-            } else {
-                tabContext = try await oracleSendTabContext(
-                    from: context,
-                    origin: .oracleSend,
-                    mode: modeRaw
-                )
-            }
+        let context = try await requireCurrentTabContext(oracleSendToolName)
+        if runPurpose == .agentModeRun, let targetWindow {
+            let owner = await resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
+            tabContext = try await oracleSendTabContext(
+                from: context,
+                owner: owner,
+                origin: .oracleSend,
+                mode: modeRaw
+            )
+        } else {
+            tabContext = try await oracleSendTabContext(
+                from: context,
+                origin: .oracleSend,
+                mode: modeRaw
+            )
         }
 
         let exportDestination: OracleExportDestination? = if exportResponse, let targetWindow {
@@ -351,6 +389,7 @@ struct MCPOracleToolService {
         }
 
         if exportResponse {
+            let groupResult = try Self.decodeOracleGroupResultForExport(result)
             let normalizedChatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             let export = try await exportOracleResponse(OracleExportRequest(
                 sourceTool: oracleSendToolName,
@@ -358,6 +397,7 @@ struct MCPOracleToolService {
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? ((normalizedChatID?.isEmpty == false) ? normalizedChatID : nil),
                 response: result["response"]?.stringValue,
+                groupResult: groupResult,
                 destination: exportDestination
             ))
             result["oracle_export_path"] = .string(export.path)
@@ -370,12 +410,40 @@ struct MCPOracleToolService {
 
     // MARK: - Shared helpers
 
+    static func decodeOracleGroupResultForExport(_ result: [String: Value]) throws -> OracleGroupResult? {
+        guard result["oracle_group_id"] != nil else { return nil }
+        do {
+            let data = try JSONEncoder().encode(result)
+            return try JSONDecoder().decode(OracleGroupResult.self, from: data)
+        } catch {
+            throw MCPError.internalError(
+                "Oracle returned an invalid grouped result for export: \(error.localizedDescription)"
+            )
+        }
+    }
+
     private func parseExportResponseFlag(_ args: [String: Value]) throws -> Bool {
         guard let value = args["export_response"] else { return false }
         guard let boolValue = value.boolValue else {
             throw MCPError.invalidParams("export_response must be a boolean")
         }
         return boolValue
+    }
+
+    private func parseOracleModelOverride(_ value: Value?) throws -> String? {
+        guard let value else { return nil }
+        guard case let .string(raw) = value else {
+            throw MCPError.invalidParams("model must be a string")
+        }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty,
+              normalized.count <= OracleRosterContract.maximumModelIdentifierLength
+        else {
+            throw MCPError.invalidParams(
+                "model must be non-empty and at most \(OracleRosterContract.maximumModelIdentifierLength) characters"
+            )
+        }
+        return normalized
     }
 
     private func validateCommonOracleArgs(_ args: [String: Value]) throws {
@@ -392,10 +460,13 @@ struct MCPOracleToolService {
             throw MCPError.invalidParams("Invalid mode: \(modeRaw). Valid modes: chat, plan, review")
         }
 
-        if let chatIDRaw = args["chat_id"]?.stringValue,
-           chatIDRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            throw MCPError.invalidParams("chat_id cannot be empty when provided")
+        if let chatIDValue = args["chat_id"] {
+            guard let chatIDRaw = chatIDValue.stringValue else {
+                throw MCPError.invalidParams("chat_id must be a string")
+            }
+            guard !chatIDRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw MCPError.invalidParams("chat_id cannot be empty when provided")
+            }
         }
         if let newChatValue = args["new_chat"], newChatValue.boolValue == nil {
             throw MCPError.invalidParams("new_chat must be a boolean")
@@ -415,55 +486,49 @@ struct MCPOracleToolService {
     }
 
     private func executeOracleModelsUtility() async throws -> Value {
-        let (showModelPresets, temporarilyDisabled) = await MainActor.run {
-            let store = GlobalSettingsStore.shared
-            return (store.mcpShowModelPresets(), store.mcpTemporarilyDisablePresets())
+        let settingsStore = GlobalSettingsStore.shared
+        let exposesPresets = settingsStore.mcpShowModelPresets()
+            && !settingsStore.mcpTemporarilyDisablePresets()
+        let presets = exposesPresets ? ModelPresetsManager.shared.allPresets() : []
+        guard !presets.isEmpty else {
+            let model = try defaultCurrentChatModelInfo()
+            return .string(
+                "Available models:\n- \(model.id): \(model.name) — modes: [Chat, Plan, Review] — \(model.description ?? "MCP Oracle Model")"
+            )
         }
 
-        var models: [ToolResultDTOs.ModelInfo] = []
-
-        if showModelPresets {
-            let presets = temporarilyDisabled ? [] : await ModelPresetsManager.shared.allPresets()
-            if !presets.isEmpty {
-                for preset in presets {
-                    let supportedModes: ToolResultDTOs.SupportedModesInfo = {
-                        if let modes = preset.supportedModes {
-                            return ToolResultDTOs.SupportedModesInfo(
-                                chat: modes.chat,
-                                plan: modes.plan,
-                                review: modes.review
-                            )
-                        }
-                        return ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
-                    }()
-                    models.append(ToolResultDTOs.ModelInfo(
-                        id: preset.id.uuidString,
-                        name: preset.name,
-                        description: preset.description,
-                        supportedModes: supportedModes
-                    ))
+        let chatPresets = ChatPresetManager.shared.allPresets
+        var lines = ["Available Model Presets (automatic-selection priority order):"]
+        for (priority, preset) in presets.enumerated() {
+            lines.append("- \(priority + 1). \(preset.name) (\(preset.id.uuidString))")
+            for (laneIndex, rawModel) in preset.modelStrings.enumerated() {
+                let label = OracleRosterContract.displayLabel(laneIndex: laneIndex)
+                if let model = AIModel.fromModelName(rawModel) {
+                    let availability = promptVM.mcpOracleIsProviderConfigured(for: model)
+                        ? "available"
+                        : "unavailable"
+                    lines.append("  - \(label): \(model.displayName) — \(availability)")
+                } else {
+                    lines.append("  - \(label): \(rawModel) — unknown model")
                 }
-            } else {
-                try models.append(defaultCurrentChatModelInfo())
             }
-        } else {
-            try models.append(defaultCurrentChatModelInfo())
-        }
+            var modes: [String] = []
+            if preset.supports(mode: "chat") { modes.append("Chat") }
+            if preset.supports(mode: "plan") { modes.append("Plan") }
+            if preset.supports(mode: "review") { modes.append("Review") }
+            lines.append("  - Modes: [\(modes.joined(separator: ", "))]")
 
-        func bracketedModes(_ supportedModes: ToolResultDTOs.SupportedModesInfo?) -> String {
-            let modes = supportedModes ?? ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
-            var items: [String] = []
-            if modes.chat { items.append("Chat") }
-            if modes.plan { items.append("Plan") }
-            if modes.review { items.append("Review") }
-            return "[\(items.joined(separator: ", "))]"
-        }
-
-        var lines = ["Available models:"]
-        for model in models {
-            let modesText = bracketedModes(model.supportedModes)
-            let descText = (model.description?.isEmpty == false) ? " — \(model.description!)" : ""
-            lines.append("- \(model.id): \(model.name) — modes: \(modesText)\(descText)")
+            let mappings: [String] = [("Chat", "chat"), ("Plan", "plan"), ("Review", "review")].compactMap { label, mode in
+                guard let id = preset.chatPresetMappings?.presetID(for: mode) else { return nil }
+                let name = chatPresets.first(where: { $0.id == id })?.name ?? "Missing (\(id.uuidString))"
+                return "\(label) → \(name)"
+            }
+            if !mappings.isEmpty {
+                lines.append("  - Chat Presets: \(mappings.joined(separator: "; "))")
+            }
+            if let description = preset.description, !description.isEmpty {
+                lines.append("  - \(description)")
+            }
         }
         return .string(lines.joined(separator: "\n"))
     }
@@ -529,7 +594,7 @@ struct MCPOracleToolService {
     private func resolveAgentOracleOwner(
         tabID: UUID,
         targetWindow: WindowState,
-        tabContext: TabScopedContext?
+        tabContext: TabContextSnapshot?
     ) async -> AgentOracleOwner {
         let agentModeViewModel = targetWindow.agentModeViewModel
         let storedSessionID = tabContext?.activeAgentSessionID
@@ -561,7 +626,7 @@ struct MCPOracleToolService {
         )
     }
 
-    private func oraclePackagingLookupContext(for context: TabScopedContext) async throws -> WorkspaceLookupContext {
+    private func oraclePackagingLookupContext(for context: TabContextSnapshot) async throws -> WorkspaceLookupContext {
         if let frozenLookupContext = context.frozenLookupContext {
             return frozenLookupContext
         }
@@ -596,7 +661,7 @@ struct MCPOracleToolService {
     }
 
     private func oracleSendTabContext(
-        from context: TabScopedContext,
+        from context: TabContextSnapshot,
         owner: AgentOracleOwner = AgentOracleOwner(
             agentSessionID: nil,
             runID: nil,

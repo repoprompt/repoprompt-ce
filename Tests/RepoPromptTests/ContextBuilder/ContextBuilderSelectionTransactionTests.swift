@@ -13,7 +13,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let context = try fixture.installContext(selection: source)
 
         let verification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
+            .init(snapshot: context.withSelection(discovered)),
             metadata: fixture.metadata,
             mutated: true
         )
@@ -33,7 +33,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let context = try fixture.installContext(selection: source)
 
         _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
+            .init(snapshot: context.withSelection(discovered)),
             metadata: fixture.metadata,
             mutated: true
         )
@@ -65,13 +65,13 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
 
         let contextBuilderContext = try fixture.installContext(selection: source)
         let firstVerification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: contextBuilderContext.withSelection(first), usesActiveTabCompatibility: false),
+            .init(snapshot: contextBuilderContext.withSelection(first)),
             metadata: fixture.metadata,
             mutated: true
         )
         let ordinaryAgentContext = try XCTUnwrap(fixture.boundContext)
         let secondVerification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: ordinaryAgentContext.withSelection(second), usesActiveTabCompatibility: false),
+            .init(snapshot: ordinaryAgentContext.withSelection(second)),
             metadata: fixture.metadata,
             mutated: true
         )
@@ -91,7 +91,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let context = try fixture.installContext(selection: source)
 
         _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
+            .init(snapshot: context.withSelection(discovered)),
             metadata: fixture.metadata,
             mutated: true
         )
@@ -116,7 +116,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let context = try fixture.installContext(selection: source)
 
         _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
+            .init(snapshot: context.withSelection(discovered)),
             metadata: fixture.metadata,
             mutated: true
         )
@@ -186,8 +186,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
         let backgroundTab = await window.promptManager.createBackgroundComposeTab(
             strategy: .blank,
-            name: "Transaction \(name)",
-            capacityPolicy: .mcpBackgroundAgent
+            name: "Transaction \(name)"
         )
         let tabID = try XCTUnwrap(backgroundTab?.id)
         return Fixture(

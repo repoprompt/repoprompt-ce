@@ -1,0 +1,191 @@
+import Foundation
+import MCP
+import RepoPromptShared
+
+package enum MCPToolExecutionCleanupDisposition: String, Equatable, Sendable {
+    case forceDisconnect = "force_disconnect"
+    case detachAndSettle = "detach_and_settle"
+}
+
+package enum MCPToolExecutionContract: Equatable, Sendable {
+    case bounded(
+        deadline: Duration,
+        cancellationGrace: Duration,
+        cleanupDisposition: MCPToolExecutionCleanupDisposition
+    )
+    case longSynchronousCancellable
+    case lifecycleManagedCancellable
+    case interactiveCancellable
+    case workspaceLifecycleCancellable
+
+    package var kind: Kind {
+        switch self {
+        case .bounded:
+            .bounded
+        case .longSynchronousCancellable:
+            .longSynchronousCancellable
+        case .lifecycleManagedCancellable:
+            .lifecycleManagedCancellable
+        case .interactiveCancellable:
+            .interactiveCancellable
+        case .workspaceLifecycleCancellable:
+            .workspaceLifecycleCancellable
+        }
+    }
+
+    package var deadline: Duration? {
+        guard case let .bounded(deadline, _, _) = self else { return nil }
+        return deadline
+    }
+
+    package var cancellationGrace: Duration? {
+        guard case let .bounded(_, cancellationGrace, _) = self else { return nil }
+        return cancellationGrace
+    }
+
+    package var cleanupDisposition: MCPToolExecutionCleanupDisposition? {
+        guard case let .bounded(_, _, cleanupDisposition) = self else { return nil }
+        return cleanupDisposition
+    }
+
+    package enum Kind: String, Sendable {
+        case bounded
+        case longSynchronousCancellable = "long_synchronous_cancellable"
+        case lifecycleManagedCancellable = "lifecycle_managed_cancellable"
+        case interactiveCancellable = "interactive_cancellable"
+        case workspaceLifecycleCancellable = "workspace_lifecycle_cancellable"
+    }
+}
+
+package enum MCPToolExecutionDispatchError: Error, Equatable, Sendable {
+    case missingContract(toolName: String)
+    case structureSettlementBusy(windowID: Int, context: MCPCodeStructureSettlementRegistry.BusyContext)
+    case structureSettlementWindowUnresolved
+}
+
+package enum MCPToolExecutionContractCatalog {
+    private static let promptExportContract = MCPToolExecutionContract.bounded(
+        deadline: MCPTimeoutPolicy.promptExportExecutionDeadline,
+        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+        cleanupDisposition: .forceDisconnect
+    )
+
+    private static let workspaceSwitchContract = MCPToolExecutionContract.bounded(
+        deadline: MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline,
+        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+        cleanupDisposition: .forceDisconnect
+    )
+
+    package static let orderedAdvertisedToolNames = MCPGlobalToolName.orderedToolNames + MCPWindowToolName.orderedToolNames
+
+    package static let contracts: [String: MCPToolExecutionContract] = {
+        let bounded = MCPToolExecutionContract.bounded(
+            deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+            cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+            cleanupDisposition: .forceDisconnect
+        )
+        var result = Dictionary(uniqueKeysWithValues: orderedAdvertisedToolNames.map { ($0, bounded) })
+        for toolName in [
+            MCPWindowToolName.fileActions,
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.readFile,
+            MCPWindowToolName.getFileTree
+        ] {
+            result[toolName] = .bounded(
+                deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                cleanupDisposition: .detachAndSettle
+            )
+        }
+
+        for toolName in [
+            MCPWindowToolName.oracleUtils,
+            MCPWindowToolName.askOracle,
+            MCPWindowToolName.oracleSend,
+            MCPWindowToolName.oracleChatLog,
+            MCPWindowToolName.contextBuilder,
+            MCPWindowToolName.search
+        ] {
+            result[toolName] = .longSynchronousCancellable
+        }
+
+        for toolName in [
+            MCPWindowToolName.agentExplore,
+            MCPWindowToolName.agentRun,
+            // `agent_session_link.wait` parks on an event, not a timer, for up to the shared agent
+            // wait maximum. A bounded dispatch deadline would sever it mid-wait.
+            MCPWindowToolName.agentSessionLink
+        ] {
+            result[toolName] = .lifecycleManagedCancellable
+        }
+
+        for toolName in [
+            MCPWindowToolName.applyEdits,
+            MCPWindowToolName.askUser,
+            MCPWindowToolName.waitForNextInstruction
+        ] {
+            result[toolName] = .interactiveCancellable
+        }
+
+        for toolName in [
+            MCPGlobalToolName.bindContext,
+            MCPGlobalToolName.manageWorkspaces,
+            MCPWindowToolName.git,
+            MCPWindowToolName.manageWorktree
+        ] {
+            result[toolName] = .workspaceLifecycleCancellable
+        }
+
+        return result
+    }()
+
+    package static func contract(for toolName: String) -> MCPToolExecutionContract? {
+        contracts[toolName]
+    }
+
+    package static func contract(
+        for toolName: String,
+        arguments: [String: Value]
+    ) -> MCPToolExecutionContract? {
+        guard let baseContract = contract(for: toolName) else { return nil }
+        if [MCPWindowToolName.prompt, MCPWindowToolName.workspaceContext].contains(toolName),
+           MCPPromptContextOperation.parse(toolName: toolName, arguments: arguments) == .export
+        {
+            return promptExportContract
+        }
+        if toolName == MCPWindowToolName.fileActions,
+           arguments["action"]?.stringValue?
+           .trimmingCharacters(in: .whitespacesAndNewlines)
+           .lowercased() == "delete"
+        {
+            return .bounded(
+                deadline: MCPTimeoutPolicy.fileActionTrashExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                cleanupDisposition: .detachAndSettle
+            )
+        }
+        guard toolName == MCPGlobalToolName.manageWorkspaces else { return baseContract }
+        guard let rawAction = arguments["action"]?.stringValue else {
+            return baseContract
+        }
+        let action = rawAction
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        let producesWorkspaceSwitch: Bool = switch action {
+        case "switch":
+            true
+        case "create":
+            // Mirror the handler's `args["switch_to_created"]?.boolValue ?? true`: an
+            // omitted or malformed flag still performs the switch, so it must stay
+            // under the workspace-switch deadline.
+            arguments["switch_to_created"]?.boolValue ?? true
+        case "delete":
+            arguments["close_window"]?.boolValue == true
+        default:
+            false
+        }
+
+        return producesWorkspaceSwitch ? workspaceSwitchContract : baseContract
+    }
+}

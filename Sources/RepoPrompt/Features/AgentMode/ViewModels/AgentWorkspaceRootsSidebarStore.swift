@@ -9,6 +9,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         case updating
         case reconciling
         case paused
+        case recoveryExhausted
         case unavailable
         case revoked
     }
@@ -41,7 +42,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
     var tone: Tone {
         switch state {
         case .notInitialized, .indexing, .updating: .accent
-        case .reconciling: .warning
+        case .reconciling, .recoveryExhausted: .warning
         case .ready: .success
         case .paused, .unavailable, .revoked: .secondary
         }
@@ -52,20 +53,24 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
     }
 
     var canToggle: Bool {
-        state != .unavailable && state != .revoked
+        state != .recoveryExhausted && state != .unavailable && state != .revoked
+    }
+
+    var canRetry: Bool {
+        state == .recoveryExhausted
     }
 
     var isActivelyMapping: Bool {
         switch state {
         case .notInitialized, .indexing, .updating, .reconciling: true
-        case .ready, .paused, .unavailable, .revoked: false
+        case .ready, .paused, .recoveryExhausted, .unavailable, .revoked: false
         }
     }
 
     var showsProgress: Bool {
         switch state {
         case .notInitialized, .indexing, .updating, .reconciling: true
-        case .ready, .paused, .unavailable, .revoked: false
+        case .ready, .paused, .recoveryExhausted, .unavailable, .revoked: false
         }
     }
 
@@ -101,6 +106,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
                 ?? "Updating — discovering files…"
         case .reconciling: "Reconciling…"
         case .paused: "Paused"
+        case .recoveryExhausted: "Retry needed"
         case .unavailable: "Unavailable"
         case .revoked: "Revoked"
         }
@@ -126,6 +132,8 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
             "Code Map graph is usable while watcher changes are reconciled."
         case .paused:
             "Paused for this loaded root. Resume to allow Code Map indexing."
+        case .recoveryExhausted:
+            "Code Map indexing stopped after repeated worker recovery attempts. Retry to resume from its checkpoint."
         case .unavailable:
             "Code Maps are unavailable for this root."
         case .revoked:
@@ -137,6 +145,10 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         guard let snapshot else { return .pending }
         let state: State = if snapshot.isGenerationSuspended {
             .paused
+        } else if snapshot.availability == .unavailable,
+                  snapshot.unavailableReason == .workerRecoveryExhausted
+        {
+            .recoveryExhausted
         } else {
             switch snapshot.availability {
             case .notInitialized: .notInitialized
@@ -169,6 +181,7 @@ struct AgentWorkspaceCodemapSummary: Equatable {
         case reconciling
         case ready
         case paused
+        case recoveryExhausted
         case mixed
         case unavailable
     }
@@ -189,7 +202,7 @@ struct AgentWorkspaceCodemapSummary: Equatable {
 
     var label: String {
         switch state {
-        case .indexing, .reconciling, .ready, .unavailable: "Code Map"
+        case .indexing, .reconciling, .ready, .recoveryExhausted, .unavailable: "Code Map"
         case .paused: "Paused"
         case .mixed: "Partial"
         }
@@ -224,6 +237,8 @@ struct AgentWorkspaceCodemapSummary: Equatable {
             return "All available roots mapped"
         case .paused:
             return "Indexing paused"
+        case .recoveryExhausted:
+            return "Indexing needs retry"
         case .mixed:
             return "\(readyRootCount) mapped • \(pausedRootCount) paused"
         case .unavailable:
@@ -250,10 +265,11 @@ struct AgentWorkspaceCodemapSummary: Equatable {
         let activelyMappingRoots = availableRoots.filter {
             switch $0.state {
             case .notInitialized, .indexing, .updating: true
-            case .reconciling, .ready, .paused, .unavailable, .revoked: false
+            case .reconciling, .ready, .paused, .recoveryExhausted, .unavailable, .revoked: false
             }
         }
         let reconcilingRoots = availableRoots.filter { $0.state == .reconciling }
+        let recoveryExhaustedRoots = presentations.filter { $0.state == .recoveryExhausted }
         let pausedRoots = availableRoots.filter(\.isPaused)
         let readyRoots = availableRoots.filter { $0.state == .ready }
         let activeNonPausedRoots = availableRoots.filter { !$0.isPaused }
@@ -274,6 +290,8 @@ struct AgentWorkspaceCodemapSummary: Equatable {
             .indexing
         } else if !reconcilingRoots.isEmpty {
             .reconciling
+        } else if !recoveryExhaustedRoots.isEmpty {
+            .recoveryExhausted
         } else if availableRoots.isEmpty {
             .unavailable
         } else if pausedRoots.count == availableRoots.count {
@@ -288,7 +306,7 @@ struct AgentWorkspaceCodemapSummary: Equatable {
             rawProgress.map { min(0.99, $0) }
         case .ready:
             1
-        case .paused, .mixed, .unavailable:
+        case .paused, .recoveryExhausted, .mixed, .unavailable:
             nil
         }
         let activeRootsAreUpdating = !activelyMappingRoots.isEmpty && activelyMappingRoots.allSatisfy {
@@ -299,7 +317,7 @@ struct AgentWorkspaceCodemapSummary: Equatable {
             activeRootsAreUpdating ? "Updating — discovering files…" : "Indexing — discovering files…"
         case .reconciling:
             "Reconciling — discovering files…"
-        case .ready, .paused, .mixed, .unavailable:
+        case .ready, .paused, .recoveryExhausted, .mixed, .unavailable:
             "Discovering files…"
         }
         return Self(
@@ -389,6 +407,7 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
     private let codemapStatusLookup: @MainActor (UUID) -> WorkspaceCodemapRootStatusSnapshot?
     private let codemapStatusChanges: AnyPublisher<Void, Never>
     private let setCodemapSuspended: @MainActor (UUID, Bool) async -> Void
+    private let retryCodemapGraphIndex: @MainActor (UUID) async -> Void
     private let workspaceManager: WorkspaceManagerViewModel
     let windowID: Int
 
@@ -408,6 +427,7 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         codemapStatusLookup: @escaping @MainActor (UUID) -> WorkspaceCodemapRootStatusSnapshot? = { _ in nil },
         codemapStatusChanges: AnyPublisher<Void, Never> = Empty<Void, Never>().eraseToAnyPublisher(),
         setCodemapSuspended: @escaping @MainActor (UUID, Bool) async -> Void = { _, _ in },
+        retryCodemapGraphIndex: @escaping @MainActor (UUID) async -> Void = { _ in },
         workspaceManager: WorkspaceManagerViewModel,
         windowID: Int
     ) {
@@ -418,6 +438,7 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         self.codemapStatusLookup = codemapStatusLookup
         self.codemapStatusChanges = codemapStatusChanges
         self.setCodemapSuspended = setCodemapSuspended
+        self.retryCodemapGraphIndex = retryCodemapGraphIndex
         self.workspaceManager = workspaceManager
         self.windowID = windowID
 
@@ -503,6 +524,16 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         codemapActionRootIDs.insert(rowID)
         defer { codemapActionRootIDs.remove(rowID) }
         await setCodemapSuspended(rowID, !row.codemap.isPaused)
+        resnapshotRootRows()
+    }
+
+    func retryCodemapGeneration(rowID: UUID) async {
+        guard !codemapActionRootIDs.contains(rowID),
+              rootRows.first(where: { $0.id == rowID })?.codemap.canRetry == true
+        else { return }
+        codemapActionRootIDs.insert(rowID)
+        defer { codemapActionRootIDs.remove(rowID) }
+        await retryCodemapGraphIndex(rowID)
         resnapshotRootRows()
     }
 

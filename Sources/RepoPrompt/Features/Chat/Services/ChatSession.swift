@@ -20,12 +20,20 @@ enum ChatSessionError: Error {
     }
 }
 
+enum OracleExecutionAuthority: String, Codable {
+    case frozen
+}
+
 struct ChatSession: Codable, Identifiable {
     let id: UUID
     var workspaceID: UUID?
     var composeTabID: UUID?
     var agentModeSessionID: UUID?
     var agentModeRunID: UUID?
+    var oracleGroupID: UUID?
+    var oracleLaneIndex: Int?
+    var oracleGroupSize: Int?
+    var oracleModelRaw: String?
     var name: String
     var savedAt: Date
     var fileURL: URL?
@@ -41,6 +49,8 @@ struct ChatSession: Codable, Identifiable {
 
     /// NEW: The selected Chat Preset for this session
     var selectedChatPresetID: UUID?
+
+    var oracleExecutionAuthority: OracleExecutionAuthority?
 
     /// Human-readable short identifier combining name slug and UUID prefix
     var shortID: String
@@ -58,6 +68,10 @@ struct ChatSession: Codable, Identifiable {
         composeTabID: UUID? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
+        oracleGroupID: UUID? = nil,
+        oracleLaneIndex: Int? = nil,
+        oracleGroupSize: Int? = nil,
+        oracleModelRaw: String? = nil,
         name: String = "Untitled",
         savedAt: Date = Date(),
         fileURL: URL? = nil,
@@ -67,6 +81,7 @@ struct ChatSession: Codable, Identifiable {
         // NEW:
         preferredAIModel: String? = nil,
         selectedChatPresetID: UUID? = nil,
+        oracleExecutionAuthority: OracleExecutionAuthority? = nil,
         messageCount: Int? = nil,
         shortID: String? = nil
     ) {
@@ -75,6 +90,10 @@ struct ChatSession: Codable, Identifiable {
         self.composeTabID = composeTabID
         self.agentModeSessionID = agentModeSessionID
         self.agentModeRunID = agentModeRunID
+        self.oracleGroupID = oracleGroupID
+        self.oracleLaneIndex = oracleLaneIndex
+        self.oracleGroupSize = oracleGroupSize
+        self.oracleModelRaw = oracleModelRaw
         self.name = name
         self.savedAt = savedAt
         self.fileURL = fileURL
@@ -84,6 +103,7 @@ struct ChatSession: Codable, Identifiable {
         self.selectedPromptIDs = selectedPromptIDs
         self.preferredAIModel = preferredAIModel
         self.selectedChatPresetID = selectedChatPresetID
+        self.oracleExecutionAuthority = oracleExecutionAuthority
         self.shortID = shortID ?? Self.makeShortID(name: name, uuid: id)
     }
 
@@ -93,6 +113,10 @@ struct ChatSession: Codable, Identifiable {
         case composeTabID
         case agentModeSessionID
         case agentModeRunID
+        case oracleGroupID
+        case oracleLaneIndex
+        case oracleGroupSize
+        case oracleModelRaw
         case name
         case savedAt
         case fileURL
@@ -102,6 +126,7 @@ struct ChatSession: Codable, Identifiable {
         case selectedPromptIDs
         case preferredAIModel // NEW
         case selectedChatPresetID // NEW
+        case oracleExecutionAuthority
         case shortID
     }
 
@@ -113,6 +138,10 @@ struct ChatSession: Codable, Identifiable {
         composeTabID = try container.decodeIfPresent(UUID.self, forKey: .composeTabID)
         agentModeSessionID = try container.decodeIfPresent(UUID.self, forKey: .agentModeSessionID)
         agentModeRunID = try container.decodeIfPresent(UUID.self, forKey: .agentModeRunID)
+        oracleGroupID = try container.decodeIfPresent(UUID.self, forKey: .oracleGroupID)
+        oracleLaneIndex = try container.decodeIfPresent(Int.self, forKey: .oracleLaneIndex)
+        oracleGroupSize = try container.decodeIfPresent(Int.self, forKey: .oracleGroupSize)
+        oracleModelRaw = try container.decodeIfPresent(String.self, forKey: .oracleModelRaw)
         name = try container.decode(String.self, forKey: .name)
         savedAt = try container.decode(Date.self, forKey: .savedAt)
         fileURL = try container.decodeIfPresent(URL.self, forKey: .fileURL)
@@ -122,6 +151,10 @@ struct ChatSession: Codable, Identifiable {
         selectedPromptIDs = try container.decodeIfPresent([UUID].self, forKey: .selectedPromptIDs) ?? []
         preferredAIModel = try container.decodeIfPresent(String.self, forKey: .preferredAIModel)
         selectedChatPresetID = try container.decodeIfPresent(UUID.self, forKey: .selectedChatPresetID)
+        oracleExecutionAuthority = try container.decodeIfPresent(
+            OracleExecutionAuthority.self,
+            forKey: .oracleExecutionAuthority
+        )
 
         // Handle backward compatibility for shortID
         if let decodedShortID = try container.decodeIfPresent(String.self, forKey: .shortID) {

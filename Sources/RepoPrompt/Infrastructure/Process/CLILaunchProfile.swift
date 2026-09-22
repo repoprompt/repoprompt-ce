@@ -15,6 +15,16 @@ enum CLILaunchProfiles {
         "~/.opencode/bin"
     ]
     static let cursorProviderSpecificPaths: [String] = []
+    /// Official Devin installer location.
+    static let devinProviderSpecificPaths: [String] = [
+        "~/.local/bin"
+    ]
+
+    /// Official Grok Build installer location (`GROK_BIN_DIR` overrides it, but a custom
+    /// value is honored through PATH or an explicitly configured absolute command only).
+    static let grokBuildProviderSpecificPaths: [String] = [
+        "~/.grok/bin"
+    ]
 
     /// Preserve the committed Codex hint order exactly: shell/package-manager
     /// fallbacks first, then Codex.app resources. System bins are intentionally not
@@ -58,6 +68,18 @@ enum CLILaunchProfiles {
         commandName: "cursor-agent",
         preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
+    )
+
+    static let devin = CLILaunchProfile(
+        commandName: "devin",
+        preferredBasenames: ["devin"],
+        supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(devinProviderSpecificPaths)
+    )
+
+    static let grokBuild = CLILaunchProfile(
+        commandName: "grok",
+        preferredBasenames: ["grok"],
+        supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(grokBuildProviderSpecificPaths)
     )
 
     static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {

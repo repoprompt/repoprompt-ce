@@ -686,9 +686,10 @@ public extension VCSService {
             sourceHead: inspection.sourceHead
         )
         let applied = try await gitBackend().applyAndCommitWorktreeMerge(
+            source: inspection.source,
+            target: inspection.target,
             sourceHead: inspection.sourceHead,
-            message: message,
-            at: inspection.target.url
+            message: message
         )
         if !applied.state.conflictFiles.isEmpty {
             return GitWorktreeMergeApplyResult(
@@ -731,7 +732,11 @@ public extension VCSService {
             sourceHead: request.sourceHead
         )
         do {
-            let commit = try await gitBackend().continueWorktreeMerge(message: message, at: request.target.url)
+            let commit = try await gitBackend().continueWorktreeMerge(
+                source: request.source,
+                target: request.target,
+                message: message
+            )
             invalidateCache(for: request.target.url)
             return GitWorktreeMergeApplyResult(
                 status: .completed,
@@ -758,7 +763,7 @@ public extension VCSService {
 
     func abortGitWorktreeMerge(_ request: GitWorktreeMergeAbortRequest) async throws -> GitWorktreeMergeAbortResult {
         try await requireGitMergeEndpoint(request.target, operation: "abort_worktree_merge")
-        let aborted = try await gitBackend().abortWorktreeMerge(at: request.target.url)
+        let aborted = try await gitBackend().abortWorktreeMerge(target: request.target)
         let targetHead = try await gitBackend().getHeadID(at: request.target.url)
         invalidateCache(for: request.target.url)
         return GitWorktreeMergeAbortResult(

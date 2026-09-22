@@ -35,6 +35,22 @@ struct RuntimeLocalSigningExpectation: Equatable {
 }
 
 enum RuntimeCodeSigningDetector {
+    static func validatesStaticCode(at executableURL: URL, requirementSource: String) -> Bool {
+        var staticCode: SecStaticCode?
+        let createStatus = SecStaticCodeCreateWithPath(executableURL as CFURL, [], &staticCode)
+        guard createStatus == errSecSuccess,
+              let staticCode,
+              let requirement = requirement(from: requirementSource)
+        else {
+            return false
+        }
+        return SecStaticCodeCheckValidity(
+            staticCode,
+            SecCSFlags(rawValue: kSecCSStrictValidate),
+            requirement
+        ) == errSecSuccess
+    }
+
     static func currentProcessSigningInfo(
         localSigningExpectation: RuntimeLocalSigningExpectation? = nil
     ) -> RuntimeCodeSigningInfo {
@@ -77,6 +93,9 @@ enum RuntimeCodeSigningDetector {
         let leafCertificateSHA256 = leafCertificateFingerprint(from: dictionary)
 
         guard let developerIDRequirement = requirement(from: RuntimeCodeSigningPolicy.developerIDRequirement),
+              let successorDeveloperIDRequirement = requirement(
+                  from: RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
+              ),
               let debugRequirement = requirement(from: RuntimeCodeSigningPolicy.appleDevelopmentDebugRequirement)
         else {
             return RuntimeCodeSigningInfo(
@@ -92,6 +111,13 @@ enum RuntimeCodeSigningDetector {
         var validatedDomains: Set<RuntimeCodeSigningDomain> = []
         if SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), developerIDRequirement) == errSecSuccess {
             validatedDomains.insert(.developerID)
+        }
+        if SecCodeCheckValidity(
+            code,
+            SecCSFlags(rawValue: kSecCSStrictValidate),
+            successorDeveloperIDRequirement
+        ) == errSecSuccess {
+            validatedDomains.insert(.successorDeveloperID)
         }
         if SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), debugRequirement) == errSecSuccess {
             validatedDomains.insert(.appleDevelopmentDebug)
@@ -115,11 +141,22 @@ enum RuntimeCodeSigningDetector {
         )
     }
 
-    private static func requirement(from source: String) -> SecRequirement? {
+    static func requirement(from source: String) -> SecRequirement? {
         var requirement: SecRequirement?
         let status = SecRequirementCreateWithString(source as CFString, [], &requirement)
         guard status == errSecSuccess else { return nil }
         return requirement
+    }
+
+    static func requirementData(from source: String) -> Data? {
+        guard let requirement = requirement(from: source) else { return nil }
+        var data: CFData?
+        guard SecRequirementCopyData(requirement, [], &data) == errSecSuccess,
+              let data
+        else {
+            return nil
+        }
+        return data as Data
     }
 
     private static func leafCertificateFingerprint(from dictionary: [String: Any]) -> String? {
