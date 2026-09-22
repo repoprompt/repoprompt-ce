@@ -93,7 +93,11 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         } else {
             "\(systemPrompt)\n\n\(userMessage)"
         }
-        return try ACPPromptContentBuilder.blocks(text: text, attachments: request.attachments)
+        return try ACPPromptContentBuilder.blocks(
+            text: text,
+            attachments: request.attachments,
+            transientImages: message.transientImages
+        )
     }
 
     func normalizeSessionUpdate(
