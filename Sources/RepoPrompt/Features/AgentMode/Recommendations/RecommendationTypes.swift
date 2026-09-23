@@ -402,7 +402,7 @@ enum BestPracticeProfiles {
 
     // MARK: Model Strength Summary
 
-    static let claudeCodeOpusRecommendationLabel = "Claude Opus via Claude Code's stable Opus alias (Opus 5 on the Anthropic API)"
+    static let claudeCodeOpusRecommendationLabel = "Claude Opus via Claude Code's stable Opus alias (Opus 5.5 on the Anthropic API)"
 
     static let claudeStrengths = """
     \(claudeCodeOpusRecommendationLabel) remains great for editing-heavy work and careful file modifications. \

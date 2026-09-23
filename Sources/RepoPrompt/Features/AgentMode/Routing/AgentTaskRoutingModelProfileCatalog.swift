@@ -7,19 +7,19 @@ import Foundation
 /// about capability and API list price. Refresh the snapshot when recommended model families,
 /// aliases, published evaluations, or prices change.
 enum AgentTaskRoutingModelProfileCatalog {
-    static let evidenceVersion = "rpce.model-routing-evidence.2026-09-19"
-    static let rubricVersion = "rpce.automatic-utility-frontier.v1-evidence-2026-09-19"
+    static let evidenceVersion = "rpce.model-routing-evidence.2026-09-23"
+    static let rubricVersion = "rpce.automatic-utility-frontier.v1-evidence-2026-09-23"
 
     static func description(for target: AgentRoutingExecutableTarget) -> String {
         let modelIdentity = normalizedModelIdentity(for: target)
         let evidence = profile(for: modelIdentity)
         let effort = effortDescription(for: target)
-        return "Evidence snapshot 2026-09-19 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): \(evidence) \(effort)"
+        return "Evidence snapshot 2026-09-23 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): \(evidence) \(effort)"
     }
 
     static func modelDescription(for target: AgentRoutingExecutableTarget) -> String {
         let modelIdentity = normalizedModelIdentity(for: target)
-        return "Evidence snapshot 2026-09-19 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): \(profile(for: modelIdentity))"
+        return "Evidence snapshot 2026-09-23 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): \(profile(for: modelIdentity))"
     }
 
     private static func profile(for modelIdentity: String) -> String {
@@ -38,8 +38,10 @@ enum AgentTaskRoutingModelProfileCatalog {
             "Claude Sonnet 5 is the balanced Claude tier for sustained everyday coding, tool use, and debugging; Anthropic reports that high effort can match Opus 4.8 on some agentic search and computer-use tasks. API list price: $2 input / $10 output per 1M tokens."
         case "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929":
             "This is an older Claude Sonnet tier for balanced coding and analysis. API list price: $3 input / $15 output per 1M tokens. No current comparable coding score is included in this snapshot."
-        case "opus", "opus[1m]", "claude-opus-5":
-            "Claude Opus 5 is a premium tier for production-ready code, long-running agents, difficult debugging, and complex knowledge work; Anthropic reports frontier performance on Frontier-Bench and near-Fable coding capability at about half Fable's token price. API list price: $5 input / $25 output per 1M tokens."
+        case "opus", "opus[1m]", "claude-opus-5-5":
+            "Claude Opus 5.5 is Anthropic's recommended starting point for most workloads and is built for long-running agentic coding and knowledge work, with a 1M-token context window and medium default effort. API list price: $4 input / $20 output per 1M tokens."
+        case "claude-opus-5":
+            "Claude Opus 5 is an older premium tier for production-ready code, long-running agents, difficult debugging, and complex knowledge work. API list price: $5 input / $25 output per 1M tokens."
         case "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-5-20251101":
             "This is an older premium Claude Opus tier for complex coding and agentic work. API list price: $5 input / $25 output per 1M tokens. No current comparable coding score is included in this snapshot."
         case "fable", "claude-fable-5-1":

@@ -199,7 +199,7 @@ struct AgentTaskRoutingCandidateBuilder {
         ),
         .init(
             provider: .claudeCode,
-            baseModelAliases: ["claude-opus-5", "opus"],
+            baseModelAliases: ["claude-opus-5-5", "claude-opus-5", "opus"],
             modelClass: "claude-opus",
             rubric: "Judge Opus as a base model using its capability, expected completion reliability, and price, including whether its stronger base capability avoids missed findings or retries."
         ),

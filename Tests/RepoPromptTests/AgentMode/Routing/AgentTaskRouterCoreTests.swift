@@ -568,7 +568,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("$0.20 input / $1.20 output"))
         XCTAssertNil(lunaCandidate.target.reasoningEffortRaw)
         XCTAssertFalse(lunaCandidate.descriptor.targetDescription.contains("Effort:"))
-        XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, "rpce.automatic-utility-frontier.v1-evidence-2026-09-19")
+        XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, "rpce.automatic-utility-frontier.v1-evidence-2026-09-23")
 
         let fableCandidate = try XCTUnwrap(candidates.first(where: {
             ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeFable51.rawValue
@@ -577,6 +577,13 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("Terminal-Bench 4.0"))
         XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("$10 input / $50 output"))
         XCTAssertNil(fableCandidate.target.reasoningEffortRaw)
+
+        let opusCandidate = try XCTUnwrap(candidates.first(where: {
+            ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeOpus55.rawValue
+        }))
+        XCTAssertEqual(opusCandidate.utilityTier, "claude-opus")
+        XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("recommended starting point for most workloads"))
+        XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("$4 input / $20 output"))
     }
 
     func testAutomaticModelCandidatesCoverAvailableBaseModelsWithoutTierDefaults() throws {
