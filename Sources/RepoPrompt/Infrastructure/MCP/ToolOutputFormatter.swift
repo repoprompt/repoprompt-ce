@@ -1966,54 +1966,28 @@ extension ToolOutputFormatter {
     static func formatReadFile(args: [String: Value], value: Value) -> [MCP.Tool.Content] {
         let path = args["path"]?.stringValue ?? "(unknown)"
         let lang = languageTag(forPath: path)
+        // Failure markers take precedence over both decoded and projected content.
+        if case let .object(obj) = value,
+           let failureText = readFileFailureText(from: obj, requestedPath: path)
+        {
+            return [.text(failureText)]
+        }
         // Preferred DTO decoding
         if let dto = value.decode(ToolResultDTOs.ReadFileReply.self) {
-            let displayPath = dto.displayPath ?? path
-            if let errorCode = dto.errorCode, dto.retryable == true {
-                let text = readFileRetryableFailure(
-                    path: displayPath,
-                    error: dto.errorMessage ?? dto.message ?? "Read failed with a retryable workspace error.",
-                    errorCode: errorCode,
-                    retryAfterMilliseconds: dto.retryAfterMilliseconds,
-                    worktreeScope: dto.worktreeScope
-                )
-                return [.text(text)]
-            }
-            let text = readFile(
-                path: displayPath,
-                first: dto.firstLine,
-                last: dto.lastLine,
-                total: dto.totalLines,
-                language: lang,
-                message: dto.message,
-                content: dto.content,
-                worktreeScope: dto.worktreeScope
-            )
-            return [.text(text)]
+            return formatDecodedReadFileReply(dto, requestedPath: path, language: lang)
         }
         // Fallback: value is an object with expected keys but decode failed
         if case let .object(obj) = value {
-            let content = obj["content"]?.stringValue ?? ""
-            let total = obj["total_lines"]?.intValue
-                ?? Int(obj["total_lines"]?.stringValue ?? "")
-                ?? content.components(separatedBy: "\n").count
-            let first = obj["first_line"]?.intValue
-                ?? Int(obj["first_line"]?.stringValue ?? "")
-                ?? (content.isEmpty ? 0 : 1)
-            let last = obj["last_line"]?.intValue
-                ?? Int(obj["last_line"]?.stringValue ?? "")
-                ?? total
-            let message = obj["message"]?.stringValue
-            let text = readFile(
-                path: path,
-                first: first,
-                last: last,
-                total: total,
-                language: lang,
-                message: message,
-                content: content
-            )
-            return [.text(text)]
+            if let projected = projectedReadFileReply(from: obj, requestedPath: path) {
+                return formatDecodedReadFileReply(projected, requestedPath: path, language: lang)
+            }
+            return [.text(readFileUnreadableResult(
+                path: obj["display_path"]?.stringValue ?? path,
+                message: obj["error"]?.stringValue
+                    ?? obj["message"]?.stringValue
+                    ?? "The read_file result had missing file content or invalid line metadata.",
+                worktreeScope: obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) }
+            ))]
         }
         // Fallback: legacy string response (assume whole content)
         if let s = value.stringValue {
@@ -2031,6 +2005,135 @@ extension ToolOutputFormatter {
         }
         // Final fallback: present JSON
         return formatGeneric(value: value)
+    }
+
+    private static func formatDecodedReadFileReply(
+        _ dto: ToolResultDTOs.ReadFileReply,
+        requestedPath: String,
+        language: String
+    ) -> [MCP.Tool.Content] {
+        let displayPath = dto.displayPath ?? requestedPath
+        guard validReadFileRange(dto) else {
+            return [.text(readFileUnreadableResult(
+                path: displayPath,
+                message: "The read_file result had invalid line metadata.",
+                worktreeScope: dto.worktreeScope
+            ))]
+        }
+        let text = readFile(
+            path: displayPath,
+            first: dto.firstLine,
+            last: dto.lastLine,
+            total: dto.totalLines,
+            language: language,
+            message: dto.message,
+            content: dto.content,
+            worktreeScope: dto.worktreeScope
+        )
+        return [.text(text)]
+    }
+
+    /// Rebuilds a reply when JSON decode into `ReadFileReply` fails, for example because
+    /// line fields arrived as whole JSON numbers stored as `.double`.
+    ///
+    /// Content-only legacy objects may infer a range. Supplied line metadata must be
+    /// complete and integral; malformed metadata must not be replaced with success.
+    private static func projectedReadFileReply(
+        from obj: [String: Value],
+        requestedPath: String
+    ) -> ToolResultDTOs.ReadFileReply? {
+        guard let content = obj["content"]?.stringValue else { return nil }
+        let hasLineMetadata = ["first_line", "last_line", "total_lines"].contains { obj[$0] != nil }
+        let first: Int
+        let last: Int
+        let total: Int
+        if hasLineMetadata {
+            guard let parsedFirst = wholeNumberInt(obj["first_line"]),
+                  let parsedLast = wholeNumberInt(obj["last_line"]),
+                  let parsedTotal = wholeNumberInt(obj["total_lines"])
+            else { return nil }
+            first = parsedFirst
+            last = parsedLast
+            total = parsedTotal
+        } else {
+            guard !content.isEmpty else { return nil }
+            first = 1
+            total = content.components(separatedBy: "\n").count
+            last = total
+        }
+        return ToolResultDTOs.ReadFileReply(
+            content: content,
+            totalLines: total,
+            firstLine: first,
+            lastLine: last,
+            message: obj["message"]?.stringValue,
+            displayPath: obj["display_path"]?.stringValue ?? requestedPath,
+            worktreeScope: obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) },
+            errorMessage: obj["error"]?.stringValue,
+            errorCode: obj["error_code"]?.stringValue,
+            retryable: obj["retryable"]?.boolValue,
+            retryAfterMilliseconds: wholeNumberInt(obj["retry_after_ms"])
+        )
+    }
+
+    private static func validReadFileRange(_ dto: ToolResultDTOs.ReadFileReply) -> Bool {
+        guard dto.totalLines >= 0, dto.firstLine >= 0, dto.lastLine >= 0 else { return false }
+        if dto.totalLines == 0 {
+            return dto.content.isEmpty && dto.firstLine == 0 && dto.lastLine == 0
+        }
+        guard dto.firstLine > 0, dto.lastLine <= dto.totalLines else { return false }
+        if dto.lastLine >= dto.firstLine { return true }
+        // The provider supports limit=0 and start_line beyond EOF without an error.
+        return dto.content.isEmpty && dto.lastLine == min(dto.firstLine - 1, dto.totalLines)
+    }
+
+    private static func readFileFailureText(
+        from obj: [String: Value],
+        requestedPath: String
+    ) -> String? {
+        let hasError = ["error", "error_code"].contains { key in
+            guard let value = obj[key] else { return false }
+            if case .null = value { return false }
+            return true
+        }
+        guard hasError || obj["retryable"]?.boolValue == true else { return nil }
+        let path = obj["display_path"]?.stringValue ?? requestedPath
+        let message = obj["error"]?.stringValue ?? obj["message"]?.stringValue ?? "The read_file request failed."
+        let errorCode = obj["error_code"]?.stringValue
+        let scope = obj["worktree_scope"].flatMap { $0.decode(ToolResultDTOs.WorktreeScopeDTO.self) }
+        if obj["retryable"]?.boolValue == true, let errorCode, !errorCode.isEmpty {
+            return readFileRetryableFailure(
+                path: path,
+                error: message,
+                errorCode: errorCode,
+                retryAfterMilliseconds: wholeNumberInt(obj["retry_after_ms"]),
+                worktreeScope: scope
+            )
+        }
+        return readFileUnreadableResult(
+            path: path,
+            message: message,
+            worktreeScope: scope,
+            errorCode: errorCode,
+            retryable: obj["retryable"]?.boolValue
+        )
+    }
+
+    /// Parses line counts from MCP `Value` ints, digit strings, or whole doubles.
+    /// Fractional doubles are rejected so a corrupt `1.5` cannot become a line number.
+    private static func wholeNumberInt(_ value: Value?) -> Int? {
+        guard let value else { return nil }
+        switch value {
+        case let .int(int):
+            return int
+        case let .string(string):
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        case let .double(double):
+            guard double.isFinite else { return nil }
+            return Int(exactly: double)
+        default:
+            return nil
+        }
     }
 
     private static func readFileRetryableFailure(
@@ -2056,6 +2159,24 @@ extension ToolOutputFormatter {
             out.append("- **Retry after**: \(retryAfterMilliseconds) ms")
         }
         out.append("- **Message**: \(error)")
+        out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
+        return out.joined(separator: "\n")
+    }
+
+    private static func readFileUnreadableResult(
+        path: String,
+        message: String,
+        worktreeScope: ToolResultDTOs.WorktreeScopeDTO?,
+        errorCode: String? = nil,
+        retryable: Bool? = nil
+    ) -> String {
+        var out: [String] = []
+        out.append("## File Read \(statusIcon(success: false))")
+        out.append("- **Path**: `\(path)`")
+        out.append("- **Status**: Unreadable tool result")
+        if let errorCode { out.append("- **Code**: \(errorCode)") }
+        if let retryable { out.append("- **Retryable**: \(retryable ? "yes" : "no")") }
+        out.append("- **Message**: \(message)")
         out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
         return out.joined(separator: "\n")
     }

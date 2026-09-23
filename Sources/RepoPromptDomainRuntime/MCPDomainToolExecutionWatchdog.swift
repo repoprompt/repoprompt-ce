@@ -123,6 +123,7 @@ package enum MCPToolExecutionWatchdog {
             case deferred
             case settleDetached
             case settleAbandoned
+            case settleForceDisconnected
         }
 
         enum DetachPreparation {
@@ -135,6 +136,7 @@ package enum MCPToolExecutionWatchdog {
             case detaching
             case detached
             case abandoned
+            case forceDisconnecting
         }
 
         private let lock = NSLock()
@@ -154,6 +156,8 @@ package enum MCPToolExecutionWatchdog {
                     return .settleDetached
                 case .abandoned:
                     return .settleAbandoned
+                case .forceDisconnecting:
+                    return .settleForceDisconnected
                 }
             }
         }
@@ -195,10 +199,23 @@ package enum MCPToolExecutionWatchdog {
         func abandon() -> ResultBox<T>? {
             lock.withLock {
                 switch mode {
-                case .detached, .abandoned:
+                case .detached, .abandoned, .forceDisconnecting:
                     return nil
                 case .running, .detaching:
                     mode = .abandoned
+                    defer { completed = nil }
+                    return completed
+                }
+            }
+        }
+
+        func forceDisconnect() -> ResultBox<T>? {
+            lock.withLock {
+                switch mode {
+                case .detached, .abandoned, .forceDisconnecting:
+                    return nil
+                case .running, .detaching:
+                    mode = .forceDisconnecting
                     defer { completed = nil }
                     return completed
                 }
@@ -307,6 +324,8 @@ package enum MCPToolExecutionWatchdog {
                     await onDetachedSettlement(settlement(for: box))
                 case .settleAbandoned:
                     await onAbandonedSettlement(settlement(for: box))
+                case .settleForceDisconnected:
+                    await onForceDisconnectedSettlement(settlement(for: box))
                 }
             }
         }
@@ -479,8 +498,12 @@ package enum MCPToolExecutionWatchdog {
 
                     switch cleanupDisposition {
                     case .forceDisconnect:
+                        let completed = operationState?.forceDisconnect()
                         tasks.cancelAll()
                         continuation.finish()
+                        if let completed {
+                            await onForceDisconnectedSettlement(settlement(for: completed))
+                        }
                         await onEvent(.cleanupGraceExpired(resolvedDisposition: .forceDisconnect))
                         throw MCPToolExecutionWatchdogError.cleanupUnresponsive
 

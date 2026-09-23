@@ -94,6 +94,24 @@ private final class ProcessDescriptorCleanup: @unchecked Sendable {
     }
 }
 
+/// Resolves a reader drain/deadline race once, without awaiting an uncancellable loser.
+private final class ProcessDrainCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    init(_ continuation: CheckedContinuation<Bool, Never>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ drained: Bool) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(returning: drained)
+    }
+}
+
 /// Global cache: remember the absolute path to a command once we've
 /// successfully launched it at least once. This avoids repeating
 /// interactive-shell lookups (which are relatively expensive).
@@ -170,17 +188,26 @@ final class CLIProcessRunner {
     private let registry = ProcessRegistry()
     private let gate: TaskSemaphore
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
+    private let beforeStreamingRead: (@Sendable () -> Void)?
+    private let beforeStreamingDrain: (@Sendable () -> Void)?
+    private let streamingDrainTimeout: TimeInterval
 
     init(
         config: CLIProcessConfiguration,
         concurrencyLimit: Int = 1,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = { pid in
             ChildProcessExitObserver(pid: pid)
-        }
+        },
+        beforeStreamingRead: (@Sendable () -> Void)? = nil,
+        beforeStreamingDrain: (@Sendable () -> Void)? = nil,
+        streamingDrainTimeout: TimeInterval = 5
     ) {
         self.config = config
         gate = TaskSemaphore(max(concurrencyLimit, 1))
         self.processExitObserverFactory = processExitObserverFactory
+        self.beforeStreamingRead = beforeStreamingRead
+        self.beforeStreamingDrain = beforeStreamingDrain
+        self.streamingDrainTimeout = streamingDrainTimeout
     }
 
     @inline(__always)
@@ -585,10 +612,12 @@ final class CLIProcessRunner {
 
             let gateCoordinator = GateReleaseCoordinator()
             let descriptorCleanup = ProcessDescriptorCleanup(process: spawned)
+            let beforeRead = beforeStreamingRead
 
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 defer { group.leave() }
+                beforeRead?()
                 let chunkSize = 64 * 1024
                 while true {
                     guard let chunk = try? spawned.stdout.read(upToCount: chunkSize), !chunk.isEmpty else { break }
@@ -602,6 +631,7 @@ final class CLIProcessRunner {
             group.enter()
             DispatchQueue.global(qos: .utility).async {
                 defer { group.leave() }
+                beforeRead?()
                 let chunkSize = 64 * 1024
                 while true {
                     guard let chunk = try? spawned.stderr.read(upToCount: chunkSize), !chunk.isEmpty else { break }
@@ -676,10 +706,10 @@ final class CLIProcessRunner {
             // This is the sole physical finalizer. It may remain pending after a
             // bounded stream failure, retaining observer/registry/gate ownership
             // until the existing observer reports a terminal outcome.
-            let finalizationTask = Task.detached { [self, gateCoordinator] in
+            let finalizationTask = Task.detached { [self, gateCoordinator] () -> Bool in
                 guard let outcome = await exitObserver.wait() else {
                     ProcessDiagnostics.log(Self.unresolvedOwnedProcessError(pid: spawned.pid).localizedDescription)
-                    return
+                    return false
                 }
 
                 if case let .failed(error) = outcome {
@@ -691,15 +721,21 @@ final class CLIProcessRunner {
                         ProcessDiagnostics.log(message)
                     }
                 )
-                ProcessDiagnostics.log("🔒 [FD] Closing FDs for pid=\(spawned.pid)")
-                descriptorCleanup.closeAll()
-
-                let groupFinished = await Self.waitForGroup(group, timeout: 5.0, pid: spawned.pid) { msg in
-                    ProcessDiagnostics.log(msg)
-                }
+                // Reaping the child does not mean its queued readers have consumed
+                // the pipe buffers. Keep output open until they reach EOF.
+                descriptorCleanup.closeInput()
+                beforeStreamingDrain?()
+                let groupFinished = await Self.waitForGroup(group, timeout: streamingDrainTimeout)
                 if !groupFinished {
-                    ProcessDiagnostics.log("⚠️ [GROUP] Reader threads timed out for pid=\(spawned.pid)")
+                    // Publish a bounded failure, but retain physical ownership until
+                    // readers settle. Do not inspect their tails or release the gate early.
+                    continuation.finish(throwing: CLIProcessRunnerError.waitFailed(
+                        "Output readers for owned process \(spawned.pid) did not drain before deadline"
+                    ))
+                    descriptorCleanup.closeOutput()
+                    await Self.waitForGroup(group)
                 }
+                descriptorCleanup.closeAll()
 
                 if !stdoutTail.isEmpty {
                     collector?.appendDataSection(title: "STDOUT", data: stdoutTail)
@@ -719,6 +755,7 @@ final class CLIProcessRunner {
                 } else {
                     ProcessDiagnostics.log("⚠️ [GATE] Double-release prevented for pid=\(spawned.pid)")
                 }
+                return groupFinished
             }
 
             // Stream publication is separate from physical finalization so a
@@ -731,7 +768,7 @@ final class CLIProcessRunner {
                     // finalizer has closed descriptors and drained the reader group.
                     // If resultTask throws an unresolved-owner failure, this await is
                     // skipped so the bounded failure remains observable immediately.
-                    await finalizationTask.value
+                    guard await finalizationTask.value else { return }
                     if status == 0, !timedOut, resolvedCommand.contains("/"),
                        Self.isRunnableExecutable(resolvedCommand)
                     {
@@ -762,7 +799,7 @@ final class CLIProcessRunner {
                         ProcessDiagnostics.log(message)
                     }
                     guard await exitObserver.wait(timeout: 0) == nil else {
-                        await finalizationTask.value
+                        _ = await finalizationTask.value
                         return
                     }
                     let error = Self.unresolvedOwnedProcessError(pid: spawned.pid)
@@ -895,36 +932,15 @@ final class CLIProcessRunner {
         }
     }
 
-    /// Wait for group with timeout to prevent deadlocks
-    private static func waitForGroup(_ group: DispatchGroup, timeout: TimeInterval, pid: pid_t, logger: @escaping (String) -> Void) async -> Bool {
-        let timeoutNs = UInt64(timeout * 1_000_000_000)
-
-        return await withTaskGroup(of: Bool.self) { taskGroup in
-            // Task 1: Wait for group to complete
-            taskGroup.addTask {
-                await withCheckedContinuation { continuation in
-                    group.notify(queue: .global()) {
-                        continuation.resume()
-                    }
-                }
-                return true
+    /// Race drain completion against a deadline without a task-group scope that
+    /// waits for the losing (uncancellable) group notification before returning.
+    private static func waitForGroup(_ group: DispatchGroup, timeout: TimeInterval) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let completion = ProcessDrainCompletion(continuation)
+            group.notify(queue: .global()) { completion.finish(true) }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                completion.finish(false)
             }
-
-            // Task 2: Timeout
-            taskGroup.addTask {
-                try? await Task.sleep(nanoseconds: timeoutNs)
-                return false
-            }
-
-            // Return result of whichever finishes first
-            let result = await taskGroup.next() ?? false
-            taskGroup.cancelAll()
-
-            if !result {
-                logger("⏰ [GROUP] Timeout waiting for reader threads for pid=\(pid)")
-            }
-
-            return result
         }
     }
 

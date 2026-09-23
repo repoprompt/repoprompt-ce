@@ -167,10 +167,20 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
     func testStreamingNormalCompletionDrainsOutputBeforeTerminalEvent() async throws {
         let reaper = RecordingChildStatusObserver()
         let lifecycle = ProcessLifecycleProbe()
+        let readers = DispatchSemaphore(value: 0)
+        // The child exits with both readers parked. Release only at the finalizer's
+        // drain boundary, so close-before-drain loses bytes deterministically.
         let runner = makeRunner(statusObserver: { pid, beforeReap, completion in
             reaper.observe(pid: pid, beforeReap: beforeReap, completion: completion)
+        }, beforeStreamingRead: {
+            readers.wait()
+        }, beforeStreamingDrain: {
+            readers.signal()
+            readers.signal()
         })
         addTeardownBlock {
+            readers.signal()
+            readers.signal()
             await runner.cancelAll()
             let processTerminated = await lifecycle.waitForAllProcessesToTerminate()
             if !processTerminated {
@@ -221,6 +231,61 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         XCTAssertEqual(terminalStatus, 0)
         XCTAssertEqual(terminalTimedOut, false)
         XCTAssertFalse(sawOutputAfterTerminal)
+        let terminationCount = await lifecycle.terminationCount
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testStreamingDrainDeadlineFailsBeforeReleasingReaderOwnership() async throws {
+        let reaper = RecordingChildStatusObserver()
+        let lifecycle = ProcessLifecycleProbe()
+        let readers = DispatchSemaphore(value: 0)
+        let terminated = expectation(description: "cleanup after reader release")
+        let runner = makeRunner(statusObserver: { pid, beforeReap, completion in
+            reaper.observe(pid: pid, beforeReap: beforeReap, completion: completion)
+        }, beforeStreamingRead: {
+            readers.wait()
+        }, streamingDrainTimeout: 0)
+        addTeardownBlock {
+            readers.signal()
+            readers.signal()
+            await runner.cancelAll()
+            let settled = await lifecycle.waitForAllProcessesToTerminate()
+            XCTAssertTrue(settled)
+        }
+
+        let stream = try await runner.runStreaming(
+            args: ["-c", "printf 'buffered'; printf 'buffered' >&2"],
+            stdin: nil,
+            outputMode: .none,
+            timeout: 2,
+            onProcessStarted: { pid in await lifecycle.recordStarted(pid) },
+            onProcessTerminated: { pid in
+                await lifecycle.recordTerminated(pid)
+                terminated.fulfill()
+            }
+        )
+        let consumerFinished = expectation(description: "bounded drain failure delivered")
+        let consumer = Task {
+            defer { consumerFinished.fulfill() }
+            do {
+                for try await event in stream {
+                    if case .terminated = event { XCTFail("Incomplete drain must not publish success") }
+                }
+                XCTFail("Expected an explicit drain failure")
+            } catch let CLIProcessRunnerError.waitFailed(message) {
+                XCTAssertTrue(message.contains("did not drain before deadline"))
+            } catch {
+                XCTFail("Unexpected stream failure: \(error)")
+            }
+        }
+        addTeardownBlock { consumer.cancel() }
+        await fulfillment(of: [consumerFinished], timeout: 5)
+        let pendingTerminationCount = await lifecycle.terminationCount
+        XCTAssertEqual(pendingTerminationCount, 0, "Physical cleanup must retain ownership of parked readers")
+        readers.signal()
+        readers.signal()
+        await fulfillment(of: [terminated], timeout: 5)
+        await consumer.value
         let terminationCount = await lifecycle.terminationCount
         XCTAssertEqual(terminationCount, 1)
     }
@@ -443,13 +508,19 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
     }
 
     private func makeRunner(
-        statusObserver: @escaping ChildProcessExitObserver.StatusObserver
+        statusObserver: @escaping ChildProcessExitObserver.StatusObserver,
+        beforeStreamingRead: (@Sendable () -> Void)? = nil,
+        beforeStreamingDrain: (@Sendable () -> Void)? = nil,
+        streamingDrainTimeout: TimeInterval = 5
     ) -> CLIProcessRunner {
         CLIProcessRunner(
             config: CLIProcessConfiguration(command: "/bin/sh", enableDebugLogging: false),
             processExitObserverFactory: { pid in
                 ChildProcessExitObserver(pid: pid, statusObserver: statusObserver)
-            }
+            },
+            beforeStreamingRead: beforeStreamingRead,
+            beforeStreamingDrain: beforeStreamingDrain,
+            streamingDrainTimeout: streamingDrainTimeout
         )
     }
 }

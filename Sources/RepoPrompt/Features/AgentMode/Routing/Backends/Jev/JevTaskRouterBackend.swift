@@ -1,6 +1,10 @@
 import Foundation
 
 struct JevTaskRouterBackend: AgentTaskRouterBackend {
+    /// The shipped routing policy submits exactly one choice question per decision. The judgment
+    /// batch seam below generalizes structural validation only; it does not change what is sent.
+    static let routeQuestionID = "route"
+
     let id = AgentTaskRouterBackendID.jev
     let displayName = "Jev"
     let credentialService: JevRouterCredentialService
@@ -27,45 +31,42 @@ struct JevTaskRouterBackend: AgentTaskRouterBackend {
     }
 
     func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
-        guard request.contractVersion == AgentTaskRoutingRequest.currentContractVersion,
-              (2 ... AgentTaskRoutingEnvelopeBuilder.maximumCandidates).contains(request.candidates.count)
-        else {
+        guard request.contractVersion == AgentTaskRoutingRequest.currentContractVersion else {
             return .failed(category: .invalidRequest, retryable: false, evidence: nil)
         }
-        var criteria: [String: String] = [:]
-        for candidate in request.candidates {
-            guard !candidate.opaqueKey.isEmpty,
-                  criteria.updateValue(
-                      "\(candidate.targetDescription) Suitable work: \(candidate.rubric)",
-                      forKey: candidate.opaqueKey
-                  ) == nil
-            else {
-                return .failed(category: .invalidRequest, retryable: false, evidence: nil)
-            }
+        // Candidate count, empty keys, and duplicate opaque keys are all structural build errors,
+        // so an invalid request is still rejected before the service is contacted.
+        guard let batch = try? JevJudgmentBatch(questions: [
+            JevJudgmentQuestion(
+                id: Self.routeQuestionID,
+                instructions: routingInstructions(for: request),
+                criteria: request.candidates.map {
+                    JevJudgmentCriterion(
+                        opaqueKey: $0.opaqueKey,
+                        description: "\($0.targetDescription) Suitable work: \($0.rubric)"
+                    )
+                }
+            )
+        ]) else {
+            return .failed(category: .invalidRequest, retryable: false, evidence: nil)
         }
         let wireRequest = JevRoutingWireRequest(
             model: JevRouterCredentialService.pinnedModel,
             state: routingState(for: request),
-            questions: [
-                "route": .init(
-                    type: "choice",
-                    instructions: routingInstructions(for: request),
-                    criteria: criteria
-                )
-            ]
+            questions: batch.wireQuestions()
         )
         do {
             let response = try await credentialService.judgeForRouting(wireRequest)
-            let validated = try JevRoutingResponseInterpreter().validate(
-                response,
-                submittedOpaqueKeys: Set(criteria.keys)
-            )
+            let validated = try JevRoutingResponseInterpreter().validate(response, batch: batch)
+            guard let answer = validated.answer(forQuestionID: Self.routeQuestionID) else {
+                return .failed(category: .invalidResponse, retryable: false, evidence: nil)
+            }
             return .selected(
-                opaqueKey: validated.selectedOpaqueKey,
+                opaqueKey: answer.selectedOpaqueKey,
                 evidence: .init(
                     policyVersion: JevRouterCredentialService.routingPolicyVersion,
-                    confidence: validated.confidence,
-                    scores: validated.probabilities,
+                    confidence: answer.confidence,
+                    scores: answer.probabilities,
                     inputTokens: validated.inputTokens,
                     outputTokens: validated.outputTokens,
                     reasonCode: "unique_argmax"

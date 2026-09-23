@@ -396,6 +396,10 @@ actor FileSystemService {
 
         /// Test-only hook invoked inside the real-filesystem off-actor content worker before each read.
         var contentReadChunkHandler: (@Sendable (String) async -> Void)?
+        /// Test-only synchronous gate immediately before fingerprint validation begins.
+        var contentPhysicalReadHandler: (@Sendable () throws -> Void)?
+        /// Test-only asynchronous gate immediately before a decoded-content cache commit.
+        var contentReadCacheCommitHandler: (@Sendable () async -> Void)?
         var contentFingerprintRequestCountForTesting = 0
         var cachedSearchContentWatcherActiveOverrideForTesting: Bool?
 
@@ -519,6 +523,8 @@ actor FileSystemService {
 
     /// Caches the detected encoding for every file we have successfully opened
     var encodingMap = [String: String.Encoding]()
+    /// A read may cache its detected encoding only while no newer filesystem invalidation is known.
+    var contentReadCacheRevision: UInt64 = 0
 
     /// Path we are managing
     let path: String

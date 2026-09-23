@@ -191,7 +191,7 @@ struct StableMenuItem {
     }
 }
 
-private extension NSMenu {
+extension NSMenu {
     static func stableMenu(from items: [StableMenuItem], fontPreset: FontScalePreset = .current) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false

@@ -47,3 +47,61 @@ When every `REPOPROMPT_MCP_WORKING_DIRS` entry is an existing Git worktree of ex
 - Direct worktree-routing tests use real linked Git worktrees and a saved workspace fixture to prove automatic canonical binding, exact existing-worktree selection, coordinator-level detached lifecycle reconciliation, child and provider-conversation inheritance and opt-out, use-time identity revalidation for mappings that carry worktree identity, physical root fencing, stable repository/worktree identities, and zero workspace or worktree-binding persistence. End-to-end `orchestrate` dispatch remains owned by the direct-headless workflow/tool-policy integration boundary rather than this routing fixture.
 - Stdio and private-endpoint tests own terminal provenance, bounded broken-pipe behavior, half-close response drain, identity fencing, token redemption, replay, expiry, and foreign-runtime rejection.
 - `Scripts/headless_runtime_guardrails.sh` rejects duplicate schema/backend/workspace authorities, flat dependency-bag storage, retired registry/window-tool compatibility types, and MainActor/UI dependencies in the domain runtime.
+
+## Canonical workspace admission diagnostics
+
+Agent admission remains fail-closed on a missing, unhealthy, or dirty canonical
+workspace snapshot. Routing-only document registrations do not participate.
+
+`DomainWorkspaceContextAuthority.agentAdmissionSnapshot` reads that snapshot and
+records its attempted/rejected/passed guard decision in one actor turn. On a
+rejected production admission, `RepoPrompt.AgentAdmission` code 2 now includes a
+`Canonical diagnostic: { ... }` JSON tuple in its localized description, so the
+normal MCP error also carries the evidence. No new tool, persistence format,
+automatic save/discard, delay, or retry is introduced.
+
+### Evidence and bounds
+
+The authority retains only its latest 128 transitions globally in memory. Internal
+developer/tests can read `DomainWorkspaceStore.transitionDiagnostics(workspaceID)`.
+History is lost at runtime shutdown and can be evicted by other workspaces.
+The runtime UUID plus lifecycle generation distinguishes reconstruction from the
+previous runtime. Reconstructed dirty origins are explicitly `reconstruction`,
+not an invented attribution to an earlier user action.
+
+Only opaque workspace/runtime/operation UUIDs, revisions, monotonic uptime,
+structured enums, and save generation/state are recorded. Working/saved revisions
+are used instead of content hashes; a boolean records whether their content
+actually differs. Workspace names, paths, document bytes, prompts, credentials,
+user identities, and raw errors never enter the evidence schema.
+
+Save transitions cover **canonical save-command lifetimes**, not UI debounce tasks
+that have not yet submitted a command. `saveScheduled` means command entry;
+`saveStarted` means the dirty save reached its persistence boundary. The terminal
+outcome distinguishes completed, failed, cancelled, and revision-superseded
+commands. A replay or already-clean save can complete without starting disk I/O.
+The existing durable document-write boundary remains authoritative: recoverable
+post-write sidecar failures must not be reported as failed saves.
+
+### Interpreting a failing case
+
+- `dirtySaveInFlight`: at least one canonical save command is live. Compare its
+  generation and revisions with its terminal event and `dirtyCleared` before
+  calling this transient and correct. An in-flight command alone is not proof
+  that it will save this dirty revision.
+- `dirtyWithoutLiveSave`: the dirty state has no live canonical save command.
+  This is **not** automatic proof of user intent or a stuck transition. Correlate
+  the originating operation, any known unsaved edit, and terminal save evidence.
+- `unhealthy` / `unavailable`: a separate canonical health/availability rejection,
+  not a dirty-state diagnosis.
+- `admissionPassed`: this clean-state guard passed, not a promise of successful
+  routing or provider bootstrap. A subsequent failure belongs to a later boundary.
+
+The deterministic tests classify a deliberately unsaved working edit as an
+intentional, correctly rejected state, and show normal completion clearing its
+exact revision. They also exercise cancellation, stale save rejection, actual
+write failure/recovery, and reconstruction. Those synthetic cases do **not**
+classify the previously observed live rejection in issue #1042. Capture the new
+error tuple and corresponding save lifecycle in that workspace before claiming
+its cause or correlating it with #829/#962. No missing terminal transition has
+been demonstrated by this change.

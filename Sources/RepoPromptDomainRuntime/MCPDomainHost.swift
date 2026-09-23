@@ -70,6 +70,9 @@ package struct MCPDomainHostInvocation: Sendable {
     /// Synchronous so the caller can establish execution timing without opening a
     /// reentrancy gap between final host admission and provider invocation.
     package let onProviderEntry: @Sendable () throws -> Void
+    /// Observation only, paired with a successful entry callback around the actual
+    /// binding call. Admission rejection never emits a provider return.
+    package let onProviderReturn: @Sendable () -> Void
     package let submittedAt: ContinuousClock.Instant
 
     package init(
@@ -81,6 +84,7 @@ package struct MCPDomainHostInvocation: Sendable {
         admittedContext: MCPDomainAdmittedContext? = nil,
         admissionDeadline: MCPDomainAdmissionDeadline? = nil,
         onProviderEntry: @escaping @Sendable () throws -> Void = {},
+        onProviderReturn: @escaping @Sendable () -> Void = {},
         submittedAt: ContinuousClock.Instant = ContinuousClock().now
     ) {
         precondition(admittedContext == nil || admittedContext?.connectionID == connectionID)
@@ -92,6 +96,7 @@ package struct MCPDomainHostInvocation: Sendable {
         self.admittedContext = admittedContext
         self.admissionDeadline = admissionDeadline
         self.onProviderEntry = onProviderEntry
+        self.onProviderReturn = onProviderReturn
         self.submittedAt = submittedAt
     }
 }
@@ -276,6 +281,7 @@ package actor MCPDomainHost {
         let admittedContext = invocation.admittedContext
         let admissionDeadline = invocation.admissionDeadline
         let onProviderEntry = invocation.onProviderEntry
+        let onProviderReturn = invocation.onProviderReturn
         #if DEBUG
             let beforeProviderActivation = debugBeforeProviderActivationForTesting
         #endif
@@ -306,6 +312,7 @@ package actor MCPDomainHost {
                         #endif
                         try admissionDeadline?.check()
                         try onProviderEntry()
+                        defer { onProviderReturn() }
                         return try await resolved.binding(arguments)
                     }
                 }

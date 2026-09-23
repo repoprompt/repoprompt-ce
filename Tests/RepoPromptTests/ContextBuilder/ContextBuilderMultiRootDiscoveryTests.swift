@@ -676,6 +676,460 @@ import XCTest
             }
         }
 
+        // MARK: - Settings changes during active runs (#810)
+
+        private static let desiredSettingsA = ContextBuilderBehaviorSettings(
+            contextTokenBudget: 70000,
+            analysisTokenBudget: 90000,
+            enhancementMode: .augment,
+            questionTimeoutSeconds: 120,
+            allowUIClarifyingQuestions: true,
+            allowMCPClarifyingQuestions: true,
+            followUpAnalysisEnabled: false
+        )
+
+        private static let desiredSettingsB = ContextBuilderBehaviorSettings(
+            contextTokenBudget: 50000,
+            analysisTokenBudget: 60000,
+            enhancementMode: .preserve,
+            questionTimeoutSeconds: 30,
+            allowUIClarifyingQuestions: false,
+            allowMCPClarifyingQuestions: false,
+            followUpAnalysisEnabled: true
+        )
+
+        private static func desiredSettings(_ vm: ContextBuilderAgentViewModel) -> ContextBuilderBehaviorSettings {
+            ContextBuilderBehaviorSettings(
+                contextTokenBudget: vm.contextTokenBudget,
+                analysisTokenBudget: vm.analysisTokenBudget,
+                enhancementMode: vm.enhancementMode,
+                questionTimeoutSeconds: vm.questionTimeoutSeconds,
+                allowUIClarifyingQuestions: vm.allowUIClarifyingQuestions,
+                allowMCPClarifyingQuestions: vm.allowMCPClarifyingQuestions,
+                followUpAnalysisEnabled: vm.followUpAnalysisEnabled
+            )
+        }
+
+        /// The production projection fed exactly as `ContextBuilderAgentView` feeds it: real
+        /// active membership, the ownership-checked capture, and the desired preference getters.
+        private static func presentation(_ driver: ContextBuilderMultiRootDiscoveryDriver) -> ContextBuilderBehaviorPresentation {
+            let running = driver.vm.tabsWithActiveContextBuilderRun.contains(driver.tabID)
+            return ContextBuilderBehaviorPresentation.resolve(
+                isRunning: running,
+                activeRunBehavior: running ? driver.vm.activeRunBehavior(for: driver.tabID) : nil,
+                desiredSettings: desiredSettings(driver.vm),
+                selectedFollowUp: driver.vm.selectedFollowUpType
+            )
+        }
+
+        /// `liveBudgetTag` is the budget a live re-read of desired B would have produced for the
+        /// origin under test (UI B enables follow-up analysis: 60000 - 1500; MCP B: 50000 - 1500).
+        private static func assertMessageBuiltFromA(
+            _ message: AgentMessage?,
+            liveBudgetTag: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            guard let message else { return XCTFail("provider did not receive a message", file: file, line: line) }
+            XCTAssertTrue(message.userMessage.contains("<token_budget>68500</token_budget>"), "A budget missing", file: file, line: line)
+            XCTAssertFalse(message.userMessage.contains("<token_budget>\(liveBudgetTag)</token_budget>"), "live B budget present", file: file, line: line)
+            XCTAssertTrue(message.systemPrompt.contains("ask_user"), "A question guidance missing", file: file, line: line)
+            // Captured A is Augment; desired B is Preserve. The mode instructions must come from the capture.
+            XCTAssertTrue(
+                message.systemPrompt.contains("Augment the handoff prompt (MANDATORY)"),
+                "captured Augment handoff guidance missing from the provider-bound system prompt",
+                file: file,
+                line: line
+            )
+            XCTAssertFalse(
+                message.systemPrompt.contains("Leave the prompt COMPLETELY unchanged"),
+                "live Preserve handoff guidance present in the provider-bound system prompt",
+                file: file,
+                line: line
+            )
+        }
+
+        /// Run IDs admitted by a journey, shared with the guaranteed cleanup even when the journey throws.
+        private final class AdmittedRuns {
+            var ids: [UUID] = []
+        }
+
+        /// Original behavior preferences, captured once inside a successfully entered driver scope
+        /// (after the fixture has validated its sandbox) and restored by the outer wrapper.
+        private final class OriginalBehaviorSettings {
+            var value: ContextBuilderBehaviorSettings?
+        }
+
+        /// Restores the seven original behavior preferences only after `body` — which wraps the
+        /// whole driver scope — has returned or thrown, i.e. after the driver's own guaranteed
+        /// shutdown (cancel all runs, join owned tasks, tear down the window). Nothing is read or
+        /// written here unless the driver scope captured the original values; the body's error is
+        /// preserved and rethrown after restoration.
+        private static func withOriginalBehaviorSettings(
+            _ body: @escaping @MainActor (OriginalBehaviorSettings) async throws -> Void
+        ) async throws {
+            let captured = OriginalBehaviorSettings()
+            var failure: Error?
+            do { try await body(captured) } catch { failure = error }
+            if let original = captured.value {
+                GlobalSettingsStore.shared.setContextBuilderBehaviorSettings(original, commit: false)
+                XCTAssertEqual(GlobalSettingsStore.shared.contextBuilderBehaviorSettings(), original)
+            }
+            if let failure { throw failure }
+        }
+
+        /// Runs a journey inside the driver scope, then always clears the reconciliation hook,
+        /// cancels every admitted run, releases gates, joins each run's teardown with a bounded
+        /// fresh per-run expectation, and restores the tab's follow-up selection before rethrowing
+        /// the journey's error. A teardown that does not join within the bound is reported as its
+        /// own failure and is never treated as joined; the driver's shutdown that follows this
+        /// scope still cancels and joins fixture-owned work before settings are restored.
+        private static func settlingAdmittedRuns(
+            _ driver: ContextBuilderMultiRootDiscoveryDriver,
+            original: OriginalBehaviorSettings,
+            _ journey: @escaping @MainActor (AdmittedRuns) async throws -> Void
+        ) async throws {
+            original.value = GlobalSettingsStore.shared.contextBuilderBehaviorSettings()
+            let originalFollowUp = driver.vm.selectedFollowUpType
+            let admitted = AdmittedRuns()
+            var failure: Error?
+            do { try await journey(admitted) } catch { failure = error }
+
+            driver.manager.rootReconciliationGateForTesting = nil
+            // A run can be registered before the journey recorded its ID (for example when a
+            // wait threw); join it too rather than relying on journey bookkeeping.
+            if let active = driver.vm.activeRunIDForTesting(tabID: driver.tabID), !admitted.ids.contains(active) {
+                admitted.ids.append(active)
+            }
+            await driver.vm.cancelAllActiveRuns()
+            driver.fixture.releaseAllGates()
+            for runID in admitted.ids {
+                let joined = await XCTWaiter.fulfillment(of: [driver.teardownExpectation(runID: runID)], timeout: 5)
+                XCTAssertEqual(joined, .completed, "teardown for run \(runID) did not join within the bound")
+            }
+            driver.vm.selectedFollowUpType = originalFollowUp
+            if let failure { throw failure }
+        }
+
+        /// After an earlier run has torn down, a later admitted run that is still active when the
+        /// driver scope exits is identified by the driver's run-specific bookkeeping and joined by
+        /// the driver's cooperative shutdown before the scope returns. A first-teardown-only join
+        /// would skip it once `teardownIDs` is non-empty. Not exercised: a run whose teardown never
+        /// completes (shutdown would wait cooperatively, by design).
+        func testDriverShutdownJoinsLaterAdmittedRunAfterEarlierTeardown() async throws {
+            var scoped: ContextBuilderMultiRootDiscoveryDriver?
+            var firstRunID: UUID?
+            var secondRunID: UUID?
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver { driver in
+                scoped = driver
+                let firstEntered = XCTestExpectation(description: "run 1 provider stream entered")
+                let firstHold = driver.fixture.makeGate()
+                driver.streamBody = { _ in
+                    firstEntered.fulfill()
+                    await firstHold.wait()
+                }
+                driver.vm.runContextBuilderAgent()
+                let first = try XCTUnwrap(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+                firstRunID = first
+                try await driver.fixture.awaitGateEvent(firstEntered)
+                await driver.vm.cancelAgentRun()
+                firstHold.release()
+                try await driver.fixture.awaitGateEvent(driver.teardownExpectation(runID: first))
+                XCTAssertEqual(driver.teardownIDs, [first])
+                XCTAssertTrue(driver.pendingTeardownRunIDs.isEmpty)
+
+                // Second admission: held on its stream and deliberately left active at scope exit.
+                let secondEntered = XCTestExpectation(description: "run 2 provider stream entered")
+                let secondHold = driver.fixture.makeGate()
+                driver.streamBody = { _ in
+                    secondEntered.fulfill()
+                    await secondHold.wait()
+                }
+                driver.vm.runContextBuilderAgent()
+                let second = try XCTUnwrap(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+                secondRunID = second
+                XCTAssertNotEqual(second, first)
+                try await driver.fixture.awaitGateEvent(secondEntered)
+                XCTAssertEqual(driver.teardownIDs, [first])
+                XCTAssertEqual(driver.pendingTeardownRunIDs, [second])
+            }
+            let driver = try XCTUnwrap(scoped)
+            let first = try XCTUnwrap(firstRunID)
+            let second = try XCTUnwrap(secondRunID)
+            XCTAssertEqual(driver.teardownIDs, [first, second])
+            XCTAssertTrue(driver.pendingTeardownRunIDs.isEmpty)
+            XCTAssertFalse(driver.vm.isRunTeardownPendingForTesting(runID: second))
+            XCTAssertEqual(driver.disposed, 2)
+        }
+
+        /// A real UI admission captures A; desired settings become B on the same actor before the
+        /// queued execution builds its message. Execution and the production projection stay on A
+        /// while the run is active, idle presentation returns to B, and a second real admission
+        /// captures B. Runs are cancelled after execution is observed; no follow-up can start.
+        func testUIRunKeepsCapturedExecutionAndPresentationAfterGlobalMutation() async throws {
+            try await Self.withOriginalBehaviorSettings { original in
+                try await ContextBuilderMultiRootDiscoveryDriver.withDriver { driver in
+                    try await Self.settlingAdmittedRuns(driver, original: original) { admitted in
+                        try await Self.uiJourney(driver, admitted: admitted)
+                    }
+                }
+            }
+        }
+
+        private static func uiJourney(_ driver: ContextBuilderMultiRootDiscoveryDriver, admitted: AdmittedRuns) async throws {
+            let selectedFollowUp = driver.vm.selectedFollowUpType
+            XCTAssertEqual(driver.vm.currentTabID, driver.tabID)
+            XCTAssertNil(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+            GlobalSettingsStore.shared.setContextBuilderBehaviorSettings(desiredSettingsA, commit: false)
+            XCTAssertEqual(desiredSettings(driver.vm), desiredSettingsA, "view model does not read the shared store")
+            let expectedA = ContextBuilderRunBehavior.ui(settings: desiredSettingsA, selectedFollowUp: selectedFollowUp)
+            XCTAssertEqual(expectedA.tokenBudget, 70000)
+
+            let streamEntered = XCTestExpectation(description: "UI run 1 provider stream entered")
+            let hold = driver.fixture.makeGate()
+            driver.streamBody = { _ in
+                streamEntered.fulfill()
+                await hold.wait()
+            }
+
+            // Admission captures and publishes A synchronously; execution is only queued.
+            driver.vm.runContextBuilderAgent()
+            let runID = try XCTUnwrap(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+            admitted.ids.append(runID)
+            XCTAssertTrue(driver.vm.tabsWithActiveContextBuilderRun.contains(driver.tabID))
+            XCTAssertEqual(driver.vm.activeRunBehavior(for: driver.tabID), expectedA)
+            XCTAssertEqual(driver.constructed, 0, "provider constructed before the queued execution ran")
+            // Desired settings become B on the same actor, with no suspension since admission.
+            GlobalSettingsStore.shared.setContextBuilderBehaviorSettings(desiredSettingsB, commit: false)
+            XCTAssertEqual(desiredSettings(driver.vm), desiredSettingsB)
+            XCTAssertEqual(driver.vm.activeRunBehavior(for: driver.tabID), expectedA)
+
+            // The provider holds its stream, so the run is still active while execution and
+            // presentation are inspected.
+            try await driver.fixture.awaitGateEvent(streamEntered)
+            XCTAssertEqual(driver.vm.activeRunIDForTesting(tabID: driver.tabID), runID)
+            assertMessageBuiltFromA(driver.messagesByRunID[runID], liveBudgetTag: "58500")
+            XCTAssertEqual(driver.vm.capturedQuestionTimeoutSeconds(tabID: driver.tabID, runID: runID), 120)
+            let active = presentation(driver)
+            XCTAssertEqual(active, .active(expectedA))
+            XCTAssertEqual(active.tokenBudgetLabel, "70k")
+            XCTAssertEqual(active.modeLabel, "Augment")
+            XCTAssertEqual(active.allowsClarifyingQuestions, true)
+            XCTAssertEqual(active.automaticFollowUpPresentation, .off)
+            XCTAssertEqual(desiredSettings(driver.vm), desiredSettingsB, "desired B was not retained")
+
+            // Settle by cancellation after execution was observed; idle presentation follows B.
+            await driver.vm.cancelAgentRun()
+            hold.release()
+            try await driver.fixture.awaitGateEvent(driver.teardownExpectation(runID: runID))
+            XCTAssertNil(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+            XCTAssertFalse(driver.vm.tabsWithActiveContextBuilderRun.contains(driver.tabID))
+            XCTAssertFalse(driver.vm.isRunTeardownPendingForTesting(runID: runID))
+            let idle = presentation(driver)
+            XCTAssertEqual(idle, .idle(ContextBuilderRunBehavior.ui(settings: desiredSettingsB, selectedFollowUp: selectedFollowUp)))
+            XCTAssertEqual(idle.tokenBudgetLabel, "60k")
+            XCTAssertEqual(idle.modeLabel, "Preserve")
+            XCTAssertEqual(idle.allowsClarifyingQuestions, false)
+            XCTAssertEqual(idle.automaticFollowUpPresentation, .enabled(selectedFollowUp))
+
+            // A second real admission captures B. It is cancelled before any completion, so the
+            // captured automatic follow-up can never start a generated response.
+            let secondEntered = XCTestExpectation(description: "UI run 2 provider stream entered")
+            let secondHold = driver.fixture.makeGate()
+            driver.streamBody = { _ in
+                secondEntered.fulfill()
+                await secondHold.wait()
+            }
+            driver.vm.runContextBuilderAgent()
+            let secondRunID = try XCTUnwrap(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+            admitted.ids.append(secondRunID)
+            XCTAssertNotEqual(secondRunID, runID)
+            let expectedB = ContextBuilderRunBehavior.ui(settings: desiredSettingsB, selectedFollowUp: selectedFollowUp)
+            XCTAssertEqual(driver.vm.activeRunBehavior(for: driver.tabID), expectedB)
+            XCTAssertEqual(expectedB.tokenBudget, 60000)
+            XCTAssertEqual(expectedB.automaticFollowUp, selectedFollowUp)
+            try await driver.fixture.awaitGateEvent(secondEntered)
+            XCTAssertEqual(presentation(driver), .active(expectedB))
+            await driver.vm.cancelAgentRun()
+            secondHold.release()
+            try await driver.fixture.awaitGateEvent(driver.teardownExpectation(runID: secondRunID))
+            XCTAssertEqual(driver.teardownIDs, [runID, secondRunID])
+            XCTAssertNil(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+            XCTAssertEqual(driver.streamStarts, 2)
+            XCTAssertEqual(driver.constructed, 2)
+            XCTAssertEqual(driver.disposed, 2)
+            XCTAssertNil(driver.vm.pendingAskUser(for: driver.tabID))
+        }
+
+        /// A real MCP admission captures A; desired settings become B inside the first
+        /// post-registration root-reconciliation callback for the owning run, before the MCP
+        /// message is built. The provider receives a message built from A, the projection stays on
+        /// A, idle presentation returns to B, and a second real admission captures B.
+        func testMCPRunKeepsCapturedExecutionAndPresentationAfterGlobalMutation() async throws {
+            try await Self.withOriginalBehaviorSettings { original in
+                try await ContextBuilderMultiRootDiscoveryDriver.withDriver { driver in
+                    try await Self.settlingAdmittedRuns(driver, original: original) { admitted in
+                        try await Self.mcpJourney(driver, admitted: admitted)
+                    }
+                }
+            }
+        }
+
+        private static func mcpJourney(_ driver: ContextBuilderMultiRootDiscoveryDriver, admitted: AdmittedRuns) async throws {
+            let selectedFollowUp = driver.vm.selectedFollowUpType
+            // Captured MCP permission derives from the desired MCP preference for an active
+            // target, never from the UI preference. In A the UI preference is off while MCP
+            // questions are allowed, so the capture is true although the live UI preference is
+            // false. B flips both preferences: the held run's capture stays true while the live
+            // MCP preference is false, and a later real admission of B captures false although
+            // the live UI preference is then true.
+            var settingsA = desiredSettingsA
+            settingsA.allowUIClarifyingQuestions = false
+            var settingsB = desiredSettingsB
+            settingsB.allowUIClarifyingQuestions = true
+            GlobalSettingsStore.shared.setContextBuilderBehaviorSettings(settingsA, commit: false)
+            XCTAssertEqual(desiredSettings(driver.vm), settingsA)
+            let expectedA = ContextBuilderRunBehavior.mcp(settings: settingsA, wantsResponse: false, targetIsActive: true)
+            XCTAssertTrue(expectedA.allowClarifyingQuestions)
+            XCTAssertEqual(expectedA.tokenBudget, 70000)
+
+            let context = try await driver.resolve()
+            let authority = try await driver.authority(context)
+            XCTAssertEqual(authority.configuration.runBehavior, expectedA)
+
+            // One-shot mutation at the first reconciliation event observed with the owning run
+            // registered and published. The run's discover policy is installed only after the MCP
+            // message has been built, so "active run, no discover policy yet" places this callback
+            // in the startup validation that precedes message construction. The callback returns
+            // immediately; nothing is held here.
+            var observationRunIDs: [UUID] = []
+            var mutatedInRunID: UUID?
+            let mutated = XCTestExpectation(description: "desired settings mutated inside the reconciliation callback")
+            let discoverClientName = try XCTUnwrap(AgentProviderKind.claudeCode.mcpClientNameHint)
+            driver.manager.rootReconciliationGateForTesting = { event in
+                guard event.phase == .observationResponse,
+                      let active = driver.vm.activeRunIDForTesting(tabID: driver.tabID) else { return }
+                observationRunIDs.append(active)
+                guard mutatedInRunID == nil else { return }
+                mutatedInRunID = active
+                admitted.ids.append(active)
+                XCTAssertTrue(driver.vm.tabsWithActiveContextBuilderRun.contains(driver.tabID))
+                XCTAssertEqual(driver.vm.activeRunBehavior(for: driver.tabID), expectedA)
+                XCTAssertNil(driver.messagesByRunID[active], "message already delivered before the callback")
+                XCTAssertEqual(driver.constructed, 0)
+                let pendingPolicies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: discoverClientName)
+                XCTAssertFalse(
+                    pendingPolicies.contains { $0.runID == active && $0.purpose == .discoverRun },
+                    "callback fired after the discover policy was installed, i.e. after message construction"
+                )
+                GlobalSettingsStore.shared.setContextBuilderBehaviorSettings(settingsB, commit: false)
+                XCTAssertEqual(desiredSettings(driver.vm), settingsB)
+                XCTAssertEqual(driver.vm.activeRunBehavior(for: driver.tabID), expectedA)
+                mutated.fulfill()
+            }
+
+            let streamEntered = XCTestExpectation(description: "MCP run 1 provider stream entered")
+            let hold = driver.fixture.makeGate()
+            driver.streamBody = { _ in
+                streamEntered.fulfill()
+                await hold.wait()
+            }
+            let terminal = XCTestExpectation(description: "MCP run 1 settled")
+            var completion: ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion?
+            var callerCancelled = false
+            driver.fixture.startOwnedTask {
+                do { completion = try await driver.run(context, authority: authority) }
+                catch is CancellationError { callerCancelled = true }
+                catch { XCTFail("Unexpected MCP caller failure: \(error)") }
+                terminal.fulfill()
+            }
+            try await driver.fixture.awaitGateEvent(mutated)
+            let runID = try XCTUnwrap(mutatedInRunID)
+            XCTAssertEqual(admitted.ids, [runID])
+
+            // The provider receives a message built from A and holds its stream, so the run is
+            // still active while execution and presentation are inspected.
+            try await driver.fixture.awaitGateEvent(streamEntered)
+            XCTAssertEqual(driver.vm.activeRunIDForTesting(tabID: driver.tabID), runID)
+            XCTAssertEqual(observationRunIDs.first, runID)
+            assertMessageBuiltFromA(driver.messagesByRunID[runID], liveBudgetTag: "48500")
+            XCTAssertEqual(driver.vm.capturedQuestionTimeoutSeconds(tabID: driver.tabID, runID: runID), 120)
+            let active = presentation(driver)
+            XCTAssertEqual(active, .active(expectedA))
+            XCTAssertEqual(active.tokenBudgetLabel, "70k")
+            XCTAssertEqual(active.allowsClarifyingQuestions, true)
+            XCTAssertNil(active.automaticFollowUp)
+            XCTAssertEqual(desiredSettings(driver.vm), settingsB, "desired B was not retained")
+            // The live MCP preference now disagrees with the captured permission. The live UI
+            // preference agrees with it, so this check alone cannot rule out a live UI read; the
+            // A capture above and the second admission below do.
+            XCTAssertTrue(driver.vm.allowUIClarifyingQuestions)
+            XCTAssertFalse(driver.vm.allowMCPClarifyingQuestions)
+
+            // Settle by cancellation after execution was observed. Cancelling an MCP-controlled
+            // run whose stream is still held resolves its caller with CancellationError.
+            await driver.vm.cancelMCPContextBuilderRun(runID: runID)
+            hold.release()
+            try await driver.fixture.awaitGateEvent(terminal)
+            XCTAssertTrue(callerCancelled, "MCP caller did not receive CancellationError for run 1")
+            XCTAssertNil(completion)
+            try await driver.fixture.awaitGateEvent(driver.teardownExpectation(runID: runID))
+            XCTAssertNil(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+            XCTAssertFalse(driver.vm.isRunTeardownPendingForTesting(runID: runID))
+            let idle = presentation(driver)
+            XCTAssertEqual(idle, .idle(ContextBuilderRunBehavior.ui(settings: settingsB, selectedFollowUp: selectedFollowUp)))
+            XCTAssertEqual(idle.tokenBudgetLabel, "60k")
+            XCTAssertEqual(idle.allowsClarifyingQuestions, true)
+
+            // A second real MCP admission captures B: MCP questions are now suppressed even though
+            // the live UI preference allows questions.
+            let secondContext = try await driver.resolve()
+            let secondAuthority = try await driver.authority(secondContext)
+            let expectedB = ContextBuilderRunBehavior.mcp(settings: settingsB, wantsResponse: false, targetIsActive: true)
+            XCTAssertEqual(secondAuthority.configuration.runBehavior, expectedB)
+            XCTAssertFalse(expectedB.allowClarifyingQuestions)
+            XCTAssertTrue(driver.vm.allowUIClarifyingQuestions)
+            let secondEntered = XCTestExpectation(description: "MCP run 2 provider stream entered")
+            let secondHold = driver.fixture.makeGate()
+            driver.streamBody = { _ in
+                secondEntered.fulfill()
+                await secondHold.wait()
+            }
+            let secondTerminal = XCTestExpectation(description: "MCP run 2 settled")
+            var secondCompletion: ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion?
+            var secondCallerCancelled = false
+            driver.fixture.startOwnedTask {
+                do { secondCompletion = try await driver.run(secondContext, authority: secondAuthority) }
+                catch is CancellationError { secondCallerCancelled = true }
+                catch { XCTFail("Unexpected second MCP caller failure: \(error)") }
+                secondTerminal.fulfill()
+            }
+            try await driver.fixture.awaitGateEvent(secondEntered)
+            let secondRunID = try XCTUnwrap(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+            admitted.ids.append(secondRunID)
+            XCTAssertEqual(admitted.ids, [runID, secondRunID])
+            XCTAssertNotEqual(secondRunID, runID)
+            XCTAssertEqual(driver.vm.activeRunBehavior(for: driver.tabID), expectedB)
+            XCTAssertEqual(driver.vm.activeRunBehavior(for: driver.tabID)?.allowClarifyingQuestions, false)
+            XCTAssertEqual(presentation(driver), .active(expectedB))
+            let secondMessage = try XCTUnwrap(driver.messagesByRunID[secondRunID])
+            XCTAssertTrue(secondMessage.userMessage.contains("<token_budget>48500</token_budget>"))
+            XCTAssertFalse(secondMessage.systemPrompt.contains("ask_user"))
+            XCTAssertEqual(mutatedInRunID, runID, "callback mutated more than once or for the wrong run")
+            await driver.vm.cancelMCPContextBuilderRun(runID: secondRunID)
+            secondHold.release()
+            try await driver.fixture.awaitGateEvent(secondTerminal)
+            XCTAssertTrue(secondCallerCancelled, "MCP caller did not receive CancellationError for run 2")
+            XCTAssertNil(secondCompletion)
+            try await driver.fixture.awaitGateEvent(driver.teardownExpectation(runID: secondRunID))
+            XCTAssertEqual(driver.teardownIDs, [runID, secondRunID])
+            XCTAssertEqual(driver.runSettlementCount, 2)
+            XCTAssertNil(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+            XCTAssertEqual(driver.streamStarts, 2)
+            XCTAssertEqual(driver.constructed, 2)
+            XCTAssertEqual(driver.disposed, 2)
+        }
+
         func testRemovalReorderOwnershipAndDeletionDuringProviderValidationRejectBeforeConstruction() async throws {
             for mutation in ["remove", "reorder", "ownership", "delete"] {
                 try await ContextBuilderMultiRootDiscoveryDriver.withDriver { driver in

@@ -51,12 +51,13 @@ The bundled adapter uses TypeSafe's documented HTTP surface directly; there is n
 
 - `GET https://api.typesafe.ai/v1/models` validates an account from a supported Jev alias/family entry (`name`); the pinned version need not appear in that alias list;
 - `POST https://api.typesafe.ai/v1/systemone` sends a map containing one `route` choice question and always pins evaluation to `jev-1.13.0`;
+- `JevJudgmentBatch` owns the structural contract for that question map. The adapter can construct and validate a batch of independent choice questions, but the shipped routing policy submits exactly one `route` question per decision, so the batch adapter itself does not change the transmitted payload or routing policy version. Submitting more than one question is a future policy change that must advance the policy version;
 - Bearer authentication;
 - one request, five-second outer deadline, no RepoPrompt-layer retry;
 - explicit 401/403, 422, 429, and 529 classification;
 - no request/response-body logging.
 
-`JevRoutingResponseInterpreter` strictly validates returned evaluator identity, the single mapped `route` choice answer, exact opaque-key coverage, finite ranged probabilities, distribution sum, a unique probability argmax matching `choice`, confidence, and nonnegative usage. The v1 selection policy accepts that unique validated argmax and records the full probability distribution, confidence, and token usage as evidence. It does not apply a separate confidence threshold.
+`JevRoutingResponseInterpreter` strictly validates returned evaluator identity, every submitted question's choice answer, exact opaque-key coverage, finite ranged probabilities, distribution sum, a unique probability argmax matching `choice`, confidence, and nonnegative usage. Each submitted question must be answered exactly once: a missing answer, an answer for a question that was not submitted, and an answer referencing a sibling question's opaque key are all rejected. Opaque keys are scoped to their own question, so batching never weakens the single-question guarantees. The current selection policy accepts that unique validated argmax and records the full probability distribution, confidence, and token usage as evidence. It does not apply a separate confidence threshold.
 
 The Jev key uses the dedicated `JevRouterAPIKey` secure-storage account. It is included in the complete repair inventory but excluded from provider/CLI, Claude-compatible, and frozen identity-migration inventories. The app-global credential service is shared across windows; each Settings window owns only its view model and observes live `APISettingsViewModel.agentAvailability`.
 

@@ -431,7 +431,32 @@ final class SlashSkillMentionHelper {
     private var refreshTask: Task<Void, Never>?
     private var suggestionTask: Task<Void, Never>?
     private var suggestionRequestID: UInt64 = 0
+    private var isProviderConfigured = false
     private static let typingDebounceNanoseconds: UInt64 = 45_000_000
+
+    /// What a `configure` call should do, given the previous configuration state.
+    enum ConfigurationOutcome: Equatable {
+        /// Slash-skill support is off: drop the provider and tear down any live session.
+        case deactivate
+        /// Support is being turned on: adopt the provider and refresh immediately.
+        case activate
+        /// Support was already on: adopt the refreshed provider closure but leave any pending
+        /// typing debounce and live session untouched.
+        case adoptProvider
+    }
+
+    /// SwiftUI re-runs `updateNSView` (and therefore `configure`) on every keystroke, handing over a
+    /// freshly allocated provider closure each time. Only an off/on transition may force a refresh;
+    /// otherwise each keystroke would cancel the typing debounce and issue a redundant suggestions
+    /// request on the main actor.
+    static func configurationOutcome(
+        enabled: Bool,
+        hasSuggestionsProvider: Bool,
+        isProviderConfigured: Bool
+    ) -> ConfigurationOutcome {
+        guard enabled, hasSuggestionsProvider else { return .deactivate }
+        return isProviderConfigured ? .adoptProvider : .activate
+    }
 
     init() {
         overlay.onRowClicked = { [weak self] _, index in
@@ -444,13 +469,29 @@ final class SlashSkillMentionHelper {
         enabled: Bool,
         suggestionsProvider: ((String) async -> [MentionSuggestion])?
     ) {
-        guard enabled, suggestionsProvider != nil else {
+        switch Self.configurationOutcome(
+            enabled: enabled,
+            hasSuggestionsProvider: suggestionsProvider != nil,
+            isProviderConfigured: isProviderConfigured
+        ) {
+        case .deactivate:
+            let hadState = isProviderConfigured
+                || self.suggestionsProvider != nil
+                || triggerRange != nil
+                || refreshTask != nil
+                || suggestionTask != nil
             self.suggestionsProvider = nil
-            dismiss()
-            return
+            isProviderConfigured = false
+            if hadState {
+                dismiss()
+            }
+        case .activate:
+            self.suggestionsProvider = suggestionsProvider
+            isProviderConfigured = true
+            scheduleRefresh(for: textView, immediate: true, enabled: enabled, isActive: true)
+        case .adoptProvider:
+            self.suggestionsProvider = suggestionsProvider
         }
-        self.suggestionsProvider = suggestionsProvider
-        scheduleRefresh(for: textView, immediate: true, enabled: enabled, isActive: true)
     }
 
     func scheduleRefresh(

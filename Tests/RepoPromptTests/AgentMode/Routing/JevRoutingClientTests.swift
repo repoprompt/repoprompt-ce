@@ -39,6 +39,41 @@ final class JevRoutingClientTests: XCTestCase {
         XCTAssertTrue(encoded.contains(#""criteria":{"#))
     }
 
+    func testJudgeRoundTripsAMultiQuestionBatchInOneRequest() async throws {
+        let body = #"{"model":"jev-1.13.0","answers":{"model":{"type":"choice","choice":"m2","probabilities":{"m1":0.3,"m2":0.7},"confidence":0.8},"effort":{"type":"choice","choice":"e1","probabilities":{"e1":0.9,"e2":0.1},"confidence":0.6}},"usage":{"input_tokens":9,"output_tokens":2}}"#
+        let transport = RecordingJevTransport(status: 200, body: body)
+        let batch = try JevJudgmentBatch(questions: [
+            .init(id: "model", instructions: "Choose the base model.", criteria: [
+                .init(opaqueKey: "m1", description: "M1"),
+                .init(opaqueKey: "m2", description: "M2")
+            ]),
+            .init(id: "effort", instructions: "Choose the effort.", criteria: [
+                .init(opaqueKey: "e1", description: "E1"),
+                .init(opaqueKey: "e2", description: "E2")
+            ])
+        ])
+        let wire = JevRoutingWireRequest(
+            model: JevRouterCredentialService.pinnedModel,
+            state: "task",
+            questions: batch.wireQuestions()
+        )
+        let response = try await JevRoutingClient(transport: transport)
+            .judge(request: wire, apiKey: "secret", timeout: .seconds(5))
+
+        let request = try XCTUnwrap(transport.lastRequest)
+        let encoded = try XCTUnwrap(request.httpBody)
+        let decoded = try JSONDecoder().decode(DecodedJevWireRequest.self, from: encoded)
+        XCTAssertEqual(Set(decoded.questions.keys), ["model", "effort"])
+        XCTAssertEqual(decoded.questions["effort"]?.criteria, ["e1": "E1", "e2": "E2"])
+        XCTAssertEqual(decoded.questions["model"]?.type, "choice")
+
+        XCTAssertEqual(Set(response.answers.keys), ["model", "effort"])
+        let validated = try JevRoutingResponseInterpreter().validate(response, batch: batch)
+        XCTAssertEqual(validated.answer(forQuestionID: "model")?.selectedOpaqueKey, "m2")
+        XCTAssertEqual(validated.answer(forQuestionID: "effort")?.selectedOpaqueKey, "e1")
+        XCTAssertEqual(validated.inputTokens, 9)
+    }
+
     func testOuterDeadlineCancelsTheRequestWithoutRetry() async {
         let transport = CancellationIgnoringJevTransport()
         let deadline = ControlledJevDeadline()
@@ -78,6 +113,20 @@ final class JevRoutingClientTests: XCTestCase {
             }
         }
     }
+}
+
+/// Decodable mirror of the encode-only wire request, so the test can assert the transmitted batch
+/// structure without depending on dictionary encoding order.
+private struct DecodedJevWireRequest: Decodable {
+    struct Question: Decodable {
+        let type: String
+        let instructions: String
+        let criteria: [String: String]
+    }
+
+    let model: String
+    let state: String
+    let questions: [String: Question]
 }
 
 private final class RecordingJevTransport: JevHTTPTransport, @unchecked Sendable {

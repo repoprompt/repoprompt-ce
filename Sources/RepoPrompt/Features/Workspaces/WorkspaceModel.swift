@@ -584,6 +584,10 @@ extension WorkspaceModel {
     @discardableResult
     mutating func normalizeComposeTabInvariants() -> Bool {
         var mutated = false
+        #if DEBUG
+            let interval = WorkspaceProjectionDecodeDiagnostics.beginNormalization()
+            defer { interval?.finish(mutated: mutated) }
+        #endif
 
         if composeTabs.isEmpty {
             let tab = ComposeTabState(

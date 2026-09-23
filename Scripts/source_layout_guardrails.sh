@@ -774,6 +774,7 @@ allowed_tracked_docs=(
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
+  "docs/architecture/mcp-lifecycle-diagnostics.md"
   "docs/architecture/model-routing.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"

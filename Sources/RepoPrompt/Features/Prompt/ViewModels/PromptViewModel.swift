@@ -2286,7 +2286,8 @@ class PromptViewModel: ObservableObject {
         windowID: Int,
         settingsManager: SettingsManaging,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
-        promptClipboardPasteboard: NSPasteboard = .general
+        promptClipboardPasteboard: NSPasteboard = .general,
+        refreshAvailableModelsOnInit: Bool = true
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2308,8 +2309,10 @@ class PromptViewModel: ObservableObject {
         loadStoredPrompts()
         updateFileTree()
 
-        Task {
-            await self.refreshAvailableModels()
+        if refreshAvailableModelsOnInit {
+            Task {
+                await self.refreshAvailableModels()
+            }
         }
 
         syncSettingsFromSettingsManager()

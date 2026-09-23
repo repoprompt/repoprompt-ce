@@ -7,6 +7,211 @@ enum ContextBuilderGeneratedAnswerActionText {
     static let viewInChatTooltip = "Open answer in chat view"
 }
 
+/// Read-only presentation authority for Context Builder behavior readouts.
+///
+/// Idle presentation describes the next run from desired settings. Active presentation
+/// describes the displayed tab's immutable, ownership-valid `ContextBuilderRunBehavior`.
+/// The projection never writes settings, never substitutes live preferences for an
+/// active run, and ends with discovery settlement; it does not own persistence,
+/// admission, run identity, or snapshot lifetime.
+enum ContextBuilderBehaviorPresentation: Equatable {
+    /// No discovery run is active for the displayed tab. Readouts follow desired settings
+    /// exactly as the next UI run would capture them.
+    case idle(ContextBuilderRunBehavior)
+    /// The displayed tab's active discovery run with its captured effective behavior.
+    case active(ContextBuilderRunBehavior)
+    /// A discovery run is active for the displayed tab, but no ownership-valid capture is
+    /// available. Nothing is inferred from desired settings.
+    case unavailable
+
+    /// UI automatic follow-up as the view presents it. `off` is a valid captured/desired
+    /// decision; `unavailable` is unknown and must not be drawn as Off.
+    enum AutomaticFollowUp: Equatable {
+        case enabled(ContextBuilderFollowUpType)
+        case off
+        case unavailable
+    }
+
+    static let unavailableLabel = "Unavailable"
+    static let unavailableSummary = "Current run settings unavailable"
+
+    static func resolve(
+        isRunning: Bool,
+        activeRunBehavior: ContextBuilderRunBehavior?,
+        desiredSettings: ContextBuilderBehaviorSettings,
+        selectedFollowUp: ContextBuilderFollowUpType
+    ) -> ContextBuilderBehaviorPresentation {
+        guard isRunning else {
+            // Desired analysis budgets are normalized to the supported preference range on
+            // read and write (#834); apply the same normalization here so idle matches the
+            // preference editor. Captured effective budgets are never re-clamped.
+            var desired = desiredSettings
+            desired.analysisTokenBudget = ContextBuilderDefaults.normalizedAnalysisTokenBudget(desired.analysisTokenBudget)
+            return .idle(ContextBuilderRunBehavior.ui(settings: desired, selectedFollowUp: selectedFollowUp))
+        }
+        guard let activeRunBehavior else { return .unavailable }
+        return .active(activeRunBehavior)
+    }
+
+    var isActive: Bool {
+        if case .idle = self { return false }
+        return true
+    }
+
+    var isUnavailable: Bool {
+        self == .unavailable
+    }
+
+    /// Effective behavior for readouts; nil only when unavailable.
+    var behavior: ContextBuilderRunBehavior? {
+        switch self {
+        case let .idle(behavior), let .active(behavior): behavior
+        case .unavailable: nil
+        }
+    }
+
+    var enhancementMode: PromptEnhancementMode? {
+        behavior?.enhancementMode
+    }
+
+    /// Effective clarifying-question permission for either origin. Nil when unavailable so
+    /// the indicator never fabricates a disabled permission.
+    var allowsClarifyingQuestions: Bool? {
+        behavior?.allowClarifyingQuestions
+    }
+
+    var questionTimeoutSeconds: TimeInterval? {
+        behavior?.questionTimeoutSeconds
+    }
+
+    /// UI automatic follow-up. Nil with a behavior means Off; MCP captures are always nil
+    /// because MCP response intent is owned separately. Nil when unavailable means unknown.
+    var automaticFollowUp: ContextBuilderFollowUpType? {
+        behavior?.automaticFollowUp
+    }
+
+    var isAutomaticFollowUpEnabled: Bool {
+        automaticFollowUp != nil
+    }
+
+    var automaticFollowUpPresentation: AutomaticFollowUp {
+        switch self {
+        case .unavailable: .unavailable
+        case let .idle(behavior), let .active(behavior):
+            behavior.automaticFollowUp.map { .enabled($0) } ?? .off
+        }
+    }
+
+    var automaticFollowUpIndicatorSymbolName: String {
+        switch automaticFollowUpPresentation {
+        case .enabled: "bolt.fill"
+        case .off: "bolt"
+        case .unavailable: "bolt.trianglebadge.exclamationmark"
+        }
+    }
+
+    /// Tooltip for the compact Auto control. Idle describes the desired next run (Off is
+    /// explicit); active describes the captured decision and budget. `planModelName` is the
+    /// separate Oracle model authority supplied by the view, not part of the capture.
+    func automaticFollowUpTooltip(planModelName: String) -> String {
+        switch self {
+        case .unavailable:
+            return Self.unavailableSummary
+        case let .active(behavior):
+            guard let followUp = behavior.automaticFollowUp else {
+                return "Automatic follow-up: Off for this run"
+            }
+            return "Auto-run \(followUp.buttonLabel.lowercased()) after Context Builder\n\nUses \(planModelName) with \(behavior.tokenBudget / 1000)k tokens"
+        case let .idle(behavior):
+            guard let followUp = behavior.automaticFollowUp else {
+                return "Automatic follow-up: Off\n\nTurn on to run the selected analysis after Context Builder"
+            }
+            return "Auto-run \(followUp.buttonLabel.lowercased()) after Context Builder\n\nUses \(planModelName) with \(behavior.tokenBudget / 1000)k tokens"
+        }
+    }
+
+    var tokenBudgetLabel: String {
+        behavior.map { "\($0.tokenBudget / 1000)k" } ?? Self.unavailableLabel
+    }
+
+    var headerTitle: String {
+        switch enhancementMode {
+        case .fullRewrite: "Task Description"
+        case .augment: "Additional Context (Optional)"
+        case .preserve: "Build Context"
+        case nil: "Context Builder"
+        }
+    }
+
+    var modeLabel: String {
+        switch enhancementMode {
+        case .fullRewrite: "Rewrite"
+        case .augment: "Augment"
+        case .preserve: "Preserve"
+        case nil: Self.unavailableLabel
+        }
+    }
+
+    var headerTooltip: String {
+        switch enhancementMode {
+        case .fullRewrite:
+            "Describe your task here.\n\nThe agent will:\n• Analyze your codebase\n• Select relevant files\n• Write detailed instructions above\n\nThis is your primary input in Rewrite mode."
+        case .augment:
+            "Add extra context to help the agent.\n\nThe agent will:\n• Keep your existing instructions\n• Add relevant context\n• Select appropriate files\n\nLeave empty to just enhance with file context."
+        case .preserve:
+            "Provide hints for context building.\n\nThe agent will:\n• Only select relevant files\n• Leave your instructions unchanged\n\nUseful when you've already written detailed instructions."
+        case nil:
+            Self.unavailableSummary
+        }
+    }
+
+    /// Empty input still describes this run while discovery is active, not the next-run preference.
+    var instructionsPlaceholder: String {
+        switch enhancementMode {
+        case .fullRewrite:
+            "Describe your task here...\n\nExample: \"Add a dark mode toggle to the settings page with system, light, and dark options. Store the preference and apply it app-wide.\""
+        case .augment:
+            "Add extra details to help the agent find relevant files and enhance your prompt"
+        case .preserve:
+            "Describe what files to look for (your instructions won't be modified)"
+        case nil:
+            Self.unavailableSummary
+        }
+    }
+
+    var questionIndicatorSymbolName: String {
+        switch allowsClarifyingQuestions {
+        case true?: "questionmark.circle.fill"
+        case false?: "questionmark.circle"
+        case nil: "questionmark.circle.dashed"
+        }
+    }
+
+    /// Behavior summary lines for the settings tooltip. The timeout appears only when the
+    /// run can ask questions, so a disabled run never implies a timeout is being awaited.
+    var summaryLines: [String] {
+        guard let behavior else { return [Self.unavailableSummary] }
+        var lines = [isActive ? "Current run settings" : "Context Builder Settings"]
+        lines.append("Token budget: \(tokenBudgetLabel)")
+        lines.append("Prompt mode: \(modeLabel)")
+        if behavior.allowClarifyingQuestions {
+            lines.append("Clarifying questions: On")
+            lines.append("Question timeout: \(Self.questionTimeoutLabel(behavior.questionTimeoutSeconds))")
+        } else {
+            lines.append("Clarifying questions: Off")
+        }
+        return lines
+    }
+
+    static func questionTimeoutLabel(_ seconds: TimeInterval) -> String {
+        let wholeSeconds = Int(seconds.rounded())
+        if wholeSeconds >= 60, wholeSeconds % 60 == 0 {
+            return "\(wholeSeconds / 60) min"
+        }
+        return "\(wholeSeconds) sec"
+    }
+}
+
 struct ContextBuilderAgentView: View {
     @ObservedObject var viewModel: ContextBuilderAgentViewModel
     @ObservedObject var oracleViewModel: OracleViewModel
@@ -111,19 +316,42 @@ struct ContextBuilderAgentView: View {
         return viewModel.activeRunBehavior(for: subjectTabID)
     }
 
+    /// Desired next-run configuration. Only idle presentation reads it.
+    private var desiredBehaviorSettings: ContextBuilderBehaviorSettings {
+        ContextBuilderBehaviorSettings(
+            contextTokenBudget: viewModel.contextTokenBudget,
+            analysisTokenBudget: viewModel.analysisTokenBudget,
+            enhancementMode: viewModel.enhancementMode,
+            questionTimeoutSeconds: viewModel.questionTimeoutSeconds,
+            allowUIClarifyingQuestions: viewModel.allowUIClarifyingQuestions,
+            allowMCPClarifyingQuestions: viewModel.allowMCPClarifyingQuestions,
+            followUpAnalysisEnabled: viewModel.followUpAnalysisEnabled
+        )
+    }
+
+    /// Single presentation authority for every readout that describes run behavior.
+    private var behaviorPresentation: ContextBuilderBehaviorPresentation {
+        ContextBuilderBehaviorPresentation.resolve(
+            isRunning: isContextBuilderRunningForTab,
+            activeRunBehavior: activeRunBehavior,
+            desiredSettings: desiredBehaviorSettings,
+            selectedFollowUp: viewModel.selectedFollowUpType
+        )
+    }
+
     private var displayedFollowUpAnalysisEnabled: Bool {
-        activeRunBehavior?.automaticFollowUp != nil || (!isContextBuilderRunningForTab && viewModel.followUpAnalysisEnabled)
+        behaviorPresentation.isAutomaticFollowUpEnabled
     }
 
     private var followUpTooltip: String {
-        let tokenBudget: Int
-        if isContextBuilderRunningForTab {
-            guard let activeRunBehavior else { return "Current run settings unavailable" }
-            tokenBudget = activeRunBehavior.tokenBudget
-        } else {
-            tokenBudget = viewModel.analysisTokenBudget
+        behaviorPresentation.automaticFollowUpTooltip(planModelName: planModelName)
+    }
+
+    private var followUpIndicatorColor: Color {
+        switch behaviorPresentation.automaticFollowUpPresentation {
+        case .enabled, .unavailable: .orange
+        case .off: .secondary
         }
-        return "Auto-run after Context Builder\n\nUses \(planModelName) with \(tokenBudget / 1000)k tokens"
     }
 
     /// Whether a prompt is available for plan generation
@@ -213,25 +441,35 @@ struct ContextBuilderAgentView: View {
                         .font(.callout)
                         .foregroundColor(.secondary)
 
-                    // Auto toggle (compact) with label
+                    // Auto toggle (compact) with label. The switch depicts a valid desired
+                    // (idle) or captured (active) decision only; an active run without an
+                    // ownership-valid capture shows a read-only Unavailable readout instead of
+                    // a false Off position.
+                    let followUpPresentation = behaviorPresentation.automaticFollowUpPresentation
                     HStack(spacing: 4) {
-                        Image(systemName: displayedFollowUpAnalysisEnabled ? "bolt.fill" : "bolt")
+                        Image(systemName: behaviorPresentation.automaticFollowUpIndicatorSymbolName)
                             .font(.caption)
-                            .foregroundColor(displayedFollowUpAnalysisEnabled ? .orange : .secondary)
+                            .foregroundColor(followUpIndicatorColor)
                         Text("Auto")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        Toggle(
-                            "",
-                            isOn: Binding(
-                                get: { displayedFollowUpAnalysisEnabled },
-                                set: { viewModel.followUpAnalysisEnabled = $0 }
+                        if followUpPresentation == .unavailable {
+                            Text(ContextBuilderBehaviorPresentation.unavailableLabel)
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        } else {
+                            Toggle(
+                                "",
+                                isOn: Binding(
+                                    get: { followUpPresentation != .off },
+                                    set: { viewModel.followUpAnalysisEnabled = $0 }
+                                )
                             )
-                        )
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                        .disabled(isContextBuilderRunningForTab)
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .labelsHidden()
+                            .disabled(isContextBuilderRunningForTab)
+                        }
                     }
                     .hoverTooltip(followUpTooltip)
 
@@ -283,52 +521,60 @@ struct ContextBuilderAgentView: View {
             return raw.capitalized
         }()
 
-        if let activeRunBehavior {
-            HStack(spacing: 8) {
-                Image(systemName: "server.rack")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.orange)
-
-                Text("MCP Controlled")
-                    .font(.callout)
-                    .fontWeight(.medium)
-                    .foregroundColor(.orange)
-
-                Text("•")
-                    .foregroundColor(.secondary)
-
-                Text(responseTypeLabel)
-                    .font(.callout)
-                    .foregroundColor(.primary)
-
-                Text("•")
-                    .foregroundColor(.secondary)
-
-                Text("\(activeRunBehavior.tokenBudget / 1000)k tokens")
-                    .font(.callout)
-                    .foregroundColor(.secondary)
-
-                if let model = viewModel.mcpPlanModel, wantsResponse {
-                    Text("•")
-                        .foregroundColor(.secondary)
-                    Text(model)
-                        .font(.callout)
-                        .foregroundColor(.secondary)
-                }
-
-                Spacer(minLength: 0)
-            }
-            .padding(.vertical, 4)
-            .padding(.horizontal, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color.orange.opacity(0.1))
-            )
-        } else {
-            Label("Current MCP run settings unavailable", systemImage: "exclamationmark.triangle.fill")
-                .font(.callout)
+        // MCP response type/model are separately owned metadata and always shown. The
+        // discovery budget shows only while the run is active; an active run without an
+        // ownership-valid capture marks its settings unavailable without hiding the rest.
+        let presentation = behaviorPresentation
+        HStack(spacing: 8) {
+            Image(systemName: "server.rack")
+                .font(.system(size: 14, weight: .medium))
                 .foregroundColor(.orange)
+
+            Text("MCP Controlled")
+                .font(.callout)
+                .fontWeight(.medium)
+                .foregroundColor(.orange)
+
+            Text("•")
+                .foregroundColor(.secondary)
+
+            Text(responseTypeLabel)
+                .font(.callout)
+                .foregroundColor(.primary)
+
+            if case let .active(behavior) = presentation {
+                Text("•")
+                    .foregroundColor(.secondary)
+
+                Text("\(behavior.tokenBudget / 1000)k tokens")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+            }
+
+            if let model = viewModel.mcpPlanModel, wantsResponse {
+                Text("•")
+                    .foregroundColor(.secondary)
+                Text(model)
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+            }
+
+            if presentation.isUnavailable {
+                Text("•")
+                    .foregroundColor(.secondary)
+                Label(ContextBuilderBehaviorPresentation.unavailableSummary, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundColor(.orange)
+            }
+
+            Spacer(minLength: 0)
         }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.orange.opacity(0.1))
+        )
     }
 
     /// Label for the current follow-up type (uses MCP response type when MCP-controlled)
@@ -398,15 +644,18 @@ struct ContextBuilderAgentView: View {
             }
 
         case .idle:
-            // Show waiting state for both UI auto-plan and MCP-controlled runs
+            // Show waiting state for UI auto-plan and MCP-controlled runs, and for an active
+            // run whose captured behavior is unavailable (never drawn as Auto Off).
+            let presentation = behaviorPresentation
             let isWaitingForContextBuilder = isContextBuilderRunningForTab &&
-                (displayedFollowUpAnalysisEnabled || viewModel.isMCPControlledRun)
+                (displayedFollowUpAnalysisEnabled || viewModel.isMCPControlledRun || presentation.isUnavailable)
 
             if isWaitingForContextBuilder {
                 HStack(spacing: 8) {
                     ProgressView()
                         .scaleEffect(0.7)
-                    // Show MCP-specific details when MCP is controlling the run
+                    // MCP intent/model are separate authority and stay visible; the MCP control
+                    // strip above already carries the unavailable-settings warning for MCP runs.
                     if viewModel.isMCPControlledRun {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(mcpWaitingText)
@@ -418,6 +667,10 @@ struct ContextBuilderAgentView: View {
                                     .foregroundColor(.secondary.opacity(0.8))
                             }
                         }
+                    } else if presentation.isUnavailable {
+                        Text(ContextBuilderBehaviorPresentation.unavailableSummary)
+                            .font(.callout)
+                            .foregroundColor(.orange)
                     } else {
                         Text("Waiting for Context Builder...")
                             .font(.callout)
@@ -937,7 +1190,7 @@ struct ContextBuilderAgentView: View {
                     get: { viewModel.followUpAnalysisEnabled },
                     set: { viewModel.followUpAnalysisEnabled = $0 }
                 ),
-                activeRunTokenBudget: activeRunBehavior?.tokenBudget,
+                presentation: behaviorPresentation,
                 resetBehaviorSettings: viewModel.resetContextBuilderBehaviorSettings,
                 isRunning: isContextBuilderRunningForTab,
                 isDisabled: !isContextBuilderRunningForTab && viewModel.isAgentBusy,
@@ -951,7 +1204,7 @@ struct ContextBuilderAgentView: View {
             ContextBuilderInstructionsEditor(
                 text: $viewModel.contextBuilderInstructions,
                 windowID: windowID,
-                enhancementMode: viewModel.enhancementMode,
+                presentation: behaviorPresentation,
                 allowNonContiguousLayout: viewModel.agentRunState.isRunning
             )
         }
@@ -1041,7 +1294,7 @@ struct ContextBuilderAgentView: View {
 private struct ContextBuilderInstructionsEditor: View {
     @Binding var text: String
     let windowID: Int
-    let enhancementMode: PromptEnhancementMode
+    let presentation: ContextBuilderBehaviorPresentation
     /// When true, enables non-contiguous layout to avoid expensive full-layout on click
     let allowNonContiguousLayout: Bool
 
@@ -1054,15 +1307,8 @@ private struct ContextBuilderInstructionsEditor: View {
     @State private var writeBackDebounceItem: DispatchWorkItem? = nil
     @State private var writeBackWorkGate = WorkItemGate()
 
-    private var placeholderText: String {
-        switch enhancementMode {
-        case .fullRewrite:
-            "Describe your task here...\n\nExample: \"Add a dark mode toggle to the settings page with system, light, and dark options. Store the preference and apply it app-wide.\""
-        case .augment:
-            "Add extra details to help the agent find relevant files and enhance your prompt"
-        case .preserve:
-            "Describe what files to look for (your instructions won't be modified)"
-        }
+    private var enhancementMode: PromptEnhancementMode? {
+        presentation.enhancementMode
     }
 
     private var editorMinHeight: CGFloat {
@@ -1107,7 +1353,7 @@ private struct ContextBuilderInstructionsEditor: View {
         .overlay(
             Group {
                 if localText.isEmpty {
-                    Text(placeholderText)
+                    Text(presentation.instructionsPlaceholder)
                         .font(.callout)
                         .foregroundColor(.secondary.opacity(0.5))
                 }
@@ -1239,7 +1485,9 @@ private struct ContextBuilderHeaderBar: View {
     @Binding var questionTimeoutSeconds: TimeInterval
     @Binding var analysisTokenBudget: Int
     @Binding var followUpAnalysisEnabled: Bool
-    let activeRunTokenBudget: Int?
+    /// Read-only authority for every behavioral readout in the header. The bindings above
+    /// remain the desired next-run editor for the settings popover only.
+    let presentation: ContextBuilderBehaviorPresentation
     let resetBehaviorSettings: () -> Void
     let isRunning: Bool
     let isDisabled: Bool
@@ -1251,52 +1499,10 @@ private struct ContextBuilderHeaderBar: View {
     @State private var showingSettingsPopover = false
     @State private var isSettingsHovered = false
 
-    private var displayBudgetLabel: String {
-        let tokenBudget = isRunning
-            ? activeRunTokenBudget
-            : (followUpAnalysisEnabled ? analysisTokenBudget : contextTokenBudget)
-        return tokenBudget.map { "\($0 / 1000)k" } ?? "Unavailable"
-    }
-
-    private var headerText: String {
-        switch enhancementMode {
-        case .fullRewrite:
-            "Task Description"
-        case .augment:
-            "Additional Context (Optional)"
-        case .preserve:
-            "Build Context"
-        }
-    }
-
-    private var modeLabel: String {
-        switch enhancementMode {
-        case .fullRewrite: "Rewrite"
-        case .augment: "Augment"
-        case .preserve: "Preserve"
-        }
-    }
-
-    private var headerTooltip: String {
-        switch enhancementMode {
-        case .fullRewrite:
-            "Describe your task here.\n\nThe agent will:\n• Analyze your codebase\n• Select relevant files\n• Write detailed instructions above\n\nThis is your primary input in Rewrite mode."
-        case .augment:
-            "Add extra context to help the agent.\n\nThe agent will:\n• Keep your existing instructions\n• Add relevant context\n• Select appropriate files\n\nLeave empty to just enhance with file context."
-        case .preserve:
-            "Provide hints for context building.\n\nThe agent will:\n• Only select relevant files\n• Leave your instructions unchanged\n\nUseful when you've already written detailed instructions."
-        }
-    }
-
     private var settingsTooltip: String {
-        var lines: [String] = []
-        lines.append("Context Builder Settings")
-        lines.append("Token budget: \(displayBudgetLabel)")
-        lines.append("Prompt mode: \(modeLabel)")
-        if allowUIClarifyingQuestions {
-            lines.append("Clarifying questions: On")
-        }
-        if isMCPControlled {
+        var lines = presentation.summaryLines
+        // MCP control metadata can outlive discovery; only an active presentation is a run.
+        if isMCPControlled, presentation.isActive {
             lines.append("")
             lines.append("MCP-controlled run active")
         }
@@ -1307,7 +1513,7 @@ private struct ContextBuilderHeaderBar: View {
         HStack(spacing: 8) {
             // Left side: Label and info
             HStack(spacing: 6) {
-                Text(headerText)
+                Text(presentation.headerTitle)
                     .font(.callout)
                     .fontWeight(.medium)
                     .foregroundColor(.primary)
@@ -1316,7 +1522,7 @@ private struct ContextBuilderHeaderBar: View {
                 Image(systemName: "info.circle")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .hoverTooltip(headerTooltip)
+                    .hoverTooltip(presentation.headerTooltip)
 
                 // Clear button
                 Button(action: {
@@ -1344,7 +1550,7 @@ private struct ContextBuilderHeaderBar: View {
                             .foregroundColor(.secondary.opacity(0.7))
                             .lineLimit(1)
                             .truncationMode(.head)
-                        Text(displayBudgetLabel)
+                        Text(presentation.tokenBudgetLabel)
                             .font(.callout)
                             .monospacedDigit()
                             .foregroundColor(.secondary)
@@ -1354,10 +1560,11 @@ private struct ContextBuilderHeaderBar: View {
                             .font(.caption)
                             .foregroundColor(.secondary.opacity(0.6))
 
-                        // Question mark indicator
-                        Image(systemName: allowUIClarifyingQuestions ? "questionmark.circle.fill" : "questionmark.circle")
+                        // Question mark indicator: effective permission for the current run,
+                        // or the desired UI permission when idle. Dashed when unavailable.
+                        Image(systemName: presentation.questionIndicatorSymbolName)
                             .font(.callout)
-                            .foregroundColor(allowUIClarifyingQuestions ? .blue : .secondary.opacity(0.5))
+                            .foregroundColor(presentation.allowsClarifyingQuestions == true ? .blue : .secondary.opacity(0.5))
 
                         // Gear icon
                         Image(systemName: "gearshape.fill")
@@ -1393,6 +1600,14 @@ private struct ContextBuilderHeaderBar: View {
                 }
                 .disabled(isRunning)
                 .hoverTooltip(settingsTooltip)
+                .onChange(of: isRunning) { _, running in
+                    // The popover edits desired next-run settings only. Dismiss it when the
+                    // displayed tab enters active discovery (new admission or switching to a
+                    // tab whose run is already active) so it cannot be mistaken for the run.
+                    if running {
+                        showingSettingsPopover = false
+                    }
+                }
                 .popover(isPresented: $showingSettingsPopover) {
                     ContextBuilderSettingsPopover(
                         contextTokenBudget: $contextTokenBudget,

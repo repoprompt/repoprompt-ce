@@ -1159,16 +1159,63 @@ enum DirectProcess {
     }
 }
 
-private final class DirectProcessInvocation: @unchecked Sendable {
-    private static let outputLimit = 8 * 1024 * 1024
+/// Serializes pipe consumption with accumulation, including the terminal drain.
+/// Reading before acquiring this lock can lose an in-flight chunk at process exit.
+final class DirectProcessOutputCapture: @unchecked Sendable {
+    static let outputLimit = 8 * 1024 * 1024
 
+    struct Snapshot: Equatable {
+        let data: Data
+        let truncated: Bool
+    }
+
+    private let lock: NSLocking
+    private let limit: Int
+    private var output = Data()
+    private var truncated = false
+    private var finalized = false
+
+    init(limit: Int = outputLimit, lock: NSLocking = NSLock()) {
+        precondition(limit >= 0)
+        self.limit = limit
+        self.lock = lock
+    }
+
+    func consume(read: () -> Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finalized else { return }
+        append(read())
+    }
+
+    func finish(drain: () -> Data) -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        if !finalized {
+            append(drain())
+            finalized = true
+        }
+        return Snapshot(data: output, truncated: truncated)
+    }
+
+    private func append(_ data: Data) {
+        guard !data.isEmpty else { return }
+        let remaining = limit - output.count
+        output.append(data.prefix(remaining))
+        if data.count > remaining { truncated = true }
+    }
+}
+
+private final class DirectProcessInvocation: @unchecked Sendable {
+    private static let outputLimit = DirectProcessOutputCapture.outputLimit
+
+    // Cancellation must not wait for a potentially blocking pipe read.
     private let lock = NSLock()
+    private let outputCapture = DirectProcessOutputCapture()
     private let process = Process()
     private let pipe = Pipe()
     private let inputPipe: Pipe?
     private let input: Data?
-    private var output = Data()
-    private var truncated = false
     private var cancellationRequested = false
 
     init(
@@ -1196,7 +1243,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                    self?.append(handle.availableData)
+                    self?.outputCapture.consume { handle.availableData }
                 }
                 process.terminationHandler = { [weak self] process in
                     guard let self else {
@@ -1204,9 +1251,10 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                         return
                     }
                     pipe.fileHandleForReading.readabilityHandler = nil
-                    append(pipe.fileHandleForReading.readDataToEndOfFile())
-                    let snapshot = takeSnapshot()
-                    if snapshot.cancelled {
+                    let snapshot = outputCapture.finish {
+                        self.pipe.fileHandleForReading.readDataToEndOfFile()
+                    }
+                    if isCancellationRequested() {
                         continuation.resume(throwing: CancellationError())
                     } else {
                         var text = String(decoding: snapshot.data, as: UTF8.self)
@@ -1235,24 +1283,6 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         } onCancel: {
             requestCancellation()
         }
-    }
-
-    private func append(_ data: Data) {
-        guard !data.isEmpty else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        guard output.count < Self.outputLimit else { truncated = true
-            return
-        }
-        let remaining = Self.outputLimit - output.count
-        output.append(data.prefix(remaining))
-        if data.count > remaining { truncated = true }
-    }
-
-    private func takeSnapshot() -> (data: Data, truncated: Bool, cancelled: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        return (output, truncated, cancellationRequested)
     }
 
     private func isCancellationRequested() -> Bool {
