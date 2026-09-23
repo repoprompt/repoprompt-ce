@@ -6,6 +6,7 @@ final class AgentCodexModelRegistry {
     private let lock = NSLock()
     private var liveModels: [CodexAppServerClient.RemoteModel] = []
     private var liveModelSignature: [CodexDynamicModelRecord] = []
+    private var cachedSortedDynamicOptions: [AgentModelOption]?
 
     private init() {}
 
@@ -19,6 +20,7 @@ final class AgentCodexModelRegistry {
         if didChange {
             liveModels = normalized
             liveModelSignature = signature
+            cachedSortedDynamicOptions = nil
         }
         lock.unlock()
 
@@ -137,7 +139,21 @@ final class AgentCodexModelRegistry {
     private func codexDynamicOptions(
         from models: [CodexAppServerClient.RemoteModel]
     ) -> [AgentModelOption] {
-        codexDynamicOptions(from: CodexDynamicModelMapper.options(from: models))
+        lock.lock()
+        if let cached = cachedSortedDynamicOptions {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let sorted = CodexDynamicModelMapper.options(from: models)
+        let result = codexDynamicOptions(from: sorted)
+
+        lock.lock()
+        cachedSortedDynamicOptions = result
+        lock.unlock()
+
+        return result
     }
 
     private func codexDynamicOptions(
