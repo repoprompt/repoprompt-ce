@@ -24,7 +24,7 @@ import test_codex_runtime_artifact as artifact_fixtures
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "Scripts" / "codex_update_candidate.py"
 BASELINE = ROOT / "Vendor" / "Codex" / "manifest.json"
-VERSION = "0.154.0"
+VERSION = "0.157.0"
 TAG = f"rust-v{VERSION}"
 TARGETS = (
     ("aarch64-apple-darwin", "arm64"),
@@ -84,13 +84,25 @@ EOF
 
     def _write_package(self, target: str, architecture: str) -> None:
         root = self.sources / target
-        for directory in (
-            root / "bin",
-            root / "codex-path",
-            root / "codex-resources" / "zsh" / "bin",
-        ):
-            directory.mkdir(parents=True, exist_ok=True)
-            directory.chmod(0o755)
+        baseline = artifact.load_manifest(BASELINE)
+        package = baseline["packages"][target]
+        mach_o_files = set(baseline["machOFiles"])
+        for entry in package["tree"]:
+            path = root / entry["path"]
+            if entry["kind"] == "directory":
+                path.mkdir(parents=True, exist_ok=True)
+                path.chmod(0o755)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if entry["path"] in mach_o_files:
+                artifact_fixtures.write_mach_o_fixture(
+                    path,
+                    architecture,
+                    f"candidate={VERSION}\ntarget={target}\npath={entry['path']}\n".encode(),
+                )
+            else:
+                path.write_text(f"candidate fixture: {entry['path']}\n", encoding="utf-8")
+                path.chmod(0o755 if entry["executable"] else 0o644)
         metadata = {
             "layoutVersion": 1,
             "version": VERSION,
@@ -101,17 +113,6 @@ EOF
             "pathDir": "codex-path",
         }
         (root / "codex-package.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-        for relative in (
-            "bin/codex",
-            "bin/codex-code-mode-host",
-            "codex-path/rg",
-            "codex-resources/zsh/bin/zsh",
-        ):
-            artifact_fixtures.write_mach_o_fixture(
-                root / relative,
-                architecture,
-                f"candidate={VERSION}\ntarget={target}\npath={relative}\n".encode(),
-            )
 
     @staticmethod
     def _make_archive(source: Path, destination: Path) -> None:
@@ -256,7 +257,7 @@ EOF
             "minimumExternalVersion",
             "License and NOTICE review",
             "Manual approval and soak",
-            "0.153.4",
+            "0.156.0",
             str(self.lipo),
             str(self.codesign),
         ):
@@ -410,14 +411,14 @@ EOF
     def test_selector_and_output_safety_fail_closed(self) -> None:
         malformed = self._run(
             self.temp / "malformed",
-            selector=("--version", "0.153.4-rc.1"),
+            selector=("--version", "0.156.0-rc.1"),
             expected=1,
         )
         self.assertIn("stable numeric triplet", malformed.stderr)
 
         not_newer = self._run(
             self.temp / "not-newer",
-            selector=("--version", "0.153.4"),
+            selector=("--version", "0.156.0"),
             expected=1,
         )
         self.assertIn("must be newer", not_newer.stderr)

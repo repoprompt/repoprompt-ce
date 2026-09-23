@@ -48,7 +48,9 @@ grep -F "## OpenAI Codex" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the OpenAI Codex section"
 grep -F "codex-resources/zsh/bin/zsh" THIRD_PARTY_NOTICES.md >/dev/null ||
     fail "THIRD_PARTY_NOTICES.md is missing the bundled Zsh notice"
-grep -F "rust-v0.153.4" docs/releasing.md >/dev/null ||
+grep -F "codex-resources/voice/" THIRD_PARTY_NOTICES.md >/dev/null ||
+    fail "THIRD_PARTY_NOTICES.md is missing the bundled voice-runtime notice"
+grep -F "rust-v0.156.0" docs/releasing.md >/dev/null ||
     fail "docs/releasing.md is missing the pinned Codex release"
 grep -F 'Contents/Resources/BundledRuntimes/Codex/<target>/' docs/releasing.md >/dev/null ||
     fail "docs/releasing.md is missing the target-specific bundled Codex layout"
@@ -80,6 +82,10 @@ grep -F 'sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_V8_ENTI
     fail "Developer ID signing must apply the trusted V8 JIT entitlement allowlist to profiled Codex executables"
 grep -F 'CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"' Scripts/sign_staged_release.sh >/dev/null ||
     fail "Developer ID signing must source the Codex V8 entitlement allowlist from the trusted control plane"
+grep -F 'CODEX_AUDIO_INPUT_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexAudioInput.entitlements"' Scripts/sign_staged_release.sh >/dev/null ||
+    fail "Developer ID signing must source the Codex audio-input entitlement allowlist from the trusted control plane"
+grep -F 'sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_AUDIO_INPUT_ENTITLEMENTS"' Scripts/sign_staged_release.sh >/dev/null ||
+    fail "Developer ID signing must preserve the voice host audio-input entitlement"
 if grep -F 'sign_path "$CODEX_BUNDLE' Scripts/sign_staged_release.sh | grep -F -- '--preserve-metadata' >/dev/null; then
     fail "Codex signing must use the explicit entitlement allowlist, never vendor entitlement preservation"
 fi
@@ -93,23 +99,25 @@ V8_PROFILE = {
     "com.apple.security.cs.allow-jit": True,
     "com.apple.security.cs.allow-unsigned-executable-memory": True,
 }
-EXPECTED_RELEASE_PROFILES = {
-    "bin/codex": V8_PROFILE,
-    "bin/codex-code-mode-host": V8_PROFILE,
-    "codex-path/rg": {},
-    "codex-resources/zsh/bin/zsh": {},
-}
+AUDIO_INPUT_PROFILE = {"com.apple.security.device.audio-input": True}
 manifest = json.loads(Path("Vendor/Codex/manifest.json").read_text(encoding="utf-8"))
 if manifest.get("schemaVersion") != 2:
     sys.exit("pinned Codex manifest must use entitlement-aware schema version 2")
-if manifest.get("releaseSigningEntitlements") != EXPECTED_RELEASE_PROFILES:
-    sys.exit("pinned release-signing entitlement profiles must grant V8 JIT to exactly bin/codex and bin/codex-code-mode-host")
+expected_release_profiles = {path: {} for path in manifest.get("machOFiles", [])}
+for path in ("bin/codex", "bin/codex-code-mode-host"):
+    expected_release_profiles[path] = V8_PROFILE
+expected_release_profiles["codex-resources/voice/bin/codex-voice-host"] = AUDIO_INPUT_PROFILE
+if manifest.get("releaseSigningEntitlements") != expected_release_profiles:
+    sys.exit("pinned release-signing profiles must grant only the approved V8 and voice audio-input entitlements")
 for policy in manifest.get("signedExecutables", []):
     if policy.get("entitlements") != V8_PROFILE:
         sys.exit(f"vendor signature policy for {policy.get('path')} must pin exactly the two approved V8 entitlements")
 plist = plistlib.loads(Path("AppBundle/CodexV8JIT.entitlements").read_bytes())
 if plist != V8_PROFILE:
     sys.exit("AppBundle/CodexV8JIT.entitlements must contain exactly the two approved V8 entitlements")
+audio_plist = plistlib.loads(Path("AppBundle/CodexAudioInput.entitlements").read_bytes())
+if audio_plist != AUDIO_INPUT_PROFILE:
+    sys.exit("AppBundle/CodexAudioInput.entitlements must contain exactly the approved audio-input entitlement")
 PYTHON
 for script in \
     Scripts/main_tip_release.sh \

@@ -11,6 +11,7 @@ TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROLLOUT_TOOL="$SCRIPT_DIR/stable_rollout.py"
 ENTITLEMENTS_TEMPLATE="$TRUSTED_ROOT/AppBundle/RepoPrompt.entitlements.template"
 CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"
+CODEX_AUDIO_INPUT_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexAudioInput.entitlements"
 TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 
 fail() {
@@ -105,6 +106,7 @@ Path(output).write_text(text, encoding="utf-8")
 PYTHON
 plutil -lint "$app_entitlements"
 plutil -lint "$CODEX_V8_ENTITLEMENTS"
+plutil -lint "$CODEX_AUDIO_INPUT_ENTITLEMENTS"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
 signing_mode_marker="$EXPECTED_SIGNING_MODE"
 plutil -replace RepoPromptSigningMode -string "$signing_mode_marker" "$APP_BUNDLE/Contents/Info.plist"
@@ -182,6 +184,9 @@ while IFS=$'\t' read -r relative_path entitlement_profile; do
     case "$entitlement_profile" in
     v8-jit)
         sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_V8_ENTITLEMENTS"
+        ;;
+    audio-input)
+        sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_AUDIO_INPUT_ENTITLEMENTS"
         ;;
     none)
         sign_path "$CODEX_BUNDLE/$relative_path"

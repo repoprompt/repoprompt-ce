@@ -283,7 +283,7 @@ public enum ClaudeCompatibleModelCatalog {
         StaticModel(
             rawValue: opus55Raw,
             displayName: "Opus 5.5",
-            description: "Pinned Claude Opus 5.5 for demanding reasoning, coding, and long-horizon agentic work.",
+            description: "Pinned Claude Opus 5.5 with 1M context for long-running agentic coding and knowledge work.",
             supportsXHigh: true
         ),
         StaticModel(

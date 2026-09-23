@@ -561,6 +561,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         modelOption("claude-haiku-4-5", "Claude Haiku 4.5"),
         modelOption("claude-sonnet-5", "Claude Sonnet 5"),
         modelOption("opus", "Claude Opus"),
+        modelOption("claude-opus-5-5", "Claude Opus 5.5"),
         modelOption("claude-fable-5-1", "Claude Fable 5.1")
     ]
 
@@ -568,12 +569,16 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         AgentModelOption(rawValue: raw, displayName: name, description: nil, isDefault: false)
     }
 
-    private func candidateBuilder(codexOptions: [AgentModelOption]? = nil) -> AgentTaskRoutingCandidateBuilder {
+    private func candidateBuilder(
+        codexOptions: [AgentModelOption]? = nil,
+        claudeOptions: [AgentModelOption]? = nil
+    ) -> AgentTaskRoutingCandidateBuilder {
         let codexOptions = codexOptions ?? Self.advertisedCodexOptions
+        let claudeOptions = claudeOptions ?? Self.advertisedClaudeOptions
         return AgentTaskRoutingCandidateBuilder { provider, _ in
             switch provider {
             case .codexExec: codexOptions
-            case .claudeCode: Self.advertisedClaudeOptions
+            case .claudeCode: claudeOptions
             default: []
             }
         }
@@ -608,6 +613,26 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("Terminal-Bench 4.0"))
         XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("$10 input / $50 output"))
         XCTAssertNil(fableCandidate.target.reasoningEffortRaw)
+
+        let opusCandidate = try XCTUnwrap(candidates.first(where: {
+            ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeOpus55.rawValue
+        }))
+        XCTAssertEqual(opusCandidate.utilityTier, "claude-opus")
+        XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("recommended starting point for most workloads"))
+        XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("$4 input / $20 output"))
+    }
+
+    func testClaudeOpusAliasIsFallbackWhenPinned55IsUnavailable() throws {
+        let claudeOptions = Self.advertisedClaudeOptions.filter {
+            $0.rawValue != AgentModel.claudeOpus55.rawValue
+        }
+        let candidates = try candidateBuilder(claudeOptions: claudeOptions).build(
+            allowedProviders: [.claudeCode],
+            availability: .init(claudeCodeAvailable: true, codexAvailable: false, openCodeAvailable: false)
+        )
+
+        let opusCandidate = try XCTUnwrap(candidates.first { $0.utilityTier == "claude-opus" })
+        XCTAssertEqual(opusCandidate.target.modelRaw, "opus")
     }
 
     func testGPT6EffortAndAgentModelResolution() {

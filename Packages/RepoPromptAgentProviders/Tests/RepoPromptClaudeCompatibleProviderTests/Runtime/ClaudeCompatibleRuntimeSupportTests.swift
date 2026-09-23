@@ -271,6 +271,8 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedSlotModel("sonnet:xhigh", config: ClaudeCompatibleBackendID.glmZAI.defaultPreset), "sonnet")
         XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedSlotModel("glm-5.2[1m]:xhigh", config: ClaudeCompatibleBackendID.glmZAI.defaultPreset), "sonnet")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("opus:xhigh"), "opus")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5-5:max"), "claude-opus-5-5")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5-5:xhigh"), "claude-opus-5-5")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5:max"), "claude-opus-5")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-4-8:max"), "claude-opus-4-8")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5:xhigh"), "claude-opus-5")

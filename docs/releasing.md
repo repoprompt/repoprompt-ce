@@ -43,11 +43,11 @@ the closed app's version history.
 
 ## Bundled Codex artifact
 
-Debug and release packaging include the complete official OpenAI Codex 0.153.4
+Debug and release packaging include the complete official OpenAI Codex 0.156.0
 standalone package. The authority is the repository-owned
 [`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
-official [`rust-v0.153.4` release](https://github.com/openai/codex/releases/tag/rust-v0.153.4),
-the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.153.4/codex-package_SHA256SUMS),
+official [`rust-v0.156.0` release](https://github.com/openai/codex/releases/tag/rust-v0.156.0),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.156.0/codex-package_SHA256SUMS),
 both macOS package assets, their complete extracted layouts, file hashes,
 architectures, and primary executable signing identities. The upstream release
 publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
@@ -81,19 +81,22 @@ fails closed unless the package matching the running app architecture is present
 Each target subtree preserves `codex-package.json`, `bin/codex`,
 `bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and all additional
 package resources; the binaries inside remain thin and must match the directory's
-target architecture. The two primary macOS executables are
-Developer ID signed by `OpenAI OpCo, LLC` (team `2DC432GLL2`) with hardened
-runtime and timestamps. RepoPrompt's signing scripts do **not** thin, mutate, or
-re-sign anything in this subtree. The outer app signature seals the resource
-tree, after which the artifact verifier rechecks every byte, architecture, and
-upstream signature. Privileged staged signing and post-notarization validation
-run the verifier implementation from trusted control-plane tooling while reading
-artifact identity from `REPOPROMPT_APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json`;
-the intentionally minimal staged payload does not carry a second manifest copy.
-This mixed-authority layout passes macOS strict deep code
-signature verification without changing the upstream binary hashes. Actual
-notarization remains enforced by the protected release workflow; if Apple ever
-rejects this policy, stop rather than silently re-signing the upstream payload.
+target architecture. Codex 0.156.0 adds `codex-resources/voice/`, including a
+voice host, native libraries/plugins, source provenance, and their licences. All
+30 macOS Mach-Os are Developer ID signed by `OpenAI OpCo, LLC` (team
+`2DC432GLL2`) with hardened runtime and timestamps in the official packages.
+
+Host-native debug packaging preserves those upstream signatures and exact bytes.
+Privileged release signing deliberately re-signs every manifest-owned Mach-O with
+the RepoPrompt identity at its final bundle path. The manifest's closed-world
+entitlement profile grants V8 JIT only to `bin/codex` and
+`bin/codex-code-mode-host`, audio input only to the voice host, and no entitlements
+to the remaining Mach-Os. Repository-owned entitlement plists are used instead of
+blindly preserving vendor metadata. Post-signing and post-notarization validation
+then rechecks the exact normalized payloads, thin architectures, RepoPrompt signing
+team, and entitlement profile from trusted control-plane tooling. Artifact identity
+comes from `REPOPROMPT_APPROVED_SOURCE_ROOT/Vendor/Codex/manifest.json`; the staged
+payload does not carry a second manifest copy.
 
 The bundled package is RepoPrompt's default Codex runtime authority; runtime
 selection never falls through to the user's environment or shell `PATH`. Settings
@@ -110,9 +113,9 @@ External version validation uses the captured launch environment, including its 
 search path.
 RepoPrompt rejects custom executables older than 0.149.0, the last proven external
 compatibility floor. This is intentionally distinct from the exact bundled and schema-gate
-pin at 0.153.4: the only consumed schema delta in this rotation is the additive incoming
-`interrupted` status, which RepoPrompt already handles, and no new outgoing request requires
-0.153.4. Bundled and external runtimes both use
+pin at 0.156.0: the bounded 0.156.0 app-server projection passes unchanged from the
+0.153.4 contract at 45 methods, 193 parameter paths, and 93 response paths, and no new outgoing
+request requires 0.156.0. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.
@@ -137,7 +140,7 @@ To diagnose acquisition independently of a build, run:
 python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
-  --package .build/codex-runtime/0.153.4/aarch64-apple-darwin
+  --package .build/codex-runtime/0.156.0/aarch64-apple-darwin
 python3 Scripts/codex_runtime_artifact.py stage-bundle \
   --arch all \
   --cache-root .build/codex-runtime \
@@ -159,8 +162,8 @@ does not edit or replace `Vendor/Codex/manifest.json`. Select exactly one explic
 stable version/tag, or opt in explicitly to GitHub's latest stable release:
 
 ```bash
-make codex-update-candidate CODEX_CANDIDATE_VERSION=0.154.0
-make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.154.0
+make codex-update-candidate CODEX_CANDIDATE_VERSION=0.157.0
+make codex-update-candidate CODEX_CANDIDATE_TAG=rust-v0.157.0
 make codex-update-candidate CODEX_CANDIDATE_LATEST=1
 ```
 
@@ -182,10 +185,10 @@ inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
 The official output directory contains a proposed `candidate-manifest.json`,
 `candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
 checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
-0.153.4 pin remains authoritative
+0.156.0 pin remains authoritative
 until a maintainer reviews and deliberately applies a complete rotation change.
 
-The known-good rollback for the 0.153.4 rotation is verified Codex 0.149.0
+The known-good rollback for the 0.156.0 rotation is verified Codex 0.149.0
 (`rust-v0.149.0`; arm64 package archive SHA-256
 `6c7589a52fe90e3742e35662115a4c55c39715601df0d41345ba8ec8f4221d4e`, x86_64
 package archive SHA-256 `ba332e647cc898e3b4e86a3bc6e8db414a124eb88d8480f4707bbc66b0432f9d`).

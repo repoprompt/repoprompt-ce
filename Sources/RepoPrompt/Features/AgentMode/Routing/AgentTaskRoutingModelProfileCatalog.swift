@@ -43,9 +43,9 @@ enum AgentTaskRoutingModelProfileCatalog {
         case "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929":
             "This is an older Claude Sonnet tier for balanced coding and analysis. API list price: $3 input / $15 output per 1M tokens. No current comparable coding score is included in this snapshot."
         case "opus", "opus[1m]", "claude-opus-5-5":
-            "Claude Opus 5.5 is Anthropic's current Opus tier for complex coding, long-running agents, and difficult knowledge work. API list price: $4 input / $20 output per 1M tokens. The stable Opus alias is preferred so Claude Code can track the provider's current release."
+            "Claude Opus 5.5 is Anthropic's recommended starting point for most workloads and is built for long-running agentic coding and knowledge work, with a 1M-token context window and medium default effort. API list price: $4 input / $20 output per 1M tokens."
         case "claude-opus-5":
-            "Claude Opus 5 is the prior premium tier for production-ready code, long-running agents, difficult debugging, and complex knowledge work. API list price: $5 input / $25 output per 1M tokens."
+            "Claude Opus 5 is an older premium tier for production-ready code, long-running agents, difficult debugging, and complex knowledge work. API list price: $5 input / $25 output per 1M tokens."
         case "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-5-20251101":
             "This is an older premium Claude Opus tier for complex coding and agentic work. API list price: $5 input / $25 output per 1M tokens. No current comparable coding score is included in this snapshot."
         case "fable", "claude-fable-5-1":

@@ -264,7 +264,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeSonnet5: "Pinned Claude Sonnet 5. Balanced speed and capability with 1M context for everyday engineering."
         case .claudeSonnet46: "Pinned Claude Sonnet 4.6. Balanced speed and capability for everyday engineering."
         case .claudeSonnet45: "Pinned Claude Sonnet 4.5. Balanced speed and capability for everyday engineering."
-        case .claudeOpus55: "Pinned Claude Opus 5.5 for demanding reasoning, coding, and long-horizon agentic work."
+        case .claudeOpus55: "Pinned Claude Opus 5.5 with 1M context for long-running agentic coding and knowledge work."
         case .claudeOpus5: "Pinned Claude Opus 5 with 1M context for demanding reasoning and long-horizon agentic work. Requires Claude Code 2.1.219 or newer."
         case .claudeOpus48: "Pinned Claude Opus 4.8 with native 1M context. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus47: "Pinned Claude Opus 4.7. Opus-tier capability for complex reasoning and architecture."
