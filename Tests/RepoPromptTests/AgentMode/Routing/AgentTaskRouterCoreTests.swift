@@ -548,6 +548,37 @@ private actor NeverCompletingRouteBackend: AgentTaskRouterBackend {
 
 @MainActor
 final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
+    private static let advertisedCodexOptions = [
+        modelOption("gpt-5.6-luna-low", "GPT-5.6 Luna Low"),
+        modelOption("gpt-5.6-terra-medium", "GPT-5.6 Terra Medium"),
+        modelOption("gpt-5.6-sol-high", "GPT-5.6 Sol High"),
+        modelOption("gpt-6-luna-low", "GPT-6 Luna Low"),
+        modelOption("gpt-6-sol-medium", "GPT-6 Sol Medium"),
+        modelOption("gpt-6-sol-high", "GPT-6 Sol High")
+    ]
+
+    private static let advertisedClaudeOptions = [
+        modelOption("claude-haiku-4-5", "Claude Haiku 4.5"),
+        modelOption("claude-sonnet-5", "Claude Sonnet 5"),
+        modelOption("opus", "Claude Opus"),
+        modelOption("claude-fable-5-1", "Claude Fable 5.1")
+    ]
+
+    private static func modelOption(_ raw: String, _ name: String) -> AgentModelOption {
+        AgentModelOption(rawValue: raw, displayName: name, description: nil, isDefault: false)
+    }
+
+    private func candidateBuilder(codexOptions: [AgentModelOption]? = nil) -> AgentTaskRoutingCandidateBuilder {
+        let codexOptions = codexOptions ?? Self.advertisedCodexOptions
+        return AgentTaskRoutingCandidateBuilder { provider, _ in
+            switch provider {
+            case .codexExec: codexOptions
+            case .claudeCode: Self.advertisedClaudeOptions
+            default: []
+            }
+        }
+    }
+
     func testModelCandidatesIncludeAuditedCapabilityAndPricingWithoutPreselectedEffort() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
@@ -555,7 +586,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             openCodeAvailable: false
         )
 
-        let candidates = try AgentTaskRoutingCandidateBuilder(opaqueKey: { UUID().uuidString }).build(
+        let candidates = try candidateBuilder().build(
             allowedProviders: [.claudeCode, .codexExec],
             availability: availability
         )
@@ -608,7 +639,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             openCodeAvailable: false
         )
 
-        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+        let candidates = try candidateBuilder().build(
             allowedProviders: [.claudeCode, .codexExec],
             availability: availability
         )
@@ -631,7 +662,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             codexAvailable: true,
             openCodeAvailable: false
         )
-        let builder = AgentTaskRoutingCandidateBuilder()
+        let builder = candidateBuilder()
         let model = try XCTUnwrap(builder.build(
             allowedProviders: [.codexExec],
             availability: availability
@@ -652,7 +683,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             codexAvailable: true,
             openCodeAvailable: false
         )
-        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+        let candidates = try candidateBuilder().build(
             allowedProviders: [.claudeCode, .codexExec],
             availability: availability,
             roleDefaults: [
@@ -670,6 +701,21 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertTrue(sol.descriptor.targetDescription.contains("Engineer (user-set)"))
         XCTAssertTrue(sol.descriptor.targetDescription.contains("not constraints or automatic choices"))
         XCTAssertTrue(candidates.contains { $0.target.modelRaw == "gpt-5.6-terra" })
+    }
+
+    func testCodexCandidatesFallBackToGPT56BeforeDiscovery() throws {
+        let codexOptions = Self.advertisedCodexOptions.filter {
+            !$0.rawValue.hasPrefix("gpt-6-")
+        }
+        let candidates = try candidateBuilder(codexOptions: codexOptions).build(
+            allowedProviders: [.codexExec],
+            availability: .init(claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false)
+        )
+
+        XCTAssertEqual(Set(candidates.map(\.target.modelRaw)), [
+            "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"
+        ])
+        XCTAssertFalse(candidates.contains { $0.target.modelRaw.hasPrefix("gpt-6-") })
     }
 
     func testUnknownModelEvidenceMakesCapabilityAndCostUncertaintyExplicit() {
@@ -692,7 +738,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             codexAvailable: true,
             openCodeAvailable: false
         )
-        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+        let candidates = try candidateBuilder().build(
             allowedProviders: [.claudeCode],
             availability: availability
         )

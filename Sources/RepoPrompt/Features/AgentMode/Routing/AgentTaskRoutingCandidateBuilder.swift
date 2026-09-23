@@ -45,9 +45,16 @@ struct AgentTaskRoutingCandidateBuilder {
     }
 
     let opaqueKey: () -> String
+    private let modelOptions: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption]
 
-    init(opaqueKey: @escaping () -> String = { UUID().uuidString.lowercased() }) {
+    init(
+        opaqueKey: @escaping () -> String = { UUID().uuidString.lowercased() },
+        modelOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
+            AgentModelCatalog.options(for: $0, availability: $1)
+        }
+    ) {
         self.opaqueKey = opaqueKey
+        self.modelOptions = modelOptions
     }
 
     func build(
@@ -63,7 +70,7 @@ struct AgentTaskRoutingCandidateBuilder {
         }
         var seenTargets: Set<AgentRoutingExecutableTarget> = []
         let candidates = definitions.compactMap { definition -> Candidate? in
-            guard let option = Self.resolveModelOption(definition, availability: availability),
+            guard let option = resolveModelOption(definition, availability: availability),
                   let baseModelRaw = Self.baseModelRaw(option.rawValue, provider: definition.provider)
             else { return nil }
             let target = AgentRoutingExecutableTarget(
@@ -115,7 +122,7 @@ struct AgentTaskRoutingCandidateBuilder {
         let selectedBase = Self.baseModelRaw(model.target.modelRaw, provider: provider)?.lowercased()
         guard let selectedBase else { throw BuildError.noAvailableTargets }
 
-        let options = AgentModelCatalog.options(for: provider, availability: availability)
+        let options = modelOptions(provider, availability)
         var targets: [(AgentRoutingExecutableTarget, String)] = []
         for option in options where !option.isPlaceholderDefault {
             guard Self.baseModelRaw(option.rawValue, provider: provider)?.lowercased() == selectedBase else { continue }
@@ -229,11 +236,11 @@ struct AgentTaskRoutingCandidateBuilder {
         )
     ]
 
-    private static func resolveModelOption(
+    private func resolveModelOption(
         _ definition: ModelDefinition,
         availability: AgentModelCatalog.AvailabilityContext
     ) -> AgentModelOption? {
-        let options = AgentModelCatalog.options(for: definition.provider, availability: availability)
+        let options = modelOptions(definition.provider, availability)
         if let family = definition.preferredCodexFamily,
            let option = AgentModelCatalog.preferredCodexFamilyOption(family, from: options)
         {
@@ -241,7 +248,7 @@ struct AgentTaskRoutingCandidateBuilder {
         }
         return definition.baseModelAliases.lazy.compactMap { alias in
             options.first { option in
-                baseModelRaw(option.rawValue, provider: definition.provider)?
+                Self.baseModelRaw(option.rawValue, provider: definition.provider)?
                     .caseInsensitiveCompare(alias) == .orderedSame
             }
         }.first
