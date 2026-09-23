@@ -257,7 +257,7 @@ EOF
             "minimumExternalVersion",
             "License and NOTICE review",
             "Manual approval and soak",
-            "0.156.0",
+            "0.156.1",
             str(self.lipo),
             str(self.codesign),
         ):
@@ -411,14 +411,14 @@ EOF
     def test_selector_and_output_safety_fail_closed(self) -> None:
         malformed = self._run(
             self.temp / "malformed",
-            selector=("--version", "0.156.0-rc.1"),
+            selector=("--version", "0.156.1-rc.1"),
             expected=1,
         )
         self.assertIn("stable numeric triplet", malformed.stderr)
 
         not_newer = self._run(
             self.temp / "not-newer",
-            selector=("--version", "0.156.0"),
+            selector=("--version", "0.156.1"),
             expected=1,
         )
         self.assertIn("must be newer", not_newer.stderr)

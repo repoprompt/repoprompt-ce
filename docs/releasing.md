@@ -43,11 +43,11 @@ the closed app's version history.
 
 ## Bundled Codex artifact
 
-Debug and release packaging include the complete official OpenAI Codex 0.156.0
+Debug and release packaging include the complete official OpenAI Codex 0.156.1
 standalone package. The authority is the repository-owned
 [`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
-official [`rust-v0.156.0` release](https://github.com/openai/codex/releases/tag/rust-v0.156.0),
-the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.156.0/codex-package_SHA256SUMS),
+official [`rust-v0.156.1` release](https://github.com/openai/codex/releases/tag/rust-v0.156.1),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.156.1/codex-package_SHA256SUMS),
 both macOS package assets, their complete extracted layouts, file hashes,
 architectures, and primary executable signing identities. The upstream release
 publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
@@ -113,9 +113,9 @@ External version validation uses the captured launch environment, including its 
 search path.
 RepoPrompt rejects custom executables older than 0.149.0, the last proven external
 compatibility floor. This is intentionally distinct from the exact bundled and schema-gate
-pin at 0.156.0: the bounded 0.156.0 app-server projection passes unchanged from the
+pin at 0.156.1: the bounded 0.156.1 app-server projection passes unchanged from the
 0.153.4 contract at 45 methods, 193 parameter paths, and 93 response paths, and no new outgoing
-request requires 0.156.0. Bundled and external runtimes both use
+request requires 0.156.1. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.
@@ -140,7 +140,7 @@ To diagnose acquisition independently of a build, run:
 python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
-  --package .build/codex-runtime/0.156.0/aarch64-apple-darwin
+  --package .build/codex-runtime/0.156.1/aarch64-apple-darwin
 python3 Scripts/codex_runtime_artifact.py stage-bundle \
   --arch all \
   --cache-root .build/codex-runtime \
@@ -185,13 +185,13 @@ inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
 The official output directory contains a proposed `candidate-manifest.json`,
 `candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
 checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
-0.156.0 pin remains authoritative
+0.156.1 pin remains authoritative
 until a maintainer reviews and deliberately applies a complete rotation change.
 
-The known-good rollback for the 0.156.0 rotation is verified Codex 0.149.0
-(`rust-v0.149.0`; arm64 package archive SHA-256
-`6c7589a52fe90e3742e35662115a4c55c39715601df0d41345ba8ec8f4221d4e`, x86_64
-package archive SHA-256 `ba332e647cc898e3b4e86a3bc6e8db414a124eb88d8480f4707bbc66b0432f9d`).
+The known-good rollback for the 0.156.1 rotation is verified Codex 0.156.0
+(`rust-v0.156.0`; arm64 package archive SHA-256
+`6f7bdad25693f464a146ad6f24d477ad6fbffe07b62556f829ee5d3b04f48f8b`, x86_64
+package archive SHA-256 `41ed9b4be611af74149c8fc9bc5f2f217117de368d6725555087b331e19f4d89`).
 After a reviewed rotation, roll back by reverting the complete rotation change and
 rebuilding from the restored manifest rather than mixing old and new authority files.
 
