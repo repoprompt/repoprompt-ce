@@ -226,9 +226,6 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
     let codexApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy?
     let codexApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer?
     let claudePermissionMode: String?
-    /// Provider-native CLI permission mode for ACP providers that accept it as a LAUNCH
-    /// ARGUMENT (Devin `--permission-mode`). `nil` = pass no flag.
-    let acpLaunchPermissionMode: String?
     let acpSessionModeID: String?
     let autoApproveAllACPToolPermissions: Bool
     let acceptsPendingACPApprovalWhenActivated: Bool
@@ -238,7 +235,6 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         codexApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy? = nil,
         codexApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer? = nil,
         claudePermissionMode: String? = nil,
-        acpLaunchPermissionMode: String? = nil,
         acpSessionModeID: String? = nil,
         autoApproveAllACPToolPermissions: Bool = false,
         acceptsPendingACPApprovalWhenActivated: Bool = false
@@ -247,7 +243,6 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         self.codexApprovalPolicy = codexApprovalPolicy
         self.codexApprovalReviewer = codexApprovalReviewer
         self.claudePermissionMode = claudePermissionMode
-        self.acpLaunchPermissionMode = acpLaunchPermissionMode
         self.acpSessionModeID = acpSessionModeID
         self.autoApproveAllACPToolPermissions = autoApproveAllACPToolPermissions
         self.acceptsPendingACPApprovalWhenActivated = acceptsPendingACPApprovalWhenActivated

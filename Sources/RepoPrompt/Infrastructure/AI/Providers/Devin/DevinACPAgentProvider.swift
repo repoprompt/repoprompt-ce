@@ -19,24 +19,22 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         .devin
     }
 
+    var supportsParameterizedModelPicker: Bool {
+        true
+    }
+
+    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        input.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "thought_level"
+            ? .thinking : nil
+    }
+
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }
 
-    /// `--permission-mode` is a TOP-LEVEL `devin` option (3000.10.21); `devin acp --help`
-    /// does not advertise it, so the flag must precede the `acp` subcommand. Unknown
-    /// non-empty carrier values are rejected rather than silently degrading to no flag.
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = try standardizedWorkingDirectory(from: request.workspacePath)
         let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
-        guard DevinAgentToolPreferences.PermissionLevel.isRecognizedCLIPermissionMode(request.launchPermissionMode) else {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Unsupported Devin permission mode `\(request.launchPermissionMode ?? "")`."
-            )
-        }
-        let permissionLevel = DevinAgentToolPreferences.PermissionLevel.from(
-            cliPermissionMode: request.launchPermissionMode
-        )
         let integration = try DevinIntegrationConfiguration.prepare(
             workingDirectory: workingDirectory,
             mcpServers: config.includeRepoPromptMCPServer
@@ -47,7 +45,7 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         return ACPLaunchConfiguration(
             providerID: providerID,
             command: resolvedLaunch.command,
-            arguments: permissionLevel.launchArguments + resolvedLaunch.arguments,
+            arguments: (config.useAutoPermissionModeAtLaunch ? ["--permission-mode", "auto"] : []) + resolvedLaunch.arguments,
             environment: resolvedLaunch.environment.merging(integration.environment) { _, overlay in overlay },
             workingDirectory: workingDirectory,
             additionalPathHints: resolvedLaunch.additionalPathHints,

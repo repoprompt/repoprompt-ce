@@ -3,6 +3,7 @@ import Foundation
 @MainActor
 final class AgentModeProviderBindingService {
     let preferences: AgentProviderPreferenceSnapshotStore
+    private var devinModeUpdates: [UUID: (id: UUID, task: Task<Void, Never>)] = [:]
 
     convenience init() {
         self.init(preferences: AgentProviderPreferenceSnapshotStore())
@@ -206,6 +207,35 @@ final class AgentModeProviderBindingService {
                 // Claude launch settings are revalidated immediately before dispatch.
                 // Avoid an eager untracked shutdown that could race a newly started run.
                 break
+            case .devin:
+                let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
+                guard session.runState.isActive,
+                      let controller = session.acpController else { continue }
+                let sessionModeID = runtime.acpSessionModeID
+                let predecessor = devinModeUpdates[session.tabID]?.task
+                let updateID = UUID()
+                let task = Task { @MainActor [weak self] in
+                    await predecessor?.value
+                    defer {
+                        if self?.devinModeUpdates[session.tabID]?.id == updateID {
+                            self?.devinModeUpdates.removeValue(forKey: session.tabID)
+                        }
+                    }
+                    guard session.runState.isActive, session.acpController === controller else { return }
+                    do {
+                        if let sessionModeID {
+                            try await controller.setSessionMode(sessionModeID, reportFailure: true)
+                        } else {
+                            try await controller.restoreOpenedSessionMode(reportFailure: true)
+                        }
+                    } catch {
+                        if AgentRuntimeProviderService.enableDebugLogging { print("[ACP-Runner] tab=\(session.tabID) failed to apply Devin session mode=\(sessionModeID ?? "default") error=\(error.localizedDescription)") }
+                    }
+                    if session.tabID == currentTabID, session.acpController === controller {
+                        updateActiveBindings(session)
+                    }
+                }
+                devinModeUpdates[session.tabID] = (updateID, task)
             case .openCode, .antigravity:
                 let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
                 guard let sessionModeID = runtime.acpSessionModeID,
@@ -239,11 +269,8 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
-            case .grokBuild, .devin:
-                // These providers take their permission level as a launch-time CLI flag
-                // (`--always-approve` / `--permission-mode`); it applies to newly launched
-                // processes and never mutates a running controller. The next run builds a
-                // fresh controller because `isCompatibleWith` keys on that flag.
+            case .grokBuild:
+                // Grok full access is a launch-time CLI flag.
                 break
             }
         }

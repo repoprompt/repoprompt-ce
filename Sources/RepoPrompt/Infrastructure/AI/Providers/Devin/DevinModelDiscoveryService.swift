@@ -122,7 +122,33 @@ actor DevinModelDiscoveryService {
             try Task.checkCancellation()
             _ = try await controller.bootstrap()
             try Task.checkCancellation()
-            let count = await controller.currentDiscoveredSessionModels()?.options.count
+            guard let initial = await controller.currentDiscoveredSessionModels() else {
+                await controller.shutdown()
+                return nil
+            }
+            var parameterSets: [ACPModelParameterSet] = []
+            var seenModels = Set<String>()
+            for model in initial.options where !model.isPlaceholderDefault {
+                let identity = ACPModelParameterIdentity.canonicalBaseModelRaw(model.rawValue, providerID: .devin)
+                guard seenModels.insert(identity).inserted else { continue }
+                try Task.checkCancellation()
+                let observed = try await controller.discoverSessionModelParameters(for: model.rawValue)
+                let matches = observed.modelParameterSets.filter {
+                    ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .devin) == identity
+                }
+                guard matches.count <= 1 else {
+                    throw AIProviderError.invalidConfiguration(detail: "Devin advertised ambiguous parameters for model '\(model.rawValue)'.")
+                }
+                parameterSets.append(contentsOf: matches)
+            }
+            try Task.checkCancellation()
+            let complete = ACPDiscoveredSessionModels(
+                options: initial.options,
+                currentModelRaw: initial.currentModelRaw,
+                modelParameterSets: parameterSets
+            )
+            _ = AgentACPModelRegistry.shared.updateDiscoveredModels(complete, for: .devin)
+            let count = initial.options.count
             await controller.shutdown()
             return count
         } catch {

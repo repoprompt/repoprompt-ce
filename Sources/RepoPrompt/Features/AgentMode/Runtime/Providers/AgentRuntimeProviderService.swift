@@ -349,7 +349,9 @@ final class AgentRuntimeProviderService {
                 config: DevinAgentConfig(
                     enableDebugLogging: Self.enableDebugLogging,
                     includeRepoPromptMCPServer: true,
-                    modelString: modelString
+                    modelString: modelString,
+                    useAutoPermissionModeAtLaunch: true,
+                    modelParameterSelections: modelParameterSelections
                 ),
                 workspacePath: workspacePath
             )

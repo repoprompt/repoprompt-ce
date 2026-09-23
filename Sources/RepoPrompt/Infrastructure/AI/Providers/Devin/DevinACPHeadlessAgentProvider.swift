@@ -31,11 +31,14 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
             },
             makeController: controllerFactory,
             beforePrompt: { controller, request in
-                guard let model = request.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !model.isEmpty,
-                      model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-                else { return }
-                try await controller.setSessionModel(model)
+                if let model = request.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !model.isEmpty,
+                   model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+                {
+                    try await controller.setSessionModel(model, forceRPC: !request.modelParameterSelections.isEmpty)
+                }
+                let report = try await controller.applySessionModelParameterSelections(request.modelParameterSelections)
+                try report.validateNoSkippedSelections()
             },
             approvalPolicy: .declineUnsupported
         )
@@ -53,7 +56,7 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
             resumeSessionID: message.resumeSessionID,
             attachments: [],
             taskLabelKind: nil,
-            launchPermissionMode: config.includeRepoPromptMCPServer ? "auto" : nil
+            modelParameterSelections: config.modelParameterSelections
         )
     }
 

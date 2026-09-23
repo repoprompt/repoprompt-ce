@@ -25,9 +25,10 @@ enum AgentMCPModelParameterSupport {
     /// demand-scoped and asynchronous — use `definitions(agent:modelRaw:workspacePath:) async`,
     /// which acquires a one-shot observation for the resolved workspace/model first.
     static func definitions(agent: AgentProviderKind, modelRaw: String) -> [ACPModelParameterDefinition] {
-        guard agent.acpProviderID == .cursor,
+        guard let providerID = agent.acpProviderID,
+              providerID == .cursor || providerID == .devin,
               let parameterSet = ACPModelParameterResolver.parameterSet(
-                  providerID: .cursor,
+                  providerID: providerID,
                   selectedModelRaw: modelRaw
               )
         else { return [] }
@@ -46,7 +47,7 @@ enum AgentMCPModelParameterSupport {
     ) async throws -> [ACPModelParameterDefinition] {
         guard let providerID = agent.acpProviderID else { return [] }
         switch providerID {
-        case .cursor:
+        case .cursor, .devin:
             return definitions(agent: agent, modelRaw: modelRaw)
         case .openCode:
             do {
@@ -125,16 +126,16 @@ enum AgentMCPModelParameterSupport {
         let requests = try parseRequests(value)
         guard !requests.isEmpty else { return [] }
         guard let agent,
-              agent.acpProviderID != nil
+              let providerID = agent.acpProviderID
         else {
             throw MCPError.invalidParams("model_parameters are supported only for ACP models.")
         }
-        guard agent == .cursor else {
+        guard agent == .cursor || agent == .devin else {
             throw MCPError.invalidParams(
                 "Model parameter metadata is unavailable for the selected model."
             )
         }
-        return try resolve(requests: requests, providerID: .cursor, modelRaw: modelRaw)
+        return try resolve(requests: requests, providerID: providerID, modelRaw: modelRaw)
     }
 
     /// Asynchronous resolver that accepts an explicit OpenCode parameter request only after a
@@ -160,8 +161,8 @@ enum AgentMCPModelParameterSupport {
             throw MCPError.invalidParams("model_parameters are supported only for ACP models.")
         }
         switch providerID {
-        case .cursor:
-            return try resolve(requests: requests, providerID: .cursor, modelRaw: modelRaw)
+        case .cursor, .devin:
+            return try resolve(requests: requests, providerID: providerID, modelRaw: modelRaw)
         case .openCode:
             guard let modelRaw else {
                 throw MCPError.invalidParams(

@@ -898,6 +898,17 @@ python3 Scripts/worktree_startup_live_benchmark.py aggregate --help
 python3 Scripts/worktree_startup_live_benchmark.py cleanup --help
 ```
 
+## Devin ACP feature map
+
+Use `./conductor build` to package the debug app, then `./conductor smoke --launch` for the app and MCP health check. The bundled `DebugApps/RepoPrompt.app/Contents/MacOS/repoprompt-mcp` CLI targets this CE app. Bind it to the intended workspace before running `agent_manage` or `agent_run`. Use Cua Driver snapshots and background actions to check the visible controls; an ad-hoc signed debug app forgets secure permission settings after relaunch.
+
+| Feature | User path | Agent drive and observable result |
+| --- | --- | --- |
+| Devin permissions | Agent Models → Devin permission level, then a Devin Agent Mode run | Select Normal/Smart/Full Approval and inspect the ACP trace for the advertised mode before `session/prompt`; Provider Default restores the mode advertised when that ACP session opened. A permission card's Allow/Allow for session must select `allow_once`/`allow_session` respectively. Account policy can reject Smart or Bypass. |
+| Agent reasoning | Agent Mode → Devin model and thinking picker | `agent_manage list_agents` advertises per-model `thought_level`; `agent_run` with `model_parameters` applies the selected value before `session/prompt`. The model menu shows the advertised default effort without changing the model ID. |
+| Context Builder | Models → All Agent Models → Context Builder Agent | Select Devin and a thinking pin with Cua Driver, then run `context_builder`; its ACP trace must apply model and effort before prompting. Headless Devin uses top-level `--permission-mode auto` and does not inherit Agent Mode's Full Approval setting. |
+| Oracle picker | Models → All Agent Models → Oracle Models | Open the Devin submenu with Cua Driver; model rows show their advertised default effort and retain their raw model identity on selection. |
+
 ## Handoff checklist
 
 - Protected contract, plausible defect, chosen layer, and observable oracle.
